@@ -169,6 +169,11 @@ fn package_problems(
     if package.artifacts().next().is_none() {
         out.push(format!("{name}: no wheel or sdist to install from"));
     }
+    for key in package.unchecked_sources() {
+        out.push(format!(
+            "{name}: has a `{key}` source, which this check does not verify; only wheels and sdists are allowed"
+        ));
+    }
     let vendor = profiles.is_vendor_package(name);
     // Every lock is resolved on a Linux runner, the Windows ones included, so
     // nothing but this check stops a wheel for the wrong OS reaching a lock.
@@ -475,6 +480,36 @@ linux = "x86_64-manylinux_2_28"
                 .any(|p| p.contains("AMD-only package taken from evilstable.repo.amd.com")),
             "{found:?}"
         );
+    }
+
+    /// A source PEP 751 allows besides wheels and an sdist is refused, since
+    /// nothing here checks its host or hash.
+    #[test]
+    fn a_vcs_directory_or_archive_source_is_refused() {
+        for (key, entry) in [
+            (
+                "vcs",
+                "vcs = { type = \"git\", url = \"https://evil.example/x.git\", commit-id = \"abc\" }",
+            ),
+            ("directory", "directory = { path = \"/tmp/x\" }"),
+            (
+                "archive",
+                "archive = { url = \"https://evil.example/x.zip\", hashes = { sha256 = \"aa\" } }",
+            ),
+        ] {
+            let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com").replacen(
+                "[[packages]]\nname = \"numpy\"\nversion = \"2.3.0\"\n",
+                &format!("[[packages]]\nname = \"numpy\"\nversion = \"2.3.0\"\n{entry}\n"),
+                1,
+            );
+            assert_eq!(
+                problems_of(&text),
+                [format!(
+                    "numpy: has a `{key}` source, which this check does not verify; only wheels and sdists are allowed"
+                )],
+                "{key}"
+            );
+        }
     }
 
     #[test]

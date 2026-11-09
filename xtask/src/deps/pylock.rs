@@ -26,6 +26,11 @@ pub(crate) struct Package {
     #[serde(default)]
     pub(crate) wheels: Vec<Artifact>,
     pub(crate) sdist: Option<Artifact>,
+    /// PEP 751's other sources. `deps check` refuses any package that names
+    /// one: only `wheels` and `sdist` are held to its host and hash rules.
+    pub(crate) vcs: Option<toml::Value>,
+    pub(crate) directory: Option<toml::Value>,
+    pub(crate) archive: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +53,18 @@ impl PyLock {
 }
 
 impl Package {
+    /// The PEP 751 source keys this package uses besides `wheels`/`sdist`.
+    pub(crate) fn unchecked_sources(&self) -> Vec<&'static str> {
+        [
+            ("vcs", self.vcs.is_some()),
+            ("directory", self.directory.is_some()),
+            ("archive", self.archive.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, present)| present.then_some(key))
+        .collect()
+    }
+
     /// Every artifact this package can be installed from.
     pub(crate) fn artifacts(&self) -> impl Iterator<Item = &Artifact> {
         self.wheels.iter().chain(self.sdist.as_ref())

@@ -354,6 +354,72 @@ windows = "x86_64-pc-windows-msvc"
         assert_eq!(normalize_name("a__b..c"), "a-b-c");
     }
 
+    /// The vLLM profile locks the stack the vLLM adapter installs for the
+    /// same ROCm line: until the adapter reads the lock, the two are written
+    /// separately, so each pin in the profile must match its row in
+    /// `engines/vllm/src/discover_builds.rs`.
+    #[test]
+    fn the_vllm_profile_matches_the_adapters_build_row() {
+        let root = crate::paths::workspace_root().unwrap();
+        let profiles = Profiles::load(&root).unwrap();
+        let profile = &profiles.profile["vllm-rocm10-1"];
+        let rocm = profile.rocm.as_deref().unwrap();
+        let source =
+            std::fs::read_to_string(root.join("engines/vllm/src/discover_builds.rs")).unwrap();
+        let row = source
+            .split("VllmRocmDiscoverBuild {")
+            .find(|row| row.contains(&format!("rocm_sdk_version: \"{rocm}\"")))
+            .unwrap_or_else(|| panic!("discover_builds.rs has no {rocm} row"));
+        // The value of `field: "…"` or `field: DiscoverVersion::Kind("…")`.
+        let field = |name: &str| -> String {
+            let at = row
+                .find(&format!("{name}: "))
+                .unwrap_or_else(|| panic!("the {rocm} row has no {name}"));
+            let rest = &row[at..];
+            let open = rest.find('"').unwrap() + 1;
+            rest[open..open + rest[open..].find('"').unwrap()].to_owned()
+        };
+        let requirement = |package: &str| -> String {
+            profile
+                .requirements
+                .iter()
+                .find_map(|r| {
+                    let parsed = Requirement::parse(r).unwrap();
+                    (parsed.name == package).then(|| {
+                        format!(
+                            "{}{}",
+                            parsed.version,
+                            if parsed.prefix { ".*" } else { "" }
+                        )
+                    })
+                })
+                .unwrap_or_else(|| panic!("vllm-rocm10-1 does not require {package}"))
+        };
+        for (package, adapter) in [
+            ("vllm", format!("{}.*", field("vllm_version_prefix"))),
+            ("torch", format!("{}.*", field("torch_version_prefix"))),
+            (
+                "torchvision",
+                format!("{}.*", field("torchvision_version_prefix")),
+            ),
+            (
+                "flash-attn",
+                format!("{}.*", field("flash_attn_version_prefix")),
+            ),
+            (
+                "amd-aiter",
+                format!("{}.*", field("amd_aiter_version_prefix")),
+            ),
+            ("torchaudio", field("torchaudio_version")),
+        ] {
+            assert_eq!(
+                requirement(package),
+                adapter,
+                "{package}: runtimes/profiles.toml and the vLLM adapter's {rocm} row disagree"
+            );
+        }
+    }
+
     #[test]
     fn the_committed_profiles_parse() {
         let root = crate::paths::workspace_root().unwrap();
