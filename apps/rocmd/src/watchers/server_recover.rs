@@ -207,9 +207,7 @@ fn handle_server_recover_event_with_record(
             // and every other watcher — down on each 30s recovery tick.
             if let Err(error) = rocm_core::ensure_public_service_has_endpoint_key(
                 &record.host,
-                rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
-                    .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
-                    .is_some(),
+                crate::engine_ipc::has_usable_endpoint_key(paths, &record.service_id),
                 record.requires_api_key,
                 rocm_core::ServiceStart::Respawn,
             ) {
@@ -977,6 +975,119 @@ mod tests {
         let reloaded = reloaded?;
         assert_eq!(reloaded.status, "failed");
         assert_eq!(reloaded.last_restart_unix_ms, None);
+        Ok(())
+    }
+
+    /// What the recovery watcher does with a loopback service whose recorded port
+    /// is occupied, given what its record and key file say. A guard that lets the
+    /// service through goes on to try the restart, which fails on the occupied
+    /// port without spawning anything; a guard that refuses reports that instead.
+    /// The logged action is what tells the two apart.
+    fn recovery_action_for(
+        test: &str,
+        requires_api_key: bool,
+        key_file: Option<&str>,
+    ) -> Result<(String, String)> {
+        let (root, paths) = temp_app_paths(test);
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let occupant = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let port = occupant.local_addr()?.port();
+        let service_id = "svc-recover-key-site";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "lemonade",
+            "qwen",
+            "qwen-canonical".to_owned(),
+            rocm_core::DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.requires_api_key = requires_api_key;
+        record.write()?;
+        if let Some(contents) = key_file {
+            fs::write(
+                rocm_engine_protocol::endpoint_key_file_path(&paths, service_id),
+                contents,
+            )?;
+        }
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Contained,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "manifest_scan".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Contained,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let event_text = fs::read_to_string(paths.automation_events_path())?;
+        let logged = serde_json::from_str::<AutomationEventRecord>(event_text.trim())?;
+        fs::remove_dir_all(root).ok();
+        drop(occupant);
+        Ok((logged.action, logged.message))
+    }
+
+    /// The watcher's guard call passes the record's `requires_api_key`: a
+    /// loopback service that asked for a key and has none is refused, and the same
+    /// service without the requirement is let through to the restart.
+    #[test]
+    fn server_recover_passes_the_recorded_key_requirement_to_the_guard() -> Result<()> {
+        let (action, message) = recovery_action_for("recover-site-requires", true, None)?;
+        assert_eq!(action, "restart_managed_service_refused");
+        let expected = rocm_core::ensure_public_service_has_endpoint_key(
+            "127.0.0.1",
+            false,
+            true,
+            rocm_core::ServiceStart::Respawn,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.ends_with(&expected), "{message}");
+
+        let (action, message) = recovery_action_for("recover-site-not-required", false, None)?;
+        assert_eq!(action, "restart_managed_service_failed", "{message}");
+        assert!(message.contains("recorded port is in use"), "{message}");
+        Ok(())
+    }
+
+    /// The watcher's guard call passes whether the key file holds a *usable* key,
+    /// not whether a file exists: the engine adapters enforce nothing for an
+    /// empty or malformed one.
+    #[test]
+    fn server_recover_passes_whether_the_key_file_is_usable_to_the_guard() -> Result<()> {
+        let (action, message) =
+            recovery_action_for("recover-site-key-usable", true, Some("a-usable-key\n"))?;
+        assert_eq!(action, "restart_managed_service_failed", "{message}");
+        assert!(message.contains("recorded port is in use"), "{message}");
+
+        for (test, contents) in [
+            ("recover-site-key-empty", ""),
+            ("recover-site-key-blank", "  \n"),
+        ] {
+            let (action, message) = recovery_action_for(test, true, Some(contents))?;
+            assert_eq!(
+                action, "restart_managed_service_refused",
+                "an unusable key file ({contents:?}) is no key: {message}"
+            );
+        }
         Ok(())
     }
 

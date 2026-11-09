@@ -2036,10 +2036,16 @@ covers `rocm services restart` and `rocmd`'s recovery supervisor, and the refusa
 happens before anything is stopped, so it cannot take down a running service.
 Both binaries apply the same guard, `rocm-core`'s
 `ensure_public_service_has_endpoint_key`, so the refusal reads the same for a
-launch, a restart and a daemon respawn bar the action it names; the unit tests
-check each caller's text against the guard's, and follow the `rocm serve
-<model> …` command it names through the real parser, `serve`'s own key policy
-and the key file it stores. A
+launch, a restart and a daemon respawn bar the action it names and, for a fresh
+launch, why the key is missing (nothing stopped, so it is not told a stop
+dropped it); the `rocm serve <model> …` command it names keeps the recorded
+host, the public-bind opt-in and `--require-api-key`, so following it does not
+bring the service back somewhere else. The unit tests check each caller's text
+against the guard's and pin the guard's arguments at every call site (`rocm`'s
+restart and launch, `rocmd`'s supervisor before its manifest write and at the
+spawn, and its recovery watcher), and follow the named command for every start
+and host through the real parser, `serve`'s own port and key policy and the key
+file it stores, checking that it binds the host the service recorded. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
@@ -2614,18 +2620,21 @@ stop report that outcome for the recorded process without signalling it: each
 checks the report on stderr, exit 1, the kept PID and stop request, and that no
 stop command is named. -03 and -04 plant an endpoint key and check that the
 `kept:` line names it and the key file is still there; -05 plants none and
-checks that the line omits it and no key file exists. `service-stop-09` plants a
-publicly bound server with no key file and runs `rocm services restart --yes`:
-it checks the refusal's text and exit status, that the `rocm serve` command it
-names parses (its `<model>` and `<port>` filled in, `--help` last, with a bogus flag as the
-negative control), and that the recorded process is still running and the
-record is not marked stopped. Because the seam
+checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
 "service-stop-0[1-689]"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
+
+`service-stop-09` (Linux, mock lane) does not use that seam, because the
+refusal it covers comes before any stop. It plants a publicly bound server with
+a running recorded process and no key file and runs `rocm services restart
+--yes`: it checks the refusal's text and exit status, that the `rocm serve`
+command it names parses (its `<model>` and `<port>` filled in, `--help` last,
+with a bogus flag as the negative control), and that the recorded process is
+still running and the record is not marked stopped.
 
 `features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same

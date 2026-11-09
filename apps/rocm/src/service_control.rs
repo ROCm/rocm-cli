@@ -1024,6 +1024,92 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// What `rocm services restart` does about the endpoint key, at the real
+    /// call site, one argument of the guard at a time. The guard is `rocm_core`'s
+    /// and is tested there; what only this call site can get wrong is what it
+    /// passes: the host, the recorded `requires_api_key`, whether a usable key
+    /// file is on disk, and that it is a restart.
+    fn restart_outcome_for(
+        test: &str,
+        host: &str,
+        requires_api_key: bool,
+        key: Option<&str>,
+    ) -> String {
+        let (root, paths) = test_paths(test);
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-key-site";
+        let mut record = stop_test_record(&paths, service_id);
+        record.host = host.to_owned();
+        record.requires_api_key = requires_api_key;
+        record.write().unwrap();
+        if let Some(key) = key {
+            endpoint_keys::store_endpoint_api_key(&paths, service_id, key).unwrap();
+        }
+        // A restart the guard lets through stops the service and then waits for
+        // the launch lock, which is held, so it ends there and starts nothing: the
+        // error is what tells a refusal from a restart that went ahead.
+        let holder = rocm_core::FileLock::acquire(paths.managed_launch_lock_path()).unwrap();
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(Some(Duration::from_millis(50))));
+        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            bare_termination(Vec::new(), true)
+        });
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
+        drop(holder);
+        let _ = fs::remove_dir_all(root);
+        format!(
+            "{:#}",
+            result.expect_err("the restart never starts a child here")
+        )
+    }
+
+    #[test]
+    fn restart_passes_the_recorded_key_requirement_to_the_guard() {
+        // A loopback service that asked for `--require-api-key` and has lost its
+        // key is refused. Only `requires_api_key` makes it so, and every other
+        // test plants it false, so this is what pins the argument.
+        let error = restart_outcome_for("restart-site-requires", "127.0.0.1", true, None);
+        assert_eq!(
+            error,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "127.0.0.1",
+                false,
+                true,
+                rocm_core::ServiceStart::Restart,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        // The same service without the requirement is not refused: it is let
+        // through to the stop and the lock wait.
+        let error = restart_outcome_for("restart-site-not-required", "127.0.0.1", false, None);
+        assert!(error.contains("stopped but NOT restarted"), "{error}");
+    }
+
+    #[test]
+    fn restart_passes_whether_a_key_is_on_disk_to_the_guard() {
+        // A public service with its key still stored is not refused; without it
+        // the same service is. Together they pin the key-present argument.
+        let error =
+            restart_outcome_for("restart-site-key-present", "0.0.0.0", false, Some("a-key"));
+        assert!(error.contains("stopped but NOT restarted"), "{error}");
+        assert!(!error.contains("without authentication"), "{error}");
+        let error = restart_outcome_for("restart-site-key-absent", "0.0.0.0", false, None);
+        assert!(error.contains("without authentication"), "{error}");
+    }
+
+    #[test]
+    fn restart_passes_the_recorded_host_to_the_guard() {
+        // Whether a keyless service is refused for its bind depends on the
+        // recorded host: a public one is, loopback is not.
+        let error = restart_outcome_for("restart-site-host-public", "0.0.0.0", false, None);
+        assert!(
+            error.contains("bound to the public host `0.0.0.0`"),
+            "{error}"
+        );
+        let error = restart_outcome_for("restart-site-host-loopback", "127.0.0.1", false, None);
+        assert!(error.contains("stopped but NOT restarted"), "{error}");
+    }
+
     #[test]
     fn stop_records_its_marker_on_disk_before_any_process_is_signalled() {
         // The daemon's `server-recover` watcher restarts a managed service whose

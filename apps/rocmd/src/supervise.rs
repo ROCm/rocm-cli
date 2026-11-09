@@ -55,6 +55,20 @@ pub(crate) fn supervise_service(
     )
 }
 
+/// The respawn guard as the daemon words it: the shared guard, for this record's
+/// host and recorded requirement, as a respawn. Both of the supervisor's checks
+/// go through it — the one before the manifest write, and the one at the spawn
+/// against the key actually threaded onto the command — so they differ only in
+/// where `key_present` comes from.
+fn refuse_keyless_respawn(record: &ManagedServiceRecord, key_present: bool) -> Result<()> {
+    rocm_core::ensure_public_service_has_endpoint_key(
+        &record.host,
+        key_present,
+        record.requires_api_key,
+        rocm_core::ServiceStart::Respawn,
+    )
+}
+
 /// [`supervise_service`] on a given host, so a test can supply the binary that
 /// runs the engine.
 #[allow(clippy::too_many_arguments)]
@@ -137,14 +151,12 @@ fn supervise_service_on(
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
     // site below re-checks against the key actually threaded onto the command.
-    rocm_core::ensure_public_service_has_endpoint_key(
-        &record.host,
-        rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
-            .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
-            .is_some(),
-        record.requires_api_key,
-        rocm_core::ServiceStart::Respawn,
+    refuse_keyless_respawn(
+        &record,
+        crate::engine_ipc::has_usable_endpoint_key(paths, &record.service_id),
     )?;
+    #[cfg(test)]
+    tests::drop_key_file_between_the_guards(paths, &record.service_id);
     // The engine runs through the hidden commands of the `rocm` binary, which
     // `rocmd` does not have. Found before the first write, like the guard above,
     // so a supervisor that cannot find it leaves the record as it was.
@@ -185,12 +197,7 @@ fn supervise_service_on(
     // an anonymous public one is not.
     let endpoint_key_applied =
         crate::engine_ipc::apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    rocm_core::ensure_public_service_has_endpoint_key(
-        &record.host,
-        endpoint_key_applied,
-        record.requires_api_key,
-        rocm_core::ServiceStart::Respawn,
-    )?;
+    refuse_keyless_respawn(&record, endpoint_key_applied)?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
@@ -1060,6 +1067,92 @@ mod tests {
             // failed later for a reason that is not this guard, or is still
             // running because it reached the spawn.
             _ => true,
+        }
+    }
+
+    /// Services whose key file [`drop_key_file_between_the_guards`] removes.
+    static KEY_DROPPED_BETWEEN_THE_GUARDS: std::sync::Mutex<Vec<String>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Test seam run between the supervisor's two key checks. The two checks read
+    /// the same key file, so without it whichever runs first refuses and the other
+    /// can be broken without any test noticing. For a service registered in
+    /// [`KEY_DROPPED_BETWEEN_THE_GUARDS`] it removes the key file there, which
+    /// leaves the first check passed and only the spawn-site check able to refuse.
+    pub(super) fn drop_key_file_between_the_guards(paths: &AppPaths, service_id: &str) {
+        let registered = KEY_DROPPED_BETWEEN_THE_GUARDS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id == service_id);
+        if registered {
+            let _ = fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
+                paths, service_id,
+            ));
+        }
+    }
+
+    /// The first check sits before the manifest write, so a refused attempt leaves
+    /// the record exactly as it was. The spawn-site check refuses the same
+    /// service too, but only after the write, so this is what tells the first
+    /// check apart from the second.
+    #[test]
+    fn the_check_before_the_write_leaves_the_record_as_it_was() {
+        let (root, paths) = temp_app_paths("supervise-pre-write-check");
+        seed_registry(&paths, "svc-pre-write", true);
+        // A field `supervise_service` overwrites when it rebuilds the record, so a
+        // write shows as a change.
+        let mut seeded = crate::persistence::load_service_record(&paths, "svc-pre-write").unwrap();
+        seeded.canonical_model_id = "seeded-marker".to_owned();
+        seeded.write().unwrap();
+
+        supervise_at_the_guard(&paths, "svc-pre-write")
+            .expect_err("a service that required a key is refused without one");
+
+        let stored = crate::persistence::load_service_record(&paths, "svc-pre-write").unwrap();
+        assert_eq!(
+            stored.canonical_model_id, "seeded-marker",
+            "the refusal came after the manifest write, not before it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The check at the spawn, one argument at a time. Each case has a key that is
+    /// present for the first check and gone for the second, so only the second can
+    /// refuse it, and what it refuses with is the shared guard's text for that
+    /// service.
+    #[test]
+    fn the_check_at_the_spawn_refuses_a_key_that_is_gone_by_then() {
+        for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
+            let service_id = format!("svc-spawn-site-{}", host.replace('.', "-"));
+            let (root, paths) = temp_app_paths(&service_id);
+            seed_registry(&paths, &service_id, requires_api_key);
+            fs::write(
+                rocm_engine_protocol::endpoint_key_file_path(&paths, &service_id),
+                "a-usable-key",
+            )
+            .unwrap();
+            KEY_DROPPED_BETWEEN_THE_GUARDS
+                .lock()
+                .unwrap()
+                .push(service_id.clone());
+
+            let error = supervise_at_the_guard_on(&paths, &service_id, host)
+                .expect_err("a key that is gone at the spawn must refuse it");
+
+            assert_eq!(
+                format!("{error:#}"),
+                rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    requires_api_key,
+                    rocm_core::ServiceStart::Respawn,
+                )
+                .unwrap_err()
+                .to_string(),
+                "{host} requires={requires_api_key}"
+            );
+            let _ = fs::remove_dir_all(&root);
         }
     }
 

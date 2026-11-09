@@ -6,11 +6,13 @@
 //!
 //! The endpoint-API-key generator, its header-safety check, and the one guard
 //! `rocm` and `rocmd` both apply before bringing a recorded service back up
-//! (see [`ensure_public_service_has_endpoint_key`]). Drawn from a
-//! CSPRNG — deliberately never derived from [`crate::service_identity`]'s
-//! timestamp-based, guessable [`crate::generate_service_id`] — the two meet
-//! only at the filesystem layer, where a service's endpoint key is stored in a
-//! sidecar named after its [`crate::ServiceId`].
+//! (see [`ensure_public_service_has_endpoint_key`]).
+//!
+//! The key is drawn from a CSPRNG — deliberately never derived from
+//! [`crate::service_identity`]'s timestamp-based, guessable
+//! [`crate::generate_service_id`] — and the two meet only at the filesystem
+//! layer, where a service's endpoint key is stored in a sidecar named after its
+//! [`crate::ServiceId`].
 
 /// Number of random alphanumeric characters in a generated endpoint API key.
 /// 48 chars from a 62-symbol alphabet is ~285 bits of entropy — far beyond what
@@ -93,6 +95,39 @@ impl ServiceStart {
             Self::Respawn => "respawning it would reopen it",
         }
     }
+
+    /// Whether a service that was running is being brought back. A fresh launch
+    /// has nothing that stopped, so it is not told a stop dropped its key, and it
+    /// is not told to "launch it again" when launching is what it just did.
+    const fn brings_back_a_service(self) -> bool {
+        match self {
+            Self::Launch => false,
+            Self::Restart | Self::Respawn => true,
+        }
+    }
+}
+
+/// The `rocm serve` command that gives a service with this recorded `host` and
+/// requirement a key again. The command keeps everything the service's bind
+/// depended on, so following it does not bring the service back somewhere else:
+/// the host (with the `--port` that `rocm serve` demands on any host but the
+/// canonical loopback one, since only there can it choose a free port), the
+/// public-bind opt-in where the host is public, and `--require-api-key` where the
+/// service asked for it.
+fn serve_command(host: &str, requires_api_key: bool) -> String {
+    let mut command = String::from("rocm serve <model>");
+    if !crate::is_canonical_loopback_host(host) {
+        command.push_str(" --host ");
+        command.push_str(host);
+        command.push_str(" --port <port>");
+    }
+    if is_public_bind_host(host) {
+        command.push_str(" --allow-public-bind");
+    }
+    if requires_api_key {
+        command.push_str(" --require-api-key");
+    }
+    command
 }
 
 /// Refuse to bring a managed service up when it needs an endpoint API key and
@@ -122,9 +157,15 @@ impl ServiceStart {
 ///
 /// Both refusals name the command that restores the service — `rocm serve
 /// <model> …` — because the key is dropped when a service stops and cannot be
-/// recovered, only issued again by a new launch. The public-bind one carries
-/// `--port <port>`, since `rocm serve` takes automatic port selection only on
-/// the canonical loopback host and a public host never is one.
+/// recovered, only issued again by a new launch. The command is built from the
+/// recorded host and requirement ([`serve_command`]) and keeps what the bind
+/// depended on: a host other than the canonical loopback one carries `--host`
+/// and `--port <port>` (`rocm serve` takes automatic port selection only on the
+/// canonical loopback host), a public host carries `--allow-public-bind`, and a
+/// service that asked for a key carries `--require-api-key`. What the start
+/// changes is only the wording of the action and of why the key is missing: a
+/// service being brought back lost its key when it stopped, a fresh launch
+/// stored a key file that is missing or unusable and has started nothing.
 pub fn ensure_public_service_has_endpoint_key(
     host: &str,
     key_present: bool,
@@ -134,27 +175,47 @@ pub fn ensure_public_service_has_endpoint_key(
     if key_present {
         return Ok(());
     }
+    let lead = if requires_api_key {
+        if start.brings_back_a_service() {
+            "managed service was launched with `--require-api-key` but has no endpoint API key"
+                .to_owned()
+        } else {
+            "this launch asks for `--require-api-key` but has no usable endpoint API key".to_owned()
+        }
+    } else if is_public_bind_host(host) {
+        if start.brings_back_a_service() {
+            format!(
+                "managed service is bound to the public host `{host}` but has no endpoint API key"
+            )
+        } else {
+            format!("this launch binds the public host `{host}` but has no usable endpoint API key")
+        }
+    } else {
+        return Ok(());
+    };
     let would_open = start.would_open();
-    if requires_api_key {
+    let command = serve_command(host, requires_api_key);
+    let choose_key = "(add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key \
+                      instead of generating one)";
+    if start.brings_back_a_service() {
+        // Something outside this process may republish the port of a service that
+        // asked for a key; that is a reason to refuse that only exists once the
+        // service has been running.
+        let republished = if requires_api_key {
+            "Something outside this machine may still be publishing its port. "
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "managed service was launched with `--require-api-key` but has no endpoint API key, \
-             so {would_open} without authentication. Something outside this machine may still be \
-             publishing its port. The key is dropped when a service stops and cannot be \
-             recovered. Launch it again with `rocm serve <model> --require-api-key` (add \
-             `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of \
-             generating one)."
+            "{lead}, so {would_open} without authentication. {republished}The key is dropped \
+             when a service stops and cannot be recovered. Launch it again with `{command}` \
+             {choose_key}."
         );
     }
-    if is_public_bind_host(host) {
-        anyhow::bail!(
-            "managed service is bound to the public host `{host}` but has no endpoint API key, \
-             so {would_open} without authentication. The key is dropped when a service stops and \
-             cannot be recovered. Launch it again with `rocm serve <model> --host {host} \
-             --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
-             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
-        );
-    }
-    Ok(())
+    anyhow::bail!(
+        "{lead}, so {would_open} without authentication. Nothing was started, and the key file \
+         this launch stored is missing or unusable. Run `{command}` again {choose_key}."
+    );
 }
 
 #[cfg(test)]
@@ -212,6 +273,74 @@ mod tests {
         }
     }
 
+    /// The command each recorded host and requirement must be told to run: it
+    /// keeps what the bind depended on, so following it does not bring the
+    /// service back somewhere else. Spelled out here, not derived.
+    const ADVISED: [(&str, bool, &str); 8] = [
+        ("127.0.0.1", true, "rocm serve <model> --require-api-key"),
+        (
+            "localhost",
+            true,
+            "rocm serve <model> --host localhost --port <port> --require-api-key",
+        ),
+        (
+            "::1",
+            true,
+            "rocm serve <model> --host ::1 --port <port> --require-api-key",
+        ),
+        (
+            "0.0.0.0",
+            true,
+            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind --require-api-key",
+        ),
+        (
+            "gpu-box.example",
+            true,
+            "rocm serve <model> --host gpu-box.example --port <port> --allow-public-bind \
+             --require-api-key",
+        ),
+        (
+            "0.0.0.0",
+            false,
+            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind",
+        ),
+        (
+            "192.168.1.10",
+            false,
+            "rocm serve <model> --host 192.168.1.10 --port <port> --allow-public-bind",
+        ),
+        (
+            "LOCALHOST",
+            false,
+            "rocm serve <model> --host LOCALHOST --port <port> --allow-public-bind",
+        ),
+    ];
+
+    /// Whether `message` names `command` as the thing to run, followed by the way to
+    /// choose the key: a service being brought back is told to "launch it again
+    /// with" it, a fresh launch to "run" it "again".
+    fn names_command(message: &str, command: &str, start: ServiceStart) -> bool {
+        let tail = if start.brings_back_a_service() {
+            "(add `--api-key <key>`"
+        } else {
+            "again (add `--api-key <key>`"
+        };
+        message.contains(&format!("`{command}` {tail}"))
+    }
+
+    #[test]
+    fn the_command_a_refusal_names_keeps_the_host_the_opt_in_and_the_key_flag() {
+        for start in STARTS {
+            for (host, requires, command) in ADVISED {
+                let message = refusal(host, false, requires, start);
+                assert!(
+                    names_command(&message, command, start),
+                    "{host} requires={requires} {start:?}: {message}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_service_that_requires_a_key_is_refused_without_one_on_any_host() {
         // The bind address is not the whole story: a loopback service that
@@ -226,16 +355,11 @@ mod tests {
             ] {
                 let message = refusal(host, false, true, start);
                 assert!(
-                    message.contains("launched with `--require-api-key`"),
-                    "{host} {start:?}: {message}"
-                );
-                assert!(
-                    message.contains("Launch it again with `rocm serve <model> --require-api-key`"),
+                    message.contains("`--require-api-key` but has no"),
                     "{host} {start:?}: {message}"
                 );
                 // It never blames the bind address, whatever the host is.
                 assert!(!message.contains("public host"), "{message}");
-                assert!(!message.contains("--allow-public-bind"), "{message}");
             }
         }
     }
@@ -252,15 +376,19 @@ mod tests {
             ] {
                 let message = refusal(host, false, false, start);
                 assert!(
-                    message.contains(&format!("bound to the public host `{host}`")),
+                    message.contains(&format!("the public host `{host}` but has no")),
                     "{host} {start:?}: {message}"
                 );
                 // The remediation keeps the host and the public-bind opt-in, so
                 // following it does not bring the service back on loopback.
                 assert!(
-                    message.contains(&format!(
-                        "Launch it again with `rocm serve <model> --host {host} --port <port> --allow-public-bind`"
-                    )),
+                    names_command(
+                        &message,
+                        &format!(
+                            "rocm serve <model> --host {host} --port <port> --allow-public-bind"
+                        ),
+                        start
+                    ),
                     "{host} {start:?}: {message}"
                 );
                 // A service that never passed the flag is not told it did.
@@ -284,34 +412,57 @@ mod tests {
     }
 
     #[test]
-    fn a_service_that_asked_for_a_key_on_a_public_host_is_told_about_the_key_requirement() {
-        // The first rule wins, so the remediation does not drop what the user
-        // asked for.
+    fn a_service_that_asked_for_a_key_on_a_public_host_is_told_about_both() {
+        // The first rule wins, so a service that asked for a key is never told its
+        // bind is the problem; and its remediation keeps the public host and the
+        // opt-in as well as the flag it asked for, since dropping them would bring
+        // it back on the default loopback host.
         for start in STARTS {
-            assert_eq!(
-                refusal("0.0.0.0", false, true, start),
-                refusal("127.0.0.1", false, true, start)
+            let message = refusal("0.0.0.0", false, true, start);
+            assert!(!message.contains("public host"), "{message}");
+            assert!(
+                message.contains(
+                    "`rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind \
+                     --require-api-key`"
+                ),
+                "{start:?}: {message}"
             );
         }
     }
 
     #[test]
-    fn the_start_changes_only_what_the_refusal_says_the_action_would_do() {
-        // The same text is shown by `rocm services restart`, a fresh `rocm serve`
-        // spawn and the daemon's recovery: only the action's own words differ, so
-        // the rules and the commands they name cannot drift apart per caller.
-        for (host, requires) in [("127.0.0.1", true), ("0.0.0.0", false)] {
+    fn a_service_being_brought_back_and_a_fresh_launch_are_worded_from_the_start() {
+        // `Restart` and `Respawn` differ from each other only in the clause naming
+        // the action; a fresh `Launch` has nothing that stopped, so it says so
+        // instead of repeating "the key is dropped when a service stops" and tells
+        // the user to run the command again rather than to "launch it again".
+        for (host, requires, _) in ADVISED {
             let restart = refusal(host, false, requires, ServiceStart::Restart);
-            for (start, clause) in [
-                (ServiceStart::Launch, "launching it would open it"),
-                (ServiceStart::Respawn, "respawning it would reopen it"),
+            assert_eq!(
+                refusal(host, false, requires, ServiceStart::Respawn),
+                restart.replace(
+                    "restarting it would reopen it",
+                    "respawning it would reopen it"
+                ),
+                "{host} requires={requires}"
+            );
+            let launch = refusal(host, false, requires, ServiceStart::Launch);
+            for stale in [
+                "dropped when a service stops",
+                "Launch it again",
+                "still be publishing",
+                "managed service",
             ] {
-                assert_eq!(
-                    refusal(host, false, requires, start),
-                    restart.replace("restarting it would reopen it", clause),
-                    "{host} {start:?}"
+                assert!(
+                    !launch.contains(stale),
+                    "{host} requires={requires}: a launch must not say {stale:?}: {launch}"
                 );
             }
+            assert!(launch.contains("Nothing was started"), "{launch}");
+            assert!(
+                launch.contains("launching it would open it without authentication"),
+                "{launch}"
+            );
         }
         assert_eq!(
             refusal("127.0.0.1", false, true, ServiceStart::Restart),
@@ -328,6 +479,22 @@ mod tests {
              so respawning it would reopen it without authentication. The key is dropped when a \
              service stops and cannot be recovered. Launch it again with `rocm serve <model> \
              --host 0.0.0.0 --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
+             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
+        );
+        assert_eq!(
+            refusal("127.0.0.1", false, true, ServiceStart::Launch),
+            "this launch asks for `--require-api-key` but has no usable endpoint API key, so \
+             launching it would open it without authentication. Nothing was started, and the \
+             key file this launch stored is missing or unusable. Run `rocm serve <model> \
+             --require-api-key` again (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to \
+             choose the key instead of generating one)."
+        );
+        assert_eq!(
+            refusal("0.0.0.0", false, false, ServiceStart::Launch),
+            "this launch binds the public host `0.0.0.0` but has no usable endpoint API key, so \
+             launching it would open it without authentication. Nothing was started, and the \
+             key file this launch stored is missing or unusable. Run `rocm serve <model> --host \
+             0.0.0.0 --port <port> --allow-public-bind` again (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }

@@ -80,6 +80,15 @@ pub(crate) fn apply_endpoint_key_env(
     false
 }
 
+/// Whether the service has a *usable* endpoint key on disk: a file that exists
+/// and holds a key the engine adapters will enforce. This is the one answer
+/// every recovery path gives the respawn guard as its `key_present`, so the
+/// supervisor, the recovery watcher and the spawn-site check cannot disagree
+/// about what "has a key" means.
+pub(crate) fn has_usable_endpoint_key(paths: &AppPaths, service_id: &str) -> bool {
+    usable_endpoint_key_file(paths, service_id).is_some()
+}
+
 /// The service's endpoint key file, when it exists and holds a usable key.
 fn usable_endpoint_key_file(paths: &AppPaths, service_id: &str) -> Option<PathBuf> {
     rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
@@ -190,125 +199,41 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn recovery_refuses_a_service_that_lost_a_key_it_was_launched_with() {
-        // The daemon once kept its own copy of this guard, and it only knew
-        // about public binds. A loopback service that something republishes — a
-        // tailnet publish outlives this daemon, let alone the process — would
-        // be recovered without authentication, and the rebuilt record would
-        // then disarm `rocm services restart` too.
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            let error = rocm_core::ensure_public_service_has_endpoint_key(
-                host,
-                false,
-                true,
-                rocm_core::ServiceStart::Respawn,
-            )
-            .expect_err("a service launched with a key must not be recovered without one");
-            let message = format!("{error:#}");
-            assert!(
-                message.contains("respawning it would reopen it without authentication"),
-                "{message}"
+    fn a_key_file_is_a_key_only_when_the_engine_adapters_would_enforce_it() {
+        // The respawn guard's `key_present` is this answer. The engine adapters
+        // enforce nothing for an empty, blank or control-character key file, so
+        // counting any of them as "has a key" would let the guard pass while the
+        // endpoint served anonymously.
+        let (_root, paths) = temp_app_paths("has-usable-endpoint-key");
+        let service_id = "svc-usable-key";
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir()).unwrap();
+
+        assert!(!has_usable_endpoint_key(&paths, service_id), "no file");
+        for (contents, usable) in [
+            ("", false),
+            ("  \n", false),
+            ("bad\r\nkey", false),
+            ("a-usable-key", true),
+            ("a-usable-key\n", true),
+        ] {
+            fs::write(&key_path, contents).unwrap();
+            assert_eq!(
+                has_usable_endpoint_key(&paths, service_id),
+                usable,
+                "{contents:?}"
+            );
+            // The key an engine child is given is the same file, so what recovery
+            // reports as present is exactly what it threads onto the child.
+            let mut command = ProcessCommand::new("true");
+            assert_eq!(
+                apply_endpoint_key_env(&mut command, &paths, service_id),
+                usable,
+                "{contents:?}"
             );
         }
-        // With the key still present, recovery proceeds.
-        rocm_core::ensure_public_service_has_endpoint_key(
-            "127.0.0.1",
-            true,
-            true,
-            rocm_core::ServiceStart::Respawn,
-        )
-        .unwrap();
-        // And a service that never had one is untouched.
-        rocm_core::ensure_public_service_has_endpoint_key(
-            "127.0.0.1",
-            false,
-            false,
-            rocm_core::ServiceStart::Respawn,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn recovery_respawn_fails_closed_for_a_public_service_without_a_key() {
-        // Daemon recovery re-execs `rocmd supervise` for the recorded host. With
-        // the key gone the child would listen on that public host anonymously,
-        // so the spawn must be refused instead.
-        let error = rocm_core::ensure_public_service_has_endpoint_key(
-            "0.0.0.0",
-            false,
-            false,
-            rocm_core::ServiceStart::Respawn,
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("respawning it would reopen it without authentication"),
-            "{error:#}"
-        );
-
-        rocm_core::ensure_public_service_has_endpoint_key(
-            "0.0.0.0",
-            true,
-            false,
-            rocm_core::ServiceStart::Respawn,
-        )
-        .unwrap();
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            rocm_core::ensure_public_service_has_endpoint_key(
-                host,
-                false,
-                false,
-                rocm_core::ServiceStart::Respawn,
-            )
-            .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
-        }
-    }
-
-    #[test]
-    fn the_key_file_rocm_serve_stores_clears_the_recovery_refusal() {
-        // The condition both refusals report is a missing *usable* key. Relaunching
-        // with the command they name makes `rocm serve` write the key file at the
-        // deterministic path, and the expression recovery uses to decide
-        // `key_present` must then read it as present. The parse of the named
-        // command itself is checked in `rocm`, which owns the clap tree, against
-        // the very text this guard produces
-        // (`the_command_a_respawn_refusal_names_clears_the_refusal`).
-        let (_root, paths) = temp_app_paths("recovery-refusal-cleared");
-        let service_id = "svc-recovery-refusal-cleared";
-        let key_present = || {
-            rocm_engine_protocol::endpoint_key_file_if_present(&paths, service_id)
-                .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
-                .is_some()
-        };
-        for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
-            let _ = fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
-                &paths, service_id,
-            ));
-            assert!(!key_present());
-            rocm_core::ensure_public_service_has_endpoint_key(
-                host,
-                key_present(),
-                requires_api_key,
-                rocm_core::ServiceStart::Respawn,
-            )
-            .expect_err("no key on disk: refused");
-
-            fs::create_dir_all(paths.services_dir()).unwrap();
-            fs::write(
-                rocm_engine_protocol::endpoint_key_file_path(&paths, service_id),
-                "freshly-issued-key\n",
-            )
-            .unwrap();
-            assert!(key_present());
-            rocm_core::ensure_public_service_has_endpoint_key(
-                host,
-                key_present(),
-                requires_api_key,
-                rocm_core::ServiceStart::Respawn,
-            )
-            .unwrap_or_else(|error| panic!("{host}: a stored key must clear it: {error:#}"));
-        }
+        // Another service's key is not this one's.
+        assert!(!has_usable_endpoint_key(&paths, "svc-other"));
     }
 
     #[test]

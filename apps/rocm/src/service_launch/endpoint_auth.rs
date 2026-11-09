@@ -379,6 +379,7 @@ mod tests {
         paths: &AppPaths,
         service_id: &str,
         start: rocm_core::ServiceStart,
+        service: (&str, bool),
     ) -> Result<()> {
         use crate::{Cli, Command, cli_command};
         use clap::FromArgMatches as _;
@@ -397,6 +398,16 @@ mod tests {
         else {
             panic!("{advised:?} is not a `rocm serve` invocation");
         };
+        // Following the advice brings the service back where it was: on the host
+        // it recorded, asking for the key again if it had asked for one. A command
+        // that cleared the guard by quietly binding somewhere else (the default
+        // loopback host) would not be advice that restores the service.
+        let (recorded_host, recorded_requires_api_key) = service;
+        assert_eq!(host, recorded_host, "{advised:?} binds another host");
+        assert_eq!(
+            require_api_key, recorded_requires_api_key,
+            "{advised:?} does not carry the service's key requirement"
+        );
         validate_bind_host(&host, allow_public_bind)?;
         // `serve()` refuses automatic port selection on any host but the
         // canonical loopback one, so advice for a public host without a port
@@ -437,6 +448,8 @@ mod tests {
                 ("127.0.0.1", true),
                 ("localhost", true),
                 ("::1", true),
+                ("0.0.0.0", true),
+                ("gpu-box.example", true),
                 ("0.0.0.0", false),
                 ("192.168.1.10", false),
                 ("gpu-box.example", false),
@@ -483,9 +496,16 @@ mod tests {
                     endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none(),
                     "the refused state has no key on disk"
                 );
-                guard_after_following(&runnable, &paths, service_id, start).unwrap_or_else(
-                    |error| panic!("{runnable:?} does not clear {host} ({start:?}): {error:#}"),
-                );
+                guard_after_following(
+                    &runnable,
+                    &paths,
+                    service_id,
+                    start,
+                    (host, requires_api_key),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{runnable:?} does not clear {host} ({start:?}): {error:#}")
+                });
                 assert!(
                     endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
                     "following the advice leaves the service a key to respawn with"
