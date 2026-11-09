@@ -18,8 +18,6 @@
 //!
 //! Zero `std::thread::spawn`/`try_recv`: every command runs as a job-bridge job.
 
-use std::path::Path;
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -32,7 +30,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{display_args, exe_label, resolve_exe};
+use crate::ui::exec::{adopt_args, display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
@@ -150,20 +148,6 @@ pub struct RuntimeManagerState {
     pub message: Option<String>,
 }
 
-/// Derive the conventional Python executable inside an env root, matching
-/// rocm-core's per-host layout (`Scripts\python.exe` on Windows, `bin/python`
-/// elsewhere) without taking a `rocm-core` dependency. The approval modal shows
-/// the exact argv, so the user verifies it before anything runs.
-fn derive_python_executable(root: &str) -> String {
-    let root = Path::new(root);
-    let path = if cfg!(windows) {
-        root.join("Scripts").join("python.exe")
-    } else {
-        root.join("bin").join("python")
-    };
-    path.to_string_lossy().into_owned()
-}
-
 /// Handle a key while the overlay is open. `runtimes` is the plumbed list.
 pub fn on_key(
     rm: &mut Option<RuntimeManagerState>,
@@ -180,15 +164,7 @@ pub fn on_key(
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
                 r.browser = None;
-                let root = path.to_string_lossy().into_owned();
-                let args = vec![
-                    "runtimes".to_string(),
-                    "adopt".to_string(),
-                    "--root".to_string(),
-                    root.clone(),
-                    "--python".to_string(),
-                    derive_python_executable(&root),
-                ];
+                let args = adopt_args(&path.to_string_lossy());
                 stage_approval(r, RuntimeAction::Adopt, args);
             }
             FolderOutcome::Cancelled => r.browser = None,

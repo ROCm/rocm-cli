@@ -176,7 +176,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} - check `rocm logs --service {}` or `rocm services list`",
+            "  note: {explanation} - follow `rocm logs --service {} --follow` or check `rocm services list`",
             summary.service_id
         );
     }
