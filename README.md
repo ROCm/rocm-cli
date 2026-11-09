@@ -1236,7 +1236,9 @@ gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
 processes, and any endpoint key, which the server may still be enforcing. It
 names each process that, or a process under it, did not exit after it was
-signaled; for a process it could not verify as the server's (its recorded
+signaled (on Windows also a process that did exit while taking the processes
+under it down did not complete, so one of them may still be running); for a
+process it could not verify as the server's (its recorded
 start-time can no longer be read back, or, on Windows, `rocm` cannot query it at
 all), it signals nothing and names an operating-system command to check on it. It does not suggest
 running the stop again: when only a process under the recorded one survived, a

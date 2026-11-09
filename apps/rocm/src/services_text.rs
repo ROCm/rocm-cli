@@ -1018,6 +1018,10 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
 ///
 /// - a process that was signalled and that, or a process under it, outlived
 ///   the deadline (`timed_out`);
+/// - a process that is gone, with the separate kill of the processes under it
+///   not completed (`descendants_unconfirmed`, Windows): this stop saw the
+///   recorded process exit, so it does not say anything outlived a deadline, but
+///   one of the processes under it may still be running;
 /// - a process that was not signalled because its identity could not be
 ///   verified (`unverified`), with how to look at it. There are two routes to
 ///   it: a recorded start-time that can no longer be read back from a running
@@ -1058,6 +1062,8 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
             .collect()
     };
     let timed_out = with_outcome(rocm_core::TerminationOutcome::TimedOut.as_str());
+    let descendants_unconfirmed =
+        with_outcome(rocm_core::TerminationOutcome::DescendantsUnconfirmed.as_str());
     let unverified = with_outcome(rocm_core::TerminationOutcome::Unverified.as_str());
 
     let mut text = String::new();
@@ -1079,6 +1085,12 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
         let _ = writeln!(
             text,
             "  still running: process {pid} ({role}) or a process under it did not exit after it was signaled"
+        );
+    }
+    for (pid, role) in &descendants_unconfirmed {
+        let _ = writeln!(
+            text,
+            "  not confirmed: process {pid} ({role}) exited, but a process under it may still be running, because taking the processes under it down did not complete"
         );
     }
     for (pid, role) in &unverified {

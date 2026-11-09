@@ -190,6 +190,23 @@ pub(crate) fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
         .collect()
 }
 
+/// Whether any process the record names may still be running: everything but a
+/// confirmed exit counts (see [`ProcessProbe::may_be_running`]), and a `0`
+/// placeholder PID is never asked about.
+///
+/// The one reading behind every destructive decision made from a recorded
+/// process's liveness: the deferred key cleanup, the reconciliation to
+/// `stopped`, and the in-use check behind `rocm services remove` and `prune`.
+/// Kept in one place so those cannot drift apart on what counts as gone.
+pub(crate) fn recorded_pids_may_be_running(
+    record: &ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
+    recorded_service_pids(record)
+        .iter()
+        .any(|pid| probe(*pid).may_be_running())
+}
+
 /// Complete a stop that was requested but could not confirm termination, once
 /// the processes are actually observed gone: drop the endpoint key and clear the
 /// marker. Returns whether the record changed.
@@ -219,10 +236,7 @@ fn settle_pending_stop_key_cleanup(
     if record.stop_requested_unix_ms.is_none() {
         return false;
     }
-    if recorded_service_pids(record)
-        .iter()
-        .any(|pid| probe(*pid).may_be_running())
-    {
+    if recorded_pids_may_be_running(record, probe) {
         return false;
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
@@ -293,7 +307,7 @@ pub(crate) fn refresh_managed_service_runtime_liveness_with(
 
     let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
-    let has_live_pid = tracked_pids.iter().any(|pid| probe(*pid).may_be_running());
+    let has_live_pid = recorded_pids_may_be_running(record, &probe);
     if has_tracked_pid && !has_live_pid {
         // Reconcile the status only. The endpoint key is *not* dropped here:
         // dead pids alone do not distinguish a stopped service from a crashed
@@ -1033,5 +1047,52 @@ mod tests {
         assert_eq!(record.stop_requested_unix_ms, Some(1));
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// The one reading behind the three destructive decisions: any recorded
+    /// process that is not confirmed gone counts, both roles are asked about, and
+    /// a placeholder `0` PID never is.
+    #[test]
+    fn recorded_pids_may_be_running_unless_every_recorded_process_is_confirmed_gone() {
+        use std::cell::RefCell;
+
+        let (root, paths) = test_paths("recorded-pids-may-be-running");
+        let mut record = pending_stop_record(&paths, "svc-pids").expect("record");
+        let _ = fs::remove_dir_all(root);
+        record.supervisor_pid = 111;
+        record.engine_pid = Some(222);
+
+        let asked_cell = RefCell::new(Vec::new());
+        let asked = &asked_cell;
+        let by_pid = |running: &'static [(u32, ProcessProbe)]| {
+            move |pid: u32| {
+                asked.borrow_mut().push(pid);
+                running
+                    .iter()
+                    .find(|(candidate, _)| *candidate == pid)
+                    .map_or(ProcessProbe::Gone, |(_, probe)| *probe)
+            }
+        };
+
+        assert!(recorded_pids_may_be_running(
+            &record,
+            by_pid(&[(222, ProcessProbe::Unqueryable)])
+        ));
+        assert!(recorded_pids_may_be_running(
+            &record,
+            by_pid(&[(111, ProcessProbe::Running)])
+        ));
+        assert!(!recorded_pids_may_be_running(&record, by_pid(&[])));
+        let engine_only = asked.borrow().iter().filter(|pid| **pid == 222).count();
+        assert!(engine_only >= 1, "the engine PID is asked about too");
+
+        record.supervisor_pid = 0;
+        record.engine_pid = None;
+        asked.borrow_mut().clear();
+        assert!(!recorded_pids_may_be_running(
+            &record,
+            by_pid(&[(0, ProcessProbe::Running)])
+        ));
+        assert!(asked.borrow().is_empty(), "a 0 placeholder is never probed");
     }
 }

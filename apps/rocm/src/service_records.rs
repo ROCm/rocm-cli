@@ -39,7 +39,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, ManagedServiceRecord, ProcessProbe};
 
 use crate::managed_service_status::{
-    load_managed_services, managed_service_is_live, recorded_service_pids,
+    load_managed_services, managed_service_is_live, recorded_pids_may_be_running,
 };
 use crate::services_text::{load_managed_service, validate_service_id};
 use crate::{cli_progress, cli_report, endpoint_keys, service_hints};
@@ -179,10 +179,7 @@ fn managed_service_record_is_in_use_with(
     record: &ManagedServiceRecord,
     probe: impl Fn(u32) -> ProcessProbe,
 ) -> bool {
-    managed_service_is_live(record)
-        || recorded_service_pids(record)
-            .iter()
-            .any(|pid| probe(*pid).may_be_running())
+    managed_service_is_live(record) || recorded_pids_may_be_running(record, probe)
 }
 
 /// Remove one non-running local server record and everything it owns.

@@ -1123,7 +1123,9 @@ pub(crate) enum ServicesCommand {
     /// confirmed gone. Otherwise it reports on stderr that the stop was not
     /// confirmed and exits with an error, keeping the record, which still names
     /// the processes, and any endpoint key, which the server may still be
-    /// enforcing. It names each process that did not exit, and for one it could
+    /// enforcing. It names each process that did not exit (on Windows also one
+    /// that exited while taking the processes under it down did not complete),
+    /// and for one it could
     /// not verify (its recorded start-time can no longer be read back, or, on
     /// Windows, it cannot be queried at all) it signals nothing and names an
     /// operating-system command to check on it. It does not suggest running the

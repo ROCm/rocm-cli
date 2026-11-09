@@ -422,6 +422,24 @@ pub(crate) const fn classify_open_failure(code: Option<i32>) -> ProcessProbe {
     }
 }
 
+/// The path of a Windows system tool, `%SystemRoot%\System32\<name>`.
+///
+/// So a directory earlier on `PATH` cannot stand in for it; the bare name when
+/// `SystemRoot` is not set. `name` includes the extension (`taskkill.exe`).
+#[must_use]
+pub fn windows_system_tool(name: &str) -> PathBuf {
+    system_tool_path(std::env::var_os("SystemRoot"), name)
+}
+
+/// [`windows_system_tool`] for a given `SystemRoot`, so a test builds the path
+/// on every host.
+fn system_tool_path(system_root: Option<std::ffi::OsString>, name: &str) -> PathBuf {
+    match system_root.filter(|root| !root.is_empty()) {
+        Some(root) => PathBuf::from(root).join("System32").join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// Look at `pid`, keeping a process that cannot be queried apart from one that
 /// is gone. See [`ProcessProbe`].
 #[cfg(windows)]
@@ -1366,6 +1384,33 @@ mod tests {
     use super::*;
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
+
+    /// A system tool is started from `System32` under `SystemRoot`, never by a
+    /// bare name that `PATH` could resolve to something else; with no
+    /// `SystemRoot` it falls back to the bare name.
+    #[test]
+    fn a_system_tool_is_resolved_under_system32_of_the_system_root() {
+        let path = system_tool_path(
+            Some(std::ffi::OsString::from("C:\\Windows")),
+            "taskkill.exe",
+        );
+        let mut expected = PathBuf::from("C:\\Windows");
+        expected.push("System32");
+        expected.push("taskkill.exe");
+        assert_eq!(path, expected);
+        assert!(path.ends_with(Path::new("System32").join("taskkill.exe")));
+        assert!(!path.parent().unwrap().as_os_str().is_empty());
+
+        assert_eq!(
+            system_tool_path(None, "tasklist.exe"),
+            PathBuf::from("tasklist.exe")
+        );
+        assert_eq!(
+            system_tool_path(Some(std::ffi::OsString::new()), "tasklist.exe"),
+            PathBuf::from("tasklist.exe"),
+            "an empty SystemRoot is no SystemRoot"
+        );
+    }
 
     /// A failed `OpenProcess` is a gone process only for the code that means
     /// "no such process". Access denied, which a live process the caller may not

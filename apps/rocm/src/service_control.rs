@@ -2819,4 +2819,50 @@ mod tests {
             "nothing about the record may change while the process is unqueryable"
         );
     }
+
+    /// A stop whose recorded process was seen to exit but whose tree kill did not
+    /// complete says so in those words, not as a timeout, and keeps what an
+    /// unconfirmed stop keeps: the claim and the state are checked together.
+    #[test]
+    fn a_stop_with_an_unconfirmed_tree_kill_says_what_happened_and_keeps_the_service() {
+        let (root, paths) = test_paths("services-stop-descendants-unconfirmed");
+        paths.ensure().unwrap();
+        let service_id = "svc-descendants-unconfirmed";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            vec![stop_of(
+                999_999_999,
+                rocm_core::TerminationOutcome::DescendantsUnconfirmed,
+            )]
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(answer["status"], "stop_unconfirmed", "{answer}");
+        let rendered = format!("{:#}", outcome.expect_err("not a confirmed stop"));
+        assert!(
+            rendered.contains(
+                "not confirmed: process 999999999 (supervisor_and_engine) exited, but a process under it may still be running"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("still running: process")
+                && !rendered.contains("did not exit after it was signaled"),
+            "the root was seen to exit, so nothing outlived a deadline: {rendered}"
+        );
+        assert!(!rendered.contains("Local server stopped"), "{rendered}");
+        assert_no_retry_line(&rendered);
+        // The claim of what was kept, against what was kept.
+        assert!(rendered.contains("kept: the server record"), "{rendered}");
+        assert_eq!(on_disk.supervisor_pid, 999_999_999);
+        assert!(on_disk.stop_requested_unix_ms.is_some());
+        assert_eq!(key.as_deref(), Some("key-123"));
+    }
 }

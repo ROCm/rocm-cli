@@ -500,7 +500,10 @@ rocm services restart <service-id> --yes
 `stop` prints `Local server stopped` only once every recorded process is
 confirmed gone; otherwise it prints `Local server stop not confirmed` on stderr,
 keeps the record and any endpoint key, and exits non-zero. It names each
-process that, or a process under it, did not exit, and for one it could not
+process that, or a process under it, did not exit (on Windows also one that did
+exit while taking the processes under it down did not complete, so one of them
+may still be running: `not confirmed: process <pid> (<role>) exited, but a
+process under it may still be running`), and for one it could not
 verify, an operating-system command to check on it. It never prints a `retry:`
 line.
 

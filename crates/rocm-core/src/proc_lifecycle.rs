@@ -208,16 +208,28 @@ pub enum TerminationOutcome {
     Forced,
     /// At least one signalled process was still alive after the bounded deadline.
     TimedOut,
+    /// The recorded process itself is gone (this stop's own wait saw it exit, or
+    /// it was already gone), but the separate kill of the processes under it did
+    /// not complete (on Windows, a `taskkill` that failed, stalled, or found no
+    /// such process while the root was still running), so one of them may still
+    /// be running and holding the device. Deliberately not
+    /// [`TimedOut`](Self::TimedOut): the root did not outlive any deadline.
+    DescendantsUnconfirmed,
 }
 
 impl TerminationOutcome {
     /// Is the recorded service confirmed to be no longer running as a result?
     ///
-    /// `false` for [`TimedOut`](Self::TimedOut) (still alive) and
-    /// [`Unverified`](Self::Unverified) (could not be confirmed either way).
+    /// `false` for [`TimedOut`](Self::TimedOut) (still alive),
+    /// [`Unverified`](Self::Unverified) (could not be confirmed either way) and
+    /// [`DescendantsUnconfirmed`](Self::DescendantsUnconfirmed) (the root is gone
+    /// but a process under it may not be).
     #[must_use]
     pub const fn stopped(self) -> bool {
-        !matches!(self, Self::TimedOut | Self::Unverified)
+        !matches!(
+            self,
+            Self::TimedOut | Self::Unverified | Self::DescendantsUnconfirmed
+        )
     }
 
     /// Did the process stop without needing a forced kill (or was it already
@@ -240,6 +252,7 @@ impl TerminationOutcome {
             Self::Graceful => "graceful",
             Self::Forced => "forced",
             Self::TimedOut => "timed_out",
+            Self::DescendantsUnconfirmed => "descendants_unconfirmed",
         }
     }
 }
@@ -395,6 +408,7 @@ impl RecordedPidStop {
                 TerminationOutcome::Graceful
                     | TerminationOutcome::Forced
                     | TerminationOutcome::TimedOut
+                    | TerminationOutcome::DescendantsUnconfirmed
             )
         )
     }
@@ -408,7 +422,9 @@ impl RecordedPidStop {
         matches!(
             self.outcome,
             RecordedPidOutcome::Terminated(
-                TerminationOutcome::Forced | TerminationOutcome::TimedOut
+                TerminationOutcome::Forced
+                    | TerminationOutcome::TimedOut
+                    | TerminationOutcome::DescendantsUnconfirmed
             )
         )
     }
@@ -561,10 +577,18 @@ enum TreeKill {
 }
 
 /// The verdict for a stop whose descendant kill ended as `tree` and whose root
-/// termination answered `outcome`. A failed tree kill turns any verdict that
-/// would confirm the stop into [`TerminationOutcome::TimedOut`]: the root was
-/// signalled, and it, or a process under it, is not confirmed exited. The
-/// verdicts that already deny the stop stay as they are.
+/// termination answered `outcome`.
+///
+/// When the tree kill did not complete ([`TreeKill::Failed`], or
+/// [`TreeKill::NotFound`] while the root was still there), a root that this
+/// stop saw exit ([`Graceful`](TerminationOutcome::Graceful),
+/// [`Forced`](TerminationOutcome::Forced)) or that was already gone is reported
+/// [`TerminationOutcome::DescendantsUnconfirmed`]: the root is gone, which is
+/// what the wait observed, but nothing watched the processes under it, so the
+/// stop cannot be called confirmed. It is not `timed_out`, which would claim
+/// that something outlived a deadline. The verdicts that already deny the stop
+/// ([`TimedOut`](TerminationOutcome::TimedOut), the root itself outlived the
+/// deadline; [`Unverified`](TerminationOutcome::Unverified)) stay as they are.
 ///
 /// A kill that found no such process ([`TreeKill::NotFound`]) is judged by the
 /// root's own re-read, which `outcome` carries: when the root is gone
@@ -577,9 +601,12 @@ const fn after_tree_kill(tree: TreeKill, outcome: TerminationOutcome) -> Termina
     match (tree, outcome) {
         (TreeKill::Completed, outcome) => outcome,
         (TreeKill::NotFound, TerminationOutcome::AlreadyGone) => TerminationOutcome::AlreadyGone,
-        (TreeKill::NotFound | TreeKill::Failed, outcome) if outcome.stopped() => {
-            TerminationOutcome::TimedOut
-        }
+        (
+            TreeKill::NotFound | TreeKill::Failed,
+            TerminationOutcome::Graceful
+            | TerminationOutcome::Forced
+            | TerminationOutcome::AlreadyGone,
+        ) => TerminationOutcome::DescendantsUnconfirmed,
         (TreeKill::NotFound | TreeKill::Failed, outcome) => outcome,
     }
 }
@@ -750,7 +777,7 @@ fn wait_for_exit_code(
 fn taskkill_tree(pid: u32) -> TreeKill {
     use std::process::{Command, Stdio};
     classify_taskkill(run_to_exit_code(
-        Command::new("taskkill")
+        Command::new(crate::windows_system_tool("taskkill.exe"))
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -966,6 +993,18 @@ mod tests {
         assert!(TerminationOutcome::AlreadyGone.stopped());
         assert!(TerminationOutcome::IdentityMismatch.stopped());
         assert!(!TerminationOutcome::TimedOut.stopped());
+        // The root is gone but a process under it may not be: not a stop, not
+        // graceful, and not the label of a timeout.
+        assert!(!TerminationOutcome::DescendantsUnconfirmed.stopped());
+        assert!(!TerminationOutcome::DescendantsUnconfirmed.graceful());
+        assert_eq!(
+            TerminationOutcome::DescendantsUnconfirmed.as_str(),
+            "descendants_unconfirmed"
+        );
+        assert_ne!(
+            TerminationOutcome::DescendantsUnconfirmed.as_str(),
+            TerminationOutcome::TimedOut.as_str()
+        );
 
         // Unverified: neither stopped nor graceful — we could not act.
         assert!(!TerminationOutcome::Unverified.stopped());
@@ -1323,7 +1362,8 @@ mod tests {
     #[test]
     fn managed_stop_classifies_each_outcome_as_signaled_forced_and_stopped() {
         use TerminationOutcome::{
-            AlreadyGone, Forced, Graceful, IdentityMismatch, TimedOut, Unverified,
+            AlreadyGone, DescendantsUnconfirmed, Forced, Graceful, IdentityMismatch, TimedOut,
+            Unverified,
         };
         let record = record_naming(SUPERVISOR_PID, None, None, None);
 
@@ -1335,6 +1375,8 @@ mod tests {
             (Graceful, true, false, true),
             (Forced, true, true, true),
             (TimedOut, true, true, false),
+            // Signalled and forced by the tree kill, but not confirmed gone.
+            (DescendantsUnconfirmed, true, true, false),
         ];
         for (outcome, signaled, forced, stopped) in expected {
             let (_, stops) = stop_with(&record, outcome);
@@ -1655,14 +1697,17 @@ mod tests {
 
     #[test]
     fn a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed() {
-        use TerminationOutcome::{AlreadyGone, Forced, Graceful, TimedOut, Unverified};
+        use TerminationOutcome::{
+            AlreadyGone, DescendantsUnconfirmed, Forced, Graceful, TimedOut, Unverified,
+        };
         // Every root verdict that would confirm the stop becomes the one that
-        // says a process under the root may still be running; the verdicts that
-        // already deny the stop are kept.
+        // says the root is gone but a process under it may still be running, not
+        // `timed_out`, which would say something outlived a deadline; the
+        // verdicts that already deny the stop are kept.
         for (root, expected) in [
-            (Forced, TimedOut),
-            (Graceful, TimedOut),
-            (AlreadyGone, TimedOut),
+            (Forced, DescendantsUnconfirmed),
+            (Graceful, DescendantsUnconfirmed),
+            (AlreadyGone, DescendantsUnconfirmed),
             (TimedOut, TimedOut),
             (Unverified, Unverified),
         ] {
@@ -1712,10 +1757,14 @@ mod tests {
     /// exit.
     #[test]
     fn a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill() {
-        use TerminationOutcome::{Forced, Graceful, TimedOut, Unverified};
+        use TerminationOutcome::{DescendantsUnconfirmed, Forced, Graceful, TimedOut, Unverified};
+        // The termination saw the root exit (Graceful, Forced) although the kill
+        // said there was no such process: the exit was observed, so the report
+        // must not say it outlived a deadline, but nothing watched what is under
+        // it.
         for (root, expected) in [
-            (Forced, TimedOut),
-            (Graceful, TimedOut),
+            (Forced, DescendantsUnconfirmed),
+            (Graceful, DescendantsUnconfirmed),
             (TimedOut, TimedOut),
             (Unverified, Unverified),
         ] {
@@ -1739,7 +1788,8 @@ mod tests {
             TerminationOutcome::AlreadyGone,
         );
 
-        assert_eq!(verdict, TerminationOutcome::TimedOut);
+        assert_eq!(verdict, TerminationOutcome::DescendantsUnconfirmed);
+        assert!(!verdict.stopped());
     }
 
     /// A recorded token that can be read and differs proves another process

@@ -1851,8 +1851,14 @@ held open from before the identity read until the stop returns, so the creation
 time that was compared is that of the process the kill then reaches
 (`the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop`). And a
 `taskkill` that failed to start or exited nonzero leaves the stop unconfirmed,
-reported as `timed_out`, whatever the root's own termination says, because only
-the root's exit is watched on Windows
+whatever the root's own termination says, because only the root's exit is
+watched on Windows. When the root itself was seen to exit (or was already gone)
+the outcome is `descendants_unconfirmed`, which says the root is gone and a
+process under it may still be running; it is not `timed_out`, which is kept for
+a root that outlived its deadline. `rocm services stop` prints it as a `not
+confirmed:` line, and `a_stop_with_an_unconfirmed_tree_kill_says_what_happened_and_keeps_the_service`
+asserts that line, that no `still running` line is printed, and the record, stop
+request and key that are kept
 (`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
 `only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found`). A
 `taskkill` that exits 128 (process not found) is judged by the root's own re-read:
@@ -1870,7 +1876,11 @@ child under a 200 ms deadline on every host and asserts the error, the bounded
 elapsed time, the reaped child and the failed verdict; `a_helper_that_exits_in_time_gives_its_exit_code`
 and `a_helper_that_cannot_be_started_is_an_error` are its neighbours). The report and the record
 a `timed_out` stop leaves are covered by
-`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. A readable
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. The
+`taskkill` is started from `%SystemRoot%\System32`, not by a bare name `PATH`
+could resolve (`a_system_tool_is_resolved_under_system32_of_the_system_root`
+builds the path on every host; ComfyUI's own `taskkill` and `tasklist` calls use
+the same helper). A readable
 recorded token that differs outranks a failed query
 (`a_readable_token_mismatch_outranks_a_failed_query`), but the creation time and
 the query are read with the same access right, so on Windows this only reaches a
@@ -1891,7 +1901,7 @@ drives the refresh with an unqueryable PID and then a confirmed-gone one,
 an unverified stop and then the refresh over the record it wrote, and
 `a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
 removal guard; each takes the probe as an argument, so they run on every host.
-Two gaps in the scenario coverage are deliberate. `service-stop-07` records no
+Three gaps in the scenario coverage are deliberate. `service-stop-07` records no
 token, so the path a record written by this version takes on Windows (a token
 recorded, matching, with the tree kill then running) has no scenario; it rests on
 `what_a_stop_does_for_each_recorded_and_live_token` and the other injected tests,
@@ -1902,6 +1912,18 @@ tool, never in the text of `rocm services stop`, and it names the stopping
 process's own PID, which a scenario cannot plant in a record before the process
 that will read it exists. `a_stop_reports_its_own_pid_as_self` and
 `a_self_row_adds_no_line_to_an_unconfirmed_report` cover the answer and the report.
+Third, the `check:` line an unverified stop prints is a diagnostic, not a
+remediation: it shows whether the process is still running, and what clears the
+condition is that process ending (or, for a record held by a process `rocm`
+cannot open, the hand-clearing in `manual-testing.md`), after which a stop or a
+service listing confirms and drops the key. The command is a stock one the host
+has, pinned by `the_process_check_command_is_the_one_the_host_has`, and
+`service-stop-07` uses the same `tasklist /FI "PID eq <pid>"` filter (in CSV
+form, which does not depend on the display language) to see whether a process is
+running; no test follows the printed command on a Windows host and reads its
+default table output, because that output is localised. What follows once the
+process is gone is covered by
+`a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`.
 `service-stop-06` (Linux) is the same stop of a real recorded process through
 `rocm services stop`, checking the persisted state: the process exited and the
 record names none. Run the Windows scenario on a Windows host with

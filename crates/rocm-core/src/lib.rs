@@ -177,7 +177,7 @@ pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
     is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
     lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
-    terminate_process_tree,
+    terminate_process_tree, windows_system_tool,
 };
 #[cfg(windows)]
 pub use process::{
