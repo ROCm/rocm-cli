@@ -535,20 +535,32 @@ active default runtime, not about what a named prefix loses.
 
 #### Which Python `install sdk` uses
 
-ROCm CLI picks the Python from the ROCm version it installs, not from a
-default you can change. ROCm 7.14 installs use Python 3.12. ROCm 10 and newer
-use Python 3.14. The ROCm 10 SDK and torch wheels are also published for older
-Pythons, but vLLM, flash-attn and amd-aiter for ROCm 10 are published for
-Python 3.14 only, so ROCm CLI requires 3.14 for every ROCm 10 install. A
-Python that doesn't match is refused rather than used, so `ROCM_CLI_PYTHON`
-(an interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the
-version ROCm CLI prepares itself) can't make a ROCm 10 install run on Python
-3.12.
+ROCm CLI picks the Python from the ROCm version it installs. ROCm 7.14 installs
+use Python 3.12. ROCm 10 and newer use Python 3.14 by default, because vLLM,
+flash-attn and amd-aiter for ROCm 10 are published for 3.14 only. The ROCm 10
+SDK and PyTorch wheels are also published for 3.10 to 3.14, so an install that
+doesn't need vLLM can choose one:
 
-If you see Python 3.14, the install resolved to ROCm 10 or newer. That
-happens with `--version 10.x.y`, and also when the channel's newest build is
-ROCm 10, as the nightly channel's is today. The install prints which Python it
-chose, and `--dry-run` shows it without changing anything.
+```
+rocm install sdk --version 10.1.0 --family gfx1200 --python-version 3.12
+```
+
+With a Python other than 3.14, the SDK and PyTorch install and run, but vLLM
+doesn't: the engine install that normally follows an SDK install on a vLLM GPU
+is skipped with a note, and `rocm engines install vllm` refuses that runtime.
+Re-run the install without `--python-version` to move it to 3.14. An update
+keeps the Python the runtime was installed with.
+
+`--python-version` applies to ROCm 10 and newer wheel installs only. A ROCm 7
+install is built for Python 3.12 and refuses any other. A Python that doesn't
+match the install is refused rather than used, so `ROCM_CLI_PYTHON` (an
+interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the version
+ROCm CLI prepares itself) must name a Python the install accepts.
+
+If you see Python 3.14 without asking for it, the install resolved to ROCm 10
+or newer. That happens with `--version 10.x.y`, and also when the channel's
+newest build is ROCm 10, as the nightly channel's is today. The install prints
+which Python it chose, and `--dry-run` shows it without changing anything.
 
 #### ROCm 10 and newer
 

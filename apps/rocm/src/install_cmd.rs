@@ -73,6 +73,7 @@ pub(crate) const fn sdk_install_request<'a>(
     prefix: Option<PathBuf>,
     version_selector: Option<therock::RuntimeVersionSelector>,
     family_override: Option<&'a str>,
+    python_version: Option<&'a str>,
     dry_run: bool,
     devel: bool,
     consent: therock::SdkInstallConsent,
@@ -83,6 +84,7 @@ pub(crate) const fn sdk_install_request<'a>(
         prefix,
         version_selector,
         family_override,
+        python_version,
         dry_run,
         include_devel: devel,
         consent,
@@ -100,6 +102,7 @@ pub(crate) fn install(target: InstallTarget) -> Result<()> {
             version,
             build_date,
             family,
+            python_version,
             dry_run,
             yes,
             approve_replacing_active_default,
@@ -125,6 +128,7 @@ pub(crate) fn install(target: InstallTarget) -> Result<()> {
                     prefix,
                     version_selector,
                     family.as_deref(),
+                    python_version.as_deref(),
                     dry_run,
                     devel,
                     consents.replace_active_default,
@@ -175,6 +179,7 @@ pub(crate) fn install(target: InstallTarget) -> Result<()> {
                                 paths,
                                 finalized,
                                 consents.system_packages,
+                                python_version.as_deref(),
                             )
                         },
                     )?;
@@ -301,6 +306,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 devel,
                 therock::SdkInstallConsent::Ask,
@@ -315,6 +321,7 @@ mod tests {
         let dry_run_only = sdk_install_request(
             "release",
             "wheel",
+            None,
             None,
             None,
             None,
@@ -345,6 +352,7 @@ mod tests {
             let request = sdk_install_request(
                 "release",
                 "wheel",
+                None,
                 None,
                 None,
                 None,

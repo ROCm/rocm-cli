@@ -31,8 +31,9 @@
 use super::family::family_override_or_recovered_arch;
 use super::process::SuppressProgressOutput;
 use super::python::{
-    PythonLauncher, PythonSource, plan_python_launcher, python_launcher_install_ready,
-    python_requirement, resolve_python_launcher, wheel_compatibility_for_python,
+    PythonLauncher, PythonRequirement, PythonSource, plan_python_launcher,
+    python_launcher_install_ready, python_requirement, python_requirement_for_tag,
+    resolve_python_launcher, wheel_compatibility_for_python,
 };
 use super::resolve::{
     AggregateDeviceTarget, resolve_pip_runtime_with_timeout, resolve_tarball_artifact_with_timeout,
@@ -476,6 +477,33 @@ fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String
     family_override_or_recovered_arch(&manifest.family, recorded_arch)
 }
 
+/// The interpreter an update of `manifest` goes on with.
+///
+/// A ROCm 10+ runtime installed with `--python-version` keeps the Python it was
+/// built on, so an update does not silently move it to the layout's default
+/// (which would also leave it unable to carry the packages it was chosen for).
+/// Anything else follows the layout.
+fn recorded_python_requirement(
+    manifest: &InstalledRuntimeManifest,
+    layout: SourceLayout,
+) -> PythonRequirement {
+    manifest
+        .python_executable
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .and_then(|path| wheel_compatibility_for_python(&path).ok())
+        .and_then(|compatibility| python_requirement_for_tag(layout, &compatibility.python_tag))
+        .unwrap_or_else(|| python_requirement(layout))
+}
+
+/// The `--python-version` an update of `manifest` reinstalls with: the one the
+/// runtime was built on, for a ROCm 10+ runtime, and none for any other.
+pub(crate) fn recorded_python_version(manifest: &InstalledRuntimeManifest) -> Option<&'static str> {
+    let layout = manifest_source_layout(manifest).ok()?;
+    (layout == SourceLayout::Next).then(|| recorded_python_requirement(manifest, layout).version)
+}
+
 fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
@@ -490,7 +518,7 @@ fn resolve_latest_for_manifest(
             // interpreter, so the recorded one is re-checked rather than trusted
             // on `is_file()` alone; otherwise a canonical cp312 venv would carry
             // into a next-layout update and resolve nothing.
-            let requirement = python_requirement(layout);
+            let requirement = recorded_python_requirement(manifest, layout);
             let manifest_python = manifest
                 .python_executable
                 .as_deref()
