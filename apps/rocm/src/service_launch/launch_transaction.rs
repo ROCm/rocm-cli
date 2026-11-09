@@ -297,6 +297,8 @@ pub(crate) fn managed_service_reuse_refusal(
 mod tests {
     use super::*;
     use crate::service_hints;
+    #[cfg(not(windows))]
+    use crate::service_launch::test_support::sleeper_test_name;
     use crate::service_launch::test_support::{reusable_record, write_live_service_record};
     use crate::tests::test_paths;
     use rocm_core::DEFAULT_LOCAL_HOST;
@@ -896,15 +898,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
-    #[ignore = "spawned as a child process by abandoned_launch_terminates_the_spawned_child"]
-    fn managed_launch_cleanup_sleeper_child() {
-        if std::env::var_os("ROCM_TEST_SLEEPER_CHILD").is_some() {
-            thread::sleep(Duration::from_mins(2));
-        }
-    }
-
-    #[test]
     #[cfg(target_os = "linux")]
     fn abandoned_launch_never_signals_a_pid_that_no_longer_matches_the_spawn_token() -> Result<()> {
         // The child exited and its pid now belongs to an unrelated live
@@ -922,7 +915,7 @@ mod tests {
         let current_exe = std::env::current_exe().expect("current test exe");
         let mut bystander = ProcessCommand::new(current_exe)
             .arg("--exact")
-            .arg("service_launch::launch_transaction::tests::managed_launch_cleanup_sleeper_child")
+            .arg(sleeper_test_name())
             .arg("--ignored")
             .arg("--test-threads=1")
             .env("ROCM_TEST_SLEEPER_CHILD", "1")
@@ -966,7 +959,7 @@ mod tests {
         let current_exe = std::env::current_exe().expect("current test exe");
         let mut child = ProcessCommand::new(current_exe)
             .arg("--exact")
-            .arg("service_launch::launch_transaction::tests::managed_launch_cleanup_sleeper_child")
+            .arg(sleeper_test_name())
             .arg("--ignored")
             .arg("--test-threads=1")
             .env("ROCM_TEST_SLEEPER_CHILD", "1")

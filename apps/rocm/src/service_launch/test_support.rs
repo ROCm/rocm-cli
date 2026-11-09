@@ -6,6 +6,10 @@
 
 use anyhow::Result;
 use rocm_core::{AppPaths, ManagedServiceRecord};
+#[cfg(not(windows))]
+use std::thread;
+#[cfg(not(windows))]
+use std::time::Duration;
 
 /// A record with every reuse-relevant field set to the "reusable" value, so
 /// each test below breaks exactly one term and nothing else.
@@ -54,4 +58,46 @@ pub(super) fn write_live_service_record(
     record.engine_pid = Some(std::process::id());
     record.write()?;
     Ok(record)
+}
+
+/// The helper the cleanup tests re-run this test binary as, to get a live child
+/// process that outlives the spawn they are checking. It is `#[ignore]`d so a
+/// normal run skips it, and it only sleeps when the tests that spawn it set
+/// `ROCM_TEST_SLEEPER_CHILD`. They select it by [`sleeper_test_name`].
+#[test]
+#[cfg(not(windows))]
+#[ignore = "spawned as a child process by abandoned_launch_terminates_the_spawned_child"]
+fn managed_launch_cleanup_sleeper_child() {
+    if std::env::var_os("ROCM_TEST_SLEEPER_CHILD").is_some() {
+        thread::sleep(Duration::from_mins(2));
+    }
+}
+
+/// The name libtest lists [`managed_launch_cleanup_sleeper_child`] under, which
+/// is what `--exact` has to be given to run it alone.
+///
+/// It is read off the function item itself, so renaming the function or moving
+/// this module changes it with them and the three tests that spawn the helper
+/// cannot be left naming a test that no longer exists. libtest names a test by
+/// its path inside the crate, while the item path starts with the crate name,
+/// which is dropped. The assertions check that against the module path as well.
+#[cfg(not(windows))]
+pub(super) fn sleeper_test_name() -> String {
+    let item_path = std::any::type_name_of_val(&managed_launch_cleanup_sleeper_child);
+    let name = item_path
+        .split_once("::")
+        .map_or(item_path, |(_krate, rest)| rest);
+    let module = module_path!()
+        .split_once("::")
+        .map_or("", |(_krate, rest)| rest);
+    assert_eq!(
+        name,
+        format!("{module}::managed_launch_cleanup_sleeper_child"),
+        "the sleeper helper is no longer where its name is derived from"
+    );
+    assert!(
+        name.starts_with("service_launch::"),
+        "libtest names tests by their path inside the crate: {name}"
+    );
+    name.to_owned()
 }

@@ -573,6 +573,8 @@ mod tests {
     use super::*;
     use crate::managed_service_status::load_managed_services;
     use crate::service_launch::launch_transaction::live_managed_services;
+    #[cfg(not(windows))]
+    use crate::service_launch::test_support::sleeper_test_name;
     use crate::service_launch::test_support::write_live_service_record;
     use crate::tests::test_paths;
     use rocm_core::DEFAULT_LOCAL_HOST;
@@ -1264,7 +1266,7 @@ mod tests {
                 // carries real serve args this test binary cannot execute as
                 // itself (see `managed_launch_cleanup_sleeper_child`).
                 ProcessCommand::new(std::env::current_exe().expect("test binary"))
-                    .arg("service_launch::launch_transaction::tests::managed_launch_cleanup_sleeper_child")
+                    .arg(sleeper_test_name())
                     .arg("--exact")
                     .arg("--ignored")
                     .env("ROCM_TEST_SLEEPER_CHILD", "1")
