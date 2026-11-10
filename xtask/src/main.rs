@@ -166,7 +166,9 @@ pub(crate) enum Command {
     /// the hook itself is made blocking; the CI check already is.
     CheckModuleSizeAdvisory,
     /// Fail if a production source file (a `.rs` file under `apps/*/src`,
-    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`.
+    /// `crates/*/src` or `engines/*/src`), or a `.rs` file under `xtask/src`,
+    /// `tests/e2e-cucumber/src` or `tests/e2e-cucumber/tests`, has no entry in
+    /// `docs/architecture.md`.
     CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
