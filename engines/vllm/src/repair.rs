@@ -169,7 +169,7 @@ fn repair_from_violations(
         // rocm-cli never touched it. Reusing the first line for the second case would
         // tell a user who hand-installed torch that the CLI had installed it for them.
         let headline = if torch_alignment_disabled {
-            "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT; the torch this runtime holds is the user's and a reinstall would replace it"
+            "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT; the torch stack this runtime holds is the user's and a reinstall would replace it"
         } else {
             "the runtime holds the SDK's build of the torch vLLM pins; that divergence is intended and a reinstall would undo it"
         };
@@ -616,6 +616,33 @@ mod tests {
             "the spared torch is still named, so the reader is not left thinking the \
              reinstall was about torch: {:?}",
             assessment.notes
+        );
+    }
+    #[test]
+    fn an_opted_out_defect_with_an_unidentified_sdk_build_gets_no_sdk_hint() {
+        // The "SDK torch stack is being written over vLLM's pinned torch" hint is only
+        // a live theory when the torch stack is not spared. Under the opt-out it is, so
+        // a defect that survives is not that. `sdk_torch_build: None` is the one input
+        // where the hint's guard on the opt-out changes the outcome.
+        let violations = [violation(
+            "vllm",
+            "The package `vllm` requires `numpy==1.26.4`, but `2.1.0` is installed",
+        )];
+        let hint = "the SDK torch stack is being written over";
+
+        let opted_out = repair_from_violations(&violations, None, OPTED_OUT);
+        assert!(opted_out.needed, "{:?}", opted_out.notes);
+        assert!(
+            !opted_out.notes.iter().any(|note| note.contains(hint)),
+            "no SDK hint under the opt-out: {:?}",
+            opted_out.notes
+        );
+
+        let aligned = repair_from_violations(&violations, None, false);
+        assert!(
+            aligned.notes.iter().any(|note| note.contains(hint)),
+            "the hint still appears without the opt-out: {:?}",
+            aligned.notes
         );
     }
     #[test]

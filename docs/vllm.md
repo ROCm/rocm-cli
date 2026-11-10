@@ -59,11 +59,15 @@ would have installed and the one it kept. The device check still runs, so an
 opt-out that leaves the runtime unable to serve says so instead of failing later
 during serving.
 
-The opt-out covers the packages the SDK installs together with torch (torchvision,
-torchaudio and triton) as well. vLLM pins an exact build of each, so when the install
-keeps the torch they are reported as expected divergences rather than violations, and the engine's
-built-in repair does not reinstall vLLM over them: that reinstall would put the
-engine's own torch back.
+The opt-out covers the packages the SDK installs together with torch
+(torchvision, torchaudio and triton) as well. vLLM pins an exact build of each.
+The install check spares them when it settled on a torch divergence, and the
+engine's built-in repair spares them whenever the opt-out is set; in both cases
+they are reported as expected divergences rather than violations, and vLLM is
+not reinstalled over them, because that reinstall would put the engine's own
+torch back. The trade-off: under the opt-out a genuinely broken torchvision,
+torchaudio or triton (including one that is not installed at all) is neither
+reported as a violation nor repaired.
 
 Use it when you are deliberately running a torch that the alignment would
 replace, such as a locally built wheel, a version under test, or a stack pinned

@@ -907,7 +907,7 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
             // the two this is, the block above has already said.
             let _ = writeln!(
                 output,
-                "  action: none; this torch is kept on purpose (see torch_alignment above)"
+                "  action: none; this torch stack is kept on purpose (see torch_alignment above)"
             );
         }
     }
