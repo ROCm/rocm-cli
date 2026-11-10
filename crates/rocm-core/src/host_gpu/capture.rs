@@ -45,14 +45,47 @@ fn capture_optional_command_candidate_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<String> {
+    candidate_with_debug(program, args, timeout, &mut debug_command_capture)
+}
+
+/// [`capture_optional_command_candidate_with_timeout`] with the place its debug
+/// lines go as an argument, so a test can read them. The sink is handed every
+/// line; whether it is printed is its own decision.
+fn candidate_with_debug(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+    debug: &mut impl FnMut(String),
+) -> Option<String> {
     let mut command = Command::new(program);
     command.args(args);
-    match optional_stdout(run_bounded(command, timeout, "process")) {
+    let capture = run_bounded(command, timeout, "process");
+    if let Some(note) = incomplete_output_note(&capture) {
+        debug(format!(
+            "rocm debug: command capture output from {} may be incomplete: {note}",
+            program.display()
+        ));
+    }
+    match optional_stdout(capture) {
         Ok(stdout) => stdout,
         Err((stage, detail)) => {
-            debug_command_capture_failure(program, stage, &detail);
+            debug(format!(
+                "rocm debug: command capture {stage} failed for {}: {detail}",
+                program.display()
+            ));
             None
         }
+    }
+}
+
+/// Why the stdout of a run that exited 0 may be shorter than the program wrote:
+/// a descendant still writing when the executor stopped waiting for it, or a
+/// pipe that failed to read. [`optional_stdout`] gives the bytes that arrived
+/// either way, so this is the only place the shortfall shows.
+fn incomplete_output_note(capture: &CommandCapture) -> Option<&str> {
+    match capture.outcome {
+        CommandOutcome::Exited(0) => capture.detail.as_deref(),
+        _ => None,
     }
 }
 
@@ -85,14 +118,12 @@ fn optional_stdout(capture: CommandCapture) -> Result<Option<String>, (&'static 
     }
 }
 
-fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
+/// Print one debug line, when `ROCM_CLI_DEBUG_COMMAND_CAPTURE` asks for them.
+fn debug_command_capture(line: String) {
     if !crate::runtime::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
         return;
     }
-    eprintln!(
-        "rocm debug: command capture {stage} failed for {}: {detail}",
-        program.display()
-    );
+    eprintln!("{line}");
 }
 
 /// The subprocess-runners pair of `docs/host-probing.md`: the three runners the
@@ -112,11 +143,12 @@ fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
 /// slow and cannot hang the suite.
 #[cfg(all(test, unix))]
 mod subprocess_runners_pair {
-    use super::capture_optional_command_with_timeout;
+    use super::{candidate_with_debug, capture_optional_command_with_timeout};
     use crate::fake_executable::write_fake_executable;
     use crate::probe_exec::{run, run_utf16le};
     use crate::process::run_with_timeout;
     use std::os::unix::process::ExitStatusExt as _;
+    use std::path::Path;
     use std::process::{Command, Output};
     use std::time::{Duration, Instant};
 
@@ -328,6 +360,55 @@ mod subprocess_runners_pair {
         assert!(elapsed < WAITED, "the executor returned after {elapsed:?}");
     }
 
+    /// What the optional capture says on its debug channel for the same two
+    /// runs: a descendant that writes after the grace gives a short answer and a
+    /// line saying so, and a run that finished cleanly gives no line. The answer
+    /// and the line are read from one call, so the line cannot be claiming a
+    /// shortfall the answer does not have.
+    #[test]
+    fn a_short_answer_from_the_optional_capture_comes_with_a_debug_line_and_a_whole_one_does_not() {
+        let late = fixture("printf 'early\\n'; (sleep 0.5; printf 'late\\n') &");
+        let mut lines = Vec::new();
+        let answer = candidate_with_debug(Path::new(&late.program), &[], LONG, &mut |line| {
+            lines.push(line);
+        });
+        assert_eq!(answer, Some("early\n".to_owned()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("rocm debug: command capture output from ")
+                && lines[0].contains(&late.program)
+                && lines[0].contains("may be incomplete: output was still arriving"),
+            "{}",
+            lines[0]
+        );
+
+        let whole = fixture("printf 'early\\n'; (sleep 0.1; printf 'late\\n') &");
+        let mut lines = Vec::new();
+        let answer = candidate_with_debug(Path::new(&whole.program), &[], LONG, &mut |line| {
+            lines.push(line);
+        });
+        assert_eq!(answer, Some("early\nlate\n".to_owned()));
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// A run that failed is described by the failure line alone, not also as an
+    /// incomplete answer: the second line would add nothing to the first.
+    #[test]
+    fn a_failed_run_gets_its_failure_line_and_no_incomplete_line() {
+        let tool = fixture("printf 'partial\\n'; (sleep 0.5; printf 'late\\n') & exit 3");
+        let mut lines = Vec::new();
+        let answer = candidate_with_debug(Path::new(&tool.program), &[], LONG, &mut |line| {
+            lines.push(line);
+        });
+        assert_eq!(answer, None);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("rocm debug: command capture exit failed for "),
+            "{}",
+            lines[0]
+        );
+    }
+
     /// A descendant that holds only stderr. The optional capture used to send
     /// stderr to the null device, so such a descendant held nothing of its and
     /// the call returned at once; it now pipes stderr like the others and gives
@@ -403,7 +484,7 @@ mod subprocess_runners_pair {
 /// the real-process cases above cannot drive there.
 #[cfg(test)]
 mod optional_stdout_tests {
-    use super::{CommandCapture, CommandOutcome, optional_stdout};
+    use super::{CommandCapture, CommandOutcome, incomplete_output_note, optional_stdout};
 
     fn capture(outcome: CommandOutcome, stdout: &[u8], detail: Option<&str>) -> CommandCapture {
         CommandCapture::from_run(
@@ -465,6 +546,34 @@ mod optional_stdout_tests {
             assert_eq!(
                 result.map_err(|(stage, _)| stage),
                 Err(stage),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_run_that_exited_0_with_something_cutting_its_output_short_is_called_incomplete() {
+        let note = "output was still arriving when the drain grace ended";
+        assert_eq!(
+            incomplete_output_note(&capture(CommandOutcome::Exited(0), b"x", Some(note))),
+            Some(note)
+        );
+        assert_eq!(
+            incomplete_output_note(&capture(CommandOutcome::Exited(0), b"x", None)),
+            None,
+            "a whole capture has nothing to report"
+        );
+        // Every other ending already has a failure line of its own.
+        for outcome in [
+            CommandOutcome::Exited(3),
+            CommandOutcome::Signaled(Some(9)),
+            CommandOutcome::TimedOut,
+            CommandOutcome::WaitFailed,
+            CommandOutcome::NotFound,
+        ] {
+            assert_eq!(
+                incomplete_output_note(&capture(outcome, b"x", Some(note))),
+                None,
                 "{outcome:?}"
             );
         }
