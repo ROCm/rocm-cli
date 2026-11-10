@@ -56,7 +56,6 @@ use rocm_engine_protocol::{EngineMethod, StopRequest, StopResponse};
 
 use crate::endpoint_keys;
 use crate::engine_ipc::{builtin_engine_serve_http_args, engine_request};
-#[cfg(not(windows))]
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{

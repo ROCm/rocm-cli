@@ -10,7 +10,6 @@ use super::spawn::{
     attach_background_stdio, detach_background_command, managed_service_process_command,
 };
 use crate::background_helper::background_helper_already_running;
-#[cfg(not(windows))]
 use crate::engine_runtime_select::managed_service_launcher_path;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};

@@ -13,7 +13,6 @@ use super::launch_transaction::{
 };
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
-#[cfg(not(windows))]
 use crate::engine_runtime_select::managed_service_launcher_path;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
