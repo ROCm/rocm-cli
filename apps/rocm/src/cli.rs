@@ -779,7 +779,8 @@ pub(crate) enum InstallTarget {
 rocm install sdk\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
 rocm install sdk --family gfx110X-all --dry-run\n  \
-rocm install sdk --devel")]
+rocm install sdk --devel\n  \
+rocm install sdk --version 10.0.0 --python-version 3.12")]
     Sdk {
         /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]

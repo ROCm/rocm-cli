@@ -78,14 +78,15 @@ so there is no fixed filename to pin in the adapter.
 The wheel's own tag shows the other thing that changes on this route: ROCm
 10.x's vLLM, flash-attn, and amd-aiter are published for **`cp314` only**, unlike
 every earlier ROCm SDK version's `cp312` wheels. ROCm CLI provisions a matching
-interpreter for a 10.x install automatically. A Python already on `PATH`, or
-already installed as ROCm CLI's managed Python, is rejected if it is not
-`cp314`, with a message naming the required tag.
+interpreter for a 10.x install automatically. By default, a Python already on
+`PATH`, or already installed as ROCm CLI's managed Python, is rejected if it is
+not `cp314`, with a message naming the required tag; with `--python-version`
+(below) the tag it names is the one you chose.
 That 3.14 is the default for a ROCm 10.x SDK install, not a limit of the SDK: the
 SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
 --python-version` picks one of them for an install that does not need vLLM. The
-vLLM install then refuses that runtime; re-running `rocm install sdk` without
-the flag moves it back to 3.14.
+vLLM install then refuses that runtime; re-running the install with
+`--python-version 3.14` moves it back.
 
 This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
 through *different* rows: they pin different vLLM minors and read vLLM from

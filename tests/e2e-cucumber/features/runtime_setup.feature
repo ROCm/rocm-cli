@@ -654,9 +654,10 @@ Feature: Runtime configuration
 
   # The flag is a choice among the interpreters the layout is published for, so a
   # request for one it is not published for is refused instead of ignored: a
-  # canonical (ROCm 7) install, whose one interpreter is 3.12, and a ROCm 10 install
-  # asked for a Python the index has no wheels for. The refusal names the Python
-  # that is allowed, and nothing is prepared on the way to it.
+  # canonical (ROCm 7) install, whose one interpreter is 3.12. This scenario covers
+  # that refusal; the ROCm 10 refusal (a Python the index has no wheels for) is
+  # unit-tested only. The refusal names the Python that is allowed, and nothing is
+  # prepared on the way to it.
   #
   # Linux only, for the same empty-`PATH` host as runtime-23. Each combination of
   # layout and version is also unit-tested on every platform

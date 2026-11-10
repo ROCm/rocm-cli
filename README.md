@@ -450,6 +450,7 @@ hardware, not something an install or a setting can put right.
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
+                    [--python-version X.Y]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]

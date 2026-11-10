@@ -498,10 +498,12 @@ fn recorded_python_requirement(
 }
 
 /// The `--python-version` an update of `manifest` reinstalls with: the one the
-/// runtime was built on, for a ROCm 10+ runtime, and none for any other.
+/// runtime was built on, for a ROCm 10+ wheel runtime, and none for any other (a
+/// tarball runtime has no Python of its own to carry over).
 pub(crate) fn recorded_python_version(manifest: &InstalledRuntimeManifest) -> Option<&'static str> {
     let layout = manifest_source_layout(manifest).ok()?;
-    (layout == SourceLayout::Next).then(|| recorded_python_requirement(manifest, layout).version)
+    (layout == SourceLayout::Next && manifest.format == "wheel")
+        .then(|| recorded_python_requirement(manifest, layout).version)
 }
 
 fn resolve_latest_for_manifest(
@@ -797,6 +799,25 @@ mod tests {
         let manifest = test_runtime_manifest("v1:gfx120X-all", "canonical:gfx120X-all", 0);
 
         assert_eq!(manifest_wheel_family_override(&manifest), "gfx120X-all");
+    }
+
+    /// The engine auto-install skip reads this: a ROCm 7 (canonical) runtime has no
+    /// recorded Python choice even when it was installed with a redundant
+    /// `--python-version 3.12`, so vLLM is never skipped on it.
+    #[test]
+    fn recorded_python_version_is_only_reported_for_a_rocm_10_runtime() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-release:gfx94X-dcgpu", 0);
+        assert_eq!(recorded_python_version(&manifest), None);
+
+        manifest.source_layout_generation = Some("next-v1".to_owned());
+        manifest.format = "wheel".to_owned();
+        assert_eq!(
+            recorded_python_version(&manifest),
+            Some(super::super::NEXT_MANAGED_PYTHON_VERSION)
+        );
+
+        manifest.format = "tarball".to_owned();
+        assert_eq!(recorded_python_version(&manifest), None);
     }
 
     /// An installed runtime must keep resolving the stream it came from, and a

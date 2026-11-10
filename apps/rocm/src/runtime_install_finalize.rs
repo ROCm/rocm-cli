@@ -58,6 +58,11 @@ pub(crate) struct SdkInstallFinalization {
     family: String,
     pub(crate) previous_runtime_key: Option<String>,
     services: runtime_services::RuntimeServiceReconciliation,
+    /// The Python the installed runtime was built on, for a ROCm 10+ runtime and
+    /// `None` for any other (see [`therock::recorded_python_version`]). Read from
+    /// the installed manifest rather than the `--python-version` text, so a ROCm 7
+    /// install that was handed a redundant `3.12` is not mistaken for a moved one.
+    sdk_python_version: Option<&'static str>,
 }
 
 pub(crate) fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
@@ -117,13 +122,14 @@ impl SdkInstallConsents {
     }
 }
 
-/// Why `engine` cannot be installed onto an SDK runtime built on `sdk_python_version`
-/// (`rocm install sdk --python-version`), or `None` when it can.
+/// Why `engine` cannot be installed onto a ROCm 10+ SDK runtime built on
+/// `sdk_python_version` (`rocm install sdk --python-version`), or `None` when it can
+/// (including `None` for a runtime of any other layout).
 ///
 /// Only vLLM has a Python of its own: for ROCm 10 it is published for
 /// [`therock::NEXT_MANAGED_PYTHON_VERSION`] alone, so installing it onto a runtime
-/// the user moved off that Python would fail. The line names the command that
-/// clears the condition: the install without the flag moves the runtime back.
+/// the user moved off that Python would fail. The line names the flag that clears
+/// the condition: repeating the install with that Python moves the runtime back.
 fn engine_skipped_for_sdk_python(engine: &str, sdk_python_version: Option<&str>) -> Option<String> {
     let version = sdk_python_version?;
     if engine != "vllm" || version == therock::NEXT_MANAGED_PYTHON_VERSION {
@@ -131,7 +137,7 @@ fn engine_skipped_for_sdk_python(engine: &str, sdk_python_version: Option<&str>)
     }
     Some(format!(
         "note: vLLM for ROCm 10 needs Python {}, and this runtime uses Python {version}; \
-         re-run `rocm install sdk` without --python-version to move it to Python {} and install vLLM",
+         re-run this `rocm install sdk` with --python-version {} to move it there and install vLLM",
         therock::NEXT_MANAGED_PYTHON_VERSION,
         therock::NEXT_MANAGED_PYTHON_VERSION
     ))
@@ -141,7 +147,6 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
     paths: &AppPaths,
     finalized: &SdkInstallFinalization,
     approved: bool,
-    sdk_python_version: Option<&str>,
 ) -> Result<()> {
     let Some(engine) = preferred_engine_for_sdk_family(&finalized.family) else {
         return Ok(());
@@ -154,7 +159,7 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
     );
     println!("  engine: {engine}");
     println!("  runtime_id: {}", finalized.runtime_key);
-    if let Some(note) = engine_skipped_for_sdk_python(engine, sdk_python_version) {
+    if let Some(note) = engine_skipped_for_sdk_python(engine, finalized.sdk_python_version) {
         println!("  status: skipped");
         println!("  {note}");
         return Ok(());
@@ -990,6 +995,7 @@ pub(crate) fn finalize_successful_sdk_install(
 
     Ok(Some(SdkInstallFinalization {
         runtime_key: activation.runtime_key,
+        sdk_python_version: therock::recorded_python_version(&manifest),
         install_root: manifest.install_root,
         family: manifest.family,
         previous_runtime_key: activation.previous_runtime_key,
@@ -1343,6 +1349,7 @@ pub(crate) mod tests {
             family: "gfx94X-dcgpu".to_owned(),
             previous_runtime_key: None,
             services: runtime_services::RuntimeServiceReconciliation::default(),
+            sdk_python_version: None,
         }
     }
 
@@ -1370,8 +1377,7 @@ pub(crate) mod tests {
         let note = engine_skipped_for_sdk_python("vllm", Some("3.12"))
             .expect("vLLM cannot be installed onto a Python 3.12 ROCm 10 runtime");
         assert!(
-            note.contains("re-run `rocm install sdk` without --python-version")
-                && note.contains("Python 3.14"),
+            note.contains("--python-version 3.14") && note.contains("Python 3.14"),
             "{note}"
         );
         assert_eq!(engine_skipped_for_sdk_python("vllm", Some("3.14")), None);
@@ -1396,12 +1402,15 @@ pub(crate) mod tests {
     #[test]
     fn auto_install_skips_vllm_on_an_sdk_moved_off_its_python() {
         let (_root, paths) = test_paths("auto-engine-skipped-for-python");
-        let finalized = sdk_install_finalization();
+        let finalized = SdkInstallFinalization {
+            sdk_python_version: Some("3.12"),
+            ..sdk_install_finalization()
+        };
         assert_eq!(
             preferred_engine_for_sdk_family(&finalized.family),
             Some("vllm")
         );
-        maybe_auto_install_sdk_preferred_engine(&paths, &finalized, false, Some("3.12"))
+        maybe_auto_install_sdk_preferred_engine(&paths, &finalized, false)
             .expect("the engine install is skipped, not attempted");
     }
 

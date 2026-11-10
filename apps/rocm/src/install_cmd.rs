@@ -179,7 +179,6 @@ pub(crate) fn install(target: InstallTarget) -> Result<()> {
                                 paths,
                                 finalized,
                                 consents.system_packages,
-                                python_version.as_deref(),
                             )
                         },
                     )?;

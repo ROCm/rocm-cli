@@ -1187,9 +1187,6 @@ exit 1
         assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12");
     }
 
-    /// ROCm 10.x framework wheels (vLLM, flash-attn, amd-aiter) are published
-    /// cp314-only, so the next layout must provision 3.14 while everything else
-    /// stays on 3.12.
     /// `--python-version` is a choice among the interpreters the layout is
     /// published for. ROCm 10 takes 3.10 to 3.14 (each with its own wheel tag and
     /// the version `uv` is asked for); the canonical layout takes only its own 3.12;
@@ -1259,6 +1256,9 @@ exit 1
         );
     }
 
+    /// ROCm 10.x framework wheels (vLLM, flash-attn, amd-aiter) are published
+    /// cp314-only, so the next layout must provision 3.14 while everything else
+    /// stays on 3.12.
     #[test]
     fn python_requirement_follows_the_source_layout() {
         let canonical = python_requirement(SourceLayout::Canonical);

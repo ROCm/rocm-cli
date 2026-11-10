@@ -213,10 +213,10 @@ pub(crate) fn install_sdk(
         consent,
     } = request;
     let channel = TheRockChannel::parse(channel)?;
-    ensure_install_format_supported(format)?;
     if python_version.is_some() && format != "wheel" {
         bail!("--python-version applies only to wheel installs; a tarball install uses no Python");
     }
+    ensure_install_format_supported(format)?;
     match format {
         "wheel" => install_wheel_runtime(
             paths,
@@ -308,16 +308,21 @@ pub(crate) fn install_sdk_for_update(
             include_devel,
             consent,
         ),
-        "tarball" => install_tarball_runtime(
-            paths,
-            channel,
-            None,
-            Some(family),
-            None,
-            layout,
-            dry_run,
-            consent,
-        ),
+        "tarball" => {
+            if python_version.is_some() {
+                bail!("a tarball install uses no Python, so it has no --python-version");
+            }
+            install_tarball_runtime(
+                paths,
+                channel,
+                None,
+                Some(family),
+                None,
+                layout,
+                dry_run,
+                consent,
+            )
+        }
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -1101,6 +1106,35 @@ mod tests {
     use super::test_support::workspace_test_artifact_dir;
     use super::test_support::{test_paths, test_runtime_manifest};
     use super::*;
+
+    /// `--format tarball` installs no Python, so a Python choice cannot be honoured
+    /// and is refused before anything is resolved or downloaded. The refusal comes
+    /// ahead of the platform's tarball check so it reads the same on every host.
+    #[test]
+    fn python_version_is_refused_for_a_tarball_install() {
+        let (_root, paths) = test_paths("tarball-python-version-refused");
+        let error = install_sdk(
+            &paths,
+            SdkInstallRequest {
+                channel: "release",
+                format: "tarball",
+                prefix: None,
+                version_selector: None,
+                family_override: None,
+                python_version: Some("3.12"),
+                dry_run: true,
+                include_devel: false,
+                consent: SdkInstallConsent::Ask,
+            },
+        )
+        .expect_err("a tarball install has no Python to choose");
+        assert!(
+            error
+                .to_string()
+                .contains("--python-version applies only to wheel installs"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn download_space_requirement_includes_the_safety_margin() {
