@@ -840,7 +840,7 @@ mod tests {
             "the `windows-debug` job no longer tests the whole workspace; update the banner text"
         );
         assert!(
-            workflow.contains("\"${{ github.event_name }}\" = \"pull_request\"")
+            workflow.contains("\"${GITHUB_EVENT_NAME}\" = \"pull_request\"")
                 && workflow.contains("sel=\"--workspace\""),
             "the `test` job no longer forces `--workspace` outside pull requests; update the banner text"
         );
