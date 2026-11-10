@@ -147,6 +147,17 @@ const fn hardware_root() -> Option<PathBuf> {
     None
 }
 
+/// Whether the probes are reading a simulated host: an `e2e-test-hooks` build
+/// with [`TEST_HOST_ROOT_ENV`] set. Always `false` in a normal build.
+///
+/// For a probe that runs a program rather than reading a file: it must not
+/// reach past `PATH` to the real host's copy, which would answer for the
+/// machine the suite is running on instead of the simulated one.
+#[must_use]
+pub fn host_is_simulated() -> bool {
+    hardware_root().is_some()
+}
+
 /// [`host_path`] with the root supplied by the caller, so the re-rooting can be
 /// tested without touching the process environment.
 ///
