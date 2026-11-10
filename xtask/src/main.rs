@@ -162,7 +162,7 @@ pub(crate) enum Command {
     /// run (`cargo metadata` fails, a file does not parse). That holds once xtask
     /// has built: if xtask or `rocm-core` fails to compile, `cargo xtask` exits
     /// non-zero before this code runs. The local pre-commit hook runs this until
-    /// the limit is enforced.
+    /// the hook itself is made blocking; the CI check already is.
     CheckModuleSizeAdvisory,
     /// Fail if a production source file (a `.rs` file under `apps/*/src`,
     /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`.
