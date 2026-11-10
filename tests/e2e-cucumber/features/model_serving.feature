@@ -826,7 +826,8 @@ Feature: Model serving
   # beside the OpenAI one — the engine's own when it serves one, else a
   # translation front on its own port — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Streaming is not translated yet, so it has no scenario.
+  # Tool use is translated for non-streaming requests (serve-53); a streaming
+  # request that offers tools is refused, which only the unit tests cover.
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -859,6 +860,14 @@ Feature: Model serving
     When the user sends a tool-use request to the Anthropic messages endpoint
     Then the response contains a tool_use content block
     And the tool_use block names a tool and arguments from the request
+
+  @id:serve-anthropic-messages-streaming @requires-gpu
+  Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a streaming request to the Anthropic messages endpoint
+    Then the response is delivered as Anthropic-style server-sent events
+    And the streamed content reassembles into a complete reply
   # ROCMAI-550, and the evidence that the Vulkan remediation is not a dead end.
   # `rocm install sdk` on a gfx90c APU refuses and tells the user to run `rocm
   # serve <model> --engine lemonade`; AGENTS.md section 3 only allows that if
@@ -878,7 +887,7 @@ Feature: Model serving
   # ROCM_CLI_TEST_HOST_ROOT (an `e2e-test-hooks` build), so the GPU-less mock
   # lane is where this runs.
   @id:serve-accepts-an-apu-the-kernel-gives-no-compute-node @requires-os:linux
-  Scenario: serve-54 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
+  Scenario: serve-55 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
     Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
     When the user is told to serve on Lemonade because this GPU has no ROCm build
     Then serving got past the no-GPU pre-flight and reported this host's usable GPU

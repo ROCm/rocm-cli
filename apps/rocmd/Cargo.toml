@@ -15,6 +15,7 @@ e2e-test-hooks = ["rocm-core/e2e-test-hooks"]
 
 [dependencies]
 anyhow.workspace = true
+async-stream.workspace = true
 axum.workspace = true
 clap.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
