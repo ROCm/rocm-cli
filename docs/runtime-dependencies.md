@@ -45,7 +45,7 @@ with `--cd runtimes`.
 | Command | Does |
 |---|---|
 | `runtimes/bin/mise run --cd runtimes lock` | Re-lock binaries at the current pins and every Python profile at the cutoff its lock records (network; see below) |
-| `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown (AMD-only Python packages are not held back; see *Cooldown*), then re-lock |
+| `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown (AMD-only Python packages are not held back; see *Cooldown*), then re-lock and move the mise launchers in `runtimes/bin/`. Linux only (the weekly workflow runs it): on Windows the task would rewrite `mise.cmd` while cmd is reading it |
 | `cargo xtask deps check` | Verify every lock, offline (also run by `cargo test -p xtask`) |
 | `cargo xtask deps verify-downloads` | Download every binary locked without a build attestation (Lemonade) and check its SHA-256 against `mise.lock` (network) |
 | `cargo xtask deps launchers --mise <bin> --cooldown-days <n>` | Regenerate the mise launchers in `runtimes/bin/` for the newest mise at least `<n>` days old, if newer (network; the `update` task's last step) |

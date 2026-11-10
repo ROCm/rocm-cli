@@ -162,9 +162,19 @@ pub(crate) fn upgrade(
 ) -> Result<Option<String>> {
     let current = pinned(root)?;
     let latest = mise.latest(None, cooldown_days)?;
+    // `mise latest` prints nothing, and exits 0, both when no release
+    // qualifies and when it cannot look releases up. mise has years of
+    // releases, so treat it as a failed lookup rather than as "nothing new".
+    ensure!(
+        !latest.is_empty(),
+        "mise reported no release at least {cooldown_days} days old; it may have failed to look releases up"
+    );
     let latest = checked_version(&latest)?.to_owned();
+    // Never back: a mise pinned by hand inside the cooldown stays.
     if !newer(&latest, &current) {
-        eprintln!("mise {current} is the newest release past the cooldown");
+        eprintln!(
+            "mise {current} is not older than {latest}, the newest release past the cooldown; it stays"
+        );
         return Ok(None);
     }
     let dir = work.join("launchers");
@@ -340,6 +350,61 @@ mod tests {
             std::fs::read_to_string(root.path().join(WINDOWS)).unwrap(),
             windows
         );
+    }
+
+    /// A mise pinned by hand inside the cooldown is newer than the newest
+    /// release past it; the update must not move it back.
+    #[test]
+    fn upgrade_never_moves_back() {
+        let root = workspace("2026.11.5", "committed");
+        let mise = fake(vec![("2026.10.25", 16), ("2026.11.5", 5)]);
+        assert_eq!(
+            upgrade(root.path(), &root.path().join("work"), &mise, 7).unwrap(),
+            None
+        );
+        assert_eq!(pinned(root.path()).unwrap(), "2026.11.5");
+        assert!(mise.generated.borrow().is_empty());
+    }
+
+    /// An empty answer from `mise latest` (what it prints when it cannot look
+    /// releases up) is an error, not "nothing new".
+    #[test]
+    fn upgrade_fails_when_mise_reports_no_release() {
+        let root = workspace("2026.10.25", "committed");
+        let err = upgrade(root.path(), &root.path().join("work"), &fake(vec![]), 7).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("may have failed to look releases up"),
+            "{err:#}"
+        );
+        assert_eq!(pinned(root.path()).unwrap(), "2026.10.25");
+    }
+
+    /// Launchers generated for another version than the one asked for are
+    /// refused, and the committed ones are left as they were.
+    #[test]
+    fn upgrade_refuses_launchers_for_another_version() {
+        struct Wrong(FakeMise);
+        impl Mise for Wrong {
+            fn latest(&self, version: Option<&str>, cooldown_days: u32) -> Result<String> {
+                self.0.latest(version, cooldown_days)
+            }
+            fn generate(&self, _version: &str, dir: &Path) -> Result<()> {
+                self.0.generate("2026.11.2", dir)
+            }
+        }
+        let root = workspace("2026.10.25", "committed");
+        let err = upgrade(
+            root.path(),
+            &root.path().join("work"),
+            &Wrong(fake(vec![("2026.11.1", 9)])),
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "mise generated launchers for a version other than 2026.11.1"
+        );
+        assert_eq!(pinned(root.path()).unwrap(), "2026.10.25");
     }
 
     #[test]
