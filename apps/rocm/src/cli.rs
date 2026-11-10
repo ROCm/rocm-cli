@@ -233,6 +233,9 @@ pub(crate) enum Command {
     },
     /// Print the rocm-cli version, release tag or branch, and commit hash,
     /// plus the ROCm SDK and GPU driver this machine would use.
+    ///
+    /// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A build
+    /// from `main` is shown as `0.0.0-dev (main, <hash>)`.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -423,7 +426,7 @@ rocm model --verbose"
     },
     /// Start a local OpenAI-compatible model server.
     ///
-    /// Picks an engine and ROCm runtime automatically unless overridden. A non-streaming
+    /// Picks an engine and ROCm runtime automatically unless overridden. An
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
     /// server runs as a managed background service and prints a deployment summary
@@ -687,10 +690,12 @@ rocm logs --search error timeout")]
     /// Remove ROCm CLI-managed files from this computer.
     ///
     /// Removes the config, data, and cache directories and the installed
-    /// binaries, including the running rocm.exe on Windows. It also undoes the
-    /// PATH change the installer made (its marked shell-profile block, or the
-    /// user PATH entry it recorded adding on Windows), unless other programs
-    /// share the install folder.
+    /// binaries, including the running rocm.exe on Windows, and the fish
+    /// completion script the Linux installer wrote for them (a rocm.fish it
+    /// did not write is left in place, and one it cannot remove is only a
+    /// warning). It also undoes the PATH change the installer made (its marked
+    /// shell-profile block, or the user PATH entry it recorded adding on
+    /// Windows), unless other programs share the install folder.
     #[command(after_help = "EXAMPLES:\n  \
 rocm uninstall --dry-run\n  \
 rocm uninstall\n  \
@@ -705,7 +710,8 @@ rocm uninstall --keep-data --yes")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries, and the installer's PATH change.
+        /// Keep installed rocm-cli binaries, the installer's PATH change, and the
+        /// fish completions it wrote.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -779,7 +785,8 @@ pub(crate) enum InstallTarget {
 rocm install sdk\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
 rocm install sdk --family gfx110X-all --dry-run\n  \
-rocm install sdk --devel")]
+rocm install sdk --devel\n  \
+rocm install sdk --version 10.0.0 --python-version 3.12")]
     Sdk {
         /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]
@@ -805,6 +812,17 @@ rocm install sdk --devel")]
         /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
+        /// Python version for a ROCm 10 or newer install, one of 3.10 to 3.14.
+        ///
+        /// ROCm 10 installs use Python 3.14 unless you name another, because
+        /// vLLM, flash-attn and amd-aiter for ROCm 10 are published for 3.14
+        /// only. With another version the SDK and PyTorch install and run, but
+        /// the vLLM engine does not: the engine install that follows an SDK
+        /// install on a vLLM GPU is skipped, and `rocm engines install vllm`
+        /// refuses that runtime. Re-run without this flag to switch it to 3.14.
+        /// Wheel installs only; a ROCm 7 install is built for Python 3.12.
+        #[arg(long, value_name = "X.Y")]
+        python_version: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
         /// building GPU code. Roughly doubles the wheel download; already
         /// included by `--format tarball`.
@@ -1483,6 +1501,39 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `cli_version_string` is `ROCM_CLI_VERSION`, the one string
+    /// `format_cli_version` in `build.rs` embeds, clap's `-V`/`--version` is
+    /// that same string, and `cli_version_number` leads it. This does not run
+    /// the binary: `@id:examine-version` compares the printed `rocm version`
+    /// and `-V`/`--version` lines. Tag, `main`, and unknown shapes are the
+    /// `format_cli_version_*` tests in `build.rs`; this checks only the shape
+    /// of the ref this checkout resolved, which is never a release tag in CI.
+    #[test]
+    fn version_surfaces_share_one_build_script_string() {
+        let full = crate::cli_version_string();
+        let number = crate::cli_version_number();
+        let reference = env!("ROCM_CLI_VERSION_REF");
+        let hash = env!("ROCM_CLI_GIT_HASH");
+        assert_eq!(full, env!("ROCM_CLI_VERSION"));
+        assert_eq!(
+            cli_command().get_version(),
+            Some(full.as_str()),
+            "-V/--version must print the same string as `rocm version`"
+        );
+        assert_eq!(full, format!("{number} ({reference}, {hash})"));
+        // A resolved ref whose text is not `v` plus the leading version is not
+        // a release tag. `main`, a feature branch, and a name such as `vllm`
+        // all land here, and none of them may report the workspace package
+        // version.
+        if reference != "unknown" && reference.strip_prefix('v') != Some(number.as_str()) {
+            assert_eq!(number, "0.0.0-dev", "{full}");
+            assert_ne!(number, env!("CARGO_PKG_VERSION"));
+        }
+        if reference == "unknown" {
+            assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,

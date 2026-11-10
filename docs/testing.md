@@ -38,13 +38,14 @@ cargo xtask check-module-size
 ```
 
 It exits non-zero and names each offending file with its count. There is one limit for
-every file: no flag, baseline or exemption. For now the check is advisory in the `clippy`
-CI job and in the `cargo-module-size` pre-commit hook, which run
-`cargo xtask check-module-size` and `cargo xtask check-module-size-advisory` and report
-offenders without failing (in CI the step shows red in the job's step list while the job
-stays green); the second is the same check that exits successfully even
-when the check itself cannot run. That holds once xtask has built: a commit that leaves
-xtask or `rocm-core` not compiling still fails the hook.
+every file: no flag, baseline or exemption. The `clippy` CI job runs
+`cargo xtask check-module-size` and fails when any file is over the limit; `clippy` is a
+required check and also runs on merge-queue runs. The failure text names each file and
+points at the split rule in [architecture.md](architecture.md). The `cargo-module-size`
+pre-commit hook still only reports: it runs `cargo xtask check-module-size-advisory`, the
+same check, but it exits successfully even when the check itself cannot run. That holds
+once xtask has built: a commit that leaves xtask or `rocm-core` not compiling still fails
+the hook.
 The counting rules are unit-tested in `xtask/src/module_size.rs`:
 
 ```bash
@@ -449,6 +450,25 @@ append a deliberately unparsable line to it, run the test with `--nocapture`
 `unparsable line, ignoring` warning naming that path, and remove the line.
 The check does not tell a seed that still reproduces from one that no longer
 does; it only confirms that something reads the file.
+
+### Property tests for persisted settings
+
+`config.json`, its migration from a legacy rocm-dash `config.toml`, and how
+the data directory is found from it have `proptest` properties, beside the
+code they drive. They run in the ordinary `cargo test`; to run only them:
+
+```bash
+cargo test -p rocm-core --lib config::props -- --nocapture
+cargo test -p rocm-core --lib persisted_paths_props -- --nocapture
+cargo test -p rocm --bin rocm therock::python::config_props -- --nocapture
+```
+
+Each property counts how many generated cases reached the input it is about
+(an unreadable `config.json`, a non-finite tick, non-ASCII text, and so on),
+prints that as a `reach:` line (`--nocapture` shows it), and fails when the
+count is zero, so a generator that stops producing that input fails the run
+instead of passing without testing anything. A property that fails prints its
+shrunk counterexample.
 
 ### Known-gap reproducers
 
@@ -895,6 +915,18 @@ order and the interpreter probes, whose stand-ins are shell scripts as in the
 other resolver tests, and no end-to-end run covers the Windows preview, so the
 Windows search order (`python`, `python3`, `py` with `PATHEXT`) is not covered
 by any test.
+`rocm install sdk --python-version` is covered by scenarios `runtime-29` (a ROCm
+10 preview plans the requested Python and its wheel tag, and not 3.14) and
+`runtime-30` (a version the canonical layout is not published for is refused,
+preparing nothing; the ROCm 10 refusal is unit-tested only). The rest is unit-tested in [python.rs](../apps/rocm/src/therock/python.rs):
+`python_version_is_a_choice_among_the_layouts_published_pythons` is the matrix of
+layout against requested version, and
+`a_recorded_wheel_tag_maps_back_to_the_requirement_it_came_from` is what lets an
+update keep a runtime's Python. That a ROCm 10 runtime on another Python skips the vLLM
+auto-install is `auto_install_skips_vllm_on_an_sdk_moved_off_its_python` in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs), and that a ROCm 7 runtime never does (whatever `--python-version` it was given) is `recorded_python_version_is_only_reported_for_a_rocm_10_runtime` in [update.rs](../apps/rocm/src/therock/update.rs); a tarball install refusing the flag is `python_version_is_refused_for_a_tarball_install` in [therock.rs](../apps/rocm/src/therock.rs). A real
+install and an update on a non-default Python are not covered by a scenario: they
+need a ROCm 10 SDK download.
 `a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
 [python.rs](../apps/rocm/src/therock/python.rs) is the state matrix: every
 combination of `PATH` Python (usable, unusable, absent), saved Python (usable,
@@ -2450,15 +2482,19 @@ cargo test -p rocm --bin rocm anthropic_endpoint
 
 The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
 (a real Messages request is answered by the served model) and `serve-52`
-(`services list` reports both endpoints healthy), and `serve-53` (a request that offers a
-tool and requires it gets a `tool_use` block back) in
+(`services list` reports both endpoints healthy), `serve-53` (a request that offers a
+tool and requires it gets a `tool_use` block back) and `serve-54`
+(`@id:serve-anthropic-messages-streaming`, which sends `stream: true` and
+checks the reply is an event stream that reassembles into text, with usage in
+`message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. Streaming is not translated yet, so no scenario covers it; a request
-for it is refused, and the unit tests above pin that. The tool-use translation
-(`tools`, `tool_choice`, `tool_use` and `tool_result` blocks, the `tool_use` stop
-reason) is unit-tested against a fake engine in the same module; `serve-53` is the
-real-engine check.
+serves with. The proxy's unit tests cover the stream event sequence, a stream
+that ends early, an engine refusal before the first byte, and the refusal of a
+streaming request that offers `tools` (no scenario covers that refusal). The
+tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
+blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
+same module; `serve-53` is the real-engine check.
 
 Natural-language plan handoff tests:
 
@@ -2736,6 +2772,62 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
+
+Fish profile setup in `install.sh` is covered on its own by
+[`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script signs a
+local bundle, points the installer at a temporary home, and checks:
+
+- a bash, zsh, or ksh login shell still updates its own profile and, with
+  `fish` on `PATH`, also writes the fish `PATH` block and records both
+  profiles;
+- the fish completion script, starting with the marker line that names the
+  install folder, and its `completions` record line, for a bash login shell
+  with `fish` on `PATH`, a bash login shell with only `~/.config/fish`, and a
+  fish login shell;
+- an absolute `$XDG_CONFIG_HOME` moves fish's config and completions there,
+  and a relative one leaves them in `~/.config/fish` (it names a different
+  folder from each directory; both with a bash login shell only);
+- a reinstall adds no second block or record line and reports fish's config
+  as already configured;
+- a fish config, or a bash profile, that already names the install folder with
+  the user's own line is left alone and not recorded;
+- a `rocm.fish` that is already there and was not written by the installer (a
+  file, a link, a link whose target carries the marker, a dangling link) is
+  left exactly as it is, not recorded, with a note, while one an earlier
+  install wrote is replaced and recorded;
+- a bash home with no fish install grows no fish config, and
+  `ROCM_CLI_UPDATE_SHELL_PATH=0` writes no profile and no completions;
+- a `rocm` that cannot print completions, or prints nothing, leaves the install
+  and the `PATH` block in place with a note. The stub fails only once, as a
+  failure that clears by itself would, and the printed lines, run as printed
+  from a bare environment in a home whose name holds a space, then create the
+  file; `rocm` is never handed the installer's stdin;
+- a profile that cannot be created is reported rather than claimed as updated,
+  and not recorded; as a non-root user only, so is one that cannot be written,
+  under both `sh` and `bash`.
+
+It needs no network or GPU. Set `INSTALL_SH` to run it against another copy of
+the installer. The Linux `build-and-test` job runs it when the change touches
+the heavy path (`needs.changes.outputs.heavy == 'true'`):
+
+```bash
+sh tests/install-sh/run.sh
+```
+
+The same path with the packaged binary, including `rocm uninstall` putting the
+bash and fish configs back and removing the fish completions, is
+`@id:lifecycle-linux-fish-configured-from-bash` (lifecycle-32) in the lifecycle
+set above. `@id:lifecycle-linux-fish-completions-not-ours-kept` (lifecycle-33)
+checks that uninstall leaves a `rocm.fish` the user wrote over the installer's
+and says so, `@id:lifecycle-linux-fish-completions-removal-failure-warns`
+(lifecycle-34) that a `rocm.fish` it cannot remove is a warning while the rest
+of the uninstall still happens, and
+`@id:lifecycle-linux-fish-existing-completions-left-alone` (lifecycle-35) that
+the installer leaves a `rocm.fish` it did not write, says so, and uninstall
+leaves it too. lifecycle-34 makes the `completions` folder read-only, so it
+needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path`
+(lifecycle-25) also seeds fish and checks the completions stay with
+`--keep-binaries`.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
@@ -3931,6 +4023,24 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
 `fix_offered`. This path has not been exercised against real hardware in CI;
 verifying it needs a lane whose GPU architecture is on the allowlist.
+`cli_version` is the leading version `rocm version` prints (`X.Y.Z` for a
+`vX.Y.Z` tag build, `0.0.0-dev` for any other resolved ref), never the ref and hash
+after it. A tag counts as a release only when its suffix uses letters,
+digits, `.`, `-` and `+` and its version is at most 64 characters, the same
+rule the report applies before publishing, so a release version is never
+published as `unknown`; `release_tag_grammar_is_the_same_everywhere` in
+[build.rs](../apps/rocm/build.rs) holds that rule equal in build.rs,
+[release.yml](../.github/workflows/release.yml) and
+[smoke_local.py](../scripts/smoke_local.py). Scenario
+`diagnose-58` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
+the field equals that leading version and that the version is the one the ref
+calls for, on a simulated host whose planted GPU is on the allowlist, so it
+prepares a report on every Linux lane, GPU or not. Those lanes build from a
+branch, so they check the `0.0.0-dev` half; the tag half is checked on the
+shipped binaries by the "Check the release binary's version" steps in
+[release.yml](../.github/workflows/release.yml). On real hardware, compare the
+field with the first word after `rocm-cli` in `rocm version`.
 
 Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
 answer with a word rather than a value, and the words are not interchangeable.
@@ -4128,8 +4238,9 @@ that grades how the agent reads a diagnosis, or what it does on an older CLI, ne
 has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/), the
 hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
 removes it afterwards. The stub replays recorded output for `rocm --version`,
-`rocm fix --json` and `rocm diagnose`, and refuses every other command with exit
-code 2. It only prints text read from the recording, so whatever an agent asks it,
+`rocm fix --json` and `rocm diagnose`, plus `rocm examine --json` for a case that
+names a `host` (below), and refuses every other command with exit code 2. It only
+prints text read from the recording, so whatever an agent asks it,
 it cannot change a machine or send anything; that comes from answering a fixed set
 of commands, not from the refusals. It also refuses `diagnose` options the
 recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
@@ -4163,10 +4274,23 @@ changed is output the skill is now graded against. What an older CLI printed can
 generated. It was recorded once from a real older build and lives in
 [`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
 
+A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
+`examine-fails`. The stub then answers `rocm examine --json`, and a case without a
+`host` still refuses it. The reply is the recorded examination with only the fields
+the host implies changed (`is_wsl`, `has_amd_gpu` and, for `amd-found`, one GPU), and
+its `status` is recomputed by `Examination::compute_status`, the rule the probe uses,
+so a recording cannot say a status the other fields contradict. The real command prints
+those fields plus a `summary` object that only the `rocm` binary can build, so the
+replay leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in
+it. Some fields are typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+`wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
+with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
+exits 1 with a fixed message on stderr, which is what the case pins.
+
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
-case id, `current` or `older`, and the error text the agent would pass as the
-symptom), run the command above, and add the case to
+case id, `current` or `older`, the error text the agent would pass as the symptom,
+and optionally a `host`), run the command above, and add the case to
 [`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
 check also fails when a case id is not an id in `evals.json`, or when the part of the
 symptom before its first `:` does not appear in that case's prompt, because the hook
@@ -4190,7 +4314,14 @@ On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionle
 include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
 directory and Python path without spaces; a path with spaces or parentheses is not
 exercised, and neither is the agent's own shell on the amd/skills Windows leg.
-Both replay cases also say "on Linux" in the prompt: run on a Windows host, the
-agent answered that its own machine is Windows and declined to run the CLI there, so
-neither case passed (0 of 2 in a local run), while on a Linux host (WSL2) both
-passed. Treat them as Linux-host cases when reading a run.
+The two cases about the older and the current CLI name no operating system in their
+prompts. They used to say "on Linux", and on a Windows host the agent answered that its
+own machine is Windows and declined to run the CLI at all, so the recorded replies never
+printed. The vLLM cases still say Linux on purpose: their catalog entries apply on Linux
+and WSL2 only, so they are not expected to pass on a Windows host.
+
+A real `rocm` on the machine can answer before the stub. The agent's shell does not
+always keep the stub first on `PATH`, so a machine that has a `rocm` installed (a
+developer's, not a grading runner) may show the real CLI's output and miss the pins. A
+miss on the `logs_contain` pin with the agent otherwise behaving as expected is that,
+not a regression.
