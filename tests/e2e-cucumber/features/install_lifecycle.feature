@@ -405,3 +405,63 @@ Feature: Release install lifecycle
     And the installer output has no banner art
     And the installer next-step hint names the installed rocm binary
     And the installer output has no ANSI escapes
+
+  # ── Download progress rendering ────────────────────────────────────────
+
+  @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
+  Scenario: lifecycle-32 - Linux - a download draws one progress bar that stays inside the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a pseudo-terminal narrower than COLUMNS
+    Then every download progress frame stays within the terminal
+    And the finished screen shows one completed bar per download
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
+  Scenario: lifecycle-33 - Linux - a terminal too narrow for a bar downloads quietly and says why
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a terminal too narrow for a progress bar
+    Then the installer reports that the terminal is too narrow for a progress bar
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
+  Scenario: lifecycle-34 - Linux - the wget fallback keeps its progress bar inside the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a pseudo-terminal with curl unavailable
+    Then every download progress frame stays within the terminal
+    And the download prints no request logging around the bar
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-piped-into-shell @lifecycle @requires-os:linux
+  Scenario: lifecycle-35 - Linux - piping the installer into a shell still sizes the bar from the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed by piping the installer into a shell
+    Then every download progress frame stays within the terminal
+    And each completed bar spans the measured terminal width
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-unsized-terminal @lifecycle @requires-os:linux
+  Scenario: lifecycle-36 - Linux - a terminal reporting no size still gets a progress bar
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed where the terminal reports no size
+    Then the installer still draws a progress bar
+    And each completed bar spans the measured terminal width
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-zero-padded-columns @lifecycle @requires-os:linux
+  Scenario: lifecycle-37 - Linux - a zero-padded COLUMNS does not abort the install
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with a zero-padded COLUMNS and no way to measure
+    Then every download progress frame stays within the terminal
+    And the installed rocm binary is present

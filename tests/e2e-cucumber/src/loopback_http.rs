@@ -30,8 +30,11 @@ use tower_http::services::ServeDir;
 
 use crate::http_server::{self, ServerHandle};
 
-/// A minimal loopback HTTP file server serving one directory, for the Windows
-/// native-HTTP install scenario. Shuts down on drop.
+/// A minimal loopback HTTP file server serving one directory.
+///
+/// Backs the install lifecycle scenarios: the Windows native-HTTP install, and
+/// the Linux progress-rendering runs, which need a real HTTP download to draw a
+/// bar for. Shuts down on drop.
 #[derive(Debug)]
 pub struct LoopbackServer {
     server: ServerHandle,
