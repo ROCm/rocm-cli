@@ -3717,6 +3717,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "proptest",
+ "regex",
  "rocm-core",
  "rocm-dash-core",
  "rocm-dash-daemon",
