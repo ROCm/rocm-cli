@@ -21,6 +21,12 @@
 //! client has to either use the shared one or add itself to [`ALLOWED`] in a
 //! reviewed diff that says why, as for [`crate::crate_edges::ALLOWLIST`].
 //!
+//! The two ingredients are looked for anywhere in a file, not on one line, so a
+//! copy that builds its `Stdio` in one place and passes it to `.stdin(..)` in
+//! another is still seen. That makes the scan coarse on purpose: a file that
+//! pipes some child's stdin for any reason and also names an envelope type is
+//! reported, and the answer to a false positive is a reviewed [`ALLOWED`] entry.
+//!
 //! What this does **not** claim: it is a source-text scan, not a call-graph
 //! analysis. A copy that builds its stdin another way (a pipe made by hand), or
 //! reaches the envelope types under another name, is outside what it can see,
@@ -117,9 +123,11 @@ mod tests {
     /// ignoring comments: the two ingredients of an engine stdio client.
     fn is_a_client(text: &str) -> bool {
         let code: Vec<&str> = text.lines().map(strip_comment).collect();
-        let pipes_stdin = code
-            .iter()
-            .any(|line| line.contains(".stdin(") && line.contains("piped()"));
+        // Anywhere in the file, not on one line: a `Stdio` built on one line and
+        // handed to `.stdin(..)` on another (a helper that takes it as a
+        // parameter) is the same ingredient.
+        let pipes_stdin = code.iter().any(|line| line.contains(".stdin("))
+            && code.iter().any(|line| line.contains("piped()"));
         let names_envelope = code
             .iter()
             .any(|line| ENVELOPE_TOKENS.iter().any(|token| line.contains(token)));
@@ -209,6 +217,21 @@ fn engine_request(engine_binary: &Path, envelope: &EngineRequestEnvelope) -> Res
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("apps/rocmd/src/engine_ipc.rs"));
         assert!(violations[0].contains("run_engine_stdio"));
+    }
+
+    #[test]
+    fn a_copy_that_builds_its_stdio_on_one_line_and_uses_it_on_another_is_recognised() {
+        let split = "
+fn spawn_engine(engine: &Path, stdin: Stdio) -> Result<Child> {
+    Ok(Command::new(engine).stdin(stdin).stdout(Stdio::null()).spawn()?)
+}
+fn ask(engine: &Path, envelope: &EngineRequestEnvelope) -> Result<()> {
+    let mut child = spawn_engine(engine, Stdio::piped())?;
+    serde_json::to_writer(child.stdin.as_mut().unwrap(), envelope)?;
+    Ok(())
+}
+";
+        assert!(is_a_client(split));
     }
 
     #[test]

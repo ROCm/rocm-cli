@@ -292,7 +292,11 @@ second copy:
 is a static text scan over every `.rs` file in the tree (comments stripped) that
 fails when a file other than the shared client both pipes a child's stdin and
 names an engine request or response envelope, which is what an engine stdio
-client is made of. A caller that reaches an engine through `run_engine_stdio`
+client is made of. Both are looked for anywhere in the file, not on one line, so
+a copy that builds its `Stdio` in one place and passes it to `.stdin(..)` in
+another is seen too (a fixture covers it); the price is that a file which pipes
+some child's stdin for another reason and also names an envelope type is
+reported, and the answer to that is a reviewed allowlist entry. A caller that reaches an engine through `run_engine_stdio`
 has neither. Pasting the old rocmd copy back into `apps/rocmd/src/engine_ipc.rs`
 fails it by name (and, separately, five of rocmd's pinning tests: the
 app-paths, crash, unparseable-answer, nonzero-with-answer and SIGPIPE ones). Like
@@ -350,7 +354,14 @@ answered (see the doc comment of `run_engine_stdio`), and its status is not part
 of the answer. The daemon asks the client to leave a note on its stderr, which is
 its log (`note_failing_exit_after_answer`); the CLI does not, since its stderr is a
 terminal. `a_failing_exit_after_an_answer_is_noted_only_when_asked_for` reads the
-stderr of a re-executed test binary for both settings. A failed read of the
+stderr of a re-executed test binary for both settings. The note is made only
+for an answer that parsed (an unreadable answer with a failing exit is reported
+by the error, with the status, and is not also logged as used), and it is written
+through the same SIGPIPE-guarded, error-ignoring write as the stderr forwarding,
+so a closed stderr neither ends a daemon hosted in `rocm` nor panics it
+(`the_note_is_made_only_for_an_answer_that_parsed` and
+`the_note_to_a_closed_stderr_neither_kills_nor_panics_the_process`, the latter
+with stderr a pipe without a reader under SIGPIPE's default action). A failed read of the
 answer carries the child's stderr like every other failure
 (`a_failed_read_of_the_answer_reports_the_stderr_too`), and a child whose stdin or
 stdout pipe is missing is killed and reaped, not left running

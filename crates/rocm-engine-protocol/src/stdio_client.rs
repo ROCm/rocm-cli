@@ -260,12 +260,6 @@ where
         .unwrap_or_default();
 
     let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-    if !status.success() && !stdout.is_empty() && options.note_failing_exit_after_answer {
-        eprintln!(
-            "{} after printing its answer; the answer was used",
-            exit_note(status)
-        );
-    }
     if !status.success() && stdout.is_empty() {
         let exited = exit_note(status);
         if stderr.is_empty() {
@@ -273,7 +267,26 @@ where
         }
         bail!("{exited}: {stderr}");
     }
-    serde_json::from_slice(&stdout).with_context(|| unparseable_answer_message(status, &stderr))
+    let answer = serde_json::from_slice(&stdout)
+        .with_context(|| unparseable_answer_message(status, &stderr));
+    // The note says the answer was used, so it is only made for an answer that
+    // parsed; an unparseable one is reported by the error above, with the status.
+    if answer.is_ok() && !status.success() && options.note_failing_exit_after_answer {
+        note_failing_exit_after_answer(&mut io::stderr(), status);
+    }
+    answer
+}
+
+/// Say on `sink` (this process's stderr, in production) that the child answered
+/// and then failed. Written like the stderr forwarding, through the SIGPIPE guard
+/// and ignoring a failed write: a closed stderr must neither end a daemon hosted
+/// in `rocm` (SIGPIPE at its default action) nor panic it, as `eprintln!` would.
+fn note_failing_exit_after_answer(sink: &mut impl Write, status: ExitStatus) {
+    let note = format!(
+        "{} after printing its answer; the answer was used\n",
+        exit_note(status)
+    );
+    forward_best_effort(sink, note.as_bytes());
 }
 
 /// How a failing exit is worded wherever the status is reported. Built from the
@@ -1065,6 +1078,97 @@ mod tests {
                 let note = "engine stdio process exited with code 7 after printing its answer; the answer was used";
                 assert_eq!(stderr.contains(note), expected, "{arm}:\n{stderr}");
             }
+        }
+
+        /// The note is only made for an answer that parsed: a child that prints
+        /// something unreadable and fails is reported by the error (with its
+        /// status), and must not also log that "the answer was used". Both cases
+        /// assert the outcome and the stderr together, in a re-executed binary.
+        #[test]
+        fn the_note_is_made_only_for_an_answer_that_parsed() {
+            if let Some(arm) = std::env::var_os("ROCM_TEST_CLIENT_NOTE_PARSE_ARM") {
+                let (body, status) = if arm == "parsed" {
+                    (format!("printf '%s' '{STOPPED}'"), 7)
+                } else {
+                    ("printf 'not json'".to_owned(), 7)
+                };
+                let engine =
+                    FakeEngine::new("client-note-parse", true, &format!("{body}\nexit {status}"));
+                let options = EngineStdioOptions {
+                    note_failing_exit_after_answer: true,
+                    ..EngineStdioOptions::default()
+                };
+                let outcome = run(&engine, &options);
+                if arm == "parsed" {
+                    assert_eq!(outcome.unwrap(), json!({"stopped": true}));
+                } else {
+                    assert_eq!(
+                        outcome.unwrap_err().to_string(),
+                        "failed to parse engine response envelope \
+                         (engine stdio process exited with code 7)"
+                    );
+                }
+                return;
+            }
+            for (arm, expected) in [("parsed", true), ("unparseable", false)] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "stdio_client::tests::child::the_note_is_made_only_for_an_answer_that_parsed",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("ROCM_TEST_CLIENT_NOTE_PARSE_ARM", arm)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{arm}: {:?}", output.status);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    stderr.contains("the answer was used"),
+                    expected,
+                    "{arm}:\n{stderr}"
+                );
+            }
+        }
+
+        /// With stderr a closed pipe and SIGPIPE at its default action (how `rocm`
+        /// runs, and the daemon with it), the note must not end the process or
+        /// panic: the answer is still returned. Re-executes this test in a process
+        /// whose stderr is a pipe with no reader.
+        #[test]
+        #[allow(unsafe_code)] // libc::signal, to install the default action in the child
+        fn the_note_to_a_closed_stderr_neither_kills_nor_panics_the_process() {
+            if std::env::var_os("ROCM_TEST_CLIENT_NOTE_CLOSED_ARM").is_some() {
+                // SAFETY: installing a signal disposition is always safe.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                }
+                let engine = FakeEngine::answering("client-note-closed", STOPPED, 7);
+                let options = EngineStdioOptions {
+                    note_failing_exit_after_answer: true,
+                    ..EngineStdioOptions::default()
+                };
+                let answer = run(&engine, &options).expect("the answer is still returned");
+                assert_eq!(answer, json!({"stopped": true}));
+                return;
+            }
+            let (reader, writer) = io::pipe().unwrap();
+            drop(reader);
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "stdio_client::tests::child::the_note_to_a_closed_stderr_neither_kills_nor_panics_the_process",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("ROCM_TEST_CLIENT_NOTE_CLOSED_ARM", "1")
+                .stderr(Stdio::from(writer))
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                None,
+                "SIGPIPE ended the process: {status:?}"
+            );
+            assert!(status.success(), "{status:?}");
         }
 
         /// A child whose stdin or stdout pipe is missing is killed and reaped, as
