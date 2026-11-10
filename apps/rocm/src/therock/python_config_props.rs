@@ -7,8 +7,11 @@
 //! rocm-dash TOML migration that could produce one.
 //!
 //! A child of `python` so it can drive the private
-//! `record_managed_python_config`. No test here reads or writes the process
-//! environment: every `AppPaths` is built by hand under the system temp dir.
+//! `record_managed_python_config`. No test here sets the process environment:
+//! every `AppPaths` is built by hand under the system temp dir. The recovery
+//! advice in the errors does read it (`ROCM_CLI_DATA_DIR` and the home
+//! folder, through `AppPaths::config_aside_advice`), which is why the tests
+//! compare against that method's output rather than a fixed string.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,7 +130,7 @@ fn managed_python_recording_never_replaces_an_unreadable_config_with_defaults() 
     let total = AtomicUsize::new(0);
     let unreadable = AtomicUsize::new(0);
     let mut runner = TestRunner::new(RunnerConfig {
-        cases: 128,
+        cases: crate::test_support::proptest_cases(128),
         ..RunnerConfig::default()
     });
     let result = runner.run(&(user_settings(), corruption()), |(settings, how)| {

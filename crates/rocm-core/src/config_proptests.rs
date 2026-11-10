@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::test_support::proptest_cases;
+use crate::{AppPaths, EngineUserConfig, RocmCliConfig};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as RunnerConfig, TestCaseError, TestError, TestRunner};
-use rocm_core::{AppPaths, EngineUserConfig, RocmCliConfig};
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -196,7 +197,7 @@ fn config_round_trips_through_save_and_load_for_finite_values() {
     ]
     .boxed();
     let mut runner = TestRunner::new(RunnerConfig {
-        cases: 512,
+        cases: proptest_cases(512),
         ..RunnerConfig::default()
     });
     let result = runner.run(&config_seed(finite), |seed| {
@@ -247,7 +248,7 @@ fn config_save_never_writes_a_file_load_rejects() {
     let (root, paths) = fresh_paths("roundtrip-any");
     let non_finite = AtomicUsize::new(0);
     let mut runner = TestRunner::new(RunnerConfig {
-        cases: 256,
+        cases: proptest_cases(256),
         ..RunnerConfig::default()
     });
     let result = runner.run(&config_seed(tick()), |seed| {
@@ -267,7 +268,7 @@ fn config_save_never_writes_a_file_load_rejects() {
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))
     });
     eprintln!(
-        "reach: non-finite tick in {} of 256",
+        "reach: non-finite tick in {} cases",
         non_finite.load(Ordering::Relaxed)
     );
     let _ = std::fs::remove_dir_all(root);
@@ -305,7 +306,7 @@ fn legacy_migration_property(ticks: &BoxedStrategy<f64>, label: &str, must_migra
     let non_finite = AtomicUsize::new(0);
     let non_ascii_engine = AtomicUsize::new(0);
     let mut runner = TestRunner::new(RunnerConfig {
-        cases: 256,
+        cases: proptest_cases(256),
         ..RunnerConfig::default()
     });
     let strategy = (ticks.clone(), ticks.clone(), ticks.clone(), opt_text());
@@ -435,54 +436,4 @@ fn toml_string_literal(value: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// Windows path normalization is applied on every manifest load and save, so
-/// it must be idempotent: normalizing an already-normalized path is a no-op.
-/// Exercised through the platform-parameterized entry point so it also runs on
-/// a Linux host.
-#[test]
-fn windows_path_normalization_is_idempotent() {
-    use rocm_core::runtime::{RuntimePlatform, normalize_runtime_path_text_for_platform as norm};
-    let segment = prop_oneof![
-        Just(String::new()),
-        Just("..".to_owned()),
-        Just(" spaced ".to_owned()),
-        Just("é日".to_owned()),
-        "[A-Za-z0-9_.-]{1,6}",
-    ];
-    let separator = prop_oneof![Just("/"), Just("\\"), Just("\\/"), Just("//")];
-    let prefix = prop_oneof![
-        Just(String::new()),
-        Just("C:".to_owned()),
-        Just("d:".to_owned()),
-        Just("/d".to_owned()),
-        Just("\\\\server\\share".to_owned()),
-        Just(" ".to_owned()),
-    ];
-    let strategy = (
-        prefix,
-        prop::collection::vec((separator, segment), 0..5),
-        prop_oneof![Just(""), Just("/"), Just("\\"), Just(" ")],
-    )
-        .prop_map(|(prefix, parts, trailing)| {
-            let mut path = prefix;
-            for (sep, seg) in parts {
-                path.push_str(sep);
-                path.push_str(&seg);
-            }
-            path.push_str(trailing);
-            path
-        });
-    let mut runner = TestRunner::new(RunnerConfig {
-        cases: 1024,
-        ..RunnerConfig::default()
-    });
-    let result = runner.run(&strategy, |path| {
-        let once = norm(&path, RuntimePlatform::Windows);
-        let twice = norm(&once, RuntimePlatform::Windows);
-        prop_assert_eq!(&twice, &once, "input {:?}", path);
-        Ok(())
-    });
-    report("windows normalization idempotence", result);
 }

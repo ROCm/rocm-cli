@@ -46,7 +46,7 @@ fn data_dir_never_silently_relocates_when_config_is_unreadable() {
     let total = AtomicUsize::new(0);
     let unreadable = AtomicUsize::new(0);
     let mut runner = TestRunner::new(RunnerConfig {
-        cases: 256,
+        cases: crate::test_support::proptest_cases(256),
         ..RunnerConfig::default()
     });
     let strategy = ("[a-z]{1,10}", 1_usize..2048);

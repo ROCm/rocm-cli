@@ -807,6 +807,12 @@ impl RocmCliConfig {
     }
 }
 
+// Property tests of save, load and the legacy migration, a child module so they
+// can use the crate's `proptest_cases`.
+#[cfg(test)]
+#[path = "config_proptests.rs"]
+mod props;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -457,7 +457,7 @@ the data directory is found from it have `proptest` properties, beside the
 code they drive. They run in the ordinary `cargo test`; to run only them:
 
 ```bash
-cargo test -p rocm-core --test persisted_config_props -- --nocapture
+cargo test -p rocm-core --lib config::props -- --nocapture
 cargo test -p rocm-core --lib persisted_paths_props -- --nocapture
 cargo test -p rocm --bin rocm therock::python::config_props -- --nocapture
 ```
