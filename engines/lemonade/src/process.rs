@@ -159,6 +159,40 @@ pub(crate) fn hide_child_console_window(command: &mut ProcessCommand) {
 #[cfg(not(windows))]
 pub(crate) const fn hide_child_console_window(_command: &mut ProcessCommand) {}
 
+/// Which of this process's standard output streams are a console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputConsoles {
+    pub(crate) stdout: bool,
+    pub(crate) stderr: bool,
+}
+
+impl OutputConsoles {
+    pub(crate) fn detect() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            stdout: std::io::stdout().is_terminal(),
+            stderr: std::io::stderr().is_terminal(),
+        }
+    }
+
+    /// Whether a child that inherits both streams may be started without a
+    /// console window.
+    ///
+    /// `CREATE_NO_WINDOW` starts the child with no console at all, and a child
+    /// with no console writes nothing to a console handle it inherited: run
+    /// from a real Windows console, `cmd /c echo`, a Python child and
+    /// `lemonade.exe --version` all printed their output without the flag and
+    /// printed nothing with it. That is how `lemonade backends install`'s
+    /// progress for a multi-gigabyte download disappeared from an interactive
+    /// `rocm serve` while still showing up in a redirected log. When either
+    /// stream is a console this process has one, so the child shares it and no
+    /// window opens; when neither is (a pipe, a file, or no console at all) the
+    /// flag is still applied, so a console-less parent never flashes a window.
+    pub(crate) const fn child_may_hide_its_console(self) -> bool {
+        !(self.stdout || self.stderr)
+    }
+}
+
 fn child_process_path(path: &Path) -> String {
     if runtime_is_windows() {
         windows_child_path(path)
@@ -309,6 +343,39 @@ pub(crate) fn run_lemonade_backend_install(
     backend: &str,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
+    let mut command = backend_install_command(
+        manifest,
+        host,
+        port,
+        backend,
+        process_env,
+        OutputConsoles::detect(),
+        hide_child_console_window,
+    )?;
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !status.success() {
+        bail!("Lemonade backend install failed with status {status}");
+    }
+    Ok(())
+}
+
+/// The `lemonade backends install` command, ready to run.
+///
+/// It inherits stdout and stderr: the backend download's progress is the child's
+/// own output. `consoles` and `hide_window` are parameters so a test can assert
+/// whether the window is hidden for each console state; the one production
+/// caller passes the real streams and [`hide_child_console_window`].
+fn backend_install_command(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    backend: &str,
+    process_env: &LemonadeProcessEnvironment,
+    consoles: OutputConsoles,
+    hide_window: impl FnOnce(&mut ProcessCommand),
+) -> Result<ProcessCommand> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
         .arg("--host")
@@ -322,14 +389,10 @@ pub(crate) fn run_lemonade_backend_install(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     apply_lemonade_process_environment(&mut command, process_env)?;
-    hide_child_console_window(&mut command);
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
-    if !status.success() {
-        bail!("Lemonade backend install failed with status {status}");
+    if consoles.child_may_hide_its_console() {
+        hide_window(&mut command);
     }
-    Ok(())
+    Ok(command)
 }
 
 fn lemonade_pull_args(host: &str, port: u16, checkpoint_ref: &str) -> Vec<String> {
@@ -643,6 +706,75 @@ mod tests {
     use crate::DEFAULT_MODEL;
     use rocm_engine_protocol::DevicePolicy;
     use serde_json::json;
+
+    fn test_manifest() -> LemonadeInstallManifest {
+        LemonadeInstallManifest {
+            env_id: "lemonade-embeddable-test".to_owned(),
+            version: "test".to_owned(),
+            runtime_dir: PathBuf::from("rt"),
+            lemond: PathBuf::from("rt").join("lemond"),
+            lemonade: PathBuf::from("rt").join("lemonade"),
+            backend_recipe: "llamacpp".to_owned(),
+            backend_name: "rocm".to_owned(),
+            installed_at_unix_ms: 0,
+        }
+    }
+
+    /// Build the real backend-install command for a console state and report
+    /// whether the window was hidden, along with the command itself.
+    fn backend_install_for(consoles: OutputConsoles) -> (ProcessCommand, bool) {
+        let mut hidden = false;
+        let command = backend_install_command(
+            &test_manifest(),
+            "127.0.0.1",
+            8123,
+            "rocm",
+            &LemonadeProcessEnvironment::default(),
+            consoles,
+            |_| hidden = true,
+        )
+        .expect("the command builds");
+        (command, hidden)
+    }
+
+    /// The backend install's progress is the child's own output. Hiding its
+    /// console while that output is a console discards it (see
+    /// `OutputConsoles::child_may_hide_its_console`), so the window is hidden
+    /// only when neither stream is one. The command is the real one: a dropped
+    /// call to the hide step, a hide step run unconditionally, or a console
+    /// check that ignores one of the streams each turn a case below red.
+    #[test]
+    fn the_backend_install_hides_its_window_only_when_no_output_is_a_console() {
+        for (stdout, stderr, expect_hidden) in [
+            (true, true, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let (command, hidden) = backend_install_for(OutputConsoles { stdout, stderr });
+            assert_eq!(
+                hidden, expect_hidden,
+                "stdout console={stdout}, stderr console={stderr}"
+            );
+            assert_eq!(command.get_program(), PathBuf::from("rt").join("lemonade"));
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                args,
+                [
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "8123",
+                    "backends",
+                    "install",
+                    "llamacpp:rocm"
+                ]
+            );
+        }
+    }
 
     #[test]
     fn models_ready_accepts_direct_serve_and_gates_router_backend() {

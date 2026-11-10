@@ -5,9 +5,7 @@
 //! WSL detection and the Windows host driver as seen from the guest: the WSL2
 //! signals, the librocdxg chain, and the local and WSL host-driver probes.
 
-use super::capture::{
-    capture_optional_command, capture_optional_command_with_timeout, tool_on_path,
-};
+use super::capture::{capture_optional_command, capture_optional_command_with_timeout};
 use super::windows_inventory::{
     WINDOWS_INVENTORY_QUERY_TIMEOUT, WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
     WindowsExamineInventory, detect_windows_examine_inventory_with_driver_facts,
@@ -15,6 +13,7 @@ use super::windows_inventory::{
 };
 use super::{DriverSummary, WslSummary};
 use crate::gfx_target::parse_windows_display_gfx_target;
+use crate::probe_exec::which;
 use crate::{discover_rocm_installs, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -372,8 +371,8 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
     // The roots are already re-rooted through `host_path`, so this existence check
     // takes the path as given.
     let librocdxg_beside_runtime = librocdxg_beside_runtime(&roots, Path::exists);
-    let rocminfo = tool_on_path("rocminfo");
-    let cargo = tool_on_path("cargo");
+    let rocminfo = which("rocminfo");
+    let cargo = which("cargo");
     let missing = missing_plumbing(
         dxg_device,
         dxcore,

@@ -18,9 +18,9 @@
 //! inside an HTML comment, a code block or a code span does not count, and
 //! neither does a link missing its `[` or `)`, one with an escaped bracket, an
 //! image, or the outer brackets of a link that contains another link),
-//! or be listed in [`EXEMPT`], or be a test-only helper (see
-//! [`is_test_helper`]). Out of scope: `build.rs` files at a crate's root and the
-//! `tests/` and `examples/` trees, which sit outside `<crate>/src`.
+//! or be a test-only helper (see [`is_test_helper`]). Out of scope: `build.rs`
+//! files at a crate's root and the `tests/` and `examples/` trees, which sit
+//! outside `<crate>/src`.
 //!
 //! It reads the git index and the working tree, never a git diff, so the answer
 //! does not depend on a base ref. That is the same answer in CI and in the
@@ -32,15 +32,6 @@
 //! The doc must use inline `[text](path)` links. Reference-style links, a
 //! `?query` suffix and a root-relative path render as working links but are not
 //! recognised, so the failure message asks for the inline form.
-//!
-//! [`EXEMPT`] is the files that existed, uncited, when the check was added. It
-//! follows the pattern of `ALLOWLIST` in [`crate::crate_edges`] and is checked
-//! in both directions: a source file in neither the doc nor the list fails,
-//! and so does a list entry that is now cited or no longer exists. The list is
-//! meant to shrink as files are documented. Nothing can stop a determined edit
-//! from adding to it, so [`EXEMPT_CEILING`] pins its size in a test: growing
-//! the list means raising that constant too, a second, visible line in the diff
-//! that a reviewer has to accept.
 //!
 //! What this does not check: whether an entry's prose still describes the file,
 //! and functions that move between two files that are both already cited.
@@ -62,96 +53,6 @@ const DOC_DIR: &str = "docs";
 /// Source roots whose `<crate>/src` trees are in scope.
 const SOURCE_ROOTS: [&str; 3] = ["apps", "crates", "engines"];
 
-/// Production files that have no entry in `docs/architecture.md` yet: everything
-/// that was uncited when this check was added, mostly the dashboard crates.
-/// Do not add to this list to make the check pass: document the file in the doc
-/// instead. Growing it is a reviewed exception and also needs
-/// [`EXEMPT_CEILING`] raised. Remove an entry when the file gets one. Keep it
-/// sorted.
-const EXEMPT: &[&str] = &[
-    "apps/rocmd/src/main.rs",
-    "crates/rocm-dash-collectors/src/amd_smi.rs",
-    "crates/rocm-dash-collectors/src/bench_load.rs",
-    "crates/rocm-dash-collectors/src/bench_tail.rs",
-    "crates/rocm-dash-collectors/src/cgroup.rs",
-    "crates/rocm-dash-collectors/src/docker.rs",
-    "crates/rocm-dash-collectors/src/engine_registry.rs",
-    "crates/rocm-dash-collectors/src/host.rs",
-    "crates/rocm-dash-collectors/src/lemonade.rs",
-    "crates/rocm-dash-collectors/src/parallel.rs",
-    "crates/rocm-dash-collectors/src/proc_scan.rs",
-    "crates/rocm-dash-collectors/src/sysfs.rs",
-    "crates/rocm-dash-collectors/src/vllm_log.rs",
-    "crates/rocm-dash-collectors/src/vllm_prom.rs",
-    "crates/rocm-dash-core/src/bench_rollup.rs",
-    "crates/rocm-dash-core/src/bench_schema.rs",
-    "crates/rocm-dash-core/src/config.rs",
-    "crates/rocm-dash-core/src/efficiency.rs",
-    "crates/rocm-dash-core/src/metrics.rs",
-    "crates/rocm-dash-core/src/observation.rs",
-    "crates/rocm-dash-core/src/partition.rs",
-    "crates/rocm-dash-core/src/persist.rs",
-    "crates/rocm-dash-core/src/protocol.rs",
-    "crates/rocm-dash-core/src/state.rs",
-    "crates/rocm-dash-core/src/traits.rs",
-    "crates/rocm-dash-core/src/vram.rs",
-    "crates/rocm-dash-daemon/src/bench_ring.rs",
-    "crates/rocm-dash-daemon/src/demo.rs",
-    "crates/rocm-dash-daemon/src/persist.rs",
-    "crates/rocm-dash-daemon/src/snapshot_ring.rs",
-    "crates/rocm-dash-daemon/src/transport.rs",
-    "crates/rocm-dash-tui/src/client.rs",
-    "crates/rocm-dash-tui/src/jobs.rs",
-    "crates/rocm-dash-tui/src/lib.rs",
-    "crates/rocm-dash-tui/src/llm.rs",
-    "crates/rocm-dash-tui/src/reconnect.rs",
-    "crates/rocm-dash-tui/src/registry_probe.rs",
-    "crates/rocm-dash-tui/src/replay.rs",
-    "crates/rocm-dash-tui/src/tool_exec.rs",
-    "crates/rocm-dash-tui/src/transport.rs",
-    "crates/rocm-dash-tui/src/ui/automations_manager.rs",
-    "crates/rocm-dash-tui/src/ui/bench.rs",
-    "crates/rocm-dash-tui/src/ui/bench_run.rs",
-    "crates/rocm-dash-tui/src/ui/command_screen.rs",
-    "crates/rocm-dash-tui/src/ui/config_manager.rs",
-    "crates/rocm-dash-tui/src/ui/core_bars.rs",
-    "crates/rocm-dash-tui/src/ui/dock.rs",
-    "crates/rocm-dash-tui/src/ui/engine_manager.rs",
-    "crates/rocm-dash-tui/src/ui/examine_manager.rs",
-    "crates/rocm-dash-tui/src/ui/folder_browser.rs",
-    "crates/rocm-dash-tui/src/ui/format.rs",
-    "crates/rocm-dash-tui/src/ui/gradient.rs",
-    "crates/rocm-dash-tui/src/ui/install_manager.rs",
-    "crates/rocm-dash-tui/src/ui/instance_list.rs",
-    "crates/rocm-dash-tui/src/ui/launcher.rs",
-    "crates/rocm-dash-tui/src/ui/logs_view.rs",
-    "crates/rocm-dash-tui/src/ui/model_picker.rs",
-    "crates/rocm-dash-tui/src/ui/onboarding.rs",
-    "crates/rocm-dash-tui/src/ui/runtime_manager.rs",
-    "crates/rocm-dash-tui/src/ui/serve_wizard.rs",
-    "crates/rocm-dash-tui/src/ui/services_manager.rs",
-    "crates/rocm-dash-tui/src/ui/sparkline.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/bench.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/chat.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/hardware.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/home.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/mod.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/observe.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/pane.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/rocm.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/serving.rs",
-    "crates/rocm-dash-tui/src/ui/update_manager.rs",
-    "crates/rocm-deps/src/lib.rs",
-    "engines/aim/src/main.rs",
-    "engines/lemonade/src/main.rs",
-    "engines/vllm/src/main.rs",
-];
-
-/// The most entries [`EXEMPT`] may hold. Lower it when entries are removed; do
-/// not raise it to make the check pass, since a file with no entry in the module
-/// map should get one. Raising it is the visible, reviewed way to grow the list.
-const EXEMPT_CEILING: usize = 76;
-
 /// Whether `path` is a tracked-file path this check covers: a `.rs` file under
 /// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // Rust sources are always lowercase `.rs`
@@ -165,7 +66,7 @@ fn in_scope(path: &str) -> bool {
 
 /// Whether `path` is a test-only helper that does not need an architecture
 /// entry: shared test support, or a property-test module. Matched on the file
-/// stem so a new helper of the same kind never needs an [`EXEMPT`] entry.
+/// stem so a new helper of the same kind never needs an entry.
 fn is_test_helper(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let stem = name.strip_suffix(".rs").unwrap_or(name);
@@ -476,9 +377,9 @@ fn cited_paths(doc: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Check the tracked files against the doc's citations and `exempt`, returning
-/// every violation found.
-fn check(tracked: &[String], cited: &BTreeSet<String>, exempt: &[&str]) -> Vec<String> {
+/// Check the tracked files against the doc's citations, returning every
+/// violation found.
+fn check(tracked: &[String], cited: &BTreeSet<String>) -> Vec<String> {
     let in_tree: BTreeSet<&str> = tracked
         .iter()
         .map(String::as_str)
@@ -488,30 +389,11 @@ fn check(tracked: &[String], cited: &BTreeSet<String>, exempt: &[&str]) -> Vec<S
     let mut violations = Vec::new();
 
     for path in &in_tree {
-        if !cited.contains(*path) && !exempt.contains(path) && !is_test_helper(path) {
+        if !cited.contains(*path) && !is_test_helper(path) {
             violations.push(format!(
                 "`{path}` is not cited in {DOC}: add an entry for it to the module map, as an \
                  inline `[text](path)` markdown link relative to docs/ (reference-style links, \
                  `?query` suffixes and root-relative paths are not recognised)"
-            ));
-        }
-    }
-
-    for entry in exempt {
-        if !in_tree.contains(entry) {
-            violations.push(format!(
-                "EXEMPT entry `{entry}` is stale: no tracked source file has that path any more; \
-                 remove it from EXEMPT in xtask/src/architecture_doc.rs"
-            ));
-        } else if cited.contains(*entry) {
-            violations.push(format!(
-                "EXEMPT entry `{entry}` is stale: {DOC} now cites it; remove it from EXEMPT in \
-                 xtask/src/architecture_doc.rs so a later removal from the doc is caught"
-            ));
-        } else if is_test_helper(entry) {
-            violations.push(format!(
-                "EXEMPT entry `{entry}` is redundant: test-only helpers are exempt by name; \
-                 remove it from EXEMPT in xtask/src/architecture_doc.rs"
             ));
         }
     }
@@ -541,28 +423,14 @@ fn tracked_files(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The violation, if any, of `entries` exempt files exceeding `ceiling`.
-fn ceiling_violation(entries: usize, ceiling: usize) -> Option<String> {
-    (entries > ceiling).then(|| {
-        format!(
-            "EXEMPT holds {entries} entries but EXEMPT_CEILING is {ceiling}: a file with no entry \
-             in the module map should get one, not an EXEMPT line. Growing the list means raising \
-             EXEMPT_CEILING in xtask/src/architecture_doc.rs too, which is a reviewed exception"
-        )
-    })
-}
-
 /// Run the check against the real workspace.
 fn violations_in(root: &Path) -> Result<Vec<String>> {
     let doc =
         std::fs::read_to_string(root.join(DOC)).with_context(|| format!("failed to read {DOC}"))?;
-    let mut violations = check(&tracked_files(root)?, &cited_paths(&doc), EXEMPT);
-    violations.extend(ceiling_violation(EXEMPT.len(), EXEMPT_CEILING));
-    Ok(violations)
+    Ok(check(&tracked_files(root)?, &cited_paths(&doc)))
 }
 
-/// Fail if a production source file has no entry in `docs/architecture.md`, or
-/// [`EXEMPT`] has gone stale.
+/// Fail if a production source file has no entry in `docs/architecture.md`.
 pub fn run() -> Result<()> {
     let root = paths::workspace_root()?;
     let violations = violations_in(&root)?;
@@ -591,13 +459,13 @@ mod tests {
     #[test]
     fn cited_file_passes() {
         let tracked = files(&["apps/rocm/src/cli.rs"]);
-        assert!(check(&tracked, &cites(&["apps/rocm/src/cli.rs"]), &[]).is_empty());
+        assert!(check(&tracked, &cites(&["apps/rocm/src/cli.rs"])).is_empty());
     }
 
     #[test]
     fn new_uncited_file_fails_and_is_named() {
         let tracked = files(&["apps/rocm/src/cli.rs", "apps/rocm/src/brand_new.rs"]);
-        let violations = check(&tracked, &cites(&["apps/rocm/src/cli.rs"]), &[]);
+        let violations = check(&tracked, &cites(&["apps/rocm/src/cli.rs"]));
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("apps/rocm/src/brand_new.rs"));
         assert!(violations[0].contains("is not cited"));
@@ -606,44 +474,9 @@ mod tests {
     #[test]
     fn a_citation_does_not_cover_the_same_name_in_another_crate() {
         let tracked = files(&["apps/rocm/src/cli.rs", "apps/rocmd/src/cli.rs"]);
-        let violations = check(&tracked, &cites(&["apps/rocm/src/cli.rs"]), &[]);
+        let violations = check(&tracked, &cites(&["apps/rocm/src/cli.rs"]));
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("apps/rocmd/src/cli.rs"));
-    }
-
-    #[test]
-    fn exempt_file_passes() {
-        let tracked = files(&["crates/rocm-dash-core/src/state.rs"]);
-        let exempt = ["crates/rocm-dash-core/src/state.rs"];
-        assert!(check(&tracked, &cites(&[]), &exempt).is_empty());
-    }
-
-    #[test]
-    fn exempt_entry_for_a_missing_file_is_stale() {
-        let exempt = ["crates/rocm-dash-core/src/gone.rs"];
-        let violations = check(&files(&[]), &cites(&[]), &exempt);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("crates/rocm-dash-core/src/gone.rs"));
-        assert!(violations[0].contains("no tracked source file"));
-    }
-
-    #[test]
-    fn exempt_entry_that_is_now_cited_is_stale() {
-        let tracked = files(&["crates/rocm-dash-core/src/state.rs"]);
-        let exempt = ["crates/rocm-dash-core/src/state.rs"];
-        let cited = cites(&["crates/rocm-dash-core/src/state.rs"]);
-        let violations = check(&tracked, &cited, &exempt);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("now cites it"));
-    }
-
-    #[test]
-    fn exempt_entry_for_a_test_helper_is_redundant() {
-        let tracked = files(&["crates/rocm-core/src/test_support.rs"]);
-        let exempt = ["crates/rocm-core/src/test_support.rs"];
-        let violations = check(&tracked, &cites(&[]), &exempt);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].contains("redundant"));
     }
 
     #[test]
@@ -656,13 +489,13 @@ mod tests {
             "apps/rocm/src/data.json",
             "tests/e2e-cucumber/src/lib.rs",
         ]);
-        assert!(check(&tracked, &cites(&[]), &[]).is_empty());
+        assert!(check(&tracked, &cites(&[])).is_empty());
     }
 
     #[test]
     fn nested_source_files_are_in_scope() {
         let tracked = files(&["crates/rocm-dash-tui/src/ui/tabs/home.rs"]);
-        let violations = check(&tracked, &cites(&[]), &[]);
+        let violations = check(&tracked, &cites(&[]));
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("ui/tabs/home.rs"));
     }
@@ -678,7 +511,7 @@ mod tests {
             "crates/rocm-core/src/examine_driver_proptests.rs",
             "apps/rocm/src/providers/local_http/proptests.rs",
         ]);
-        assert!(check(&tracked, &cites(&[]), &[]).is_empty());
+        assert!(check(&tracked, &cites(&[])).is_empty());
     }
 
     #[test]
@@ -729,7 +562,7 @@ mod tests {
     fn commenting_out_the_only_entry_leaves_the_file_uncited() {
         let doc = format!("<!-- {CLI} -->");
         let tracked = files(&["apps/rocm/src/cli.rs"]);
-        let violations = check(&tracked, &cited_paths(&doc), &[]);
+        let violations = check(&tracked, &cited_paths(&doc));
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("apps/rocm/src/cli.rs"));
     }
@@ -850,7 +683,7 @@ mod tests {
             "cli](../apps/rocm/src/cli.rs)",
             "\\[cli](../apps/rocm/src/cli.rs)",
         ] {
-            let violations = check(&tracked, &cited_paths(broken), &[]);
+            let violations = check(&tracked, &cited_paths(broken));
             assert_eq!(violations.len(), 1, "{broken:?} must not cite the file");
         }
     }
@@ -869,11 +702,7 @@ mod tests {
         assert!(!cited_cli("![cli](../apps/rocm/src/cli.rs)"));
         assert!(!cited_cli("see ![cli](../apps/rocm/src/cli.rs \"title\")"));
         let tracked = files(&["apps/rocm/src/cli.rs"]);
-        let violations = check(
-            &tracked,
-            &cited_paths("![cli](../apps/rocm/src/cli.rs)"),
-            &[],
-        );
+        let violations = check(&tracked, &cited_paths("![cli](../apps/rocm/src/cli.rs)"));
         assert_eq!(violations.len(), 1);
     }
 
@@ -921,23 +750,13 @@ mod tests {
     }
 
     #[test]
-    fn the_exempt_list_stays_within_its_ceiling() {
-        assert_eq!(ceiling_violation(EXEMPT.len(), EXEMPT_CEILING), None);
-        assert_eq!(ceiling_violation(77, 77), None);
-        assert_eq!(ceiling_violation(70, 77), None);
-        let violation = ceiling_violation(78, 77).expect("one over the ceiling fails");
-        assert!(violation.contains("78 entries"));
-        assert!(violation.contains("EXEMPT_CEILING is 77"));
-    }
-
-    #[test]
     fn the_link_forms_the_failure_message_rules_out_are_not_citations() {
         // The message tells authors these forms are not recognised; this holds it
         // to what the parser does.
         assert!(!cited_cli("[cli][c]\n\n[c]: ../apps/rocm/src/cli.rs"));
         assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs?plain=1)"));
         assert!(!cited_cli("[cli](/apps/rocm/src/cli.rs)"));
-        let message = &check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]), &[])[0];
+        let message = &check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]))[0];
         assert!(message.contains("inline `[text](path)`"));
         assert!(message.contains("reference-style"));
         assert!(message.contains("`?query`"));
@@ -946,10 +765,9 @@ mod tests {
 
     #[test]
     fn the_failure_message_for_an_uncited_file_only_asks_for_an_entry() {
-        let violations = check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]), &[]);
+        let violations = check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]));
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("add an entry for it to the module map"));
-        assert!(!violations[0].contains("EXEMPT"));
     }
 
     #[test]
@@ -963,14 +781,6 @@ mod tests {
                 "apps/rocm/src/c.rs"
             ])
         );
-    }
-
-    #[test]
-    fn exempt_list_is_sorted_and_unique() {
-        let mut sorted = EXEMPT.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted, EXEMPT, "keep EXEMPT sorted, without duplicates");
     }
 
     #[test]

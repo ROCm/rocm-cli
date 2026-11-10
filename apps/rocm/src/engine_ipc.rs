@@ -381,11 +381,13 @@ pub(crate) fn run_builtin_engine_serve_http(
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
-    // ROCMAI-541 (B3): short-circuit every real engine entirely when the
+    // ROCMAI-541: short-circuit every real engine entirely when the
     // scripted-engine E2E hook is armed, so a scenario can exercise a managed
     // child that survives its early-startup liveness checks and then dies (or
     // runs until stopped) without any real engine logic — GPU, Python venv, or
-    // network download — in the way. See `run_scripted_e2e_engine_serve_http`.
+    // network download — in the way. Ahead of the Anthropic endpoint below,
+    // which fronts a real engine this path never starts. See
+    // `run_scripted_e2e_engine_serve_http`.
     #[cfg(feature = "e2e-test-hooks")]
     if std::env::var_os("ROCM_E2E_SCRIPTED_ENGINE").is_some() {
         let result =
@@ -395,6 +397,9 @@ pub(crate) fn run_builtin_engine_serve_http(
         }
         return result;
     }
+    // Not `?`: an unparseable policy is as much an engine failure as any other,
+    // and the state file has to say so or the service reads `starting` forever
+    // (ROCMAI-541).
     let parsed_policy = match parse_device_policy(Some(device_policy)) {
         Ok(policy) => policy,
         Err(error) => {
@@ -402,6 +407,16 @@ pub(crate) fn run_builtin_engine_serve_http(
             return Err(error);
         }
     };
+    // Every engine is fronted the same way, so the Anthropic endpoint is started
+    // here once rather than inside each adapter. It runs on a thread of this
+    // process, which is the service's supervisor: it ends when the service does.
+    rocmd::anthropic_proxy::spawn_alongside_engine(rocmd::anthropic_proxy::AnthropicProxyConfig {
+        host: host.clone(),
+        engine_port: port,
+        served_model: model_ref.clone(),
+        state_path: state_path.clone(),
+        probe_api_key: rocm_engine_protocol::resolve_endpoint_api_key(),
+    });
     let result = match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
             service_id.clone(),

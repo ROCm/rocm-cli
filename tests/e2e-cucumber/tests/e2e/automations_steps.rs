@@ -101,7 +101,7 @@ fn write_harness_autostart_claim(path: &std::path::Path) {
 
 /// Re-stamp a claim `plant_inflight_autostart_claim` planted, right before the
 /// CLI runs. The CLI honours a claim for only 30 seconds
-/// (`AUTOSTART_CLAIM_TTL_MS` in `apps/rocm/src/service_launch.rs`). The mock
+/// (`AUTOSTART_CLAIM_TTL_MS` in `apps/rocm/src/service_launch/helper_autostart.rs`). The mock
 /// lane runs up to 64 scenarios at once, and every step blocks a runtime
 /// worker while its `rocm` child runs, so this scenario's When can start more
 /// than 30 seconds after its Given. The CLI then rightly reads the claim as
