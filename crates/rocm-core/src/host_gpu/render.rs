@@ -95,18 +95,21 @@ impl ExamineSummary {
             // `rocm diagnose` is the command that can: its `fix-3-rocm-kernel`,
             // `fix-4-render-group` and `fix-5-amdgpu-load` entries are exactly
             // the reasons a present GPU goes undetected.
+            //
+            // Kept to one sentence each: the level word already says the CLI
+            // cannot answer, so spelling out "can confirm neither ROCm support
+            // nor its absence" in both arms was length without information.
+            // The distinction it was carrying lives in this comment and in
+            // `GpuSupportLevel`'s own docs, which is where it is load-bearing.
             GpuSupportLevel::Unknown => match detected {
                 Some(gfx) => format!(
-                    "  rocm_support: unknown - GPU target {gfx} is not in this \
-                     build's catalog, so this build can confirm neither ROCm \
-                     support nor its absence; serve a model with `rocm serve \
-                     <model> --engine lemonade` and read the backend it picked \
-                     from the `device:` row of `rocm services list`\n"
+                    "  rocm_support: unknown - {gfx} is not in this build's \
+                     catalog; serve with `rocm serve <model> --engine lemonade`, \
+                     then read the `device:` row of `rocm services list` for the \
+                     backend it used\n"
                 ),
-                None => "  rocm_support: unknown - no AMD GPU was detected, so \
-                         this build can confirm neither ROCm support nor its \
-                         absence; run `rocm diagnose` to find out why no GPU is \
-                         visible\n"
+                None => "  rocm_support: unknown - no AMD GPU was detected; run \
+                         `rocm diagnose` to find out why none is visible\n"
                     .to_owned(),
             },
         }
@@ -270,6 +273,29 @@ mod tests {
         assert!(rendered.contains("managed_runtimes: 2"));
         assert!(rendered.contains("managed_services: 1"));
         assert!(rendered.contains("model_cache_entries: 3"));
+    }
+
+    /// The exact placeholders the report prints for the three GPU fields when
+    /// it has no value, pinned because they are read back as data.
+    ///
+    /// examine-35 decides which support tier a host is in by filtering these
+    /// out of `detected_gfx_target`, `compatible_therock_family` and
+    /// `detected_therock_family`. Reword one and that scenario stops seeing an
+    /// absent value as absent: a lane would be classified into the wrong tier
+    /// and its tier-specific command assertion would silently stop describing
+    /// the host it ran on. The two strings differ on purpose — "not detected"
+    /// is about a managed install, "unknown" about a probe — so neither may
+    /// stand in for the other.
+    #[test]
+    fn examine_render_spells_its_absent_value_placeholders() {
+        let rendered = examine_summary_with_gpu(None, None).render_text();
+        for field in [
+            "detected_gfx_target: <unknown>",
+            "compatible_therock_family: <unknown>",
+            "detected_therock_family: <not detected>",
+        ] {
+            assert!(rendered.contains(field), "missing `{field}`:\n{rendered}");
+        }
     }
 
     fn examine_summary_with_gpu(
@@ -660,9 +686,7 @@ mod tests {
         let unknown = examine_summary_with_gpu(Some("gfx803"), None);
         let rendered = unknown.render_text();
         assert!(
-            rendered.contains(
-                "rocm_support: unknown - GPU target gfx803 is not in this build's catalog"
-            ),
+            rendered.contains("rocm_support: unknown - gfx803 is not in this build's catalog"),
             "{rendered}"
         );
         assert!(

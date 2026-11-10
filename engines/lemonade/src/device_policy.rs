@@ -133,10 +133,16 @@ pub(crate) const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     }
 }
 
-/// The device string reported once a model is loaded. Reflects the backend that
-/// actually ran (`rocm`, `vulkan`, …), the pinned GPU ordinal when known, and
-/// the GPU name recorded at launch, rather than a hardcoded value, so the
-/// report matches observed execution.
+/// The device string reported once a model is loaded: the backend this service
+/// was launched on (`rocm`, `vulkan`, …), the pinned GPU ordinal when known, and
+/// the GPU name recorded at launch.
+///
+/// Read back from the service's own recorded `backend_requested` rather than
+/// from a hardcoded value — so it follows the backend selection this launch
+/// actually made, including a ROCm-to-Vulkan fallback. It is this engine's
+/// account of what it asked llama.cpp for, not an independent measurement of
+/// which device executed, which is why the CLI's docs say the row *reports* a
+/// device rather than naming the one observed.
 ///
 /// Formatted by [`rocm_engine_protocol::format_reported_device`] so all three
 /// engines render one shape; see that function for why the ordinal-less row

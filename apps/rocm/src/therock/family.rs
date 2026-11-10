@@ -186,6 +186,19 @@ pub(super) fn resolve_family(
 /// on a host with no ROCm, and fail under the no-CPU-fallback policy. Naming
 /// the engine makes the sentence true whatever the config says, because the
 /// explicit flag out-ranks every other selection source.
+///
+/// **The named command is not refused on the host that is shown it.** `serve`'s
+/// no-usable-GPU pre-flight is `host_has_no_usable_gpu` (`serve_cmd.rs`) over
+/// `rocm_core::usable_amd_gpu_indices`, and on Linux that composes the KFD
+/// compute-node count with the DRM `amdgpu` card count: a *zero* KFD count
+/// falls back to DRM rather than refusing. A gfx90c APU whose kernel exposes no
+/// compute node can only have been named by the DRM `ip_discovery` read, which
+/// walks the same `card*/device` entries that count — so this branch is
+/// reachable only on a host with at least one such card, and the pre-flight
+/// therefore sees ordinal 0. `rocm_core`'s
+/// `a_gfx90c_host_the_kernel_gives_no_compute_node_still_has_a_usable_gpu`
+/// drives both halves off one planted `/sys`, and serve-50 runs the real binary
+/// against that same host shape on a GPU-less lane.
 fn unsupported_host_gpu_message(raw_arch: &str) -> String {
     format!(
         "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \

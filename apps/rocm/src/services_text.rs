@@ -77,7 +77,7 @@
 //! classification respectively — stay in `main.rs`'s shared `mod tests`
 //! instead.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Read as _, Seek as _, SeekFrom};
@@ -379,6 +379,23 @@ fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id
 /// bounded and flat in the number of services, which is what makes it
 /// acceptable there.
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
+    render_services_text_with_devices(paths, all, |ready| fetch_service_devices(paths, ready))
+}
+
+/// [`render_services_text`] with the live device probe injected.
+///
+/// Split out because the probe is the one thing a unit test cannot have: it is
+/// a `Healthcheck` RPC to a running engine, so in default CI (no GPU, no
+/// servers) it answers nothing and the `device:` row is never rendered at all —
+/// deleting the row would stay green everywhere except the GPU lanes, which is
+/// exactly the gap this closes. The seam takes only the probe, not the row:
+/// which services are offered to it (`status == "ready"`) and where the row
+/// lands both stay in the shared body, so a test can pin them.
+fn render_services_text_with_devices(
+    paths: &AppPaths,
+    all: bool,
+    probe_devices: impl FnOnce(Vec<(&str, &str)>) -> HashMap<String, String>,
+) -> Result<String> {
     // Counts describe the WHOLE registry, not the rows this view keeps. The
     // default view hides records that are not live, and counting the filtered
     // list made the header say "none ready" on a host whose only local servers
@@ -434,12 +451,12 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
     // same gate `rocm serve`'s summary uses, and capped in aggregate by
     // `fetch_service_devices` so a long list (or one unresponsive server)
     // cannot turn what used to be a local-only render into a long wait.
-    let devices = fetch_service_devices(
-        paths,
+    let devices = probe_devices(
         records
             .iter()
             .filter(|record| record.status == "ready")
-            .map(|record| (record.service_id.as_str(), record.engine.as_str())),
+            .map(|record| (record.service_id.as_str(), record.engine.as_str()))
+            .collect(),
     );
 
     let _ = writeln!(output, "Servers");
@@ -2498,6 +2515,110 @@ pub(crate) mod tests {
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
+        Ok(())
+    }
+
+    /// The *positive* half of the `device:` row, which nothing in default CI
+    /// could assert before: it needs a running engine to answer a `Healthcheck`,
+    /// and this suite has none, so the row rendered nowhere and deleting the
+    /// `if let` that writes it stayed green off the GPU lanes.
+    ///
+    /// Three things are pinned here, all of which a plausible edit could undo
+    /// while the rest of the suite stayed green: that only `ready` services are
+    /// probed at all (a `starting` server has nothing to report and probing it
+    /// would spend the shared budget on a certain miss), that a device that
+    /// *is* known reaches the output, and that it lands between `engine:` and
+    /// `model:` rather than merely appearing somewhere in the text.
+    #[test]
+    fn render_services_text_shows_the_device_a_ready_engine_reports() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (root, paths) = test_paths("services-list-device");
+        paths.ensure()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let ready_port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0_u8; 512];
+                let read = stream.read(&mut request)?;
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(())
+        });
+        let current_pid = std::process::id();
+        for (service_id, status, port) in [
+            ("svc-ready", "ready", ready_port),
+            ("svc-starting", "starting", 11438_u16),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                port,
+                "managed",
+                current_pid,
+                Some("therock-release".to_owned()),
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            record.status = status.to_owned();
+            record.write()?;
+        }
+
+        let mut offered: Vec<(String, String)> = Vec::new();
+        let rendered = render_services_text_with_devices(&paths, false, |ready| {
+            offered = ready
+                .iter()
+                .map(|(id, engine)| ((*id).to_owned(), (*engine).to_owned()))
+                .collect();
+            HashMap::from([(
+                "svc-ready".to_owned(),
+                "rocm gpu 0 (AMD Instinct MI300X)".to_owned(),
+            )])
+        })?;
+        server
+            .join()
+            .expect("fake models server should not panic")?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            offered,
+            [("svc-ready".to_owned(), "vllm".to_owned())],
+            "only a service ready to answer may be probed"
+        );
+        assert!(
+            rendered.contains("  device: rocm gpu 0 (AMD Instinct MI300X)\n"),
+            "the device the engine reported must reach the list:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("  engine: vllm\n  device: rocm gpu 0 (AMD Instinct MI300X)\n  model: "),
+            "the device belongs with the engine that selected it, above the \
+             model:\n{rendered}"
+        );
+        // The service the probe said nothing about keeps no row of its own.
+        assert_eq!(
+            rendered.matches("  device: ").count(),
+            1,
+            "only the service with a reported device gets a row:\n{rendered}"
+        );
         Ok(())
     }
 
