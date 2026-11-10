@@ -398,20 +398,16 @@ mod tests {
     /// to attempt a `llamacpp:rocm` install: that attempt is the whole premise
     /// of `@id:serve-lemonade-preparation-recovery`, which then fails it.
     ///
-    /// The table is read out of the fixture's own source rather than copied, so
-    /// editing it there is checked here, on every lane that runs unit tests. A
-    /// parser change that stopped accepting it would otherwise make the
-    /// scenario stop reaching the failure it asserts, with no unit test
-    /// noticing.
+    /// The fixture prints the table from a data file, and this test reads the
+    /// same file, so editing it there is checked here, on every lane that runs
+    /// unit tests. A parser change that stopped accepting it would otherwise
+    /// make the scenario stop reaching the failure it asserts, with no unit
+    /// test noticing.
     #[test]
     fn the_e2e_fake_runtime_table_drives_a_rocm_backend_install() {
-        const FIXTURE: &str = include_str!("../../../tests/e2e-cucumber/src/bin/fake-lemonade.rs");
-        let table = FIXTURE
-            .split_once("const BACKENDS_TABLE: &str = r\"")
-            .and_then(|(_, rest)| rest.split_once("\";"))
-            .map(|(table, _)| table)
-            .expect("fake-lemonade.rs must declare BACKENDS_TABLE as a raw string literal without hashes");
-        let backends = parse_llamacpp_backend_statuses(table);
+        const TABLE: &str =
+            include_str!("../../../tests/e2e-cucumber/fixtures/lemonade_backends_table.txt");
+        let backends = parse_llamacpp_backend_statuses(TABLE);
         assert_eq!(
             backends,
             vec![

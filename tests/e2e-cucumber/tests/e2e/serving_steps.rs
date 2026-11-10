@@ -2160,8 +2160,8 @@ async fn assert_no_runtime_manifest_written(world: &mut E2eWorld) {
 
 /// Serve a Lemonade model under the GPU-required default while the unrelated
 /// live service planted above exists. No fault-injection env var: the scripted
-/// Lemonade backend failure would waive the very GPU pre-flight this scenario
-/// asserts.
+/// Lemonade free-space override would waive the very GPU pre-flight this
+/// scenario asserts.
 #[when("the user serves a different model with Lemonade under the GPU-required default")]
 async fn user_serves_other_model_with_unrelated_service_live(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(

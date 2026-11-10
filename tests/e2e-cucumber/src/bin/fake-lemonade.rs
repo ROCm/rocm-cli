@@ -38,15 +38,10 @@ use e2e_cucumber::fixture_binary::FAKE_LEMONADE_INSTALL_REFUSAL;
 
 /// What `lemonade backends` prints here.
 ///
-/// Read by the Lemonade engine's own unit tests (`include_str!` of this file),
-/// which check that the engine parses it into a `llamacpp:rocm` install
-/// attempt. Keep it a raw string literal without hashes: that test extracts it
-/// textually.
-const BACKENDS_TABLE: &str = r"Recipe    Backend   Status
---------  --------  -----------
-llamacpp  rocm      installable
-llamacpp  vulkan    unsupported
-";
+/// A data file rather than a literal so the Lemonade engine's own unit tests
+/// can `include_str!` the same file and check that the engine parses it into a
+/// `llamacpp:rocm` install attempt.
+const BACKENDS_TABLE: &str = include_str!("../../fixtures/lemonade_backends_table.txt");
 
 fn main() -> ExitCode {
     // Copied rather than symlinked (self-hosted Windows runners commonly lack

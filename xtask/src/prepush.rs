@@ -211,14 +211,21 @@ fn package_args<'a>(packages: Option<impl Iterator<Item = &'a str>>) -> Vec<Stri
 ///   every `rocm ...` command shown there, `rocm` compiles in the assistant
 ///   skill, and xtask's tests read the pinned release key under `docs/keys` and
 ///   other docs.
-/// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
-///   although it lives in the e2e crate.
+/// - the e2e fixtures: `rocm-core`'s `fix` tests `include_str!` the PowerShell
+///   cases, and `rocm-engine-lemonade`'s backend tests the fake runtime's
+///   `lemonade backends` table, although both live in the e2e crate. The
+///   directory entry keeps `rocm-core` for any fixture; the table's own entry
+///   adds its one other reader.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
     ("README.md", &["rocm", "xtask"]),
     ("docs/", &["rocm", "xtask"]),
     ("skills/", &["rocm", "xtask"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
+    (
+        "tests/e2e-cucumber/fixtures/lemonade_backends_table.txt",
+        &["rocm-engine-lemonade"],
+    ),
 ];
 
 fn read_pattern_matches(pattern: &str, file: &str) -> bool {

@@ -1,0 +1,4 @@
+Recipe    Backend   Status
+--------  --------  -----------
+llamacpp  rocm      installable
+llamacpp  vulkan    unsupported

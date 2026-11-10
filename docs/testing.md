@@ -992,8 +992,9 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
 so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
 file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
-test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
-selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+test reads them and `rocm` compiles in the assistant skill), and the e2e `fixtures/` directory also
+selects `rocm-core` (its tests `include_str!` the PowerShell cases), and the fake Lemonade runtime's
+backends table there also selects `rocm-engine-lemonade` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
 [prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
 `include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
 covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
@@ -1943,7 +1944,7 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES`, compiled only into the
   `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
   disk that nothing was downloaded. That variable also waives serve's no-GPU
-  refusal, as serve-18's failure hook does.
+  refusal, so the scenario reaches the install on a host with no GPU.
 - `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
   and checks `rocm storage report` lists both and flags the unused one.
 - `lemonade-installs-04` uninstalls that runtime and checks the install record

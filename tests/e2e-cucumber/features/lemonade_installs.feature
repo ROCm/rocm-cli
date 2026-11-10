@@ -27,7 +27,7 @@ Feature: Lemonade installs on disk
 
   # `rocm serve` reaches the same install on its own, which is how the second
   # copy used to appear without a word. The free-space override also stands in
-  # for the GPU the no-GPU lane does not have, as serve-18's failure hook does.
+  # for the GPU the no-GPU lane does not have.
   @id:lemonade-installs-serve-refused-without-space
   Scenario: lemonade-installs-02 - Serving with Lemonade on a drive that cannot hold it is refused before downloading
     Given the drive for a new Lemonade install cannot hold even Lemonade itself
