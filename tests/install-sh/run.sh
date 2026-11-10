@@ -467,6 +467,7 @@ for kind in file link markedlink dangling; do
       ln -s "${own_target}" "${own_path}"
       ;;
     dangling) ln -s "${own_target}" "${own_path}" ;;
+    *) fail "unknown rocm.fish kind ${kind}" ;;
   esac
   install_case "${own_log}" "${own_home}" /bin/bash "${FISH_PATH}" 1
   assert_log_contains "${own_log}" "note: fish completions not installed: ${own_path} already exists and was not written by this installer" "user's rocm.fish (${kind}) was not reported as left alone"
@@ -485,6 +486,7 @@ for kind in file link markedlink dangling; do
       [ -L "${own_path}" ] || fail "user's dangling rocm.fish link was replaced"
       assert_absent_file "${own_target}" "the installer wrote through the user's dangling rocm.fish link"
       ;;
+    *) fail "unknown rocm.fish kind ${kind}" ;;
   esac
   if grep -F -q -- "completions " "${own_home}/.local/bin/.rocm-cli-path-edit"; then
     fail "user's rocm.fish (${kind}) was recorded for uninstall to remove"
