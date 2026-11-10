@@ -585,9 +585,13 @@ carries the same ROCm build identifier.
 Nothing about this happens on its own. Without a `--version` of 10 or newer,
 `install sdk` resolves the same release and nightly sources as before. It doesn't
 quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
-you what it couldn't find instead. When a ROCm 10 pin can't be satisfied, the
-error lists the other stable ROCm 10 releases that source publishes, if any,
-and suggests one of them to re-run with.
+you what it couldn't find instead. When a ROCm 10 pin can't be satisfied
+because that release isn't published, or has no installable packages for this
+computer, the error lists the other stable ROCm 10 releases that source
+publishes, if any, and suggests one of them to re-run with. When `rocm update`
+fails the same way, it suggests a whole `rocm install sdk` command that keeps
+the runtime's format and `--devel` toolchain. A failure no other version can
+fix, such as an unknown GPU arch or a network error, suggests no version.
 
 #### Driver installation
 

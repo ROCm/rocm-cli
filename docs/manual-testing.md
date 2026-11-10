@@ -243,6 +243,11 @@ Version pins, checked with `--dry-run`:
 - A ROCm 10 pin the source cannot satisfy fails with a list of the other
   stable ROCm 10 releases it publishes, if any, and a `--version` to try. Running that suggestion
   must succeed, and the error must not suggest `--channel nightly`.
+- A `rocm update --apply` of a ROCm 10 runtime that fails the same way
+  suggests a whole `rocm install sdk` command with the runtime's `--format`
+  and, for a `--devel` runtime, `--devel`. Running that command with
+  `--dry-run` must succeed. A failure no other version can clear, such as an
+  unknown device target, must suggest no version.
 
 ### 2a. A GPU target with no ROCm build
 
