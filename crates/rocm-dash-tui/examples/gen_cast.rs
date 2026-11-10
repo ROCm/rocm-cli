@@ -54,7 +54,8 @@ struct Args {
     input: PathBuf,
 
     /// Output cast file. Parent dir created if absent. The default is relative
-    /// to the working directory.
+    /// to the working directory and is git-ignored at the repository root, so a
+    /// run from another directory leaves the file there.
     #[arg(long, default_value = "rocm-dash.cast")]
     output: PathBuf,
 
