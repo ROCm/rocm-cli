@@ -528,10 +528,38 @@ version. An upgrade or downgrade keeps the previous install on disk. Only a
 same-version reinstall reuses the same root.
 
 `--prefix` changes this. The folder you name is used as-is for every version, so
-successive installs into one prefix replace each other in place. If the venv
-already there no longer runs its own Python, it is removed outright and rebuilt.
-The approval prompt doesn't cover this, because it asks only about changing the
-active default runtime, not about what a named prefix loses.
+successive installs into one prefix replace each other in place. A venv is
+reused when its `pyvenv.cfg` is there and its Python runs, reports the required
+wheel tag, and reports the folder as its `sys.prefix`. Otherwise, a folder that
+is missing or empty gets a new venv, and a folder with anything in it is used
+only if ROCm CLI can show a ROCm CLI install was made there: the
+`.rocm-cli-runtime.json` a finished wheel install writes, naming that folder,
+or a folder inside `runtimes/wheel` in ROCm CLI's data folder, where it puts
+wheel runtimes itself. ROCm CLI then removes only the venv's own files
+(`bin`/`Scripts`, `lib`/`Lib`, `lib64`, `include`/`Include`, `CACHEDIR.TAG`,
+`pyvenv.cfg`), keeps everything else in the folder, such as ComfyUI's models,
+workflows, and outputs under `apps/comfyui`, and prints what it kept and which
+check the old venv failed. If that clearing stops part-way, the next install
+sees an incomplete venv and clears it again. Any other non-empty folder, or one
+in a protected system location, is refused with nothing changed, and the
+refusal names what it found; choose an empty folder, or one where a ROCm CLI
+install finished, instead.
+
+`--dry-run` runs nothing from the install folder, since the folder can hold any
+`bin/python`. It reads the folder's files and reports which of these will
+happen, with `command: none; the install will refuse this folder` and a
+`refusal:` line holding the install's message for a folder the install would
+refuse. Whether a folder holding both a Python and `pyvenv.cfg` would be
+reused depends on running that Python, so the preview says it cannot tell and
+shows both outcomes. If the Python the preview would check first (on `PATH`, or
+`ROCM_CLI_PYTHON`) is inside the `--prefix` folder, it stops and says it did not
+run it.
+
+ROCm CLI never runs `uv venv` over a folder that has anything in it without
+`--allow-existing`, and sets `UV_VENV_CLEAR=0` for that command, so neither
+uv's own handling of an existing folder (older uv deletes an existing venv,
+newer uv refuses it) nor a `UV_VENV_CLEAR` exported in your shell can clear the
+folder.
 
 #### ROCm 10 and newer
 

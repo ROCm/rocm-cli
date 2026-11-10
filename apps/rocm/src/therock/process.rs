@@ -85,17 +85,25 @@ fn emit_progress_line(message: &str) {
     PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().push(message.to_owned()));
 }
 
-fn capture_command_output(program: &Path, args: &[&str]) -> Result<Output> {
+fn capture_command_output(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<Output> {
     if runtime_is_windows() {
-        return capture_command_output_with_temp_files(program, args);
+        return capture_command_output_with_temp_files(program, args, cwd);
     }
-    Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
         .output()
         .with_context(|| format!("failed to launch {}", program.display()))
 }
 
-fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Result<Output> {
+fn capture_command_output_with_temp_files(
+    program: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> Result<Output> {
     let temp_dir = windows_temp_dir("rocm-cli-command")?;
     let stdout_path = temp_dir.join("stdout.txt");
     let stderr_path = temp_dir.join("stderr.txt");
@@ -103,7 +111,11 @@ fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Resu
         .with_context(|| format!("failed to create {}", stdout_path.display()))?;
     let stderr_file = fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let status = Command::new(program)
+    let mut command = Command::new(program);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let status = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
@@ -170,7 +182,7 @@ pub(super) fn capture_python_stdout(
     context_text: &str,
 ) -> Result<String> {
     if !runtime_is_windows() {
-        let output = capture_command_output(python_executable, &["-c", script])?;
+        let output = capture_command_output(python_executable, &["-c", script], None)?;
         if !output.status.success() {
             bail!(
                 "{context_text}: {}",
@@ -235,8 +247,25 @@ fn windows_child_path(path: &Path) -> String {
 }
 
 pub(super) fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
+    run_command_in(program, args, None, context_text)
+}
+
+/// [`run_command`], started in `cwd` when one is given. `python -m` puts the
+/// working directory first on `sys.path`, so a module run that way from a
+/// folder someone else controls can import that folder's code instead of the
+/// standard library's; a caller that runs one starts it in a folder it made.
+pub(super) fn run_command_in(
+    program: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    context_text: &str,
+) -> Result<()> {
     if runtime_is_windows() {
-        let status = Command::new(program)
+        let mut command = Command::new(program);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let status = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -249,7 +278,7 @@ pub(super) fn run_command(program: &Path, args: &[&str], context_text: &str) -> 
         bail!("{context_text}: command exited with status {status}");
     }
 
-    let output = capture_command_output(program, args)?;
+    let output = capture_command_output(program, args, cwd)?;
     if output.status.success() {
         return Ok(());
     }

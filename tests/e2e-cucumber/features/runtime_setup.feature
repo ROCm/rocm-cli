@@ -634,3 +634,82 @@ Feature: Runtime configuration
     And a host with no uv and no usable Python
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
     Then the preview says it did not resolve the ROCm 10 package versions, as it says
+
+  # `install sdk --prefix` uses the folder it is given as-is, and rebuilds the
+  # Python environment in it when the one already there no longer runs. That
+  # rebuild used to delete the whole folder, whoever made it — reported for a
+  # home folder whose `~/bin/python` fails `--version`. The install now refuses
+  # a folder ROCm CLI cannot show it created, and the second half takes the
+  # refusal's own advice to prove it is a way forward, not a dead end. The
+  # `--dry-run` preview comes first: it has to predict that refusal from the
+  # folder's files, without running the folder's Python, and print
+  # `command: none`, since the install will run no command.
+  #
+  # No GPU or network: the index is a loopback fixture, and the install pins
+  # ROCm 10 with an exact arch, the one path whose device payload comes from the
+  # arch given rather than a probe of the host GPU. A fake uv and Python stand
+  # in for the real ones, so the install stops at the package step, after the
+  # decision under test. Linux-only because those fakes and the broken Python
+  # are shell scripts.
+  @id:runtime-install-sdk-refuses-unowned-prefix @requires-os:linux
+  Scenario: runtime-29 - Installing into a home folder with a broken Python refuses rather than deleting it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's home folder holds their files and a Python that no longer runs
+    When the user previews installing the SDK into their home folder
+    Then the preview predicts the refusal of the home folder and changes nothing
+    When the user installs the SDK into their home folder
+    Then the install refuses to rebuild the home folder and changes nothing in it
+    When the user installs the SDK into an empty folder instead
+    Then the install gets past the refusal and creates a Python environment in the empty folder
+
+  # Even a folder ROCm CLI did create holds more than the environment: ComfyUI
+  # keeps the user's models, workflows and outputs under `apps/comfyui`. A
+  # rebuild replaces the environment's own files and nothing else, and the line
+  # it prints names what it kept — asserted together with the disk. The preview
+  # runs nothing from the folder, so it cannot tell reuse from a rebuild; it
+  # says so and shows the `uv venv --allow-existing` a rebuild runs. Same hermetic setup and
+  # Linux-only reason as runtime-29; the fake uv refuses a non-empty folder
+  # without `--allow-existing` and wipes it on `--clear`, as uv 0.10 does.
+  @id:runtime-install-sdk-rebuild-keeps-comfyui-data @requires-os:linux
+  Scenario: runtime-30 - Rebuilding a broken environment ROCm CLI created keeps the ComfyUI data in its folder
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a folder ROCm CLI installed into holds ComfyUI models and a Python that no longer runs
+    When the user previews installing the SDK into the folder ROCm CLI installed into
+    Then the preview shows a rebuild in place that keeps the folder
+    When the user installs the SDK into the folder ROCm CLI installed into
+    Then the install rebuilds only the environment's own files and reports keeping the ComfyUI data
+
+  # A preview runs nothing from the install folder. `install_sdk_dry_run` is a
+  # tool the local assistant may call without approval and with a `--prefix` of
+  # its choosing, so a folder holding someone else's `bin/python` (a downloaded
+  # or cloned tree) must not be run by a preview. Whether a folder with a
+  # Python and `pyvenv.cfg` would be reused is something only running that
+  # Python can tell, so the preview says it cannot tell and prints the refusal
+  # the install gives if it is not reused. The planted Python records every
+  # run, and the Then checks the record together with the line.
+  #
+  # Same hermetic setup and Linux-only reason as runtime-29. The interpreter
+  # search a preview runs is held to the same rule by the unit test
+  # `a_dry_run_runs_no_python_from_the_install_folder_while_searching` in
+  # `apps/rocm/src/therock/python.rs`.
+  @id:runtime-install-preview-runs-nothing-from-prefix @requires-os:linux
+  Scenario: runtime-31 - Previewing an SDK install into a folder holding another Python environment runs nothing from it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's folder holds a Python environment ROCm CLI did not make
+    When the user previews installing the SDK into that folder
+    Then the preview says it cannot tell whether that environment is reused, runs nothing from the folder, and changes nothing
+
+  # The same rule for the Python a preview checks before anything else: when it
+  # is inside the install folder (here `ROCM_CLI_PYTHON` names the folder's own
+  # `bin/python`; the same holds for one found on `PATH`), the preview stops
+  # rather than run it, and says why. The planted Python records every run, and
+  # the Then checks the record together with the message. Same hermetic setup
+  # and Linux-only reason as runtime-29; the `PATH` and bare-name cases are unit
+  # tested by `a_dry_run_runs_no_python_from_the_install_folder_while_searching`.
+  @id:runtime-install-preview-stops-at-prefix-python @requires-os:linux
+  Scenario: runtime-32 - Previewing an SDK install whose Python is inside the install folder stops without running it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's folder holds a Python environment ROCm CLI did not make
+    When the user previews installing the SDK into that folder with that folder's Python as ROCM_CLI_PYTHON
+    Then the install fails
+    And the preview stops without running that Python and says why

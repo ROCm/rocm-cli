@@ -385,7 +385,7 @@ fn install_wheel_runtime(
     // configuration. It asks what a real install would do instead and prints
     // that. A real install resolves, and so prepares, exactly as it always did.
     // It also prints the line naming the interpreter, once the decision is made.
-    let python = python_for_install(paths, python_requirement, dry_run)?;
+    let python = python_for_install(paths, python_requirement, dry_run, prefix.as_deref())?;
     let wheel_compatibility = python.wheel_compatibility()?;
     progress_line(format!(
         "Checking TheRock {} packages for this AMD GPU...",
@@ -489,7 +489,7 @@ fn install_wheel_runtime(
     let mut output = String::new();
     write_wheel_plan(&mut output, &plan);
     if dry_run {
-        write_dry_run_tail(&mut output, &plan);
+        write_dry_run_tail(&mut output, &plan, Some(paths));
         return Ok(SdkInstallResult::plan(output));
     }
 
@@ -1011,11 +1011,13 @@ fn runtime_key(
 }
 
 fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> PathBuf {
-    paths
-        .data_dir
-        .join("runtimes")
-        .join(format)
-        .join(runtime_key)
+    managed_format_root(paths, format).join(runtime_key)
+}
+
+/// The folder every managed runtime of `format` is created in, one per
+/// runtime key.
+fn managed_format_root(paths: &AppPaths, format: &str) -> PathBuf {
+    paths.data_dir.join("runtimes").join(format)
 }
 
 /// Where to build a runtime, resolved to its real location on disk first.

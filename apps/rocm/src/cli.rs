@@ -788,6 +788,11 @@ rocm install sdk --devel")]
         #[arg(long, default_value = "wheel")]
         format: InstallFormat,
         /// Full folder path where the ROCm Python environment should be created.
+        ///
+        /// Use an empty folder or one where a ROCm CLI install finished. In a
+        /// folder that is not empty, ROCm CLI reuses a working environment, or
+        /// rebuilds only its venv files if a ROCm CLI install was recorded
+        /// there; any other non-empty folder is refused with nothing changed.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
         /// Exact TheRock package version to install.
@@ -823,6 +828,11 @@ rocm install sdk --devel")]
         /// host with no uv installed, the plan marks the package versions it
         /// would need uv to choose, and everything made from them, as not
         /// resolved.
+        ///
+        /// Runs nothing from the install folder: what happens to a Python
+        /// environment already there is read from its files, and where only
+        /// running its Python could tell whether it is reused, the plan says
+        /// so and shows both outcomes.
         #[arg(long)]
         dry_run: bool,
         /// Approve replacing the current active default ROCm runtime (and

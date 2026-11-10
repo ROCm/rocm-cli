@@ -156,8 +156,11 @@ Expected result:
   `--approve-replacing-active-default` as the flag to add.
 - With `--approve-replacing-active-default`, the install proceeds without
   asking and prints a line crediting that flag by name — not `--yes`.
-- `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
-  active default is: the preview stops before the gate.
+- `rocm install sdk ... --dry-run` never prompts, and never asks for
+  `--approve-replacing-active-default`, whatever the active default is: the
+  preview stops before that gate. It does still report refusals the install
+  would give for other reasons, such as the Python and install-folder checks
+  below.
 - On a host with no usable Python (a minimal container; run with `PATH` pointing
   at an empty folder and no `ROCM_CLI_PYTHON`) and a clean data folder,
   `rocm install sdk ... --dry-run` still prints a plan. Its `python_launcher:`
@@ -195,6 +198,30 @@ Expected result:
   what was found (for example that the `PATH` Python is not usable) and never
   says a real install would prepare or use a managed Python.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
+- If the `--prefix` folder already has anything in it and its venv does not
+  run, rocm-cli rebuilds only that venv's own files, and only in a folder where
+  a wheel install finished (its `.rocm-cli-runtime.json` names the folder).
+  It prints what it kept and why the venv could not be used (for example `no
+  pyvenv.cfg beside it`, or `whose sys.prefix is ..., not this folder`), and
+  anything else in the folder, such as `apps/comfyui`, is still there
+  afterwards. A folder it did not create, such as your home folder with a
+  broken `~/bin/python`, is refused with nothing changed, and the refusal names
+  the same reason.
+- `--dry-run` runs nothing from the `--prefix` folder: put a `bin/python` there
+  that writes a file when run, and after the preview that file does not exist.
+  It reads the folder's files instead. For your home folder with a broken
+  `~/bin/python` and no `pyvenv.cfg`, `python_env:` says
+  `the install will refuse this folder`, `command:` is
+  `none; the install will refuse this folder`, and a
+  `refusal:` line gives the install's message. For a folder with both a Python
+  and `pyvenv.cfg`, it cannot tell without running that Python whether the
+  venv would be reused, so `python_env:` says so, `command:` shows only the
+  `uv pip install`, and a `command_if_rebuilt:` or `refusal_if_not_reused:`
+  line gives the other outcome. The `uv venv` commands it shows start with
+  `UV_VENV_CLEAR=0`, as the install runs them; a rebuild first removes the
+  venv's own entries, which the command does not show. If the Python the
+  preview would check first (on `PATH`, or `ROCM_CLI_PYTHON`) is inside the
+  `--prefix` folder, the preview stops and says it did not run it.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned

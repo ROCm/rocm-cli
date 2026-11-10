@@ -14,6 +14,12 @@ rocm-cli local assistants use structured tools, not shell commands.
   before anything runs.
 - Read-only ROCm checks can run immediately and return their output to the
   model.
+- A read-only check runs nothing from a location the model chose. The
+  `install_sdk_dry_run` preview takes a model-chosen `--prefix`, so it reads
+  that folder's files and never runs a `bin/python` or script found there; where
+  only running it could tell what the install would do, the preview says it
+  cannot tell. It also stops, without running it, when the Python it would check
+  first is inside that folder.
 - Installs, starts, stops, updates, deletes, settings changes, and other
   mutations must pause on the TUI approval screen.
 - The model should inspect first, then request a change only when the inspection

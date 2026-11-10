@@ -816,7 +816,9 @@ rocm install sdk --channel release --format wheel < /dev/null   # expect the ref
 
 The preview path is unaffected: `--dry-run` returns before the gate is
 consulted, so `rocm install sdk --channel release --format wheel --dry-run`
-never prompts and never refuses, whatever the active default is.
+never prompts and never asks for that consent, whatever the active default is.
+It can still fail, or report that the install would refuse, for the Python and
+install-folder reasons below.
 
 The preview also prepares no Python. On a host with no usable Python, a real
 install downloads a managed `uv`, has it install Python, and saves that Python's
@@ -908,6 +910,34 @@ preview does still write its package-index cache under the cache folder.
 The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
 previews in this sense: on a ROCm 10 or newer runtime they resolve with `uv` and
 can fetch it. They prepare no Python, though (see `update-09` and `update-10`).
+
+The preview runs nothing from the install folder. `install_sdk_dry_run` is a
+model-callable tool that runs without approval and with a model-chosen
+`--prefix`, so a folder holding a hostile `bin/python` must not be executed by
+it. The venv step is decided from the folder's files (`dry_run_venv_plan` in
+[python.rs](../apps/rocm/src/therock/python.rs)); where only running the
+folder's Python could tell whether its venv is reused, the preview says so and
+prints both outcomes (`command:` plus `command_if_rebuilt:` or
+`refusal_if_not_reused:`). The interpreter search stops the preview, saying it
+did not run it, when the Python it would check first is inside `--prefix`.
+`a_dry_run_reads_the_install_folder_and_runs_nothing_from_it` plants a Python
+that records every run in each folder state and asserts the lines and an empty
+record; `a_dry_run_runs_no_python_from_the_install_folder_while_searching`
+covers `PATH`, an absolute `ROCM_CLI_PYTHON` and a bare one resolved through
+`PATH`. End to end, scenarios `runtime-29` (an unowned home folder is refused,
+by the preview and by the install, and the advised empty folder works),
+`runtime-30` (a rebuild of a folder ROCm CLI made keeps the ComfyUI data and
+says why the old venv was not reused) and `runtime-31` (a preview of a folder
+holding someone else's venv says it cannot tell and runs nothing) and
+`runtime-32` (a preview whose `ROCM_CLI_PYTHON` is inside the folder stops
+without running it) run the real
+CLI with a loopback index, a fake `uv` and planted Pythons that record every
+run. They are Linux-only because those stand-ins are shell scripts. The
+folder decision itself (empty, refused with the condition named, owned by the
+wheel marker) reads only files, so
+`the_venv_folder_decision_reads_files_on_every_platform` runs it on every
+platform, the Windows CI job included, with that platform's venv layout; no
+Windows test runs a preview or a rebuild against a planted interpreter.
 
 Then it verifies:
 
