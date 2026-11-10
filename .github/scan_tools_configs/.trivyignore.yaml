@@ -1,0 +1,22 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Path-scoped trivy suppressions, selected by `ignorefile` in trivy.yml.
+# Reference: https://trivy.dev/latest/docs/configuration/filtering/#by-finding-ids
+# (the plain-text .trivyignore beside this file cannot scope by path, so it is
+# not used.)
+
+misconfigurations:
+  # tests/remote-ssh/Dockerfile is a throwaway sshd stand-in for a remote GPU
+  # machine, built and run only by the remote scenarios (tests/remote-ssh/run.sh)
+  # and never published. It has to run as root (sshd, adduser/chpasswd, root's
+  # authorized_keys) and listen on port 22, because the point is to exercise a
+  # real OpenSSH server the way `rocm remote` meets one.
+  - id: AVD-DS-0002 # image user should not be 'root'
+    paths:
+      - tests/remote-ssh/Dockerfile
+    statement: Test-only sshd stand-in; needs root to run sshd and provision accounts.
+  - id: AVD-DS-0004 # port 22 exposed
+    paths:
+      - tests/remote-ssh/Dockerfile
+    statement: Test-only sshd stand-in; port 22 is the thing under test.

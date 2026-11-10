@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +42,9 @@ env:
 
 jobs:
   nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build Linux nightly assets
     runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
@@ -56,6 +59,8 @@ jobs:
       ref: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -130,7 +135,7 @@ jobs:
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
-            -e ROCM_CLI_RELEASE_REF="${{ github.ref_name }}" \
+            -e ROCM_CLI_RELEASE_REF="${GITHUB_REF_NAME}" \
             -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
@@ -157,9 +162,11 @@ jobs:
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          STEPS_META_OUTPUTS_DATE: ${{ steps.meta.outputs.date }}
+          STEPS_META_OUTPUTS_SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
-          DATE="${{ steps.meta.outputs.date }}"
-          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          DATE="${STEPS_META_OUTPUTS_DATE}"
+          SHORT_SHA="${STEPS_META_OUTPUTS_SHORT_SHA}"
           DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
           chmod +x install.sh
@@ -190,6 +197,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          STEPS_CHECK_OUTPUTS_COMMITS: ${{ steps.check.outputs.commits }}
         run: |
           STAGING_TAG="nightly-staging-${DATE}-${SHORT_SHA}"
           gh release delete "${STAGING_TAG}" --yes --cleanup-tag 2>/dev/null || true
@@ -202,7 +210,7 @@ jobs:
 
           Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))
 
-          ${{ steps.check.outputs.commits }} commit(s) since the previous nightly.
+          ${STEPS_CHECK_OUTPUTS_COMMITS} commit(s) since the previous nightly.
 
           Install the latest nightly on Linux x86_64:
 
@@ -223,12 +231,17 @@ jobs:
           echo "tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
 
   windows-nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build and upload Windows nightly
     runs-on: windows-latest
     needs: nightly
     if: needs.nightly.outputs.skip != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
@@ -252,9 +265,11 @@ jobs:
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          NEEDS_NIGHTLY_OUTPUTS_DATE: ${{ needs.nightly.outputs.date }}
+          NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA: ${{ needs.nightly.outputs.short_sha }}
         run: |
-          $date = "${{ needs.nightly.outputs.date }}"
-          $shortSha = "${{ needs.nightly.outputs.short_sha }}"
+          $date = "$env:NEEDS_NIGHTLY_OUTPUTS_DATE"
+          $shortSha = "$env:NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA"
           $dist = "rocm-cli-nightly-$date-$shortSha-windows-amd64"
           cargo xtask package $dist
           Copy-Item "dist\$dist.zip" "dist\rocm-cli-nightly-windows-amd64.zip"
@@ -277,8 +292,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG: ${{ needs.nightly.outputs.staging_tag }}
         run: |
-          $stagingTag = "${{ needs.nightly.outputs.staging_tag }}"
+          $stagingTag = "$env:NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG"
           if (-not $stagingTag) {
             throw "nightly staging release tag was not produced"
           }
@@ -289,6 +305,9 @@ jobs:
           gh release upload $stagingTag @assets --clobber
 
   publish-nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Publish nightly
     runs-on: ubuntu-24.04 # one LTS: publishing only
     needs:
@@ -297,15 +316,20 @@ jobs:
     if: needs.nightly.outputs.skip != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Publish staged nightly
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG: ${{ needs.nightly.outputs.staging_tag }}
+          NEEDS_NIGHTLY_OUTPUTS_DATE: ${{ needs.nightly.outputs.date }}
+          NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA: ${{ needs.nightly.outputs.short_sha }}
         run: |
-          STAGING_TAG="${{ needs.nightly.outputs.staging_tag }}"
-          DATE="${{ needs.nightly.outputs.date }}"
-          SHORT_SHA="${{ needs.nightly.outputs.short_sha }}"
+          STAGING_TAG="${NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG}"
+          DATE="${NEEDS_NIGHTLY_OUTPUTS_DATE}"
+          SHORT_SHA="${NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA}"
           ASSET_DIR="$(mktemp -d)"
           if [ -z "${STAGING_TAG}" ]; then
             echo "nightly staging release tag was not produced" >&2
@@ -358,6 +382,9 @@ jobs:
           gh release delete "${STAGING_TAG}" --yes 2>/dev/null || true
 
   cleanup-staging-nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Clean failed nightly staging release
     runs-on: ubuntu-24.04 # one LTS: release cleanup only
     needs:
@@ -369,7 +396,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
+          NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG: ${{ needs.nightly.outputs.staging_tag }}
+        run: gh release delete "${NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG}" --yes --cleanup-tag 2>/dev/null || true
 
   # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
   # large-model serve), which the per-PR e2e-selfhosted.yml `e2e-gpu` job skips
@@ -395,6 +423,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -495,6 +525,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -574,6 +606,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -655,6 +689,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -754,6 +790,8 @@ jobs:
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
         run: |
@@ -842,6 +880,8 @@ jobs:
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Reclaim GPU from stray E2E processes
         shell: powershell
@@ -1122,6 +1162,8 @@ jobs:
       ROCM_CLI_RELEASE_REF: "${{ github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # See e2e-wsl in e2e-selfhosted.yml for the full rationale behind each
       # of these steps — this job mirrors it exactly, minus the scoped
@@ -1553,9 +1595,8 @@ jobs:
     name: E2E consolidated report (nightly)
     runs-on: ubuntu-24.04 # one LTS: only merges report.json files
     timeout-minutes: 15
-    # Narrower than the workflow-level `contents: write`, which exists for the
-    # release-publishing jobs. This one checks out, downloads artifacts, runs an
-    # xtask and uploads; it has no business being able to write to the repo.
+    # This one checks out, downloads artifacts, runs an xtask and uploads; it
+    # has no business being able to write to the repo.
     # `actions: read` lets the missing-report check list this run's artifacts.
     permissions:
       contents: read
@@ -1575,6 +1616,8 @@ jobs:
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:

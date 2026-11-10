@@ -2,12 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Context, Result, bail};
-use std::fs;
-use std::path::Path;
+use anyhow::{Result, bail};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod amd_smi;
+pub mod anthropic_endpoint;
 #[cfg(all(test, unix))]
 mod archive_props;
 pub mod atomic_write;
@@ -59,6 +58,8 @@ pub mod service_record;
 pub mod terminal;
 pub mod user_path;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod foreign_temp_probe;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
@@ -67,6 +68,10 @@ pub mod uv;
 pub mod vllm_oom;
 pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
+pub use anthropic_endpoint::{
+    ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
+    anthropic_endpoint_ready, wait_for_published_anthropic_endpoint,
+};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
@@ -76,7 +81,9 @@ pub use automation::{
     load_recent_automation_events, load_recent_automation_proposals,
     update_automation_proposal_status,
 };
-pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
+pub use binary_paths::{
+    daemon_binary_path, engine_binary_path, sibling_binary_path, sibling_binary_path_from,
+};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
@@ -103,8 +110,8 @@ pub use disk_space::{
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 pub use download::{
-    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
+    Backoff, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest,
+    download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress,
 };
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
@@ -142,7 +149,11 @@ use host_gpu::{
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
 pub use jsonl_store::jsonl_lock_path;
-pub use log_tail::tail_lines;
+pub use log_tail::{
+    LOG_VIEW_MAX_TAIL_READ, LogDecode, LogTail, newest_line_exceeds_bound_notice,
+    service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
+    tail_log_decoded,
+};
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
@@ -165,7 +176,7 @@ pub use model_catalog::{
 pub use net::{
     DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
     format_host_for_url, format_host_port, format_http_base_url, http_get_text,
-    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
+    http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
@@ -226,9 +237,10 @@ pub use service_record::{
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
-    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, find_uv_binary,
+    split_local_version, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
+    uv_pip_check_args, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject,
+    violations_requiring,
 };
 pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
@@ -346,69 +358,9 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
-/// Replace `path`'s content with `bytes`, atomically.
-///
-/// Writes a sibling temp file and renames it over the destination: an
-/// interrupted write (full disk, crash, killed process) can never leave a
-/// truncated file in place, and a reader sees
-/// either the old content or the new content. The destination is NOT removed
-/// first: `fs::rename` replaces an existing file on both supported platforms
-/// (it is `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows), and
-/// removing it would open a window with no file at all, which a concurrent
-/// reader could see as "file doesn't exist" instead of the old or new
-/// content. The temp file is removed if the write or the rename fails.
-///
-/// `tmp_ext` names the temp file's extension (e.g. `"json"`, `"jsonl"`).
-/// Both halves of the generated suffix matter: the timestamp keeps
-/// successive writes to the same path apart, and the pid keeps two
-/// processes writing in the same millisecond from clobbering each other's
-/// temp file and losing one of the two updates.
-///
-/// Not guaranteed:
-/// - Serializing writers: this takes no lock, so two read-modify-write
-///   cycles that overlap still lose one update (last rename wins). A caller
-///   whose new content depends on the old must hold a lock across the whole
-///   cycle, as the JSONL proposal store does (`jsonl_store::jsonl_lock_path`).
-///   Two callers in the *same process* within the same millisecond are a
-///   sharper case of this, not just a milder one: they generate the exact
-///   same temp path below, so concurrent `fs::write`s truncating that one
-///   path can publish mixed bytes, and the losing rename then fails outright
-///   (its source file already gone) rather than merely losing an update —
-///   this is the same-process collision
-///   `automation::tests::concurrent_appends_from_many_threads_lose_no_records`'s
-///   own comment describes ("two threads of one process even shared a
-///   temp-file name") — fixed for its own callers by the per-store lock
-///   `automation.rs` takes before ever calling into this function.
-/// - Durability: the bytes are not fsynced before the rename, so a power
-///   loss can still surface the new name with unflushed contents.
-/// - Replacing a destination another process holds open without delete
-///   sharing: on Windows the rename then fails with a sharing violation,
-///   this returns that error, and the old destination stays in place.
-pub fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
-    let tmp_path = path.with_extension(format!(
-        "{tmp_ext}.tmp-{}-{}",
-        unix_time_millis(),
-        std::process::id()
-    ));
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("failed to write {}", tmp_path.display()))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp_path);
-        })?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to replace {}", path.display()))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp_path);
-        })?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::ffi::OsString;
-    use std::fs;
 
     fn test_exit_status() -> std::process::ExitStatus {
         std::process::ExitStatus::default()
@@ -438,65 +390,5 @@ mod tests {
     fn command_failure_detail_reports_no_output_when_both_are_empty_or_whitespace() {
         let output = test_process_output("  \n", "   ");
         assert_eq!(command_failure_detail(&output), "no output");
-    }
-
-    #[test]
-    fn write_atomic_writes_bytes_and_leaves_no_temp_file() -> Result<()> {
-        let temp_root =
-            std::env::temp_dir().join(format!("rocm-cli-write-atomic-ok-{}", unix_time_millis()));
-        fs::create_dir_all(&temp_root)?;
-        let path = temp_root.join("store.jsonl");
-
-        write_atomic(&path, b"hello\n", "jsonl")?;
-
-        let written = fs::read(&path)?;
-        let leftovers: Vec<_> = fs::read_dir(&temp_root)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
-            .collect();
-        let _ = fs::remove_dir_all(&temp_root);
-
-        assert_eq!(written, b"hello\n");
-        assert_eq!(
-            leftovers,
-            vec![OsString::from("store.jsonl")],
-            "a successful write must leave no `*.tmp-*` sibling behind"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn write_atomic_rename_failure_leaves_destination_and_dir_untouched() -> Result<()> {
-        let temp_root =
-            std::env::temp_dir().join(format!("rocm-cli-write-atomic-fail-{}", unix_time_millis()));
-        fs::create_dir_all(&temp_root)?;
-        let path = temp_root.join("store.jsonl");
-        // A file can't be renamed over an existing directory, so making the
-        // destination a directory forces `write_atomic`'s rename step to fail
-        // after the temp file has already been written.
-        fs::create_dir_all(&path)?;
-
-        let result = write_atomic(&path, b"hello\n", "jsonl");
-        let destination_is_still_a_dir = path.is_dir();
-        let leftovers: Vec<_> = fs::read_dir(&temp_root)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
-            .collect();
-        let _ = fs::remove_dir_all(&temp_root);
-
-        assert!(
-            result.is_err(),
-            "renaming a file onto an existing directory must fail"
-        );
-        assert!(
-            destination_is_still_a_dir,
-            "a failed rename must leave the destination untouched"
-        );
-        assert_eq!(
-            leftovers,
-            vec![OsString::from("store.jsonl")],
-            "the temp file must be removed when the rename fails"
-        );
-        Ok(())
     }
 }

@@ -62,8 +62,8 @@ cargo xtask check-architecture-doc
 ```
 
 It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
-does not link, and on a stale entry in the `EXEMPT` list in
-[architecture_doc.rs](../xtask/src/architecture_doc.rs), which is empty. Test-only helpers need no entry. The
+does not link, and there is no exemption list; see
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
@@ -191,6 +191,70 @@ test fails on a path that no longer exists rather than dropping it from the
 guard. When the planner needs something that lives in `chat.rs`, move it into
 a leaf module and import it from there.
 
+### Dash-TUI text fields go through `apply_char_key`
+
+A dash-TUI form edits its `String` through `apply_char_key` /
+`apply_char_key_filtered` in
+[`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs), not through its
+own "`Char` appends, `Backspace` pops one char" code. As with the other module
+rules above, a test enforces it rather than an `xtask` subcommand:
+`the_dash_tui_has_no_hand_rolled_text_edit_outside_the_helper` in `xtask`
+([`dash_text_edit_contract.rs`](../xtask/src/dash_text_edit_contract.rs)) scans
+the non-test code of every file under `crates/rocm-dash-tui/src/` and fails,
+naming each hit as `file:line` with a pointer to the helper. Run it on its own
+with:
+
+```bash
+cargo test -p xtask dash_text_edit_contract
+```
+
+It is per file, not per `match` arm, because the copies the helper replaced were
+not all arms (one had its `push` in a `type_char` method the arm called). In a
+file other than `ui/widgets.rs` it reports a no-argument `.pop()` when the file
+names `KeyCode::Backspace`, and `.push(x)` (also `.push(*x)`,
+`.push(x.method())` and `.push(x as char)`, each with or without a trailing
+comma) when `x` is a name the file binds as a key character
+(`KeyCode::Char(x)`, `KeyCode::Char(mut x)`) or declares as `x: char`, in a file
+that names `KeyCode::Char(`. A `#[cfg(test)] mod name { .. }` block is skipped,
+so a unit test may drive a buffer by hand; a `#[cfg(test)]` on anything else
+skips nothing, and an out-of-line test module (`#[cfg(test)] mod name;`) is a
+file of its own, scanned in full.
+
+What it does not see: it matches the shape, not the type, so a `let top =
+stack.pop()` in a file that handles `Backspace` is a false alarm, and an
+unrelated `out.push(c)` is reported when the same file binds `KeyCode::Char(c)`
+elsewhere. A push is read only when its argument is that name alone in one of the
+spellings above: `.push((x))`, `.push(char::from(x))`, a `.push(if ..)` of the
+name, and a call with a gap before the paren (`.push (x)`, which rustfmt never
+writes) are not seen. Only `#[cfg(test)]` exactly is read as a test gate (a
+`#[cfg(all(test, ..))]` is scanned, which can only cause a false alarm), and
+`use KeyCode::*` or an alias of `KeyCode` defeats the scan. A typed key passed
+from one file to a method in another is not followed. Only `.pop()` and
+`.push(x)` are matched: `push_str`, `truncate`, `clear`, `.insert(..)`,
+`.remove(..)` and `replace_range(..)` are not scanned, partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
+[`serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs)) cannot use
+the append-only helper and is a different thing. A `Backspace` arm that never
+pops, such as the folder browser's "go to the parent directory", is not a text
+edit and is not reported.
+
+The one file with its own `push` and `pop` is the Chat input in
+[`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs), whose keys are
+mapped to a `KeyAction` by a separately tested table. It is listed in `ALLOWED`
+in the test with its reason and the number of offenses it is expected to carry
+(its one push and its one pop). The test fails when the file carries a different
+number, so a further hand-rolled field added there is caught, as is an entry that
+stops being needed, or whose file moves. A new field reuses the helper; a new
+exception is a reviewed entry in that list.
+
+Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
+for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
+every pull request that changes Rust, and the merge queue and post-merge runs
+test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
+selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
+a file it reads, so a pull request that touches nothing but
+`crates/rocm-dash-tui` does not run this test on Linux. The module-import
+contract above has the same property.
+
 ### Tests that run a fake executable
 
 Plant a stand-in `python`, `uv`, `amd-smi`, ... with
@@ -315,11 +379,14 @@ PROPTEST_CASES=10000 cargo test -p rocm --bin rocm proptests
 ```
 
 An explicit case count overrides `PROPTEST_CASES`, so a module that sets one
-reads the variable back itself: through the `proptest_cases` helper in each
-crate's test support, [rocm's](../apps/rocm/src/test_support.rs) and
-[rocm-core's](../crates/rocm-core/src/test_support.rs), and through
-`run_property` in [archive_props.rs](../crates/rocm-core/src/archive_props.rs),
-which keeps its own copy because three crates include it by `#[path]`. All of
+reads the variable back itself: through the `proptest_cases` helper in
+[tests/common/proptest_cases.rs](../crates/rocm-core/tests/common/proptest_cases.rs),
+which [rocm's](../apps/rocm/src/test_support.rs) and
+[rocm-core's](../crates/rocm-core/src/test_support.rs) test support, the
+`rocm-core` and `rocm-engine-protocol` integration tests and the Lemonade
+engine's unit tests all include by `#[path]`; and through `run_property` in
+[archive_props.rs](../crates/rocm-core/src/archive_props.rs), which keeps its
+own copy because three crates include it by `#[path]`. All of
 them only ever raise the module's count: a `PROPTEST_CASES` below it is
 ignored, because some of these properties catch their target defect in a small
 share of cases and would pass with it present on a short run. The uninstall properties read their own
@@ -808,12 +875,47 @@ download could start. The printed `command:` line then shows
 `uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
 so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
 with a different Python 3.12 it can choose that one rather than the managed one
-a real install prepares. That scenario is a canonical-layout preview. A preview
-of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) does still
-need `uv`: it resolves the published package versions with `uv pip compile`, so
-on a clean host it can download the managed `uv` and create the data folder's
-`tools` folder, although it still prepares no Python. The "no `uv`, no `tools`
-folder" guarantee is therefore the canonical layout's only.
+a real install prepares. That scenario is a canonical-layout preview.
+
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
+to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+is the one step that chooses the `torch` and `torchvision` versions (the CLI
+picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
+previous install left) and, with none, stops before that step. It then prints
+what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
+would be asked about), marks `target`, `runtime_key`, `package_specs`, `command`
+and `manifest` as `not resolved by this preview`, and says why in a
+`resolution_note:` line and a progress line, in the voice of `python_note:`. It
+cannot say whether the published stack installs together either. A real install
+and `rocm update` still fetch `uv` as before, and a preview made after either
+has run is the complete plan. Scenario `runtime-28` checks the note against the
+state it left on a host with no `uv`: no managed-tools folder, no tool archive in
+its own cache folder (here the real detector, since no stand-in `uv` is named),
+no saved config, and no `torch` or `torchvision` version anywhere in the output.
+`runtime-27` is the other polarity: with a `uv` present (the recording stand-in,
+which answers `uv pip compile` with the fixture's four pins, drains its stdin
+under `FAKE_UV_DRAIN_STDIN`, and logs its arguments under `FAKE_UV_LOG`), the
+preview runs it exactly once, for the compile, and prints the resolved plan. The
+`therock-next` scenarios that print resolved package specs start from `And a uv
+is already installed`, which installs the managed `uv` into the scenario's data
+folder the way a real install would have.
+The decision is unit-tested on every platform, Windows included
+(`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
+[uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
+both layouts, a preview or an install, and a `uv` present or not), as are the
+plan's whole text and its key order against a resolved plan's
+(`the_plan_a_preview_without_uv_prints_is_exactly_this` and
+`a_resolved_and_an_unresolved_plan_print_the_same_keys` in
+[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs)). On Unix,
+`a_preview_never_acquires_uv_and_a_real_resolution_still_does` there runs the
+real resolution against a served index and a stand-in `uv`, counting what each
+row looked for, acquired and ran. What no test reaches without the network is the
+real download a real install makes when no `uv` is installed, and that the public
+entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
+first is a network call, and the second is held only by the types (those entry
+points return a resolved plan and refuse the unresolved one) and by the lanes
+that install a ROCm 10 runtime for real.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
@@ -848,6 +950,9 @@ progress output and that `uv` was not run and no file was written. Beside it are
 `a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` and
 `a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
 preview does still write its package-index cache under the cache folder.
+The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
+previews in this sense: on a ROCm 10 or newer runtime they resolve with `uv` and
+can fetch it. They prepare no Python, though (see `update-09` and `update-10`).
 
 Then it verifies:
 
@@ -1440,6 +1545,40 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## Lemonade Installs On Disk
+
+`features/lemonade_installs.feature` covers what a user is told about the
+Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
+
+- `lemonade-installs-01` and `-02` reach the engine's pre-install free-space
+  refusal from `rocm engines install lemonade` and from `rocm serve`, with 1 MiB
+  reported free (below what any Lemonade install needs). Room for Lemonade but
+  not for the multi-gigabyte ROCm backend only warns, which the unit tests cover
+  because a scenario would have to start the download. They use
+  `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES`, compiled only into the
+  `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
+  disk that nothing was downloaded. That variable also waives serve's no-GPU
+  refusal, as serve-18's failure hook does.
+- `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
+  and checks `rocm storage report` lists both and flags the unused one.
+- `lemonade-installs-04` uninstalls that runtime and checks the install record
+  is cleared.
+- `lemonade-installs-05` and `-06` cover the two cases the report must not
+  overstate: a record naming a folder with no install (the surviving copy is
+  not offered for deletion) and a read-only runtime (its copy is not said to be
+  removed with it, and uninstall then leaves it). A copy inside a registered
+  runtime is never marked reclaimable, because it is reused when that runtime
+  becomes active; two registered runtimes are covered by a unit test.
+
+Run them alone with `cargo xtask e2e -- -n "lemonade-installs-"`.
+
+The Windows console fix for the backend download's progress is unit-tested
+through the real command builder (`backend_install_command` in
+[process.rs](../engines/lemonade/src/process.rs)), which receives the console
+state and the hide step, so a dropped or unconditional hide turns the test red.
+Whether the output actually reaches a real console is a manual check in
+[manual-testing.md](manual-testing.md).
+
 ## Uninstall And Download Removal
 
 `rocm uninstall` and `rocm storage remove-downloads` both end in the same
@@ -1462,9 +1601,25 @@ The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
 anything is removed, and a dry run on a machine ROCm CLI never touched
-(`uninstall-06`) reporting nothing to remove and creating no folder. The
-`uninstall` command does not start the file logger, which would otherwise create
-the data folder's `logs` folder before the plan is built:
+(`uninstall-06`) reporting nothing to remove and creating no folder. At a
+terminal (a pseudo-terminal on the Linux lane), a dry run that lists something
+ends by saying to run it again without `--dry-run`, and `uninstall-07` does that
+and checks the listed folder goes; a run whose stdin or stdout is not a terminal, and an
+empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
+mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
+is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
+its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+ends differently, since it has no flag to offer: it says removal needs approval,
+which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
+`uninstall-13` to `uninstall-15` drive the confirmation prompt under a
+pseudo-terminal, which is the only way to reach it, and pin the shared `[y/N]`
+helper's behaviour for an answer that is neither yes nor no, for ending the input
+with Ctrl-D, and for a plain no, each together with the config folder being left
+in place. They run on the default mock lane; the helper's other callers (`rocm fix`,
+the SDK-overwrite prompt) share it and are covered by its unit tests in
+[confirm.rs](../crates/rocm-core/src/confirm.rs).
+The `uninstall` command does not start the file logger, which would otherwise
+create the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"
@@ -1605,6 +1760,29 @@ second terminal to watch the download.
 
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
+
+The log views read the end of a log through one bounded routine,
+`rocm_core::tail_log_decoded`, and decode invalid text lossily. Scenario `logs-08`
+plants an action log with a byte that is not valid text and checks that
+`rocm logs --search` still finds every matching line. Scenarios `logs-09` and
+`logs-10` (`rocm services logs`) and `logs-11` and `logs-12` (`rocm comfyui logs`)
+plant an over-long single line and an empty file and check that only the empty
+file is reported as having no output, with the wording checked against the file
+on disk. Scenario `logs-15` plants a command log whose only line is that long and
+checks that `rocm logs` lists it with a line saying no output could be shown
+rather than printing `No logs found yet.`. The routine itself is covered by `cargo test -p rocm-core --lib log_tail`.
+
+The `service_logs` tool (what the assistant and MCP clients call to read a
+server's log) answers through `rocm_core::service_log_tool_summary`, so an empty
+log (`has no log output yet`) and a log whose newest line is longer than the
+4 MiB a log view reads (`none is shown: the newest line is longer than ...`, with
+`newest_line_exceeds_read_bound` set in the structured reply) are not both
+reported as zero lines read. The structured `lines` is the number of lines
+returned and `lines_requested` the number asked for (scenario `logs-16` asks for
+50 lines of a three-line log). The CLI's copy of the tool is run by scenarios
+`logs-13`, `logs-14` and `logs-16` through `rocm mcp-call service_logs`; the daemon's copy
+is covered by `cargo test -p rocmd --lib service_logs`, because the harness
+drives only the `rocm` binary.
 
 TUI log pagination focused tests:
 
@@ -2300,6 +2478,29 @@ serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper che
 not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
 the row also matches other Linux lemonade hosts, where a pass is tolerated).
 
+Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
+its HTTP front are tested in
+[anthropic_proxy.rs](../apps/rocmd/src/anthropic_proxy.rs) against a stand-in
+OpenAI engine, including an engine that has its own `/v1/messages` route, which is
+still fronted by the proxy so a Claude model name works. The record's adoption of the published endpoint are tested in
+[anthropic_endpoint.rs](../crates/rocm-core/src/anthropic_endpoint.rs) and
+[service_record.rs](../crates/rocm-core/src/service_record.rs).
+
+```bash
+cargo test -p rocmd --lib anthropic_proxy
+cargo test -p rocm-core --lib anthropic_endpoint
+cargo test -p rocm-core --lib engine_refresh_adopts_the_published_anthropic_endpoint
+cargo test -p rocm --bin rocm anthropic_endpoint
+```
+
+The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
+(a real Messages request is answered by the served model) and `serve-52`
+(`services list` reports both endpoints healthy) in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
+serves with. Streaming and tool use are not translated yet, so no scenario
+covers them; a request for either is refused, and the unit tests above pin that.
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -2364,11 +2565,46 @@ cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
 
+A check changes nothing, and that includes Python. Reading the index for a wheel
+runtime needs the interpreter's wheel tag. A runtime that records a usable Python
+supplies it. For one that does not, on a host with no usable Python, the check
+used to download a managed `uv`, have it install Python and save that Python's
+path in the config, only to ask it for the tag. The text report, `--json`, the
+startup check that runs ahead of other commands, and the plan behind
+`rocm update --apply --dry-run` now take the tag from the interpreter the layout
+requires instead and prepare nothing; the text report adds a `python_note:` line
+saying an update would use `uv` to install the managed Python, which the check did
+not do. `--json` carries no such line, since its shape is the dashboard's
+contract. `rocm update --apply` still prepares the Python, because the install
+that follows needs it. Scenarios `update-09` (the report) and `update-10`
+(`--dry-run`) check the note against the state it left, as `runtime-23` does for
+the install preview: the recording `uv` was never run, and there is no
+managed-tools folder and no saved config. They run on Linux; the entry points the
+scenarios do not drive are covered by
+`the_update_checks_prepare_no_python_and_the_apply_plan_does` in
+[update.rs](../apps/rocm/src/therock/update.rs), which drives the report, the
+JSON, the startup check, the check plan and `apply_runtime_update` with
+`--dry-run`, with the plan an apply works from, and a real apply, as the controls
+that show the stand-in `uv` is reachable. Which of the two plans a `--dry-run` and
+an apply take is also pinned on every platform, Windows included, by
+`a_dry_run_takes_the_check_and_an_apply_takes_the_plan` in
+[update_cmd.rs](../apps/rocm/src/update_cmd.rs). Unlike the install preview, which fetches no
+`uv`, the check on a ROCm 10 or newer runtime still resolves the package versions
+with `uv pip compile` and can fetch the managed `uv`, though never a Python; the
+scenarios above use the canonical layout, which needs no `uv`.
+
 Runtime version-ordering tests:
 
 ```bash
 cargo test -p rocm --bin rocm version_proptests
 cargo xtask e2e -- -n 'update-0[78]'
+```
+
+Update checks that must not prepare Python:
+
+```bash
+cargo test -p rocm --bin rocm the_update_checks_prepare_no_python
+cargo xtask e2e -- -n 'update-(09|10)'
 ```
 
 Where `rocm install sdk` and `rocm update` compare runtime versions, they
@@ -2389,6 +2625,36 @@ index that publishes the other,
 because its runtime key and package specs carry the index's spelling.
 `generator_reach_report` prints how often each hard case is generated (run it
 with `-- --nocapture`), and fails if the generator stops reaching them.
+
+Artifact integrity and engine protocol property tests:
+
+```bash
+cargo test -p rocm-core --test digest_gate_properties --test integrity_properties --test model_selector_properties
+cargo test -p rocm-engine-protocol --test protocol_properties
+cargo test -p rocm-engine-lemonade --lib archive_digest
+cargo test -p xtask verify_pinned_keys
+```
+
+These check the code that decides whether a download, a signature or the
+pinned release key is authentic, and the code that decodes engine output. The
+generators aim at near misses — a digest one nibble off or sharing a correct
+prefix, a signature with one byte changed or leading zeros, a loopback spelling
+padded or re-cased, a model id with a variant suffix — because a uniformly
+random input is rejected by any implementation, correct or not. The pinned-key
+tests run the real check over a scratch repository root and walk every
+position of the committed key. `model_selector_properties` also pins, rather
+than asserts away, two shapes where readiness accepts an engine's reported name
+for a different model: a bare family word such as `qwen` reads as ready for
+other models of that family, in the catalog and beyond, and a catalog alias
+that spells another catalog model's basename (`qwen3-32b`, an alias of
+`Qwen/Qwen3-32B-FP8` and the basename of `Qwen/Qwen3-32B`) reads as ready for
+that other model. The second is checked against a list of the catalog's
+current collisions, so a catalog change that adds one fails the test.
+The pinned-key tests also pin that a character outside the base64 alphabet
+(a space, `!` or `.`) inserted into an installer's copy of the key is refused
+as a malformed key block, in either installer, rather than ignored by the
+comparison: an installer that embeds such a key cannot load it.
+`non_base64_noise_in_an_embedded_key_is_refused_as_malformed` holds that.
 
 Model recipe engine metadata checks:
 
@@ -2583,6 +2849,14 @@ cargo test -p rocmd supervise_service_first_write_keeps_a_standing_stop_marker
 cargo test -p rocmd restart_failure_write_keeps_a_stop_marker_set_meanwhile
 cargo test -p rocmd restart_records_its_supervisor_without_erasing_a_stop_marker
 cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
+cargo test -p rocmd daemon_host
+cargo test -p rocmd restart_runs_supervise_on_the_rocmd_it_is_given
+cargo test -p rocmd restart_without_a_rocmd_to_run_changes_nothing
+cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
+cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
+cargo test -p rocmd engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd
+cargo test -p rocmd engine_request_without_a_rocm_beside_rocmd_names_it
+cargo test -p rocm-core sibling_binary_path_from
 cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
 cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
 cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
@@ -2606,6 +2880,24 @@ sandbox tool) starts a new engine only after its stop is confirmed; otherwise
 it reports the unconfirmed stop and starts nothing. Its own later writes are
 applied to the record as it is on disk, and only while it still reads as the
 restart left it, so a stop asked for during the restart keeps its marker.
+
+The daemon runs as the `rocmd` binary or embedded in `rocm` (`rocm daemon`),
+and each binary has commands the other lacks: `supervise` is `rocmd`'s, and the
+hidden engine commands (`__engine-serve-http`, `__engine-stdio`) are `rocm`'s.
+Every daemon spawn therefore asks `DaemonHost` for the binary instead of
+re-executing its own: the recovery restart runs `supervise` on `rocmd`, and the
+supervisor starts its engine, polls its readiness and asks it to stop through
+`rocm`, each the current executable when the daemon is that binary and the
+sibling installed beside it otherwise, named in the error when there is none.
+`rocmd`'s unit tests never reach the real host: under test `DaemonHost::detect`
+returns the test binary for both commands and looks for no sibling, the two
+stand-in hosts name only the binary they stand in for and fail when asked for
+the other, each test that needs a different host passes the code under test one
+of its own, and a test that needs a binary writes a stand-in script (its shell
+and `sleep` found on `PATH` once and asserted by name), so none of them can run
+a `rocm` or `rocmd` that happens to sit in the build directory. `run_from_args_marks_the_process_as_embedded_in_rocm`
+checks the embedded marking in a child run of the test binary, because the flag
+is process-wide.
 
 Automation GPU-metrics event tests:
 
@@ -2769,7 +3061,7 @@ the per-PR mock lane. The host predicate itself is the shared
 than restated in either, so the test cannot drift from the production rule.
 
 The bypass decision's other arguments are in the same position — the unit tests
-in `apps/rocm/src/service_launch.rs` pin `managed_service_reuse_refusal` itself,
+in [`launch_transaction.rs`](../apps/rocm/src/service_launch/launch_transaction.rs) pin `managed_service_reuse_refusal` itself,
 not which values `serve()` hands it — so each one has a scenario instead:
 serve-30 for `require_api_key`, serve-32 for the requested recipe. The device
 policy needs neither: the predicate takes it by value rather than as an
@@ -3246,6 +3538,12 @@ cache nor the variable involved, which is the layout of a TheRock tarball
 (ROCM-30386). Its control is `examine-33`, which plants the library alone and
 stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
 is what the verdict turns on.
+
+`examine-35`, `examine-36`, `examine-37` and `examine-38` hold the two answers `rocm examine --json` gives to "is `rocminfo` installed" level on that same planted WSL machine: `summary.wsl.rocminfo` from the host summary and `wsl.rocminfo` from the examination, which share one `PATH` lookup. They plant a stand-in `rocminfo` that prints nothing, and build the `PATH` from the machine's stand-in directory followed by the runner's own entries that hold no `rocminfo`, so a runner with ROCm installed cannot be why the tool reads as found. `examine-35` is the control: the tool in a `PATH` directory is found by both. `examine-36` puts it only in the directory the command runs from, with an empty entry first on `PATH`: neither report finds it, because an empty entry is skipped and not read as the current directory (the harness's `command_dir` sets that directory). `examine-38` is its control: the same machine with `.` as the first entry instead, which both reports find, so it fails if `rocm` does not really run from that directory and `examine-36`'s answer cannot come from a harness that ignored `command_dir`. `examine-37` puts it in a `PATH` directory whose name is not valid Unicode: both find it, because a `PATH` that is not Unicode is still searched. The Windows spellings of the lookup (`PATHEXT`, a quoted entry holding a `;`, the System32 locations) cannot run on the Linux lane and are covered by the unit tests in `probe_exec.rs`, which the Windows job runs.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
+```
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 

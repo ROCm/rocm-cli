@@ -1094,9 +1094,10 @@ pub fn run_property(
     // `PROPTEST_CASES` (proptest's own knob, which an explicit case count
     // would otherwise override) scales every property up for a longer hunt.
     // Never down: the reach floors below are percentages, which a handful of
-    // cases cannot meet. The same rule as rocm-core's `proptest_cases`, kept
-    // inline because this file is also `#[path]`-included into `rocm` and the
-    // Lemonade engine, where `crate::test_support` is a different module.
+    // cases cannot meet. The same rule as `tests/common/proptest_cases.rs`,
+    // kept inline because this file is also `#[path]`-included into `rocm` and
+    // the Lemonade engine, and a `#[path]` inside it would resolve relative to
+    // each includer.
     let requested = std::env::var("PROPTEST_CASES").ok();
     let cases = match requested.as_deref().map(str::parse::<u32>) {
         Some(Ok(requested)) if requested >= cases => requested,

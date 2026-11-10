@@ -8,10 +8,10 @@
 //! it whenever the row set changes rather than relying on the upstream
 //! `pass_n_of_n` / `pass_at_n` CSV columns.
 //!
-//! See `../wiki/concepts/benchmark-result-schema.md` and
-//! `../wiki/entities/normalize-results.md`: rows are grouped by
-//! `(cell, model, backend, concurrency)` and each group of N trials yields
-//! two verdicts — strict (all N passed) and lenient (at least one passed).
+//! Rows are grouped by `(cell, model, engine, tp, dtype, concurrency)` (the
+//! private `RollupKey`) and each group of N trials yields two verdicts —
+//! strict (all N passed) and lenient (at least one passed). `engine` is part
+//! of the key, so a row with no `engine` does not group with one that has it.
 
 use std::collections::BTreeMap;
 

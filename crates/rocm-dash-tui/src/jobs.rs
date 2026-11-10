@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Async job-bridge runtime (Phase 3 Wave 0).
+//! Async job-bridge runtime.
 //!
 //! Interprets [`SideEffect::SpawnJob`]: launches the child process, streams its
 //! stdout+stderr back as [`StateEvent::JobLine`], finishes with

@@ -120,6 +120,8 @@ jobs:
       windows: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Filter changed paths (pull requests only)
         id: filter
@@ -298,6 +300,7 @@ jobs:
         with:
           # Need the PR range to read its commit messages.
           fetch-depth: 0
+          persist-credentials: false
       - name: Warn on referenced bugs that still have xfail rows
         # Title/body are passed via env (never interpolated into the shell) so a
         # crafted PR description can't inject commands.
@@ -388,6 +391,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install native build deps
         if: needs.changes.outputs.heavy == 'true'
@@ -584,6 +589,7 @@ jobs:
           # base history and the real PR head (not the synthetic merge ref).
           fetch-depth: 0
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          persist-credentials: false
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
@@ -613,8 +619,8 @@ jobs:
           # The `cargo xtask` alias builds xtask in release (target/release), so
           # computing the selection doesn't perturb the debug feature resolution
           # the nextest build below uses.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            sel=$(cargo xtask affected --base "origin/${{ github.base_ref }}")
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            sel=$(cargo xtask affected --base "origin/${GITHUB_BASE_REF}")
           else
             sel="--workspace"
           fi
@@ -712,6 +718,8 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
       # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
@@ -901,6 +909,8 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
       # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
@@ -1183,6 +1193,8 @@ jobs:
       && needs.changes.outputs.heavy == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -1283,6 +1295,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # cargo-fmt hook needs rustfmt (no build).
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -1337,6 +1351,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Docker and the OpenSSH client are both present on the hosted Ubuntu
       # images; jq is the only extra, and only for asserting on JSON contracts.
@@ -1398,6 +1414,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
       # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
@@ -1529,6 +1547,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         if: needs.changes.outputs.tpn == 'true'
@@ -1578,6 +1598,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
@@ -1634,6 +1656,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         if: needs.changes.outputs.lint == 'true'
@@ -1692,6 +1716,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.skills == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The `skillscope` step below names skills/rocm-doctor explicitly, so a
       # third skills/<name>/ folder added later would pass this job green
@@ -1760,6 +1786,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Cache hawkeye binary
         id: cache-hawkeye
@@ -1866,6 +1894,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check markdown links
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
@@ -1886,6 +1916,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.docs == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Cache pip packages
         id: cache-pip
@@ -1929,6 +1961,7 @@ jobs:
           # so these are normal commits that preserve their Signed-off-by trailer
           # and are GitHub "Verified" (web-flow signed).
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
@@ -1993,6 +2026,8 @@ jobs:
           || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Whether the real work runs this time. On push/PR/merge_group: only when
       # `clippy` passed, build-and-test ran to a verdict, and the change is
@@ -2113,6 +2148,8 @@ jobs:
         || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
