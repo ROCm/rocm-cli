@@ -79,8 +79,8 @@ use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
     managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
-    resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
-    wait_begin_client_config,
+    resolve_endpoint_auth, run_attached_service, scripted_managed_engine_startup_failure,
+    start_managed_service, validate_bind_host, wait_begin_client_config,
 };
 use crate::{
     GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
@@ -499,6 +499,39 @@ pub(crate) struct ServeArgs {
     pub(crate) engine_env: Vec<String>,
 }
 
+/// The progress line a background launch paints while it waits.
+trait LaunchProgress {
+    /// Erases the line so whatever prints next starts on a clean one.
+    fn clear(&mut self);
+}
+
+impl LaunchProgress for cli_progress::Spinner {
+    fn clear(&mut self) {
+        Self::clear(self);
+    }
+}
+
+/// Runs a background serve's managed launch, then starts the background
+/// helper, and erases `progress` if either step fails.
+///
+/// `Spinner` has no `Drop`, so an error returned past a painted line would
+/// print on top of it. Both steps are fallible and run back to back, so they
+/// share one clear-on-error here instead of each call site guarding its own.
+/// The helper is not started when the launch fails. On success `progress` is
+/// left painted: the caller still uses it (the smoke test relabels it) and
+/// clears it itself.
+fn launch_then_start_helper<P: LaunchProgress, T>(
+    progress: &mut P,
+    launch: impl FnOnce(&mut P) -> Result<T>,
+    start_helper: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    let launched = launch(progress).and_then(|report| start_helper().map(|()| report));
+    if launched.is_err() {
+        progress.clear();
+    }
+    launched
+}
+
 pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let ServeArgs {
         model,
@@ -877,9 +910,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         ]
         .iter()
         .any(|variable| std::env::var_os(variable).is_some());
+    // The scripted startup-death scenario bypasses the same host precondition, for
+    // the same reason: it asserts what happens *after* a spawn, so it must reach
+    // one without real GPU hardware.
     if !cpu_only
         && !scripted_backend_failure
         && !e2e_simulate_oom_launch()
+        && !scripted_managed_engine_startup_failure()
         && !reuse_existing
         && host_has_no_usable_gpu
     {
@@ -996,9 +1033,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             device_policy_name(&device_policy)
         );
     }
+    // Preparation is skipped for the scripted startup-death scenario too: it
+    // asserts the launch, not the install, and a real runtime download is exactly
+    // what the ungated lane cannot do.
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
         && resolved_model.is_none()
+        && !scripted_managed_engine_startup_failure()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
@@ -1183,36 +1224,38 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             },
             &mut |_elapsed| spinner.borrow_mut().tick(),
         );
-        // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
-        let report = match launched {
-            Ok(report) => report,
-            Err(error) => {
-                spinner.borrow_mut().clear();
-                return Err(error);
-            }
-        };
         let mut spinner = spinner.into_inner();
-        // Not when the launch was fabricated. `simulate_oom_managed_launch`
-        // writes a `starting` record for a process that never existed, so the
-        // helper would be left watching a pid that will never appear, with
-        // nothing in the scenario's teardown to stop it: observed as `rocm
-        // daemon` processes outliving their e2e checkout by days, still
-        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
-        // supervising a real spawned server, and there is none here.
-        //
-        // That — not ordering — is the whole justification. This suppression
-        // runs *before* the OOM note is computed in the `summary_mode` block
-        // below, so the previous claim here, that the note "is computed before
-        // it would have run", was backwards and could not have excused it.
-        // serve-40's `no background automation daemon was left behind` is what
-        // holds the branch: deleting it left the scenario green with a `rocm
-        // daemon` still running.
-        //
-        // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
-        // the test-only feature, so this branch folds away in shipped builds.
-        if !e2e_simulate_oom_launch() {
-            ensure_background_helper_running_quiet(summary_mode)?;
-        }
+        // `Spinner` has no `Drop`: a failed launch or a failed helper start clears
+        // its row before the error prints, so `Error:` is not glued to it.
+        let report = launch_then_start_helper(
+            &mut spinner,
+            |_| launched,
+            // Not when the launch was fabricated. `simulate_oom_managed_launch`
+            // writes a `starting` record for a process that never existed, so the
+            // helper would be left watching a pid that will never appear, with
+            // nothing in the scenario's teardown to stop it: observed as `rocm
+            // daemon` processes outliving their e2e checkout by days, still
+            // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+            // supervising a real spawned server, and there is none here.
+            //
+            // That — not ordering — is the whole justification. This suppression
+            // runs *before* the OOM note is computed in the `summary_mode` block
+            // below, so the previous claim here, that the note "is computed before
+            // it would have run", was backwards and could not have excused it.
+            // serve-40's `no background automation daemon was left behind` is what
+            // holds the branch: deleting it left the scenario green with a `rocm
+            // daemon` still running.
+            //
+            // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
+            // the test-only feature, so this branch folds away in shipped builds.
+            || {
+                if e2e_simulate_oom_launch() {
+                    Ok(())
+                } else {
+                    ensure_background_helper_running_quiet(summary_mode)
+                }
+            },
+        )?;
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -2172,6 +2215,87 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
+        );
+    }
+
+    /// Records what a background launch did to its progress line.
+    #[derive(Default)]
+    struct RecordedProgress {
+        ticks: usize,
+        clears: usize,
+    }
+
+    impl LaunchProgress for RecordedProgress {
+        fn clear(&mut self) {
+            self.clears += 1;
+        }
+    }
+
+    #[test]
+    fn a_background_helper_that_fails_to_start_clears_the_launch_progress() {
+        let mut progress = RecordedProgress::default();
+
+        let result = launch_then_start_helper(
+            &mut progress,
+            |progress| {
+                progress.ticks += 1;
+                Ok("report")
+            },
+            || anyhow::bail!("background helper did not start"),
+        );
+
+        let error = result.expect_err("the helper's failure is the launch's failure");
+        assert_eq!(error.to_string(), "background helper did not start");
+        assert_eq!(progress.ticks, 1, "the launch ran before the helper");
+        assert_eq!(
+            progress.clears, 1,
+            "the painted line is erased before the error prints"
+        );
+    }
+
+    #[test]
+    fn a_failed_launch_clears_its_progress_and_never_starts_the_helper() {
+        let mut progress = RecordedProgress::default();
+        let mut helper_started = false;
+
+        let result: Result<()> = launch_then_start_helper(
+            &mut progress,
+            |_| anyhow::bail!("engine died at startup"),
+            || {
+                helper_started = true;
+                Ok(())
+            },
+        );
+
+        let error = result.expect_err("the launch failed");
+        assert_eq!(error.to_string(), "engine died at startup");
+        assert!(
+            !helper_started,
+            "no helper is started for a launch that failed"
+        );
+        assert_eq!(progress.clears, 1);
+    }
+
+    #[test]
+    fn a_successful_launch_leaves_its_progress_for_the_caller_to_clear() {
+        let mut progress = RecordedProgress::default();
+        let mut helper_started = false;
+
+        let report = launch_then_start_helper(
+            &mut progress,
+            |_| Ok("report"),
+            || {
+                helper_started = true;
+                Ok(())
+            },
+        )
+        .expect("both steps succeed");
+
+        assert_eq!(report, "report");
+        assert!(helper_started);
+        assert_eq!(
+            progress.clears, 0,
+            "the smoke test still relabels the line, so the caller clears it"
         );
     }
 }
