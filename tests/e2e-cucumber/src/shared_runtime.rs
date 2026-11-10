@@ -344,6 +344,45 @@ mod tests {
         );
     }
 
+    /// Whether `err` is Windows refusing a symlink because the account lacks
+    /// `SeCreateSymbolicLinkPrivilege` (error 1314), which is the default for a
+    /// non-elevated account without Developer Mode. Never true elsewhere.
+    fn is_missing_symlink_privilege(err: &std::io::Error) -> bool {
+        cfg!(windows) && err.raw_os_error() == Some(1314)
+    }
+
+    /// Create a directory symlink `link` -> `target`.
+    ///
+    /// Returns `false`, after saying why on stderr, when this host will not let
+    /// the account create one, so the caller can skip instead of failing on a
+    /// condition of the machine and not of the code. Every other error still
+    /// panics.
+    fn try_dir_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+        match result {
+            Ok(()) => true,
+            Err(e) if is_missing_symlink_privilege(&e) => {
+                eprintln!(
+                    "SKIPPED: this account cannot create symlinks ({e}); enable Windows                      Developer Mode or run elevated to exercise this test"
+                );
+                false
+            }
+            Err(e) => panic!("symlink: {e}"),
+        }
+    }
+
+    #[test]
+    fn only_windows_privilege_error_1314_counts_as_a_skippable_symlink_refusal() {
+        let refused = std::io::Error::from_raw_os_error(1314);
+        assert_eq!(is_missing_symlink_privilege(&refused), cfg!(windows));
+        // An unrelated failure must never be swallowed into a skip.
+        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!is_missing_symlink_privilege(&other));
+    }
+
     /// Reaching the tree through a symlinked parent must not disqualify every
     /// healthy runtime in it.
     ///
@@ -362,10 +401,9 @@ mod tests {
         installed(&real, "release-wheel-multi-arch-7-14-0");
 
         let link = tmp.path().join("link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real, &link).expect("symlink");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&real, &link).expect("symlink");
+        if !try_dir_symlink(&real, &link) {
+            return;
+        }
 
         // Selection is handed the unresolved spelling, exactly as CI would.
         assert_eq!(
@@ -387,10 +425,9 @@ mod tests {
         poisoned(&real, "release-wheel-gfx94x-dcgpu-7-13-0");
 
         let link = tmp.path().join("link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real, &link).expect("symlink");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&real, &link).expect("symlink");
+        if !try_dir_symlink(&real, &link) {
+            return;
+        }
 
         assert_eq!(runtime_key_to_activate(&link), None);
     }

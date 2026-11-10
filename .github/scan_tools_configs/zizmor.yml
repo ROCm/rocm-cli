@@ -25,4 +25,11 @@
 #
 # Add rule-specific settings and suppressions under `rules:`.
 
-rules: {}
+rules:
+  dangerous-triggers:
+    ignore:
+      # Deliberate: the privileged half of dependabot-manifests.yml. It runs
+      # the default branch's definition, never checks out or executes PR code,
+      # and commits only two fixed paths after verifying the run's actor, event,
+      # live PR head and artifact provenance (see the guard step in the file).
+      - dependabot-manifests-commit.yml
