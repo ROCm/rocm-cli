@@ -194,18 +194,35 @@ fn run_with(
         resolved.push((committed, locked));
     }
 
-    // Only once every target has resolved: a failure part-way must not leave
-    // some locks upgraded and others not. Each lock is replaced by rename, so
-    // a reader never sees a half-written file.
-    for (committed, locked) in resolved {
-        if let Some(parent) = committed.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    // Nothing is written until every target has resolved, and every new lock
+    // is written beside its committed one before any is replaced: a failed
+    // resolution or write (a full disk, say) changes no lock. Each lock is
+    // then replaced by a rename within `runtimes/locks/`, so a reader never
+    // sees a half-written file. A rename can still fail part-way (the
+    // directory changed under the run, or on Windows a lock is held open),
+    // which leaves the earlier locks replaced; the error names the lock it
+    // stopped at, and no partial file is left behind.
+    let mut written = Vec::with_capacity(resolved.len());
+    for (committed, locked) in &resolved {
         let partial = committed.with_extension("toml.partial");
-        if let Err(err) =
-            fs::write(&partial, locked).and_then(|()| fs::rename(&partial, &committed))
-        {
+        let write = committed
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| fs::write(&partial, locked));
+        if let Err(err) = write {
             let _ = fs::remove_file(&partial);
+            for (_, done) in &written {
+                let _ = fs::remove_file(done);
+            }
+            return Err(err).with_context(|| format!("failed to write {}", committed.display()));
+        }
+        written.push((committed, partial));
+    }
+    for (index, (committed, partial)) in written.iter().enumerate() {
+        if let Err(err) = fs::rename(partial, committed) {
+            for (_, left) in &written[index..] {
+                let _ = fs::remove_file(left);
+            }
             return Err(err).with_context(|| format!("failed to write {}", committed.display()));
         }
     }
@@ -1298,5 +1315,91 @@ linux = "x86_64-manylinux_2_28"
             !locks.join("pylock.p-linux.toml.partial").exists(),
             "the partial file is cleaned up"
         );
+    }
+
+    /// A rename that fails part-way names the lock it stopped at, leaves the
+    /// locks renamed before it replaced and the ones after it untouched, and
+    /// leaves no partial file of any lock behind.
+    #[test]
+    fn a_failed_rename_names_its_lock_and_leaves_no_partial_file() {
+        let names = ["pylock.p-linux.toml", "pylock.q-linux.toml"];
+        for (failing, blocked) in names.iter().enumerate() {
+            let root = workspace();
+            let locks = root.path().join("runtimes/locks");
+            for name in names.iter().filter(|name| *name != blocked) {
+                fs::write(locks.join(name), "the committed lock\n").unwrap();
+            }
+            // A non-empty directory where this lock goes makes its rename
+            // fail; its partial file is written first, so the write phase
+            // passes.
+            fs::create_dir_all(locks.join(blocked)).unwrap();
+            fs::write(locks.join(blocked).join("keep"), "").unwrap();
+            let err = run_with(
+                root.path(),
+                &root.path().join("work"),
+                &plain(),
+                &FakeUv::new("0.13.6"),
+                vec![],
+                now(),
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("failed to write") && message.contains(blocked),
+                "{blocked}: {message}"
+            );
+            for (index, name) in names.iter().enumerate() {
+                assert!(
+                    !locks.join(format!("{name}.partial")).exists(),
+                    "{name}.partial is cleaned up with {blocked} blocked"
+                );
+                if index == failing {
+                    continue;
+                }
+                let replaced =
+                    fs::read_to_string(locks.join(name)).unwrap() != "the committed lock\n";
+                assert_eq!(replaced, index < failing, "{name} with {blocked} blocked");
+            }
+        }
+    }
+
+    /// A lock that cannot be written, whichever target it is, replaces no
+    /// lock: every new lock is written before any committed one is replaced.
+    #[test]
+    fn a_failed_write_of_any_lock_replaces_none() {
+        for blocked in ["pylock.p-linux.toml", "pylock.q-linux.toml"] {
+            let root = workspace();
+            let locks = root.path().join("runtimes/locks");
+            for name in ["pylock.p-linux.toml", "pylock.q-linux.toml"] {
+                fs::write(locks.join(name), "the committed lock\n").unwrap();
+            }
+            // A non-empty directory where this target's partial file goes
+            // makes its write fail.
+            let partial = locks.join(format!("{blocked}.partial"));
+            fs::create_dir_all(&partial).unwrap();
+            fs::write(partial.join("keep"), "").unwrap();
+            let err = run_with(
+                root.path(),
+                &root.path().join("work"),
+                &plain(),
+                &FakeUv::new("0.13.6"),
+                vec![],
+                now(),
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("failed to write"), "{err:#}");
+            for name in ["pylock.p-linux.toml", "pylock.q-linux.toml"] {
+                assert_eq!(
+                    fs::read_to_string(locks.join(name)).unwrap(),
+                    "the committed lock\n",
+                    "{name} with {blocked} blocked"
+                );
+                let other = locks.join(format!("{name}.partial"));
+                assert!(
+                    name == blocked || !other.exists(),
+                    "{name}.partial is cleaned up with {blocked} blocked"
+                );
+            }
+        }
     }
 }

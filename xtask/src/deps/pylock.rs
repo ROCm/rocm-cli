@@ -10,19 +10,34 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
-/// The fields of a lock that `deps check` and `deps diff` inspect.
+/// A lock as `deps check` and `deps diff` read it. The fields uv writes for
+/// the current profiles are named here, and any other is refused
+/// (`deny_unknown_fields`), as in
+/// `mise.lock`: a field this tooling does not know might change what gets
+/// installed without `deps check` looking at it.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct PyLock {
     pub(crate) lock_version: String,
+    /// The tool that wrote the lock; not checked.
+    #[serde(default, rename = "created-by")]
+    pub(crate) _created_by: Option<String>,
+    /// The Python range of the lock; the profile's Python is checked per
+    /// wheel instead.
+    #[serde(default, rename = "requires-python")]
+    pub(crate) _requires_python: Option<String>,
     #[serde(default)]
     pub(crate) packages: Vec<Package>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct Package {
     pub(crate) name: String,
     pub(crate) version: Option<String>,
+    /// The environments the package is installed in; only narrows them.
+    #[serde(default, rename = "marker")]
+    pub(crate) _marker: Option<String>,
     #[serde(default)]
     pub(crate) wheels: Vec<Artifact>,
     pub(crate) sdist: Option<Artifact>,
@@ -34,10 +49,16 @@ pub(crate) struct Package {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct Artifact {
     pub(crate) url: Option<String>,
     #[serde(default)]
     pub(crate) hashes: BTreeMap<String, String>,
+    /// Index metadata; the hash, not these, identifies the file.
+    #[serde(default, rename = "upload-time")]
+    pub(crate) _upload_time: Option<toml::Value>,
+    #[serde(default, rename = "size")]
+    pub(crate) _size: Option<u64>,
 }
 
 impl PyLock {
@@ -50,6 +71,27 @@ impl PyLock {
         );
         Ok(lock)
     }
+}
+
+/// A PEP 508 name: ASCII letters, digits, `-`, `_` and `.`, starting and
+/// ending alphanumeric. `deps check` refuses any other, and `deps diff` will
+/// not render one, since the name goes as-is into the update's Markdown table.
+pub(crate) fn is_valid_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.ends_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// PEP 440's characters only (ASCII letters, digits, `. + ! _ -`), starting
+/// with a digit. Not the full grammar: what matters is that the version, too,
+/// goes as-is into the update's Markdown table.
+pub(crate) fn is_valid_version(version: &str) -> bool {
+    version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-'))
 }
 
 impl Package {

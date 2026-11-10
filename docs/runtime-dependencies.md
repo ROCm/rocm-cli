@@ -153,6 +153,9 @@ mise's own `pypi` backend was evaluated for these stacks and cannot lock them
 - every wheel's platform tag fits the lock's OS (x86-64 Linux, or `win_amd64`),
   since the Windows locks are resolved on a Linux runner;
 - each package is locked once, with a version and at least one artifact;
+- the lock names no field this tooling does not know, at any level (only
+  those uv writes for the current profiles; a uv or profile change that adds
+  one fails until the tooling learns it), as for `mise.lock`;
 - every package name is a PEP 508 name and every version uses PEP 440's
   characters only (ASCII letters and digits plus `. + ! _ -`, starting with a
   digit), so no value can break the update PR's version table;

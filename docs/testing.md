@@ -542,7 +542,11 @@ a profile's first lock" there):
   uploading the re-locked files as the `runtime-locks` artifact. It downloads
   every AMD wheel the locks name (about 17 GiB), which is why it is
   path-filtered, does not run on pushes or in the merge queue, and runs on a
-  GitHub-hosted runner rather than locally.
+  GitHub-hosted runner rather than locally. The same job, and the weekly
+  update's `check` job, also run `cargo xtask deps verify-downloads`, which
+  downloads every binary `runtimes/mise.lock` records without a build
+  attestation (Lemonade) and fails if its SHA-256 differs from the lock; its
+  own tests use a fake download and run with `cargo test -p xtask`.
 - `python scripts/validate_runtime_update.py --self-test`
   ([script](../scripts/validate_runtime_update.py); run by the
   "Acceptance harness self-tests" CI step) covers the script the weekly update
@@ -558,6 +562,7 @@ a profile's first lock" there):
 
 ```bash
 cargo xtask deps check                       # offline
+cargo xtask deps verify-downloads            # network; re-hashes Lemonade
 runtimes/bin/mise run --cd runtimes lock    # network; slow, see above
 ```
 
