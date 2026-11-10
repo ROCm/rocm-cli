@@ -143,6 +143,44 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The leading version `rocm version` must print for a resolved `reference`,
+/// derived here from the ref alone rather than read back from the binary, so a
+/// build that reports the wrong version for its ref fails instead of agreeing
+/// with itself. Mirrors `release_version` in `apps/rocm/build.rs`: an exact
+/// `vX.Y.Z` tag, with an optional non-empty pre-release (`-rc.1`) or build
+/// (`+meta`) suffix of ASCII letters, digits, `.`, `-` and `+`, and at most 64
+/// characters after the `v` (`RELEASE_TAG_PATTERN` and
+/// `RELEASE_VERSION_MAX_LEN` there), is that version without its leading `v`; any other
+/// resolved ref (`main`, a feature branch, `vllm`, `v0.2`) is `0.0.0-dev`.
+/// The `unknown` ref is not covered: both callers reject it first.
+pub(crate) fn expected_leading_version(reference: &str) -> &str {
+    const NON_RELEASE: &str = "0.0.0-dev";
+    let Some(rest) = reference.strip_prefix('v') else {
+        return NON_RELEASE;
+    };
+    if rest.len() > 64 {
+        return NON_RELEASE;
+    }
+    let core = match rest.split_once(['-', '+']) {
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
+        Some(_) => return NON_RELEASE,
+        None => rest,
+    };
+    let components: Vec<&str> = core.split('.').collect();
+    let is_release = components.len() == 3
+        && components
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if is_release { rest } else { NON_RELEASE }
+}
+
 #[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let outputs = world.cli_outputs.as_ref().expect("no commands were run");
@@ -184,6 +222,11 @@ async fn assert_version_returned(world: &mut E2eWorld) {
     assert!(
         !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "version hash is not hexadecimal: {output}"
+    );
+    assert_eq!(
+        version,
+        expected_leading_version(reference),
+        "the leading version does not follow from the ref: {output}"
     );
 
     // `rocm version`'s own two lines beyond the build string. Both are printed
@@ -1444,6 +1487,27 @@ async fn os_release_with_a_command(world: &mut E2eWorld) {
 const RUNS_A_COMMAND_ON_LINE_3: &str =
     "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n";
 
+/// Writes each `(name, script)` as an executable in the isolated root's
+/// `fake-bin` and puts that directory first on the scenario's `PATH`.
+fn put_fake_executables_on_path(world: &mut E2eWorld, executables: &[(&str, &str)]) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    for (name, script) in executables {
+        rocm_core::fake_executable::write_fake_executable(&bin.join(name), script)
+            .unwrap_or_else(|e| panic!("failed to write the fake {name}: {e}"));
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
 /// One GPU node in the kernel topology: a gfx1101 with no PCI address, so it
 /// matches no `lspci` entry and is listed from the topology alone. Plus an
 /// `lspci` that lists an empty bus, ahead of any real one, so the PCI probe
@@ -1465,15 +1529,7 @@ fn plant_gpu_fixtures(world: &mut E2eWorld) {
         "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
     )
     .expect("failed to write planted KFD node properties");
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
-        .expect("failed to write the fake lspci");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(world, &[("lspci", "#!/bin/sh\nexit 0\n")]);
 }
 
 #[given("a GPU machine whose release file runs a command on line 3")]
@@ -1500,6 +1556,152 @@ async fn gpu_machine_with_unreadable_release_file(world: &mut E2eWorld) {
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
     plant_gpu_fixtures(world);
+}
+
+/// A simulated host root, plus a `lsmod` on `PATH` that lists `amdgpu` and no
+/// `amdkfd`, so the module list never answers for kfd. `with_kfd` plants the
+/// `/dev/kfd` node.
+fn plant_machine_without_amdkfd_module(world: &mut E2eWorld, with_kfd: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    if with_kfd {
+        std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    }
+    put_fake_executables_on_path(
+        world,
+        &[(
+            "lsmod",
+            "#!/bin/sh\nprintf 'Module Size Used by\\namdgpu 1 0\\ndrm 1 1 amdgpu\\n'\n",
+        )],
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[given("a machine whose kernel exposes kfd but lists no amdkfd module")]
+async fn machine_with_built_in_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, true);
+}
+
+#[given("a machine whose kernel has no kfd and lists no amdkfd module")]
+async fn machine_without_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, false);
+}
+
+/// A simulated host root with `/dev/kfd`, no `/proc/modules`, and a `lsmod`
+/// on `PATH` that fails: no module list can be read at all.
+#[given("a machine whose kernel exposes kfd but whose module list cannot be read")]
+async fn machine_with_kfd_and_no_module_list(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    put_fake_executables_on_path(world, &[("lsmod", "#!/bin/sh\nexit 1\n")]);
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[then("the inspection reports kfd as loaded")]
+async fn assert_kfd_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the inspection reports kfd as not loaded")]
+async fn assert_kfd_not_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(false), "{json:#}");
+}
+
+/// A simulated host root with `/sys/bus/pci/drivers/amdgpu` and a `lsmod` that lists
+/// neither `amdgpu` nor `amdkfd`: amdgpu built into the kernel. A ROCm install
+/// (`ROCM_PATH`) and a `mokutil` reporting Secure Boot enabled are planted too,
+/// so the three `rocm diagnose` evidence lines that read `amdgpu_loaded` have
+/// everything else they need to fire.
+#[given("a machine whose kernel has amdgpu built in and lists no amdgpu module")]
+async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("sys/bus/pci/drivers/amdgpu"))
+        .expect("failed to plant /sys/bus/pci/drivers/amdgpu");
+    world.plant_unmanaged_rocm();
+    put_fake_executables_on_path(
+        world,
+        &[
+            (
+                "lsmod",
+                "#!/bin/sh\nprintf 'Module Size Used by\\ndrm 1 0\\n'\n",
+            ),
+            ("mokutil", "#!/bin/sh\necho 'SecureBoot enabled'\n"),
+        ],
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+/// Both commands read the same planted machine, so the scenario environment
+/// (the host root and the fake executables on `PATH`) is restored between
+/// them: `run_rocm_with_scenario_env` consumes it.
+#[when("the user inspects and diagnoses that machine")]
+async fn user_inspects_and_diagnoses_planted_machine(world: &mut E2eWorld) {
+    let env = world.command_env.clone();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    world.command_env = env;
+    let (diagnosis, _, diagnose_rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--json"]);
+    assert_eq!(diagnose_rc, 0, "diagnose is a query and exits 0");
+    world.cli_outputs = Some(vec![diagnosis]);
+}
+
+#[then("the inspection reports amdgpu as loaded")]
+async fn assert_amdgpu_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdgpu_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence")]
+async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
+    let diagnosis = &world.cli_outputs.as_ref().expect("no diagnosis was run")[0];
+    let report: serde_json::Value = serde_json::from_str(diagnosis)
+        .unwrap_or_else(|e| panic!("diagnose --json is not JSON ({e}):\n{diagnosis}"));
+    let evidence: Vec<&str> = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("diagnose --json has no matched array:\n{report:#}"))
+        .iter()
+        .flat_map(|m| m["evidence"].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for line in evidence {
+        assert!(
+            !rocm_core::diagnose::AMDGPU_MISSING_EVIDENCE
+                .iter()
+                .any(|p| line.contains(p)),
+            "amdgpu was reported missing though the amdgpu PCI driver is registered: {line}"
+        );
+    }
 }
 
 #[when("the user inspects that machine in machine-readable form")]
@@ -2542,6 +2744,164 @@ async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
         (false, false),
         "(host summary, examination)"
     );
+}
+
+// ── Both reports read the kernel release from one `uname -r` ───────
+
+/// The release the stand-in `uname` reports, chosen so no real host has it.
+const STAND_IN_KERNEL_RELEASE: &str = "6.8.0-stand-in-kernel";
+
+/// Where the stand-in `uname` logs the arguments of every call, one line each,
+/// so a scenario can count the reads. Inside the isolated root.
+fn stand_in_uname_log(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-calls.log")
+}
+
+/// Plant a `uname` first on the `PATH` of the next `rocm` run. `-r` runs
+/// `release_body` (a shell fragment); `-v` answers a fixed string, so the
+/// examination's other `uname` read has nothing to wait for. Every call appends
+/// its arguments to [`stand_in_uname_log`]. Nothing else on the
+/// machine is planted: the stand-in is what `rocm examine` reads on any Linux
+/// host, native or WSL, because both stacks run `uname -r` there.
+fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in uname directory");
+    let log = stand_in_uname_log(world);
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(release_body, &log),
+    )
+    .expect("failed to write the stand-in uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a machine whose uname reports a kernel release")]
+async fn machine_whose_uname_reports_a_release(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}"));
+}
+
+#[given("a machine whose uname prints a kernel release and then fails")]
+async fn machine_whose_uname_prints_a_release_and_fails(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}; exit 3"));
+}
+
+/// The `probe_failures` entries of an `examine --json` document, whatever they
+/// say.
+fn probe_failures(json: &serde_json::Value) -> Vec<String> {
+    json.get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `probe_failures` of the same machine with a `uname` that works, for a
+/// baseline: entries this machine legitimately has for other reasons are not
+/// the kernel read's, and a failure the failing `uname` adds, however worded,
+/// is.
+fn probe_failures_with_a_working_uname(world: &E2eWorld) -> Vec<String> {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-baseline-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the baseline uname directory");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(
+            &format!("echo {STAND_IN_KERNEL_RELEASE}"),
+            &world
+                .isolated_root
+                .as_ref()
+                .expect("no isolated root")
+                .path()
+                .join("uname-baseline-calls.log"),
+        ),
+    )
+    .expect("failed to write the baseline uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    let path = path.to_str().expect("PATH is UTF-8").to_owned();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["examine", "--framework", "skip", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        rc, 0,
+        "the baseline `rocm examine --json` failed:\n{stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("the baseline run emitted JSON");
+    probe_failures(&json)
+}
+
+#[then("the summary and the examination report that kernel release")]
+async fn assert_both_report_the_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/kernel"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, "/kernel_release"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+}
+
+/// One `rocm examine --json` run asks `uname` for the release once, for the
+/// examination and the summary together: the stand-in logged a single `-r`. A
+/// second read would show as a second line, and it is what lets a transient
+/// failure make the two fields disagree.
+#[then("that run asked uname for the kernel release once")]
+async fn assert_uname_was_asked_for_the_release_once(world: &mut E2eWorld) {
+    let log = std::fs::read_to_string(stand_in_uname_log(world))
+        .expect("the stand-in uname was never called");
+    let release_reads = log.lines().filter(|line| line.trim() == "-r").count();
+    assert_eq!(release_reads, 1, "calls of the stand-in uname:\n{log}");
+}
+
+#[then(
+    "neither the summary nor the examination reports a kernel release, and neither calls it a failure"
+)]
+async fn assert_neither_reports_a_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert!(
+        json.pointer("/summary/kernel")
+            .is_some_and(serde_json::Value::is_null),
+        "the summary must read no kernel from a uname that failed:\n{json:#}"
+    );
+    assert_eq!(inspection_str(&json, "/kernel_release"), "", "{json:#}");
+    // No `probe_failures` entry beyond what the same machine has with a working
+    // `uname`, so a failure worded in any way cannot slip through.
+    let baseline = probe_failures_with_a_working_uname(world);
+    let new_failures: Vec<String> = probe_failures(&json)
+        .into_iter()
+        .filter(|failure| !baseline.contains(failure))
+        .collect();
+    assert_eq!(new_failures, Vec::<String>::new(), "{json:#}");
 }
 
 // ── A probe tool that leaves a background process behind ───────────────────

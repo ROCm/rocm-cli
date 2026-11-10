@@ -1,5 +1,8 @@
 Feature: GPU detection and system inspection
 
+  # A release tag `vX.Y.Z` is reported as `X.Y.Z (vX.Y.Z, <hash>)`. Any other
+  # resolved ref, including `main`, is reported as `0.0.0-dev` rather than the
+  # unpublished workspace package version. The step checks that shape.
   @id:examine-version
   Scenario: examine-01 - The CLI reports its version
     When the user asks for the version through every CLI surface
@@ -474,7 +477,7 @@ Feature: GPU detection and system inspection
   # The other side of examine-24/25/26, and the user-observable half of the
   # `/dev/kfd` pre-flight (EAI-8457): where those three prove a healthy device
   # still reaches amd-smi, this proves an unopenable one stops the launch from
-  # happening at all. (Declared here at the end rather than beside them because
+  # happening at all. (Declared after examine-30 rather than beside them because
   # the scenario index is per-feature and in declaration order.) On a host in
   # that state amd-smi can park in
   # uninterruptible sleep, where no signal and therefore no timeout reaches it,
@@ -599,6 +602,79 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then both reports say rocminfo is installed
 
+  # kfd is linked into `amdgpu` (`HSA_AMD` is a `bool` Kconfig option), so a
+  # healthy machine never lists an `amdkfd` module. The report used to read
+  # that as "kfd missing". Each scenario plants a module list naming `amdgpu`
+  # only, so the answer can come only from the kernel's kfd interfaces.
+  @id:examine-reports-kfd-built-into-the-kernel @requires-os:linux
+  Scenario: examine-39 - The inspection reports kfd on a machine whose module list has no amdkfd
+    Given a machine whose kernel exposes kfd but lists no amdkfd module
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as loaded
+
+  # A negative control for examine-39, not proof of the fix: it passes with
+  # the fix reverted too, and fails if the kfd check reports true regardless.
+  @id:examine-reports-kfd-absent-without-kfd-interfaces @requires-os:linux
+  Scenario: examine-40 - The inspection reports kfd as not loaded on a machine without it
+    Given a machine whose kernel has no kfd and lists no amdkfd module
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as not loaded
+
+  # amdgpu built into the kernel is absent from `lsmod` too, so it was read as
+  # "module not loaded" and `rocm diagnose` scored that, plus a DKMS failure
+  # and Secure Boot, as evidence. `/sys/bus/pci/drivers/amdgpu` exists for a loaded
+  # module and a built-in driver alike. The machine also has a ROCm install
+  # and Secure Boot enabled, so the evidence lines are reachable if the flag
+  # regresses.
+  @id:examine-reports-amdgpu-built-into-the-kernel @requires-os:linux
+  Scenario: examine-41 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
+    Given a machine whose kernel has amdgpu built in and lists no amdgpu module
+    When the user inspects and diagnoses that machine
+    Then the inspection reports amdgpu as loaded
+    And the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence
+
+  # With no module list at all (`lsmod` fails and `/proc/modules` is empty),
+  # the kernel's kfd interfaces still answer: kfd is linked into amdgpu, so
+  # `/dev/kfd` reports both drivers as loaded rather than leaving them unknown.
+  @id:examine-reports-drivers-from-kfd-without-a-module-list @requires-os:linux
+  Scenario: examine-42 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
+    Given a machine whose kernel exposes kfd but whose module list cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as loaded
+    And the inspection reports amdgpu as loaded
+
+  # `rocm examine --json` reads the kernel release twice: the host summary
+  # (`summary.kernel`, which the text form prints as `kernel:`) and the examination
+  # (`kernel_release`, which the WSL version check and the kernel-dependent
+  # diagnoses read). They used to run `uname -r` separately, with different limits
+  # and different rules for a failed or malformed answer, and could disagree. They
+  # share one read now, so one `--json` run holds the two level on a specific
+  # value, not only on both being filled, and the stand-in counts its calls to show
+  # that the run asked for the release once: the summary takes the examination's
+  # read, so a transient failure cannot make the two fields disagree and a hung
+  # `uname` costs one timeout.
+  #
+  # The stand-in `uname` is planted first on PATH, so the scenario describes a
+  # kernel no runner has. It runs on every Linux lane, native or WSL, because both
+  # stacks read `uname -r` on both; Windows is out of scope, where the examination
+  # leaves `kernel_release` empty and the summary reads `cmd /C ver`.
+  @id:examine-reports-one-kernel-release-in-both-forms @requires-os:linux
+  Scenario: examine-43 - The summary and the examination report the same kernel release
+    Given a machine whose uname reports a kernel release
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that kernel release
+    And that run asked uname for the kernel release once
+
+  # A `uname` that fails is not trusted for what it printed first: the examination
+  # used to keep that release while the summary dropped it. Neither reports a
+  # kernel now, and a failed read is not a probe failure, so a host without a
+  # usable `uname` does not read as degraded.
+  @id:examine-reports-no-kernel-release-from-a-failing-uname @requires-os:linux
+  Scenario: examine-44 - Neither report keeps a kernel release from a uname that failed
+    Given a machine whose uname prints a kernel release and then fails
+    When the user inspects that machine in machine-readable form
+    Then neither the summary nor the examination reports a kernel release, and neither calls it a failure
+
   # The host probes' subprocess helpers used to read a tool's output until every
   # holder of the pipe had closed it, so a tool that left a background process
   # behind (a helper the tool starts and does not wait for) held the whole
@@ -610,7 +686,7 @@ Feature: GPU detection and system inspection
   # tool printed before it exited is still collected. It does not pin the length
   # of the grace: that is the unit tests' (`subprocess_runners_pair`).
   @id:examine-lspci-leaving-a-background-process-does-not-hold-up-the-inspection @requires-os:linux
-  Scenario: examine-39 - A PCI listing tool that leaves a background process behind does not hold up the inspection
+  Scenario: examine-45 - A PCI listing tool that leaves a background process behind does not hold up the inspection
     Given a machine whose lspci prints a GPU and leaves a background process holding its output open
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does

@@ -269,8 +269,22 @@ pub struct Examination {
     pub has_discrete_amd: bool,
 
     // driver / runtime (Linux)
+    /// amdgpu is present: listed as a module, or registered as a PCI driver
+    /// (`/sys/bus/pci/drivers/amdgpu`), which it is whether amdgpu is loaded
+    /// as a module or built into the kernel (where it never appears in
+    /// `lsmod`), or kfd is present on the host (kfd is linked into amdgpu).
+    ///
+    /// This is the driver being present, not a GPU being bound to it: a
+    /// built-in driver registers at boot with or without a matching GPU, as a
+    /// loaded module does when `modprobe`d on any machine. Whether there is an
+    /// AMD GPU is `has_amd_gpu`. `diagnose` reads only `Some(false)`, as a
+    /// module that failed to load (DKMS, a blacklist, Secure Boot), none of
+    /// which can stop a driver that is present.
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
+    /// kfd is available: as a separate `amdkfd` module on kernels before 4.20
+    /// (where kfd was merged into `amdgpu.ko`), or through `/sys/class/kfd/kfd`
+    /// or `/dev/kfd` on current ones. The name predates the merge.
     pub amdkfd_loaded: Option<bool>,
     pub secure_boot: String,
     pub iommu_kernel_param: String,
@@ -531,6 +545,29 @@ impl Examination {
         Self::probe_with_interpreter(framework, None)
     }
 
+    /// Probe this host and gather its summary from the examination, returning
+    /// both: what `rocm examine --json` prints as one document.
+    ///
+    /// The pairing is made here so no caller can hand the summary an
+    /// examination of another host. The summary takes the examination's kernel
+    /// release (a failed read included) instead of running `uname -r` again, so
+    /// one inspection reads it once: `summary.kernel` and `kernel_release`
+    /// cannot disagree on a transient failure, and a hung `uname` costs one
+    /// timeout rather than two. Probing is as [`Self::probe_with_interpreter`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the host summary cannot be gathered (the application
+    /// directories cannot be resolved); the examination itself never fails.
+    pub fn probe_with_summary(
+        framework: FrameworkProbe,
+        interpreter: Option<&FrameworkInterpreter>,
+    ) -> anyhow::Result<(Self, crate::ExamineSummary)> {
+        let examination = Self::probe_with_interpreter(framework, interpreter);
+        let summary = crate::ExamineSummary::gather_after(&examination)?;
+        Ok((examination, summary))
+    }
+
     /// As [`Self::probe`], but running the framework probe under `interpreter`
     /// when one is given.
     ///
@@ -633,7 +670,12 @@ impl Examination {
     /// Coarse machine-readable verdict reported via the `status` field. The
     /// process exit code does NOT encode this — `rocm examine` always exits 0
     /// when it ran; callers branch on `status` instead.
-    fn compute_status(&self) -> String {
+    ///
+    /// Public so that a tool which edits a recorded examination (the skill-eval
+    /// recordings do) can recompute the verdict from the same rule the probe uses,
+    /// instead of typing a `status` that could disagree with the other fields.
+    #[must_use]
+    pub fn compute_status(&self) -> String {
         let value = if self.is_wsl {
             "wsl"
         } else if !matches!(self.os_family.as_str(), "linux" | "windows") {
