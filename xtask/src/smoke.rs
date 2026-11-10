@@ -526,15 +526,55 @@ fn exit_code_text(status: &std::process::ExitStatus) -> String {
 /// The two serve rejections, which ran last, need a port chosen at run time;
 /// their argv carries [`PORT_TOKEN`], which [`execute`] resolves.
 fn checks() -> Vec<Check> {
-    let mut checks = checks_before_platform_gate();
-    if cfg!(windows) {
+    checks_for(Host::current())
+}
+
+/// The host family the gate runs on, as far as the table depends on it.
+///
+/// Native Windows is the only host whose expectations differ, and it is a
+/// parameter rather than a `cfg!` inside the table so that a test on any host
+/// can pin the native-Windows table too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Host {
+    NativeWindows,
+    Other,
+}
+
+impl Host {
+    const fn current() -> Self {
+        if cfg!(windows) {
+            Self::NativeWindows
+        } else {
+            Self::Other
+        }
+    }
+
+    /// The expected text for a command that native Windows refuses up front:
+    /// there `rocm` rules vLLM out before it looks at a runtime, a device
+    /// policy or a port, so the refusal names the platform rather than the
+    /// condition the check exercises elsewhere.
+    const fn unless_vllm_ruled_out(self, elsewhere: &'static str) -> &'static str {
+        match self {
+            Self::NativeWindows => VLLM_NATIVE_WINDOWS_REFUSAL,
+            Self::Other => elsewhere,
+        }
+    }
+}
+
+/// What `rocm` prints when it refuses a vLLM serve or install on native
+/// Windows (`ensure_engine_allowed_on_platform` in `apps/rocm`).
+const VLLM_NATIVE_WINDOWS_REFUSAL: &str = "vLLM is not supported on native Windows";
+
+fn checks_for(host: Host) -> Vec<Check> {
+    let mut checks = checks_before_platform_gate(host);
+    if host == Host::NativeWindows {
         checks.extend(windows_only_checks());
     }
-    checks.extend(checks_after_platform_gate());
+    checks.extend(checks_after_platform_gate(host));
     checks
 }
 
-fn checks_before_platform_gate() -> Vec<Check> {
+fn checks_before_platform_gate(host: Host) -> Vec<Check> {
     vec![
         Check::new("rocm examine", Bin::Rocm, &["examine"])
             .contains("rocm examine")
@@ -560,7 +600,7 @@ fn checks_before_platform_gate() -> Vec<Check> {
             &["engines", "install", "vllm"],
         )
         .failing()
-        .contains("no active ROCm runtime is configured"),
+        .contains(host.unless_vllm_ruled_out("no active ROCm runtime is configured")),
         Check::new(
             "rocm chat local status",
             Bin::Rocm,
@@ -626,7 +666,7 @@ fn windows_only_checks() -> Vec<Check> {
     ]
 }
 
-fn checks_after_platform_gate() -> Vec<Check> {
+fn checks_after_platform_gate(host: Host) -> Vec<Check> {
     vec![
         Check::new("rocmd status", Bin::Rocmd, &["status"]).contains("rocmd status"),
         Check::new("rocmd bridge snapshot", Bin::Rocmd, &["bridge-snapshot"])
@@ -690,7 +730,7 @@ fn checks_after_platform_gate() -> Vec<Check> {
             ],
         )
         .failing()
-        .contains("gpu_required")
+        .contains(host.unless_vllm_ruled_out("gpu_required"))
         .not_contains("CPU fallback"),
         Check::new(
             "rocm vllm reject cpu serve",
@@ -708,7 +748,7 @@ fn checks_after_platform_gate() -> Vec<Check> {
             ],
         )
         .failing()
-        .contains("CPU mode is not a fallback path"),
+        .contains(host.unless_vllm_ruled_out("CPU mode is not a fallback path")),
     ]
 }
 
@@ -977,23 +1017,48 @@ mod tests {
     /// into "this must succeed" — is the failure this exists to catch.
     ///
     /// Update it when a check genuinely changes, and say why in the commit.
+    ///
+    /// Both hosts' tables are pinned on every host, so the native-Windows
+    /// expectations are checked by the Linux CI job too, not only by the
+    /// Windows one.
     #[test]
     fn every_check_pins_its_command_and_its_expectations() {
+        for host in [Host::Other, Host::NativeWindows] {
+            let rendered: Vec<String> = checks_for(host).iter().map(render_check).collect();
+            assert_eq!(rendered, pinned_table(host), "{host:?}");
+        }
+    }
+
+    /// The gate runs the current host's table.
+    #[test]
+    fn the_gate_runs_the_current_hosts_table() {
         let rendered: Vec<String> = checks().iter().map(render_check).collect();
-        let expected = vec![
+        let expected = if cfg!(windows) {
+            pinned_table(Host::NativeWindows)
+        } else {
+            pinned_table(Host::Other)
+        };
+        assert_eq!(rendered, expected);
+    }
+
+    fn pinned_table(host: Host) -> Vec<&'static str> {
+        let windows = host == Host::NativeWindows;
+        let mut table = vec![
             r#"rocm examine | rocm ["examine"] | =contains["rocm examine", "default_engine:", "managed_runtimes: 0", "managed_services: 0"]"#,
             r#"rocm engines list | rocm ["engines", "list"] | =contains["lemonade", "vllm"]"#,
             r#"rocm config set telemetry off | rocm ["config", "set-telemetry", "off"] | =contains["telemetry mode set to off", "policy: disabled"]"#,
             r#"rocm config show | rocm ["config", "show"] | =contains["telemetry_mode: off", "telemetry_policy: disabled"]"#,
-            r#"rocm engines install requires exact runtime | rocm ["engines", "install", "vllm"] | !contains["no active ROCm runtime is configured"]"#,
+            if windows {
+                r#"rocm engines install requires exact runtime | rocm ["engines", "install", "vllm"] | !contains["vLLM is not supported on native Windows"]"#
+            } else {
+                r#"rocm engines install requires exact runtime | rocm ["engines", "install", "vllm"] | !contains["no active ROCm runtime is configured"]"#
+            },
             r#"rocm chat local status | rocm ["chat", "--provider", "local"] | =any["Provider: local", "Assistant source: local model on this computer"]"#,
             r#"rocm freeform installed status question | rocm ["is rocm installed?"] | =contains["ROCm status", "Nothing was changed."] absent["No ROCm action selected"]"#,
             r#"rocm freeform comfyui help question | rocm ["how do i setup comfyui"] | =contains["ComfyUI status", "Nothing was changed."] absent["No ROCm action selected"]"#,
             r#"rocm freeform comfyui install request | rocm ["can you setup comfyui for me"] | =contains["Install ComfyUI", "approval: required"]"#,
             r#"rocm freeform vllm plan | rocm ["serve qwen with vllm"] | =contains["engine: vllm", "no CPU fallback is implied"]"#,
             r#"rocm freeform tiny gpu recipe plan | rocm ["serve tiny-gpt2"] | =contains["model: sshleifer/tiny-gpt2", "device_policy: gpu_required", "--device gpu_required", "approval: required"]"#,
-            #[cfg(windows)]
-            r#"windows tarball sdk rejection | rocm ["install", "sdk", "--format", "tarball", "--dry-run"] | !contains["TheRock tarball installs are not supported on Windows"]"#,
             r#"rocmd status | rocmd ["status"] | =contains["rocmd status"]"#,
             r#"rocmd bridge snapshot | rocmd ["bridge-snapshot"] | =json(Protocol("rocmd-codex-bridge-v0"))"#,
             r#"rocmd sandbox examine snapshot | rocmd ["sandbox-run", "examine_snapshot", "--allow-native-fallback"] | =json(SandboxTool { tool: "examine_snapshot", noun: "examine" })"#,
@@ -1003,10 +1068,28 @@ mod tests {
             r#"vllm capabilities | vllm ["capabilities"] | =json(VllmCapabilities)"#,
             r#"vllm resolve qwen | vllm ["resolve-model", "qwen"] | =contains["qwen"]"#,
             r#"vllm reject cpu | vllm ["resolve-model", "qwen", "--device-policy", "cpu_only"] | !contains["no CPU fallback is used"]"#,
-            r#"vllm reject required gpu | rocm ["serve", "qwen", "--engine", "vllm", "--device", "gpu_required", "--foreground", "--port", "{port}"] | !contains["gpu_required"] absent["CPU fallback"]"#,
-            r#"rocm vllm reject cpu serve | rocm ["serve", "qwen", "--engine", "vllm", "--device", "cpu", "--foreground", "--port", "{port}"] | !contains["CPU mode is not a fallback path"]"#,
+            if windows {
+                r#"vllm reject required gpu | rocm ["serve", "qwen", "--engine", "vllm", "--device", "gpu_required", "--foreground", "--port", "{port}"] | !contains["vLLM is not supported on native Windows"] absent["CPU fallback"]"#
+            } else {
+                r#"vllm reject required gpu | rocm ["serve", "qwen", "--engine", "vllm", "--device", "gpu_required", "--foreground", "--port", "{port}"] | !contains["gpu_required"] absent["CPU fallback"]"#
+            },
+            if windows {
+                r#"rocm vllm reject cpu serve | rocm ["serve", "qwen", "--engine", "vllm", "--device", "cpu", "--foreground", "--port", "{port}"] | !contains["vLLM is not supported on native Windows"]"#
+            } else {
+                r#"rocm vllm reject cpu serve | rocm ["serve", "qwen", "--engine", "vllm", "--device", "cpu", "--foreground", "--port", "{port}"] | !contains["CPU mode is not a fallback path"]"#
+            },
         ];
-        assert_eq!(rendered, expected);
+        if windows {
+            let after_freeform = table
+                .iter()
+                .position(|row| row.starts_with("rocmd status |"))
+                .expect("rocmd status row");
+            table.insert(
+                after_freeform,
+                r#"windows tarball sdk rejection | rocm ["install", "sdk", "--format", "tarball", "--dry-run"] | !contains["TheRock tarball installs are not supported on Windows"]"#,
+            );
+        }
+        table
     }
 
     /// `=` expects success, `!` expects a non-zero exit.
@@ -1046,7 +1129,10 @@ mod tests {
     /// asserts nothing while looking like it does.
     #[test]
     fn no_check_carries_an_empty_needle() {
-        for check in &checks() {
+        for check in [Host::Other, Host::NativeWindows]
+            .into_iter()
+            .flat_map(checks_for)
+        {
             for needle in check
                 .contains
                 .iter()
@@ -1102,9 +1188,8 @@ mod tests {
     /// platform-gated entry, which the next test places.
     #[test]
     fn the_check_sequence_matches_the_gate_it_replaces() {
-        let labels: Vec<&str> = checks_before_platform_gate()
+        let labels: Vec<&str> = checks_for(Host::Other)
             .iter()
-            .chain(checks_after_platform_gate().iter())
             .map(|check| check.label)
             .collect();
         assert_eq!(
@@ -1140,31 +1225,39 @@ mod tests {
     /// checks, where the script ran it — not appended at the end.
     #[test]
     fn the_windows_check_sits_between_the_two_halves() {
-        let before = checks_before_platform_gate();
+        let before = checks_before_platform_gate(Host::NativeWindows);
         assert_eq!(
             before.last().expect("a check").label,
             "rocm freeform tiny gpu recipe plan"
         );
         assert_eq!(
-            checks_after_platform_gate().first().expect("a check").label,
+            checks_after_platform_gate(Host::NativeWindows)
+                .first()
+                .expect("a check")
+                .label,
             "rocmd status"
         );
-        if cfg!(windows) {
-            let labels: Vec<&str> = checks().iter().map(|check| check.label).collect();
-            let gated = labels
+        let labels: Vec<&str> = checks_for(Host::NativeWindows)
+            .iter()
+            .map(|check| check.label)
+            .collect();
+        let gated = labels
+            .iter()
+            .position(|label| *label == "windows tarball sdk rejection")
+            .expect("the windows check is in the table");
+        assert_eq!(gated, before.len());
+        assert!(
+            !checks_for(Host::Other)
                 .iter()
-                .position(|label| *label == "windows tarball sdk rejection")
-                .expect("the windows check is in the table");
-            assert_eq!(gated, before.len());
-        }
+                .any(|check| check.label == "windows tarball sdk rejection"),
+            "the windows check runs only on native Windows"
+        );
     }
 
     #[test]
     fn check_labels_are_unique_across_the_table() {
-        let mut labels: Vec<&str> = checks_before_platform_gate()
+        let mut labels: Vec<&str> = checks_for(Host::NativeWindows)
             .iter()
-            .chain(windows_only_checks().iter())
-            .chain(checks_after_platform_gate().iter())
             .map(|check| check.label)
             .collect();
         let total = labels.len();
@@ -1175,10 +1268,9 @@ mod tests {
 
     #[test]
     fn every_check_asserts_something() {
-        for check in checks_before_platform_gate()
+        for check in checks_for(Host::NativeWindows)
             .iter()
-            .chain(windows_only_checks().iter())
-            .chain(checks_after_platform_gate().iter())
+            .chain(checks_for(Host::Other).iter())
         {
             assert!(
                 !check.contains.is_empty()
@@ -1192,15 +1284,36 @@ mod tests {
         }
     }
 
+    /// The refusals are what the gate exists for, so each must be in the
+    /// table on every host, expected to fail, and asserting what it printed.
     #[test]
-    fn the_no_cpu_fallback_checks_are_in_the_table() {
-        let labels: Vec<&str> = checks().iter().map(|check| check.label).collect();
-        for required in [
-            "rocm engines install requires exact runtime",
-            "vllm reject cpu",
-            "rocm freeform vllm plan",
-        ] {
-            assert!(labels.contains(&required), "{required} is not smoked");
+    fn every_gpu_refusal_is_smoked_as_a_refusal_on_every_host() {
+        for host in [Host::Other, Host::NativeWindows] {
+            let table = checks_for(host);
+            for required in [
+                "rocm engines install requires exact runtime",
+                "vllm reject cpu",
+                "vllm reject required gpu",
+                "rocm vllm reject cpu serve",
+            ] {
+                let check = table
+                    .iter()
+                    .find(|check| check.label == required)
+                    .unwrap_or_else(|| panic!("{required} is not smoked on {host:?}"));
+                assert!(
+                    check.expect_failure,
+                    "{required} must expect a refusal on {host:?}"
+                );
+                assert!(
+                    !check.contains.is_empty(),
+                    "{required} must assert the refusal's text on {host:?}"
+                );
+            }
+            let plan = table
+                .iter()
+                .find(|check| check.label == "rocm freeform vllm plan")
+                .unwrap_or_else(|| panic!("the vllm plan is not smoked on {host:?}"));
+            assert!(plan.contains.contains(&"no CPU fallback is implied"));
         }
     }
 
