@@ -184,14 +184,16 @@ pub use paths::{
     AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV, DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs,
 };
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
+    RecordedPidStop, TerminationOutcome, identity_state, process_start_ticks,
+    terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
+    terminate_verified,
 };
 pub use process::{
-    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
     is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
-    lease_loopback_port_or_bind_error, process_is_running, terminate_process,
-    terminate_process_tree,
+    lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
+    terminate_process_tree, windows_system_tool,
 };
 #[cfg(windows)]
 pub use process::{

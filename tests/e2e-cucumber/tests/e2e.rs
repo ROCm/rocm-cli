@@ -215,6 +215,11 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// The identity of a process the recorded one started (`service-stop-07`'s
+    /// `ping`). Teardown ends it on its own account, because a stop that fails
+    /// to take it down leaves it running with a dead parent, where nothing else
+    /// can find it.
+    pub recorded_descendant: Option<rocm_core::ProcessIdentity>,
     /// Whether the Doctor report preview in the dashboard console was the CLI's
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
@@ -386,6 +391,7 @@ impl Default for E2eWorld {
             skill_symptom: None,
             helper_identity: None,
             recorded_process: None,
+            recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,
         }
@@ -733,6 +739,21 @@ impl Drop for E2eWorld {
         if let Some(mut process) = self.recorded_process.take() {
             let _ = process.kill();
             let _ = process.wait();
+        }
+        // The process the recorded one started: ended too when it is still the
+        // process that was recorded, so a failed scenario does not leave it
+        // running until its own timeout.
+        if let Some(descendant) = self.recorded_descendant.take() {
+            use e2e_cucumber::stray_process::{Leftover, RecordedState, leftover_action};
+            let state = match rocm_core::identity_state(&descendant) {
+                rocm_core::IdentityState::Matches => RecordedState::Same,
+                rocm_core::IdentityState::Gone => RecordedState::Gone,
+                rocm_core::IdentityState::Recycled => RecordedState::Reused,
+                rocm_core::IdentityState::Indeterminate => RecordedState::Unconfirmed,
+            };
+            if leftover_action(state) == Leftover::Terminate {
+                let _ = rocm_core::terminate_recorded_pid(&descendant);
+            }
         }
         // A scenario that enabled a watcher started a real detached `rocm daemon`,
         // which only exits once the watcher is disabled. If a step failed first,
