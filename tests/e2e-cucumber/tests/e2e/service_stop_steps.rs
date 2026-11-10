@@ -222,6 +222,72 @@ async fn next_stop_unverified(world: &mut E2eWorld) {
     script_next_stop_outcome(world, "unverified");
 }
 
+// ── Given: an engine child the scenario controls ────────────────────
+
+/// The standalone daemon's file name: `rocmd`, with the platform's suffix.
+const STANDALONE_ROCMD: &str = if cfg!(windows) { "rocmd.exe" } else { "rocmd" };
+/// What the stand-in engine launcher records, one line per time it is run.
+const ENGINE_INVOCATIONS: &str = "engine-invocations";
+/// What the stand-in engine launcher read on its stdin, over every run.
+const ENGINE_REQUESTS: &str = "engine-requests";
+
+/// The directory holding the standalone daemon copy and the stand-in `rocm`.
+fn standalone_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("standalone-daemon")
+}
+
+/// Plant a copy of the real `rocmd` with a stand-in `rocm` beside it.
+///
+/// A `rocmd` named exactly that reaches an engine through the `rocm` next to it,
+/// so the engine child the daemon runs for its `Stop` request is `behaviour`: a
+/// shell script that first records its argv and what it read on stdin (into
+/// [`ENGINE_INVOCATIONS`] and [`ENGINE_REQUESTS`] beside it), then does what the
+/// scenario says. The copy is a plain file, not a link, because the daemon looks
+/// for its sibling next to where its executable really is.
+fn install_standalone_daemon(world: &E2eWorld, behaviour: &str) {
+    let dir = standalone_dir(world);
+    std::fs::create_dir_all(&dir).expect("failed to create the standalone daemon dir");
+    let rocmd = std::fs::read(crate::rocmd_binary()).expect("failed to read rocmd");
+    rocm_core::fake_executable::write_fake_executable(&dir.join(STANDALONE_ROCMD), rocmd)
+        .expect("failed to plant the standalone daemon");
+    let script = format!(
+        "#!/bin/sh\n\
+         dir=$(dirname \"$0\")\n\
+         echo \"$*\" >> \"$dir/{ENGINE_INVOCATIONS}\"\n\
+         cat >> \"$dir/{ENGINE_REQUESTS}\"\n\
+         {behaviour}\n"
+    );
+    rocm_core::fake_executable::write_fake_executable(&dir.join("rocm"), script)
+        .expect("failed to plant the stand-in rocm");
+}
+
+#[given("the engine answers the stop request and then exits with a failing status")]
+async fn engine_answers_then_fails(world: &mut E2eWorld) {
+    install_standalone_daemon(
+        world,
+        "echo '{\"ok\":true,\"data\":{\"stopped\":true,\"graceful\":true}}'\n\
+         echo 'stand-in engine: exiting with a failing status after answering' >&2\n\
+         exit 3",
+    );
+}
+
+#[given(
+    "the engine prints something that is not an answer, complains on stderr and exits with a failing status"
+)]
+async fn engine_prints_garbage_and_fails(world: &mut E2eWorld) {
+    install_standalone_daemon(
+        world,
+        "printf 'this is not an answer'\n\
+         echo 'engine exploded: no container runtime' >&2\n\
+         exit 1",
+    );
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 /// Runs the pinned, directly-runnable form `serve_summary.rs`'s `stop` row
@@ -239,7 +305,25 @@ async fn stop_with_yes(world: &mut E2eWorld) {
 
 #[when("the daemon's stop_server tool stops that server")]
 async fn stop_server_tool(world: &mut E2eWorld) {
-    let mut command = Command::new(crate::rocmd_binary());
+    run_stop_server_tool(world, crate::rocmd_binary());
+}
+
+/// The same tool, run from the copy of `rocmd` that has a stand-in `rocm` beside
+/// it (see [`install_standalone_daemon`]), so the engine's `Stop` request reaches
+/// a child the scenario controls.
+#[when("the standalone daemon's stop_server tool stops that server")]
+async fn standalone_stop_server_tool(world: &mut E2eWorld) {
+    let rocmd = standalone_dir(world).join(STANDALONE_ROCMD);
+    assert!(
+        rocmd.is_file(),
+        "no standalone daemon was installed: {}",
+        rocmd.display()
+    );
+    run_stop_server_tool(world, rocmd);
+}
+
+fn run_stop_server_tool(world: &mut E2eWorld, rocmd: PathBuf) {
+    let mut command = Command::new(rocmd);
     command.args(["sandbox-tool", "stop_server", "--service-id", SERVICE_ID]);
     world.isolate_cmd(&mut command);
     let output = command.output().expect("failed to run rocmd");
@@ -309,6 +393,117 @@ async fn tool_reports_stopped(world: &mut E2eWorld) {
             .is_some_and(|pids| pids.iter().any(|p| p.as_u64() == Some(pid))),
         "{report}"
     );
+}
+
+/// The standalone `rocmd` reaches an engine through the `rocm` beside it (it has
+/// no engine verb of its own), so its `Stop` request is answered rather than
+/// failing with the standalone binary's "unrecognized subcommand". The report
+/// carries the engine's answer or the error that took its place.
+///
+/// The answer is `stopped: false`, and that is the right one here, not a gap: the
+/// planted record names no engine state with a process id, so the real `vllm`
+/// engine has nothing it can confirm stopping (`stop_service` answers `false`
+/// when no PID is recorded). The recorded supervisor, which the daemon itself
+/// signals, is what the other steps check. Asserting the whole answer, not just
+/// that it is a boolean, is what tells it from an engine that was never reached.
+#[then("the tool asked the engine to stop and the engine answered")]
+async fn engine_answered_the_stop(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    let report: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+    let engine_stop = &report["result"]["engine_stop"];
+    assert_eq!(engine_stop["attempted"], true, "{report}");
+    assert!(
+        engine_stop.get("error").is_none(),
+        "the engine's answer was an error instead: {report}"
+    );
+    assert_eq!(
+        *engine_stop,
+        serde_json::json!({"attempted": true, "stopped": false, "graceful": false}),
+        "{report}"
+    );
+}
+
+/// The stop report `rocmd sandbox-tool stop_server` printed, with the tool's own
+/// exit status checked first: both engine endings below leave the stop itself
+/// succeeding.
+fn tool_report(world: &E2eWorld) -> serde_json::Value {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "rocmd failed:\n{stdout}\n{}",
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    serde_json::from_str(stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"))
+}
+
+/// The stand-in engine was run once, as `__engine-stdio vllm`, and was sent one
+/// line: an engine `stop` request for the planted server. Reads what the
+/// stand-in itself recorded, so it holds for the child the daemon ran, not for
+/// what the daemon says it ran.
+#[then("the engine received one stop request for that server over stdio")]
+async fn engine_received_one_stop_request(world: &mut E2eWorld) {
+    let dir = standalone_dir(world);
+    let invocations = std::fs::read_to_string(dir.join(ENGINE_INVOCATIONS))
+        .expect("the stand-in engine was never run");
+    assert_eq!(
+        invocations,
+        format!("__engine-stdio {ENGINE}\n"),
+        "the daemon must run the rocm beside it once, as `__engine-stdio <engine>`"
+    );
+    let requests = std::fs::read_to_string(dir.join(ENGINE_REQUESTS))
+        .expect("the stand-in engine recorded no request");
+    assert_eq!(
+        requests.lines().count(),
+        1,
+        "one request, one line: {requests:?}"
+    );
+    let request: serde_json::Value = serde_json::from_str(&requests)
+        .unwrap_or_else(|error| panic!("the request is not JSON ({error}): {requests:?}"));
+    assert_eq!(request["method"], "stop", "{request}");
+    assert_eq!(request["payload"]["service_id"], SERVICE_ID, "{request}");
+}
+
+/// What the engine printed before it exited non-zero is what the report carries:
+/// a stop it answered, with no error taken from the exit status.
+#[then("the tool reports the engine's answer to the stop, not the status it exited with")]
+async fn engine_answer_survives_a_failing_exit(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    assert_eq!(
+        report["result"]["engine_stop"],
+        serde_json::json!({"attempted": true, "stopped": true, "graceful": true}),
+        "{report}"
+    );
+    assert_eq!(report["status"], "stopped", "{report}");
+    assert_eq!(report["result"]["stopped"], true, "{report}");
+}
+
+/// An answer that cannot be read is reported as that, together with the status
+/// the engine exited with and what it said on stderr: the status says the answer
+/// was cut short, the stderr why.
+#[then("the tool reports the stop request failed, with the engine's exit status and stderr")]
+async fn unreadable_answer_reported_with_stderr(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    let engine_stop = &report["result"]["engine_stop"];
+    assert_eq!(engine_stop["attempted"], true, "{report}");
+    assert_eq!(
+        engine_stop["error"],
+        "failed to parse engine response envelope \
+         (engine stdio process exited with code 1); \
+         stderr: engine exploded: no container runtime",
+        "{report}"
+    );
+    assert!(engine_stop.get("stopped").is_none(), "{report}");
+}
+
+/// For a `vllm` server the engine's `Stop` is advisory: the recorded process
+/// decides, so a failed request does not leave the server unconfirmed.
+#[then("the tool still reports the server stopped")]
+async fn tool_still_reports_stopped(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    assert_eq!(report["status"], "stopped", "{report}");
+    assert_eq!(report["result"]["stopped"], true, "{report}");
 }
 
 #[then("the recorded process is no longer running")]
