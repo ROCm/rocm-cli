@@ -136,6 +136,13 @@ reason = "Lemonade managed serve never exposes the model, so readiness never cov
 serve_timeout_secs = 90
 flaky = true
 
+[["serve-anthropic-messages-streaming"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the streaming Anthropic request never gets an answer."
+serve_timeout_secs = 90
+flaky = true
+
 # Explicit Lemonade serving shares the same failure on the Ubuntu lane.
 [["serve-lemonade-inference"]]
 when = { effective_engine = "lemonade", os = "linux" }

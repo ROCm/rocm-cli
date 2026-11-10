@@ -83,6 +83,9 @@ pub struct E2eWorld {
     /// The reply to a request sent to the served model's Anthropic-compatible
     /// `/v1/messages` endpoint.
     pub anthropic_response: Option<serde_json::Value>,
+    /// The raw server-sent-event body of a streaming request sent to the same
+    /// endpoint.
+    pub anthropic_stream: Option<String>,
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
@@ -346,6 +349,7 @@ impl Default for E2eWorld {
             model_name: None,
             chat_response: None,
             anthropic_response: None,
+            anthropic_stream: None,
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
