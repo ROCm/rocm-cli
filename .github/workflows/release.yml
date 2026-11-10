@@ -82,12 +82,15 @@ jobs:
               exit 1
               ;;
           esac
-          # `rocm version` reports a release only for this shape (same rule as
-          # `release_version` in apps/rocm/build.rs); any other tag would ship
-          # binaries that call themselves 0.0.0-dev. Checked here so it fails
-          # before the builds rather than after them.
-          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$ ]]; then
-            echo "release version must be vX.Y.Z with an optional -pre or +build suffix, got: ${VERSION}" >&2
+          # `rocm version` reports a release only for this shape; any other
+          # tag would ship binaries that call themselves 0.0.0-dev. Checked
+          # here so it fails before the builds rather than after them. The
+          # pattern and the length are RELEASE_TAG_PATTERN and
+          # RELEASE_VERSION_MAX_LEN (+1 for the v) in apps/rocm/build.rs, and
+          # its test `release_tag_grammar_is_the_same_everywhere` fails if
+          # they differ.
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || [ "${#VERSION}" -gt 65 ]; then
+            echo "release version must be vX.Y.Z with an optional -pre or +build suffix of letters, digits, '.', '-' and '+', at most 65 characters, got: ${VERSION}" >&2
             exit 1
           fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"

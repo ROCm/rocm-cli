@@ -3896,8 +3896,13 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 verifying it needs a lane whose GPU architecture is on the allowlist.
 `cli_version` is the leading version `rocm version` prints (`X.Y.Z` for a
 `vX.Y.Z` tag build, `0.0.0-dev` for any other resolved ref), never the ref and hash
-after it (a release suffix outside letters, digits, `.`, `-` and `+`, or a
-version over 64 characters, is published as `unknown`). Scenario
+after it. A tag counts as a release only when its suffix uses letters,
+digits, `.`, `-` and `+` and its version is at most 64 characters, the same
+rule the report applies before publishing, so a release version is never
+published as `unknown`; `release_tag_grammar_is_the_same_everywhere` in
+[build.rs](../apps/rocm/build.rs) holds that rule equal in build.rs,
+[release.yml](../.github/workflows/release.yml) and
+[smoke_local.py](../scripts/smoke_local.py). Scenario
 `diagnose-58` in
 [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
 the field equals that leading version and that the version is the one the ref

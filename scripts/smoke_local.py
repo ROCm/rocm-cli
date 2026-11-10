@@ -92,8 +92,16 @@ def assert_not_contains(text: str, needle: str, label: str) -> None:
         fail(f"{label} contained unexpected text: {needle}\n{text}")
 
 
-# A release tag as apps/rocm/build.rs's release_version reads one.
-RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+].+)?")
+# A release tag as apps/rocm/build.rs's release_version reads one: the pattern
+# and length are its RELEASE_TAG_PATTERN and RELEASE_VERSION_MAX_LEN (+1 for
+# the v), and its test release_tag_grammar_is_the_same_everywhere fails if
+# these differ.
+RELEASE_TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$")
+RELEASE_TAG_MAX_LEN = 65
+
+
+def is_release_tag(ref: str) -> bool:
+    return len(ref) <= RELEASE_TAG_MAX_LEN and RELEASE_TAG.fullmatch(ref) is not None
 
 
 def assert_version_string(text: str, label: str) -> None:
@@ -106,11 +114,11 @@ def assert_version_string(text: str, label: str) -> None:
             f"{label} has an unresolved ref ('unknown'), expected a real tag/branch:\n{text}"
         )
     # Same contract as format_cli_version in apps/rocm/build.rs: an exact tag
-    # vX.Y.Z (optional non-empty -pre or +build suffix) is reported with that
+    # vX.Y.Z (see is_release_tag) is reported with that
     # one leading v removed; every other resolved ref, including main, is
     # 0.0.0-dev rather than the workspace package version. The expected value
     # comes from the ref alone, so a tag build that printed 0.0.0-dev fails.
-    expected = ref[1:] if RELEASE_TAG.fullmatch(ref) else "0.0.0-dev"
+    expected = ref[1:] if is_release_tag(ref) else "0.0.0-dev"
     if version != expected:
         fail(
             f"{label} reported {version!r} for ref {ref!r}; expected {expected!r}:\n"

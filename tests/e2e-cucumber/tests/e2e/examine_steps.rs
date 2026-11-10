@@ -148,7 +148,9 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
 /// build that reports the wrong version for its ref fails instead of agreeing
 /// with itself. Mirrors `release_version` in `apps/rocm/build.rs`: an exact
 /// `vX.Y.Z` tag, with an optional non-empty pre-release (`-rc.1`) or build
-/// (`+meta`) suffix, is that version without its leading `v`; any other
+/// (`+meta`) suffix of ASCII letters, digits, `.`, `-` and `+`, and at most 64
+/// characters after the `v` (`RELEASE_TAG_PATTERN` and
+/// `RELEASE_VERSION_MAX_LEN` there), is that version without its leading `v`; any other
 /// resolved ref (`main`, a feature branch, `vllm`, `v0.2`) is `0.0.0-dev`.
 /// The `unknown` ref is not covered: both callers reject it first.
 pub(crate) fn expected_leading_version(reference: &str) -> &str {
@@ -156,8 +158,18 @@ pub(crate) fn expected_leading_version(reference: &str) -> &str {
     let Some(rest) = reference.strip_prefix('v') else {
         return NON_RELEASE;
     };
+    if rest.len() > 64 {
+        return NON_RELEASE;
+    }
     let core = match rest.split_once(['-', '+']) {
-        Some((core, suffix)) if !suffix.is_empty() => core,
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
         Some(_) => return NON_RELEASE,
         None => rest,
     };

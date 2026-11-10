@@ -401,8 +401,11 @@ the tool that wrote the report instead of something read off the machine.
 That value is the version `rocm version` leads with (`X.Y.Z` for a release
 tag `vX.Y.Z`, `0.0.0-dev` for any other resolved ref), without the ref and
 commit hash that follow it there, since a local branch name is text from the
-machine. A version with characters other than letters, digits, `.`, `-` and
-`+`, or longer than 64 characters, is reported as `unknown` instead.
+machine. A release tag's suffix may only use letters, digits, `.`, `-` and
+`+`, and the version is at most 64 characters, so a release always reports
+its version here; a tag outside that is not treated as a release, and the
+release workflow refuses it. Anything else that reaches the report outside
+those rules is reported as `unknown`.
 The distribution is checked against a list of known names instead of
 being repeated from the machine.
 

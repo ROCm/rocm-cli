@@ -8,7 +8,8 @@
 //! the branch name, otherwise `unknown`) and the commit hash into one value,
 //! `ROCM_CLI_VERSION`:
 //!
-//! - exact tag `vX.Y.Z` (optional pre-release or build suffix) →
+//! - exact tag `vX.Y.Z`, optionally with a `-pre` or `+build` suffix of
+//!   ASCII letters, digits, `.`, `-` and `+` ([`RELEASE_TAG_PATTERN`]) →
 //!   `X.Y.Z (vX.Y.Z, <hash>)`, with a single leading `v` removed
 //! - any other resolved ref, including `main` and feature branches →
 //!   `0.0.0-dev (<ref>, <hash>)`, which is not a release
@@ -133,13 +134,42 @@ fn displayed_version(version_ref: &str, cargo_pkg_version: &str) -> String {
     NON_RELEASE_VERSION.to_owned()
 }
 
-/// `vX.Y.Z` with an optional pre-release (`-rc.1`) or build (`+meta`) suffix.
-/// Returns the version with that one leading `v` removed. A ref that merely
-/// starts with `v` (`vllm`) is not a release tag.
+/// The release-tag grammar, as an anchored regular expression: `vX.Y.Z`
+/// with an optional non-empty `-pre` or `+build` suffix of ASCII letters,
+/// digits, `.`, `-` and `+`. `release_version` is its implementation, and
+/// release.yml's "Determine version" step and `scripts/smoke_local.py` carry
+/// it verbatim; `release_tag_grammar_is_the_same_everywhere` holds all three
+/// together. The suffix characters are the ones a problem report publishes
+/// (`cli_version` in `crates/rocm-core/src/report.rs`), so a release never
+/// reports itself as `unknown` there.
+// Only the test reads it: the build itself runs `release_version`, which
+// needs no regex engine.
+#[cfg(test)]
+const RELEASE_TAG_PATTERN: &str = r"^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$";
+
+/// Longest release version (the tag without its `v`), the same bound a
+/// problem report puts on `cli_version`. release.yml checks the tag against
+/// this plus one, for the `v`.
+const RELEASE_VERSION_MAX_LEN: usize = 64;
+
+/// [`RELEASE_TAG_PATTERN`], with the version at most
+/// [`RELEASE_VERSION_MAX_LEN`] long. Returns the version with that one leading
+/// `v` removed. A ref that merely starts with `v` (`vllm`) is not a release
+/// tag.
 fn release_version(version_ref: &str) -> Option<&str> {
     let rest = version_ref.strip_prefix('v')?;
+    if rest.len() > RELEASE_VERSION_MAX_LEN {
+        return None;
+    }
     let core = match rest.split_once(['-', '+']) {
-        Some((core, suffix)) if !suffix.is_empty() => core,
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
         Some(_) => return None,
         None => rest,
     };
@@ -277,7 +307,10 @@ fn run_git_at(cwd: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_version_number, format_cli_version, git_watch_paths};
+    use super::{
+        RELEASE_TAG_PATTERN, RELEASE_VERSION_MAX_LEN, cli_version_number, format_cli_version,
+        git_watch_paths, release_version,
+    };
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -582,6 +615,76 @@ mod tests {
         assert_eq!(
             env!("ROCM_CLI_VERSION_NUMBER"),
             cli_version_number(env!("ROCM_CLI_VERSION_REF"), env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The release-tag grammar lives in three places: `release_version` here,
+    /// the "Determine version" check in release.yml and `is_release_tag` in
+    /// scripts/smoke_local.py. The two copies must carry
+    /// [`RELEASE_TAG_PATTERN`] and the [`RELEASE_VERSION_MAX_LEN`] bound
+    /// verbatim, and the pattern must accept exactly what `release_version`
+    /// accepts.
+    #[test]
+    fn release_tag_grammar_is_the_same_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|err| panic!("reading {rel}: {err}"))
+                .replace("\r\n", "\n")
+        };
+        let tag_max = RELEASE_VERSION_MAX_LEN + 1;
+
+        let workflow = read(".github/workflows/release.yml");
+        let check = format!(
+            r#"[[ "${{VERSION}}" =~ {RELEASE_TAG_PATTERN} ]] || [ "${{#VERSION}}" -gt {tag_max} ]"#
+        );
+        assert!(
+            workflow.contains(&check),
+            "release.yml's tag check is not `{check}`"
+        );
+        let smoke = read("scripts/smoke_local.py");
+        for needle in [
+            format!(r#"RELEASE_TAG = re.compile(r"{RELEASE_TAG_PATTERN}")"#),
+            format!("RELEASE_TAG_MAX_LEN = {tag_max}"),
+        ] {
+            assert!(smoke.contains(&needle), "smoke_local.py lacks `{needle}`");
+        }
+
+        let pattern = regex::Regex::new(RELEASE_TAG_PATTERN).expect("pattern compiles");
+        let at_limit = format!("v1.2.3-{}", "a".repeat(RELEASE_VERSION_MAX_LEN - 6));
+        let over_limit = format!("{at_limit}a");
+        assert_eq!(at_limit.len(), tag_max);
+        for tag in [
+            "v0.2.1",
+            "v1.2.3-rc.1",
+            "v1.2.3+build.5",
+            "v1.2.3-rc.1+build.5",
+            "v0.1.0-experimental.1",
+            "v1.2.3-rc_1",
+            "v1.2.3-rc 1",
+            "v1.2.3-",
+            "v1.2.3+",
+            "v1.2",
+            "v1.2.3.4",
+            "v1.x.3",
+            "vllm",
+            "main",
+            at_limit.as_str(),
+            over_limit.as_str(),
+        ] {
+            let by_pattern = pattern.is_match(tag) && tag.len() <= tag_max;
+            assert_eq!(
+                release_version(tag).is_some(),
+                by_pattern,
+                "release_version and RELEASE_TAG_PATTERN disagree on {tag:?}"
+            );
+        }
+        // The suffix rule is the problem report's: a release must never be
+        // published as `unknown`.
+        assert!(release_version("v1.2.3-rc_1").is_none());
+        assert_eq!(
+            release_version(&at_limit).map(str::len),
+            Some(RELEASE_VERSION_MAX_LEN)
         );
     }
 }
