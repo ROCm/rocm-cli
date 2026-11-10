@@ -450,6 +450,7 @@ hardware, not something an install or a setting can put right.
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
+                    [--python-version X.Y]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -533,10 +534,40 @@ already there no longer runs its own Python, it is removed outright and rebuilt.
 The approval prompt doesn't cover this, because it asks only about changing the
 active default runtime, not about what a named prefix loses.
 
+#### Which Python `install sdk` uses
+
+ROCm CLI picks the Python from the ROCm version it installs. ROCm 7.14 installs
+use Python 3.12. ROCm 10 and newer use Python 3.14 by default, because vLLM,
+flash-attn and amd-aiter for ROCm 10 are published for 3.14 only. The ROCm 10
+SDK and PyTorch wheels are also published for 3.10 to 3.14, so an install that
+doesn't need vLLM can choose one:
+
+```
+rocm install sdk --version 10.1.0 --family gfx1200 --python-version 3.12
+```
+
+With a Python other than 3.14, the SDK and PyTorch install and run, but vLLM
+doesn't: the engine install that normally follows an SDK install on a vLLM GPU
+is skipped with a note, and `rocm engines install vllm` refuses that runtime.
+Re-run the install without `--python-version` to move it to 3.14. An update
+keeps the Python the runtime was installed with.
+
+`--python-version` applies to ROCm 10 and newer wheel installs only. A ROCm 7
+install is built for Python 3.12 and refuses any other. A Python that doesn't
+match the install is refused rather than used, so `ROCM_CLI_PYTHON` (an
+interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the version
+ROCm CLI prepares itself) must name a Python the install accepts.
+
+If you see Python 3.14 without asking for it, the install resolved to ROCm 10
+or newer. That happens with `--version 10.x.y`, and also when the channel's
+newest build is ROCm 10, as the nightly channel's is today. The install prints
+which Python it chose, and `--dry-run` shows it without changing anything.
+
 #### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version`. These versions select their device payload by exact
+version with `--version` (an unpinned nightly install also gets ROCm 10 while
+that channel's newest build is one, from the nightly sources as before). These versions select their device payload by exact
 GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
 a family of GPUs, or none), or you want to target a different GPU, also pass
 `--family` with the raw `gfx` code instead of a family label:
@@ -577,8 +608,9 @@ dependency metadata alongside the pinned torchaudio. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
+Nothing about this happens on its own on the release channel. Without a
+`--version` of 10 or newer, `install sdk` resolves the same release and nightly
+sources as before. It doesn't
 quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
 you what it couldn't find instead.
 

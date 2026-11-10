@@ -896,6 +896,18 @@ order and the interpreter probes, whose stand-ins are shell scripts as in the
 other resolver tests, and no end-to-end run covers the Windows preview, so the
 Windows search order (`python`, `python3`, `py` with `PATHEXT`) is not covered
 by any test.
+`rocm install sdk --python-version` is covered by scenarios `runtime-29` (a ROCm
+10 preview plans the requested Python and its wheel tag, and not 3.14) and
+`runtime-30` (a version the canonical layout is not published for is refused,
+preparing nothing; the ROCm 10 refusal is unit-tested only). The rest is unit-tested in [python.rs](../apps/rocm/src/therock/python.rs):
+`python_version_is_a_choice_among_the_layouts_published_pythons` is the matrix of
+layout against requested version, and
+`a_recorded_wheel_tag_maps_back_to_the_requirement_it_came_from` is what lets an
+update keep a runtime's Python. That a ROCm 10 runtime on another Python skips the vLLM
+auto-install is `auto_install_skips_vllm_on_an_sdk_moved_off_its_python` in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs), and that a ROCm 7 runtime never does (whatever `--python-version` it was given) is `recorded_python_version_is_only_reported_for_a_rocm_10_runtime` in [update.rs](../apps/rocm/src/therock/update.rs); a tarball install refusing the flag is `python_version_is_refused_for_a_tarball_install` in [therock.rs](../apps/rocm/src/therock.rs). A real
+install and an update on a non-default Python are not covered by a scenario: they
+need a ROCm 10 SDK download.
 `a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
 [python.rs](../apps/rocm/src/therock/python.rs) is the state matrix: every
 combination of `PATH` Python (usable, unusable, absent), saved Python (usable,

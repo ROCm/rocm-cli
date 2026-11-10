@@ -349,6 +349,7 @@ fn apply_runtime_update_with(
             plan.device_target.as_deref(),
             plan.source_layout_generation.as_deref(),
             source.includes_devel(),
+            therock::recorded_python_version(source),
             true,
             activate,
         )?;
@@ -374,6 +375,7 @@ fn apply_runtime_update_with(
         // Reinstall what the user originally chose rather than silently
         // adding or dropping the compiler toolchain on update.
         source.includes_devel(),
+        therock::recorded_python_version(source),
         false,
         activate,
     )?;
