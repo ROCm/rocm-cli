@@ -88,16 +88,16 @@ The answers that moved, each with the test that pins it:
 
 | Difference | Before | Now | Pinned by |
 |---|---|---|---|
-| `uname` prints a release and exits non-zero | summary: none; examination: the release | none in both | `a_non_zero_exit_with_output_is_dropped_by_both`, scenario `examine-47` |
+| `uname` prints a release and exits non-zero | summary: none; examination: the release | none in both | `a_non_zero_exit_with_output_is_dropped_by_both`, scenario `examine-44` |
 | `uname` output that is not UTF-8 | summary: none; examination: the release with the bad byte replaced | none in both | `output_that_is_not_utf8_is_dropped_by_both` |
 | `uname` that answers after 2 s | summary: none (1.5 s); examination: the release (5 s) | the release in both | `an_answer_after_two_seconds_is_read_by_both` |
 | `uname` that never answers | none in both | none in both; the unit test's child reads twice, each bounded by the one 5 s limit | `a_uname_that_never_answers_reads_as_nothing_in_both_within_the_timeout` (it checks the elapsed time, since the answers alone cannot tell a timeout from none) |
 | `uname` that prints nothing | none in both | unchanged | `a_silent_uname_reads_as_nothing_in_both` |
 | WSL 1 and WSL 2 style releases | read as printed by both | unchanged; `probe_wsl` makes version 1 of the first and version 2 of the second, of an empty one and of the original `-microsoft-standard` form | `both_read_wsl_style_releases_as_printed`, `probe_wsl_reads_the_wsl_version_from_the_kernel_release` |
-| A failed read and `probe_failures` | no entry | no entry | the check in the same tests that no case leaves a `probe_failures` entry about the kernel, and scenario `examine-47` |
-| Reads in one `rocm examine --json` run | two (`probe_os` and the summary each ran `uname -r`) | one: the summary takes the examination's | `the_summary_reads_the_kernel_only_when_the_examination_did_not` (a counted read), and the last step of scenario `examine-46`, which counts the calls of a stand-in `uname` |
+| A failed read and `probe_failures` | no entry | no entry | the check in the same tests that no case leaves a `probe_failures` entry about the kernel, and scenario `examine-44` |
+| Reads in one `rocm examine --json` run | two (`probe_os` and the summary each ran `uname -r`) | one: the summary takes the examination's | `the_summary_reads_the_kernel_only_when_the_examination_did_not` (a counted read), and the last step of scenario `examine-43`, which counts the calls of a stand-in `uname` |
 
-The scenarios `examine-46` and `examine-47` in [examine.feature](../tests/e2e-cucumber/features/examine.feature) drive the observable answer on the Linux lane, native and WSL: with a stand-in `uname` first on `PATH`, one `rocm examine --json` run holds `summary.kernel` and `kernel_release` level on a specific release and shows from the stand-in's call log that `uname -r` ran once, and, for a `uname` that prints a release and then fails, holds both empty with no kernel `probe_failures` entry. The unit tests plant the same stand-in in a child copy of the test binary with its own `PATH`, because a test thread cannot change `PATH` without disturbing every other test.
+The scenarios `examine-43` and `examine-44` in [examine.feature](../tests/e2e-cucumber/features/examine.feature) drive the observable answer on the Linux lane, native and WSL: with a stand-in `uname` first on `PATH`, one `rocm examine --json` run holds `summary.kernel` and `kernel_release` level on a specific release and shows from the stand-in's call log that `uname -r` ran once, and, for a `uname` that prints a release and then fails, holds both empty with no kernel `probe_failures` entry. The unit tests plant the same stand-in in a child copy of the test binary with its own `PATH`, because a test thread cannot change `PATH` without disturbing every other test.
 
 ## CPU model
 

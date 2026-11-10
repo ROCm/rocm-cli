@@ -656,7 +656,7 @@ Feature: GPU detection and system inspection
   # stacks read `uname -r` on both; Windows is out of scope, where the examination
   # leaves `kernel_release` empty and the summary reads `cmd /C ver`.
   @id:examine-reports-one-kernel-release-in-both-forms @requires-os:linux
-  Scenario: examine-46 - The summary and the examination report the same kernel release
+  Scenario: examine-43 - The summary and the examination report the same kernel release
     Given a machine whose uname reports a kernel release
     When the user inspects that machine in machine-readable form
     Then the summary and the examination report that kernel release
@@ -667,7 +667,7 @@ Feature: GPU detection and system inspection
   # kernel now, and a failed read is not a probe failure, so a host without a
   # usable `uname` does not read as degraded.
   @id:examine-reports-no-kernel-release-from-a-failing-uname @requires-os:linux
-  Scenario: examine-47 - Neither report keeps a kernel release from a uname that failed
+  Scenario: examine-44 - Neither report keeps a kernel release from a uname that failed
     Given a machine whose uname prints a kernel release and then fails
     When the user inspects that machine in machine-readable form
     Then neither the summary nor the examination reports a kernel release, and neither calls it a failure
