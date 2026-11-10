@@ -3717,6 +3717,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "proptest",
+ "regex",
  "rocm-core",
  "rocm-dash-core",
  "rocm-dash-daemon",
@@ -3930,6 +3931,7 @@ name = "rocmd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "clap",
  "libc",

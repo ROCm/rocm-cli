@@ -273,6 +273,17 @@ pub fn torch_alignment_disabled() -> bool {
     std::env::var_os(TORCH_ALIGNMENT_DISABLED_ENV).is_some()
 }
 
+/// The packages the SDK installs together with torch, in one transaction.
+///
+/// Under [`torch_alignment_disabled`] these are all treated as the user's: the SDK
+/// overwrites the lot, and vLLM pins an exact build of each, so sparing only torch
+/// leaves the others as defects whose repair reinstalls the engine's torch over the
+/// one the opt-out keeps. The CLI's dependency check and the engine's repair
+/// assessment both read this list, so they agree on which packages are spared. They
+/// still gate it differently: the engine spares them whenever the opt-out is set, the
+/// CLI only when the install settled on a torch divergence.
+pub const SDK_TORCH_STACK_PACKAGES: &[&str] = &["torch", "torchvision", "torchaudio", "triton"];
+
 pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{field_name} must not be empty");

@@ -1130,7 +1130,9 @@ mod tests {
 
     /// A real `rocm update` report on a machine with no managed runtime, captured
     /// verbatim from the built binary rather than written by hand — the parser has
-    /// to survive the whole document, not an idealized excerpt of it.
+    /// to survive the whole document, not an idealized excerpt of it. The
+    /// `cli: installed=` token is the leading version `rocm version` prints; a
+    /// non-release build reports `0.0.0-dev`, not the workspace package version.
     ///
     /// Note the `update_surfaces` block: `runtimes: status=none_configured` is one
     /// character away from a real `runtime <key> … status=…` entry, and carries a
@@ -1141,7 +1143,7 @@ update
   managed runtimes: none
   next step: run `rocm install sdk --channel release --dry-run` to resolve a TheRock runtime
   update_surfaces:
-    cli: installed=0.1.0 status=not_configured reason=repository-owned CLI update feed is not published yet
+    cli: installed=0.0.0-dev status=not_configured reason=repository-owned CLI update feed is not published yet
     engines: status=package_managed packaged=[lemonade,vllm] reason=first-party engine binaries update with the rocm-cli package; data-dir plugins are user-managed
     model_recipes: status=built_in count=13 reason=external signed recipe index is not configured
     runtimes: status=none_configured reason=TheRock runtime update checks above are the only live update checks in this build

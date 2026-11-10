@@ -384,17 +384,24 @@ fn parse_cli() -> Result<Cli> {
 }
 
 /// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
-/// the MCP in-process handler) prints: the semantic version Cargo built, plus
-/// the git ref and commit hash [`build.rs`] embedded, additively — never a
-/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
-/// still reports a real version number rather than none at all.
+/// the MCP in-process handler) prints. `format_cli_version` in `build.rs`
+/// computes this once from the ref and commit hash it already resolves and
+/// exports it as `ROCM_CLI_VERSION`, so these surfaces cannot disagree.
+///
+/// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A branch,
+/// including `main`, is shown as `0.0.0-dev (<ref>, <hash>)`. Only an
+/// unresolved ref falls back to the workspace package version, which is not
+/// bumped per release (see the module docs in `build.rs`).
 fn cli_version_string() -> String {
-    format!(
-        "{} ({}, {})",
-        env!("CARGO_PKG_VERSION"),
-        env!("ROCM_CLI_VERSION_REF"),
-        env!("ROCM_CLI_GIT_HASH")
-    )
+    env!("ROCM_CLI_VERSION").to_owned()
+}
+
+/// The leading version of [`cli_version_string`], without the parenthetical
+/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`
+/// and a problem report's `cli_version`. `build.rs` exports it beside the full
+/// string, from the same function, so nothing here parses that string.
+fn cli_version_number() -> String {
+    env!("ROCM_CLI_VERSION_NUMBER").to_owned()
 }
 
 /// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
