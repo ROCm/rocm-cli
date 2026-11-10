@@ -2311,7 +2311,23 @@ verdict to the JSON; `rocm services stop` exits 1. The stop
 records the request in the manifest before it signals anything, and applies its
 result to the manifest as it is once the stop ends, so a write made meanwhile is
 kept — and a restart that recorded new processes meanwhile makes the stop
-unconfirmed rather than having its PIDs cleared.
+unconfirmed rather than having its PIDs cleared. What the stop's verdict still
+covers is decided by `ManagedServiceRecord::is_covered_by_stop_of`: the same
+processes, or none recorded because a liveness refresh that saw every process
+gone completed this same stop first (the record reads `stopped` and names
+nothing). A restart, whether it has recorded new processes or is mid-launch with
+none yet (status `starting`), is not covered. The unit test
+`a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch`
+is the table; in `rocm`, `a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
+persists a real liveness refresh between the termination and the final read and
+asserts a confirmed stop with the marker not restored,
+`a_restart_is_not_refused_because_a_listing_completed_its_stop` that a restart then
+carries on past its stop, and `stop_does_not_confirm_over_a_restart_that_has_recorded_no_process_yet`
+and `stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile` that a real
+relaunch is still detected; `rocmd` has the same three (`a_stop_completed_by_a_concurrent_listing_is_still_confirmed`,
+`a_stop_does_not_claim_a_restart_that_has_recorded_no_process_yet`,
+`a_stop_does_not_clear_processes_recorded_while_it_ran`), the first with the listing's
+write made directly because the refresh lives in the `rocm` binary.
 
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded

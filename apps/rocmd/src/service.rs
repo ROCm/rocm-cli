@@ -106,7 +106,7 @@ pub(crate) fn stop_managed_service_via(
     let engine_stop_confirms = !rocm_core::engine_stop_decides_confirmation(&stopping.engine)
         || engine_stop.as_ref().is_some_and(Result::is_ok);
     let all_stopped = stops.iter().all(|stop| stop.stopped())
-        && stopping.names_same_processes(&record)
+        && record.is_covered_by_stop_of(&stopping)
         && engine_stop_confirms;
     // A PID whose identity cannot be read at all — `/proc/<pid>/stat`
     // unreadable while `kill(pid, 0)` still answers: another uid, `hidepid`, an
@@ -852,6 +852,81 @@ mod tests {
         assert_eq!(reloaded.supervisor_start_ticks, Some(42));
         assert!(reloaded.stop_requested_unix_ms.is_some());
         assert!(key_kept, "the restarted service's key must be kept");
+        Ok(())
+    }
+
+    /// A `rocm` listing that sees every process gone completes the pending stop
+    /// and persists it (marker and key cleared, recorded processes forgotten,
+    /// `stopped`), possibly before this stop reads the record again. That record
+    /// names no process, which is not a restart: the stop is still confirmed and
+    /// the marker is not put back. The write below is exactly the one the
+    /// listing's cleanup makes (it lives in the `rocm` binary, which this crate
+    /// cannot call; `rocm` has the test that runs the real refresh).
+    #[test]
+    fn a_stop_completed_by_a_concurrent_listing_is_still_confirmed() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-listing-completed-it");
+        paths.ensure()?;
+        let service_id = "svc-stop-listing-completed-it";
+        let key_path = seed_keyed_service(&paths, service_id, 11455)?;
+
+        let result = stop_managed_service_with(&paths, service_id, |_| {
+            let mut on_disk = load_service_record(&paths, service_id).expect("record");
+            on_disk.clear_recorded_processes();
+            on_disk.stop_requested_unix_ms = None;
+            on_disk.status = "stopped".to_owned();
+            on_disk.write().expect("concurrent listing write");
+            rocm_core::TerminationOutcome::Graceful
+        });
+        let key_removed = !key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("stopped").and_then(Value::as_bool),
+            Some(true),
+            "{value}"
+        );
+        let reloaded = reloaded?;
+        assert_eq!(reloaded.status, "stopped");
+        assert_eq!(
+            reloaded.stop_requested_unix_ms, None,
+            "a confirmed stop does not put the marker back"
+        );
+        assert!(key_removed);
+        Ok(())
+    }
+
+    /// A restart that has begun launching but recorded no process yet reads
+    /// `starting` with nothing named: not the stop completing, so the stop does
+    /// not claim it or drop the key.
+    #[test]
+    fn a_stop_does_not_claim_a_restart_that_has_recorded_no_process_yet() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-restart-in-flight");
+        paths.ensure()?;
+        let service_id = "svc-stop-restart-in-flight";
+        let key_path = seed_keyed_service(&paths, service_id, 11456)?;
+
+        let result = stop_managed_service_with(&paths, service_id, |_| {
+            let mut on_disk = load_service_record(&paths, service_id).expect("record");
+            on_disk.clear_recorded_processes();
+            on_disk.stop_requested_unix_ms = None;
+            on_disk.status = "starting".to_owned();
+            on_disk.write().expect("concurrent restart write");
+            rocm_core::TerminationOutcome::Graceful
+        });
+        let key_kept = key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("stopped").and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_eq!(reloaded?.status, "starting");
+        assert!(key_kept, "the restarting service's key must be kept");
         Ok(())
     }
 

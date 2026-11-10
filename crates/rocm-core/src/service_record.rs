@@ -330,6 +330,35 @@ impl ManagedServiceRecord {
             && self.engine_start_ticks == other.engine_start_ticks
     }
 
+    /// Whether `self`, the record as it is now, is still the record of the
+    /// service that `stopping`, the copy the stop read before it signalled
+    /// anything, was stopping: the stop's verdict covers what it names.
+    ///
+    /// True when the two name the same processes
+    /// ([`Self::names_same_processes`]), and also when `self` names none because
+    /// the same stop was completed under it: a liveness refresh that saw every
+    /// recorded process gone, with the stop requested, clears the processes and
+    /// reads the record as `stopped` (the deferred cleanup). A record reading
+    /// `stopped` that names no process has nothing left that the stop did not
+    /// handle, so the stop's own confirmation is still true of it.
+    ///
+    /// False for a restart that recorded new processes, and equally for one that
+    /// is mid-launch with none recorded yet: that record reads `starting` (or
+    /// another live status), not `stopped`, and claiming it stopped, or dropping
+    /// the key it will serve with, would be false.
+    #[must_use]
+    pub fn is_covered_by_stop_of(&self, stopping: &Self) -> bool {
+        self.names_same_processes(stopping) || (self.status == "stopped" && self.names_no_process())
+    }
+
+    /// Whether the record names neither a supervisor nor an engine process.
+    const fn names_no_process(&self) -> bool {
+        self.supervisor_pid == 0
+            && self.supervisor_start_ticks.is_none()
+            && self.engine_pid.is_none()
+            && self.engine_start_ticks.is_none()
+    }
+
     /// Record `pid` as the engine, together with its start-time token. See
     /// [`Self::record_supervisor_identity`].
     pub fn record_engine_identity(&mut self, pid: u32) {
@@ -849,6 +878,76 @@ mod tests {
         // before and finds this after does not claim the same processes.
         assert!(!before.names_same_processes(&record));
         assert!(record.names_same_processes(&record.clone()));
+    }
+
+    /// What a stop's verdict still covers, record by record: the same processes,
+    /// or none because the same stop was completed under it (`stopped`, nothing
+    /// recorded). A restart's record is never covered: new processes recorded, or
+    /// still starting with none recorded yet.
+    #[test]
+    fn a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch() {
+        let mut stopping = probe_test_record(11438);
+        stopping.supervisor_pid = 4242;
+        stopping.supervisor_start_ticks = None;
+        stopping.engine_pid = Some(4243);
+        stopping.engine_start_ticks = Some(77);
+        stopping.status = "ready".to_owned();
+        let record_with = |status: &str, pid: u32, engine: Option<u32>| {
+            let mut record = stopping.clone();
+            status.clone_into(&mut record.status);
+            record.supervisor_pid = pid;
+            record.supervisor_start_ticks = None;
+            record.engine_pid = engine;
+            record.engine_start_ticks = None;
+            record
+        };
+        // (what the record on disk is now, whether the stop still covers it)
+        let rows = [
+            ("unchanged", stopping.clone(), true),
+            // The deferred cleanup of this very stop: every process gone, so the
+            // record is stopped and names none.
+            (
+                "completed under the stop",
+                record_with("stopped", 0, None),
+                true,
+            ),
+            // A restart that recorded new processes.
+            (
+                "relaunched, ready",
+                record_with("ready", 5555, Some(5556)),
+                false,
+            ),
+            (
+                "relaunched, starting",
+                record_with("starting", 5555, None),
+                false,
+            ),
+            // A restart mid-launch that has not recorded anything yet: not a stop.
+            (
+                "restarting, nothing recorded",
+                record_with("starting", 0, None),
+                false,
+            ),
+            (
+                "recovering, nothing recorded",
+                record_with("recovering", 0, None),
+                false,
+            ),
+            (
+                "ready, nothing recorded",
+                record_with("ready", 0, None),
+                false,
+            ),
+            // Stopped, but naming a process the stop did not handle.
+            (
+                "stopped, other process",
+                record_with("stopped", 5555, None),
+                false,
+            ),
+        ];
+        for (name, record, covered) in rows {
+            assert_eq!(record.is_covered_by_stop_of(&stopping), covered, "{name}");
+        }
     }
 
     /// Writing a service manifest never writes through a file another writer

@@ -252,7 +252,7 @@ fn stop_internal_managed_service_confirmed_with(
     // supervisor that follows it, so a failed `Stop` leaves the stop unconfirmed.
     let engine_stop_confirms =
         !rocm_core::engine_stop_decides_confirmation(&stopping.engine) || engine_stop.is_ok();
-    let record_changed = !stopping.names_same_processes(&record);
+    let record_changed = !record.is_covered_by_stop_of(&stopping);
     let all_stopped = terminated_all && !record_changed && engine_stop_confirms;
     if all_stopped {
         record.status = "stopped".to_owned();
@@ -1115,6 +1115,127 @@ mod tests {
             on_disk.stop_requested_unix_ms.is_some(),
             "an unconfirmed stop re-stamps the marker the restart cleared"
         );
+        assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+    }
+
+    /// A liveness refresh that lands after the stop's processes have exited but
+    /// before the stop reads the record again completes the same stop (key,
+    /// marker, recorded processes cleared, `stopped`) and writes it. That record
+    /// names no process, which must not read as a restart: the stop is confirmed,
+    /// the marker is not put back, and a restart is not refused for it.
+    #[test]
+    fn a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it() {
+        use rocm_core::TerminationOutcome::Graceful;
+        let (root, paths) = test_paths("stop-listing-before-finalization");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-listing-before-finalization";
+        let mut planted = stop_test_record(&paths, service_id);
+        planted.supervisor_pid = 4242;
+        planted.supervisor_start_ticks = None;
+        planted.engine_pid = Some(4243);
+        planted.engine_start_ticks = Some(77);
+        planted.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |stopping| {
+            assert!(stopping.stop_requested_unix_ms.is_some());
+            // The processes have exited; a concurrent `services` listing sees it,
+            // completes the pending stop and persists that, before this stop
+            // reads the record again.
+            let (mut listed, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+            let changed =
+                crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                    &paths,
+                    &mut listed,
+                    |_| rocm_core::ProcessProbe::Gone,
+                );
+            assert!(changed, "premise: the listing completed the stop");
+            listed.write().unwrap();
+            assert_eq!(raw_manifest(&paths, service_id).supervisor_pid, 0);
+            vec![stop_of(4242, Graceful), stop_of(4243, Graceful)]
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["stopped"], true, "{report}");
+        assert_eq!(on_disk.status, "stopped");
+        assert_eq!(
+            on_disk.stop_requested_unix_ms, None,
+            "a confirmed stop does not put the marker back"
+        );
+        assert_eq!(on_disk.supervisor_pid, 0);
+        assert_eq!(key, None, "the key goes with the confirmed stop");
+    }
+
+    /// The same race through `restart`: the restart's own stop is completed by a
+    /// listing before it finalizes, and the restart must carry on past the stop
+    /// (here to the launch lock, which a holder keeps, so it stops there)
+    /// instead of refusing with "could not confirm".
+    #[test]
+    fn a_restart_is_not_refused_because_a_listing_completed_its_stop() -> Result<()> {
+        use rocm_core::TerminationOutcome::Graceful;
+        let (root, paths) = test_paths("restart-listing-before-finalization");
+        paths.ensure()?;
+        let service_id = "svc-restart-listing-before-finalization";
+        stop_test_record(&paths, service_id).write()?;
+        let holder = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(Some(Duration::from_millis(100))));
+        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            let (mut listed, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+            let _ = crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                &paths,
+                &mut listed,
+                |_| rocm_core::ProcessProbe::Gone,
+            );
+            listed.write().unwrap();
+            vec![stop_of(999_999_999, Graceful)]
+        });
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
+        drop(holder);
+        let _ = fs::remove_dir_all(root);
+
+        let message = format!(
+            "{:#}",
+            result.expect_err("the held launch lock fails the restart")
+        );
+        assert!(
+            !message.contains("could not confirm"),
+            "the stop was completed, the restart must not be refused for it: {message}"
+        );
+        assert!(message.contains("stopped but NOT restarted"), "{message}");
+        Ok(())
+    }
+
+    /// The other half of the same check: a restart that has begun launching but
+    /// has recorded no process yet (status `starting`, nothing named) is not the
+    /// stop completing, and the stop must not claim it or drop the key it will
+    /// serve with.
+    #[test]
+    fn stop_does_not_confirm_over_a_restart_that_has_recorded_no_process_yet() {
+        let (root, paths) = test_paths("stop-restart-in-flight");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-restart-in-flight";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut restarting = raw_manifest(&paths, service_id);
+            restarting.status = "starting".to_owned();
+            restarting.clear_recorded_processes();
+            restarting.stop_requested_unix_ms = None;
+            restarting.write().unwrap();
+            bare_termination(Vec::new(), true)
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["status"], "starting", "{report}");
+        assert_eq!(on_disk.status, "starting", "the restart's status stays");
         assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
     }
 
