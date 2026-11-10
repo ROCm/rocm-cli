@@ -284,7 +284,7 @@ The library every first-party app and engine crate depends on. It holds host exa
 | [`examine/framework.rs`](../crates/rocm-core/src/examine/framework.rs) | The PyTorch probe (through the active runtime or `PATH`) and the llama.cpp probe. | domain |
 | [`examine/host_env.rs`](../crates/rocm-core/src/examine/host_env.rs) | Host environment probes: OS and distro, CPU, tracked environment variables, shared memory, container check and kernel log. | domain |
 | [`examine/library_copies.rs`](../crates/rocm-core/src/examine/library_copies.rs) | Finds every copy of the comgr and HIP runtime libraries the loader could pick, and which install owns each. | domain |
-| [`examine/linux_driver.rs`](../crates/rocm-core/src/examine/linux_driver.rs) | Linux driver access: kernel modules, device nodes and who may open them, and Secure Boot. | domain |
+| [`examine/linux_driver.rs`](../crates/rocm-core/src/examine/linux_driver.rs) | Linux driver access: kernel modules (loaded or built in), device nodes and who may open them, and Secure Boot. | domain |
 | [`examine/linux_gpus.rs`](../crates/rocm-core/src/examine/linux_gpus.rs) | Linux GPU enumeration from `lspci`, `rocminfo`, sysfs and the kernel topology, with the marketing-name and APU classification they share. | domain |
 | [`examine/rocm_install_probe.rs`](../crates/rocm-core/src/examine/rocm_install_probe.rs) | How ROCm was installed and which live package-repository files configure it. | domain |
 | [`examine/windows.rs`](../crates/rocm-core/src/examine/windows.rs) | Native Windows probes: the GPU query, the HIP SDK, the Adrenalin driver and the MSVC redistributable. | domain |
