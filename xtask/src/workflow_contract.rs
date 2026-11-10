@@ -6948,6 +6948,59 @@ fi
         );
     }
 
+    /// The `cargo-module-size` hook is the local mirror of the module-size step in
+    /// the `clippy` CI job, and it only stops a commit if it runs the strict
+    /// command itself: the `check-module-size-advisory` wrapper it used to run
+    /// exits 0 on an offender. The entry is exact, so a wrapper (or any flag that
+    /// changes the exit status) fails here. The check takes no file arguments
+    /// (clap rejects them), so prek must not append the staged filenames
+    /// (`pass_filenames: false`); and it runs only when Rust source is staged
+    /// (`types: [rust]`, with no `files:` or `exclude:` filter narrowing that).
+    #[test]
+    fn module_size_hook_runs_the_strict_check_at_pre_commit() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "cargo-module-size");
+        assert!(
+            hook_block_sets(block, "entry: cargo xtask check-module-size"),
+            "cargo-module-size hook must run exactly `cargo xtask check-module-size`, which \
+             exits non-zero on an offender; a wrapper that always succeeds cannot stop a \
+             commit:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "stages: [pre-commit]"),
+            "cargo-module-size hook must run at pre-commit, like the other xtask checks:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "cargo-module-size hook must set `pass_filenames: false`: the check takes no \
+             file arguments, so appending the staged filenames would make it fail on every \
+             commit:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "language: system"),
+            "cargo-module-size hook must run its entry as a system command:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "types: [rust]"),
+            "cargo-module-size hook must be triggered by Rust source:\n{block}"
+        );
+        for filter_key in ["files:", "exclude:", "types_or:"] {
+            assert!(
+                !block.contains(filter_key),
+                "cargo-module-size hook must not narrow `types: [rust]` with `{filter_key}`, \
+                 or a commit that stages Rust source could skip it:\n{block}"
+            );
+        }
+        assert!(
+            !block
+                .lines()
+                .any(|line| strip_comment(line).contains("advisory")),
+            "the cargo-module-size hook's name and entry must not say advisory:\n{block}"
+        );
+    }
+
     // Extractor guards: prove the helpers above actually parse the shapes they
     // claim to — multiline hook blocks, comment-stripping, and single-line pin
     // tokens alike — so the contract tests above can't silently false-pass on a

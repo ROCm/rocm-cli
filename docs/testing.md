@@ -42,11 +42,17 @@ every file: no flag, baseline or exemption. The `clippy` CI job runs
 `cargo xtask check-module-size` and fails when any file is over the limit; `clippy` is a
 required check and also runs on merge-queue runs. The failure text names each file and
 points at the split rule in [architecture.md](architecture.md). The `cargo-module-size`
-pre-commit hook still only reports: it runs `cargo xtask check-module-size-advisory`, the
-same check, but it exits successfully even when the check itself cannot run. That holds
-once xtask has built: a commit that leaves xtask or `rocm-core` not compiling still fails
-the hook.
-The counting rules are unit-tested in `xtask/src/module_size.rs`:
+pre-commit hook is the local mirror of that step: it runs the same
+`cargo xtask check-module-size`, so a commit that stages Rust source while a file is over the
+limit is refused, and the output names the file and its count. It only checks and never
+rewrites or restages anything. The check measures the working tree, so the hook also
+fails when a Rust file under a crate's `src/` is not declared by any `mod`, even an
+untracked scratch file; the error says to declare or delete it, where CI only sees the
+files that are committed. It runs only for contributors who installed the hooks, so the
+CI step stays the authority.
+The counting rules are unit-tested in `xtask/src/module_size.rs`, and
+[workflow_contract.rs](../xtask/src/workflow_contract.rs) pins that the hook runs the
+strict check:
 
 ```bash
 cargo test -p xtask module_size
