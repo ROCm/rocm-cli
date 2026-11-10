@@ -504,6 +504,10 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
 
+      - name: Nightly canary self-test
+        if: needs.changes.outputs.heavy == 'true'
+        run: python scripts/nightly_canary.py --self-test
+
       - name: Pinned key consistency check
         if: needs.changes.outputs.heavy == 'true'
         run: cargo xtask verify-pinned-keys

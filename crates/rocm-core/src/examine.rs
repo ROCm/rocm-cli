@@ -545,6 +545,29 @@ impl Examination {
         Self::probe_with_interpreter(framework, None)
     }
 
+    /// Probe this host and gather its summary from the examination, returning
+    /// both: what `rocm examine --json` prints as one document.
+    ///
+    /// The pairing is made here so no caller can hand the summary an
+    /// examination of another host. The summary takes the examination's kernel
+    /// release (a failed read included) instead of running `uname -r` again, so
+    /// one inspection reads it once: `summary.kernel` and `kernel_release`
+    /// cannot disagree on a transient failure, and a hung `uname` costs one
+    /// timeout rather than two. Probing is as [`Self::probe_with_interpreter`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the host summary cannot be gathered (the application
+    /// directories cannot be resolved); the examination itself never fails.
+    pub fn probe_with_summary(
+        framework: FrameworkProbe,
+        interpreter: Option<&FrameworkInterpreter>,
+    ) -> anyhow::Result<(Self, crate::ExamineSummary)> {
+        let examination = Self::probe_with_interpreter(framework, interpreter);
+        let summary = crate::ExamineSummary::gather_after(&examination)?;
+        Ok((examination, summary))
+    }
+
     /// As [`Self::probe`], but running the framework probe under `interpreter`
     /// when one is given.
     ///

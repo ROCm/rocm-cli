@@ -457,6 +457,25 @@ append a deliberately unparsable line to it, run the test with `--nocapture`
 The check does not tell a seed that still reproduces from one that no longer
 does; it only confirms that something reads the file.
 
+### Property tests for persisted settings
+
+`config.json`, its migration from a legacy rocm-dash `config.toml`, and how
+the data directory is found from it have `proptest` properties, beside the
+code they drive. They run in the ordinary `cargo test`; to run only them:
+
+```bash
+cargo test -p rocm-core --lib config::props -- --nocapture
+cargo test -p rocm-core --lib persisted_paths_props -- --nocapture
+cargo test -p rocm --bin rocm therock::python::config_props -- --nocapture
+```
+
+Each property counts how many generated cases reached the input it is about
+(an unreadable `config.json`, a non-finite tick, non-ASCII text, and so on),
+prints that as a `reach:` line (`--nocapture` shows it), and fails when the
+count is zero, so a generator that stops producing that input fails the run
+instead of passing without testing anything. A property that fails prints its
+shrunk counterexample.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
@@ -2664,6 +2683,16 @@ python scripts/release_readiness.py --self-test
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 bash scripts/reclaim-gpu.sh --self-test
 ```
+
+The nightly stream canary has its own self-test, which checks each rule
+against a fixture plan without the network:
+
+```bash
+python scripts/nightly_canary.py --self-test
+```
+
+What the scheduled canary checks, who is told and how to rerun it are in
+[ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
 
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
 as a whole string — so a change to its quoting, spacing or field order fails
