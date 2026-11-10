@@ -676,11 +676,7 @@ mod tests {
             let answers = serde_json::json!({
                 "summary": crate::host_gpu::detect_kernel_version(),
                 "examination": e.kernel_release,
-                "failures_about_uname": e
-                    .probe_failures
-                    .iter()
-                    .filter(|failure| failure.contains("uname") || failure.contains("kernel"))
-                    .count(),
+                "probe_failures": e.probe_failures,
             });
             println!("{ANSWER_PREFIX}{answers}");
         }
@@ -728,10 +724,12 @@ mod tests {
                     )
                 });
             let json: serde_json::Value = serde_json::from_str(line).expect("answers are JSON");
-            // A failed read is empty, not a failure: no case leaves a
-            // `probe_failures` entry about the kernel, so a host with a missing
-            // or broken `uname` does not read as degraded.
-            assert_eq!(json["failures_about_uname"], 0, "{json}");
+            // A failed read is empty, not a failure: `probe_os` records no
+            // `probe_failures` entry at all in any case (whatever its wording
+            // would be), so a host with a missing or broken `uname` does not read
+            // as degraded. The fake host's os-release reads cleanly, so the list
+            // is empty rather than compared with a baseline.
+            assert_eq!(json["probe_failures"], serde_json::json!([]), "{json}");
             Pair {
                 summary: json["summary"].as_str().map(str::to_owned),
                 examination: json["examination"]
