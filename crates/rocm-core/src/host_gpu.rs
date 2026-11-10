@@ -219,8 +219,12 @@ impl ExamineSummary {
         Self::gather_scoped(true, None)
     }
 
-    /// [`gather`](Self::gather) for a caller that has just examined the same host
-    /// (`rocm examine --json` builds both documents in one run).
+    /// [`gather`](Self::gather) for the examination of this same host, which
+    /// [`Examination::probe_with_summary`](crate::Examination::probe_with_summary)
+    /// has just made (`rocm examine --json` builds both documents in one run).
+    /// Crate-private so that no caller can pass an examination of another host,
+    /// such as one deserialised from a report: its kernel release would be
+    /// reported as this host's.
     ///
     /// On Linux the kernel release is the examination's `kernel_release`, a failed
     /// read included, instead of a second `uname -r`. One inspection then reads the
@@ -228,12 +232,7 @@ impl ExamineSummary {
     /// transient failure, and a hung `uname` costs one timeout rather than two.
     /// Everywhere else (the examination does not read the kernel on Windows) the
     /// summary reads it itself, as [`gather`](Self::gather) does.
-    ///
-    /// `examination` must come from probing this host: its kernel release is
-    /// reported as this host's. Not for one deserialised from a report or probed
-    /// for another machine. It stays `pub` because its caller, `rocm examine
-    /// --json`, is in another crate.
-    pub fn gather_after(examination: &crate::Examination) -> Result<Self> {
+    pub(crate) fn gather_after(examination: &crate::Examination) -> Result<Self> {
         Self::gather_scoped(true, Some(&examination.kernel_release))
     }
 

@@ -31,7 +31,7 @@ const KERNEL_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// On Linux (native and WSL), the trimmed output of `uname -r`. That is the one
 /// read of the kernel release for both stacks: `Examination`'s `kernel_release`
-/// is this value, with `None` shown as empty, and `ExamineSummary::gather_after`
+/// is this value, with `None` shown as empty, and `Examination::probe_with_summary`
 /// hands the examination's value to the summary, so one `rocm examine --json` run
 /// reads it once. The read is strict:
 ///

@@ -668,7 +668,20 @@ mod tests {
         /// The child's side of [`ask`]: print both answers as JSON.
         #[test]
         fn kernel_pair_child_reports_both_answers() {
-            if std::env::var_os(CHILD_ENV).is_none() {
+            let Some(mode) = std::env::var_os(CHILD_ENV) else {
+                return;
+            };
+            if mode == "inspect" {
+                // One inspection through the entry point `rocm examine --json` uses.
+                let (e, summary) =
+                    Examination::probe_with_summary(crate::FrameworkProbe::Skip, None)
+                        .expect("probe and gather");
+                let answers = serde_json::json!({
+                    "summary": summary.kernel,
+                    "examination": e.kernel_release,
+                    "probe_failures": e.probe_failures,
+                });
+                println!("{ANSWER_PREFIX}{answers}");
                 return;
             }
             let mut e = Examination::default();
@@ -685,13 +698,36 @@ mod tests {
         /// both stacks. `uname -v` answers a fixed string, so `probe_os` has
         /// nothing else to wait for.
         fn ask(body: &str) -> Pair {
+            let (json, _release_reads) = run_child(body, "pair");
+            // A failed read is empty, not a failure: `probe_os` records no
+            // `probe_failures` entry at all in any case (whatever its wording
+            // would be), so a host with a missing or broken `uname` does not read
+            // as degraded. The fake host's os-release reads cleanly, so the list
+            // is empty rather than compared with a baseline.
+            assert_eq!(json["probe_failures"], serde_json::json!([]), "{json}");
+            Pair {
+                summary: json["summary"].as_str().map(str::to_owned),
+                examination: json["examination"]
+                    .as_str()
+                    .expect("the examination answer is a string")
+                    .to_owned(),
+            }
+        }
+
+        /// Run the child in `mode` against a fake `uname` whose `-r` output is
+        /// `body`, and return its answers and how many times `-r` was asked.
+        /// `uname -v` answers a fixed string, so `probe_os` has nothing else to
+        /// wait for.
+        fn run_child(body: &str, mode: &str) -> (serde_json::Value, usize) {
             let scratch = tempfile::tempdir().expect("scratch directory");
             let bin = scratch.path().join("bin");
             std::fs::create_dir_all(&bin).expect("create the fake bin directory");
+            let calls = scratch.path().join("release-reads");
             crate::fake_executable::write_fake_executable(
                 &bin.join("uname"),
                 format!(
-                    "#!/bin/sh\nif [ \"$1\" = -v ]; then echo '#1 SMP fake'; exit 0; fi\n{body}\n"
+                    "#!/bin/sh\nif [ \"$1\" = -v ]; then echo '#1 SMP fake'; exit 0; fi\necho x >> '{}'\n{body}\n",
+                    calls.display()
                 ),
             )
             .expect("plant the fake uname");
@@ -706,7 +742,7 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env(CHILD_ENV, "1")
+                .env(CHILD_ENV, mode)
                 // The fake first; the system directories so `sleep` and `printf`
                 // resolve inside it.
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -724,19 +760,26 @@ mod tests {
                     )
                 });
             let json: serde_json::Value = serde_json::from_str(line).expect("answers are JSON");
-            // A failed read is empty, not a failure: `probe_os` records no
-            // `probe_failures` entry at all in any case (whatever its wording
-            // would be), so a host with a missing or broken `uname` does not read
-            // as degraded. The fake host's os-release reads cleanly, so the list
-            // is empty rather than compared with a baseline.
-            assert_eq!(json["probe_failures"], serde_json::json!([]), "{json}");
-            Pair {
-                summary: json["summary"].as_str().map(str::to_owned),
-                examination: json["examination"]
-                    .as_str()
-                    .expect("the examination answer is a string")
-                    .to_owned(),
-            }
+            let reads = std::fs::read_to_string(&calls).map_or(0, |log| log.lines().count());
+            (json, reads)
+        }
+
+        /// One inspection reads the release once, for the examination and the
+        /// summary together, so the two fields agree and a hung `uname` costs
+        /// one timeout. The reads are counted by the fake `uname` itself, so a
+        /// second read shows even when both return the same string. A failed
+        /// read is shared too: both are empty and it is still one read.
+        #[test]
+        fn one_inspection_reads_the_kernel_release_once() {
+            let (json, reads) = run_child("echo 6.8.0-fake", "inspect");
+            assert_eq!(json["summary"], "6.8.0-fake", "{json}");
+            assert_eq!(json["examination"], "6.8.0-fake", "{json}");
+            assert_eq!(reads, 1, "{json}");
+
+            let (json, reads) = run_child("echo 6.8.0-partial; exit 3", "inspect");
+            assert_eq!(json["summary"], serde_json::Value::Null, "{json}");
+            assert_eq!(json["examination"], "", "{json}");
+            assert_eq!(reads, 1, "{json}");
         }
 
         #[test]
