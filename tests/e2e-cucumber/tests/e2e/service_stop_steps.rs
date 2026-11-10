@@ -302,13 +302,21 @@ fn wait_for_descendant_pid(pid_file: &std::path::Path) -> u32 {
 }
 
 /// Whether Windows has a process `pid`, by `tasklist`: a match prints a CSV
-/// row naming it, and no match prints an INFO line without one.
+/// row naming it, and no match prints an INFO line without one. A `tasklist`
+/// that fails has said nothing about the process, so the scenario fails rather
+/// than read it as "exited" (`e2e_cucumber::tasklist`).
 fn windows_process_is_running(pid: u32) -> bool {
     let output = Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
         .expect("failed to run tasklist");
-    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    e2e_cucumber::tasklist::tasklist_reports_running(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+        pid,
+    )
+    .unwrap_or_else(|message| panic!("{message}"))
 }
 
 /// Write the record for a ready server whose supervisor is `process`, with

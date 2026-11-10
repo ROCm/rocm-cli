@@ -30,6 +30,7 @@ pub mod serve_log;
 pub mod serve_plan;
 pub mod shared_runtime;
 pub mod stray_process;
+pub mod tasklist;
 pub mod terminal_size;
 
 use std::path::{Path, PathBuf};

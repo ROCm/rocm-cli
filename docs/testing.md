@@ -2278,7 +2278,11 @@ service listing confirms and drops the key. The command is a stock one the host
 has, pinned by `the_process_check_command_is_the_one_the_host_has`, and
 `service-stop-07` uses the same `tasklist /FI "PID eq <pid>"` filter (in CSV
 form, which does not depend on the display language) to see whether a process is
-running; no test follows the printed command on a Windows host and reads its
+running. A `tasklist` that does not exit successfully is no answer: the scenario
+fails instead of reading the missing row as an exit
+(`tasklist_reports_running` in `tests/e2e-cucumber/src/tasklist.rs`, a pure read of
+the status and output covered by `a_failed_run_is_no_answer_whatever_it_printed` on
+every host). No test follows the printed command on a Windows host and reads its
 default table output, because that output is localised. What follows once the
 process is gone is covered by
 `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`.
