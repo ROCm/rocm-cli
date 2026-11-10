@@ -37,9 +37,10 @@ use crate::{
     host_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
 };
 use anyhow::Result;
+use os_facts::detect_cpu_model;
 pub(crate) use os_facts::detect_distro_name;
+pub(crate) use os_facts::detect_kernel_version;
 pub use os_facts::detect_system_ram_gib;
-use os_facts::{detect_cpu_model, detect_kernel_version};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -194,12 +195,45 @@ pub struct HostGpuSummary {
     pub therock_family: Option<String>,
 }
 
+/// The kernel the summary reports: the examination's, when the caller has one and
+/// this is Linux (the examination reads it there, and an empty one is a failed
+/// read); otherwise whatever `read` gives. `read` is not called in the first case.
+fn summary_kernel(
+    examined: Option<&str>,
+    linux: bool,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match examined {
+        Some(kernel) if linux => Some(kernel)
+            .filter(|kernel| !kernel.is_empty())
+            .map(str::to_owned),
+        _ => read(),
+    }
+}
+
 impl ExamineSummary {
     /// The full host summary, including the Windows display driver version and
     /// date. Everything that prints the summary, or serializes it for a client
     /// (`rocm examine`, the MCP and bridge snapshots), wants this one.
     pub fn gather() -> Result<Self> {
-        Self::gather_scoped(true)
+        Self::gather_scoped(true, None)
+    }
+
+    /// [`gather`](Self::gather) for the examination of this same host, which
+    /// [`Examination::probe_with_summary`](crate::Examination::probe_with_summary)
+    /// has just made (`rocm examine --json` builds both documents in one run).
+    /// Crate-private so that no caller can pass an examination of another host,
+    /// such as one deserialised from a report: its kernel release would be
+    /// reported as this host's.
+    ///
+    /// On Linux the kernel release is the examination's `kernel_release`, a failed
+    /// read included, instead of a second `uname -r`. One inspection then reads the
+    /// release once, so `summary.kernel` and `kernel_release` cannot disagree on a
+    /// transient failure, and a hung `uname` costs one timeout rather than two.
+    /// Everywhere else (the examination does not read the kernel on Windows) the
+    /// summary reads it itself, as [`gather`](Self::gather) does.
+    pub(crate) fn gather_after(examination: &crate::Examination) -> Result<Self> {
+        Self::gather_scoped(true, Some(&examination.kernel_release))
     }
 
     /// The host summary without the Windows driver version and date, for a
@@ -207,10 +241,10 @@ impl ExamineSummary {
     /// PowerShell video-controller query `gather` adds for them; the GPU
     /// target, CPU, RAM and every other field are the same.
     pub fn gather_without_driver_facts() -> Result<Self> {
-        Self::gather_scoped(false)
+        Self::gather_scoped(false, None)
     }
 
-    fn gather_scoped(driver_facts: bool) -> Result<Self> {
+    fn gather_scoped(driver_facts: bool, examined_kernel: Option<&str>) -> Result<Self> {
         let paths = AppPaths::discover()?;
         let windows_inventory = if driver_facts {
             detect_windows_examine_inventory_with_driver_facts()
@@ -237,7 +271,7 @@ impl ExamineSummary {
         Ok(Self {
             os: runtime_os_name().to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
-            kernel: detect_kernel_version(),
+            kernel: summary_kernel(examined_kernel, runtime_is_linux(), detect_kernel_version),
             distro: detect_distro_name(),
             cpu: detect_cpu_model_with_windows_inventory(windows_inventory.as_ref()),
             system_ram_gib: detect_system_ram_gib_with_windows_inventory(
@@ -733,6 +767,32 @@ mod tests {
             let rendered = windows_summary_with_driver(summary.windows).render_text();
             assert!(!rendered.contains("driver_age:"), "{rendered}");
             assert!(!rendered.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+        }
+    }
+
+    /// The summary takes the examination's kernel release on Linux without a
+    /// second read, and an empty one is a failed read, not a release. Off Linux,
+    /// or with no examination, it reads for itself. The reads are counted, so a
+    /// second `uname -r` shows up as a count of 1.
+    #[test]
+    fn the_summary_reads_the_kernel_only_when_the_examination_did_not() {
+        for (examined, linux, reads, expected) in [
+            (Some("6.8.0-fake"), true, 0, Some("6.8.0-fake")),
+            (Some(""), true, 0, None),
+            (Some("6.8.0-fake"), false, 1, Some("read")),
+            (None, true, 1, Some("read")),
+            (None, false, 1, Some("read")),
+        ] {
+            let count = std::cell::Cell::new(0);
+            let kernel = summary_kernel(examined, linux, || {
+                count.set(count.get() + 1);
+                Some("read".to_owned())
+            });
+            assert_eq!(
+                (kernel.as_deref(), count.get()),
+                (expected, reads),
+                "{examined:?} on linux={linux}"
+            );
         }
     }
 }

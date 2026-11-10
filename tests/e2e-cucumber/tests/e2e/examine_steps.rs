@@ -2746,6 +2746,164 @@ async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
     );
 }
 
+// ── Both reports read the kernel release from one `uname -r` ───────
+
+/// The release the stand-in `uname` reports, chosen so no real host has it.
+const STAND_IN_KERNEL_RELEASE: &str = "6.8.0-stand-in-kernel";
+
+/// Where the stand-in `uname` logs the arguments of every call, one line each,
+/// so a scenario can count the reads. Inside the isolated root.
+fn stand_in_uname_log(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-calls.log")
+}
+
+/// Plant a `uname` first on the `PATH` of the next `rocm` run. `-r` runs
+/// `release_body` (a shell fragment); `-v` answers a fixed string, so the
+/// examination's other `uname` read has nothing to wait for. Every call appends
+/// its arguments to [`stand_in_uname_log`]. Nothing else on the
+/// machine is planted: the stand-in is what `rocm examine` reads on any Linux
+/// host, native or WSL, because both stacks run `uname -r` there.
+fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in uname directory");
+    let log = stand_in_uname_log(world);
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(release_body, &log),
+    )
+    .expect("failed to write the stand-in uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a machine whose uname reports a kernel release")]
+async fn machine_whose_uname_reports_a_release(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}"));
+}
+
+#[given("a machine whose uname prints a kernel release and then fails")]
+async fn machine_whose_uname_prints_a_release_and_fails(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}; exit 3"));
+}
+
+/// The `probe_failures` entries of an `examine --json` document, whatever they
+/// say.
+fn probe_failures(json: &serde_json::Value) -> Vec<String> {
+    json.get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `probe_failures` of the same machine with a `uname` that works, for a
+/// baseline: entries this machine legitimately has for other reasons are not
+/// the kernel read's, and a failure the failing `uname` adds, however worded,
+/// is.
+fn probe_failures_with_a_working_uname(world: &E2eWorld) -> Vec<String> {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-baseline-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the baseline uname directory");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(
+            &format!("echo {STAND_IN_KERNEL_RELEASE}"),
+            &world
+                .isolated_root
+                .as_ref()
+                .expect("no isolated root")
+                .path()
+                .join("uname-baseline-calls.log"),
+        ),
+    )
+    .expect("failed to write the baseline uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    let path = path.to_str().expect("PATH is UTF-8").to_owned();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["examine", "--framework", "skip", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        rc, 0,
+        "the baseline `rocm examine --json` failed:\n{stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("the baseline run emitted JSON");
+    probe_failures(&json)
+}
+
+#[then("the summary and the examination report that kernel release")]
+async fn assert_both_report_the_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/kernel"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, "/kernel_release"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+}
+
+/// One `rocm examine --json` run asks `uname` for the release once, for the
+/// examination and the summary together: the stand-in logged a single `-r`. A
+/// second read would show as a second line, and it is what lets a transient
+/// failure make the two fields disagree.
+#[then("that run asked uname for the kernel release once")]
+async fn assert_uname_was_asked_for_the_release_once(world: &mut E2eWorld) {
+    let log = std::fs::read_to_string(stand_in_uname_log(world))
+        .expect("the stand-in uname was never called");
+    let release_reads = log.lines().filter(|line| line.trim() == "-r").count();
+    assert_eq!(release_reads, 1, "calls of the stand-in uname:\n{log}");
+}
+
+#[then(
+    "neither the summary nor the examination reports a kernel release, and neither calls it a failure"
+)]
+async fn assert_neither_reports_a_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert!(
+        json.pointer("/summary/kernel")
+            .is_some_and(serde_json::Value::is_null),
+        "the summary must read no kernel from a uname that failed:\n{json:#}"
+    );
+    assert_eq!(inspection_str(&json, "/kernel_release"), "", "{json:#}");
+    // No `probe_failures` entry beyond what the same machine has with a working
+    // `uname`, so a failure worded in any way cannot slip through.
+    let baseline = probe_failures_with_a_working_uname(world);
+    let new_failures: Vec<String> = probe_failures(&json)
+        .into_iter()
+        .filter(|failure| !baseline.contains(failure))
+        .collect();
+    assert_eq!(new_failures, Vec::<String>::new(), "{json:#}");
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]

@@ -515,6 +515,32 @@ mod tests {
         );
     }
 
+    /// The consumer of `kernel_release` for the WSL facts. The kernel read is a
+    /// pair of the host-probing note ("Kernel version"); this pins what
+    /// `probe_wsl` makes of each string the two reads can hand it, including
+    /// the empty string a failed read leaves: a WSL 1 style release is version
+    /// 1, a WSL 2 style one and an empty one are version 2.
+    #[test]
+    fn probe_wsl_reads_the_wsl_version_from_the_kernel_release() {
+        for (release, version) in [
+            ("4.4.0-19041-Microsoft", 1),
+            ("5.15.167.4-microsoft-standard-WSL2", 2),
+            ("4.19.104-microsoft-standard", 2),
+            ("", 2),
+        ] {
+            let mut e = Examination {
+                kernel_release: release.to_owned(),
+                ..Examination::default()
+            };
+            probe_wsl(&mut e);
+            assert_eq!(
+                e.wsl.as_ref().map(|wsl| wsl.version),
+                Some(version),
+                "{release:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_distro_list_decodes_as_utf16_whatever_script_it_is_in() {
         fn utf16le(text: &str, bom: bool) -> Vec<u8> {
