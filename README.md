@@ -194,8 +194,8 @@ covers `q`, the Esc menu's `Quit` row, and `/quit` or `/exit` in chat, from the
 launcher or from a dashboard or chat session opened directly.
 
 The prompt names the model and the `rocm services stop <id> --yes` command to
-stop it. From the dashboard, press `s` instead to jump straight to the Services overlay and
-stop it there.
+stop it. From the dashboard, press `s` instead to jump straight to the Services
+overlay and stop it there.
 
 At the prompt:
 
@@ -591,14 +591,17 @@ you what it couldn't find instead.
 
 #### Driver installation
 
-`install driver` previews or installs Linux AMD driver support. Without `--dkms`
-it prints a non-mutating plan and changes nothing; `--dkms` plans the DKMS
-install; add `--yes` to apply it. On bare metal it defaults to the floating
-`latest` amdgpu release;
-set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
-older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
-pinned a fixed default and are no longer read; the plan is refused while either is still set,
-so an old pin is never silently turned into `latest`.
+`install driver` previews or installs Linux AMD driver support. On bare metal,
+it prints a non-mutating plan and changes nothing unless you pass `--dkms`,
+which plans the DKMS install; add `--yes` to apply it. On WSL2 there is no
+DKMS flow: the command plans the ROCDXG install instead, and `--yes` applies it
+without `--dkms` (see [Install ROCDXG in WSL](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md#install-rocdxg-in-wsl)).
+
+On bare metal it defaults to the floating `latest` amdgpu release; set
+`ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the older
+`ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which pinned a
+fixed default and are no longer read; the plan is refused while either is still
+set, so an old pin is never silently turned into `latest`.
 
 On Ubuntu, the plan uses the `repo.radeon.com/amdgpu` suite matching the
 release (`jammy` 22.04, `noble` 24.04, `resolute` 26.04). If `amdgpu-dkms` from
@@ -607,6 +610,11 @@ warning naming the removal command (`apt-get autoremove -y amdgpu-dkms`); it
 never removes the old driver itself, and the install continues after the
 warning. This applies to every apt-based distro the DKMS flow covers (Ubuntu
 and Debian 12/13).
+
+On dnf hosts (RHEL, Oracle Linux, and Rocky Linux) and zypper hosts (SLES), the
+plan follows the same repository-based flow: it imports the AMD key, writes a
+package-manager repository file, and installs `amdgpu-dkms` with `dnf` or
+`zypper`.
 
 Approving (`--yes`) a plan that is `supported: false` (an
 undocumented distro, or a refused version override) installs nothing and exits
@@ -921,8 +929,9 @@ address.
 #### Other serve options
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
-total video RAM, or VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
-`mistral`, which also turns on automatic tool choice) apply to vLLM only. Lower
+total video RAM, or VRAM) and `--tool-call-parser` (for example `hermes`,
+`llama3_json`, or `mistral`, which also turns on automatic tool choice) apply to
+vLLM only. Lower
 the memory fraction when a small model shouldn't reserve most of a large card.
 
 `--require-api-key` makes a loopback endpoint require an API key too, which
@@ -1108,7 +1117,8 @@ than they are:
   check refuses *every* index on a host with no usable GPU, because there is no
   visible ordinal for one to name. So `rocm serve <model> --gpu 0` is refused on
   a GPU-less host whether or not a reusable service is running, and so is
-  any other index, such as `--gpu 1`. The exemption applies under the default `--gpu auto`.
+  any other index, such as `--gpu 1`. The exemption applies under the default
+  `--gpu auto`.
 
 #### When a serve runs out of GPU memory
 
@@ -1545,8 +1555,9 @@ when only `ROCM_CLI_DATA_DIR` is set, the cache directory moves with it, to
 while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by
 `rocm uninstall`. Delete it by hand if you don't need it. `uninstall` removes a
 category's directory unless you keep that category, so on a default
-installation a flag doesn't protect its files by itself. To keep your settings and data, pass `--keep-config`
-and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
+installation a flag doesn't protect its files by itself. To keep your settings
+and data, pass `--keep-config` and `--keep-data` together. Run with `--dry-run`
+first to confirm what is kept.
 
 The binaries it removes include the running `rocm.exe` on Windows. It also
 undoes the `PATH` change the installer made: the marked block in your shell

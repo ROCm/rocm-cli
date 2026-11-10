@@ -252,9 +252,9 @@ multiple GPUs is not supported.
 
 ## GPU memory
 
-vLLM claims a fixed fraction of each GPU's **total** VRAM for weights plus KV
-cache. The fraction is not based on the free VRAM, and it is not scaled to the
-model. On a large card, a small model therefore still reserves a large slice.
+vLLM claims a fixed fraction of each GPU's **total** video RAM (VRAM) for
+weights plus KV cache. The fraction is not based on the free VRAM, and it is not
+scaled to the model. On a large card, a small model therefore still reserves a large slice.
 
 ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
 applies unless a value comes from somewhere else: either a model's catalog
@@ -292,7 +292,7 @@ a tiny model. ROCm CLI helps in three ways:
   heavily used, `rocm serve` prints a note. The note appears before launch on
   the plain path, or in the post-readiness summary in the default interactive
   mode. For vLLM, the note also points to `--gpu-memory-utilization` as the fix.
-- **OOM failures hint the workaround.** When a startup failure log shows an
+- **Out-of-memory (OOM) failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
   reservation, such as `--gpu-memory-utilization 0.5`, or targeting a less busy
   GPU with `--gpu <index>`. It also points to `rocm diagnose --symptom '<the
