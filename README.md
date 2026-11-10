@@ -1375,6 +1375,14 @@ alone: a healthy model with no endpoint needs `attach`, not a restart. `stop`
 withdraws the endpoint and stops the model, and keeps the session listed if it
 cannot confirm both. Use `--force` to forget one whose machine is gone.
 
+Sessions are recorded under the data directory in `remote-sessions/`, which is
+created accessible to your user only on Linux; `serve` refuses to use one that
+another user owns. A record is skipped with a warning
+rather than acted on if it names a remote command other than the ones `serve`
+writes, or, on Linux, if it is owned by another user. That includes running
+`rocm remote` under `sudo` against your own records: run it as the user who
+created the session.
+
 Communication with the machine uses your existing `ssh` setup. Set
 `ROCM_REMOTE_SSH_CONFIG` to point at a configuration file other than the
 default.

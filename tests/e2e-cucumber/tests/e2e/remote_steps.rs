@@ -632,6 +632,111 @@ async fn then_machine_publishing(world: &mut E2eWorld) {
     );
 }
 
+/// Where this scenario's CLI keeps its session records — the same data dir
+/// `isolate_env` hands every spawned `rocm`.
+fn sessions_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario root")
+        .path()
+        .join("data")
+        .join("remote-sessions")
+}
+
+/// The one record this scenario's `serve` wrote.
+fn only_session_record(world: &E2eWorld) -> PathBuf {
+    let records = std::fs::read_dir(sessions_dir(world))
+        .expect("read the sessions directory")
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "expected one session record: {records:?}");
+    records.into_iter().next().expect("one record")
+}
+
+#[then("the session is recorded where only the user can reach it")]
+async fn then_sessions_private(world: &mut E2eWorld) {
+    // The record names commands run on the machine with the user's SSH
+    // identity, and its credential sits beside it, so the directory is
+    // owner-only. Unix permissions only: Windows keeps it in the per-user
+    // profile and the CLI does not set an ACL of its own.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = sessions_dir(world);
+        let mode = std::fs::metadata(&directory)
+            .expect("the sessions directory exists after a serve")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "{} is {mode:o}; another account could add or replace a record in it",
+            directory.display()
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = world;
+}
+
+/// A file only the extra command creates, so its presence is the proof it ran.
+const EXTRA_COMMAND_MARKER: &str = "/tmp/rocm-e2e-extra-command-ran";
+
+#[when("the session record is altered to run an extra command on that machine")]
+async fn when_record_altered(world: &mut E2eWorld) {
+    let path = only_session_record(world);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read record")).expect("parse record");
+    let cli = record["remote_cli"]
+        .as_str()
+        .expect("the record names a remote CLI")
+        .to_owned();
+    // Keeps the real CLI first so the original command would still run, and
+    // comments out the rest of the line, which is what makes the extra command
+    // invisible in normal output.
+    record["remote_cli"] =
+        serde_json::Value::String(format!("{cli}; touch {EXTRA_COMMAND_MARKER} #"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&record).expect("serialize"),
+    )
+    .expect("write altered record");
+}
+
+#[then("the user is told the session record was refused")]
+async fn then_record_refused(world: &mut E2eWorld) {
+    let said = said(world);
+    assert!(
+        said.contains("refusing to act on") && said.contains("unexpected remote CLI"),
+        "the user must be told the record was refused and why:\n{said}"
+    );
+    assert!(
+        said.contains("No remote sessions"),
+        "a refused record must not be listed as a session:\n{said}"
+    );
+}
+
+#[then("the extra command never ran on the machine")]
+async fn then_extra_command_never_ran(world: &mut E2eWorld) {
+    // Prints one of two words rather than relying on an exit status, so a
+    // broken probe cannot read as "absent".
+    let seen = machine(world).exec(&[
+        "sh",
+        "-c",
+        &format!("if [ -e {EXTRA_COMMAND_MARKER} ]; then echo ran; else echo absent; fi"),
+    ]);
+    assert_eq!(
+        seen.trim(),
+        "absent",
+        "the altered record's extra command ran on the machine"
+    );
+}
+
 #[then("the model and the endpoint are both reported healthy")]
 async fn then_both_healthy(world: &mut E2eWorld) {
     let said = said(world);

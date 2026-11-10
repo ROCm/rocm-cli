@@ -143,7 +143,7 @@ Further `apps/rocm` modules, not part of the `main.rs` split:
   - [`remote/install.rs`](../apps/rocm/src/remote/install.rs) — installing ROCm on an unattended remote machine.
   - [`remote/provision.rs`](../apps/rocm/src/remote/provision.rs) — putting the ROCm CLI on a remote machine that does not have it.
   - [`remote/publish.rs`](../apps/rocm/src/remote/publish.rs) — publishing a remote machine's loopback service onto the tailnet.
-  - [`remote/session.rs`](../apps/rocm/src/remote/session.rs) — local records of work running on other machines.
+  - [`remote/session.rs`](../apps/rocm/src/remote/session.rs) — local records of work running on other machines, kept in an owner-only directory on unix and vetted on every read (`read_one`): a record owned by another user, or naming a remote CLI other than the two forms [`remote/bootstrap.rs`](../apps/rocm/src/remote/bootstrap.rs) writes, is refused.
   - [`remote/tailnet.rs`](../apps/rocm/src/remote/tailnet.rs) — reading the local tailnet: which machines exist, and how to address one.
   - [`remote/transport.rs`](../apps/rocm/src/remote/transport.rs) — the SSH control channel to a remote GPU host.
 

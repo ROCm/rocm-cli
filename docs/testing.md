@@ -542,7 +542,11 @@ The `rocm remote` cucumber scenarios that need a second machine carry
 `@requires-docker` and run only when `E2E_INCLUDE_DOCKER=1`, which the
 GitHub-hosted `E2E tests` lane sets. A working daemon alone is not enough — the
 self-hosted GPU runners have one but cannot reach the package mirror the fixture
-image builds from, so they skip those scenarios. To run them locally:
+image builds from, so they skip those scenarios. Among them, `remote-16` rewrites
+a recorded session so its remote command would also create a marker file on the
+container, and asserts that `rocm remote status` refuses the record, says why,
+and that the marker never appears; `remote-10` also checks the sessions directory
+is left owner-only. To run them locally:
 
 ```bash
 E2E_INCLUDE_DOCKER=1 cargo xtask e2e
