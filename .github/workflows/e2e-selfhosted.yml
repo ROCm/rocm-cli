@@ -177,7 +177,7 @@ jobs:
       - name: Compute sdk_version matrix (ROCMAI-430)
         id: sdk_matrix
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${GITHUB_REF}" == refs/heads/release/* ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/heads/release/* ]]; then
             echo 'matrix=["current","n-1","n-2"]' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
@@ -559,7 +559,7 @@ jobs:
           # See the e2e-gpu lane and `xtask e2e-prewarm` for why the old
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm" \
+            cargo xtask e2e-prewarm --channel "${MATRIX_CHANNEL}" --prewarm-dir "$prewarm" \
               --release-label "${MATRIX_SDK_VERSION}"
 
           # Optional scenario-name filter for a scoped manual dispatch.
@@ -571,6 +571,7 @@ jobs:
             cargo xtask e2e
           fi
         env:
+          MATRIX_CHANNEL: ${{ matrix.channel }}
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
@@ -1734,9 +1735,8 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          # rust-cache keys on "Linux-x64" only; name the image so a target dir
-          # built against one Ubuntu release's glibc is never restored on another.
-          cache-key: ubuntu-24.04
+          # No rust-cache restore/save: builds start from a clean tree, so a
+          # poisoned cache entry cannot reach this job (zizmor cache-poisoning).
           cache: false
 
       # Pull every self-hosted e2e artifact matching the glob; `xtask e2e-report`

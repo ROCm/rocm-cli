@@ -16,10 +16,9 @@
 #      ID per line. Add `exp:YYYY-MM-DD` for a temporary suppression:
 #          CVE-2019-14697 exp:2027-01-01
 #      Reference: https://trivy.dev/latest/docs/configuration/filtering/#trivyignore
-#      Keep it beside this file (`.github/scan_tools_configs/.trivyignore`)
-#      or at the repository root. The file beside this config takes
-#      precedence; the two are never merged. The `.trivyignore` here is
-#      a commented placeholder.
+#      NOTE: this config sets `ignorefile:` to `.trivyignore.yaml` (below),
+#      so trivy reads only that file; IDs added to the plain `.trivyignore`
+#      are not read. Add ID-only suppressions to `.trivyignore.yaml` too.
 #
 #   2. `scan.skip-dirs` / `scan.skip-files` below -- paths trivy never
 #      reads, for vendored trees and generated output. Anything found only

@@ -35,9 +35,8 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          # rust-cache keys on "Linux-x64" only; name the image so a target dir
-          # built against one Ubuntu release's glibc is never restored on another.
-          cache-key: ubuntu-24.04
+          # No rust-cache restore/save: builds start from a clean tree, so a
+          # poisoned cache entry cannot reach this job (zizmor cache-poisoning).
           cache: false
 
       # VHS + its runtime deps. ttyd/ffmpeg from apt; vhs pinned via `go install`
