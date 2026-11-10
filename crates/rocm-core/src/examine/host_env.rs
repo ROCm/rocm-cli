@@ -788,17 +788,18 @@ mod tests {
             assert_eq!(ask("printf '6.8.0-\\377\\n'"), pair(None, ""));
         }
 
-        /// A `uname` that answers after 3 s is read by both: the one timeout is
+        /// A `uname` that answers after 2 s is read by both: the one timeout is
         /// the longer of the two old ones, 5 s. The summary used to give up at
-        /// 1.5 s.
+        /// 1.5 s, so 2 s is past that old limit and leaves 3 s of margin to the
+        /// new one on a loaded runner.
         #[test]
-        fn an_answer_after_three_seconds_is_read_by_both() {
+        fn an_answer_after_two_seconds_is_read_by_both() {
             let started = Instant::now();
             assert_eq!(
-                ask("sleep 3; echo 6.8.0-slow"),
+                ask("sleep 2; echo 6.8.0-slow"),
                 pair(Some("6.8.0-slow"), "6.8.0-slow")
             );
-            assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+            assert!(started.elapsed() >= std::time::Duration::from_secs(2));
         }
 
         /// A `uname` that never answers is read as nothing by both, each after
