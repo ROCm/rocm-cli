@@ -354,11 +354,16 @@ pub(crate) fn judge_uninstall_root(
     }
 }
 
-/// Whether the real directory `path` really sits inside the user's home,
+/// Whether the real directory `path` really is the user's home or inside it,
 /// though spelled outside it — on Windows the temp folder is often spelled
 /// with the home folder's short 8.3 name (`C:\Users\RUNNER~1\...`), which by
 /// spelling alone is someone else's folder under `C:\Users`. Such a root is
-/// judged by where it really is instead.
+/// judged by where it really is instead, which allows it inside home and
+/// refuses it as the home folder itself.
+///
+/// A home that resolves to the top of the filesystem decides nothing: every
+/// folder is inside it, so it cannot tell another user's folder from one of
+/// the user's own.
 fn resolves_inside_own_home(
     path: &Path,
     home: Option<&Path>,
@@ -370,8 +375,8 @@ fn resolves_inside_own_home(
     let Ok(resolved_home) = canonicalize(home) else {
         return false;
     };
-    rocm_core::runtime_path_is_same_or_inside(&resolved, &resolved_home)
-        && !rocm_core::runtime_paths_equivalent(&resolved, &resolved_home)
+    resolved_home.parent().is_some()
+        && rocm_core::runtime_path_is_same_or_inside(&resolved, &resolved_home)
 }
 
 pub(crate) fn build_uninstall_plan(
@@ -2017,6 +2022,96 @@ mod tests {
             bobs.refused[0].why,
             rocm_core::ProtectedLocation::OtherUsersHome
         );
+    }
+
+    /// The cases that bound the short-name allowance in
+    /// [`super::judge_uninstall_root`], each judged directly with the real
+    /// resolver unless it says otherwise. `users/` is home's parent, so by
+    /// spelling alone everything under it but home is another user's.
+    #[test]
+    #[cfg(unix)]
+    fn the_short_name_allowance_applies_only_to_a_real_folder_in_home() {
+        use rocm_core::ProtectedLocation::{Home, OtherUsersHome, System};
+        let root = sandbox("short-name-bounds");
+        let users = root.join("users");
+        let home = users.join("home");
+        let data = home.join(".rocm").join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let elsewhere = root.join("elsewhere").join("data");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let resolve: Canonicalize<'_> = &rocm_core::canonicalize_for_compare;
+        let judge = |path: &Path, home: &Path, resolve: Canonicalize<'_>| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            super::judge_uninstall_root(path, &metadata, Some(home), resolve)
+        };
+        let why = |judgment: &super::RootJudgment| match judgment {
+            super::RootJudgment::Refuse { why, .. } => Some(*why),
+            super::RootJudgment::Remove { .. } => None,
+        };
+
+        // A link spelled beside home, pointing into it, is still another
+        // user's: only a real folder is judged by where it is.
+        let link = users.join("LINK~1");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        let as_link = judge(&link, &home, resolve);
+
+        // A real folder spelled beside home that is home itself is refused
+        // as the home folder, by where it really is.
+        let alias = users.join("ALIAS~1");
+        std::os::unix::fs::symlink(&users, &alias).unwrap();
+        let home_itself = judge(&alias.join("home"), &home, resolve);
+
+        // Home given through a link of its own still counts as home.
+        let home_link = root.join("home-link");
+        std::os::unix::fs::symlink(&home, &home_link).unwrap();
+        let through_linked_home = judge(
+            &alias.join("home").join(".rocm").join("data"),
+            &home_link,
+            resolve,
+        );
+
+        // A folder spelled under users/ that really is somewhere else
+        // entirely keeps the refusal its spelling earns.
+        let away = users.join("AWAY~1");
+        std::os::unix::fs::symlink(elsewhere.parent().unwrap(), &away).unwrap();
+        let spelled_away = judge(&away.join("data"), &home, resolve);
+
+        // A system location is refused by its spelling even when it resolves
+        // into home; the resolver is told so, as no real `/usr` does.
+        let system = Path::new("/usr/rocm-short-name-test");
+        let into_home = data.clone();
+        let fake: &dyn Fn(&Path) -> std::io::Result<PathBuf> = &move |path: &Path| {
+            if path == system {
+                Ok(into_home.clone())
+            } else {
+                rocm_core::canonicalize_for_compare(path)
+            }
+        };
+        let system_metadata = std::fs::symlink_metadata(&data).unwrap();
+        let spelled_system =
+            super::judge_uninstall_root(system, &system_metadata, Some(&home), fake);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(why(&as_link), Some(OtherUsersHome), "{as_link:?}");
+        assert_eq!(why(&home_itself), Some(Home), "{home_itself:?}");
+        assert_eq!(why(&through_linked_home), None, "{through_linked_home:?}");
+        assert_eq!(why(&spelled_away), Some(OtherUsersHome), "{spelled_away:?}");
+        assert_eq!(why(&spelled_system), Some(System), "{spelled_system:?}");
+    }
+
+    /// With home at the top of the filesystem every folder is inside it, so
+    /// the allowance decides nothing and the spelling's refusal stands.
+    #[test]
+    fn a_home_at_the_filesystem_root_grants_no_short_name_allowance() {
+        let root = sandbox("short-name-root-home");
+        let top = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        let resolve: Canonicalize<'_> = &rocm_core::canonicalize_for_compare;
+        assert!(!super::resolves_inside_own_home(&root, Some(top), resolve));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Check, then act, for a root that was a symbolic link at review time:
