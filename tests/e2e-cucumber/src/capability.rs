@@ -294,7 +294,8 @@ struct ActiveRuntime {
 }
 
 /// Read the active managed runtime's version, channel, install root, exact GFX
-/// target and package source from the runtimes registry. Returns `None` when the tree names no single runtime.
+/// target and package source from the runtimes registry. Returns `None` when
+/// the tree names no single runtime.
 /// `channel` is `None` for a registry record predating the field.
 ///
 /// Which runtime that is comes from [`crate::shared_runtime::runtime_key_to_activate`],
@@ -342,10 +343,28 @@ fn active_runtime_install_root(runtimes_dir: &std::path::Path) -> Option<ActiveR
     } else {
         std::path::PathBuf::from(json.get("install_root")?.as_str()?)
     };
+    // Mirrors the CLI's `wheel_composition_device_target`
+    // (`apps/rocm/src/runtime_registry.rs`): a runtime installed with a family
+    // label records no `rocm_sdk_target`, only the `device-<target>` extra in its
+    // package specs.
     let gfx_target = json
         .pointer("/wheel_composition/rocm_sdk_target")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            json.pointer("/wheel_composition/package_specs")?
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find_map(|spec| {
+                    let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+                    extras
+                        .split(',')
+                        .map(str::trim)
+                        .find_map(|extra| extra.strip_prefix("device-"))
+                })
+                .map(str::to_owned)
+        });
     let source = json
         .get("index_url")
         .and_then(serde_json::Value::as_str)
@@ -1309,6 +1328,36 @@ Local model engines
         let legacy = active_runtime_install_root(legacy_dir.path()).expect("one runtime");
         assert_eq!(legacy.gfx_target, None);
         assert_eq!(legacy.source, None);
+    }
+
+    /// A runtime installed with a family label records no `rocm_sdk_target`; the
+    /// target is the `device-<target>` extra in its package specs, as the CLI's
+    /// `wheel_composition_device_target` reads it.
+    #[test]
+    fn gfx_target_falls_back_to_the_device_extra_in_package_specs() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        let key = "release-wheel-gfx110x-all-7-14-0";
+        let registry = dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": "7.14.0",
+                "install_root": install_root,
+                "wheel_composition": {
+                    "package_specs": ["rocm[libraries,device-gfx1100]==7.14.0"],
+                },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let runtime = active_runtime_install_root(dir).expect("one runtime");
+        assert_eq!(runtime.gfx_target.as_deref(), Some("gfx1100"));
     }
 
     /// Several runtimes and no marker: report nothing rather than guess. An

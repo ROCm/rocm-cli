@@ -269,14 +269,19 @@ active runtime was installed from. Both are read from that runtime's own
 registry record by the harness (`collect_versions` in
 [`capability.rs`](../tests/e2e-cucumber/src/capability.rs)), never from a
 workflow label, so a lane running on a legacy or different source shows that
-source instead of the one the workflow meant. A row without
-them has no managed runtime, or its runtime's record predates the fields. What
+source instead of the one the workflow meant. A row omits the target or the
+source when it has no managed runtime, when its runtime's record predates the
+field, when the record carries none (a tarball runtime has no index URL, and a
+wheel runtime whose device target was not resolved exactly has no target), or,
+for the source, when a legacy record has no index URL. What
 a lane skips on a given platform follows from the `@requires-*` tags above.
 
-To reproduce a lane's result locally, install the same runtime
-(`rocm install sdk --channel release|nightly --family <family>`) and run the
-scenario with `cargo xtask e2e -- -n "<scenario id>"`; the scenario ids are the
-anchors in the report.
+To reproduce a lane's result locally, install the runtime the Platform cell
+names (`rocm install sdk --channel release|nightly`, adding `--family` or
+`--version` to match it) and run the scenario by its name prefix, for example
+`cargo xtask e2e -- -n "serve-28"`. The anchors in the report are `@id:` slugs,
+which `-n` does not match; see [testing.md](testing.md) for how to select a
+scenario.
 
 `nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
 via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows

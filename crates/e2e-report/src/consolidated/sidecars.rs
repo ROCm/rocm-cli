@@ -91,48 +91,41 @@ pub(super) struct PlatformVersions {
     pub(super) source: Option<String>,
 }
 
+/// Join the present parts with " · ", skipping absent ones.
+fn join_parts<const N: usize>(parts: [Option<String>; N]) -> String {
+    parts.into_iter().flatten().collect::<Vec<_>>().join(" · ")
+}
+
 impl PlatformVersions {
     /// "target gfx1100 · source <url> (<generation>)" for the summary-matrix
     /// Platform cell, skipping what is unknown. Empty when neither is known.
     pub(super) fn provenance(&self) -> String {
-        [
+        join_parts([
             self.gfx_target.as_deref().map(|v| format!("target {v}")),
             self.source.as_deref().map(|v| format!("source {v}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
+        ])
     }
 
     /// Rendered "os X · ROCm Y · vLLM Z · lemonade W" line for a column heading,
     /// skipping absent components. Empty when nothing is known.
     pub(super) fn summary(&self) -> String {
-        [
+        join_parts([
             self.os.as_deref().map(|v| format!("OS {v}")),
             self.rocm.as_deref().map(|v| format!("ROCm {v}")),
             self.vllm.as_deref().map(|v| format!("vLLM {v}")),
             self.lemonade.as_deref().map(|v| format!("lemonade {v}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
+        ])
     }
 
     /// The software-stack versions (ROCm/vLLM/lemonade, WITHOUT the OS — that goes
     /// in its own cell), for the summary-matrix Platform cell. Empty when none are
     /// known (e.g. mock, which has no installed runtime).
     pub(super) fn platform_stack(&self) -> String {
-        [
+        join_parts([
             self.rocm.as_deref().map(|v| format!("ROCm {v}")),
             self.vllm.as_deref().map(|v| format!("vLLM {v}")),
             self.lemonade.as_deref().map(|v| format!("lemonade {v}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
+        ])
     }
 }
 
