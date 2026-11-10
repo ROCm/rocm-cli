@@ -3220,7 +3220,7 @@ if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
     fi
   fi
   /bin/mkdir -p "$target/bin"
-  cat > "$target/bin/python" <<PY
+  /bin/cat > "$target/bin/python" <<PY
 #!/bin/sh
 if [ "\$1" = "-c" ]; then
   case "\$2" in *sys.prefix*) echo "$target" ;; *) echo cp312 ;; esac
