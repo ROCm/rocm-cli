@@ -255,7 +255,11 @@ repos:
         # a crate's src/ that no `mod` declares fails it too, even an untracked scratch
         # file, and the error says to declare or delete it. Only a commit that stages
         # Rust source runs it, and only for someone who installed the hooks; CI stays
-        # the authority.
+        # the authority. Stage: pre-commit, like the other local checks, not pre-push.
+        # The consequence is that it also refuses the intermediate commits when an
+        # over-limit file is split across several commits (CI only sees the final
+        # state). Do the split in one commit, or commit the intermediate steps with
+        # `SKIP=cargo-module-size git commit ...`.
         entry: cargo xtask check-module-size
         language: system
         types: [rust]

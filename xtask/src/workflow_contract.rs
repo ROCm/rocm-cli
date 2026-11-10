@@ -6836,6 +6836,13 @@ fi
         block.lines().any(|line| strip_comment(line).trim() == flag)
     }
 
+    /// True when `word` appears in the hook block outside comments, so a comment
+    /// that merely mentions a key (for example "no `files:` filter here") does not
+    /// count as setting it.
+    fn hook_block_mentions(block: &str, word: &str) -> bool {
+        block.lines().any(|line| strip_comment(line).contains(word))
+    }
+
     /// Regression guard: the `license-headers` hook once had a `types_or`
     /// filter (`types_or: [rust, python, shell]`) that let a
     /// `licenserc.toml`- or Markdown-only commit skip it entirely, while
@@ -6988,7 +6995,7 @@ fi
         );
         for filter_key in ["files:", "exclude:", "types_or:"] {
             assert!(
-                !block.contains(filter_key),
+                !hook_block_mentions(block, filter_key),
                 "cargo-module-size hook must not narrow `types: [rust]` with `{filter_key}`, \
                  or a commit that stages Rust source could skip it:\n{block}"
             );
@@ -7151,6 +7158,25 @@ fi
             "        # always_run: true\n        always_run: false",
             "always_run: true"
         ));
+    }
+
+    #[test]
+    fn hook_block_mentions_ignores_comments_but_reads_real_keys() {
+        // A comment, whole-line or trailing, that names a filter key is not a filter.
+        assert!(!hook_block_mentions(
+            "        # no files: or exclude: filter here\n        types: [rust]  # not types_or:",
+            "files:"
+        ));
+        assert!(!hook_block_mentions(
+            "        # no files: or exclude: filter here\n        types: [rust]  # not types_or:",
+            "types_or:"
+        ));
+        // The real key still counts, with or without a trailing comment.
+        assert!(hook_block_mentions(
+            "        files: '^src/'  # narrows the hook",
+            "files:"
+        ));
+        assert!(hook_block_mentions("        exclude: '^x/'", "exclude:"));
     }
 
     #[test]
