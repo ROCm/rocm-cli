@@ -49,6 +49,13 @@ pub fn gpu_ids_overlap(gpu_ids: &[String], gpus: &[GpuMetrics]) -> bool {
 /// a GPU has no per-container reading the split on that GPU is equal, rather
 /// than guessing a skew from partial data. A sole occupant gets the whole GPU.
 ///
+/// An occupant that is still starting and has no reading while another occupant
+/// does is left out of the split. (A status of `Unknown` means no readiness
+/// information, not "not serving", so it stays in.) It has not
+/// allocated GPU memory, so the evidence says it is drawing next to nothing, and
+/// an equal share would show the serving neighbour about half its real power and
+/// roughly double its real tokens per watt until the newcomer loads.
+///
 /// Power on a GPU no instance occupies (idle, or a process outside the managed
 /// set) is attributed to nobody; it still counts toward node power. An entry is
 /// `None` when none of its GPUs matched a GPU reporting power (id join found
@@ -76,6 +83,19 @@ pub fn attribute_power_w<S: BuildHasher>(
         if occupants.is_empty() {
             continue;
         }
+        let reading = |k: usize| {
+            per_container_vram_mb
+                .get(&instances[k].container_id)
+                .is_some_and(|&mb| mb > 0)
+        };
+        let occupants: Vec<usize> = if occupants.iter().any(|&k| reading(k)) {
+            occupants
+                .into_iter()
+                .filter(|&k| reading(k) || !instances[k].status.is_starting())
+                .collect()
+        } else {
+            occupants
+        };
         let weights: Option<Vec<f64>> = occupants
             .iter()
             .map(|&k| {
@@ -252,6 +272,7 @@ pub fn tokens_per_watt(gen_tps: Option<f64>, power_w: Option<f64>) -> Option<f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::InstanceStatus;
 
     fn gpu(device_id: &str, power_w: f32) -> GpuMetrics {
         GpuMetrics {
@@ -566,6 +587,51 @@ mod tests {
                 vec![Some(200.0), Some(200.0)]
             );
         }
+    }
+
+    #[test]
+    fn a_starting_occupant_with_no_reading_does_not_dilute_a_serving_neighbour() {
+        let gpus = [gpu("gpu-0", 400.0)];
+        let mut serving = inst("a", &["0"]);
+        serving.status = InstanceStatus::Ready;
+        let mut loading = inst("b", &["0"]);
+        loading.status = InstanceStatus::Starting { phase: None };
+        let insts = [serving, loading];
+        // `a` has a VRAM reading; `b` is still loading and has none.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p, vec![Some(400.0), None], "the loader gets no share yet");
+        // Once it has allocated memory it takes part in the split.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000), ("b", 10_000)]));
+        assert_eq!(p, vec![Some(300.0), Some(100.0)]);
+        // With no readings at all nothing is known, so the split stays equal.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[]));
+        assert_eq!(p, vec![Some(200.0), Some(200.0)]);
+    }
+
+    #[test]
+    fn a_starting_occupant_is_left_out_but_an_unmeasured_serving_one_still_forces_equal() {
+        let gpus = [gpu("gpu-0", 400.0)];
+        let mut measured = inst("a", &["0"]);
+        measured.status = InstanceStatus::Ready;
+        let mut unmeasured = inst("b", &["0"]);
+        unmeasured.status = InstanceStatus::Ready;
+        let mut loading = inst("c", &["0"]);
+        loading.status = InstanceStatus::Starting { phase: None };
+        let insts = [measured, unmeasured, loading];
+        // Only `a` has a reading. `c` is starting with none, so it is dropped;
+        // `b` is serving but unmeasured (e.g. a missed /proc join), so leaving
+        // it out would credit `a` with the whole board: the rest stay equal.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p, vec![Some(200.0), Some(200.0), None]);
+        // Without the starting occupant in the picture the result is the same
+        // for the other two, so the starting one is what changed the split.
+        let p2 = attribute_power_w(&insts[..2], &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p2, vec![Some(200.0), Some(200.0)]);
+        // An `Unknown` status is not "starting": it stays in the split.
+        let mut unknown = inst("d", &["0"]);
+        unknown.status = InstanceStatus::Unknown;
+        let p3 = attribute_power_w(&[insts[0].clone(), unknown], &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p3, vec![Some(200.0), Some(200.0)]);
     }
 
     #[test]
