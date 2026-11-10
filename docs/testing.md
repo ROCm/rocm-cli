@@ -270,6 +270,170 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### The engine stdio client
+
+`rocm` and `rocmd` run an engine child through one client,
+[`stdio_client.rs`](../crates/rocm-engine-protocol/src/stdio_client.rs) in
+`rocm-engine-protocol`. Its conversation (the request line, the environment each
+option sets, what a failing exit or an unusable answer is reported as, the
+SIGPIPE guard) is tested there against `FakeEngine`, a shell-script engine child
+from [`fake_engine.rs`](../crates/rocm-engine-protocol/src/fake_engine.rs) that
+records its argv, environment and stdin; the pure parts (the command a call
+builds, `decode_engine_response`, stderr collection) run on every platform, and
+the ones that start the fake are `#[cfg(unix)]`. The `rocm` and `rocmd` callers
+each run their own entry point against the same fake and pin only what they
+choose: the program and verb, the app paths, and whether stderr is forwarded (see
+`apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). These tests
+catch behavioural drift: a caller whose own copy of the conversation behaved
+differently from the shared client in what they pin (the framing, the
+environment, the exit and answer handling, the guards) would fail them. A copy
+that behaves the same passes them, so a second guard is on the existence of a
+second copy:
+[engine_stdio_client_contract.rs](../xtask/src/engine_stdio_client_contract.rs)
+is a static text scan over every `.rs` file in the tree (comments stripped) that
+fails when a file other than the shared client both pipes a child's stdin and
+names an engine request or response envelope, which is what an engine stdio
+client is made of. Both are looked for anywhere in the file, not on one line, so
+a copy that builds its `Stdio` in one place and passes it to `.stdin(..)` in
+another is seen too (a fixture covers it); the price is that a file which pipes
+some child's stdin for another reason and also names an envelope type is
+reported, and the answer to that is a reviewed allowlist entry. A caller that reaches an engine through `run_engine_stdio`
+has neither. Pasting the old rocmd copy back into `apps/rocmd/src/engine_ipc.rs`
+fails it by name (and, separately, five of rocmd's pinning tests: the
+app-paths, crash, unparseable-answer, nonzero-with-answer and SIGPIPE ones). Like
+the other allowlists it is bidirectional, so an exemption cannot outlive its
+reason.
+
+```bash
+cargo test -p xtask engine_stdio_client_contract
+```
+
+It is a source-text scan, not a call-graph analysis: a copy that makes its pipe
+by hand, or reaches the envelope types under another name, is outside what it
+can see, and it does not check that a caller uses the shared client correctly
+(the callers' tests do). It closes the cheap, likely regression of a
+spawn-write-read helper pasted back into a binary.
+
+An answer that is not a response envelope is reported as that, and when the
+child also exited with a failing status the error says so, because the status is
+often why the answer was cut short (a clean exit adds nothing). A failing child
+that printed nothing is reported by its status alone. The status is worded from
+the exit code (`exited with code N`) or, for a child ended by a signal on Unix,
+the signal (`was terminated by signal N`), not from `ExitStatus`'s own text, which
+already reads `exit status: N` and would double up (`a_child_ended_by_a_signal_is_reported_by_the_signal`). Both carry the child's
+stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
+the three cases against the fake, and `engine-ipc-02` below shows the same
+message in a `stop_server` report next to what the stop did.
+
+The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
+its default action, which is how `rocm` runs, because the test harness leaves it
+ignored and changing it process-wide would race sibling tests. A write that is
+not guarded kills that process, and the parent test reports the signal. Two
+writes are covered that way: the request to the child's stdin, and the forwarding
+of the child's stderr to this process's stderr (a line of progress, and the note
+recorded when reading it fails). The forwarding test writes into a real pipe whose
+reader is closed, because a mock sink that returns `BrokenPipe` itself never
+raises the signal. Each forwarding write is guarded on its own, never the loop
+around it, because the reads between lines block for as long as the engine is
+quiet and the disposition is process-wide; a third re-executed test,
+`forwarding_guards_each_write_and_never_the_reads_between_them`, records the
+disposition inside every read and every write and after the loop. `FakeEngine` quotes the response and its scratch directory
+for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
+apostrophe, reaches the client intact.
+
+The `forward_stderr` option, which is what shows a user an engine install's
+progress, is tested at both ends: the client runs against a private entry point
+that takes the sink (`a_childs_stderr_reaches_the_forwarding_sink_when_there_is_one`,
+a `Vec`-backed writer), and the public entry point is run in a re-executed test
+binary whose own stderr the parent reads
+(`forward_stderr_sends_the_childs_stderr_to_this_processs_stderr`: the child's
+line is there with the option and absent without it). Replacing the one
+`forward_stderr.then(io::stderr)` with `None` turns the second red.
+
+A child that answers and then exits with a failing status is read as having
+answered (see the doc comment of `run_engine_stdio`), and its status is not part
+of the answer. The daemon asks the client to leave a note on its stderr, which is
+its log (`note_failing_exit_after_answer`); the CLI does not, since its stderr is a
+terminal. `a_failing_exit_after_an_answer_is_noted_only_when_asked_for` reads the
+stderr of a re-executed test binary for both settings. The note is made only
+for an answer that parsed (an unreadable answer with a failing exit is reported
+by the error, with the status, and is not also logged as used), and it is written
+through the same SIGPIPE-guarded, error-ignoring write as the stderr forwarding,
+so a closed stderr neither ends a daemon hosted in `rocm` nor panics it
+(`the_note_is_made_only_for_an_answer_that_parsed` and
+`the_note_to_a_closed_stderr_neither_kills_nor_panics_the_process`, the latter
+with stderr a pipe without a reader under SIGPIPE's default action). A failed read of the
+answer carries the child's stderr like every other failure
+(`a_failed_read_of_the_answer_reports_the_stderr_too`), and a child whose stdin or
+stdout pipe is missing is killed and reaped, not left running
+(`a_missing_pipe_kills_and_reaps_the_child`, Linux only).
+
+What is forwarded to the terminal is complete UTF-8: stderr is read in chunks
+that can end in the middle of a multi-byte character, and Rust's stdio on a
+Windows console refuses a write that is not valid UTF-8, an error the best-effort
+forwarding discards, so a split character would silently lose output. The
+collector carries an incomplete trailing sequence to the next chunk (invalid
+bytes become U+FFFD, and a character cut off by the end of the stream is flushed
+lossily) while still publishing the raw bytes at once for the error. The logic is
+the pure `Utf8Carry`, tested on every platform by
+`text_split_across_chunks_is_forwarded_whole_and_valid_at_every_boundary` (every
+two-point split of a string with two-, three- and four-byte characters),
+`bytes_that_are_not_text_are_replaced_and_a_cut_off_tail_is_flushed` and
+`the_collector_forwards_a_split_character_whole_and_keeps_the_raw_bytes` (a source
+that hands out one byte at a time).
+
+A child whose answer cannot be read is killed and reaped before the error is
+returned, as it is when the request cannot be written, so the long-lived daemon
+does not collect a running engine or a zombie per failure.
+`a_failed_read_of_the_answer_kills_and_reaps_the_child` (Linux only) runs the
+read step on a real child with a reader that fails and checks that the child's
+`/proc` entry is gone: a killed child that was never waited on would keep it as a
+zombie.
+
+A request that cannot be written (the engine exited, or closed its stdin, before
+reading it) is reported with what the engine wrote to stderr, since that is
+usually the explanation, after the child has been killed and reaped. The child is
+killed whether or not a `try_wait` would show it gone, because its pipe closes
+while it is still exiting; the read of its stderr is bounded (a grandchild that
+holds the pipe cannot hold the error path). `a_request_to_an_engine_that_exited_reports_what_it_said_on_stderr`
+runs the whole client against a fake that exits without reading;
+`a_request_that_cannot_be_written_kills_and_reaps_a_child_that_is_still_running`
+(Linux only) checks the `/proc` entry of one that is still running, and
+`the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` one whose
+grandchild keeps the pipe open. The last two run the step on a real child with an
+injected write error, because whether a real write fails before the child has
+closed its stdin is a race. The answer of an engine that exits without draining a request larger than a pipe buffer is not read on this path (every engine here reads stdin to the end before answering, so that needs one that breaks the protocol); the module comment in `stdio_client.rs` states the limit. The stderr of a failed
+write is collected by a thread that starts before the request is written and is
+waited for with one deadline (`StderrCollector::finish`), returning what had
+arrived when it passes; `a_collector_stops_waiting_at_its_deadline_and_keeps_collecting`
+and `an_expired_deadline_returns_what_is_collected_without_waiting` run that on
+every platform. It publishes each chunk as it arrives, not each complete line, so
+a diagnostic with no trailing newline that arrived before the deadline is
+reported (`the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` uses
+`printf` without a newline for that reason). When the request has failed and the
+collector is dropped, the capture is marked abandoned: what it held is released,
+and the thread, which must keep draining the pipe so a surviving descendant is not
+sent a SIGPIPE, discards and no longer forwards what arrives later, in chunks of
+a fixed size, so a long-lived daemon does not grow with every failed request
+(`an_abandoned_collector_releases_what_it_held_and_discards_what_arrives_later`,
+red without the drop handling).
+
+Starting the collector before the write also means an engine that fills its
+stderr pipe before it has drained a request larger than a pipe buffer cannot
+deadlock the client (the engine blocked on a full stderr, the client on a full
+stdin, nobody reading either).
+`an_engine_that_writes_a_lot_of_stderr_before_reading_its_request_does_not_deadlock`
+runs that against a fake that writes 300 kB to stderr first and is red when the
+collector is started after the write.
+
+One wait is deliberately not bounded and has no test: after the child exits, the
+answer is read to the end of its stdout and its stderr collector is joined, so an
+engine that leaves a grandchild holding either pipe makes the request wait for
+it. The clients this one replaced had the same exposure, and bounding it would
+mean reading both pipes on their own threads and choosing what to report when a
+deadline passes, which is a timeout policy the engine contract does not have
+today. The module comment in `stdio_client.rs` states the limit and its tradeoff.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
@@ -2418,7 +2582,8 @@ listing's write made directly in those that need it because the refresh lives in
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded
 process and checks the confirmed report against the process, the record and
-the endpoint key file. Run it with
+the endpoint key file, and that the standalone `rocmd` got an answer to its
+engine `Stop` request (it reaches the engine through the `rocm` beside it). Run it with
 `ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
 cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
 `service-stop-03`, `-04` and `-05` (Linux, mock lane) cover `rocm services
@@ -2435,6 +2600,24 @@ a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 "service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
+
+`features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
+covers how the daemon reads an engine child's answer, through the same
+`stop_server` tool. Each scenario copies the real `rocmd` into a scratch
+directory and puts a stand-in `rocm` shell script beside it, which is the
+executable the standalone daemon runs for an engine request; the stand-in
+records its argv and the request it was sent, and prints what the scenario
+says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
+report carries the engine's answer (not an error built from the exit status).
+`engine-ipc-02` has it print something that is not an answer, write to stderr
+and exit non-zero: the report's engine error is the parse failure, naming the
+exit status the engine ended with, followed by its stderr. Both check the report together with the server's process, record and
+endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
+one `stop` request line. The server is a `vllm` one, for which the engine's
+`Stop` is advisory, so in `-02` the stop still completes; an engine whose stop
+decides the confirmation (`aim`) is not staged here, because teardown would
+then run the real engine's stop. Run them with a hooks build and `-n
+"engine-ipc"`.
 
 Manual restricted-tool smoke:
 

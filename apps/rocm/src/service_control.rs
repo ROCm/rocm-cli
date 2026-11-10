@@ -56,8 +56,6 @@ use rocm_engine_protocol::{EngineMethod, StopRequest, StopResponse};
 
 use crate::endpoint_keys;
 use crate::engine_ipc::{builtin_engine_serve_http_args, engine_request};
-#[cfg(not(windows))]
-use crate::engine_runtime_select::apply_app_path_env;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{
@@ -615,7 +613,7 @@ fn restart_internal_managed_service_inner(
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
-        apply_app_path_env(&mut command, paths);
+        paths.apply_env(&mut command);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
             command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
         }

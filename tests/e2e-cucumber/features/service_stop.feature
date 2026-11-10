@@ -41,7 +41,11 @@ Feature: Stopping a managed service
   #
   # The recorded process is a real one the scenario starts, recorded with the
   # kernel's own start-time token for it, so the stop's identity check confirms
-  # it and goes on to terminate it. No GPU and no engine are involved.
+  # it and goes on to terminate it. No GPU and no running engine are involved: the
+  # daemon does ask the engine to stop (a real `vllm` engine, reached through the
+  # `rocm` beside the standalone `rocmd`), and since the planted record names no
+  # engine process the engine answers that it stopped nothing, which the scenario
+  # checks along with the report.
   #
   # Linux-only: the token is read from `/proc`, which is where `rocmd` reads it
   # too; without one the identity check is not exercised at all.
@@ -59,6 +63,7 @@ Feature: Stopping a managed service
     Given a managed server whose recorded process is running
     When the daemon's stop_server tool stops that server
     Then the tool reports the server stopped, naming the process it stopped
+    And the tool asked the engine to stop and the engine answered
     And the recorded process is no longer running
     And the server's record reads stopped and names no process
     And the server's endpoint key file is gone
