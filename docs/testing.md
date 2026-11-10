@@ -2137,7 +2137,15 @@ on the Linux e2e jobs `-07` is skipped and `-08` runs its Linux half. Not covere
 by any CI job: the end-to-end tree kill of a parent with a child (`-07`), the
 failure cases that cannot be staged (an `OpenProcess` access-denied process, a
 failing or stalled `taskkill`, `taskkill` exiting 128), and the launch-cleanup
-branch; the unit tests above stop a `ping` that has no child of its own, so they
+branch run against a real Windows child. The failed-launch cleanup terminates its
+child through the same routine as a stop (`terminate_recorded_pid_within`, so on
+Windows the tree kill runs too), and what it asks of the termination is tested
+through an injected function on every host
+(`abandoned_launch_asks_the_termination_for_the_spawned_child_with_its_token`:
+the child's PID with the token captured at spawn, and nothing at all for a child
+with no token where tokens are recorded); that the production wiring reaches the tree
+kill is not observable on Linux, where the termination walks the tree itself, so it
+rests on the routine's own tests and on review. The unit tests above stop a `ping` that has no child of its own, so they
 do not show a descendant being taken down. A stop that cannot
 verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
 eq <pid>"` on Windows (`process_check_command`).
@@ -2248,6 +2256,12 @@ drives the refresh with an unqueryable PID and then a confirmed-gone one,
 an unverified stop and then the refresh over the record it wrote, and
 `a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
 removal guard; each takes the probe as an argument, so they run on every host.
+A pending stop of a container-backed engine (`engine_stop_decides_confirmation`,
+today `aim`) is never completed that way: its supervisor can be gone while the
+container still runs, and only the engine `Stop` decides that stop, so a listing
+does not complete it from PID evidence. The key, the marker and the recorded processes stay until a later
+`services stop` is confirmed
+(`a_pending_stop_of_a_container_engine_is_not_completed_by_a_gone_supervisor`).
 When that refresh completes a pending stop (every recorded process confirmed gone) it
 also forgets the recorded processes and reads the record as stopped, as a stop that
 confirmed the exit itself does, so a later `rocm services stop` visits no PID: a PID
@@ -2256,7 +2270,9 @@ whatever process now holds the number. A process that may still be running stays
 named. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
 checks both halves (named while unqueryable, forgotten once gone),
 `a_completed_pending_stop_reads_stopped_whatever_live_status_it_had` that every live
-status still ends as `stopped` in that one refresh, and
+status, and `failed`, still ends as `stopped` in that one refresh (a `failed` record
+cleared but left `failed` would not be covered by `is_covered_by_stop_of`, and the stop
+finalizing would report itself unconfirmed), and
 `a_stop_completed_by_a_later_listing_leaves_no_pid_for_the_next_stop` runs the real
 termination routine over the record the listing wrote and asserts it visits nothing.
 Three gaps in the scenario coverage are deliberate. `service-stop-07` records no
@@ -2273,7 +2289,13 @@ that will read it exists. `a_stop_reports_its_own_pid_as_self` and
 Third, the `check:` line an unverified stop prints is a diagnostic, not a
 remediation: it shows whether the process is still running, and what clears the
 condition is that process ending (or, for a record held by a process `rocm`
-cannot open, `rocm services remove <id> --force --yes`), after which a stop or a
+cannot open, `rocm services remove <id> --force --yes`; for a record still reading
+`ready` that nobody has tried to stop, `--force` is refused and names
+`rocm services stop <id> --yes` first, which reports the process unverified and
+records the request, so the clearing is those two commands, on purpose:
+`--force` never removes a record nobody tried to stop, and
+`a_ready_record_held_by_an_unqueryable_process_is_cleared_by_stop_then_force`
+runs the chain), after which a stop or a
 service listing confirms and drops the key. The command is a stock one the host
 has, pinned by `the_process_check_command_is_the_one_the_host_has`, and
 `service-stop-07` uses the same `tasklist /FI "PID eq <pid>"` filter (in CSV

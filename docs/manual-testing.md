@@ -646,6 +646,10 @@ possibly running, which is the safe direction: the record never reconciles to
    state and its endpoint key. The server can no longer be restarted afterwards.
    `rocm services prune` has no `--force`: it leaves such a record alone and lists it
    under `Left alone` with this exact command.
+   If the record still reads `ready` and nobody has run `rocm services stop` on it,
+   `--force` is refused and the refusal names that stop first; run it (it reports
+   the process unverified and records the request), then the forced removal. This is
+   the intended order, not a gap: `--force` never removes a record nobody tried to stop.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either

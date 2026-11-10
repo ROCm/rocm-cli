@@ -2093,6 +2093,56 @@ mod tests {
         Ok(())
     }
 
+    /// A `ready` record whose dead server's PID is now held by a process this
+    /// account cannot open, and that nobody has tried to stop: `--force` is
+    /// refused (it never forces a record nobody tried to stop), and the refusal
+    /// names `services stop`. That stop cannot verify the process, reports it
+    /// unverified and records the request, after which `--force` removes the
+    /// record. So the record is not stuck: the way out is those two commands, and
+    /// this is the intended shape, not a gap.
+    #[test]
+    fn a_ready_record_held_by_an_unqueryable_process_is_cleared_by_stop_then_force() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-ready-unqueryable-chain");
+        paths.ensure()?;
+        held_record(&paths, "svc-ready-held", false)?;
+        let pid = std::process::id();
+
+        let first =
+            remove_managed_service_record_with(&paths, "svc-ready-held", true, true, |_| {
+                ProcessProbe::Unqueryable
+            })
+            .map(|removed| removed.text)
+            .expect_err("a record nobody tried to stop is not forced");
+        let report = crate::service_control::stop_internal_managed_service_with(
+            &paths,
+            "svc-ready-held",
+            |_| {
+                vec![rocm_core::RecordedPidStop {
+                    pid,
+                    role: "supervisor_and_engine",
+                    outcome: rocm_core::RecordedPidOutcome::Terminated(
+                        rocm_core::TerminationOutcome::Unverified,
+                    ),
+                }]
+            },
+        )?;
+        let second =
+            remove_managed_service_record_with(&paths, "svc-ready-held", true, true, |_| {
+                ProcessProbe::Unqueryable
+            })?;
+        let left = files_left(&paths, "svc-ready-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            format!("{first:#}").contains("rocm services stop svc-ready-held --yes"),
+            "{first:#}"
+        );
+        assert_eq!(report["stopped"], false, "{report}");
+        assert!(second.forced);
+        assert_eq!(left, 0, "the forced removal took the record and its files");
+        Ok(())
+    }
+
     /// `--force` never goes past a process that is confirmed running, and it
     /// needs a stop to have been requested: the refusal says which, and names the
     /// stop that is the way forward.

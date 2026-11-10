@@ -1122,51 +1122,63 @@ mod tests {
     /// before the stop reads the record again completes the same stop (key,
     /// marker, recorded processes cleared, `stopped`) and writes it. That record
     /// names no process, which must not read as a restart: the stop is confirmed,
-    /// the marker is not put back, and a restart is not refused for it.
+    /// the marker is not put back, and a restart is not refused for it. A record
+    /// that read `failed` is completed to `stopped` too, as a confirmed stop makes
+    /// it, so it is covered as well and not left reading `failed` with no process.
     #[test]
     fn a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it() {
         use rocm_core::TerminationOutcome::Graceful;
-        let (root, paths) = test_paths("stop-listing-before-finalization");
-        paths.ensure().unwrap();
-        let service_id = "svc-stop-listing-before-finalization";
-        let mut planted = stop_test_record(&paths, service_id);
-        planted.supervisor_pid = 4242;
-        planted.supervisor_start_ticks = None;
-        planted.engine_pid = Some(4243);
-        planted.engine_start_ticks = Some(77);
-        planted.write().unwrap();
-        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+        for status in ["ready", "failed"] {
+            let (root, paths) = test_paths(&format!("stop-listing-before-finalization-{status}"));
+            paths.ensure().unwrap();
+            let service_id = "svc-stop-listing-before-finalization";
+            let mut planted = stop_test_record(&paths, service_id);
+            planted.status = status.to_owned();
+            planted.supervisor_pid = 4242;
+            planted.supervisor_start_ticks = None;
+            planted.engine_pid = Some(4243);
+            planted.engine_start_ticks = Some(77);
+            planted.write().unwrap();
+            endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
 
-        let report = stop_internal_managed_service_with(&paths, service_id, |stopping| {
-            assert!(stopping.stop_requested_unix_ms.is_some());
-            // The processes have exited; a concurrent `services` listing sees it,
-            // completes the pending stop and persists that, before this stop
-            // reads the record again.
-            let (mut listed, _) = read_managed_service_manifest(&paths, service_id).unwrap();
-            let changed =
-                crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
-                    &paths,
-                    &mut listed,
-                    |_| rocm_core::ProcessProbe::Gone,
+            let report = stop_internal_managed_service_with(&paths, service_id, |stopping| {
+                assert!(stopping.stop_requested_unix_ms.is_some());
+                // The processes have exited; a concurrent `services` listing sees
+                // it, completes the pending stop and persists that, before this
+                // stop reads the record again.
+                let (mut listed, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+                // The fake PIDs read as gone to the stop's own initial refresh,
+                // which may already have demoted the status: put back the status
+                // the listing under test starts from.
+                status.clone_into(&mut listed.status);
+                let changed =
+                    crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                        &paths,
+                        &mut listed,
+                        |_| rocm_core::ProcessProbe::Gone,
+                    );
+                assert!(
+                    changed,
+                    "premise: the listing completed the stop ({status})"
                 );
-            assert!(changed, "premise: the listing completed the stop");
-            listed.write().unwrap();
-            assert_eq!(raw_manifest(&paths, service_id).supervisor_pid, 0);
-            vec![stop_of(4242, Graceful), stop_of(4243, Graceful)]
-        })
-        .unwrap();
+                listed.write().unwrap();
+                assert_eq!(raw_manifest(&paths, service_id).supervisor_pid, 0);
+                vec![stop_of(4242, Graceful), stop_of(4243, Graceful)]
+            })
+            .unwrap();
 
-        let on_disk = raw_manifest(&paths, service_id);
-        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
-        let _ = fs::remove_dir_all(root);
-        assert_eq!(report["stopped"], true, "{report}");
-        assert_eq!(on_disk.status, "stopped");
-        assert_eq!(
-            on_disk.stop_requested_unix_ms, None,
-            "a confirmed stop does not put the marker back"
-        );
-        assert_eq!(on_disk.supervisor_pid, 0);
-        assert_eq!(key, None, "the key goes with the confirmed stop");
+            let on_disk = raw_manifest(&paths, service_id);
+            let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+            let _ = fs::remove_dir_all(root);
+            assert_eq!(report["stopped"], true, "{status}: {report}");
+            assert_eq!(on_disk.status, "stopped", "{status}");
+            assert_eq!(
+                on_disk.stop_requested_unix_ms, None,
+                "{status}: a confirmed stop does not put the marker back"
+            );
+            assert_eq!(on_disk.supervisor_pid, 0, "{status}");
+            assert_eq!(key, None, "{status}: the key goes with the confirmed stop");
+        }
     }
 
     /// The same race through `restart`: the restart's own stop is completed by a

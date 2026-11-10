@@ -225,6 +225,10 @@ pub(crate) fn recorded_pids_may_be_running(
 /// "stopped" by another route still gets its deferred cleanup rather than
 /// stranding the key.
 ///
+/// A container-backed engine never completes this way: its supervisor can exit
+/// while the container runs, so only a stop whose engine `Stop` confirms may end
+/// it.
+///
 /// "Observed gone" means every recorded process is *confirmed* gone: a process
 /// that could not be queried (on Windows, a live one this process may not open)
 /// is not gone, and the stop that reported it unverified must keep its key and
@@ -235,6 +239,14 @@ fn settle_pending_stop_key_cleanup(
     probe: impl Fn(u32) -> ProcessProbe,
 ) -> bool {
     if record.stop_requested_unix_ms.is_none() {
+        return false;
+    }
+    // A container-backed engine (`engine_stop_decides_confirmation`) is stopped by
+    // its engine `Stop`, not by the recorded supervisor: that process can be gone
+    // while the container still runs, so PID evidence alone cannot say the stop
+    // completed. The stop that could not confirm keeps its key, marker and
+    // recorded processes, and the next `services stop` asks the engine again.
+    if rocm_core::engine_stop_decides_confirmation(&record.engine) {
         return false;
     }
     if recorded_pids_may_be_running(record, probe) {
@@ -251,15 +263,17 @@ fn settle_pending_stop_key_cleanup(
     // (`clear_recorded_processes`), and it is done only here, behind the
     // confirmed-gone check above: a process that may still be running stays named.
     record.clear_recorded_processes();
-    // And the status a confirmed stop leaves, set here rather than left to the
-    // reconciliation below: with no PID recorded that reconciliation has nothing
-    // to read, so a record still reading `ready` or `running` would stay live.
-    // Setting it also makes the caller's liveness gate return at once, so the one
-    // write the caller makes covers the key cleanup, the cleared processes and
-    // the status together.
-    if managed_service_is_live(record) {
-        "stopped".clone_into(&mut record.status);
-    }
+    // And the status a confirmed stop leaves, whatever the record read before:
+    // `stopped`, as `rocm services stop` and `rocmd`'s stop set on a confirmed
+    // stop for a `failed` record too. Set here rather than left to the
+    // reconciliation below, which has no PID to read once they are cleared, so a
+    // `ready` or `running` record would stay live; and not only for a live status,
+    // because a `failed` record with its processes cleared is not the `stopped`
+    // record `is_covered_by_stop_of` accepts as this same stop completing, so a
+    // stop still finalizing would report itself unconfirmed. Setting it also makes
+    // the caller's liveness gate return at once, so the one write the caller makes
+    // covers the key cleanup, the cleared processes and the status together.
+    "stopped".clone_into(&mut record.status);
     true
 }
 
@@ -1079,10 +1093,45 @@ mod tests {
     /// The deferred cleanup forgets the PIDs, so the reconciliation after it has
     /// none to read: every live status must still end as `stopped`, in the one
     /// refresh, rather than a record such as `starting` staying live with no
-    /// process behind it.
+    /// process behind it, and a `failed` one must too, as a confirmed stop makes it.
+    /// A container-backed engine's supervisor can be gone while the container
+    /// still runs, and its stop is decided by the engine `Stop`, which the
+    /// unconfirmed stop did not get. A listing that sees the supervisor gone must
+    /// not complete that stop: key, marker and recorded processes stay for the
+    /// next `services stop`. A process engine with the same PID evidence does
+    /// complete (the sibling tests above).
+    #[test]
+    fn a_pending_stop_of_a_container_engine_is_not_completed_by_a_gone_supervisor() -> Result<()> {
+        assert!(rocm_core::engine_stop_decides_confirmation("aim"));
+        let (root, paths) = test_paths("liveness-container-pending-stop");
+        paths.ensure()?;
+        let service_id = "svc-container";
+        let mut record = pending_stop_record(&paths, service_id)?;
+        "aim".clone_into(&mut record.engine);
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = Some(5);
+
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+
+        assert!(
+            endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
+            "the key stays: the container may still be serving with it"
+        );
+        assert_eq!(record.stop_requested_unix_ms, Some(1));
+        assert_eq!(
+            (record.supervisor_pid, record.supervisor_start_ticks),
+            (4242, Some(5)),
+            "the record keeps naming what the stop could not confirm"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn a_completed_pending_stop_reads_stopped_whatever_live_status_it_had() -> Result<()> {
-        for status in ["starting", "running", "ready", "recovering"] {
+        for status in ["starting", "running", "ready", "recovering", "failed"] {
             let (root, paths) = test_paths(&format!("liveness-pending-stop-{status}"));
             paths.ensure()?;
             let mut record = pending_stop_record(&paths, "svc-status")?;
