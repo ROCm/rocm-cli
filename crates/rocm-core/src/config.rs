@@ -1001,7 +1001,7 @@ mod tests {
         let message = format!("{error:#}");
         let after = fs::read(paths.config_path())?;
         let rename = format!(
-            "rename {config} to {config}.broken",
+            "rename \"{config}\" to \"{config}.broken\"",
             config = paths.config_path().display()
         );
         let renamed = paths.config_dir.join("config.json.broken");

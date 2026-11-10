@@ -2591,7 +2591,7 @@ exit 1
         let config = paths.config_path();
         assert!(
             message.contains(&format!(
-                "rename {} to {}.broken",
+                "rename \"{}\" to \"{}.broken\"",
                 config.display(),
                 config.display()
             )) && message.contains(&paths.config_aside_advice()),

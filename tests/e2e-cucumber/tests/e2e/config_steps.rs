@@ -215,8 +215,24 @@ async fn confirm_key_not_echoed(world: &mut E2eWorld) {
 
 /// The custom ROCm folder the damaged settings file records, inside the
 /// scenario's sandbox so the suggested `ROCM_CLI_DATA_DIR` can be used as-is.
+/// Its name has a space, so the refusal's advice only works if it quotes it.
 fn custom_rocm_folder(world: &E2eWorld) -> std::path::PathBuf {
-    sandbox(world).join("custom-rocm")
+    sandbox(world).join("custom rocm")
+}
+
+/// The path in double quotes right after the first `label` in `stderr`: what
+/// a user copies when the refusal tells them which path to use.
+fn quoted_after(stderr: &str, label: &str) -> String {
+    let (_, rest) = stderr
+        .split_once(label)
+        .unwrap_or_else(|| panic!("the refusal does not say {label:?}:\n{stderr}"));
+    let rest = rest
+        .strip_prefix('"')
+        .unwrap_or_else(|| panic!("no quoted path after {label:?}:\n{stderr}"));
+    let (path, _) = rest
+        .split_once('"')
+        .unwrap_or_else(|| panic!("an unclosed quote after {label:?}:\n{stderr}"));
+    path.to_owned()
 }
 
 /// A `config.json` cut off just after it recorded `setup.therock_venv`, the
@@ -323,21 +339,20 @@ async fn change_setting_with_suggested_data_dir(world: &mut E2eWorld) {
 }
 
 /// The `ROCM_CLI_DATA_DIR` value the refusal told the user to set, read from
-/// its stderr — "setting ROCM_CLI_DATA_DIR=<folder> points commands ..." — the
-/// first time it is needed, and remembered for the steps after that.
+/// its stderr — "setting the environment variable ROCM_CLI_DATA_DIR to
+/// \"<folder>\" ..." — the first time it is needed, and remembered for the
+/// steps after that.
 fn suggested_data_dir(world: &mut E2eWorld) -> String {
     if let Some(folder) = &world.suggested_data_dir {
         return folder.clone();
     }
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
-    let (_, rest) = stderr
-        .split_once("setting ROCM_CLI_DATA_DIR=")
-        .unwrap_or_else(|| panic!("the refusal suggested no ROCM_CLI_DATA_DIR value:\n{stderr}"));
-    let (folder, _) = rest
-        .split_once(" points commands")
-        .unwrap_or_else(|| panic!("cannot find the end of the suggested value:\n{stderr}"));
-    world.suggested_data_dir = Some(folder.to_owned());
-    folder.to_owned()
+    let folder = quoted_after(
+        stderr,
+        "setting the environment variable ROCM_CLI_DATA_DIR to ",
+    );
+    world.suggested_data_dir = Some(folder.clone());
+    folder
 }
 
 #[when(
@@ -365,7 +380,10 @@ async fn open_after_renaming_settings(world: &mut E2eWorld) {
 async fn refuses_unreadable_settings(world: &mut E2eWorld) {
     assert_failed(world);
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
-    let suggestion = format!("ROCM_CLI_DATA_DIR={}", custom_rocm_folder(world).display());
+    let suggestion = format!(
+        "setting the environment variable ROCM_CLI_DATA_DIR to \"{}\"",
+        custom_rocm_folder(world).display()
+    );
     for needle in [
         "cannot tell where rocm-cli keeps its data",
         "config.json",
@@ -383,21 +401,12 @@ async fn refuses_unreadable_settings(world: &mut E2eWorld) {
     }
     // The file to rename is the exact one the CLI read — here under the
     // scenario's own config folder — and the name to give it sits beside it.
-    let (_, rest) = stderr
-        .split_once("keeps its data: ")
-        .unwrap_or_else(|| panic!("the refusal names no settings file:\n{stderr}"));
-    let (from, _) = rest
-        .split_once(" cannot be read (")
-        .unwrap_or_else(|| panic!("cannot find the end of the settings file's path:\n{stderr}"));
-    let (_, rest) = stderr
-        .split_once("Renaming it to ")
-        .unwrap_or_else(|| panic!("the refusal does not say what to rename it to:\n{stderr}"));
-    let (to, _) = rest
-        .split_once(" resets every setting")
-        .unwrap_or_else(|| panic!("cannot find the end of the suggested name:\n{stderr}"));
+    // Both are read from between their quotes, as a user would copy them.
+    let from = quoted_after(stderr, "keeps its data: ");
+    let to = quoted_after(stderr, "Renaming it to ");
     assert_eq!(std::path::Path::new(&from), settings_path(world));
-    assert_eq!(std::path::Path::new(to), renamed_settings_path(world));
-    world.suggested_settings_rename = Some((from.to_owned(), to.to_owned()));
+    assert_eq!(std::path::Path::new(&to), renamed_settings_path(world));
+    world.suggested_settings_rename = Some((from, to));
 }
 
 #[then("the settings file is left exactly as it was")]
@@ -573,7 +582,7 @@ async fn refuses_to_change_setting(world: &mut E2eWorld) {
     assert_failed(world);
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
     let rename = format!(
-        "To start from default settings instead, rename {} to {}",
+        "To start from default settings instead, rename \"{}\" to \"{}\"",
         settings_path(world).display(),
         renamed_settings_path(world).display()
     );
@@ -585,7 +594,7 @@ async fn refuses_to_change_setting(world: &mut E2eWorld) {
     // The user already set the folder the first refusal suggested, so being
     // told to set it again would be wrong.
     assert!(
-        !stderr.contains("then also need ROCM_CLI_DATA_DIR"),
+        !stderr.contains("then also need the environment variable ROCM_CLI_DATA_DIR"),
         "the refusal repeated the ROCM_CLI_DATA_DIR advice the user already followed:\n{}",
         combined_output(world)
     );

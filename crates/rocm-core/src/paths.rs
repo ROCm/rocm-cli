@@ -415,27 +415,29 @@ fn configured_managed_root_from_config(paths: &AppPaths) -> Result<Option<PathBu
 ///   need `ROCM_CLI_DATA_DIR`.
 ///
 /// When the damaged bytes still name the recorded folder, the advice names the
-/// exact `ROCM_CLI_DATA_DIR` value that finds it.
+/// exact `ROCM_CLI_DATA_DIR` value that finds it. Every path is quoted and the
+/// variable is named in words rather than as `NAME=value`, so the advice reads
+/// the same on Windows and Unix and survives a space in a path.
 fn unreadable_config_error(path: &Path, detail: &str, recorded: Option<PathBuf>) -> anyhow::Error {
     let (data_dir_hint, aside_hint) = match recorded {
         Some(recorded) => {
             let data_root = managed_runtime_data_root(&recorded);
             (
                 format!(
-                    "It still names {} as the ROCm folder: setting ROCM_CLI_DATA_DIR={} points \
-                     commands back at it meanwhile",
-                    recorded.display(),
-                    data_root.display()
+                    "It still names {} as the ROCm folder: setting the environment variable \
+                     ROCM_CLI_DATA_DIR to {} points commands back at it meanwhile",
+                    quoted(&recorded),
+                    quoted(&data_root)
                 ),
                 runtimes_need_data_dir_override(&data_root),
             )
         }
         None => (
-            "Setting ROCM_CLI_DATA_DIR to the folder that holds your runtimes points commands \
-             back at it meanwhile"
+            "Setting the environment variable ROCM_CLI_DATA_DIR to the folder that holds your \
+             runtimes points commands back at it meanwhile"
                 .to_owned(),
-            "runtimes installed into a custom folder then need ROCM_CLI_DATA_DIR set to that \
-             folder"
+            "runtimes installed into a custom folder then need the environment variable \
+             ROCM_CLI_DATA_DIR set to that folder"
                 .to_owned(),
         ),
     };
@@ -445,8 +447,8 @@ fn unreadable_config_error(path: &Path, detail: &str, recorded: Option<PathBuf>)
          that changes settings still stops on it, and other commands either stop too or run on \
          default settings. Renaming it to {renamed} resets every setting to its default, and \
          {aside_hint}",
-        path.display(),
-        renamed = config_rename_target(path).display(),
+        quoted(path),
+        renamed = quoted(&config_rename_target(path)),
         data_hint = data_dir_hint,
     )
 }
@@ -461,11 +463,19 @@ fn data_dir_without_config() -> Option<PathBuf> {
 /// The clause naming the `ROCM_CLI_DATA_DIR` value that keeps `data_root`
 /// once `config.json` no longer records it.
 fn runtimes_need_data_dir_override(data_root: &Path) -> String {
+    // The variable is named in words, not as `NAME=value`, which is one
+    // shell's syntax and not a command on Windows.
     format!(
-        "the runtimes under {} then also need ROCM_CLI_DATA_DIR={}",
-        data_root.display(),
-        data_root.display()
+        "the runtimes under {} then also need the environment variable ROCM_CLI_DATA_DIR set to {}",
+        quoted(data_root),
+        quoted(data_root)
     )
+}
+
+/// `path` in double quotes, so a path with a space is still one value when
+/// the advice is read or copied.
+fn quoted(path: &Path) -> String {
+    format!("\"{}\"", path.display())
 }
 
 impl AppPaths {
@@ -510,8 +520,8 @@ fn config_aside_advice(
 ) -> String {
     let rename = format!(
         "To start from default settings instead, rename {} to {}",
-        config_path.display(),
-        config_rename_target(config_path).display()
+        quoted(config_path),
+        quoted(&config_rename_target(config_path))
     );
     if without_config == Some(data_dir) {
         rename
@@ -709,9 +719,12 @@ mod tests {
             .expect("the saved config records the managed root");
         let cut_after_root = saved[..value_at + recorded.len() + 2].to_vec();
         let cut_inside_root = saved[..value_at + recorded.len() / 2].to_vec();
-        let suggested = format!("ROCM_CLI_DATA_DIR={}", managed_root.display());
+        let suggested = format!(
+            "setting the environment variable ROCM_CLI_DATA_DIR to \"{}\"",
+            managed_root.display()
+        );
         let rename_advice = format!(
-            "Renaming it to {} resets every setting",
+            "Renaming it to \"{}\" resets every setting",
             paths.config_dir.join("config.json.broken").display()
         );
 
@@ -754,13 +767,13 @@ mod tests {
             // out below.
             let aside = if names_the_root {
                 format!(
-                    "resets every setting to its default, and the runtimes under {root} then \
-                     also need ROCM_CLI_DATA_DIR={root}",
+                    "resets every setting to its default, and the runtimes under \"{root}\" \
+                     then also need the environment variable ROCM_CLI_DATA_DIR set to \"{root}\"",
                     root = managed_root.display()
                 )
             } else {
                 "resets every setting to its default, and runtimes installed into a custom \
-                 folder then need ROCM_CLI_DATA_DIR set to that folder"
+                 folder then need the environment variable ROCM_CLI_DATA_DIR set to that folder"
                     .to_owned()
             };
             assert!(
@@ -844,24 +857,36 @@ mod tests {
         fs::remove_dir_all(root).ok();
         Ok(())
     }
-    /// The text between `start` and the next `end` in `text`.
-    fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    /// The quoted value right after the first `label` in `text`: what a
+    /// reader copies when told to use the path the advice prints.
+    fn quoted_after<'a>(text: &'a str, label: &str) -> &'a str {
         let rest = &text[text
-            .find(start)
-            .unwrap_or_else(|| panic!("no {start:?} in: {text}"))
-            + start.len()..];
-        rest.find(end).map_or(rest, |at| &rest[..at])
+            .find(label)
+            .unwrap_or_else(|| panic!("no {label:?} in: {text}"))
+            + label.len()..];
+        let rest = rest
+            .strip_prefix('"')
+            .unwrap_or_else(|| panic!("no quoted path after {label:?} in: {text}"));
+        &rest[..rest
+            .find('"')
+            .unwrap_or_else(|| panic!("an unclosed quote after {label:?} in: {text}"))]
     }
 
     /// A command that found its data dir through `config.json` but cannot
     /// load the settings in it (another field is bad) is told which file to
     /// rename, to what, and what renaming it does. Following that advice to
     /// the letter — the exact paths it prints — keeps the data dir, while
-    /// renaming the file without the override it names would not.
+    /// renaming the file without the override it names would not. Both the
+    /// config folder and the data folder have a space in their names, so a
+    /// path the advice did not quote would be read as two words.
     #[test]
     fn config_rename_advice_keeps_a_recorded_data_dir_when_followed() -> Result<()> {
         let (root, paths) = temp_app_paths("config-aside-advice");
-        let managed_root = root.join("managed");
+        let paths = AppPaths {
+            config_dir: root.join("my config"),
+            ..paths
+        };
+        let managed_root = root.join("managed rocm");
         let mut config = RocmCliConfig::default();
         config.setup.therock_venv = Some(managed_root.clone());
         config.save(&paths)?;
@@ -883,18 +908,25 @@ mod tests {
         assert_eq!(
             advice,
             format!(
-                "To start from default settings instead, rename {config} to {config}.broken; \
-                 the runtimes under {dir} then also need ROCM_CLI_DATA_DIR={dir}",
+                "To start from default settings instead, rename \"{config}\" to \
+                 \"{config}.broken\"; the runtimes under \"{dir}\" then also need the \
+                 environment variable ROCM_CLI_DATA_DIR set to \"{dir}\"",
                 config = paths.config_path().display(),
                 dir = managed_root.display()
             )
         );
         // The file it names is the one discovery read — under the custom
-        // config folder these paths use, not a default location.
-        let from = PathBuf::from(between(&advice, "rename ", " to "));
-        let to = PathBuf::from(between(&advice, &format!("{} to ", from.display()), ";"));
-        let suggested = PathBuf::from(between(&advice, "ROCM_CLI_DATA_DIR=", "\n"));
+        // config folder these paths use, not a default location. Each path is
+        // taken from between its quotes, as a reader would copy it.
+        let from = PathBuf::from(quoted_after(&advice, "rename "));
+        let to = PathBuf::from(quoted_after(
+            &advice,
+            &format!("\"{}\" to ", from.display()),
+        ));
+        let suggested = PathBuf::from(quoted_after(&advice, "ROCM_CLI_DATA_DIR set to "));
         assert_eq!(from, paths.config_path());
+        assert_eq!(to, paths.config_dir.join("config.json.broken"));
+        assert_eq!(suggested, managed_root);
 
         fs::rename(&from, &to)?;
         assert_eq!(
@@ -939,14 +971,15 @@ mod tests {
         assert_eq!(
             advice,
             format!(
-                "To start from default settings instead, rename {config} to {config}.broken",
+                "To start from default settings instead, rename \"{config}\" to \
+                 \"{config}.broken\"",
                 config = paths.config_path().display()
             )
         );
-        let from = PathBuf::from(between(&advice, "rename ", " to "));
+        let from = PathBuf::from(quoted_after(&advice, "rename "));
         fs::rename(
             &from,
-            between(&advice, &format!("{} to ", from.display()), "\n"),
+            quoted_after(&advice, &format!("\"{}\" to ", from.display())),
         )?;
         let renamed = AppPaths::discover_from_paths(paths, false, false)?;
         assert_eq!(renamed.data_dir, default_root.data_dir);
@@ -967,7 +1000,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (root, paths) = temp_app_paths("config-aside-advice-method");
         let rename = format!(
-            "To start from default settings instead, rename {config} to {config}.broken",
+            "To start from default settings instead, rename \"{config}\" to \"{config}.broken\"",
             config = paths.config_path().display()
         );
         let fallback = AppPaths {
@@ -980,7 +1013,8 @@ mod tests {
         assert_eq!(
             paths.config_aside_advice(),
             format!(
-                "{rename}; the runtimes under {dir} then also need ROCM_CLI_DATA_DIR={dir}",
+                "{rename}; the runtimes under \"{dir}\" then also need the environment variable \
+                 ROCM_CLI_DATA_DIR set to \"{dir}\"",
                 dir = paths.data_dir.display()
             )
         );
@@ -1004,7 +1038,8 @@ mod tests {
         assert_eq!(
             advice,
             format!(
-                "To start from default settings instead, rename {config} to {config}.broken",
+                "To start from default settings instead, rename \"{config}\" to \
+                 \"{config}.broken\"",
                 config = paths.config_path().display()
             )
         );
