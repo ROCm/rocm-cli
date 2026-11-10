@@ -211,6 +211,17 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+/// Hold the lock `with_scoped_builtin_engine_env` takes while it rewrites the
+/// `ROCM_CLI_*` variables, for a test that reads them and must not see a
+/// built-in engine call's values in the middle of a parallel test.
+#[cfg(test)]
+pub(crate) fn builtin_engine_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    BUILTIN_ENGINE_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn with_scoped_builtin_engine_env<R>(
     paths: Option<&AppPaths>,
     env_root: Option<&Path>,

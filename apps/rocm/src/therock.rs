@@ -42,7 +42,7 @@ pub(crate) use self::probe::{
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 pub(crate) use self::python::NEXT_MANAGED_PYTHON_VERSION;
 use self::python::{
-    ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
+    ensure_marked_uv_venv, managed_python_version, python_for_install, python_requirement,
     python_requirement_for_version,
 };
 use self::resolve::{
@@ -624,7 +624,7 @@ fn install_wheel_runtime(
         "Creating Python environment at {}.",
         install_root.display()
     ));
-    ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
+    ensure_marked_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
 
     progress_line(format!(
@@ -922,7 +922,7 @@ fn install_tarball_runtime(
     }
 
     fs::create_dir_all(paths.cache_dir.join("therock"))?;
-    fs::create_dir_all(&install_root)?;
+    rocm_core::create_marked_root(&install_root)?;
     ensure_tarball_install_target_is_clean(&install_root)?;
 
     if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {

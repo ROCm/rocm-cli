@@ -647,6 +647,9 @@ impl RocmCliConfig {
     ///   "no settings".
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
+        // Saving the config is often what first brings the config folder into
+        // being, so it is created as ROCm CLI's own (marked) when this is.
+        crate::runtime::create_marked_root(&paths.config_dir)?;
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
         serde_json::from_slice::<Self>(&bytes).with_context(|| {
@@ -1461,6 +1464,35 @@ last_installed_runtime_id = "therock-release"
     /// supported platforms without needing permissions a root CI lane ignores —
     /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
     /// uses in `rocm_core::atomic_write`.
+    /// Saving the config often creates the config folder; when it does, the
+    /// folder is marked as ROCm CLI's own, so `rocm uninstall` can later remove
+    /// it outside the home folder. A config folder that already existed is not
+    /// marked.
+    #[test]
+    fn the_config_folder_a_save_creates_is_marked_and_an_existing_one_is_not() -> Result<()> {
+        let (root, fresh) = temp_app_paths("config-save-marks-root");
+        RocmCliConfig::default().save(&fresh)?;
+        let fresh_marked = fresh
+            .config_dir
+            .join(crate::runtime::ROCM_CLI_ROOT_MARKER)
+            .is_file();
+        let (other_root, existing) = temp_app_paths("config-save-keeps-existing-root");
+        fs::create_dir_all(&existing.config_dir)?;
+        RocmCliConfig::default().save(&existing)?;
+        let existing_marked = existing
+            .config_dir
+            .join(crate::runtime::ROCM_CLI_ROOT_MARKER)
+            .exists();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other_root);
+        assert!(
+            fresh_marked,
+            "the config folder a save created is not marked"
+        );
+        assert!(!existing_marked, "an existing config folder was marked");
+        Ok(())
+    }
+
     #[test]
     fn a_config_save_that_cannot_publish_cleans_up_its_temp_file() -> Result<()> {
         let (root, paths) = temp_app_paths("config-save-rename-fails");

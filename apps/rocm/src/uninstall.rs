@@ -12,6 +12,9 @@
 //! - removing the fish completion script the Linux installer recorded writing,
 //!   when it is still the installer's own file;
 //! - deleting the running `rocm.exe` on Windows, which cannot unlink itself.
+//!
+//! [`apply_uninstall_plan`] lives here too: it is the one step that deletes,
+//! and it refuses a plan with a protected root on its own.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -20,11 +23,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, interactive_terminal, require_yes_or_interactive};
+use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::uninstall_plan::{
-    PlanAudience, UninstallOptions, UninstallPlan, UninstallPlanEntry, build_uninstall_plan,
-    confirm_uninstall, is_rocm_install_entry_name, remove_path, render_uninstall_plan,
+    PlanAudience, PlannedAs, UninstallOptions, UninstallPlan, UninstallPlanEntry,
+    build_uninstall_plan, confirm_uninstall, entry_path, is_rocm_install_entry_name, remove_path,
+    render_uninstall_plan,
 };
 
 /// The file, next to the installed binaries, in which `install.sh` and
@@ -81,8 +85,8 @@ pub(crate) fn reject_force(force: bool) -> Result<()> {
 }
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let plan = build_uninstall_plan(&paths, &options)?;
+    let (paths, sources) = AppPaths::discover_with_sources()?;
+    let plan = build_uninstall_plan(&paths, &sources, &options)?;
     print!(
         "{}",
         render_uninstall_plan(
@@ -91,26 +95,61 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
             PlanAudience::for_command(interactive_terminal())
         )
     );
+    run_uninstall_plan(&plan, &options, interactive_terminal, confirm_uninstall)
+}
 
-    if plan_is_empty(&plan) || options.dry_run {
+/// Everything after the review is printed: refuse, preview, confirm, remove.
+///
+/// How to tell whether the terminal is interactive and how to ask are passed
+/// in, so tests can prove the refusal comes before the prompt rather than only
+/// before the first removal.
+pub(crate) fn run_uninstall_plan(
+    plan: &UninstallPlan,
+    options: &UninstallOptions,
+    interactive: impl FnOnce() -> bool,
+    confirm: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    // A refused root stops the whole command, before the prompt and before the
+    // first removal: removing the rest and then failing would leave a partial
+    // uninstall behind a folder that was never going to be removed. A dry run
+    // fails too, so `rocm uninstall --dry-run && rocm uninstall --yes` cannot
+    // read a refusal as a go-ahead; its review above already carries the advice.
+    if let Some(error) = plan.refusal_error() {
+        if options.dry_run {
+            bail!("uninstall would be refused; see the review above");
+        }
+        bail!(error);
+    }
+
+    if plan_is_empty(plan) || options.dry_run {
         return Ok(());
     }
 
-    let already_approved = require_yes_or_interactive(options.yes, "uninstall")?;
-    if !already_approved && !confirm_uninstall()? {
+    let already_approved =
+        rocm_core::require_yes_or_interactive_with(options.yes, "uninstall", interactive)?;
+    if !already_approved && !confirm()? {
         println!("uninstall cancelled");
         return Ok(());
     }
 
-    execute_plan(&plan, &mut |line| println!("{line}"))?;
+    apply_uninstall_plan(plan)?;
     println!("uninstall complete");
     Ok(())
+}
+
+/// Remove everything `plan` lists, reporting each step as it happens.
+///
+/// Refuses again on its own, so no caller can reach a removal with a protected
+/// root in the plan, whatever it checked first.
+pub(crate) fn apply_uninstall_plan(plan: &UninstallPlan) -> Result<()> {
+    execute_plan(plan, &mut |line| println!("{line}"))
 }
 
 /// Carry out `plan`, handing `report` a line for each step as soon as it is
 /// done, so a failure partway still leaves the user told what already changed.
 ///
-/// The PATH changes are undone first, so a change that cannot be undone stops
+/// A plan with a refused root is refused here before anything changes. The
+/// PATH changes are undone first, so a change that cannot be undone stops
 /// the uninstall before anything is removed: `rocm`, the user's settings, and
 /// the record of the change are all still there to retry with. Then the
 /// config, data, and cache go, while `rocm` is still there to retry a failure
@@ -118,6 +157,15 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
 /// A fish completion script that cannot be removed is reported as a warning
 /// and the rest goes on.
 fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<()> {
+    if let Some(error) = plan.refusal_error() {
+        bail!(error);
+    }
+    // Every entry is checked once before anything changes, so one that moved
+    // since the review stops the uninstall with the PATH change still in place,
+    // and again right before its own removal below.
+    for entry in &plan.actions {
+        recheck(entry)?;
+    }
     for edit in &plan.path_edits {
         match apply_path_edit(edit) {
             Ok(line) => report(line),
@@ -133,33 +181,43 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
     let non_binaries = plan.actions.iter().filter(|entry| !is_binary(entry.kind));
     let binaries = plan.actions.iter().filter(|entry| is_binary(entry.kind));
     for entry in non_binaries.chain(binaries) {
-        // The review may have sat at a prompt, so a completion script is
-        // looked at again: only the regular file that was planned is removed.
-        if entry.kind == SHELL_COMPLETIONS_KIND && is_not_a_regular_file(&entry.path) {
-            report(format!(
-                "warning: left {} {} in place: it is no longer the regular file that was \
-                 reviewed",
-                entry.kind,
-                entry.path.display()
-            ));
+        // A fish completion script keeps its own, softer check: the review may
+        // have sat at a prompt, so it is looked at again, only the regular file
+        // that was planned is removed, and a failure is a warning, not a stop.
+        if entry.kind == SHELL_COMPLETIONS_KIND {
+            if is_not_a_regular_file(&entry.path) {
+                report(format!(
+                    "warning: left {} {} in place: it is no longer the regular file that was \
+                     reviewed",
+                    entry.kind,
+                    entry.path.display()
+                ));
+                continue;
+            }
+            match remove_path(&entry.path) {
+                Ok(()) => report(format!("removed {} {}", entry.kind, entry.path.display())),
+                // Completions are best effort when installed, so a script that
+                // cannot be removed does not stop the uninstall either.
+                Err(error) => report(format!(
+                    "warning: could not remove {} {}: {error:#}\n  \
+                     The uninstall went on without it; delete that file yourself so fish \
+                     stops completing rocm.",
+                    entry.kind,
+                    entry.path.display()
+                )),
+            }
             continue;
         }
-        match remove_path(&entry.path) {
-            Ok(()) => report(format!("removed {} {}", entry.kind, entry.path.display())),
-            // Completions are best effort when installed, so a script that
-            // cannot be removed does not stop the uninstall either.
-            Err(error) if entry.kind == SHELL_COMPLETIONS_KIND => report(format!(
-                "warning: could not remove {} {}: {error:#}\n  \
-                 The uninstall went on without it; delete that file yourself so fish \
-                 stops completing rocm.",
-                entry.kind,
-                entry.path.display()
-            )),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to remove {}", entry.path.display()));
-            }
-        }
+        let Some(target) = recheck(entry)? else {
+            // Already gone, as for a cache folder inside a data folder removed
+            // just before it: the review listed it and it is gone, so it is
+            // reported like every other entry rather than left unaccounted for.
+            report(format!("removed {} {}", entry.kind, entry.path.display()));
+            continue;
+        };
+        remove_path(&target)
+            .with_context(|| format!("failed to remove {}", entry.path.display()))?;
+        report(format!("removed {} {}", entry.kind, entry.path.display()));
     }
     if let Some(record) = &plan.path_record {
         remove_path(record).with_context(|| format!("failed to remove {}", record.display()))?;
@@ -170,6 +228,95 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
         report(delete_running_executable(exe)?);
     }
     Ok(())
+}
+
+/// Check `entry` again against what the review saw, and return what to
+/// remove: `None` when it is already gone (for example inside a folder removed
+/// earlier in the plan).
+///
+/// Check, then act on what was checked. The review judged where a real
+/// directory resolved to when it was made; a parent swapped for a
+/// symlink while the prompt was open would point the same spelling at
+/// a different folder. Resolve again, refuse if it moved, and remove
+/// the resolved location rather than re-walking the spelling.
+fn recheck(entry: &UninstallPlanEntry) -> Result<Option<PathBuf>> {
+    let target = match &entry.planned {
+        PlannedAs::Unchecked => entry.path.clone(),
+        PlannedAs::Dir(planned) => match rocm_core::canonicalize_for_compare(&entry.path) {
+            Ok(now) if &now == planned => now,
+            Ok(now) => bail!(
+                "stopped before removing the {} folder {}: it now resolves to {}, not {} as \
+                 the review showed. Anything reported as removed above is gone; nothing \
+                 after it was touched. Check the folder and run the uninstall again.",
+                entry.kind,
+                entry.path.display(),
+                now.display(),
+                planned.display()
+            ),
+            // Already gone, e.g. inside a folder removed earlier in the plan.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve {} before removing it",
+                        entry.path.display()
+                    )
+                });
+            }
+        },
+        // A link or file is unlinked, never walked — unless it has turned
+        // into something else since the review: a link replaced by a real
+        // folder would otherwise be removed recursively, unreviewed.
+        PlannedAs::Link { parent } | PlannedAs::File { parent } => {
+            let was_link = matches!(entry.planned, PlannedAs::Link { .. });
+            let spelled = entry_path(&entry.path);
+            let now = match std::fs::symlink_metadata(&spelled) {
+                Ok(now) => now,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to check {} before removing it", spelled.display())
+                    });
+                }
+            };
+            let unchanged = if was_link {
+                now.file_type().is_symlink()
+            } else {
+                now.is_file()
+            };
+            if !unchanged {
+                bail!(
+                    "stopped before removing the {} {}: it was a {} when reviewed and is \
+                     not one now. Anything reported as removed above is gone; nothing after \
+                     it was touched. Check it and run the uninstall again.",
+                    entry.kind,
+                    entry.path.display(),
+                    if was_link { "symbolic link" } else { "file" }
+                );
+            }
+            let parent_now = spelled
+                .parent()
+                .map(|p| {
+                    if p.as_os_str().is_empty() {
+                        std::path::Path::new(".")
+                    } else {
+                        p
+                    }
+                })
+                .and_then(|p| rocm_core::canonicalize_for_compare(p).ok());
+            if parent.is_some() && &parent_now != parent {
+                bail!(
+                    "stopped before removing the {} {}: the folder holding it now resolves \
+                     somewhere else than the review showed. Anything reported as removed \
+                     above is gone; nothing after it was touched.",
+                    entry.kind,
+                    entry.path.display()
+                );
+            }
+            spelled
+        }
+    };
+    Ok(Some(target))
 }
 
 pub(crate) const fn plan_is_empty(plan: &UninstallPlan) -> bool {
@@ -454,6 +601,8 @@ fn plan_completion_removals_with(
                 plan.actions.push(UninstallPlanEntry {
                     kind: SHELL_COMPLETIONS_KIND,
                     path,
+                    // Re-checked by its own rule in `execute_plan`.
+                    planned: PlannedAs::Unchecked,
                 });
             }
             Ok(Some(owner)) => plan.skipped.push(format!(
@@ -1130,6 +1279,7 @@ mod tests {
                 .map(|path| crate::uninstall_plan::UninstallPlanEntry {
                     kind: "binary",
                     path: path.clone(),
+                    planned: crate::uninstall_plan::PlannedAs::Unchecked,
                 })
                 .collect();
             plan
@@ -1149,9 +1299,129 @@ mod tests {
                 crate::uninstall_plan::UninstallPlanEntry {
                     kind: "config",
                     path: config.clone(),
+                    planned: crate::uninstall_plan::PlannedAs::Unchecked,
                 },
             );
             Ok((plan, config))
+        }
+
+        /// A planned folder that an earlier step already removed — the cache
+        /// folder inside the data folder, when only the data folder is set —
+        /// is reported as removed like the rest, so the report accounts for
+        /// every entry the review listed.
+        #[test]
+        fn an_entry_removed_with_an_earlier_one_is_still_reported() -> Result<()> {
+            let layout = layout()?;
+            let data = layout.home.join(".rocm").join("data");
+            let cache = data.join("cache");
+            fs::create_dir_all(&cache)?;
+            let dir = |kind, path: &Path| -> Result<crate::uninstall_plan::UninstallPlanEntry> {
+                Ok(crate::uninstall_plan::UninstallPlanEntry {
+                    kind,
+                    path: path.to_path_buf(),
+                    planned: PlannedAs::Dir(rocm_core::canonicalize_for_compare(path)?),
+                })
+            };
+            let plan = UninstallPlan {
+                actions: vec![dir("data", &data)?, dir("cache", &cache)?],
+                ..UninstallPlan::default()
+            };
+
+            let (lines, result) = run(&plan);
+            result?;
+            assert_eq!(
+                lines,
+                vec![
+                    format!("removed data {}", data.display()),
+                    format!("removed cache {}", cache.display()),
+                ]
+            );
+            assert!(!data.exists());
+            Ok(())
+        }
+
+        /// A refused root stops the uninstall before the installer's PATH
+        /// change is undone, not only before the first removal: "nothing was
+        /// removed" covers the shell profile too.
+        #[test]
+        fn a_refused_plan_leaves_the_path_change_in_place() -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            let contents = format!("export A=1\n{POSIX_BLOCK}");
+            fs::write(&profile, &contents)?;
+            let record = record(&layout, &format!("profile {}\n", profile.display()))?;
+            let mut plan = with_binaries(&layout, plan_for(&layout));
+            assert!(!plan.path_edits.is_empty(), "{plan:?}");
+            // A fish completion script the installer wrote, planned for
+            // removal: the refusal keeps it too, despite its softer rule.
+            let fish = layout.home.join("completions").join("rocm.fish");
+            fs::create_dir_all(fish.parent().expect("parent"))?;
+            fs::write(&fish, "# rocm-cli fish completions for x\n")?;
+            plan.actions.insert(
+                0,
+                crate::uninstall_plan::UninstallPlanEntry {
+                    kind: SHELL_COMPLETIONS_KIND,
+                    path: fish.clone(),
+                    planned: PlannedAs::Unchecked,
+                },
+            );
+            plan.refused.push(crate::uninstall_plan::RefusedRoot {
+                kind: "data",
+                path: layout.home.clone(),
+                resolved: None,
+                real: None,
+                why: rocm_core::ProtectedLocation::Home,
+                source: rocm_core::AppPathSource::Default,
+            });
+
+            let (lines, result) = run(&plan);
+            let error = format!("{:#}", result.expect_err("a refused plan must fail"));
+            assert!(error.contains("nothing was removed"), "{error}");
+            assert!(lines.is_empty(), "nothing may be reported: {lines:?}");
+            assert_eq!(fs::read_to_string(&profile)?, contents);
+            assert!(record.exists() && layout.removed.iter().all(|path| path.exists()));
+            assert!(
+                fish.is_file(),
+                "a refused plan removed the fish completions"
+            );
+            Ok(())
+        }
+
+        /// A binary that is no longer what the review saw stops the uninstall
+        /// before anything changes, PATH change included: the entries are all
+        /// checked once before the first step, with the resolver the plan was
+        /// built with.
+        #[test]
+        fn a_binary_that_became_a_folder_stops_before_the_path_change() -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            let contents = format!("export A=1\n{POSIX_BLOCK}");
+            fs::write(&profile, &contents)?;
+            record(&layout, &format!("profile {}\n", profile.display()))?;
+            let mut plan = UninstallPlan::default();
+            crate::uninstall_plan::plan_installed_binaries(
+                &mut plan,
+                &UninstallOptions::default(),
+                || Ok(layout.removed[0].clone()),
+                Some(&layout.home),
+                &rocm_core::canonicalize_for_compare,
+            )?;
+            assert!(!plan.path_edits.is_empty(), "{plan:?}");
+            let swapped = &layout.removed[1];
+            fs::remove_file(swapped)?;
+            fs::create_dir(swapped)?;
+            fs::write(swapped.join("keep.txt"), "user data")?;
+
+            let (lines, result) = run(&plan);
+            let error = format!("{:#}", result.expect_err("a changed binary must stop"));
+            assert!(
+                error.contains("stopped before removing the binary"),
+                "{error}"
+            );
+            assert!(lines.is_empty(), "nothing may be reported: {lines:?}");
+            assert_eq!(fs::read_to_string(&profile)?, contents);
+            assert!(swapped.join("keep.txt").is_file() && layout.removed[0].is_file());
+            Ok(())
         }
 
         #[test]
@@ -1228,6 +1498,7 @@ mod tests {
                 .push(crate::uninstall_plan::UninstallPlanEntry {
                     kind: "binary",
                     path: layout.bin.join("x".repeat(300)),
+                    planned: crate::uninstall_plan::PlannedAs::Unchecked,
                 });
 
             let (lines, result) = run(&plan);
@@ -1484,6 +1755,7 @@ mod tests {
                     &options,
                     || Ok(layout.removed[0].clone()),
                     Some(&layout.home),
+                    &rocm_core::canonicalize_for_compare,
                 )?;
                 Ok(plan)
             };
@@ -1969,6 +2241,7 @@ mod tests {
                 crate::uninstall_plan::UninstallPlanEntry {
                     kind: SHELL_COMPLETIONS_KIND,
                     path: stuck.clone(),
+                    planned: PlannedAs::Unchecked,
                 },
             );
 

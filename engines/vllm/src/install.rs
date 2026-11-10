@@ -525,8 +525,7 @@ fn vllm_rocm10_discover_remaining_install_args(
 /// need the same `ignore-error-codes` treatment here. There is no CLI flag or
 /// env var for it, only this config file.
 fn write_vllm_index_uv_config(paths: &AppPaths, build: &VllmRocmDiscoverBuild) -> Result<PathBuf> {
-    std::fs::create_dir_all(&paths.cache_dir)
-        .with_context(|| format!("failed to create {}", paths.cache_dir.display()))?;
+    rocm_core::create_marked_root(&paths.cache_dir)?;
     let path = paths.cache_dir.join("vllm-rocm10-uv.toml");
     let contents = format!(
         "[[index]]\nurl = \"{}\"\nignore-error-codes = [403]\n",

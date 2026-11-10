@@ -12,7 +12,8 @@
 //! `daemon_run_argv`, `managed_service_launcher_path`), the `ROCM_CLI_*`
 //! environment variables every managed child inherits
 //! (`app_path_env_var_values`/`app_path_env_var_refs`, over
-//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`), and polling a freshly launched service until it can
+//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`, and a `rocm`
+//! child also gets the folders' sources from `rocm_child_app_path_env`), and polling a freshly launched service until it can
 //! actually answer inference requests (`wait_for_service_http_ready`,
 //! `wait_for_service_http_ready_with_progress`,
 //! `service_http_readiness_paths`, `http_get_local_service`,
@@ -64,6 +65,7 @@
 //! `engine_recipe_json_arg` is `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
+//! `rocm_child_app_path_env` is `pub(crate)`, read from `chat/mcp_bridge.rs`;
 //! `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
 //! and `service_control.rs`'s `restart_internal_managed_service_with`.
@@ -302,6 +304,26 @@ pub(crate) fn managed_service_launcher_path() -> Result<PathBuf> {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)
+}
+
+/// [`AppPaths::env_vars`] for a `rocm` child run on the user's behalf (the
+/// dashboard's and assistant's approved commands). The variables pin the
+/// child's folders, which would make it report every one as "set by
+/// ROCM_CLI_*_DIR"; this also tells it where each pinned folder really came
+/// from, so a refusal names a setting the user can change. Not used for an
+/// interactive shell or an engine, which have no use for it.
+pub(crate) fn rocm_child_app_path_env(paths: &AppPaths) -> Vec<(&'static str, OsString)> {
+    let mut vars = paths
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (key, value.as_os_str().to_owned()))
+        .collect::<Vec<_>>();
+    if let Ok(sources) =
+        serde_json::to_string(&rocm_core::ForwardedAppPathSources::for_paths(paths))
+    {
+        vars.push((rocm_core::APP_PATH_SOURCES_ENV, OsString::from(sources)));
+    }
+    vars
 }
 
 pub(crate) fn wait_for_service_http_ready(

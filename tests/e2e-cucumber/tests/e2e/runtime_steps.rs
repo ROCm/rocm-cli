@@ -42,7 +42,13 @@ fn linked_runtimes_target(world: &E2eWorld) -> std::path::PathBuf {
         .path()
         .join("data")
         .join("real-runtimes");
-    let resolved = real.canonicalize().unwrap_or(real);
+    canonical_without_verbatim(&real)
+}
+
+/// `path` canonicalized, minus the verbatim `\\?\` prefix Windows adds (see
+/// [`linked_runtimes_target`] for why), or `path` itself if it cannot be.
+pub(crate) fn canonical_without_verbatim(path: &std::path::Path) -> std::path::PathBuf {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         return std::path::PathBuf::from(format!(r"\\{rest}"));

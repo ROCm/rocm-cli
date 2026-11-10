@@ -697,10 +697,17 @@ rocm logs --search error timeout")]
     /// warning). It also undoes the PATH change the installer made (its marked
     /// shell-profile block, or the user PATH entry it recorded adding on
     /// Windows), unless other programs share the install folder.
-    #[command(after_help = "EXAMPLES:\n  \
+    #[command(
+        after_help = "Never removes /, your home folder or one containing it, another user's home, a \
+system location (/usr, /etc, /lib, /run, ...; Windows, Program Files, ProgramData), or a shared \
+folder (anything directly under /, /var/lib, /mnt/<drive>, ...). Outside your home folder it \
+removes only a folder holding the .rocm-cli-root file ROCm CLI writes into folders it creates. A \
+refusal stops the whole uninstall and says what clears it. See the README for the full rules.\n\n\
+EXAMPLES:\n  \
 rocm uninstall --dry-run\n  \
 rocm uninstall\n  \
-rocm uninstall --keep-data --yes")]
+rocm uninstall --keep-data --yes"
+    )]
     Uninstall {
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,

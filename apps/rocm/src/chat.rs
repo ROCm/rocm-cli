@@ -34,6 +34,11 @@ pub(crate) use self::summaries::deterministic_comfyui_tool_summary;
 // `run_internal_mcp_call` lives in `mcp_bridge.rs` and stays reachable here as
 // `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.
 pub(crate) use self::mcp_bridge::run_internal_mcp_call;
+// `run_rocm_read_only_in_process` lives in `mcp_bridge.rs` and stays
+// reachable here for `uninstall_plan.rs`'s tests, which prove the assistant's
+// in-process uninstall preview honours the `--keep-*` flags a refusal advises.
+#[cfg(test)]
+pub(crate) use self::mcp_bridge::run_rocm_read_only_in_process;
 // `rocm_chat_tool_system_prompt_for_host` lives in `turn.rs` and stays
 // reachable here as `chat::rocm_chat_tool_system_prompt_for_host` for `dash.rs`.
 use self::turn::render_chat_prompt_result_with_progress;

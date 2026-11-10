@@ -23,9 +23,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rocm_core::{
-    AppPaths, RocmCliConfig, require_yes_or_interactive, runtime_install_root_is_protected,
-};
+use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
 use serde::Serialize;
 
 use crate::cli_report::{JsonOrText, print_json_or_text};
@@ -895,15 +893,16 @@ pub(crate) fn build_prune_plan(
         // Belt and braces on top of `should_remove_runtime_install_root`: prune
         // acts on a set the user never typed out, so a runtime whose folder sits
         // in a protected system location is refused outright.
-        if runtime_install_root_is_protected(&manifest.install_root) {
+        if let Some(why) = rocm_core::runtime_protected_location(&manifest.install_root) {
             plan.skipped.push(format!(
-                "{runtime_key}: folder {} is in a protected system location",
-                manifest.install_root.display()
+                "{runtime_key}: folder {} is {}, so it is left in place",
+                manifest.install_root.display(),
+                why.describe()
             ));
             continue;
         }
 
-        // The single source of truth for "may ROCm CLI delete this folder?".
+        // The runtime-folder rule for "may ROCm CLI delete this folder?".
         // It refuses read-only and imported records and requires a matching
         // in-tree manifest, and it runs `ensure_runtime_install_root_is_safe_to_remove`.
         match should_remove_runtime_install_root(manifest) {
@@ -1046,7 +1045,11 @@ pub(crate) fn build_downloads_plan(paths: &AppPaths) -> UninstallPlan {
                     stack.push(path);
                 } else {
                     found = true;
-                    plan.actions.push(UninstallPlanEntry { kind, path });
+                    plan.actions.push(UninstallPlanEntry {
+                        kind,
+                        path,
+                        planned: crate::uninstall_plan::PlannedAs::Unchecked,
+                    });
                 }
             }
         }
@@ -1624,6 +1627,46 @@ mod tests {
             held.iter()
                 .all(|(_, reason)| *reason == HoldReason::NotOwned)
         );
+    }
+
+    /// A registry entry whose folder sits in a protected location is left in
+    /// place by prune, and the line says which folder and why.
+    #[test]
+    fn prune_plan_leaves_a_protected_install_folder_and_says_why() -> Result<()> {
+        let (root, paths) = test_paths("prune-protected");
+        let mut old = install_fixture(&paths, manifest("old", "gfx110X-all", "7.10.0", 10), 64)?;
+        install_fixture(&paths, manifest("newer", "gfx110X-all", "7.11.0", 20), 64)?;
+        // In the host's own spelling: the registry entry is read back
+        // normalized, and the line prints it that way.
+        let protected = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\rocm-cli-prune-test")
+        } else {
+            PathBuf::from("/etc/rocm-cli-prune-test")
+        };
+        old.install_root = protected.clone();
+        std::fs::write(
+            paths
+                .data_dir
+                .join("runtimes")
+                .join("registry")
+                .join("old.json"),
+            serde_json::to_vec_pretty(&old)?,
+        )?;
+
+        let plan = build_prune_plan(&paths, &RocmCliConfig::default(), 1)?;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(plan.remove.is_empty(), "{:?}", plan.remove);
+        let expected = format!(
+            "old: folder {} is a protected system location, so it is left in place",
+            protected.display()
+        );
+        assert!(
+            plan.skipped.contains(&expected),
+            "expected `{expected}` in {:?}",
+            plan.skipped
+        );
+        Ok(())
     }
 
     #[test]
