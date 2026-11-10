@@ -127,28 +127,49 @@ impl NodeEfficiency {
     }
 }
 
-/// Node-level efficiency for a snapshot, or `None` when it cannot be stated.
+/// Aggregate generation throughput across instances.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeThroughput {
+    /// Σ `gen_tps` over the instances with a finite reading, in tokens/s. A real
+    /// zero counts: an idle node is zero throughput, not no data.
+    pub tokens_per_sec: f64,
+    /// Freshness of the throughput behind the sum, as for
+    /// [`NodeEfficiency::freshness`]: instances at zero tok/s add nothing to the
+    /// sum and are not counted.
+    pub freshness: Option<ObservationFreshness>,
+}
+
+impl NodeThroughput {
+    /// Whether any throughput behind the sum is held.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.freshness == Some(ObservationFreshness::Held)
+    }
+}
+
+/// Node throughput over `instances`, or `None` when no instance has a finite
+/// `gen_tps` (a single NaN/Inf must not poison the sum).
 ///
-/// Throughput is summed over instances with a finite `gen_tps` (a single
-/// NaN/Inf must not poison the node), power over every GPU's board power. It is
-/// `None` with no traffic (`Σ gen_tps == 0`), no power telemetry
-/// (`Σ power_w == 0`), or a non-finite quotient. Power here is the whole board,
-/// including GPUs no instance occupies, because the question is the node's
-/// efficiency, not an instance's: per-instance figures use attributed power
-/// ([`attribute_power_w`]) instead.
+/// This is the one place the node's throughput and its freshness are worked
+/// out, so every surface that shows the aggregate (the efficiency hero, the
+/// throughput hero, the Hardware header, the assistant) agrees on both. An
+/// instance at zero tok/s contributes nothing to the sum, so its freshness says
+/// nothing about the sum's either: a held idle instance must not mark a figure
+/// that comes from fresh ones as held.
 #[must_use]
-pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
-    let mut tps = 0.0_f64;
+pub fn node_throughput<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+) -> Option<NodeThroughput> {
+    let mut tokens_per_sec = 0.0_f64;
+    let mut any = false;
     let mut held = false;
     let mut unknown = false;
-    for inst in &snap.instances {
+    for inst in instances {
         let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) else {
             continue;
         };
-        tps += v;
-        // An instance at zero tok/s adds nothing to the figure, so its
-        // freshness says nothing about the figure's either: a held idle
-        // instance must not mark a figure that comes from fresh ones as held.
+        tokens_per_sec += v;
+        any = true;
         if v <= 0.0 {
             continue;
         }
@@ -165,12 +186,51 @@ pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
     } else {
         Some(ObservationFreshness::Fresh)
     };
-    let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
-    if tps > 0.0 && power > 0.0 {
-        let tokens_per_watt = tps / power;
+    any.then_some(NodeThroughput {
+        tokens_per_sec,
+        freshness,
+    })
+}
+
+/// Total board power (W) of the GPUs that report a usable reading.
+///
+/// A reading that is not finite or not positive is skipped, as
+/// [`attribute_power_w`] does: zero means "no telemetry" (a platform without a
+/// power source), and a faulty sensor reporting infinity, NaN or a negative
+/// value must not turn a quotient into a plausible-looking 0 or deflate the
+/// total. Every surface that shows the node's power or divides by it uses this,
+/// so they agree on what counts.
+#[must_use]
+pub fn node_power_w(gpus: &[GpuMetrics]) -> f64 {
+    gpus.iter()
+        .map(|g| f64::from(g.power_w))
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .sum()
+}
+
+/// Node-level efficiency for a snapshot, or `None` when it cannot be stated.
+///
+/// Throughput is [`node_throughput`]; power is [`node_power_w`], so one faulty
+/// sensor cannot turn the quotient into a plausible-looking 0 (infinity) or
+/// deflate the total (negative). It is `None` with no traffic
+/// (`Σ gen_tps == 0`), no usable power telemetry, or a non-finite quotient.
+///
+/// Power here is the whole board, including GPUs no instance occupies, because
+/// the question is the node's efficiency, not an instance's: per-instance
+/// figures use attributed power ([`attribute_power_w`]) instead.
+///
+/// A node whose only throughput is held at zero tok/s reports a fresh 0 tok/s
+/// from [`node_throughput`] (nothing contributes, so nothing is held), and no
+/// efficiency figure from here, since there is no throughput to divide.
+#[must_use]
+pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
+    let throughput = node_throughput(&snap.instances)?;
+    let power = node_power_w(&snap.gpus);
+    if throughput.tokens_per_sec > 0.0 && power > 0.0 {
+        let tokens_per_watt = throughput.tokens_per_sec / power;
         tokens_per_watt.is_finite().then_some(NodeEfficiency {
             tokens_per_watt,
-            freshness,
+            freshness: throughput.freshness,
         })
     } else {
         None
@@ -304,6 +364,85 @@ mod tests {
             node_efficiency(&snap).unwrap().freshness,
             Some(ObservationFreshness::Fresh)
         );
+    }
+
+    #[test]
+    fn node_throughput_and_node_efficiency_agree_on_freshness() {
+        // The two panels that show these must never disagree: a held instance
+        // at zero beside a fresh one is fresh for both.
+        let snap = snap_with(
+            vec![
+                serving("busy", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("idle", Some(0.0), Some(ObservationFreshness::Held)),
+            ],
+            vec![gpu("gpu-0", 500.0)],
+        );
+        let t = node_throughput(&snap.instances).unwrap();
+        assert!((t.tokens_per_sec - 250.0).abs() < 1e-9);
+        assert!(!t.held());
+        assert_eq!(t.freshness, node_efficiency(&snap).unwrap().freshness);
+        // A held instance that does contribute marks both.
+        let held = snap_with(
+            vec![
+                serving("busy", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("slow", Some(5.0), Some(ObservationFreshness::Held)),
+            ],
+            vec![gpu("gpu-0", 500.0)],
+        );
+        assert!(node_throughput(&held.instances).unwrap().held());
+        assert!(node_efficiency(&held).unwrap().held());
+    }
+
+    #[test]
+    fn node_throughput_distinguishes_idle_from_no_data() {
+        // A real zero is a figure; nothing finite is no figure.
+        let idle = [serving("a", Some(0.0), Some(ObservationFreshness::Fresh))];
+        assert!(node_throughput(&idle).unwrap().tokens_per_sec.abs() < f64::EPSILON);
+        let none = [serving("a", None, None), serving("b", Some(f64::NAN), None)];
+        assert_eq!(node_throughput(&none), None);
+        assert_eq!(node_throughput(&[]), None);
+    }
+
+    #[test]
+    fn node_efficiency_skips_a_faulty_power_sensor_like_attribute_power_does() {
+        let insts = vec![serving("a", Some(250.0), Some(ObservationFreshness::Fresh))];
+        // An infinite reading must not turn the quotient into 0.
+        let inf = snap_with(
+            insts.clone(),
+            vec![gpu("gpu-0", 500.0), gpu("gpu-1", f32::INFINITY)],
+        );
+        let n = node_efficiency(&inf).unwrap();
+        assert!((n.tokens_per_watt - 0.5).abs() < 1e-9, "got {n:?}");
+        // A negative reading must not deflate the total.
+        let neg = snap_with(
+            insts.clone(),
+            vec![gpu("gpu-0", 500.0), gpu("gpu-1", -300.0)],
+        );
+        let n = node_efficiency(&neg).unwrap();
+        assert!((n.tokens_per_watt - 0.5).abs() < 1e-9, "got {n:?}");
+        // Only faulty readings: no usable power, so no figure. A lone infinity is
+        // the case only the filter decides: unfiltered, tps / inf is a finite 0.
+        let only_bad = snap_with(
+            insts.clone(),
+            vec![gpu("gpu-0", f32::NAN), gpu("gpu-1", -5.0)],
+        );
+        assert_eq!(node_efficiency(&only_bad), None);
+        let lone_inf = snap_with(insts, vec![gpu("gpu-0", f32::INFINITY)]);
+        assert_eq!(node_efficiency(&lone_inf), None);
+    }
+
+    #[test]
+    fn node_power_sums_only_usable_readings() {
+        let gpus = [
+            gpu("gpu-0", 300.0),
+            gpu("gpu-1", f32::INFINITY),
+            gpu("gpu-2", f32::NAN),
+            gpu("gpu-3", -40.0),
+            gpu("gpu-4", 0.0),
+            gpu("gpu-5", 200.0),
+        ];
+        assert!((node_power_w(&gpus) - 500.0).abs() < 1e-9);
+        assert!(node_power_w(&[]).abs() < f64::EPSILON);
     }
 
     #[test]
