@@ -423,7 +423,7 @@ rocm model --verbose"
     },
     /// Start a local OpenAI-compatible model server.
     ///
-    /// Picks an engine and ROCm runtime automatically unless overridden. A non-streaming
+    /// Picks an engine and ROCm runtime automatically unless overridden. An
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
     /// server runs as a managed background service and prints a deployment summary
