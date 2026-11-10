@@ -123,6 +123,19 @@ pub struct ManagedServiceRecord {
     /// ([`Self::reset_for_restart`]); absent from records that never had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_stop_unix_ms: Option<u128>,
+    /// The generation of a relaunch that has begun but not yet published its
+    /// processes: stamped by `rocm services restart` once its own stop has
+    /// confirmed and before it restores the endpoint key or spawns, and cleared
+    /// when the restart publishes ([`Self::reset_for_restart`]).
+    ///
+    /// Until then the record is an empty `stopped` manifest, which is also what a
+    /// stop's own completion looks like, so a stop that read the record earlier
+    /// would claim it and delete the key the restart restored for its child. A
+    /// stop covers the record only while the record carries the generation the
+    /// stop read ([`Self::is_covered_by_stop_of`]). Absent from records that are
+    /// not between a restart's stop and its publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunch_started_unix_ms: Option<u128>,
     /// When the last inference probe was attempted. Throttles re-probing of a
     /// service that is listed but still loading — see
     /// [`crate::INFERENCE_PROBE_RETRY_INTERVAL`]. Absent on records written before
@@ -269,6 +282,7 @@ impl ManagedServiceRecord {
             last_restart_unix_ms: None,
             stop_requested_unix_ms: None,
             settled_stop_unix_ms: None,
+            relaunch_started_unix_ms: None,
             startup_phase: None,
             inference_verified_at_unix_ms: None,
             inference_probe_attempted_at_unix_ms: None,
@@ -313,8 +327,10 @@ impl ManagedServiceRecord {
         // died with the previous run.
         self.anthropic_endpoint_url = None;
         self.anthropic_endpoint_mode = None;
-        // A relaunch is no longer the stop that was settled under it.
+        // A relaunch is no longer the stop that was settled under it, and it is
+        // published now, so it is no longer waiting to be.
         self.settled_stop_unix_ms = None;
+        self.relaunch_started_unix_ms = None;
         self.restart_count = self.restart_count.saturating_add(1);
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
@@ -368,8 +384,16 @@ impl ManagedServiceRecord {
     /// once it reads `stopped`, or once a liveness refresh consumed that very
     /// marker ([`Self::settled_stop_unix_ms`]), which leaves a `starting` or
     /// `failed` record at its status with the marker gone.
+    ///
+    /// Never true for a record in another relaunch generation than the stop read
+    /// ([`Self::relaunch_started_unix_ms`]): a restart that has stopped the
+    /// service and not yet published its child leaves an empty `stopped` record
+    /// that an older stop would otherwise take for its own completion.
     #[must_use]
     pub fn is_covered_by_stop_of(&self, stopping: &Self) -> bool {
+        if self.relaunch_started_unix_ms != stopping.relaunch_started_unix_ms {
+            return false;
+        }
         if self.status == "stopped" && self.names_no_process() {
             return true;
         }
@@ -384,6 +408,19 @@ impl ManagedServiceRecord {
                 || self.stop_requested_unix_ms.is_some()
                 || (stopping.stop_requested_unix_ms.is_some()
                     && self.settled_stop_unix_ms == stopping.stop_requested_unix_ms))
+    }
+
+    /// Stamp the record as a relaunch that has begun and not yet published its
+    /// processes, as a generation no earlier stop or relaunch carried. See
+    /// [`Self::relaunch_started_unix_ms`].
+    pub fn begin_relaunch(&mut self) {
+        let now = unix_time_millis();
+        self.relaunch_started_unix_ms = Some(
+            now.max(
+                self.relaunch_started_unix_ms
+                    .map_or(0, |earlier| earlier + 1),
+            ),
+        );
     }
 
     /// Whether the record names neither a supervisor nor an engine process.
@@ -1062,6 +1099,38 @@ mod tests {
         );
     }
 
+    /// A restart between its own confirmed stop and the publication of its child
+    /// leaves an empty `stopped` record. A stop that read the record before that
+    /// (another generation) must not cover it, however the rest of the record
+    /// reads, while a stop that read the same generation still does.
+    #[test]
+    fn a_stop_does_not_cover_a_record_in_another_relaunch_generation() {
+        let mut stopping = probe_test_record(11440);
+        stopping.supervisor_pid = 4242;
+        stopping.status = "ready".to_owned();
+        let mut relaunching = stopping.clone();
+        relaunching.clear_recorded_processes();
+        "stopped".clone_into(&mut relaunching.status);
+        assert!(
+            relaunching.is_covered_by_stop_of(&stopping),
+            "premise: without a relaunch the completed stop covers it"
+        );
+        relaunching.begin_relaunch();
+        assert!(
+            !relaunching.is_covered_by_stop_of(&stopping),
+            "an older stop does not cover a record whose relaunch has begun"
+        );
+        // A stop that read the record during the relaunch, and an empty snapshot
+        // of the same generation, are the same stop as before.
+        let mut during = relaunching.clone();
+        during.stop_requested_unix_ms = Some(9);
+        assert!(relaunching.is_covered_by_stop_of(&during));
+        // The generation is never reused, even within one millisecond.
+        let first = relaunching.relaunch_started_unix_ms;
+        relaunching.begin_relaunch();
+        assert!(relaunching.relaunch_started_unix_ms > first);
+    }
+
     /// A restart supersedes the stop that was settled under it: the stamp a
     /// listing left behind does not outlive the relaunch, or a stop that began
     /// before it would read the relaunch's empty record as its own completion.
@@ -1069,8 +1138,13 @@ mod tests {
     fn restarting_forgets_a_settled_stop() {
         let mut record = probe_test_record(11439);
         record.settled_stop_unix_ms = Some(7);
+        record.begin_relaunch();
         record.reset_for_restart();
         assert_eq!(record.settled_stop_unix_ms, None);
+        assert_eq!(
+            record.relaunch_started_unix_ms, None,
+            "publishing ends the relaunch generation"
+        );
     }
 
     /// Writing a service manifest never writes through a file another writer

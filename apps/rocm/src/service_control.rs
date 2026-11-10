@@ -506,6 +506,26 @@ fn restart_internal_managed_service_inner(
             stop_report["signaled_pids"]
         );
     }
+    // Publish that a relaunch has begun before anything is restored or spawned.
+    // From here until `record_restarted_child` the record is an empty `stopped`
+    // manifest, which an older stop still finalizing would take for its own
+    // completion and delete the restored key under; the generation stamp is what
+    // keeps `is_covered_by_stop_of` from covering it. Applied to the record as it
+    // is on disk now, guarded on it still being what the confirmed stop left.
+    let (confirmed_record, _) = read_managed_service_manifest(paths, service_id)?;
+    if update_restarting_record(
+        paths,
+        &confirmed_record,
+        ManagedServiceRecord::begin_relaunch,
+    )?
+    .is_none()
+    {
+        bail!(
+            "`{service_id}` was stopped but NOT restarted: it changed on disk while the \
+             restart was beginning; run `{}` to try again",
+            service_hints::service_action_hint("restart", service_id)
+        );
+    }
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
     }
@@ -670,8 +690,8 @@ fn restart_internal_managed_service_inner(
 /// against for the supervisor's writes.
 ///
 /// Nothing is written, and `None` returned, when the record no longer reads
-/// as `expected` left it — it is gone, names other processes, or has another
-/// status: whoever wrote since holds a truer view than this restart. `update`
+/// as `expected` left it — it is gone, names other processes, has another
+/// status, or is in another relaunch generation: whoever wrote since holds a truer view than this restart. `update`
 /// never touches the stop marker, so a stop asked for meanwhile survives.
 fn update_restarting_record(
     paths: &AppPaths,
@@ -682,7 +702,10 @@ fn update_restarting_record(
         return Ok(None);
     }
     let (mut current, _) = read_managed_service_manifest(paths, &expected.service_id)?;
-    if !current.names_same_processes(expected) || current.status != expected.status {
+    if !current.names_same_processes(expected)
+        || current.status != expected.status
+        || current.relaunch_started_unix_ms != expected.relaunch_started_unix_ms
+    {
         return Ok(None);
     }
     update(&mut current);
@@ -2047,6 +2070,49 @@ mod tests {
         assert_eq!(on_disk.supervisor_pid, std::process::id());
     }
 
+    /// The relaunch generation a restart stamps lives only until the restart
+    /// publishes: recording the child clears it, and a record whose generation
+    /// moved since the restart read it (another restart began, or this one's
+    /// stamp is gone) is not written over, as one with other processes is not.
+    #[test]
+    fn a_restart_publishing_its_child_ends_the_relaunch_generation_and_respects_a_moved_one() {
+        let (root, paths) = test_paths("restart-relaunch-generation");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-relaunch-generation";
+        let mut stopped = stop_test_record(&paths, service_id);
+        stopped.status = "stopped".to_owned();
+        stopped.clear_recorded_processes();
+        stopped.begin_relaunch();
+        stopped.write().unwrap();
+        let stopped = raw_manifest(&paths, service_id);
+        assert!(stopped.relaunch_started_unix_ms.is_some(), "premise");
+
+        // Another restart began meanwhile: the generation on disk is not the one
+        // this restart read.
+        let mut moved = stopped.clone();
+        moved.begin_relaunch();
+        moved.write().unwrap();
+        assert!(
+            moved.relaunch_started_unix_ms > stopped.relaunch_started_unix_ms,
+            "a new generation is always distinct from the one before it"
+        );
+        let refused = record_restarted_child(&paths, &stopped, None, std::process::id());
+        let untouched = raw_manifest(&paths, service_id);
+
+        // With the generation as the restart read it, publication goes through.
+        stopped.write().unwrap();
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(refused.is_err(), "a moved generation is not written over");
+        assert_eq!(untouched.status, "stopped");
+        assert_eq!(untouched.supervisor_pid, 0, "no child was recorded");
+        assert_eq!(started.relaunch_started_unix_ms, None);
+        assert_eq!(on_disk.relaunch_started_unix_ms, None);
+        assert_eq!(on_disk.supervisor_pid, std::process::id());
+    }
+
     #[test]
     fn restart_reports_a_child_it_could_not_record_and_writes_nothing() {
         // Between the restart's stop and its spawn, another restart recorded
@@ -2298,6 +2364,60 @@ mod tests {
             rendered.contains("spawn intercepted by test"),
             "the restart must have reached the spawn: {rendered}"
         );
+        Ok(())
+    }
+
+    /// An older stop finalizing while a restart is between its own confirmed stop
+    /// and the publication of its child. The record is then an empty `stopped`
+    /// manifest, which is also what an older stop's own completion looks like, but
+    /// the restart has restored the endpoint key and is about to serve with it.
+    /// The older stop (here the outer one, whose termination step runs the whole
+    /// restart, so its snapshot predates it) must neither claim that record nor
+    /// delete the key. The restart's spawn is failed on purpose, which leaves the
+    /// record exactly as it is at the spawn: published nothing, key restored.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_older_stop_finalizing_before_a_restart_publishes_does_not_delete_its_key() -> Result<()> {
+        let (root, paths) = test_paths("older-stop-during-restart");
+        paths.ensure()?;
+        let service_id = "svc-older-stop-during-restart";
+        // A live PID (this test's own), so the restart's own load does not take
+        // the older stop's marker for a completed stop and clear the key before
+        // the restart has captured it. Nothing signals it: every termination
+        // step here is a stand-in.
+        let mut planted = stop_test_record(&paths, service_id);
+        planted.supervisor_pid = std::process::id();
+        planted.write()?;
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123")?;
+        let restart_reached_spawn = std::cell::Cell::new(false);
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let spawn: &RestartSpawnOverride<'_> = &|_command| {
+                restart_reached_spawn.set(true);
+                Err(io::Error::other("spawn intercepted by test"))
+            };
+            let restart = restart_internal_managed_service_inner(
+                &paths,
+                service_id,
+                None,
+                |_| bare_termination(Vec::new(), true),
+                Some(spawn),
+            );
+            assert!(restart.is_err(), "the intercepted spawn fails the restart");
+            bare_termination(Vec::new(), true)
+        })?;
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert!(restart_reached_spawn.get(), "premise: the restart ran");
+        assert_eq!(
+            key.as_deref(),
+            Some("key-123"),
+            "the key the restart restored for its child is not the older stop's to delete"
+        );
+        assert_eq!(report["stopped"], false, "{report}");
+        assert_eq!(on_disk.restart_count, 0, "nothing was published");
         Ok(())
     }
 

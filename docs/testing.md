@@ -2553,7 +2553,16 @@ covers is decided by `ManagedServiceRecord::is_covered_by_stop_of`: the same
 processes, or none recorded because a liveness refresh that saw every process
 gone completed this same stop first (the record reads `stopped` and names
 nothing). A restart, whether it has recorded new processes or is mid-launch with
-none yet (status `starting`), is not covered. The unit test
+none yet (status `starting`), is not covered, and neither is the empty `stopped`
+record a `rocm services restart` leaves between its own confirmed stop and the
+publication of its child: the restart stamps a relaunch generation
+(`relaunch_started_unix_ms`) before it restores the endpoint key or spawns, a
+stop covers only the generation it read, and publishing the child clears it
+(`an_older_stop_finalizing_before_a_restart_publishes_does_not_delete_its_key`
+finalizes an older stop in that window and asserts the restored key survives;
+`a_stop_does_not_cover_a_record_in_another_relaunch_generation` is the unit
+table; `a_restart_publishing_its_child_ends_the_relaunch_generation_and_respects_a_moved_one`
+covers the publication guard). The unit test
 `a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch`
 is the table, and it runs again from a stopping snapshot that names no process (an
 empty record is that stop only while it carries the stop's marker, reads
