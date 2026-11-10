@@ -647,7 +647,12 @@ impl Examination {
     /// Coarse machine-readable verdict reported via the `status` field. The
     /// process exit code does NOT encode this — `rocm examine` always exits 0
     /// when it ran; callers branch on `status` instead.
-    fn compute_status(&self) -> String {
+    ///
+    /// Public so that a tool which edits a recorded examination (the skill-eval
+    /// recordings do) can recompute the verdict from the same rule the probe uses,
+    /// instead of typing a `status` that could disagree with the other fields.
+    #[must_use]
+    pub fn compute_status(&self) -> String {
         let value = if self.is_wsl {
             "wsl"
         } else if !matches!(self.os_family.as_str(), "linux" | "windows") {
