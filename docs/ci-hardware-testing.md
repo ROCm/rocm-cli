@@ -53,6 +53,47 @@ the nightly channel; native Windows and WSL stay on their dedicated runners,
 since the queue runs Linux pods. See
 [nightly-on-the-queue.md](nightly-on-the-queue.md).
 
+## Nightly stream canary
+
+[`nightly-canary.yml`](../.github/workflows/nightly-canary.yml) runs daily at
+07:23 UTC (and on `workflow_dispatch`) on GitHub-hosted `ubuntu-24.04` and
+`windows-2022`. It needs no GPU and installs nothing. For each of
+`gfx110X-all` and `gfx120X-all` (plus `gfx950-dcgpu`, on Linux only: the Windows run does not
+probe an Instinct target) it runs
+`rocm install sdk --channel nightly --family <family> --dry-run` and checks the
+plan with [`nightly_canary.py`](../scripts/nightly_canary.py):
+
+- the channel, source URL and source layout generation are the canonical
+  nightly ones, read from [`source.rs`](../apps/rocm/src/therock/source.rs)
+  rather than copied, so a legacy endpoint, the stable stream or another
+  channel taking part in nightly resolution fails the run;
+- the selected version is a dated nightly and its build is at most three days
+  old, which is how a stream that stopped publishing, or a resolver stuck on an
+  old train, shows up. No expected version is hard-coded;
+- when the plan pins the package stack, `rocm` and every framework package's
+  `+rocm` label name the one selected build, so a mixed-build stack fails;
+- the dry run itself succeeds, so an unknown layout, a redirect or a missing or
+  incomplete build fails with the resolver's own message.
+
+It also reads the index's `rocm` listing and warns, without failing, when a
+newer build is listed than the one selected: the resolver skips a build that is
+not complete yet.
+
+What it does not cover: the periodic hardware lane that installs the resolved
+nightly and runs a real GPU operation (the per-channel legs of `nightly.yml`
+are the closest thing today), and whether a newer listed build is complete.
+
+**Who is told.** A failed scheduled run emails the person who last changed the
+workflow's schedule and shows red on the Actions tab; nothing else routes the
+alert yet. Whoever owns the nightly lanes (the `nightly.yml` owner) is the
+owner of this one.
+
+**Rerun.** Actions, "Nightly stream canary", "Run workflow". Locally, with a
+built `rocm`: `python scripts/nightly_canary.py --rocm target/release/rocm`
+(add `--family gfx110X-all` to probe one family; `--self-test` runs the rules
+against fixtures without the network).
+
+
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
 "release/**"]`. On that trigger, every self-hosted GPU job additionally pins
