@@ -474,6 +474,17 @@ tear down, and refuse to publish over a Funnel-exposed port — and needs
 `cargo build -p rocm` first. It does not prove the endpoint carries traffic;
 that needs a real two-node tailnet.
 
+`remote-17` to `remote-20` cover what happens to a refused session record
+without a second machine: they plant the record on disk and check that
+`rocm remote status` counts it instead of reporting no sessions, that
+`rocm remote stop` names it and leaves it in place, that a record filed
+under another session's name is refused, and that `rocm remote serve` over a
+refused record names it instead of offering `stop`. `uninstall-07`
+(`features/uninstall.feature`) checks that a dry-run uninstall names a refused
+record. All of these run on every lane. The refusals of records and session
+directories owned by another user are unit-tested only, because a scenario
+cannot create a file another user owns without privileges.
+
 The `rocm remote` cucumber scenarios that need a second machine carry
 `@requires-docker` and run only when `E2E_INCLUDE_DOCKER=1`, which the
 GitHub-hosted `E2E tests` lane sets. A working daemon alone is not enough — the
@@ -481,7 +492,8 @@ self-hosted GPU runners have one but cannot reach the package mirror the fixture
 image builds from, so they skip those scenarios. Among them, `remote-16` rewrites
 a recorded session so its remote command would also create a marker file on the
 container, and asserts that `rocm remote status` refuses the record, says why,
-and that the marker never appears; `remote-10` also checks the sessions directory
+counts it as refused rather than reporting no sessions, and that the marker never
+appears; `remote-10` also checks the sessions directory
 is left owner-only. To run them locally:
 
 ```bash

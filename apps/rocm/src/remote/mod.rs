@@ -119,6 +119,10 @@ rocm remote doctor gpu-box --symptom \"hip error 101\"")]
         ssh_port: Option<u16>,
     },
     /// Show the remote sessions started from this machine.
+    ///
+    /// Without a session, a record that cannot be used safely is skipped with a
+    /// warning and counted rather than listed. With one, only a usable session
+    /// matching it is reported.
     Status {
         /// Session id, or part of a machine name. Omit for all sessions.
         session: Option<String>,
@@ -297,7 +301,24 @@ fn serve_with_transport(
         // can know the remote service id, so any failure between the two — a
         // registry it cannot parse, a publish that will not confirm — leaves the
         // key behind with no record beside it.
-        if RemoteSessionRecord::path_in(paths, &session_id).exists() {
+        let record_path = RemoteSessionRecord::path_in(paths, &session_id);
+        if record_path.exists() {
+            // A record `load_all` refuses is invisible to `stop`, so pointing at
+            // `stop` for it would be the same provably failing advice as for a
+            // lone key. The refusal names the file and carries the remedy for
+            // its own reason — under root, to run as the record's owner rather
+            // than to remove it — so nothing is added here that could
+            // contradict it.
+            if let Err(refusal) = session::read_recorded(paths, &session_id) {
+                bail!(
+                    "a session record for {} on port {} is on this machine, but it cannot be \
+                     used: {refusal:#}\n\
+                     `rocm remote stop` cannot reach a record it refuses. Or serve on another \
+                     port with `--remote-port`.",
+                    request.target,
+                    request.remote_port,
+                );
+            }
             bail!(
                 "a session is already recorded for {} on port {}.\n\
                  Serving again here would take over its credential and could leave it \
@@ -323,6 +344,11 @@ fn serve_with_transport(
             session::key_path(paths, &session_id).display()
         );
     }
+
+    // The sessions directory is where this run's credential and record will go.
+    // A directory this user may not use is refused here, before the machine is
+    // prepared, rather than after a CLI or ROCm has been installed on it.
+    session::ensure_sessions_dir(paths)?;
 
     println!("Preparing {} ...", request.target);
     let remote_cli = bootstrap::ensure_ready_with(
@@ -908,22 +934,20 @@ fn observe(transport: &dyn Transport, record: &RemoteSessionRecord) -> SessionOb
 
 fn status(session: Option<&str>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let sessions = match session {
-        Some(needle) => vec![session::resolve(&paths, needle)?],
-        None => session::load_all(&paths)?,
+    let loaded = if let Some(needle) = session {
+        // `resolve` already names any refused record when nothing matches; a
+        // match is reported on its own.
+        session::LoadedSessions {
+            records: vec![session::resolve(&paths, needle)?],
+            refused: Vec::new(),
+        }
+    } else {
+        session::load_all(&paths)?
     };
-
-    if sessions.is_empty() {
-        println!("No remote sessions have been started from this machine.");
-        println!();
-        println!("Start one with `rocm remote serve <machine> <model>`.");
-        return Ok(());
-    }
-
-    let observations = sessions
-        .iter()
-        .map(|record| {
-            let observed = SshTransport::new(&record.target, record.ssh_port).map_or_else(
+    print!(
+        "{}",
+        status_report(&paths, &loaded, |record| {
+            SshTransport::new(&record.target, record.ssh_port).map_or_else(
                 // A record naming a machine ssh cannot address is not a reason
                 // to hide every other session from the listing.
                 //
@@ -938,12 +962,50 @@ fn status(session: Option<&str>) -> Result<()> {
                     publish: publish::PublishObservation::Unreachable(format!("{error:#}")),
                 },
                 |transport| observe(&transport, record),
-            );
-            (record.clone(), observed)
+            )
         })
-        .collect::<Vec<_>>();
-    print!("{}", render_status(&paths, &observations));
+    );
     Ok(())
+}
+
+/// Everything `status` prints, from what `load_all` returned and a way to
+/// observe each usable session.
+///
+/// The observer is passed in so a test can drive the whole report — including
+/// whether refused records are counted — without a machine to probe.
+fn status_report(
+    paths: &AppPaths,
+    loaded: &session::LoadedSessions,
+    observe_one: impl Fn(&RemoteSessionRecord) -> SessionObservation,
+) -> String {
+    let refused = loaded.refused_summary();
+    if loaded.records.is_empty() {
+        return render_no_sessions(refused.as_deref());
+    }
+    let observations = loaded
+        .records
+        .iter()
+        .map(|record| (record.clone(), observe_one(record)))
+        .collect::<Vec<_>>();
+    let mut output = render_status(paths, &observations);
+    if let Some(refused) = refused {
+        let _ = write!(output, "\n{refused}\n");
+    }
+    output
+}
+
+/// What `status` prints when it has no usable session to report.
+///
+/// "No remote sessions have been started" is only true when nothing was
+/// refused: a refused record is a session this machine started and may still be
+/// serving, so that case says so instead of claiming there is nothing.
+fn render_no_sessions(refused: Option<&str>) -> String {
+    match refused {
+        Some(refused) => format!("No usable remote sessions are recorded.\n\n{refused}\n"),
+        None => "No remote sessions have been started from this machine.\n\n\
+                 Start one with `rocm remote serve <machine> <model>`.\n"
+            .to_owned(),
+    }
 }
 
 /// Render sessions with their two lifecycles kept apart.
@@ -1343,7 +1405,9 @@ mod tests {
         )
         .unwrap();
 
-        let records = session::load_all(&paths).expect("one bad record must not fail the read");
+        let records = session::load_all(&paths)
+            .expect("one bad record must not fail the read")
+            .records;
         assert!(
             records.is_empty(),
             "a record naming an unexpected remote CLI must be refused, not acted on: {records:?}"
@@ -1358,6 +1422,7 @@ mod tests {
             assert_eq!(
                 session::load_all(&paths)
                     .unwrap()
+                    .records
                     .iter()
                     .filter(|loaded| loaded.remote_cli == cli)
                     .count(),
@@ -2049,7 +2114,7 @@ mod tests {
             "the surviving credential must be the winner's, not an emptied file"
         );
         assert_eq!(
-            session::load_all(&paths).expect("load").len(),
+            session::load_all(&paths).expect("load").records.len(),
             1,
             "one session, not one per racer"
         );
@@ -2526,5 +2591,277 @@ mod tests {
             .is_none(),
             "a successful stop is not a failure"
         );
+    }
+
+    /// Plant a record for `session_id` whose `remote_cli` is one this tool never
+    /// writes, so `load_all` refuses it. Returns its path.
+    fn plant_refused_record(paths: &AppPaths, session_id: &str) -> std::path::PathBuf {
+        let mut record = sample_record();
+        record.session_id = session_id.to_owned();
+        record.write(paths).unwrap();
+        let path = record.path(paths);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        json["remote_cli"] = serde_json::Value::String("rocm; true #".to_owned());
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        path
+    }
+
+    /// A refused record is a session this machine started and may still be
+    /// serving, so `status` must not say there are none. What it prints is
+    /// computed from what `load_all` returned, and asserted against it.
+    #[test]
+    fn status_with_only_refused_records_does_not_claim_there_are_none() {
+        let (root, paths) = temp_paths("status-refused");
+        let path = plant_refused_record(&paths, "remote-gpu-box-11434");
+
+        let loaded = session::load_all(&paths).unwrap();
+        assert!(loaded.records.is_empty());
+        let printed = status_report(&paths, &loaded, |_| unreachable!("nothing to observe"));
+        assert!(
+            !printed.contains("No remote sessions have been started"),
+            "a refused record is not the absence of a session: {printed}"
+        );
+        assert!(
+            printed.contains("1 remote session record(s) were refused")
+                && printed.contains(&path.display().to_string())
+                && printed.contains("may still be serving"),
+            "{printed}"
+        );
+        assert!(
+            !printed.contains("rocm remote stop"),
+            "`stop` cannot reach a refused record, so it must not be offered: {printed}"
+        );
+
+        // With nothing refused, the empty listing is still the plain one.
+        std::fs::remove_file(&path).unwrap();
+        let loaded = session::load_all(&paths).unwrap();
+        let printed = status_report(&paths, &loaded, |_| unreachable!("nothing to observe"));
+        assert!(
+            printed.contains("No remote sessions have been started"),
+            "{printed}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `status <id>` and `stop <id>` (with or without `--force`) all go through
+    /// `resolve`, so naming a refused record must say it was refused, not that
+    /// nothing is recorded.
+    #[test]
+    fn resolving_a_refused_record_names_it() {
+        let (root, paths) = temp_paths("resolve-refused");
+        let path = plant_refused_record(&paths, "remote-gpu-box-11434");
+
+        let error = format!(
+            "{:#}",
+            session::resolve(&paths, "remote-gpu-box-11434").unwrap_err()
+        );
+        assert!(
+            !error.contains("no remote sessions are recorded"),
+            "the record is there; it was refused: {error}"
+        );
+        assert!(
+            error.contains("were refused") && error.contains(&path.display().to_string()),
+            "{error}"
+        );
+
+        // Beside a usable session, a miss still names the refused one.
+        let mut usable = sample_record();
+        usable.session_id = "remote-other-box-11434".to_owned();
+        usable.write(&paths).unwrap();
+        let error = format!("{:#}", session::resolve(&paths, "no-such").unwrap_err());
+        assert!(
+            error.contains("remote-other-box-11434") && error.contains(&path.display().to_string()),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `serve`'s collision guard used to say "Stop it first: rocm remote stop
+    /// <id>" for any record on disk — advice that provably fails for one `stop`
+    /// refuses. It names the file instead, and once the record is repaired the
+    /// guard is back to the ordinary refusal whose `stop` advice works.
+    #[test]
+    fn serving_over_a_refused_record_names_the_file_not_stop() {
+        let (root, paths) = temp_paths("serve-over-refused");
+        let request = request();
+        let peer_host = "gpu-box.example-tailnet.ts.net";
+        let session_id = RemoteSessionRecord::id_for(peer_host, request.remote_port);
+        let path = plant_refused_record(&paths, &session_id);
+
+        let transport = ScriptedTransport::new(Vec::new());
+        let error = serve_with_transport(&transport, &paths, peer_host, &request)
+            .expect_err("a refused record still holds the name");
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains(&format!("rocm remote stop {session_id}")),
+            "`stop` cannot reach a refused record: {rendered}"
+        );
+        // The remedy is the refusal's own, said once, not a second one added by
+        // the guard.
+        assert!(
+            rendered.contains("cannot be used")
+                && rendered.contains(&path.display().to_string())
+                && rendered.contains("unexpected remote CLI")
+                && rendered.contains("set \"remote_cli\" in the file back"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("does not stop").count(), 1, "{rendered}");
+        assert!(transport.calls().is_empty(), "{:?}", transport.calls());
+
+        // Repaired as the refusal says, the record is one `stop` can reach,
+        // and the guard says so.
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        json["remote_cli"] = serde_json::Value::String("rocm".to_owned());
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        assert!(session::resolve(&paths, &session_id).is_ok());
+        let rendered = format!(
+            "{:#}",
+            serve_with_transport(&transport, &paths, peer_host, &request).unwrap_err()
+        );
+        assert!(
+            rendered.contains(&format!("rocm remote stop {session_id}")),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A sessions directory this user may not use is refused before anything
+    /// reaches the machine, not after it has been provisioned.
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_a_foreign_sessions_directory_before_touching_the_machine() {
+        let (root, paths) = temp_paths("serve-foreign-dir");
+        std::fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+        let request = request();
+        let someone_else = session::current_uid_for_tests().wrapping_add(1);
+
+        let transport = ScriptedTransport::new(Vec::new());
+        let error = session::with_expected_owner(someone_else, || {
+            serve_with_transport(
+                &transport,
+                &paths,
+                "gpu-box.example-tailnet.ts.net",
+                &request,
+            )
+            .unwrap_err()
+        });
+        assert!(
+            format!("{error:#}").contains("owned by another user"),
+            "{error:#}"
+        );
+        assert!(
+            transport.calls().is_empty(),
+            "nothing may be sent before the refusal: {:?}",
+            transport.calls()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Beside a usable session, a refused record is still counted: the listing
+    /// is followed by the same summary, so the user learns of the session that
+    /// is not listed and may still be serving.
+    #[test]
+    fn status_counts_refused_records_beside_usable_sessions() {
+        let (root, paths) = temp_paths("status-mixed");
+        let mut usable = sample_record();
+        usable.session_id = "remote-other-box-11434".to_owned();
+        usable.write(&paths).unwrap();
+        let refused = plant_refused_record(&paths, "remote-gpu-box-11434");
+
+        let loaded = session::load_all(&paths).unwrap();
+        let printed = status_report(&paths, &loaded, |_| SessionObservation {
+            server: ServerHealth::Unreachable,
+            publish: publish::PublishObservation::Unreachable("not probed in a test".to_owned()),
+        });
+        assert!(printed.contains("remote-other-box-11434"), "{printed}");
+        assert!(
+            printed.contains("1 remote session record(s) were refused")
+                && printed.contains(&refused.display().to_string()),
+            "{printed}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A record somebody else owns is refused by `serve`'s guard through the
+    /// same owner check `load_all` uses, so it is not offered `stop` either.
+    #[cfg(unix)]
+    #[test]
+    fn serving_over_a_record_another_user_owns_names_the_file_not_stop() {
+        let (root, paths) = temp_paths("serve-foreign-record");
+        let request = request();
+        let peer_host = "gpu-box.example-tailnet.ts.net";
+        let session_id = RemoteSessionRecord::id_for(peer_host, request.remote_port);
+        let mut record = sample_record();
+        record.session_id = session_id.clone();
+        record.write(&paths).unwrap();
+        let someone_else = session::current_uid_for_tests().wrapping_add(1);
+
+        let transport = ScriptedTransport::new(Vec::new());
+        let rendered = session::with_expected_owner(someone_else, || {
+            format!(
+                "{:#}",
+                serve_with_transport(&transport, &paths, peer_host, &request).unwrap_err()
+            )
+        });
+        assert!(
+            rendered.contains("owned by another user")
+                && rendered.contains(&record.path(&paths).display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("rocm remote stop {session_id}")),
+            "{rendered}"
+        );
+        assert!(transport.calls().is_empty(), "{:?}", transport.calls());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Under `sudo -E`, `serve` reads the user's own record as another user's.
+    /// The guard passes on the refusal's root advice — run as the owner — and
+    /// adds no advice to get rid of the record that would contradict it.
+    #[cfg(unix)]
+    #[test]
+    fn serving_under_root_over_the_users_own_record_says_to_run_as_them() {
+        let (root, paths) = temp_paths("serve-under-root");
+        let request = request();
+        let peer_host = "gpu-box.example-tailnet.ts.net";
+        let mut record = sample_record();
+        record.session_id = RemoteSessionRecord::id_for(peer_host, request.remote_port);
+        record.write(&paths).unwrap();
+        let mut user = session::current_uid_for_tests();
+        if user == 0 {
+            // Run as root already: hand the record to an unprivileged uid, so
+            // the comparison below still sees somebody else's file.
+            user = 65534;
+            std::os::unix::fs::lchown(record.path(&paths), Some(user), None).unwrap();
+        }
+
+        let transport = ScriptedTransport::new(Vec::new());
+        let rendered = session::with_expected_owner(0, || {
+            format!(
+                "{:#}",
+                serve_with_transport(&transport, &paths, peer_host, &request).unwrap_err()
+            )
+        });
+        assert!(
+            rendered.contains(&format!("(uid {user}), not under sudo")),
+            "{rendered}"
+        );
+        for advice in [
+            "delete it",
+            "restore its ownership",
+            "Deleting it",
+            "remove it",
+        ] {
+            assert!(
+                !rendered.contains(advice),
+                "{advice:?} under root: {rendered}"
+            );
+        }
+        assert!(transport.calls().is_empty(), "{:?}", transport.calls());
+        assert!(record.path(&paths).exists(), "the record is left in place");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

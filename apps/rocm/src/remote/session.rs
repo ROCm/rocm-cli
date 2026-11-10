@@ -119,7 +119,11 @@ impl RemoteSessionRecord {
         bail!(
             "remote session names an unexpected remote CLI {remote_cli:?}; \
              it is run unquoted on the remote, so only the forms this tool \
-             installs are accepted"
+             installs are accepted. To use the session again, set \"remote_cli\" \
+             in the file back to \"rocm\" or \"{}\", whichever the machine has. \
+             Removing the file instead forgets the session but does not stop a \
+             model it started on the remote machine, so check the machine first",
+            super::bootstrap::REMOTE_CLI_PATH
         )
     }
 
@@ -202,12 +206,13 @@ pub(crate) fn exists(paths: &AppPaths, session_id: &str) -> bool {
 /// One that already exists but belongs to another account — or is a link
 /// another account owns — is refused instead: its owner could list, replace or
 /// remove anything written into it, and could not be locked out by a `chmod`
-/// this user is not allowed to make. Refusing is safe at both call sites:
-/// [`store_key`] runs before a model is started on the machine, and a failed
-/// [`RemoteSessionRecord::write`] unwinds the session it was recording.
-fn ensure_sessions_dir(paths: &AppPaths) -> Result<()> {
+/// this user is not allowed to make. Refusing is safe at each call site:
+/// `serve` calls this before it prepares the machine, [`store_key`] runs before
+/// a model is started there, and a failed [`RemoteSessionRecord::write`] unwinds
+/// the session it was recording.
+pub(crate) fn ensure_sessions_dir(paths: &AppPaths) -> Result<()> {
     #[cfg(unix)]
-    let owner = Some(current_uid());
+    let owner = Some(expected_owner());
     #[cfg(not(unix))]
     let owner = None;
     ensure_sessions_dir_owned_by(paths, owner)
@@ -236,11 +241,16 @@ fn ensure_sessions_dir_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<
         // Already there — from an earlier session, or another writer that got
         // here first. Use it only if it is this user's own directory.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {
-            match owner {
-                Some(owner) => claim_existing_dir(&directory, owner)
-                    .with_context(|| format!("refusing to use {}", directory.display())),
-                None => Ok(()),
+            // Ownership is a unix check only; on Windows the directory sits in
+            // the per-user profile and `owner` is always `None`.
+            #[cfg(unix)]
+            if let Some(owner) = owner {
+                claim_existing_dir(&directory, owner)
+                    .with_context(|| format!("refusing to use {}", directory.display()))?;
             }
+            #[cfg(not(unix))]
+            let _ = owner;
+            Ok(())
         }
         Err(error) => Err(anyhow::Error::new(error))
             .with_context(|| format!("failed to create {}", directory.display())),
@@ -256,14 +266,19 @@ fn claim_existing_dir(directory: &Path, owner: u32) -> Result<()> {
         .with_context(|| format!("failed to inspect {}", directory.display()))?;
     let target = fs::metadata(directory)
         .with_context(|| format!("failed to inspect {}", directory.display()))?;
-    if let Some(found) = [link.uid(), target.uid()]
-        .into_iter()
-        .find(|uid| *uid != owner)
-    {
+    if let Some(found) = first_foreign_uid(&[link.uid(), target.uid()], owner) {
         bail!(
             "this directory is owned by another user (uid {found}), who could list, \
-             replace or remove the session records and credentials kept in it. \
-             If it is yours, restore its ownership; otherwise remove it, then retry"
+             replace or remove the session records and credentials kept in it. {}",
+            // Emptying a directory needs write access to it, which this user
+            // lacks; its parent is this user's, so moving it aside works.
+            foreign_owner_remedy(
+                found,
+                owner,
+                "move it aside or have its owner remove it",
+                "Moving it aside forgets every session recorded in it, but does not stop \
+                 the models those sessions started on remote machines."
+            )
         );
     }
     if target.mode() & 0o077 != 0 {
@@ -273,11 +288,38 @@ fn claim_existing_dir(directory: &Path, owner: u32) -> Result<()> {
     Ok(())
 }
 
-/// Ownership is only checked on unix, where [`ensure_sessions_dir`] passes an
-/// owner.
-#[cfg(not(unix))]
-fn claim_existing_dir(_directory: &Path, _owner: u32) -> Result<()> {
-    Ok(())
+/// The first of `uids` that is not `owner`.
+///
+/// A path is checked twice — the link itself and what it resolves to — and
+/// either belonging to someone else is enough to refuse it, so the order the
+/// two are passed in must not matter.
+#[cfg(unix)]
+fn first_foreign_uid(uids: &[u32], owner: u32) -> Option<u32> {
+    uids.iter().copied().find(|uid| *uid != owner)
+}
+
+/// What to tell a user whose record or sessions directory belongs to `found`
+/// while this process runs as `owner`.
+///
+/// Derived from the same uid the refusal compared against, so the advice cannot
+/// disagree with the decision. Running as root is the case that needs its own
+/// words: `sudo -E`, or a `sudo` that keeps `HOME`, reads the invoking user's
+/// own files as somebody else's, so that branch says only to run as their owner
+/// and never to get rid of them — `otherwise` and its `consequence` are advice
+/// for a user who really is looking at somebody else's file.
+#[cfg(unix)]
+fn foreign_owner_remedy(found: u32, owner: u32, otherwise: &str, consequence: &str) -> String {
+    if owner == 0 {
+        format!(
+            "This command is running as root: if it is yours, run `rocm remote` as the \
+             user who owns it (uid {found}), not under sudo."
+        )
+    } else {
+        format!(
+            "If it is yours, restore its ownership; otherwise {otherwise}, then retry. \
+             {consequence}"
+        )
+    }
 }
 
 /// The effective user id of this process.
@@ -288,6 +330,48 @@ fn current_uid() -> u32 {
     unsafe {
         libc::geteuid()
     }
+}
+
+/// The uid records and the sessions directory must belong to: this process's
+/// own, except where a test has stood in another, which is how a test reaches
+/// the owner checks through [`load_all`] and [`ensure_sessions_dir`] themselves
+/// rather than only through their `_owned_by` halves.
+#[cfg(unix)]
+fn expected_owner() -> u32 {
+    #[cfg(test)]
+    if let Some(owner) = OWNER_OVERRIDE.with(std::cell::Cell::get) {
+        return owner;
+    }
+    current_uid()
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static OWNER_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` as if this process were `owner`, for the owner checks only.
+///
+/// An unprivileged test cannot create a file another user owns, but it can
+/// expect a uid other than its own, which takes the same comparison. Scoped to
+/// the calling thread and reset even if `body` panics.
+#[cfg(all(unix, test))]
+pub(crate) fn with_expected_owner<T>(owner: u32, body: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OWNER_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    OWNER_OVERRIDE.with(|cell| cell.set(Some(owner)));
+    let _reset = Reset;
+    body()
+}
+
+/// This process's own uid, for tests that need a uid that is not it.
+#[cfg(all(unix, test))]
+pub(crate) fn current_uid_for_tests() -> u32 {
+    current_uid()
 }
 
 /// A staging path no other writer will pick, for the write-then-rename above.
@@ -403,10 +487,52 @@ pub(crate) fn clear_key(paths: &AppPaths, session_id: &str) {
     }
 }
 
-/// Every session recorded on this machine, ordered by id so listings are stable.
-pub(crate) fn load_all(paths: &AppPaths) -> Result<Vec<RemoteSessionRecord>> {
+/// What [`load_all`] found: the records it will act on, and the paths of the
+/// `.json` files it would not act on.
+///
+/// The refused ones are kept rather than dropped because the session each
+/// describes may still be running: a listing that silently omits it tells the
+/// user there is nothing on the machine, and `stop` cannot reach it either.
+#[derive(Debug, Default)]
+pub(crate) struct LoadedSessions {
+    pub(crate) records: Vec<RemoteSessionRecord>,
+    pub(crate) refused: Vec<PathBuf>,
+}
+
+impl LoadedSessions {
+    /// One sentence for `status` and `resolve`, which would otherwise report
+    /// "no sessions" or "no such session", or `None` when nothing was refused.
+    ///
+    /// It gives no remedy of its own: each refused record's warning, printed as
+    /// it was loaded, carries the remedy for its own reason, and a second one
+    /// here could contradict it — under root, for one. Nor does it say to run
+    /// `rocm remote stop`, which cannot reach a refused record.
+    pub(crate) fn refused_summary(&self) -> Option<String> {
+        if self.refused.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} remote session record(s) were refused and are not listed (see the warnings \
+             above): {}. The machine(s) they name may still be serving a model.",
+            self.refused.len(),
+            self.refused
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+/// Every session recorded on this machine that is safe to act on, ordered by
+/// id so listings are stable, together with every record that was refused.
+///
+/// A record is refused — skipped with a warning on stderr and returned in
+/// [`LoadedSessions::refused`] — when it cannot be read or parsed, when it fails
+/// the checks in [`read_one`], or, on unix, when another user owns it.
+pub(crate) fn load_all(paths: &AppPaths) -> Result<LoadedSessions> {
     #[cfg(unix)]
-    let owner = Some(current_uid());
+    let owner = Some(expected_owner());
     #[cfg(not(unix))]
     let owner = None;
     load_all_owned_by(paths, owner)
@@ -417,13 +543,13 @@ pub(crate) fn load_all(paths: &AppPaths) -> Result<Vec<RemoteSessionRecord>> {
 /// Split out so a test can stand in for "written by another account": an
 /// unprivileged test cannot create a file someone else owns, but it can ask for
 /// records owned by a uid other than its own, which takes the same branch.
-fn load_all_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<Vec<RemoteSessionRecord>> {
+fn load_all_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<LoadedSessions> {
     let directory = paths.remote_sessions_dir();
+    let mut loaded = LoadedSessions::default();
     if !directory.is_dir() {
-        return Ok(Vec::new());
+        return Ok(loaded);
     }
 
-    let mut records = Vec::new();
     for entry in fs::read_dir(&directory)
         .with_context(|| format!("failed to read {}", directory.display()))?
     {
@@ -434,7 +560,7 @@ fn load_all_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<Vec<RemoteS
             continue;
         }
         match read_one(&path, owner) {
-            Ok(record) => records.push(record),
+            Ok(record) => loaded.records.push(record),
             // One unreadable record must not hide the rest. A half-written file
             // from an interrupted run would otherwise make every session
             // invisible, including the ones still publishing an endpoint.
@@ -445,11 +571,25 @@ fn load_all_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<Vec<RemoteS
             // adds already names the file.
             Err(error) => {
                 eprintln!("warning: ignoring a remote session record: {error:#}");
+                loaded.refused.push(path);
             }
         }
     }
-    records.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    Ok(records)
+    loaded
+        .records
+        .sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    loaded.refused.sort();
+    Ok(loaded)
+}
+
+/// Read the record filed under `session_id`, with every check [`load_all`]
+/// applies. For a caller that has to tell a usable record from a refused one.
+pub(crate) fn read_recorded(paths: &AppPaths, session_id: &str) -> Result<RemoteSessionRecord> {
+    #[cfg(unix)]
+    let owner = Some(expected_owner());
+    #[cfg(not(unix))]
+    let owner = None;
+    read_one(&RemoteSessionRecord::path_in(paths, session_id), owner)
 }
 
 /// Read and vet one record.
@@ -461,13 +601,23 @@ fn load_all_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<Vec<RemoteS
 /// opened file, so the file checked is the file read; a symlink's own owner is
 /// checked too, so a link another account planted cannot borrow this user's
 /// ownership of whatever it points at.
+///
+/// The record must also be filed under its own id. `stop` and `serve` find a
+/// record by building its path from the id, so one filed under another name is
+/// a session those commands would act on under the wrong name — and `stop`
+/// would delete a file other than the one it read.
 fn read_one(path: &Path, owner: Option<u32>) -> Result<RemoteSessionRecord> {
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    // Ownership is a unix check only; on Windows the records sit in the
+    // per-user profile and `owner` is always `None`.
+    #[cfg(unix)]
     if let Some(owner) = owner {
         check_owner(path, &file, owner)
             .with_context(|| format!("refusing to act on {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = owner;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -475,6 +625,16 @@ fn read_one(path: &Path, owner: Option<u32>) -> Result<RemoteSessionRecord> {
         .with_context(|| format!("failed to parse {}", path.display()))?;
     RemoteSessionRecord::validate_id(&record.session_id)
         .with_context(|| format!("refusing to act on {}", path.display()))?;
+    let filed_as = path.file_stem().and_then(|stem| stem.to_str());
+    if filed_as != Some(record.session_id.as_str()) {
+        bail!(
+            "refusing to act on {}: it records session {:?} but is not named after it; \
+             rename it to {:?} or remove it",
+            path.display(),
+            record.session_id,
+            format!("{}.json", record.session_id)
+        );
+    }
     RemoteSessionRecord::validate_remote_cli(&record.remote_cli)
         .with_context(|| format!("refusing to act on {}", path.display()))?;
     Ok(record)
@@ -491,19 +651,19 @@ fn check_owner(path: &Path, file: &fs::File, owner: u32) -> Result<()> {
         .metadata()
         .with_context(|| format!("failed to inspect {}", path.display()))?
         .uid();
-    if let Some(found) = [link, opened].into_iter().find(|uid| *uid != owner) {
+    if let Some(found) = first_foreign_uid(&[link, opened], owner) {
         bail!(
             "this session record is owned by another user (uid {found}), and its commands \
-             would run on a remote machine as you. If you wrote it, restore its ownership; \
-             otherwise delete it"
+             would run on a remote machine as you. {}",
+            foreign_owner_remedy(
+                found,
+                owner,
+                "delete it",
+                "Deleting it forgets the session but does not stop a model it started on \
+                 the remote machine."
+            )
         );
     }
-    Ok(())
-}
-
-/// Ownership is only checked on unix, where [`load_all`] passes an owner.
-#[cfg(not(unix))]
-fn check_owner(_path: &Path, _file: &fs::File, _owner: u32) -> Result<()> {
     Ok(())
 }
 
@@ -512,10 +672,22 @@ fn check_owner(_path: &Path, _file: &fs::File, _owner: u32) -> Result<()> {
 /// Accepts an exact session id, or any unambiguous fragment of the target or
 /// peer name. Ambiguity is refused rather than resolved by picking: `stop` on
 /// the wrong session tears down someone's running model.
+///
+/// A refused record is never a match — it is not safe to act on. When nothing
+/// is recorded or nothing matches, the refused records are named, since one of
+/// them may be the session the user meant.
 pub(crate) fn resolve(paths: &AppPaths, needle: &str) -> Result<RemoteSessionRecord> {
-    let sessions = load_all(paths)?;
+    let loaded = load_all(paths)?;
+    let refused = loaded
+        .refused_summary()
+        .map(|summary| format!("\n{summary}"))
+        .unwrap_or_default();
+    let sessions = &loaded.records;
     if sessions.is_empty() {
-        bail!("no remote sessions are recorded on this machine");
+        if refused.is_empty() {
+            bail!("no remote sessions are recorded on this machine");
+        }
+        bail!("no usable remote session is recorded on this machine.{refused}");
     }
 
     if let Some(found) = sessions
@@ -537,7 +709,7 @@ pub(crate) fn resolve(paths: &AppPaths, needle: &str) -> Result<RemoteSessionRec
 
     match matches.as_slice() {
         [] => bail!(
-            "no remote session matches `{needle}`. Recorded sessions: {}",
+            "no remote session matches `{needle}`. Recorded sessions: {}{refused}",
             sessions
                 .iter()
                 .map(|session| session.session_id.as_str())
@@ -627,11 +799,11 @@ mod tests {
         let record = sample("gpu-box-1.example-tailnet.ts.net", 11434);
         record.write(&paths)?;
 
-        let loaded = load_all(&paths)?;
+        let loaded = load_all(&paths)?.records;
         assert_eq!(loaded, vec![record.clone()]);
 
         record.remove(&paths);
-        assert!(load_all(&paths)?.is_empty());
+        assert!(load_all(&paths)?.records.is_empty());
         // Removing twice must be safe: teardown calls it without checking.
         record.remove(&paths);
 
@@ -652,7 +824,7 @@ mod tests {
         second.model = "a-different-model".to_owned();
         second.write(&paths).unwrap();
 
-        let loaded = load_all(&paths).unwrap();
+        let loaded = load_all(&paths).unwrap().records;
         assert_eq!(loaded.len(), 1, "a rewrite must replace, not accumulate");
         assert_eq!(loaded[0].model, "a-different-model");
 
@@ -740,7 +912,7 @@ mod tests {
             b"{\"session_id\": ",
         )?;
 
-        let loaded = load_all(&paths)?;
+        let loaded = load_all(&paths)?.records;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].peer_host, "gpu-box-1.example-tailnet.ts.net");
 
@@ -849,7 +1021,7 @@ mod tests {
         sample("other-box.example-tailnet.ts.net", 11434)
             .write(&paths)
             .unwrap();
-        let loaded = load_all(&paths).unwrap();
+        let loaded = load_all(&paths).unwrap().records;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].peer_host, "other-box.example-tailnet.ts.net");
 
@@ -933,7 +1105,7 @@ mod tests {
             !refusal.contains('\u{1b}'),
             "a control character from the file reached the message: {refusal:?}"
         );
-        assert!(load_all(&paths).unwrap().is_empty());
+        assert!(load_all(&paths).unwrap().records.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -992,9 +1164,10 @@ mod tests {
             "a directory that is refused is left as it was"
         );
 
-        // The remedy the message gives: remove it, and the next write recreates
-        // it private to this user.
-        fs::remove_dir_all(&directory).unwrap();
+        // The remedy the message gives a non-root user: move it aside — its
+        // parent is this user's — and the next write recreates it private.
+        assert!(refusal.contains("move it aside"), "{refusal}");
+        fs::rename(&directory, directory.with_extension("aside")).unwrap();
         store_key(&paths, "remote-gpu-box-11434", "secret").unwrap();
         assert_eq!(mode_of(&directory), 0o700);
 
@@ -1038,6 +1211,7 @@ mod tests {
         assert!(
             load_all_owned_by(&paths, Some(someone_else))
                 .unwrap()
+                .records
                 .is_empty(),
             "a record owned by another account must not be acted on"
         );
@@ -1049,10 +1223,307 @@ mod tests {
             refusal.contains("owned by another user"),
             "the user must be told why the record was skipped: {refusal}"
         );
+        // Expected owner is not root: the ordinary remedy, and what deleting does.
+        assert!(
+            refusal.contains("restore its ownership")
+                && refusal.contains("delete it")
+                && refusal.contains("does not stop"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("not under sudo"), "{refusal}");
 
         // The same file, checked against its real owner, is a session like any
         // other — which is what `load_all` itself checks against.
-        assert_eq!(load_all(&paths).unwrap(), vec![record]);
+        assert_eq!(load_all(&paths).unwrap().records, vec![record]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Rewrite one field of the record at `path`, as an editor or a script would.
+    fn rewrite_field(path: &Path, field: &str, value: &str) {
+        let mut json: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        json[field] = serde_json::Value::String(value.to_owned());
+        fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    }
+
+    /// What `load_all` warns with for the record at `path`.
+    fn refusal_of(path: &Path, owner: Option<u32>) -> String {
+        format!("{:#}", read_one(path, owner).unwrap_err())
+    }
+
+    /// A uid other than root's that the given paths belong to: this process's
+    /// own, or — run as root — an unprivileged one they are handed to, so the
+    /// owner tests run, rather than skip, in a root CI container.
+    #[cfg(unix)]
+    fn unprivileged_owner_of(paths: &[&Path]) -> u32 {
+        const UNPRIVILEGED: u32 = 65534;
+        let me = current_uid();
+        if me != 0 {
+            return me;
+        }
+        for path in paths {
+            std::os::unix::fs::lchown(path, Some(UNPRIVILEGED), None).unwrap();
+        }
+        UNPRIVILEGED
+    }
+
+    /// A refused record is reported back, not only warned about, and the
+    /// remedy its message gives — restoring `remote_cli` — makes it a session
+    /// again. Message and outcome together, so the advice cannot go stale.
+    #[test]
+    fn a_refused_remote_cli_is_returned_with_a_remedy_that_works() {
+        let (root, paths) = temp_paths("remote-cli-remedy");
+        let record = sample("gpu-box.example-tailnet.ts.net", 11434);
+        record.write(&paths).unwrap();
+        let path = record.path(&paths);
+        rewrite_field(&path, "remote_cli", "rocm; true #");
+
+        let loaded = load_all(&paths).unwrap();
+        assert!(loaded.records.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.refused, vec![path.clone()]);
+        let refusal = refusal_of(&path, None);
+        assert!(
+            refusal.contains("set \"remote_cli\" in the file back to \"rocm\"")
+                && refusal.contains("does not stop"),
+            "the refusal must say how to recover and what removing does: {refusal}"
+        );
+
+        rewrite_field(&path, "remote_cli", "rocm");
+        let loaded = load_all(&paths).unwrap();
+        assert_eq!(loaded.records, vec![record]);
+        assert!(loaded.refused.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `stop` builds a record's path from its id, so a record filed under some
+    /// other name would be acted on under a name that is not its file. It is
+    /// refused, and renaming it as the message says makes it usable.
+    #[test]
+    fn a_record_filed_under_another_name_is_refused_until_renamed() {
+        let (root, paths) = temp_paths("misfiled");
+        let record = sample("gpu-box.example-tailnet.ts.net", 11434);
+        record.write(&paths).unwrap();
+        let misfiled = paths.remote_sessions_dir().join("remote-other-box-1.json");
+        fs::rename(record.path(&paths), &misfiled).unwrap();
+
+        let loaded = load_all(&paths).unwrap();
+        assert!(loaded.records.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.refused, vec![misfiled.clone()]);
+        let refusal = refusal_of(&misfiled, None);
+        assert!(
+            refusal.contains("is not named after it")
+                && refusal.contains(&format!("{}.json", record.session_id)),
+            "{refusal}"
+        );
+
+        fs::rename(&misfiled, record.path(&paths)).unwrap();
+        assert_eq!(load_all(&paths).unwrap().records, vec![record]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Either uid being foreign is enough, whichever position it is in.
+    #[cfg(unix)]
+    #[test]
+    fn first_foreign_uid_finds_a_stranger_in_either_position() {
+        assert_eq!(first_foreign_uid(&[1000, 1001], 1000), Some(1001));
+        assert_eq!(first_foreign_uid(&[1001, 1000], 1000), Some(1001));
+        assert_eq!(first_foreign_uid(&[1000, 1000], 1000), None);
+    }
+
+    /// The owner check runs inside `load_all` itself, not only in the
+    /// `_owned_by` halves the other tests call: a process expecting another uid
+    /// refuses the user's records, and reports them as refused.
+    #[cfg(unix)]
+    #[test]
+    fn load_all_and_the_writers_check_ownership_themselves() {
+        let (root, paths) = temp_paths("owner-wiring");
+        let record = sample("gpu-box.example-tailnet.ts.net", 11434);
+        record.write(&paths).unwrap();
+        let someone_else = current_uid().wrapping_add(1);
+
+        let loaded = with_expected_owner(someone_else, || load_all(&paths).unwrap());
+        assert!(loaded.records.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.refused, vec![record.path(&paths)]);
+        assert!(
+            refusal_of(&record.path(&paths), Some(someone_else)).contains("owned by another user")
+        );
+
+        let refusal = with_expected_owner(someone_else, || {
+            store_key(&paths, &record.session_id, "secret").unwrap_err()
+        });
+        assert!(
+            format!("{refusal:#}").contains("owned by another user"),
+            "{refusal:#}"
+        );
+        assert!(!key_path(&paths, &record.session_id).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Under `sudo -E`, or a `sudo` that keeps `HOME`, root reads the user's
+    /// own records. The refusal tells root to run as that user and says nothing
+    /// about getting rid of them — and running as that user does work.
+    #[cfg(unix)]
+    #[test]
+    fn under_root_a_refusal_says_to_run_as_the_owner_rather_than_delete() {
+        let (root, paths) = temp_paths("under-sudo");
+        let record = sample("gpu-box.example-tailnet.ts.net", 11434);
+        record.write(&paths).unwrap();
+        let directory = paths.remote_sessions_dir();
+        let user = unprivileged_owner_of(&[&directory, &record.path(&paths)]);
+
+        let loaded = load_all_owned_by(&paths, Some(0)).unwrap();
+        assert!(loaded.records.is_empty(), "root must not act on it");
+        let refusal = refusal_of(&record.path(&paths), Some(0));
+        assert!(
+            refusal.contains("running as root")
+                && refusal.contains(&format!("(uid {user}), not under sudo")),
+            "{refusal}"
+        );
+        for advice in ["delete it", "restore its ownership", "Deleting it"] {
+            assert!(
+                !refusal.contains(advice),
+                "{advice:?} under root: {refusal}"
+            );
+        }
+        assert_eq!(
+            load_all_owned_by(&paths, Some(user)).unwrap().records,
+            vec![record],
+            "run as its owner, the record is a session again"
+        );
+
+        let before = fs::metadata(&directory).unwrap().permissions();
+        let refusal = format!(
+            "{:#}",
+            ensure_sessions_dir_owned_by(&paths, Some(0)).unwrap_err()
+        );
+        assert!(
+            refusal.contains("running as root")
+                && refusal.contains(&format!("(uid {user}), not under sudo")),
+            "{refusal}"
+        );
+        for advice in ["move it aside", "restore its ownership", "Moving it aside"] {
+            assert!(
+                !refusal.contains(advice),
+                "{advice:?} under root: {refusal}"
+            );
+        }
+        assert_eq!(fs::metadata(&directory).unwrap().permissions(), before);
+        ensure_sessions_dir_owned_by(&paths, Some(user)).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A root-owned path for the linked tests: as root, one this test creates
+    /// already owner-only, so even a broken check has nothing to tighten; run
+    /// unprivileged, a system path this process cannot change.
+    #[cfg(unix)]
+    fn root_owned(root: &Path, system_path: &str, directory: bool) -> PathBuf {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let path = if current_uid() == 0 {
+            let path = root.join("root-owned");
+            if directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, b"{}").unwrap();
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        } else {
+            PathBuf::from(system_path)
+        };
+        assert_eq!(
+            fs::metadata(&path).unwrap().uid(),
+            0,
+            "{} must be root-owned for this test to mean anything",
+            path.display()
+        );
+        path
+    }
+
+    /// A record reached through a link is refused when either end belongs to
+    /// someone else. The link is the user's and its target is root's, so each
+    /// owner passed sees exactly one foreign end.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_record_is_refused_if_either_end_is_foreign() {
+        let (root, paths) = temp_paths("linked-record");
+        let target = root_owned(&root, "/etc/passwd", false);
+        fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+        let link = paths
+            .remote_sessions_dir()
+            .join("remote-gpu-box-11434.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let user = unprivileged_owner_of(&[&link]);
+
+        // The opened file is root's: refused as uid 0, though the link is the
+        // user's.
+        let refusal = refusal_of(&link, Some(user));
+        assert!(
+            refusal.contains("owned by another user (uid 0)"),
+            "{refusal}"
+        );
+        // The link is the user's, not root's: refused as theirs, though root
+        // owns what it points at.
+        let refusal = refusal_of(&link, Some(0));
+        assert!(
+            refusal.contains(&format!("owned by another user (uid {user})")),
+            "{refusal}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The same for the sessions directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_sessions_directory_is_refused_if_either_end_is_foreign() {
+        let (root, paths) = temp_paths("linked-dir");
+        let target = root_owned(&root, "/", true);
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        std::os::unix::fs::symlink(&target, paths.remote_sessions_dir()).unwrap();
+        let user = unprivileged_owner_of(&[&paths.remote_sessions_dir()]);
+
+        let refusal = format!(
+            "{:#}",
+            ensure_sessions_dir_owned_by(&paths, Some(user)).unwrap_err()
+        );
+        assert!(
+            refusal.contains("owned by another user (uid 0)"),
+            "{refusal}"
+        );
+        let refusal = format!(
+            "{:#}",
+            ensure_sessions_dir_owned_by(&paths, Some(0)).unwrap_err()
+        );
+        assert!(
+            refusal.contains(&format!("owned by another user (uid {user})")),
+            "{refusal}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Something other than a directory where the sessions directory belongs is
+    /// not claimed — not tightened, not written into — but reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_where_the_sessions_directory_belongs_is_not_claimed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (root, paths) = temp_paths("file-not-dir");
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let directory = paths.remote_sessions_dir();
+        fs::write(&directory, b"not a directory").unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = format!(
+            "{:#}",
+            ensure_sessions_dir_owned_by(&paths, Some(current_uid())).unwrap_err()
+        );
+        assert!(error.contains("failed to create"), "{error}");
+        assert_eq!(mode_of(&directory), 0o644, "the file is left as it was");
 
         let _ = fs::remove_dir_all(root);
     }

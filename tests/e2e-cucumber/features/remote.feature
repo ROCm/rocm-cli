@@ -143,3 +143,36 @@ Feature: Working with GPU machines over a private network
     And the user asks about their remote sessions
     Then the user is told the session record was refused
     And the extra command never ran on the machine
+
+  # The same refusal without a machine: a record already on disk that names a
+  # remote command this tool never writes. Runs on every lane, because nothing
+  # here reaches the network.
+  @id:remote-status-counts-refused-record
+  Scenario: remote-17 - A refused session record is counted, not reported as no sessions
+    Given a session record on this machine that names a remote command this tool never writes
+    When the user asks about their remote sessions
+    Then the user is told the session record was refused
+
+  @id:remote-stop-names-refused-record
+  Scenario: remote-18 - Stopping a refused session names the record instead of claiming nothing is recorded
+    Given a session record on this machine that names a remote command this tool never writes
+    When the user asks to stop that session
+    Then the user is told the record was refused and how to clear it
+    And the session record is left in place
+
+  @id:remote-status-refuses-misnamed-record
+  Scenario: remote-19 - A session record filed under another session's name is refused
+    Given a session record on this machine filed under a name other than its own session
+    When the user asks about their remote sessions
+    Then the user is told the session record is not named after its session
+
+  # `serve` computes the same session id for the same machine and port, so a
+  # refused record already filed under it blocks the serve. `stop` cannot reach
+  # it, so the refusal must not send the user there.
+  @id:remote-serve-refuses-over-refused-record
+  Scenario: remote-20 - Serving over a refused session record names the record instead of offering stop
+    Given a private network with a GPU machine and a phone
+    And a session record for the GPU machine that names a remote command this tool never writes
+    When the user asks to serve a model on the GPU machine
+    Then the user is told the session record cannot be used and `stop` cannot reach it
+    And the session record is left in place

@@ -159,8 +159,8 @@ pub(crate) fn build_uninstall_plan(
     // and this plan goes on to delete the data directory those records live in,
     // so the warning that something is still published elsewhere would be lost at
     // exactly the moment it was the last copy.
-    let remote_sessions = match remote::session::load_all(paths) {
-        Ok(sessions) => sessions,
+    let loaded = match remote::session::load_all(paths) {
+        Ok(loaded) => loaded,
         Err(error) => {
             plan.warnings.push(format!(
                 "could not read the remote session records under {}: {error:#}\n\
@@ -168,9 +168,28 @@ pub(crate) fn build_uninstall_plan(
                  their endpoints published. Check with `rocm remote status` before continuing.",
                 paths.remote_sessions_dir().display()
             ));
-            Vec::new()
+            remote::session::LoadedSessions::default()
         }
     };
+    // A refused record is still a session this machine started, and its model
+    // may still be running; it is only unsafe to act on. Count it here too, or
+    // the uninstall would delete its last trace without a word.
+    if !loaded.refused.is_empty() {
+        plan.warnings.push(format!(
+            "{} remote session record(s) under {} could not be used and may still name models \
+             running on remote machines: {}. `rocm remote stop` cannot reach these; check \
+             each machine before removing them.",
+            loaded.refused.len(),
+            paths.remote_sessions_dir().display(),
+            loaded
+                .refused
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let remote_sessions = loaded.records;
     if !remote_sessions.is_empty() {
         plan.warnings.push(format!(
             "{} remote session record(s) exist under {}; their models keep running on the \
@@ -661,6 +680,50 @@ mod tests {
             warning.is_ascii(),
             "the remote-session warning must be ASCII-only (ROCMAI-543): {warning}"
         );
+        Ok(())
+    }
+
+    /// A remote session record `rocm remote` refuses to act on is still a
+    /// session this machine started, so the uninstall review counts it too,
+    /// rather than deleting its last trace without a word.
+    #[test]
+    fn uninstall_warns_about_refused_remote_session_records() -> Result<()> {
+        let (root, paths) = test_paths("uninstall-refused-remote-session");
+        paths.ensure()?;
+        let session_id = crate::remote::session::RemoteSessionRecord::id_for("dev-box", 8000);
+        let directory = paths.remote_sessions_dir();
+        fs::create_dir_all(&directory)?;
+        let record_path = directory.join(format!("{session_id}.json"));
+        fs::write(
+            &record_path,
+            format!(
+                r#"{{"session_id":"{session_id}","target":"dev-box","peer_host":"dev-box",
+                    "model":"qwen","remote_service_id":"svc-remote","remote_cli":"rocm; true #",
+                    "remote_port":8000,"tailnet_port":8000,"base_url":"http://dev-box:8000/v1",
+                    "created_at_unix_ms":1}}"#
+            ),
+        )?;
+
+        let options = UninstallOptions {
+            dry_run: true,
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &options);
+        let _ = fs::remove_dir_all(&root);
+        let plan = plan?;
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("could not be used"))
+            .unwrap_or_else(|| panic!("a refused record must be warned about: {plan:#?}"));
+        assert!(
+            warning.starts_with("1 remote session record(s)")
+                && warning.contains(&record_path.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.is_ascii(), "{warning}");
         Ok(())
     }
 

@@ -451,3 +451,27 @@ async fn config_intact(world: &mut E2eWorld) {
         output(world)
     );
 }
+
+#[then("the uninstall warns about the refused remote session record")]
+async fn warns_about_refused_remote_record(world: &mut E2eWorld) {
+    let said = format!(
+        "{}\n{}",
+        world.cli_output.clone().unwrap_or_default(),
+        world.cli_stderr.clone().unwrap_or_default()
+    );
+    let record = crate::e2e::remote_steps::sessions_dir(world).join(format!(
+        "{}.json",
+        crate::e2e::remote_steps::PLANTED_SESSION_ID
+    ));
+    assert!(
+        said.contains("1 remote session record(s) under")
+            && said.contains(&record.display().to_string())
+            && said.contains("`rocm remote stop` cannot reach these"),
+        "the dry run must name the refused record and say `stop` cannot reach it:\n{said}"
+    );
+    assert!(
+        record.exists(),
+        "a dry run must not remove {}",
+        record.display()
+    );
+}
