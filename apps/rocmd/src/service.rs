@@ -897,6 +897,47 @@ mod tests {
         Ok(())
     }
 
+    /// The listing's cleanup of an empty record (see above) leaves a `starting` or
+    /// `failed` record at its status with the marker gone and the marker's stamp
+    /// kept: that is the stop's own marker consumed, not a relaunch, so the stop
+    /// is confirmed. `rocm` has the test that runs the real refresh.
+    #[test]
+    fn a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed() -> Result<()>
+    {
+        for status in ["starting", "failed"] {
+            let (root, paths) = temp_app_paths(&format!("stop-empty-listing-{status}"));
+            paths.ensure()?;
+            let service_id = "svc-stop-empty-listing";
+            let key_path = seed_keyed_service(&paths, service_id, 11457)?;
+            let mut empty = load_service_record(&paths, service_id)?;
+            empty.clear_recorded_processes();
+            status.clone_into(&mut empty.status);
+            empty.write()?;
+
+            let result = stop_managed_service_with(&paths, service_id, |_| {
+                let mut on_disk = load_service_record(&paths, service_id).expect("record");
+                on_disk.settled_stop_unix_ms = on_disk.stop_requested_unix_ms.take();
+                on_disk.write().expect("concurrent listing write");
+                rocm_core::TerminationOutcome::Graceful
+            });
+            let key_removed = !key_path.exists();
+            let reloaded = load_service_record(&paths, service_id);
+            fs::remove_dir_all(root).ok();
+
+            let value = result?;
+            assert_eq!(
+                value.get("stopped").and_then(Value::as_bool),
+                Some(true),
+                "{status}: {value}"
+            );
+            let reloaded = reloaded?;
+            assert_eq!(reloaded.status, "stopped", "{status}");
+            assert_eq!(reloaded.stop_requested_unix_ms, None, "{status}");
+            assert!(key_removed, "{status}");
+        }
+        Ok(())
+    }
+
     /// A restart that has begun launching but recorded no process yet reads
     /// `starting` with nothing named: not the stop completing, so the stop does
     /// not claim it or drop the key.

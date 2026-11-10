@@ -266,11 +266,15 @@ fn settle_pending_stop_key_cleanup(
         return false;
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
-    record.stop_requested_unix_ms = None;
+    let consumed_marker = record.stop_requested_unix_ms.take();
     // A record that named no process has no stop to complete: the key and the
     // stale marker go, as they always did, but it is not read as stopped. It may
-    // be a launch that has not recorded its supervisor yet.
+    // be a launch that has not recorded its supervisor yet. The marker's value
+    // stays on the record (`settled_stop_unix_ms`), because a stop that began on
+    // this empty record and finds it with no marker would otherwise read this
+    // cleanup as a relaunch and report itself unconfirmed.
     if recorded_service_pids(record).is_empty() {
+        record.settled_stop_unix_ms = consumed_marker;
         return true;
     }
     // Every recorded process is confirmed gone, so none of them is the
@@ -1175,6 +1179,11 @@ mod tests {
         assert_eq!(record.stop_requested_unix_ms, None);
         assert!(endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none());
         assert_eq!(record.status, "starting", "it is not read as stopped");
+        assert_eq!(
+            record.settled_stop_unix_ms,
+            Some(1),
+            "the consumed marker's stamp stays, so a stop that began on this record can tell its own marker was consumed from a relaunch having cleared it"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -1195,6 +1204,10 @@ mod tests {
             assert!(changed, "{status}");
             assert_eq!(record.status, "stopped", "{status}");
             assert_eq!(record.supervisor_pid, 0, "{status}");
+            assert_eq!(
+                record.settled_stop_unix_ms, None,
+                "{status}: a record that names processes reads stopped and needs no stamp"
+            );
             let _ = fs::remove_dir_all(root);
         }
         Ok(())

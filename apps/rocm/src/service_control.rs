@@ -1291,6 +1291,102 @@ mod tests {
         assert_eq!(untouched["stopped"], true, "{untouched}");
     }
 
+    /// The interleaving the empty-relaunch guard above must not mistake for a
+    /// relaunch: the record being stopped names no process and reads `starting` or
+    /// `failed` (a liveness refresh leaves both as they are), and a concurrent
+    /// listing finds the stop marker with nothing recorded to wait for and clears
+    /// it before the stop reads the record again. Nobody relaunched, so the stop is
+    /// confirmed as it is when no listing intervenes (the last block), and the
+    /// record reads `stopped` afterwards with its key gone.
+    #[test]
+    fn a_listing_clearing_the_marker_of_an_empty_stop_does_not_make_it_unconfirmed() {
+        for status in ["starting", "failed"] {
+            let (root, paths) = test_paths(&format!("stop-empty-listing-{status}"));
+            paths.ensure().unwrap();
+            let service_id = "svc-stop-empty-listing";
+            let mut empty = stop_test_record(&paths, service_id);
+            status.clone_into(&mut empty.status);
+            empty.clear_recorded_processes();
+            empty.write().unwrap();
+            endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+            let report = stop_internal_managed_service_with(&paths, service_id, |stopping| {
+                assert!(stopping.stop_requested_unix_ms.is_some());
+                // The listing under test: it reads the record with the stop's
+                // marker on it, finds no process to wait for, and persists the
+                // cleanup before this stop reads the record again.
+                let (mut listed, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+                let changed =
+                    crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                        &paths,
+                        &mut listed,
+                        |_| rocm_core::ProcessProbe::Gone,
+                    );
+                assert!(
+                    changed,
+                    "premise: the listing cleaned the marker ({status})"
+                );
+                listed.write().unwrap();
+                let after_listing = raw_manifest(&paths, service_id);
+                assert_eq!(after_listing.stop_requested_unix_ms, None, "{status}");
+                assert_eq!(after_listing.status, status, "premise: status unchanged");
+                bare_termination(Vec::new(), true)
+            })
+            .unwrap();
+
+            let on_disk = raw_manifest(&paths, service_id);
+            let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+            let _ = fs::remove_dir_all(root);
+            assert_eq!(report["stopped"], true, "{status}: {report}");
+            assert_eq!(on_disk.status, "stopped", "{status}");
+            assert_eq!(on_disk.stop_requested_unix_ms, None, "{status}");
+            assert_eq!(key, None, "{status}: the key goes with the confirmed stop");
+        }
+    }
+
+    /// The same interleaving followed by a real relaunch: the listing consumed the
+    /// marker, then the daemon restarted the empty record (a restart counts itself,
+    /// clears the marker and reads `recovering` or `starting`). The stamp the
+    /// listing left is the stop's own, but the relaunch wipes it, so the stop still
+    /// does not claim the relaunch's record.
+    #[test]
+    fn a_relaunch_after_a_listing_consumed_the_marker_is_still_not_the_stop() {
+        let (root, paths) = test_paths("stop-empty-listing-then-relaunch");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-empty-listing-then-relaunch";
+        let mut empty = stop_test_record(&paths, service_id);
+        "starting".clone_into(&mut empty.status);
+        empty.clear_recorded_processes();
+        empty.write().unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let (mut listed, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+            let _ = crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                &paths,
+                &mut listed,
+                |_| rocm_core::ProcessProbe::Gone,
+            );
+            listed.write().unwrap();
+            let mut relaunch = raw_manifest(&paths, service_id);
+            assert!(
+                relaunch.settled_stop_unix_ms.is_some(),
+                "premise: the listing left the stop's stamp"
+            );
+            "recovering".clone_into(&mut relaunch.status);
+            relaunch.reset_for_restart();
+            relaunch.stop_requested_unix_ms = None;
+            relaunch.write().unwrap();
+            bare_termination(Vec::new(), true)
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["stopped"], false, "{report}");
+        assert_eq!(on_disk.status, "recovering", "the relaunch's status stays");
+        assert_eq!(on_disk.restart_count, 1);
+    }
+
     #[test]
     fn stop_of_a_container_engine_is_unconfirmed_when_the_engine_stop_fails() {
         // For `aim` the recorded PID is only the supervisor; killing it says

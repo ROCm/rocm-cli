@@ -2392,9 +2392,17 @@ nothing). A restart, whether it has recorded new processes or is mid-launch with
 none yet (status `starting`), is not covered. The unit test
 `a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch`
 is the table, and it runs again from a stopping snapshot that names no process (an
-empty record is that stop only while it carries the stop's marker or reads
-`stopped`; an empty `starting` relaunch has cleared the marker and is not covered,
-`stop_does_not_confirm_over_an_empty_relaunch_of_an_empty_record`); in `rocm`, `a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
+empty record is that stop only while it carries the stop's marker, reads
+`stopped`, or a liveness refresh consumed that marker and left its stamp in
+`settled_stop_unix_ms`; an empty `starting` relaunch has cleared the marker
+without leaving the stamp and is not covered,
+`stop_does_not_confirm_over_an_empty_relaunch_of_an_empty_record`); in `rocm`,
+`a_listing_clearing_the_marker_of_an_empty_stop_does_not_make_it_unconfirmed` runs the
+real refresh between the termination and the final read of an empty `starting` and an
+empty `failed` record (which the refresh leaves at their status) and asserts a confirmed
+stop, `a_relaunch_after_a_listing_consumed_the_marker_is_still_not_the_stop` that a
+restart following that listing is still not covered (it wipes the stamp), and
+`a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
 persists a real liveness refresh between the termination and the final read and
 asserts a confirmed stop with the marker not restored,
 `a_restart_is_not_refused_because_a_listing_completed_its_stop` that a restart then
@@ -2402,8 +2410,10 @@ carries on past its stop, and `stop_does_not_confirm_over_a_restart_that_has_rec
 and `stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile` that a real
 relaunch is still detected; `rocmd` has the same three (`a_stop_completed_by_a_concurrent_listing_is_still_confirmed`,
 `a_stop_does_not_claim_a_restart_that_has_recorded_no_process_yet`,
-`a_stop_does_not_clear_processes_recorded_while_it_ran`), the first with the listing's
-write made directly because the refresh lives in the `rocm` binary.
+`a_stop_does_not_clear_processes_recorded_while_it_ran`) plus
+`a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed`, the
+listing's write made directly in those that need it because the refresh lives in the
+`rocm` binary.
 
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded
