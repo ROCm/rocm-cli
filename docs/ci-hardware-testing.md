@@ -44,6 +44,14 @@ R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
 rung instead of being removed outright.
 
+A pull request now runs on exactly one Linux GPU node and one Windows GPU
+node: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
+the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
+Ubuntu (`e2e-gpu-strix-ubuntu`) and W7900 (`e2e-gpu-w7900`) lanes no longer
+start on `pull_request`; they keep their `push`/`merge_group`/dispatch
+triggers and run nightly (`e2e-gpu-nightly-strix` on the same DevLab Dispatch
+pool labels, `e2e-gpu-nightly-w7900`).
+
 [`queue-run.yml`](../.github/workflows/queue-run.yml) runs GPU lanes on a
 shared GPU queue, one per GPU model, so no runner holds a GPU for the length
 of a job, and publishes the result;

@@ -9,6 +9,12 @@ name: E2E self-hosted
 # THIS workflow's supersession, never the required checks in ci.yml. Only
 # pull_request runs are superseded (see `concurrency:` below).
 #
+# Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
+# MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
+# node (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
+# Ubuntu and W7900 lanes keep their push / merge_group / dispatch triggers and
+# run nightly (nightly.yml); they just no longer start on pull_request.
+#
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
 # because of `continue-on-error`, which is `false` on every lane but
@@ -470,11 +476,16 @@ jobs:
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
+    # Not on pull_request: a PR gets exactly one Linux GPU node (MI300X, the only
+    # lane where vLLM runs) and one Windows node (the Strix Halo pool). This lane
+    # still runs on push/merge_group/dispatch and nightly (nightly.yml,
+    # e2e-gpu-nightly-strix, same pool labels).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
+          && github.event_name != 'pull_request'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
@@ -1599,11 +1610,15 @@ jobs:
       fail-fast: false
       matrix:
         sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
+    # Not on pull_request: one runner on borrowed quota, 58-70% of its PR jobs
+    # never started before being superseded. Still runs on push/merge_group/
+    # dispatch and nightly (nightly.yml, e2e-gpu-nightly-w7900).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
+          && github.event_name != 'pull_request'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'w7900'))

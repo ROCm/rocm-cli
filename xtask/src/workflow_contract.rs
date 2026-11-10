@@ -1620,6 +1620,10 @@ jobs:
         for (per_pr_job, nightly_job) in [
             ("e2e-wsl", "e2e-wsl-nightly"),
             ("e2e-gpu-strix-windows", "e2e-gpu-nightly-strix-windows"),
+            // Off the PR path since the two-node PR scope, so the nightly is where
+            // this lane runs on a schedule: it must not drift back to the
+            // offline static `native` host.
+            ("e2e-gpu-strix-ubuntu", "e2e-gpu-nightly-strix"),
         ] {
             let per_pr = runs_on_values(job_block(&sh, per_pr_job));
             let nightly_values = runs_on_values(job_block(&nightly, nightly_job));
@@ -7679,18 +7683,25 @@ jobs:
             !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
             "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
         );
-        for job in [
-            "e2e-gpu-strix-ubuntu",
-            "e2e-gpu-strix-windows",
-            "e2e-wsl",
-            "e2e-gpu-w7900",
-        ] {
+        for job in ["e2e-gpu-strix-windows", "e2e-wsl"] {
             // Only the dispatch split may look at the event: any other event
             // condition could silently keep the lane out of the merge queue.
             let gate = normalized_whitespace(&gate(job));
             assert!(
                 !gate.contains("merge_group") && !gate.contains("'pull_request'"),
                 "`{job}` must keep running in the merge queue (gate: `{gate}`)"
+            );
+        }
+        // A pull request runs one Linux node (MI300X) and one Windows node (the
+        // Strix Halo pool). These two lanes are off the pull_request path but must
+        // still run in the merge queue, so the gate may name `pull_request` and
+        // nothing else about the event.
+        for job in ["e2e-gpu-strix-ubuntu", "e2e-gpu-w7900"] {
+            let gate = normalized_whitespace(&gate(job));
+            assert!(
+                gate.contains("github.event_name != 'pull_request'")
+                    && !gate.contains("merge_group"),
+                "`{job}` must skip pull_request but keep running in the merge queue (gate: `{gate}`)"
             );
         }
     }

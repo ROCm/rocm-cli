@@ -768,23 +768,18 @@ jobs:
     # it, so the "Report whether Docker is reachable" step logs the answer. If it
     # does not, no nightly lane runs AIM serve and a pool-based one is needed.
     timeout-minutes: 120
-    # `native` disambiguates this runner from any host that might carry a bare
-    # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
-    # before the WSL lanes moved to the ephemeral pool) -- the paths below
-    # exist only on the native host, whether or not that other runner remains
-    # registered.
-    runs-on: [self-hosted, linux, strix-halo, native]
+    # The DevLab Dispatch pool, identical to the per-PR e2e-gpu-strix-ubuntu
+    # lane in e2e-selfhosted.yml (pinned by workflow_contract.rs). This lane used
+    # to target the static `native` host, which is offline: every nightly sat
+    # queued until the 12h run cap and the lane never ran. Pool hosts are cold,
+    # so there are no host-specific HOME or cache-dir overrides.
+    runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         channel: [release, nightly]
     env:
-      HOME: /home/ubuntu/actions-runner/e2e-home
-      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
-      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
-      TMPDIR: /home/ubuntu/actions-runner/tmp
-      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
@@ -793,11 +788,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
-        run: |
-          mkdir -p "$HOME" "$TMPDIR" "$PIP_CACHE_DIR"
-          echo "prepared"
-          bash scripts/reclaim-gpu.sh
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
       # process survives. gfx1151 shares system memory, so the floor is smaller
@@ -815,11 +807,11 @@ jobs:
 
       - name: Ensure Rust toolchain
         run: |
-          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # serve-26/27 (AIM) need Docker reachable on this host; without it they skip
       # silently. Say which it is, so a nightly that never ran them is visible.
