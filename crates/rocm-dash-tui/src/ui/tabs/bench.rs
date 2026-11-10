@@ -323,10 +323,19 @@ fn sparkline_max(data: &[u64]) -> u64 {
 /// then says how many of the rows actually carry one.
 ///
 /// Shared with the tests so they exercise this, rather than a copy of it.
-fn prompt_tps_series(rows: &[BenchmarkRow]) -> (Vec<u64>, String) {
-    let n = rows.len();
+///
+/// Takes an iterator rather than a slice: `bench_rows` is a `VecDeque` that
+/// evicts with `pop_front`, so once it has wrapped it is physically split and
+/// `as_slices().0` holds only the older half. A slice parameter quietly invited
+/// that call and dropped the newest rows from both the series and the count.
+fn prompt_tps_series<'a, I>(rows: I) -> (Vec<u64>, String)
+where
+    I: IntoIterator<Item = &'a BenchmarkRow>,
+{
+    let mut n = 0usize;
     let data: Vec<u64> = rows
-        .iter()
+        .into_iter()
+        .inspect(|_| n += 1)
         .filter_map(|r| r.prompt_tps)
         .map(|v| v.max(0.0) as u64)
         .collect();
@@ -339,7 +348,7 @@ fn prompt_tps_series(rows: &[BenchmarkRow]) -> (Vec<u64>, String) {
 }
 
 fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let (data, title) = prompt_tps_series(state.bench_rows.as_slices().0);
+    let (data, title) = prompt_tps_series(state.bench_rows.iter());
     let inner = panel::bento(f, area, Some(&title), BoxRole::Success, false, theme);
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -397,7 +406,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (data, title) = prompt_tps_series(&rows);
+        let (data, title) = prompt_tps_series(rows.iter());
         assert_eq!(data, vec![120, 90], "an unmeasured row reached the widget");
         assert_eq!(title, "prompt_tps · 2 of last 3 rows");
 
@@ -408,9 +417,80 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (data, title) = prompt_tps_series(&all_measured);
+        let (data, title) = prompt_tps_series(all_measured.iter());
         assert_eq!(data, vec![50, 50, 50]);
         assert_eq!(title, "prompt_tps · last 3 rows");
+    }
+
+    #[test]
+    fn the_drawn_panel_counts_a_wrapped_deque_in_full() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // Guards the call site, not just the helper: a unit test on
+        // `prompt_tps_series` cannot see what `draw_sparkline` hands it, so
+        // reinstating `as_slices().0` there would leave that test green.
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        // Built at a small capacity so it is physically split after a few
+        // evictions; `AppState`'s own deque reserves BENCH_CAP and would stay
+        // contiguous until hundreds of rows had gone through it.
+        let mut rows: std::collections::VecDeque<BenchmarkRow> =
+            std::collections::VecDeque::with_capacity(4);
+        for i in 0..7u32 {
+            if rows.len() == 4 {
+                rows.pop_front();
+            }
+            rows.push_back(BenchmarkRow {
+                prompt_tps: Some(f64::from(i) * 10.0),
+                ..Default::default()
+            });
+        }
+        assert!(
+            !rows.as_slices().1.is_empty(),
+            "fixture no longer wraps, so it cannot catch the bug"
+        );
+        state.bench_rows = rows;
+        let backend = TestBackend::new(60, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = state.theme;
+        term.draw(|f| draw_sparkline(f, f.area(), &state, &theme))
+            .unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            screen.contains("last 4 rows"),
+            "panel did not count the whole deque: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_deque_still_contributes_its_newest_rows() {
+        use std::collections::VecDeque;
+        // `bench_rows` evicts with `pop_front`, so a long session leaves the
+        // deque physically split. Reading only `as_slices().0` keeps the older
+        // half and silently drops the newest rows, which is exactly the half a
+        // "last N rows" panel exists to show.
+        let mut rows: VecDeque<BenchmarkRow> = VecDeque::with_capacity(4);
+        for i in 0..7u32 {
+            if rows.len() == 4 {
+                rows.pop_front();
+            }
+            rows.push_back(BenchmarkRow {
+                prompt_tps: Some(f64::from(i) * 10.0),
+                ..Default::default()
+            });
+        }
+        assert!(
+            !rows.as_slices().1.is_empty(),
+            "fixture no longer wraps, so it cannot catch the bug"
+        );
+        let (data, title) = prompt_tps_series(rows.iter());
+        assert_eq!(data, vec![30, 40, 50, 60], "newest rows were dropped");
+        assert_eq!(title, "prompt_tps · last 4 rows");
     }
 
     #[test]

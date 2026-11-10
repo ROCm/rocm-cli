@@ -254,9 +254,44 @@ async fn cpu_box_reports_core_count(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the CPU box did not report the core count: {e}"));
 }
 
+/// Cores for `dash-51`. The side-by-side split wants two columns per core on
+/// each half of the CPU slot, and Observe's centre column is about 116 columns
+/// at the detail geometry, so 16 cores clear it with room to spare while
+/// `IDLE_CORES` does not. Widening the terminal is not the lever: past a
+/// threshold Observe grows side docks and the centre column gets narrower.
+const SIDE_BY_SIDE_CORES: usize = 16;
+
+#[when("the user opens the dashboard replaying an idle 16-core host")]
+async fn open_dashboard_replaying_idle_16_core_host(world: &mut E2eWorld) {
+    replay_idle_host(world, SIDE_BY_SIDE_CORES, "idle-16-core-recording.ndjson");
+}
+
+#[then("the CPU graph and the per-core strip sit side by side")]
+async fn cpu_boxes_sit_side_by_side(world: &mut E2eWorld) {
+    // Both titles on one screen row is what separates this layout from the
+    // stacked one, where each box owns its own row.
+    session(world)
+        .wait_for_screen_where(
+            "the CPU and per-core titles share a row",
+            |screen| {
+                screen
+                    .lines()
+                    .any(|row| row.contains("CPU · ") && row.contains("Per-core · 16 cores"))
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the CPU boxes were not drawn side by side: {e}"));
+}
+
 #[when("the user opens the dashboard replaying an idle host")]
 async fn open_dashboard_replaying_idle_host(world: &mut E2eWorld) {
-    let per_core = (0..IDLE_CORES)
+    replay_idle_host(world, IDLE_CORES, "idle-host-recording.ndjson");
+}
+
+/// Replay a quiet host with `cores` idle cores: 2% overall, 1% each.
+fn replay_idle_host(world: &mut E2eWorld, cores: usize, file_name: &str) {
+    let per_core = (0..cores)
         .map(|_| "1.0".to_string())
         .collect::<Vec<_>>()
         .join(",");
@@ -270,9 +305,13 @@ async fn open_dashboard_replaying_idle_host(world: &mut E2eWorld) {
     );
     replay_recorded_snapshots_with_host(
         world,
-        "idle-host-recording.ndjson",
+        file_name,
         &host,
-        r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}"#,
+        // The GPU is given a load rather than left at 0: the widget draws an
+        // idle series as the same baseline run this scenario looks for, so a
+        // quiet GPU panel could satisfy the assertion without the CPU graph
+        // ever rendering.
+        r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"gpu_utilization_pct":55.0,"temperature_c":40.0,"power_w":90.0,"clock_mhz":null}"#,
         "",
         "",
     );
