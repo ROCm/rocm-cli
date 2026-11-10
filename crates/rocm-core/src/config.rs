@@ -723,13 +723,20 @@ impl RocmCliConfig {
     }
 
     /// One-shot migration of a legacy rocm-dash `config.toml` into the unified
-    /// JSON config. If no `config.json` exists yet **and** a legacy TOML is
-    /// present, its knobs are mapped into `dashboard` (and the canonical
-    /// `default_engine`/`engines`), `config.json` is written once, and the
-    /// migrated legacy path is returned so the caller can print a notice. The
-    /// TOML is left untouched. Returns `Ok(None)` when there is nothing to do
-    /// (already on the unified config, or no legacy file) — never clobbers an
-    /// existing `config.json`.
+    /// JSON config. If nothing is at the `config.json` path yet **and** a
+    /// legacy TOML is present, its knobs are mapped into `dashboard` (and the
+    /// canonical `default_engine`/`engines`), `config.json` is written once,
+    /// and the migrated legacy path is returned so the caller can print a
+    /// notice. The TOML is left untouched.
+    ///
+    /// Returns `Ok(None)` when there is nothing to do: no legacy file, or
+    /// anything at all already at the `config.json` path — a settings file,
+    /// but also a directory or a symbolic link, dangling or not. Only an empty
+    /// path is "no settings yet" here, so the migration never writes over,
+    /// beside or through something the user put there; `load` reports a
+    /// directory itself. Returns an error, writing nothing and leaving the TOML
+    /// alone, when a daemon tick is not a valid `Duration` (rocm-dash's own
+    /// reader rejects such a file) or the TOML cannot be read or parsed.
     pub fn migrate_legacy_dashboard_toml(paths: &AppPaths) -> Result<Option<PathBuf>> {
         let Some(legacy) = Self::legacy_dashboard_toml_path() else {
             return Ok(None);
@@ -743,8 +750,19 @@ impl RocmCliConfig {
         paths: &AppPaths,
         legacy: &Path,
     ) -> Result<Option<PathBuf>> {
-        if paths.config_path().is_file() || !legacy.is_file() {
+        if !legacy.is_file() {
             return Ok(None);
+        }
+        // `symlink_metadata`, not `exists`/`is_file`: a directory, or a link
+        // whose target is missing, is something the user put there, not an
+        // empty slot to migrate into.
+        match fs::symlink_metadata(paths.config_path()) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to check {}", paths.config_path().display()));
+            }
         }
 
         let raw = fs::read_to_string(legacy)
@@ -1366,6 +1384,58 @@ last_installed_runtime_id = "therock-release"
         let _ = fs::remove_dir_all(&root);
         assert!(migrated.is_some());
         assert!(loaded.is_ok());
+        Ok(())
+    }
+
+    /// Only an empty `config.json` path is "no settings yet". A directory
+    /// there (which `load` rejects) and a link whose target is missing are the
+    /// user's, so the migration writes nothing: not into the directory, not
+    /// through the link, and the TOML stays as it was.
+    #[test]
+    fn migrate_legacy_dashboard_toml_leaves_a_directory_or_link_at_config_json_alone() -> Result<()>
+    {
+        let legacy_text = "default_engine = \"vllm\"\n[tui]\ntheme = \"nord\"\n";
+
+        let (root, paths) = temp_app_paths("migrate-dash-dir-at-config");
+        fs::create_dir_all(paths.config_path())?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(&legacy, legacy_text)?;
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy);
+        let entries = fs::read_dir(paths.config_path())?.count();
+        let still_a_dir = paths.config_path().is_dir();
+        let legacy_after = fs::read_to_string(&legacy)?;
+        let leftovers: Vec<String> = fs::read_dir(&paths.config_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.json")
+            .collect();
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(migrated?, None, "migrated over a directory at config.json");
+        assert!(still_a_dir && entries == 0, "the directory was changed");
+        assert!(
+            leftovers.is_empty(),
+            "files were left beside it: {leftovers:?}"
+        );
+        assert_eq!(legacy_after, legacy_text);
+
+        #[cfg(unix)]
+        {
+            let (root, paths) = temp_app_paths("migrate-dash-dangling-link");
+            fs::create_dir_all(&paths.config_dir)?;
+            let target = root.join("dotfiles").join("rocm-config.json");
+            std::os::unix::fs::symlink(&target, paths.config_path())?;
+            let legacy = root.join("legacy-config.toml");
+            fs::write(&legacy, legacy_text)?;
+            let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy);
+            let target_written = target.exists();
+            let still_a_link = fs::symlink_metadata(paths.config_path())?
+                .file_type()
+                .is_symlink();
+            fs::remove_dir_all(&root).ok();
+            assert_eq!(migrated?, None, "migrated through a dangling link");
+            assert!(!target_written, "the link's target was created");
+            assert!(still_a_link, "the link was replaced");
+        }
         Ok(())
     }
 
