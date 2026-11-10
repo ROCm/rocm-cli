@@ -674,3 +674,44 @@ Feature: GPU detection and system inspection
     Given a machine whose uname prints a kernel release and then fails
     When the user inspects that machine in machine-readable form
     Then neither the summary nor the examination reports a kernel release, and neither calls it a failure
+
+  # `rocm examine --json` reads the CPU twice: the host summary (`summary.cpu`,
+  # which the text form prints as `cpu:`) and the examination (`cpu_model` and
+  # `cpu_vendor`). They used to read `/proc/cpuinfo` separately and spelled the
+  # same model differently; they share one reader now, so one `--json` run holds
+  # the two level on a specific value, not only on both being filled.
+  #
+  # The planted machine is a simulated host root holding only a `/proc/cpuinfo`,
+  # so the scenario describes a CPU no runner has, and it is not WSL whatever the
+  # runner is: the comparison is scoped to hosts where `is_wsl` is false, because
+  # on WSL the examination does not read the CPU at all (`examine-47`). The model
+  # in `/proc/cpuinfo` has repeated spaces, which the examination used to keep and
+  # the summary to collapse. Native Windows reads the same CPU through the system
+  # inventory and cannot run on this lane; the unit tests in
+  # `crates/rocm-core/src/host_gpu/os_facts.rs` cover it.
+  @id:examine-reports-one-cpu-in-both-forms @requires-os:linux
+  Scenario: examine-45 - The summary and the examination report the same CPU model and its vendor
+    Given a machine that is not WSL whose cpuinfo names an AMD CPU with repeated spaces in its model
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that CPU model, and the examination reports its vendor as amd
+
+  # A board whose cpuinfo has a `Hardware` line and no `model name` (an Arm board)
+  # showed a CPU in the summary and none in the examination. Both read the
+  # `Hardware` line now, and the vendor stays unknown because such a file names
+  # none.
+  @id:examine-reports-a-hardware-line-cpu-in-both-forms @requires-os:linux
+  Scenario: examine-46 - Both reports name a CPU that cpuinfo gives only as Hardware
+    Given a machine that is not WSL whose cpuinfo has a Hardware line and no model name
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that CPU model, and the examination reports its vendor as unknown
+
+  # The difference this change leaves as it is: on WSL the examination returns
+  # before it reads the CPU, so `cpu_model` is empty and `cpu_vendor` is
+  # `unknown` while the summary shows the CPU. Pinned so that collecting CPU
+  # facts on WSL is a visible change of its own, which would turn this scenario.
+  # The other two scenarios compare the two reports on hosts that are not WSL.
+  @id:examine-reports-no-cpu-model-on-wsl-where-the-summary-has-one @requires-os:linux
+  Scenario: examine-47 - On WSL the summary reports the CPU and the examination does not
+    Given a WSL machine whose cpuinfo names an AMD CPU
+    When the user inspects that machine in machine-readable form
+    Then the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor
