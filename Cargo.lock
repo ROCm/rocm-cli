@@ -3905,6 +3905,8 @@ dependencies = [
 name = "rocm-engine-protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "libc",
  "proptest",
  "rocm-core",
  "serde",
@@ -3932,6 +3934,7 @@ dependencies = [
  "async-stream",
  "axum",
  "clap",
+ "libc",
  "rocm-core",
  "rocm-engine-protocol",
  "serde",
