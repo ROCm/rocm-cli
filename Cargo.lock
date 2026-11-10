@@ -3888,6 +3888,7 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "object",
  "proptest",
  "rocm-core",
  "rocm-deps",

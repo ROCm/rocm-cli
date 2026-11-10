@@ -41,6 +41,23 @@ const EMBEDDABLE_WINDOWS_SHA256: &str =
 const EMBEDDABLE_LINUX_SHA256: &str =
     "16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90";
 
+/// What the `lemond` in the pinned Linux archive needs from the host, read with
+/// `objdump -T lemond` (the newest `GLIBC_*` and `OPENSSL_*` versions listed).
+/// A host older than either is refused before download and before `lemond`
+/// starts; see [`crate::host_libraries`]. Like the digests, these belong to one
+/// release: re-read them on every bump and record that archive's digest here,
+/// which a unit test holds equal to [`EMBEDDABLE_LINUX_SHA256`]. Lemonade
+/// 2026.45.3's `lemond`, for one, needs glibc 2.43 and OpenSSL 3.2.0, which
+/// Ubuntu 24.04 does not have; that is why the pin stays at 2026.44.1
+/// (<https://github.com/lemonade-sdk/lemonade/issues/4123>).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const LINUX_LEMOND_NEEDS: crate::host_libraries::LemondHostNeeds =
+    crate::host_libraries::LemondHostNeeds {
+        archive_sha256: "16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90",
+        glibc: "2.38",
+        openssl: "3.0.0",
+    };
+
 /// Embeddable asset token and archive extension for the host this adapter runs
 /// on. Only `windows-x64` and `ubuntu-x64` are wired up here; the release also
 /// publishes `macos-arm64` and `ubuntu-arm64`, which this adapter never selects.
@@ -806,6 +823,24 @@ mod tests {
             );
         }
         assert_ne!(EMBEDDABLE_LINUX_SHA256, EMBEDDABLE_WINDOWS_SHA256);
+    }
+
+    /// The host-library needs were read from the archive that is pinned: a bump
+    /// that records a new Linux digest without re-reading `lemond`'s glibc and
+    /// OpenSSL needs fails here, instead of refusing hosts by the old needs.
+    #[test]
+    fn linux_lemond_needs_belong_to_the_pinned_linux_archive() {
+        assert_eq!(
+            LINUX_LEMOND_NEEDS.archive_sha256, EMBEDDABLE_LINUX_SHA256,
+            "re-read the pinned lemond's needs with `objdump -T lemond` and record \
+             them for this archive"
+        );
+        for need in [LINUX_LEMOND_NEEDS.glibc, LINUX_LEMOND_NEEDS.openssl] {
+            assert!(
+                crate::host_libraries::LibVersion::parse(need).is_some(),
+                "{need:?} is not a version"
+            );
+        }
     }
 
     #[test]

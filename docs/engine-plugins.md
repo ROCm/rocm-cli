@@ -143,7 +143,18 @@ derived from it, so the tree cannot end up holding two different versions of
 the same runtime. A Lemonade bump also records the new release's archive
 digests (`EMBEDDABLE_LINUX_SHA256` and `EMBEDDABLE_WINDOWS_SHA256` in
 [install.rs](../engines/lemonade/src/install.rs)): the downloaded archive is
-checked against them, and a digest cannot be derived from the version.
+checked against them, and a digest cannot be derived from the version. It also
+re-reads what the new Linux `lemond` needs from the host, the newest `GLIBC_*`
+and `OPENSSL_*` versions `objdump -T lemond` lists, into `LINUX_LEMOND_NEEDS`
+beside those digests; a unit test fails until that record names the new Linux
+archive. On Linux, `rocm engines install lemonade` refuses a host whose glibc
+or OpenSSL is older than that before downloading anything, and the engine
+refuses to start that `lemond` on such a host, naming the version needed and
+the version the host has for each library
+([host_libraries.rs](../engines/lemonade/src/host_libraries.rs)). Lemonade
+2026.44.1, the current pin, needs glibc 2.38 and OpenSSL 3.0.0, which Ubuntu
+24.04 meets; 2026.45.3's `lemond` needs glibc 2.43 and OpenSSL 3.2.0, which it
+does not.
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.

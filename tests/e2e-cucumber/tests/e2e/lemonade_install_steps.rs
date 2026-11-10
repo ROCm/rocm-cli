@@ -8,7 +8,8 @@
 //! Black-box throughout. The two Lemonade trees and the install record are
 //! planted as plain files in the layout the engine writes, so no scenario
 //! downloads anything; the refusal scenario reaches the engine's free-space
-//! check through the `rocm/e2e-test-hooks` override instead of a full drive.
+//! check through the `rocm/e2e-test-hooks` override instead of a full drive,
+//! and the host-library refusal through the same build's library override.
 
 use std::path::PathBuf;
 
@@ -129,6 +130,65 @@ async fn assert_lemonade_install_refused(world: &mut E2eWorld) {
     let tree = data_folder_tree(world);
     // The claim "Nothing was downloaded" is checked against the disk: no
     // archive cache and no extracted runtime.
+    assert!(
+        !tree.join("downloads").exists(),
+        "an archive was downloaded despite the refusal:\n{output}"
+    );
+    assert!(
+        !tree.join("runtime").exists(),
+        "a runtime was extracted despite the refusal:\n{output}"
+    );
+    assert!(
+        !install_record(world).exists(),
+        "a refused install must not record Lemonade as installed:\n{output}"
+    );
+}
+
+/// Host library versions older than any Lemonade build needs. Reported through
+/// the `rocm/e2e-test-hooks` override, so the refusal is reached on a host
+/// whose real glibc and OpenSSL are new.
+const OLD_HOST_GLIBC: &str = "2.17";
+const OLD_HOST_OPENSSL: &str = "1.1.1";
+
+#[given("this host's glibc and OpenSSL are older than the pinned Lemonade server needs")]
+async fn host_libraries_too_old(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_LEMONADE_HOST_GLIBC", OLD_HOST_GLIBC.into()));
+    world
+        .command_env
+        .push(("ROCM_E2E_LEMONADE_HOST_OPENSSL", OLD_HOST_OPENSSL.into()));
+}
+
+/// The refusal names, for each library, the version needed and the version
+/// the host has, says nothing was downloaded, and that is true on disk.
+#[then("the Lemonade install is refused for the host's libraries before anything is downloaded")]
+async fn assert_lemonade_install_refused_for_host_libraries(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    // Without the hook the engine sees this host's real libraries and starts a
+    // real install. Name that cause rather than a baffling mismatch.
+    assert!(
+        output.contains("this host's libraries are too old for the Lemonade "),
+        "no host-library refusal: the binary under test was probably built without \
+         the `rocm/e2e-test-hooks` feature, which `cargo xtask e2e` enables:\n{output}"
+    );
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the install must fail on a host too old for the pinned Lemonade server:\n{output}"
+    );
+    for expected in [
+        format!("or newer (this host has glibc {OLD_HOST_GLIBC})"),
+        format!("or newer (this host has OpenSSL {OLD_HOST_OPENSSL})"),
+        "it needs glibc ".to_owned(),
+        "Nothing was downloaded.".to_owned(),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "missing `{expected}`:\n{output}"
+        );
+    }
+    let tree = data_folder_tree(world);
     assert!(
         !tree.join("downloads").exists(),
         "an archive was downloaded despite the refusal:\n{output}"

@@ -16,7 +16,8 @@ Feature: Lemonade installs on disk
   # None downloads anything or needs a GPU, so all run on the mock lane every PR.
   # lemonade-installs-01 and -02 need the `rocm/e2e-test-hooks` build
   # `cargo xtask e2e` makes, to report a nearly full drive without filling a
-  # real one.
+  # real one; lemonade-installs-07 needs it to report old host libraries on a
+  # host whose libraries are new.
 
   @id:lemonade-installs-refused-without-space
   Scenario: lemonade-installs-01 - A Lemonade install the drive cannot hold is refused before downloading
@@ -62,3 +63,13 @@ Feature: Lemonade installs on disk
     Then the report does not say that copy is removed with its ROCm install
     When the user uninstalls the ROCm install holding Lemonade
     Then that Lemonade copy is still on disk
+
+  # The pinned Linux Lemonade server links against a minimum glibc and OpenSSL.
+  # On an older host it used to exit with a loader error that reached the user
+  # only as "Lemonade server did not become ready"; the install now refuses
+  # first and names both versions. Linux only: Windows has no such floor.
+  @id:lemonade-installs-refused-on-too-old-host-libraries @requires-os:linux
+  Scenario: lemonade-installs-07 - A Lemonade install on a host with too old glibc and OpenSSL is refused before downloading
+    Given this host's glibc and OpenSSL are older than the pinned Lemonade server needs
+    When the user installs the Lemonade engine
+    Then the Lemonade install is refused for the host's libraries before anything is downloaded
