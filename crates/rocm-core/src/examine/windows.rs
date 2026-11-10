@@ -5,7 +5,7 @@
 //! The native Windows probes: the GPU query, the HIP SDK, the Adrenalin driver and
 //! the MSVC redistributable.
 
-use super::linux_gpus::{classify_amd_marketing_name, gfx_is_apu_family};
+use super::linux_gpus::{classify_amd_marketing_name, gfx_apu_verdict, gfx_is_apu_family};
 use super::{Examination, Gpu};
 use crate::probe_exec::{MEDIUM, run};
 use std::path::Path;
@@ -30,7 +30,7 @@ pub(super) fn probe_gpus_windows(e: &mut Examination) {
 /// Split out from [`probe_gpus_windows`] so the parsing can be driven with
 /// synthetic `Win32_VideoController` output -- there is no Windows host to run
 /// the real probe against in this test suite.
-fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
+pub(super) fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
     for line in out.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -79,8 +79,7 @@ fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
         // the brand.
         let (gfx_target, is_apu) = match crate::host_gpu::gfx_target_from_pnp_device_id(&pnp) {
             // `gfx_is_apu_family` knows the answer whenever the id resolved a
-            // target; the name heuristic's `is_apu` guess is only consulted
-            // when nothing identified the part.
+            // target; the name table is only consulted when the id did not.
             Some(target) => (target.to_owned(), gfx_is_apu_family(target)),
             None => classify_amd_marketing_name(&name),
         };
@@ -154,18 +153,18 @@ pub(super) fn probe_hip_sdk_windows(e: &mut Examination) {
 /// prints a block for a card the PCI-id table resolved, but that card is no
 /// longer an empty slot, so a naive "first empty slot" walk hands *its*
 /// architecture to the next card along. The concrete case: a Radeon 680M
-/// (resolved to `gfx1035` from its device id) beside an RX 6800M (in neither
-/// table). `hipInfo` prints gfx1035 then gfx1031; the first line finds the 6800M
-/// as the only empty slot and makes it a `gfx1035` APU. That inverts both
-/// `has_apu` and `has_discrete_amd`, which gate `fix-9-igpu-dgpu`, and the
-/// second line is then dropped — the discrete card ends up described as the
-/// integrated one.
+/// (resolved to `gfx1035` from its device id) beside a discrete RX 6800M whose
+/// row neither table resolved. `hipInfo` prints gfx1035 then gfx1031; the first
+/// line finds the 6800M as the only empty slot and makes it a `gfx1035` APU.
+/// That inverts both `has_apu` and `has_discrete_amd`, which gate
+/// `fix-9-igpu-dgpu`, and the second line is then dropped — the discrete card
+/// ends up described as the integrated one.
 ///
 /// So an architecture already held by an identified GPU is consumed rather than
 /// assigned: one line per holder, by count, not by presence. Counting matters —
 /// two identical cards print the same name twice, and dropping every repeat
 /// would leave the second one unidentified forever.
-fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
+pub(super) fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
     // What the earlier, better probes already answered. Each of these has a
     // `gcnArchName` block of its own coming, which belongs to it.
     let mut already_identified: Vec<String> = gpus
@@ -191,7 +190,16 @@ fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
         else {
             continue;
         };
-        gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+        // Same rule as `apply_rocminfo_gpu_agents`: a target whose packaging is
+        // known outranks the display probe's verdict, an unknown one leaves it.
+        // Today the two branches cannot disagree here: a row reaches this loop
+        // only with an empty target, and the Windows probe gives every such row
+        // the "not an APU" default, so an unknown target leaves exactly what an
+        // overwrite with `gfx_is_apu_family`'s `false` would. The rule is kept
+        // so the hipInfo fold cannot quietly drift from the rocminfo one.
+        if let Some(is_apu) = gfx_apu_verdict(&gfx) {
+            gpu.is_apu = Some(is_apu);
+        }
         gpu.gfx_target = gfx;
     }
 }
@@ -320,7 +328,7 @@ mod tests {
         // ROCMAI-546: the real host this ticket was filed against. Windows
         // reports Renoir/Cezanne's Vega iGPU under the generic marketing name
         // "AMD Radeon(TM) Graphics", which `classify_amd_marketing_name` does
-        // not recognize (it only maps Phoenix/Strix-and-newer names) -- so
+        // not resolve (the generic name names no part) -- so
         // without the PCI-id lookup this host's `gfx_target` stays empty and
         // `info-20-gpu-no-rocm-support` can never fire on it.
         let out = "AMD Radeon(TM) Graphics\t31.0.21004.7\tPCI\\VEN_1002&DEV_1636&SUBSYS_12341002&REV_C8\\4&1a2b3c4d&0&0008";
@@ -339,7 +347,7 @@ mod tests {
         // Barcelo-R laptop (PNP id 164d), but `gfx_is_apu_family` used to have
         // no gfx103x arm at all, so a real iGPU reported `is_apu: Some(false)`
         // -- the opposite of what the marketing-name path ("AMD Radeon 680M")
-        // would have said via `APU_KEYWORDS`. That silently suppressed
+        // would have said. That silently suppressed
         // `fix-9-igpu-dgpu` detection on exactly the iGPU+dGPU host shape this
         // PR is otherwise improving detection for.
         let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\\3&11583659&0&08";
@@ -396,8 +404,8 @@ mod tests {
     /// (`check_9_igpu_dgpu_collision`), and both are derived from `is_apu` by
     /// `summarise_gpu_categories`. A Rembrandt iGPU reported as discrete does
     /// not merely carry a wrong field: it turns the gate off on the one host
-    /// shape the check exists for. Note the dGPU's marketing name carries no
-    /// APU keyword either way, so nothing here rests on `APU_KEYWORDS`.
+    /// shape the check exists for. Both rows resolve by device id here, so
+    /// nothing in this test rests on the marketing-name table.
     #[test]
     fn a_rembrandt_laptop_with_a_discrete_card_opens_the_igpu_dgpu_gate() {
         let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\n\
@@ -428,7 +436,7 @@ mod tests {
     /// identify.
     ///
     /// Concretely: a Radeon 680M resolved to gfx1035 from its device id, beside
-    /// an RX 6800M that is in neither table. `hipInfo` prints gfx1035 then
+    /// an RX 6800M the probe left unidentified. `hipInfo` prints gfx1035 then
     /// gfx1031. Unguarded, the 6800M becomes a gfx1035 APU, `has_discrete_amd`
     /// goes false, `has_apu` is the only flag left, and `fix-9-igpu-dgpu` is
     /// suppressed on the one host shape it exists for.
@@ -442,8 +450,10 @@ mod tests {
                 is_apu: Some(true),
                 ..Gpu::default()
             },
-            // In neither table: no device-id arm, and "RX 6800M" carries no APU
-            // keyword, so it arrives here genuinely unidentified.
+            // Unidentified on arrival: the probe resolved no target for this
+            // row, so it carries the "not an APU" default. (The name table does
+            // know "RX 6800M"; the row stands for any card whose name and
+            // device id both miss.)
             Gpu {
                 name: "AMD Radeon RX 6800M".to_owned(),
                 is_amd: true,
