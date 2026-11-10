@@ -35,7 +35,40 @@ pub struct AppPaths {
     pub cache_dir: PathBuf,
 }
 
+/// The variable that moves where engine virtualenvs live (see
+/// [`AppPaths::engine_envs_root`]), and the one `rocm` sets on an engine child
+/// that must install into a particular root.
+pub const ENGINE_ENVS_ROOT_ENV: &str = "ROCM_CLI_ENGINE_ENVS_ROOT";
+
+/// The variable that moves the config root.
+pub const CONFIG_DIR_ENV: &str = "ROCM_CLI_CONFIG_DIR";
+/// The variable that moves the data root (and, unless it is set too, the cache
+/// root that follows it).
+pub const DATA_DIR_ENV: &str = "ROCM_CLI_DATA_DIR";
+/// The variable that moves the cache root.
+pub const CACHE_DIR_ENV: &str = "ROCM_CLI_CACHE_DIR";
+
 impl AppPaths {
+    /// The three `ROCM_CLI_*_DIR` variables that make a child process run on
+    /// these roots, in the order config, data, cache. [`Self::discover`] reads
+    /// the same three back, so a child started with these finds the roots its
+    /// parent was given.
+    pub fn env_vars(&self) -> [(&'static str, &Path); 3] {
+        [
+            (CONFIG_DIR_ENV, self.config_dir.as_path()),
+            (DATA_DIR_ENV, self.data_dir.as_path()),
+            (CACHE_DIR_ENV, self.cache_dir.as_path()),
+        ]
+    }
+
+    /// Set [`Self::env_vars`] on `command`, so the child it starts runs on these
+    /// roots.
+    pub fn apply_env(&self, command: &mut std::process::Command) {
+        for (key, value) in self.env_vars() {
+            command.env(key, value);
+        }
+    }
+
     /// Resolve the config, data and cache dirs from the environment and
     /// `config.json`.
     ///
@@ -48,10 +81,10 @@ impl AppPaths {
     /// does, and the AIM engine then keeps its state file in the working
     /// directory, as it already did when no data dir could be found.
     pub fn discover() -> Result<Self> {
-        let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
-        let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
+        let data_dir_override = env_path_override(DATA_DIR_ENV);
+        let cache_dir_override = env_path_override(CACHE_DIR_ENV);
         let paths = Self::from_overrides(PathOverrides {
-            config: env_path_override("ROCM_CLI_CONFIG_DIR"),
+            config: env_path_override(CONFIG_DIR_ENV),
             data: data_dir_override.clone(),
             cache: cache_dir_override.clone(),
         })?;
@@ -174,7 +207,7 @@ impl AppPaths {
     /// dropped; `engine_envs_dir_reads_its_root_from_the_environment` is what
     /// keeps the lookup honest meanwhile.
     pub fn engine_envs_root(&self) -> PathBuf {
-        self.engine_envs_root_from(env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref())
+        self.engine_envs_root_from(env_path_override(ENGINE_ENVS_ROOT_ENV).as_deref())
     }
 
     /// [`Self::engine_envs_root`] against a caller-supplied override.
@@ -576,6 +609,42 @@ mod tests {
 
     use crate::RocmCliConfig;
     use crate::test_support::temp_app_paths;
+
+    /// `env_vars` and `discover` share one constant per name, so they cannot
+    /// disagree; the names themselves are what a child process and a user's
+    /// shell see, so they are pinned here.
+    #[test]
+    fn apply_env_sets_exactly_the_three_roots_on_a_command() {
+        let (_root, paths) = temp_app_paths("apply-env");
+        let mut command = std::process::Command::new("true");
+        paths.apply_env(&mut command);
+        let mut set: Vec<_> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+            .collect();
+        let expected: Vec<_> = paths
+            .env_vars()
+            .iter()
+            .map(|(key, value)| ((*key).into(), Some(value.as_os_str().to_owned())))
+            .collect();
+        let mut expected = expected;
+        set.sort();
+        expected.sort();
+        assert_eq!(set, expected);
+    }
+
+    #[test]
+    fn env_vars_pair_each_root_with_its_public_variable_name() {
+        let (_root, paths) = temp_app_paths("env-vars");
+        assert_eq!(
+            paths.env_vars(),
+            [
+                ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()),
+                ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
+                ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
+            ]
+        );
+    }
 
     /// For every `config.json` that `load` accepts, discovery reads the
     /// recorded folder as `load` does: the saved `therock_venv`, trimmed, and

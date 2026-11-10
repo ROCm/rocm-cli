@@ -316,9 +316,12 @@ fn engine_serve_http_args(
     if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(gpu_indices) {
         args.extend(["--gpu".to_owned(), csv]);
     }
-    args.extend(crate::common::optional_arg("--runtime-id", runtime_id));
-    args.extend(crate::common::optional_arg("--env-id", env_id));
-    args.extend(crate::common::optional_arg(
+    args.extend(rocm_engine_protocol::optional_arg(
+        "--runtime-id",
+        runtime_id,
+    ));
+    args.extend(rocm_engine_protocol::optional_arg("--env-id", env_id));
+    args.extend(rocm_engine_protocol::optional_arg(
         "--engine-recipe-json",
         engine_recipe_json,
     ));
@@ -886,18 +889,18 @@ fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
             .unwrap_or("gpu_required")
             .to_owned(),
     ];
-    args.extend(crate::common::optional_arg(
+    args.extend(rocm_engine_protocol::optional_arg(
         "--runtime-id",
         record.runtime_id.as_deref(),
     ));
-    args.extend(crate::common::optional_arg(
+    args.extend(rocm_engine_protocol::optional_arg(
         "--env-id",
         record.env_id.as_deref(),
     ));
     if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&record.gpu_indices) {
         args.extend(["--gpu".to_owned(), csv]);
     }
-    args.extend(crate::common::optional_arg(
+    args.extend(rocm_engine_protocol::optional_arg(
         "--engine-recipe-json",
         record.engine_recipe_json.as_deref(),
     ));

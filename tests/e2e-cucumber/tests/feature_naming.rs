@@ -33,6 +33,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("diagnose.feature", "diagnose"),
     ("download_progress_pty.feature", "download-progress"),
     ("driver_install.feature", "driver-install"),
+    ("engine_ipc.feature", "engine-ipc"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
