@@ -72,6 +72,18 @@ regexes = [
 ]
 
 [[allowlists]]
+description = "Model names and runtime keys: identifiers, not credentials"
+# `generic-api-key` fires on any identifier containing "key" that is followed by
+# a high-entropy-looking string. These field names hold a model name
+# ("Qwen3-0.6B-GGUF") or the key that names an installed runtime
+# ("wheel-gfx942-7.13.0"); the Rust unit tests assign literal values to them.
+# Anchored on the identifier and the assignment, like the entry above.
+regexTarget = "match"
+regexes = [
+  '''(?i)\b(runtime_key|api_model)\s*[:=]\s*"''',
+]
+
+[[allowlists]]
 description = "Public artifact digests (variable names ending in SHA256/512/MD5)"
 # SHA-256/512/MD5 hashes of public artifacts are not secrets.
 regexTarget = "line"
