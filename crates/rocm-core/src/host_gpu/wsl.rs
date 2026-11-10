@@ -193,15 +193,32 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 /// Deliberately not routed through [`host_path`]: these are programs this
 /// process executes, not files it reads to describe the machine, and a
 /// simulated host root holds no working linker to run. The e2e suite answers
-/// the bare `ldconfig` with a stand-in on `PATH` instead; the absolute
-/// fallbacks still reach the real host's linker when `PATH` has none.
+/// the bare `ldconfig` with a stand-in on `PATH` instead, so on a simulated
+/// host only that one is asked (see [`ldconfig_programs`]).
 pub(crate) fn ldconfig_cache() -> Option<String> {
-    for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
-        if let Some(text) = capture_optional_command(program, &["-p"]) {
-            return Some(text);
-        }
+    ldconfig_cache_with(|program| capture_optional_command(program, &["-p"]))
+}
+
+/// [`ldconfig_cache`] with the program runner supplied, so a test can see which
+/// `ldconfig`s it asks: the [`ldconfig_programs`] for whether the probes are
+/// reading a simulated host, in order, until one answers.
+fn ldconfig_cache_with(mut run: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    ldconfig_programs(crate::hardware_root::host_is_simulated())
+        .iter()
+        .find_map(|program| run(program))
+}
+
+/// The `ldconfig`s to ask, in order. A real host also tries the conventional
+/// absolute paths, since `/sbin` is often off a user's `PATH`. A simulated host
+/// asks only the one on `PATH`: an absolute path is the real host's linker,
+/// which would answer for the machine the suite runs on, so a simulated
+/// machine without `ldconfig` must read as "could not ask".
+const fn ldconfig_programs(simulated: bool) -> &'static [&'static str] {
+    if simulated {
+        &["ldconfig"]
+    } else {
+        &["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"]
     }
-    None
 }
 
 /// Whether the linker cache lists ROCDXG, or `None` if it could not be read.
@@ -455,6 +472,55 @@ mod tests {
     use super::*;
     use crate::host_gpu::tests::{CountingSources, pnputil_host};
     use crate::host_gpu::windows_inventory::{InventoryScope, assemble_windows_inventory};
+
+    #[test]
+    fn a_simulated_host_never_asks_the_real_hosts_ldconfig() {
+        assert_eq!(ldconfig_programs(true), ["ldconfig"]);
+        let real = ldconfig_programs(false);
+        assert_eq!(real.first(), Some(&"ldconfig"));
+        assert!(real.contains(&"/sbin/ldconfig") && real.contains(&"/usr/sbin/ldconfig"));
+    }
+
+    /// The linker-cache probe asks the `ldconfig`s of the host it is reading:
+    /// with a simulated root set in a hook build, only the one on `PATH`, so a
+    /// simulated machine without one reads as "could not ask"; without a root,
+    /// the absolute fallbacks too.
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn the_linker_cache_probe_follows_a_simulated_root() {
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Which programs were asked, with a root set to `root`, when the first
+        // `answers` of them answer and the rest do not.
+        let probe = |root: &str, answers: usize| {
+            let _root = crate::test_env::RestoredEnvVar::set(
+                crate::hardware_root::TEST_HOST_ROOT_ENV,
+                std::path::Path::new(root),
+            );
+            let mut programs = Vec::new();
+            let cache = ldconfig_cache_with(|program| {
+                programs.push(program.to_owned());
+                (programs.len() <= answers).then(|| format!("cache from {program}"))
+            });
+            (cache, programs)
+        };
+        assert_eq!(
+            probe("/nonexistent/simulated-host", 0),
+            (None, vec!["ldconfig".to_owned()])
+        );
+        let (cache, real) = probe("", 0);
+        assert_eq!(cache, None);
+        assert_eq!(real, ldconfig_programs(false));
+        // The first program that answers ends the search.
+        assert_eq!(
+            probe("", 1),
+            (
+                Some("cache from ldconfig".to_owned()),
+                vec!["ldconfig".to_owned()]
+            )
+        );
+    }
 
     /// A host that answers but has no AMD adapter reads as `NoAmdDisplay`; a host
     /// where no source answers reads as `Unreachable`. The CPU and RAM answer is

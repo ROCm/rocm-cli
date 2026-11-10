@@ -358,7 +358,12 @@ Some reads stay on the real machine even in a hook build:
   re-rooted read under them is the ROCDXG file check above, which looks for its
   two files under each discovered install's path inside the simulated root.
 - The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
-  the probes execute, such as `ldconfig`.
+  the probes execute, such as `ldconfig`, which are found on `PATH`. With a
+  simulated root set, the WSL ROCDXG check asks only the `ldconfig` on `PATH`
+  and not its `/sbin` and `/usr/sbin` fallbacks, so that a simulated machine
+  without one reads as "could not ask" instead of answering from the real
+  machine's linker cache. A build without the hook has no root and keeps the
+  fallbacks.
 - Every package-manager plan, which reads the real `/etc/os-release` (with the
   same `/usr/lib/os-release` fallback): the OpenMPI, libatomic and libnuma
   install hints, and the driver, OpenMPI and runtime-library installs `rocm`
