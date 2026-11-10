@@ -3135,7 +3135,7 @@ cargo test -p rocm --bin rocm every_lemonade_catalog_recipe_resolves_to_a_servab
 
 The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 `rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
-It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
+It carries `@requires-real-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
 the vLLM half falls to the Instinct lane. Those lanes do run on pull requests

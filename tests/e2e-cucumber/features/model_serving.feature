@@ -689,7 +689,7 @@ Feature: Model serving
   # watcher enabled, serve now starts no helper; the scenario's fresh config
   # has none enabled. The helper's own lifecycle once a watcher is on is
   # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
-  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  @id:serve-stop-leaves-no-background-helper @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
@@ -772,7 +772,7 @@ Feature: Model serving
   # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
   # apps/rocm/src/service_launch/launch_transaction.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
-  @id:serve-explicit-port-reserved @requires-gpu @merge-queue
+  @id:serve-explicit-port-reserved @requires-real-gpu @merge-queue
   Scenario: serve-45 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
@@ -785,12 +785,12 @@ Feature: Model serving
   # `resolve_serve_port` never reaches the "reserved by managed service" branch
   # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
   # routing to `explicit_bind_error`'s "already in use by another process"
-  # message. Needs the same `@requires-gpu` as serve-45 for the same reason:
+  # message. Needs the same `@requires-real-gpu` as serve-45 for the same reason:
   # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
   # completed model/GPU resolution in hand (GPU indices are selected earlier in
   # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
   # `serve` has no CPU fallback that gets there.
-  @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
+  @id:serve-explicit-port-in-use-by-untracked-process @requires-real-gpu @merge-queue
   Scenario: serve-46 - Serving on a port an untracked process already holds is refused
     Given a managed runtime is active
     And the default serve port is occupied
@@ -802,7 +802,7 @@ Feature: Model serving
   # the legacy default while one real managed GPU serve starts; the reported
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
-  @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
+  @id:serve-auto-port-skips-occupied @requires-real-gpu @merge-queue
   Scenario: serve-47 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
@@ -812,7 +812,7 @@ Feature: Model serving
   # An explicit --port is a demand: when an equivalent service (same engine and
   # model) is already live on a different port, serve refuses instead of
   # reporting success on the old port. Same planted record and lane as serve-24.
-  @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
+  @id:serve-explicit-port-refused-for-live-equivalent @requires-real-gpu @requires-engine:lemonade @requires-os:linux
   Scenario: serve-48 - An explicit port that differs from a running equivalent service is refused
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
@@ -838,7 +838,7 @@ Feature: Model serving
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
   # Tool use is translated for non-streaming requests (serve-53); a streaming
   # request that offers tools is refused, which only the unit tests cover.
-  @id:serve-anthropic-endpoint-advertised @requires-gpu
+  @id:serve-anthropic-endpoint-advertised @requires-real-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
     And a model is being served on GPU
@@ -846,7 +846,7 @@ Feature: Model serving
     Then the service details include an Anthropic-compatible messages endpoint
     And the service details still include the existing OpenAI-compatible endpoint
 
-  @id:serve-anthropic-messages-inference @requires-gpu
+  @id:serve-anthropic-messages-inference @requires-real-gpu
   Scenario: serve-51 - A served model responds to an Anthropic Messages API request
     Given a managed runtime is active
     And a model is being served on GPU
@@ -854,7 +854,7 @@ Feature: Model serving
     Then the response is a valid Anthropic Messages API response
     And the Anthropic response identifies the correct model
 
-  @id:serve-anthropic-endpoint-readiness @requires-gpu
+  @id:serve-anthropic-endpoint-readiness @requires-real-gpu
   Scenario: serve-52 - Readiness covers the Anthropic-compatible endpoint
     Given a managed runtime is active
     And a model is being served on GPU
@@ -863,7 +863,7 @@ Feature: Model serving
 
   # ROCMAI-920: tool use is translated in both directions. A request offering
   # one tool and requiring it gets a `tool_use` block back.
-  @id:serve-anthropic-messages-tool-use @requires-gpu
+  @id:serve-anthropic-messages-tool-use @requires-real-gpu
   Scenario: serve-53 - A served model handles tool use via the Anthropic Messages API
     Given a managed runtime is active
     And a model is being served on GPU
@@ -871,7 +871,7 @@ Feature: Model serving
     Then the response contains a tool_use content block
     And the tool_use block names a tool and arguments from the request
 
-  @id:serve-anthropic-messages-streaming @requires-gpu
+  @id:serve-anthropic-messages-streaming @requires-real-gpu
   Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
     Given a managed runtime is active
     And a model is being served on GPU
@@ -889,7 +889,7 @@ Feature: Model serving
   # Deliberately NOT tagged @requires-engine: the engine is the CLI's to pick
   # here, and pinning one would make the harness attribute the run to an engine
   # the scenario never asked for. The host's own default engine is what gates it.
-  @id:serve-small-assistant-short-name @requires-gpu
+  @id:serve-small-assistant-short-name @requires-real-gpu
   Scenario: serve-55 - The recommended small assistant serves from its short name alone
     Given a managed runtime is active
     And the recommended small assistant is being served by its short name
