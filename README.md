@@ -17,13 +17,13 @@ SPDX-License-Identifier: MIT
  ██║  ██║╚██████╔╝╚██████╗██║ ╚═╝ ██║    ╚██████╗███████╗██║
  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝     ╚═╝     ╚═════╝╚══════╝╚═╝
 
-        Local AI on AMD GPUs — one binary, zero setup
+        Local AI on AMD GPUs — one install, zero setup
 ```
 
 ROCm CLI is a command-line tool for setting up and running local AI on AMD GPUs, with a
 full-screen terminal user interface (TUI) dashboard for GPU telemetry, model serving, and chat.
 
-It ships as a single prebuilt binary for Linux and Windows (x86_64), needs no
+It ships as prebuilt binaries (`rocm` and `rocmd`) for Linux and Windows (x86_64), needs no
 Python, Rust, or existing ROCm install, and includes inference engine adapters
 for Lemonade and vLLM.
 
