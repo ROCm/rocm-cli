@@ -40,6 +40,9 @@ fi
 
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
+# A lane runs on a real GPU, so it runs the @requires-real-gpu scenarios that a
+# simulated machine cannot stand in for; without this they would all skip.
+export E2E_HARDWARE="${E2E_HARDWARE-real}"
 
 # The channels are checked before anything is built, so a typo costs nothing.
 # Each at most once: a repeat would rerun into the same pre-warm tree and

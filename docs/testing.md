@@ -787,7 +787,11 @@ real-GPU scenarios. A missing one would skip them just as quietly, so
 `every_self_hosted_lane_runs_the_real_gpu_scenarios` in
 [workflow_contract.rs](../xtask/src/workflow_contract.rs) fails when a
 self-hosted lane does not set `E2E_HARDWARE: real`, when a WSL lane does not
-forward it through `WSLENV`, or when a GitHub-hosted job sets it. To run them locally on a GPU host:
+forward it through `WSLENV`, when anything else in a workflow sets it (a
+GitHub-hosted job, the workflow-level `env:`, a `run:` script), or when
+[run-e2e-lane.sh](../scripts/run-e2e-lane.sh), which the shared-GPU-queue
+lanes run, stops exporting it, exports it only after running the suite, or
+names it on any other line. To run them locally on a GPU host:
 
 ```bash
 E2E_HARDWARE=real cargo xtask e2e
