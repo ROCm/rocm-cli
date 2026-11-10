@@ -71,7 +71,7 @@ syn = { version = "2", default-features = false, features = ["full", "parsing", 
 # acceptable cost for a preflight check. Unlisted mounts are detected by the
 # device-ID cross-check in `rocm-core::disk_space` and reported as unknown,
 # which never blocks an install.
-sysinfo = { version = "0.39", features = ["linux-tmpfs"] }
+sysinfo = { version = "0.40", features = ["linux-tmpfs"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [workspace.lints.rust]
