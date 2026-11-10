@@ -11,6 +11,9 @@ use super::launch_transaction::{
     ManagedPortDecision, ManagedReuseRefusal, abandon_failed_managed_launch,
     managed_service_reuse_refusal, no_usable_gpu_refusal, resolve_managed_port_in_transaction,
 };
+// Both are reached only from the Unix early-exit branch below; the Windows
+// branch has no `try_wait()` of its own to land in.
+#[cfg(not(windows))]
 use super::readiness::{managed_service_stop_was_requested, mark_service_failed};
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
@@ -25,8 +28,6 @@ use crate::service_hints;
 use crate::services_text::read_optional_tail_lines;
 use crate::{device_policy_name, record_cli_audit_event};
 use anyhow::{Context, Result, bail};
-#[cfg(windows)]
-use rocm_core::process_is_running;
 use rocm_core::{AppPaths, ManagedServiceRecord};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 use std::fs;
