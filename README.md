@@ -289,7 +289,7 @@ form works depends on the engine your GPU selects.
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
-| `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus a text-only Anthropic `/v1/messages` endpoint) |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
@@ -545,6 +545,14 @@ a family of GPUs, or none), or you want to target a different GPU, also pass
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
 ```
 
+The `--dry-run` preview downloads no `uv` and creates no `tools` folder. For ROCm
+10 and newer, `uv pip compile` is what chooses the `torch` and `torchvision`
+versions, so the preview runs a `uv` that is already installed and gives the
+complete plan. With none installed it can't, and it says so in a
+`resolution_note:` line: the package specs, runtime key, install folder, manifest
+and `command:` (everything made from those versions) read `not resolved by this
+preview`, and a real install fetches `uv` and resolves them.
+
 A family label such as `--family gfx120X-all` is rejected for those versions
 instead of being resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
@@ -754,6 +762,28 @@ being followed. The two archive rows the report prints are tagged
 `note: can be downloaded again; safe to remove`, so it is visible which rows
 `remove-downloads` acts on.
 
+The report also lists `Engine installs`: each Lemonade copy on disk and its
+size. Lemonade installs into the active ROCm runtime's own folder when one is
+active and into the data folder otherwise, so a machine that installed
+Lemonade before its first SDK can hold two full copies (about 25 GiB each). The
+copy Lemonade runs from is `in use`. A copy it is not using right now is marked
+`not used right now`, which is not a promise it stays unused: Lemonade installs
+into the active ROCm runtime's folder, so a copy inside a ROCm install is reused
+as soon as that install becomes active, and is never marked reclaimable. Only
+the data folder's copy, which no ROCm install owns, is marked reclaimable, and
+nothing removes it automatically: delete its `runtime`, `downloads` and `extract`
+folders to free the space. A copy is only called unused when Lemonade's install
+record points at another copy that is really there: if the record names a folder
+with no install, or cannot be read, the report says so and marks no copy
+reclaimable. A copy inside a runtime folder
+also counts toward that runtime's size. `rocm runtimes uninstall` removes it
+with the runtime and clears Lemonade's install record, so Lemonade is no longer
+recorded as installed; it says so when the record could not be cleared, and when
+it could not be read it names `rocm engines install lemonade`, which rewrites
+the record and keeps a current install.
+For an external or imported runtime, uninstall only unregisters it, so its
+Lemonade copy stays and the report does not say otherwise.
+
 The report also lists `local server records`: one JSON record plus the engine's
 log for each `rocm serve --managed` launch, kept after the server stops.
 `rocm services list --all` lists them, and no `rocm storage` command removes
@@ -782,6 +812,18 @@ pins from the cached Lemonade archive (it does not download), prints a warning,
 and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
+
+Before Lemonade writes a new install, whether from `rocm engines install
+lemonade` or the first `rocm serve` that needs it, it prints the folder it is
+installing into, the download (up to about 4.4 GiB) and disk use (up to about
+25 GiB) of its llama.cpp ROCm backend, and any Lemonade install it is not
+reusing. Those are upper bounds: Lemonade picks the backend after the install
+starts, and a smaller one needs less. So it stops before downloading only when
+the drive cannot hold Lemonade itself (about 16 MiB), and with less room than
+the ROCm backend or the finished install it warns and continues. An install that
+replaces the existing one (`--reinstall`, or a new Lemonade version) deletes it
+first, so its space counts as free and the notice says so. On Windows the
+backend download's own progress appears in the console.
 
 `--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
 libnuma), including a `sudo` password prompt. `engines install` never asks for
@@ -950,6 +992,25 @@ rocm serve <model> [--engine lemonade|vllm|aim]
                    [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
                    [--engine-env KEY=VALUE]...
 ```
+
+Alongside the OpenAI-compatible endpoint, a served model gets an
+Anthropic-compatible `/v1/messages` endpoint, shown as `anthropic endpoint:` in
+`rocm services list` and in the interactive `rocm serve` summary (a fresh launch
+waits briefly for it; if it is not there yet, check `rocm services list`). It is
+a text-only, non-streaming endpoint. It is a base URL: point an
+Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
+if the service has one, as `x-api-key` (the translation front also accepts a
+bearer token). `rocm` runs a
+translation front on its own port, inside the serving process, so it starts and
+stops with the service; it fronts the engine even when the engine has its own
+`/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
+answers, and the reply names it. The translation covers text turns, system
+prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`;
+streaming, tool use (`tools`, `tool_choice`), extended thinking and image or
+other non-text content blocks are refused with
+an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
+marks the endpoint `(not responding)` when a ready service's endpoint does not
+answer.
 
 `--engine aim` runs the model in a Docker container instead of a host
 process; it requires a reachable Docker daemon and is Linux/WSL2 only.
@@ -1573,12 +1634,19 @@ non-zero too, after printing its log.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
-and `--yes` to skip the confirmation. It does not create the folders it reports
-on: with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there
-is nothing to remove. Outside an interactive terminal, when there is something
-to remove, it refuses with exit code 1 and removes nothing unless you pass
-`--yes`. Each `--keep-*` flag skips the removal of one category:
+do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
+Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
+exits with code 0. Any other answer cancels the same way, after a line saying
+that the answer was not understood and is treated as no. Use `--dry-run` to only
+list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
+is a separate opt-in for development builds. At a terminal, a dry run that finds
+something to remove ends by saying to run the same command again without
+`--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
+(its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
+with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
+nothing to remove. Outside an interactive terminal, when there is something to
+remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
+Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.

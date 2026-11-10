@@ -423,7 +423,9 @@ rocm model --verbose"
     },
     /// Start a local OpenAI-compatible model server.
     ///
-    /// Picks an engine and ROCm runtime automatically unless overridden. By default the
+    /// Picks an engine and ROCm runtime automatically unless overridden. A text-only,
+    /// non-streaming Anthropic `/v1/messages` endpoint is published beside the OpenAI
+    /// one (see `rocm services list`). By default the
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, smoke-test metrics, and the backend device the engine
     /// reports it is running on). The device line is read back from the running server, so
@@ -692,6 +694,10 @@ rocm logs --search error timeout")]
     /// PATH change the installer made (its marked shell-profile block, or the
     /// user PATH entry it recorded adding on Windows), unless other programs
     /// share the install folder.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm uninstall --dry-run\n  \
+rocm uninstall\n  \
+rocm uninstall --keep-data --yes")]
     Uninstall {
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
@@ -719,6 +725,11 @@ rocm logs --search error timeout")]
         /// Allow removing development binaries inside the current build tree.
         #[arg(long)]
         force_dev_binaries: bool,
+        /// Not an option; accepted only to say so. Without it clap answers a
+        /// mistyped `--force` (a likely guess for skipping the confirmation)
+        /// with `--force-dev-binaries`, which removes development binaries.
+        #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "")]
+        force: Option<String>,
     },
 }
 
@@ -810,6 +821,11 @@ rocm install sdk --devel")]
         #[arg(long)]
         devel: bool,
         /// Resolve the install plan without changing files.
+        ///
+        /// Downloads no uv and prepares no Python. For ROCm 10 and newer on a
+        /// host with no uv installed, the plan marks the package versions it
+        /// would need uv to choose, and everything made from them, as not
+        /// resolved.
         #[arg(long)]
         dry_run: bool,
         /// Approve replacing the current active default ROCm runtime (and
@@ -1469,7 +1485,7 @@ impl PermissionsModeArg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cli_command, device_policy_name, engine_inventory};
+    use crate::{cli_command, device_policy_name, engine_inventory, uninstall::reject_force};
     use clap::{CommandFactory, Parser};
     use rocm_engine_protocol::DevicePolicy;
 
@@ -2419,6 +2435,124 @@ mod tests {
         assert_eq!(uninstall.get_all_aliases().count(), 0);
         Cli::try_parse_from(["rocm", "uninstal"])
             .expect_err("an abbreviated subcommand name must not reach uninstall");
+    }
+
+    /// `--force` is a likely guess for "skip the confirmation", and without a
+    /// declared `--force` clap answers it, and every near miss of it, with
+    /// `--force-dev-binaries`, which removes the binaries of a development build.
+    /// The scenario `uninstall-mistyped-force-is-not-answered-with-a-destructive-flag`
+    /// proves the real binary's output; this pins the parse behind it.
+    #[test]
+    fn a_mistyped_force_never_reaches_the_dev_binaries_flag() {
+        // `--force` itself parses, so the handler can say what to use instead.
+        let cli = Cli::try_parse_from(["rocm", "uninstall", "--force"]).unwrap();
+        let Some(Command::Uninstall {
+            force,
+            force_dev_binaries,
+            ..
+        }) = cli.command
+        else {
+            panic!("not an uninstall command");
+        };
+        assert!(force.is_some() && !force_dev_binaries);
+        let refusal = reject_force(force.is_some()).unwrap_err().to_string();
+        assert!(refusal.contains("`--force` is not an option"), "{refusal}");
+        assert!(refusal.contains("--yes"), "{refusal}");
+        assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
+        assert!(reject_force(false).is_ok());
+        // `--force=x` is the same mistake, and gets the same answer rather than
+        // a usage line that lists every flag.
+        let cli = Cli::try_parse_from(["rocm", "uninstall", "--force=x"]).unwrap();
+        let Some(Command::Uninstall { force, .. }) = cli.command else {
+            panic!("not an uninstall command");
+        };
+        assert!(reject_force(force.is_some()).is_err());
+
+        // Near misses and the forms clap suggests from elsewhere in the command
+        // line never offer the destructive flag.
+        for args in [
+            vec!["uninstall", "--forc"],
+            vec!["uninstall", "--forcee"],
+            vec!["uninstall", "--keep-binaries", "--forc"],
+            vec!["uninstall", "-f"],
+            vec!["--force", "uninstall"],
+        ] {
+            let error = cli_command()
+                .try_get_matches_from(std::iter::once("rocm").chain(args.iter().copied()))
+                .unwrap_err();
+            let rendered = error.render().to_string();
+            assert!(
+                !rendered.contains("force-dev-binaries"),
+                "{args:?} was answered with the destructive flag:\n{rendered}"
+            );
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+
+        // The guard depends on clap offering the hidden `--force` as the
+        // suggestion for a near miss: its candidates are every declared long
+        // name, hidden or not. If a clap upgrade stopped suggesting hidden
+        // arguments, `--forc` would be answered with `--force-dev-binaries`
+        // again, so the near misses must name `--force` and not the
+        // destructive flag. The two checks together are independent of
+        // clap's wording around the suggestion.
+        for args in [
+            vec!["uninstall", "--forc"],
+            vec!["uninstall", "--keep-binaries", "--forc"],
+        ] {
+            let rendered = cli_command()
+                .try_get_matches_from(std::iter::once("rocm").chain(args.iter().copied()))
+                .unwrap_err()
+                .render()
+                .to_string();
+            assert!(
+                rendered.contains("--force") && !rendered.contains("force-dev-binaries"),
+                "{args:?} must be steered to the declared `--force`, not the destructive flag:\n{rendered}"
+            );
+        }
+
+        // The whole flag misspelled is still met with the flag it was meant to be.
+        let error = cli_command()
+            .try_get_matches_from(["rocm", "uninstall", "--force-dev-binary"])
+            .unwrap_err()
+            .render()
+            .to_string();
+        assert!(error.contains("--force-dev-binaries"), "{error}");
+
+        // It stays out of the help.
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("Not an option"), "{help}");
+    }
+
+    /// The help leads with the safe preview, then the real run, as the tip a
+    /// person reads before running a command that deletes things.
+    #[test]
+    fn uninstall_help_shows_a_dry_run_before_the_real_run() {
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .expect("uninstall subcommand")
+            .render_long_help()
+            .to_string();
+        let examples = help.split_once("EXAMPLES:").map_or_else(
+            || panic!("`rocm uninstall --help` has no examples:\n{help}"),
+            |(_, rest)| rest,
+        );
+        let rows: Vec<&str> = examples
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            rows.first().copied(),
+            Some("rocm uninstall --dry-run"),
+            "{examples}"
+        );
+        assert!(rows.contains(&"rocm uninstall"), "{examples}");
     }
 
     #[test]

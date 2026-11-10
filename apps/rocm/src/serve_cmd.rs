@@ -866,8 +866,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
     // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
     // not have.
+    //
+    // The scripted free-space override opens the same waiver: it exists to refuse a
+    // Lemonade install on a drive that cannot hold it, which `rocm serve` only
+    // reaches past this bail.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
-        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+        && [
+            "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
+            "ROCM_E2E_LEMONADE_FREE_SPACE_BYTES",
+        ]
+        .iter()
+        .any(|variable| std::env::var_os(variable).is_some());
     if !cpu_only
         && !scripted_backend_failure
         && !e2e_simulate_oom_launch()
@@ -1266,6 +1275,24 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 engine_serves_vllm,
             );
             notes.extend(engine_env_notes.iter().cloned());
+            // Published by the serving process shortly after the engine lists its
+            // model. A service that was already running published it long ago, so
+            // only a fresh launch is waited for.
+            let anthropic_endpoint = rocm_core::wait_for_published_anthropic_endpoint(
+                &paths.service_engine_state_path(&selected_engine, &report.service_id),
+                if report.already_running || report.status != "ready" {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs(5)
+                },
+            );
+            if anthropic_endpoint.is_none() && !report.already_running && report.status == "ready" {
+                notes.push(
+                    "the Anthropic-compatible endpoint was not published yet; it appears as \
+                     `anthropic endpoint:` in `rocm services list` once the engine lists its model"
+                        .to_owned(),
+                );
+            }
             // A managed serve that failed on VRAM lands here not-ready with the OOM
             // traceback only in its own log. Read that log tail so the summary can
             // name the memory knobs, since the pre-launch low-VRAM warning cannot
@@ -1298,6 +1325,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 requested_model: model,
                 api_model: resolve.served_model_name().to_owned(),
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
+                anthropic_endpoint,
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
                 device,
@@ -1307,7 +1335,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 notes,
             };
             // Same intentional one-time key display as `print_managed_launch_plain`
-            // in service_launch.rs; see its rationale for why the tag below is currently inert.
+            // in service_launch/start.rs; see its rationale for why the tag below is
+            // currently inert.
             // codeql[rust/cleartext-logging]
             print!("{}", serve_summary::render_summary(&summary));
         } else {

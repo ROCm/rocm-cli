@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Automations manager overlay (Phase 3 Wave 3).
+//! Automations manager overlay.
 //!
 //! Lists the background checks ("watchers", plumbed in from the bin which owns
 //! `rocm-core`) and toggles them via the `rocm automations …` verbs:
