@@ -1035,6 +1035,181 @@ mod tests {
         .to_string()
     }
 
+    /// A completion whose message asks for `calls`, each `(tool, arguments)`.
+    fn tool_call_completion_body(calls: &[(&str, serde_json::Value)]) -> String {
+        let tool_calls = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                serde_json::json!({
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() },
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "choices": [{"message": {"content": "", "tool_calls": tool_calls}}]
+        })
+        .to_string()
+    }
+
+    /// A question none of the chat's own shortcuts answers, so the model is
+    /// asked and its tool calls are the ones that run.
+    const OPEN_CHAT_QUESTION: &str = "I would like some help figuring out what to do with my GPU";
+
+    /// What a one-shot chat turn left behind: what `rocm chat --prompt` would
+    /// print (it prints only an `Ok`), and the state the refusal message says
+    /// the turn did not change.
+    struct OneShotTurn {
+        rendered: Result<String>,
+        /// The install folder the model asked for, or its parent, exists
+        /// after the turn.
+        prefix_created: bool,
+        /// The managed services after the turn, by id; the planted assistant
+        /// is the only one before it.
+        service_ids: Vec<String>,
+        /// Runtimes registered after the turn; there are none before it.
+        registered_runtimes: usize,
+    }
+
+    /// Ask the one-shot chat, with ROCm tools, against a local model that
+    /// answers once with the body `make_body` builds from the folder the
+    /// model's calls name (inside this test's own root, so whether it was
+    /// created can be checked).
+    fn one_shot_chat_against(
+        name: &str,
+        make_body: impl FnOnce(&str) -> String,
+    ) -> Result<OneShotTurn> {
+        let (root, paths) = temp_app_paths(name);
+        paths.ensure()?;
+        let prefix = root.join("R&D").join("rocm");
+        let body = make_body(&prefix.to_string_lossy());
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            vec![body],
+        );
+        ready_builtin_planner_service(&paths, port)?;
+        let rendered = crate::chat::render_chat_prompt_text(
+            &paths,
+            "local",
+            None,
+            OPEN_CHAT_QUESTION,
+            true,
+            crate::ChatInferenceParams::default(),
+        );
+        assert_eq!(
+            server.join().expect("server thread")?,
+            1,
+            "the model is asked once"
+        );
+        let registry = crate::runtime_registry::runtime_registry_dir(&paths);
+        let turn = OneShotTurn {
+            rendered,
+            prefix_created: prefix.exists() || prefix.parent().is_some_and(std::path::Path::exists),
+            service_ids: crate::managed_service_status::load_managed_services(&paths)?
+                .into_iter()
+                .map(|record| record.service_id)
+                .collect(),
+            registered_runtimes: fs::read_dir(&registry).map_or(0, Iterator::count),
+        };
+        let _ = fs::remove_dir_all(root);
+        Ok(turn)
+    }
+
+    /// The state a refused turn must leave: nothing printed (so no
+    /// `advanced manual command:` line and no approval reaches the user), no
+    /// folder created, no server started, no runtime registered.
+    fn assert_nothing_changed_and_nothing_offered(turn: &OneShotTurn) {
+        assert!(turn.rendered.is_err(), "a refused turn prints nothing");
+        assert!(!turn.prefix_created, "the folder must not be created");
+        assert_eq!(
+            turn.service_ids,
+            ["svc-qwen-planner"],
+            "no server may start"
+        );
+        assert_eq!(turn.registered_runtimes, 0, "no runtime may be registered");
+    }
+
+    fn install_into(prefix: &str) -> serde_json::Value {
+        serde_json::json!({ "channel": "release", "format": "wheel", "prefix": prefix })
+    }
+
+    /// The calls in the provider's reply are the model's, so the model-only
+    /// rules apply to them through the real turn: a folder with `&` is refused,
+    /// and the message's claim (nothing changed, nothing offered to paste) is
+    /// checked against the state the turn left. The same folder from the
+    /// user's own prompt is accepted:
+    /// `a_folder_the_user_typed_is_rendered_whatever_it_holds`.
+    #[test]
+    fn a_model_reply_asking_for_an_unsafe_folder_is_refused_through_the_chat_turn() -> Result<()> {
+        let turn = one_shot_chat_against("chat-model-unsafe-folder", |prefix| {
+            tool_call_completion_body(&[("install_sdk", install_into(prefix))])
+        })?;
+        assert_nothing_changed_and_nothing_offered(&turn);
+        let error = turn.rendered.expect_err("refused").to_string();
+        assert!(
+            error.contains("'&'")
+                && error.contains("supply it yourself by running `rocm install sdk`"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A refusal after a read-only check and an approvable call the same reply
+    /// asked for: the check ran, and the approvable call's command line is not
+    /// printed either, so "nothing was changed, and no command was offered"
+    /// holds for the whole turn, not only for the refused call.
+    #[test]
+    fn a_refusal_after_earlier_calls_says_and_leaves_nothing_changed() -> Result<()> {
+        let turn = one_shot_chat_against("chat-model-refusal-after-check", |prefix| {
+            tool_call_completion_body(&[
+                ("path_exists", serde_json::json!({ "path": "/" })),
+                ("install_sdk", install_into(&prefix.replace("R&D", "plain"))),
+                ("install_sdk", install_into(prefix)),
+            ])
+        })?;
+        assert_nothing_changed_and_nothing_offered(&turn);
+        let error = turn
+            .rendered
+            .expect_err("the third call is refused")
+            .to_string();
+        assert!(
+            error.contains(
+                "Nothing was changed, and no command was offered to paste for this call."
+            ) && !error.contains("Nothing was run"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A model's request handed to the planner comes back with the values it
+    /// chose on the plan's `tool_call:` lines; those are held to the same
+    /// rules before the plan is shown.
+    #[test]
+    fn a_plan_for_a_model_request_with_an_unsafe_folder_is_refused() -> Result<()> {
+        let turn = one_shot_chat_against("chat-model-unsafe-plan", |prefix| {
+            tool_call_completion_body(&[(
+                "natural_language_plan",
+                serde_json::json!({ "request": format!("install therock into {prefix}") }),
+            )])
+        })?;
+        assert_nothing_changed_and_nothing_offered(&turn);
+        let error = turn
+            .rendered
+            .expect_err("the plan's folder must be refused")
+            .to_string();
+        assert!(
+            error.starts_with("the plan for the local assistant's request")
+                && error.contains("'&'"),
+            "{error}"
+        );
+        Ok(())
+    }
+
     fn ready_builtin_planner_service(paths: &AppPaths, port: u16) -> Result<()> {
         let mut qwen = ManagedServiceRecord::new(
             paths,
@@ -1130,7 +1305,7 @@ mod tests {
         // The fix: one build, reused for both the rendered text and the next
         // action. This is exactly what `plan_freeform_request_with_context`
         // (what `natural_language_plan` calls today) does.
-        let (text, action) =
+        let (text, action, _) =
             crate::freeform_planner::plan_freeform_request_with_context("serve", &paths, &config);
         let action = action.expect("provider-resolved plan should produce a next action");
         assert!(

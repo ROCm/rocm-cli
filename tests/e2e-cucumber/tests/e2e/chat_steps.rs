@@ -203,7 +203,7 @@ async fn assert_model_generated_reply(world: &mut E2eWorld) {
     assert!(!content.is_empty(), "empty reply in chat response: {resp}");
 }
 
-// ── Model output reaching the terminal (chat-18, chat-19) ──────────
+// ── Model output reaching the terminal (chat-17, chat-18, chat-19) ──
 
 /// The model id the CLI's built-in assistant is served under; see the same
 /// constant in `planner_steps.rs` for why the harness repeats it.
@@ -224,7 +224,9 @@ const CONCEALED_REPLY_TEXT: &str = " --port 9";
 fn hostile_reply() -> String {
     format!(
         "Run rocm serve qwen\u{1b}[8m{CONCEALED_REPLY_TEXT}\u{1b}[28m --managed\n\
-         \u{1b}]0;rocm\u{7}\u{1b}]52;c;aGVsbG8=\u{7}\u{9d}0;rocm\u{9c}Done."
+         \u{1b}]0;rocm\u{7}\u{1b}]52;c;aGVsbG8=\u{7}\u{9d}0;rocm\u{9c}Done.\n\
+         An open title\u{1b}]0;never closed\n\
+         Still here."
     )
 }
 
@@ -280,7 +282,7 @@ async fn assistant_asks_for_an_ampersand_folder(world: &mut E2eWorld) {
 
 #[when("the user asks the chat assistant with ROCm tools a question in one-shot chat")]
 async fn user_asks_the_assistant_a_question(world: &mut E2eWorld) {
-    // The exit code is checked by the `Then` steps: chat-19 expects a refusal.
+    // The exit code is checked by the `Then` steps: chat-18 expects a refusal.
     let (stdout, stderr, rc) = crate::run_rocm(
         world,
         &[
@@ -297,8 +299,10 @@ async fn user_asks_the_assistant_a_question(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-/// The characters a terminal acts on, in whatever the CLI wrote: everything
-/// `char::is_control` covers apart from newline and tab.
+/// The control characters in whatever the CLI wrote, apart from newline and
+/// tab. `char::is_control` rather than the CLI's own predicate, so the check
+/// does not share a gap with the code it checks; the scripted replies carry
+/// only controls (ESC, BEL and the 8-bit introducers), so it sees all of them.
 fn terminal_controls(text: &str) -> Vec<char> {
     text.chars()
         .filter(|character| character.is_control() && !matches!(character, '\n' | '\t'))
@@ -325,6 +329,12 @@ async fn cli_output_has_no_escape(world: &mut E2eWorld) {
         !output.contains("aGVsbG8=") && !output.contains("0;rocm"),
         "an escape sequence's payload reached the output:\n{output:?}"
     );
+    // A sequence left open costs the rest of its own line, never the lines
+    // after it.
+    assert!(
+        output.contains("An open title\nStill here."),
+        "a line after an unterminated sequence was lost:\n{output:?}"
+    );
 }
 
 #[then("the hidden part of the reply is shown in plain text")]
@@ -340,8 +350,11 @@ async fn hidden_reply_text_is_shown(world: &mut E2eWorld) {
     );
 }
 
-#[then("the CLI refuses the assistant's folder and tells the user to supply it themselves")]
-async fn cli_refuses_the_assistants_folder(world: &mut E2eWorld) {
+/// The refusal the one-shot chat turn ended with, on stderr: the turn failed,
+/// the assistant was asked once (so the refusal came from its reply), and the
+/// message names the `&` and the command the user can run with the value.
+/// The state is checked in the step after: nothing offered to paste.
+fn refused_ampersand_value(world: &E2eWorld) -> &str {
     let stdout = world.cli_output.as_deref().expect("no command was run");
     let stderr = world.cli_stderr.as_deref().unwrap_or_default();
     let rc = world.cli_rc.expect("no command was run");
@@ -356,8 +369,6 @@ async fn cli_refuses_the_assistants_folder(world: &mut E2eWorld) {
         1,
         "the assistant must have been asked once, and the refusal must come from its reply"
     );
-    // The message, asserted with the state checked in the next step: it names
-    // the character and the command the user can run with the value.
     assert!(
         stderr.contains("'&'")
             && stderr.contains(
@@ -369,20 +380,62 @@ async fn cli_refuses_the_assistants_folder(world: &mut E2eWorld) {
         terminal_controls(stderr).is_empty(),
         "the refusal reached the terminal with control characters:\n{stderr:?}"
     );
+    stderr
 }
 
-#[then("no command line holding that folder is offered to paste, and nothing is installed")]
-async fn nothing_offered_and_nothing_installed(world: &mut E2eWorld) {
+#[then("the CLI refuses the assistant's folder and tells the user to supply it themselves")]
+async fn cli_refuses_the_assistants_folder(world: &mut E2eWorld) {
+    let stderr = refused_ampersand_value(world);
+    assert!(
+        stderr.contains("local assistant chose the argument"),
+        "the refusal must be the one for the assistant's own call:\n{stderr}"
+    );
+}
+
+#[given(
+    "a local chat assistant that asks for a plan to install ROCm into a folder whose name holds an ampersand"
+)]
+async fn assistant_asks_for_a_plan_into_an_ampersand_folder(world: &mut E2eWorld) {
+    let prefix = crate::e2e::therock_steps::ampersand_folder(world)
+        .to_string_lossy()
+        .into_owned();
+    start_scripted_assistant(
+        world,
+        vec![chat_tool_call_reply(
+            BUILTIN_ASSISTANT_MODEL_ID,
+            "natural_language_plan",
+            &serde_json::json!({ "request": format!("install therock into {prefix}") }),
+        )],
+    )
+    .await;
+}
+
+#[then("the CLI refuses the plan for the assistant's request")]
+async fn cli_refuses_the_plan_for_the_assistants_request(world: &mut E2eWorld) {
+    let stderr = refused_ampersand_value(world);
+    assert!(
+        stderr.contains("the plan for the local assistant's request chose the argument"),
+        "the refusal must be the one for the plan, not for the call:\n{stderr}"
+    );
+}
+
+#[then("no command line holding that folder is offered to paste")]
+async fn no_line_holding_the_folder_is_offered(world: &mut E2eWorld) {
+    // The refusal is on stderr; stdout is where the transcript, and with it the
+    // `advanced manual command:` line and the approval it stands for, would
+    // have been. The whole turn is withheld, so stdout is empty: nothing at all
+    // was offered. `rocm chat --prompt` never makes a change itself, so there
+    // is no folder or server to look for; the unit tests in `providers.rs`
+    // check that state through the same chat turn.
     let stdout = world.cli_output.as_deref().expect("no command was run");
     assert!(
-        !stdout.contains("advanced manual command")
-            && !stdout.contains(crate::e2e::therock_steps::AMPERSAND_FOLDER_NAME),
-        "no line naming the assistant's folder may be offered:\n{stdout}"
+        stdout.is_empty(),
+        "a refused turn must print nothing to stdout:\n{stdout}"
     );
-    let folder = crate::e2e::therock_steps::ampersand_folder(world);
+    // stderr carries the refusal, which quotes the value, but no command line.
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
     assert!(
-        !folder.exists(),
-        "nothing may be installed into {}",
-        folder.display()
+        !stderr.contains("advanced manual command:") && !stderr.contains("tool_call:"),
+        "a refused turn must offer no command line on stderr either:\n{stderr}"
     );
 }

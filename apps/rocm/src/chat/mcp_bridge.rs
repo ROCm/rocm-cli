@@ -254,7 +254,8 @@ pub(crate) fn run_internal_mcp_call(
             // same `StructuredRequestPlan`, so a provider-assisted plan (not
             // guaranteed deterministic across calls) cannot describe one
             // command in `text` and a different one in `action`.
-            let (text, action) = plan_freeform_request_with_context(&request, paths, &config);
+            let (text, action, planned_args) =
+                plan_freeform_request_with_context(&request, paths, &config);
             let action = action.map(|action| {
                 serde_json::json!({
                     "args": action.args,
@@ -269,6 +270,10 @@ pub(crate) fn run_internal_mcp_call(
                     "request": request,
                     "text": text,
                     "action": action,
+                    // Every action's argv, as its `tool_call:` line in `text`
+                    // prints it, so a caller can hold a model's request to the
+                    // model-only rules (`tool_policy::validate_model_chosen_plan`).
+                    "planned_args": planned_args,
                 }),
             ))
         }

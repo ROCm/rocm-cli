@@ -58,7 +58,7 @@ pub(crate) use crate::tool_policy::{
 };
 pub(crate) use crate::tool_policy::{
     chat_tool_approval_request, chat_tool_call_is_read_only, validate_chat_tool_call,
-    validate_model_chosen_tool_call,
+    validate_model_chosen_plan_result, validate_model_chosen_tool_call,
 };
 use crate::{ChatInferenceParams, providers};
 use anyhow::{Context, Result};
@@ -126,23 +126,30 @@ fn piped_prompt_from_input(input: &str) -> Option<String> {
 }
 
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
-    let status = providers::provider_status(paths, provider)?;
+    Ok(render_chat_status_text(&providers::provider_status(
+        paths, provider,
+    )?))
+}
+
+/// The `rocm chat` status screen for `status`. The model names come from a
+/// provider's or a local server's listing, which this process did not write,
+/// so each is sanitized on its own before it is composed with the screen's
+/// lines; everything else on the screen is this process's own text.
+fn render_chat_status_text(status: &providers::ProviderStatus) -> String {
+    use rocm_core::terminal::sanitize_terminal_text;
     let mut output = String::new();
     let _ = writeln!(output, "Chat assistant");
     let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Assistant source: {}",
-        if status.provider == "local" {
-            "local model on this computer"
-        } else {
-            status.provider.as_str()
-        }
-    );
+    let source = if status.provider == "local" {
+        "local model on this computer".to_owned()
+    } else {
+        sanitize_terminal_text(&status.provider)
+    };
+    let _ = writeln!(output, "Assistant source: {source}");
     let _ = writeln!(
         output,
         "Status: {}",
-        plain_provider_auth_status(&status.auth_status)
+        sanitize_terminal_text(&plain_provider_auth_status(&status.auth_status))
     );
     let _ = writeln!(
         output,
@@ -157,8 +164,8 @@ pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<Strin
         let _ = writeln!(output, "Models: none found yet");
     } else {
         let _ = writeln!(output, "Models:");
-        for model in status.models {
-            let _ = writeln!(output, "  - {model}");
+        for model in &status.models {
+            let _ = writeln!(output, "  - {}", sanitize_terminal_text(model));
         }
     }
     let _ = writeln!(output);
@@ -167,9 +174,7 @@ pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<Strin
         "Choose Chat source to switch between local and remote assistants."
     );
     let _ = writeln!(output, "Choose Settings to manage saved keys and defaults.");
-    // The model names come from a provider or a local server's listing, which
-    // this process did not write.
-    Ok(rocm_core::terminal::sanitize_terminal_text(&output))
+    output
 }
 
 fn plain_provider_auth_status(status: &str) -> String {
@@ -232,6 +237,29 @@ pub(crate) fn parse_positive_u32(value: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status screen prints model names a server listed and a provider
+    /// name from configuration: each is printed with its escape sequences
+    /// removed, and one left open cannot take the screen's own lines with it.
+    #[test]
+    fn the_status_screen_prints_listed_names_without_their_escapes() {
+        let status = providers::ProviderStatus {
+            provider: "remote\u{1b}]0;title\u{7}x".to_owned(),
+            auth_status: "ready".to_owned(),
+            models: vec![
+                "qwen\u{1b}]0;never closed".to_owned(),
+                "llama\u{9b}2K".to_owned(),
+            ],
+            tool_call_schema: String::new(),
+        };
+        assert_eq!(
+            render_chat_status_text(&status),
+            "Chat assistant\n\nAssistant source: remotex\nStatus: Ready\nROCm help: not available\n\
+             Models:\n  - qwen\n  - llama\n\n\
+             Choose Chat source to switch between local and remote assistants.\n\
+             Choose Settings to manage saved keys and defaults.\n"
+        );
+    }
 
     #[test]
     fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {

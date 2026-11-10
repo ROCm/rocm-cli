@@ -77,7 +77,16 @@ impl RocmToolExecutor for BinToolExecutor {
         {
             return RocmToolOutcome::Error(e.to_string());
         }
-        self.execute(name, args)
+        let outcome = self.execute(name, args);
+        // The plan for a request the model wrote holds values the model chose
+        // on its `tool_call:` lines, so it is checked before it is shown.
+        if name == "natural_language_plan"
+            && let RocmToolOutcome::Result(value) = &outcome
+            && let Err(e) = chat::validate_model_chosen_plan_result(value)
+        {
+            return RocmToolOutcome::Error(e.to_string());
+        }
+        outcome
     }
 
     fn execute_approved(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
@@ -207,6 +216,30 @@ mod tests {
             ),
             other => panic!("the operator's own folder must be staged, got {other:?}"),
         }
+    }
+
+    /// A request the dashboard agent hands to the planner is the model's, so
+    /// the plan it comes back as is checked before the dashboard shows it; the
+    /// same request typed by the operator (`/plan`, through `execute`) is not.
+    #[test]
+    fn seam_refuses_a_plan_for_a_model_request_but_not_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let args = serde_json::json!({ "request": "install therock into /mnt/R&D/rocm" });
+        match exec.execute_model_call("natural_language_plan", &args) {
+            RocmToolOutcome::Error(error) => assert!(
+                error.starts_with("the plan for the local assistant's request")
+                    && error.contains("'&'"),
+                "{error}"
+            ),
+            other => panic!("the model's plan must be refused, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                exec.execute("natural_language_plan", &args),
+                RocmToolOutcome::Result(_)
+            ),
+            "the operator's own request is planned"
+        );
     }
 
     #[test]

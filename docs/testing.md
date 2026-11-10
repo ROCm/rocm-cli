@@ -1438,47 +1438,65 @@ cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
 What the chat prints from a model, and what it offers to paste, is covered by
-two more mock-lane scenarios in the same feature file (steps in
+three more mock-lane scenarios in the same feature file (steps in
 [chat_steps.rs](../tests/e2e-cucumber/tests/e2e/chat_steps.rs)):
 
-- `chat-18` (`chat-cli-reply-escapes-stripped`): a reply that conceals part of
+- `chat-17` (`chat-cli-reply-escapes-stripped`): a reply that conceals part of
   a line with SGR 8, retitles the window and writes the clipboard (OSC 52, and
   an 8-bit OSC) reaches stdout of `rocm chat --prompt` with no control
   character and no sequence payload, and the concealed text printed where it
-  was.
-- `chat-19` (`chat-assistant-value-unsafe-to-paste-refused`): the assistant
+  was. A title sequence the reply leaves open removes the rest of its own line
+  only: the line after it (`Still here.`) is printed.
+- `chat-18` (`chat-assistant-value-unsafe-to-paste-refused`): the assistant
   asks `install_sdk` for a folder whose name holds `&`, which `cmd.exe` acts
   on even inside the single quotes the line is rendered in. The CLI exits
-  non-zero, asked the assistant once, offers no command line naming the
-  folder and installs nothing, and its message names the character and says
-  to run `rocm install sdk` with the value; the user's own
-  `rocm install sdk --dry-run` into that folder (therock-next-15's pip index
-  fixture) is accepted and names it as one argument.
+  non-zero, asked the assistant once, and prints nothing to stdout; stderr
+  holds the refusal, which names the character and says to run
+  `rocm install sdk` with the value, and no `advanced manual command:` or
+  `tool_call:` line. The user's own `rocm install sdk --dry-run` into that
+  folder (therock-next-15's pip index fixture) is accepted and names it as
+  one argument. That nothing was installed is checked by the chat-turn unit
+  tests in `providers.rs` listed below, not by the scenario.
+- `chat-19` (`chat-assistant-plan-unsafe-to-paste-refused`): the assistant
+  asks `natural_language_plan` to plan an install into the same kind of
+  folder. The plan's `tool_call:` line would carry the folder, so the CLI
+  refuses the plan the same way, with the refusal naming the plan for the
+  assistant's request, and prints nothing to stdout.
 
 ```bash
+cargo xtask e2e -- -n "chat-17"
 cargo xtask e2e -- -n "chat-18"
 cargo xtask e2e -- -n "chat-19"
 ```
 
-The unit tests behind them: `sanitize_terminal_text` and
-`is_display_altering` in [terminal.rs](../crates/rocm-core/src/terminal.rs)
-(`cargo test -p rocm-core terminal::`), the paste-unsafe set in
-[shell_quote.rs](../apps/rocm/src/shell_quote.rs), the model-only refusals and
-the serve character set in [tool_policy.rs](../apps/rocm/src/tool_policy.rs)
-(including that the same value passes `validate_chat_tool_call`), the
-model-versus-user split in `chat/turn.rs`
-(`a_model_chosen_folder_a_windows_shell_would_split_is_never_offered_to_paste`,
-`a_folder_the_user_typed_is_rendered_whatever_it_holds`) and in
-[dash_seam.rs](../apps/rocm/src/dash_seam.rs)
-(`seam_refuses_a_model_chosen_value_but_not_the_operators_own`), the planner's
-in `provider_planner_refuses_values_unsafe_to_paste`, and the error report in
-`an_error_quoting_untrusted_text_is_printed_without_its_escapes`:
+The unit tests behind them: `sanitize_terminal_text`, `hides_or_moves_text`
+and `is_display_altering` in [terminal.rs](../crates/rocm-core/src/terminal.rs)
+(exact output for every introducer, an unterminated sequence ending at its
+line, the glyph-shaper rule and the default-ignorable table's edges), the
+paste-unsafe set in [shell_quote.rs](../apps/rocm/src/shell_quote.rs), the
+model-only refusals, the serve option and character rules and the plan check
+in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) (including that the same
+value passes `validate_chat_tool_call`, and that every tool that shows a
+command line is checked on it), the model-versus-user split in `chat/turn.rs`
+and [dash_seam.rs](../apps/rocm/src/dash_seam.rs), the chat turn against a
+local model in [providers.rs](../apps/rocm/src/providers.rs) (a refused
+folder, a refusal after a read-only check, a refused plan), the planner's
+check in [freeform_planner.rs](../apps/rocm/src/freeform_planner.rs), the
+status screen in [chat.rs](../apps/rocm/src/chat.rs), the error report as
+written to stderr in [main.rs](../apps/rocm/src/main.rs), and the dashboard
+agent's entry point in
+[tools.rs](../crates/rocm-dash-tui/src/agent/tools.rs):
 
 ```bash
 cargo test -p rocm-core terminal::
-cargo test -p rocm --bin rocm paste
-cargo test -p rocm --bin rocm serve_reference
-cargo test -p rocm --bin rocm escape
+cargo test -p rocm --bin rocm shell_quote::
+cargo test -p rocm --bin rocm tool_policy::
+cargo test -p rocm --bin rocm chat::
+cargo test -p rocm --bin rocm dash_seam::
+cargo test -p rocm --bin rocm freeform_planner::tests::provider_planner_refuses
+cargo test -p rocm --bin rocm providers::tests::a_
+cargo test -p rocm --bin rocm tests::an_error
+cargo test -p rocm-dash-tui --lib agent::tools
 ```
 
 Log browser smoke:

@@ -1109,7 +1109,8 @@ Expected result:
 - `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
 - A plan whose command carries a value a Windows shell reads as syntax inside
-  single quotes (a single quote, or any of `& | < > ^ % " !`) is not shown:
+  single quotes, such as `'`, `&` or `%` (the full set is in
+  [llm-tool-use.md](llm-tool-use.md)), is not shown:
   the CLI falls back to its own plan and its note says to supply that value
   yourself. The same holds for `rocm chat --tools --prompt …`, where the
   assistant's request is refused with that message on stderr and no

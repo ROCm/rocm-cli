@@ -296,34 +296,24 @@ fn reject_control_characters(tool: &str, arguments: &serde_json::Value) -> Resul
     }
 }
 
-/// The tools whose arguments become a command line the operator is shown and
-/// may paste: the approval card, the `advanced manual command:` line, and for
-/// `install_sdk_dry_run` the dry run's `command: uv …` line. `rocm_command`
-/// is handled on its own, through its normalized argv.
-const CHAT_TOOLS_RENDERED_AS_COMMANDS: [&str; 7] = [
-    "install_sdk",
-    "install_sdk_dry_run",
-    "install_engine",
-    "launch_server",
-    "stop_server",
-    "watcher_disable",
-    "watcher_enable",
-];
-
-/// The `launch_server` fields that become `rocm serve` values, held to
-/// [`is_model_requested_serve_token`].
-const LAUNCH_SERVER_SERVE_FIELDS: [&str; 5] = ["model", "engine", "device", "runtime_id", "env_id"];
-
 /// The checks a tool call gets when the *model* chose it, on top of
 /// [`validate_chat_tool_call`], which every call gets whoever made it.
 ///
-/// Two rules, both about the command lines `rocm chat` and the dashboard print
-/// for the operator to approve or paste:
+/// Two rules, both about the command line `rocm chat` and the dashboard print
+/// for the operator to approve or paste — the argv the call is rendered as
+/// ([`model_rendered_argv`]), not the JSON it arrived in, so a field that is
+/// never printed (a `rocm_command` `reason`) is never refused:
 ///
-/// * no value may carry a [`paste_unsafe_character`], which a Windows shell
+/// * no argument may carry a [`paste_unsafe_character`], which a Windows shell
 ///   reads as syntax however the line is quoted;
-/// * a model-requested `serve` names its model and option values only with
+/// * a model-requested `serve` uses only options `rocm serve` has, and names
+///   its model and every option value only with
 ///   [`is_model_requested_serve_token`] characters.
+///
+/// A tool that renders no command line (`path_exists`, `natural_language_plan`,
+/// the other read-only tools) has nothing to check here; the plan
+/// `natural_language_plan` returns is checked on its own, by
+/// [`validate_model_chosen_plan`].
 ///
 /// Not part of [`validate_chat_tool_call`] on purpose. That function also
 /// checks calls the CLI builds from what the user typed — an install folder
@@ -333,46 +323,125 @@ const LAUNCH_SERVER_SERVE_FIELDS: [&str; 5] = ["model", "engine", "device", "run
 /// executor. Run it after [`validate_chat_tool_call`], so a value carrying a
 /// control character is refused for that first and never echoed.
 pub(crate) fn validate_model_chosen_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    if call.name == "rocm_command" {
-        let args = normalized_chat_rocm_command_args(call)?;
-        return validate_model_chosen_argv(&args, "local assistant");
+    match model_rendered_argv(call)? {
+        Some(args) => validate_model_chosen_argv(&args, "local assistant"),
+        None => Ok(()),
     }
-    if !CHAT_TOOLS_RENDERED_AS_COMMANDS.contains(&call.name.as_str()) {
-        return Ok(());
+}
+
+/// The `rocm` argv (without the program name) a model's tool call is shown
+/// as, or `None` for a tool that shows no command line. Derived from
+/// [`rocm_chat_tool_requested_args`], the same function that renders the
+/// approval card and the `advanced manual command:` line, so a tool that
+/// starts rendering a command is checked without being listed anywhere.
+/// `install_sdk_dry_run` previews `rocm install sdk` with the same fields, and
+/// `rocm_command` is checked on the argv as the model wrote it, before the
+/// flags the policy adds.
+fn model_rendered_argv(call: &providers::ChatToolCall) -> Result<Option<Vec<String>>> {
+    match call.name.as_str() {
+        "rocm_command" => normalized_chat_rocm_command_args(call).map(Some),
+        "install_sdk_dry_run" => Ok(rocm_chat_tool_requested_args(&providers::ChatToolCall {
+            name: "install_sdk".to_owned(),
+            ..call.clone()
+        })),
+        _ => Ok(rocm_chat_tool_requested_args(call)),
     }
-    // The dry run previews `rocm install sdk`, and has no argv of its own.
-    let command = if call.name == "install_sdk_dry_run" {
-        "rocm install sdk".to_owned()
-    } else {
-        rocm_chat_tool_requested_args(call)
-            .map_or_else(|| "rocm".to_owned(), |args| command_head(&args))
-    };
-    reject_unpasteable_values(&command, None, &call.arguments)?;
-    if call.name == "launch_server"
-        && let Some(object) = call.arguments.as_object()
-    {
-        for field in LAUNCH_SERVER_SERVE_FIELDS {
-            if let Some(value) = object.get(field).and_then(serde_json::Value::as_str) {
-                validate_model_requested_serve_token("local assistant", field, value)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// [`validate_model_chosen_tool_call`]'s two rules for a whole `rocm` argv
-/// (without the program name), for `rocm_command` and for the provider planner,
-/// whose argv lands in the `request plan` block. `actor` opens each refusal.
+/// (without the program name): a `rocm_command`, the provider planner's
+/// `tool_call`, or a tool's rendered argv. `actor` opens each refusal.
 pub(crate) fn validate_model_chosen_argv(args: &[String], actor: &str) -> Result<()> {
+    check_model_chosen_argv(args, actor, Placeholders::Refused)
+}
+
+/// The plans `natural_language_plan` returned for a request the *model*
+/// wrote, each a `rocm` argv as it is printed in the plan's `tool_call:` lines.
+///
+/// The request is prose, and the planner turns words from it into argv values
+/// — an install folder, a model name — so the line it prints holds values the
+/// model chose as surely as a tool call does. The same two rules apply, except
+/// that a planner placeholder such as `<model>` is the planner's own text, not
+/// a value, and passes.
+pub(crate) fn validate_model_chosen_plan(planned: &[Vec<String>]) -> Result<()> {
+    planned.iter().try_for_each(|args| {
+        check_model_chosen_argv(
+            args,
+            "the plan for the local assistant's request",
+            Placeholders::Allowed,
+        )
+    })
+}
+
+/// [`validate_model_chosen_plan`] over the result of a `natural_language_plan`
+/// tool call: the `planned_args` it reports beside the rendered text. Read
+/// from the result rather than planned again, because a provider-assisted plan
+/// need not come out the same twice. Call it before the result is shown.
+///
+/// A result marked `isError` holds no plan and passes. Any other result
+/// without `planned_args` as a list of string lists is refused, so a result
+/// whose plans cannot be read is never shown unchecked.
+pub(crate) fn validate_model_chosen_plan_result(result: &serde_json::Value) -> Result<()> {
+    if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let planned = result
+        .pointer("/structuredContent/planned_args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|plans| {
+            plans
+                .iter()
+                .map(|args| {
+                    args.as_array()?
+                        .iter()
+                        .map(|arg| arg.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .with_context(|| {
+            format!(
+                "the plan for the local assistant's request could not be read. {NOTHING_CHANGED}"
+            )
+        })?;
+    validate_model_chosen_plan(&planned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placeholders {
+    Refused,
+    Allowed,
+}
+
+/// The one argument the free-form planner writes where it has no value yet:
+/// a `rocm serve` with no model named. Shared with `freeform_planner.rs`, which
+/// writes it, so the plan check exempts exactly that string, and only as the
+/// model of a `serve`, the one place the planner writes it.
+pub(crate) const PLAN_MODEL_PLACEHOLDER: &str = "<model>";
+
+fn is_plan_placeholder(arg: &str) -> bool {
+    arg == PLAN_MODEL_PLACEHOLDER
+}
+
+fn check_model_chosen_argv(args: &[String], actor: &str, placeholders: Placeholders) -> Result<()> {
     let command = command_head(args);
-    for arg in args {
-        reject_unpasteable_value(actor, &command, "argument", arg)?;
+    let is_serve = args.first().is_some_and(|first| first == "serve");
+    for (index, arg) in args.iter().enumerate() {
+        if placeholders == Placeholders::Allowed
+            && is_serve
+            && index == 1
+            && is_plan_placeholder(arg)
+        {
+            continue;
+        }
+        reject_unpasteable_value(actor, &command, arg)?;
+        reject_invisible_value(actor, &command, arg)?;
     }
     if args
         .first()
         .is_some_and(|first| first.eq_ignore_ascii_case("serve"))
     {
-        validate_model_requested_serve_values(args, actor)?;
+        validate_model_requested_serve_argv(args, actor, placeholders)?;
     }
     Ok(())
 }
@@ -403,24 +472,29 @@ fn command_head(args: &[String]) -> String {
     head.join(" ")
 }
 
-fn reject_unpasteable_values(
-    command: &str,
-    field: Option<&str>,
-    arguments: &serde_json::Value,
-) -> Result<()> {
-    match arguments {
-        serde_json::Value::String(value) => {
-            let what = field.map_or_else(|| "a value".to_owned(), |field| format!("`{field}`"));
-            reject_unpasteable_value("local assistant", command, &what, value)
-        }
-        serde_json::Value::Array(values) => values
-            .iter()
-            .try_for_each(|value| reject_unpasteable_values(command, field, value)),
-        serde_json::Value::Object(entries) => entries
-            .iter()
-            .try_for_each(|(key, value)| reject_unpasteable_values(command, Some(key), value)),
-        _ => Ok(()),
+/// How every model-only refusal ends. "Nothing was changed" rather than
+/// "nothing was run": the refusal can follow a read-only check the same reply
+/// asked for, which did run, but nothing that changes the machine runs from a
+/// chat turn without approval, and the refused call never reaches one.
+const NOTHING_CHANGED: &str =
+    "Nothing was changed, and no command was offered to paste for this call.";
+
+/// Refuse a model-chosen `value` holding any invisible character, the single
+/// joiner or presentation selector [`has_terminal_control_character`] lets
+/// through included. That exemption is for a value a person typed, where an
+/// emoji folder name is theirs; a model has no use for one, and after a plain
+/// character it makes two values look identical on the approval card while
+/// naming different things.
+fn reject_invisible_value(actor: &str, command: &str, value: &str) -> Result<()> {
+    if value.chars().any(rocm_core::terminal::is_display_altering) {
+        let value = value.escape_default();
+        bail!(
+            "{actor} chose the argument \"{value}\" for `{command}`, which holds an invisible \
+             character that would make it look like a different value. {NOTHING_CHANGED} If you \
+             meant that value, supply it yourself by running `{command}` with it"
+        );
     }
+    Ok(())
 }
 
 /// Refuse `value` if it holds a [`paste_unsafe_character`]. The message names
@@ -429,15 +503,15 @@ fn reject_unpasteable_values(
 /// escaped to ASCII (`escape_default`), so a typographic quote reaches a
 /// console on any code page as `\u{2019}` rather than as mojibake; the value
 /// has already passed the control-character check.
-fn reject_unpasteable_value(actor: &str, command: &str, what: &str, value: &str) -> Result<()> {
+fn reject_unpasteable_value(actor: &str, command: &str, value: &str) -> Result<()> {
     if let Some(character) = paste_unsafe_character(value) {
         let value = value.escape_default();
         let character = character.escape_default();
         bail!(
-            "{actor} chose {what} \"{value}\" for `{command}`, and its '{character}' is not safe on a \
-             command line meant to be pasted: a Windows shell reads it as syntax (PowerShell a \
-             single quote, cmd.exe any of & | < > ^ % \" !). Nothing was run. If you meant that \
-             value, supply it yourself by running `{command}` with it"
+            "{actor} chose the argument \"{value}\" for `{command}`, and its '{character}' is not \
+             safe on a command line meant to be pasted: a Windows shell reads it as syntax \
+             (PowerShell a single quote, cmd.exe characters such as & or %). {NOTHING_CHANGED} If \
+             you meant that value, supply it yourself by running `{command}` with it"
         );
     }
     Ok(())
@@ -467,41 +541,89 @@ fn is_model_requested_serve_token(value: &str) -> bool {
         })
 }
 
-fn validate_model_requested_serve_token(actor: &str, field: &str, value: &str) -> Result<()> {
+fn validate_model_requested_serve_token(
+    actor: &str,
+    what: &str,
+    value: &str,
+    placeholders: Placeholders,
+) -> Result<()> {
+    if placeholders == Placeholders::Allowed && is_plan_placeholder(value) {
+        return Ok(());
+    }
     if !is_model_requested_serve_token(value) {
         let value = value.escape_default();
         bail!(
-            "{actor} requested serve `{field}` \"{value}\"; only letters, digits and \
-             `. _ - / : @ + \\` are accepted, not starting with `-`. Nothing was run. To serve \
+            "{actor} requested serve {what} \"{value}\"; only letters, digits and \
+             `. _ - / : @ + \\` are accepted, not starting with `-`. {NOTHING_CHANGED} To serve \
              anything else, run `rocm serve` yourself"
         );
     }
     Ok(())
 }
 
-/// Hold every value on a model-requested `serve` argv — the model reference and
-/// each option's value, attached (`--engine=vllm`) or not — to
-/// [`is_model_requested_serve_token`]. Flags themselves are left to clap and
-/// to [`validate_serve_command_safety`].
-fn validate_model_requested_serve_values(args: &[String], actor: &str) -> Result<()> {
-    for arg in args.iter().skip(1) {
-        let value = match arg.strip_prefix("--") {
-            Some(flag) => match flag.split_once('=') {
-                Some((name, value)) => {
-                    if !name
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
-                    {
-                        bail!("{actor} requested a malformed serve option {arg:?}");
-                    }
-                    value
-                }
-                None => continue,
-            },
-            None if arg.starts_with('-') => continue,
-            None => arg.as_str(),
-        };
-        validate_model_requested_serve_token(actor, "argument", value)?;
+/// Hold a model-requested `serve` argv to the shape a model has any reason to
+/// ask for: every `--option` one `rocm serve` actually has, its value — the
+/// next argument, or attached as `--option=value` — and the model reference
+/// held to [`is_model_requested_serve_token`], and no short or unknown option.
+///
+/// The options are read from the CLI definition itself, so an option added to
+/// `rocm serve` is accepted without being listed here, and one that is not
+/// there cannot be used to slide a value past the check. A value has to be a
+/// serve token, so it cannot begin with `-` either: `--gpu-memory-utilization
+/// -0.9;id` is refused, not read as a flag followed by nothing.
+fn validate_model_requested_serve_argv(
+    args: &[String],
+    actor: &str,
+    placeholders: Placeholders,
+) -> Result<()> {
+    let cli = <crate::Cli as clap::CommandFactory>::command();
+    let serve = cli
+        .find_subcommand("serve")
+        .context("the CLI definition has no serve command")?;
+    let mut tokens = args.iter().skip(1);
+    let mut models = 0_usize;
+    while let Some(token) = tokens.next() {
+        if let Some(long) = token.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let Some(option) = serve
+                .get_arguments()
+                .find(|argument| argument.get_long() == Some(name))
+            else {
+                bail!(
+                    "{actor} requested serve option \"--{}\", which `rocm serve` does not have. \
+                     {NOTHING_CHANGED}",
+                    name.escape_default()
+                );
+            };
+            let what = format!("`--{name}` value");
+            if let Some(value) = attached {
+                validate_model_requested_serve_token(actor, &what, value, placeholders)?;
+            } else if option.get_action().takes_values() {
+                let Some(value) = tokens.next() else {
+                    bail!(
+                        "{actor} requested serve option `--{name}` without a value. {NOTHING_CHANGED}"
+                    );
+                };
+                validate_model_requested_serve_token(actor, &what, value, placeholders)?;
+            }
+        } else {
+            // The model reference, or a lone `-x`: a model-requested serve uses
+            // long options only, and the token check refuses a leading `-`.
+            validate_model_requested_serve_token(actor, "model", token, placeholders)?;
+            models += 1;
+        }
+    }
+    // Exactly one model reference. A `launch_server` model of
+    // `--allow-public-bind` renders as an option, not a model, and leaves
+    // none; that line must not be offered either.
+    if models != 1 {
+        bail!(
+            "{actor} requested a serve with {models} model references instead of one. \
+             {NOTHING_CHANGED} To serve anything else, run `rocm serve` yourself"
+        );
     }
     Ok(())
 }
@@ -3150,8 +3272,10 @@ mod tests {
             let error = validate_model_chosen_tool_call(&launch_server_call(model))
                 .expect_err(&format!("launch_server accepted {model:?}"))
                 .to_string();
+            // `--allow-public-bind` renders as an option, leaving no model.
             assert!(
-                error.contains("only letters, digits")
+                (error.contains("only letters, digits") || error.contains("0 model references"))
+                    && error.contains("Nothing was changed")
                     && error.contains("run `rocm serve` yourself"),
                 "{model:?}: {error}"
             );
@@ -3221,5 +3345,273 @@ mod tests {
             "rocm update"
         );
         assert_eq!(command_head(&owned_argv(&["x&y", "sdk"])), "rocm");
+    }
+
+    /// One minimal call per tool that may render a command line, as the
+    /// approval card does, and one per tool that renders none.
+    fn rendering_tool_calls() -> Vec<providers::ChatToolCall> {
+        let call = |name: &str, arguments: serde_json::Value| providers::ChatToolCall {
+            id: None,
+            name: name.to_owned(),
+            arguments,
+        };
+        vec![
+            install_sdk_call("install_sdk", "/mnt/data/rocm"),
+            install_sdk_call("install_sdk_dry_run", "/mnt/data/rocm"),
+            call("install_engine", serde_json::json!({ "engine": "vllm" })),
+            launch_server_call("qwen"),
+            call("stop_server", serde_json::json!({ "service_id": "svc-1" })),
+            call(
+                "watcher_enable",
+                serde_json::json!({ "watcher": "server-recover" }),
+            ),
+            call(
+                "watcher_disable",
+                serde_json::json!({ "watcher": "server-recover" }),
+            ),
+            rocm_command_call(&["serve", "qwen", "--managed"]),
+        ]
+    }
+
+    /// Completeness, so dropping a tool from the check cannot pass unnoticed:
+    /// every call whose approval card shows a command line is checked on that
+    /// argv, and a tool that shows none is not.
+    #[test]
+    fn every_tool_that_shows_a_command_line_is_checked_on_it() {
+        for call in rendering_tool_calls() {
+            let argv = model_rendered_argv(&call)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", call.name))
+                .unwrap_or_else(|| panic!("{} shows a command but is not checked", call.name));
+            assert!(!argv.is_empty(), "{}", call.name);
+            if call.name != "install_sdk_dry_run" {
+                let approval = chat_tool_approval_request(&call, None)
+                    .unwrap_or_else(|error| panic!("{}: {error:#}", call.name));
+                let shown = approval.display_command.expect("a command line is shown");
+                for arg in &argv {
+                    assert!(
+                        shown.contains(&crate::shell_quote::shell_quote(arg)),
+                        "{}: {arg:?} is checked but not in {shown:?}",
+                        call.name
+                    );
+                }
+            }
+        }
+        for name in [
+            "path_exists",
+            "natural_language_plan",
+            "examine",
+            "services",
+        ] {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: name.to_owned(),
+                arguments: serde_json::json!({ "path": "/tmp", "request": "x" }),
+            };
+            assert_eq!(
+                model_rendered_argv(&call).expect("no argv to build"),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    /// Each value the approval card renders is checked, field by field: a
+    /// check that read only `model` or only `prefix` would leave the rest.
+    #[test]
+    fn every_rendered_field_of_a_model_call_is_checked() {
+        let engine = providers::ChatToolCall {
+            id: None,
+            name: "install_engine".to_owned(),
+            arguments: serde_json::json!({ "engine": "vllm&calc" }),
+        };
+        validate_chat_tool_call(&engine).expect("structurally valid");
+        assert!(validate_model_chosen_tool_call(&engine).is_err());
+        let engine_runtime = providers::ChatToolCall {
+            id: None,
+            name: "install_engine".to_owned(),
+            arguments: serde_json::json!({ "engine": "vllm", "runtime_id": "r|x" }),
+        };
+        assert!(validate_model_chosen_tool_call(&engine_runtime).is_err());
+        for (field, value) in [
+            ("engine", "vllm;id"),
+            ("device", "gpu;id"),
+            ("runtime_id", "r;id"),
+            ("env_id", "e;id"),
+        ] {
+            let mut call = launch_server_call("qwen");
+            call.arguments[field] = serde_json::json!(value);
+            let error = validate_model_chosen_tool_call(&call)
+                .expect_err(&format!("launch_server accepted {field}={value:?}"))
+                .to_string();
+            assert!(error.contains("only letters, digits"), "{field}: {error}");
+        }
+        for (field, value) in [("version", "7.0&x"), ("prefix", "/mnt/a%b%")] {
+            let mut call = install_sdk_call("install_sdk", "/mnt/data/rocm");
+            call.arguments[field] = serde_json::json!(value);
+            let error = validate_model_chosen_tool_call(&call)
+                .expect_err(&format!("install_sdk accepted {field}={value:?}"))
+                .to_string();
+            assert!(
+                error.contains("supply it yourself") || error.contains("version"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    /// A field that is never printed is not refused on behalf of a line it
+    /// never reaches: `rocm_command`'s `reason` is prose for the model.
+    #[test]
+    fn a_field_that_is_never_shown_is_not_refused() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--managed"],
+                "reason": "the user's folder & the model's \"default\"",
+            }),
+        };
+        validate_chat_tool_call(&call).expect("valid");
+        validate_model_chosen_tool_call(&call).expect("the reason is never printed");
+    }
+
+    /// A `serve` the model asks for cannot reach the approval card with a
+    /// value hidden behind a leading `-`, an option `rocm serve` lacks, a
+    /// short option, or no model at all.
+    #[test]
+    fn a_model_requested_serve_cannot_slip_a_value_past_the_check() {
+        for args in [
+            vec![
+                "serve",
+                "qwen",
+                "--managed",
+                "--gpu-memory-utilization",
+                "-0.9;id",
+            ],
+            vec!["serve", "qwen", "--managed", "--x;id"],
+            vec!["serve", "qwen", "--managed", "--engine", "-a;b"],
+            vec!["serve", "qwen", "--managed", "--engine=-a"],
+            vec!["serve", "qwen", "--managed", "-x"],
+            vec!["serve", "qwen", "--managed", "--engine"],
+            vec!["serve", "--managed"],
+            vec!["serve", "qwen", "other", "--managed"],
+        ] {
+            let error = validate_model_chosen_tool_call(&rocm_command_call(&args))
+                .expect_err(&format!("{args:?} was accepted"))
+                .to_string();
+            assert!(error.contains("Nothing was changed"), "{args:?}: {error}");
+        }
+    }
+
+    /// The edges of the serve character set: `+` belongs to it, and so does a
+    /// reference of exactly 256 characters; one more does not.
+    #[test]
+    fn the_serve_character_set_has_exact_edges() {
+        validate_model_chosen_tool_call(&launch_server_call("repo+lora:Q4"))
+            .expect("`+` is in the set");
+        let longest = "a".repeat(256);
+        validate_model_chosen_tool_call(&launch_server_call(&longest)).expect("256 fits");
+        let too_long = "a".repeat(257);
+        assert!(validate_model_chosen_tool_call(&launch_server_call(&too_long)).is_err());
+    }
+
+    /// The plan `natural_language_plan` returns for a model's request is held
+    /// to the same rules; a planner placeholder is the planner's own text.
+    #[test]
+    fn a_plan_for_a_model_request_is_held_to_the_model_rules() {
+        use crate::test_support::owned_argv;
+
+        for plan in [
+            owned_argv(&["install", "sdk", "--prefix", "D:\\R&D\\rocm"]),
+            owned_argv(&["serve", "qwen & calc", "--managed"]),
+            owned_argv(&["serve", "qwen", "--managed", "--x;id"]),
+        ] {
+            let error = validate_model_chosen_plan(std::slice::from_ref(&plan))
+                .expect_err(&format!("{plan:?}"))
+                .to_string();
+            assert!(
+                error.starts_with("the plan for the local assistant's request")
+                    && error.contains("Nothing was changed"),
+                "{error}"
+            );
+        }
+        validate_model_chosen_plan(&[owned_argv(&["serve", "<model>", "--managed"])])
+            .expect("a placeholder is not a value");
+        validate_model_chosen_plan(&[owned_argv(&["install", "sdk", "--prefix", "<folder&>"])])
+            .expect_err("only the planner's own placeholder passes");
+        validate_model_chosen_plan(&[owned_argv(&["serve", "<x>", "--managed"])])
+            .expect_err("a value shaped like a placeholder is still a value");
+        // The placeholder passes only as a serve's model, where the planner
+        // writes it; a request that puts the same text anywhere else is refused.
+        for elsewhere in [
+            owned_argv(&["install", "sdk", "--prefix", "<model>"]),
+            owned_argv(&["serve", "qwen", "--engine", "<model>", "--managed"]),
+            owned_argv(&["serve", "qwen", "--engine=<model>", "--managed"]),
+        ] {
+            validate_model_chosen_plan(std::slice::from_ref(&elsewhere))
+                .expect_err(&format!("{elsewhere:?}"));
+        }
+        // And never in a call: only a plan has a placeholder.
+        validate_model_chosen_argv(
+            &owned_argv(&["serve", "<model>", "--managed"]),
+            "local assistant",
+        )
+        .expect_err("a model's call has no placeholder");
+        // Every plan is checked, not only the last: the unsafe one is first.
+        let result = serde_json::json!({
+            "structuredContent": {
+                "planned_args": [["install", "sdk", "--prefix", "/mnt/R&D"], ["examine"]]
+            }
+        });
+        let error = validate_model_chosen_plan_result(&result)
+            .expect_err("an earlier plan is checked")
+            .to_string();
+        assert!(error.contains("/mnt/R&D"), "{error}");
+        let clean = serde_json::json!({
+            "structuredContent": { "planned_args": [["examine"], ["serve", "<model>", "--managed"]] }
+        });
+        validate_model_chosen_plan_result(&clean).expect("nothing a model chose is unsafe");
+    }
+
+    /// A successful result whose plans cannot be read is refused rather than
+    /// passed with nothing checked; an error result holds no plan.
+    #[test]
+    fn a_plan_result_that_cannot_be_read_is_refused() {
+        for result in [
+            serde_json::json!({ "isError": false, "structuredContent": {} }),
+            serde_json::json!({ "structuredContent": { "planned_args": "serve x" } }),
+            serde_json::json!({ "structuredContent": { "planned_args": [["serve", 7]] } }),
+            serde_json::json!({ "structuredContent": { "planned_args": [["examine"], "serve"] } }),
+        ] {
+            let error = validate_model_chosen_plan_result(&result)
+                .expect_err(&format!("{result}"))
+                .to_string();
+            assert!(error.contains("could not be read"), "{error}");
+        }
+        validate_model_chosen_plan_result(&serde_json::json!({ "isError": true }))
+            .expect("an error result holds no plan");
+    }
+
+    /// The emoji exemption is for values a person typed. A model-chosen value
+    /// holding even a single joiner or presentation selector is refused: after
+    /// a plain character it shapes nothing, and the value would look like
+    /// another on the approval card while naming something else.
+    #[test]
+    fn a_model_chosen_value_with_any_invisible_character_is_refused() {
+        for prefix in [
+            "/mnt/data\u{200d}",
+            "/mnt/dat\u{fe0f}a",
+            "/mnt/\u{2764}\u{fe0f}",
+        ] {
+            let call = install_sdk_call("install_sdk", prefix);
+            validate_chat_tool_call(&call)
+                .unwrap_or_else(|error| panic!("a user may name {prefix:?}: {error:#}"));
+            let error = validate_model_chosen_tool_call(&call)
+                .expect_err(&format!("a model-chosen {prefix:?} must be refused"))
+                .to_string();
+            assert!(
+                error.contains("invisible character") && error.is_ascii(),
+                "{prefix:?}: {error}"
+            );
+        }
     }
 }

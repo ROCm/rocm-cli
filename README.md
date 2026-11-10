@@ -1401,10 +1401,11 @@ sequences and invisible characters removed, so a reply cannot hide part of a
 line, retitle the window or write the clipboard; text it tried to hide is
 shown. A change the assistant asks for with `--tools` is not made from
 `--prompt`: it is shown as an `advanced manual command:` line, quoted for a
-POSIX shell. A value the assistant chose is refused if it holds a character
-that PowerShell or `cmd.exe` would read as syntax inside those quotes (a single
-quote, or any of `& | < > ^ % " !`); the message tells you to run the command
-yourself with that value. Values you typed are shown as typed.
+POSIX shell. A value the assistant chose, in that line or in a plan it asked
+for, is refused if it holds a character a Windows shell reads as syntax even
+inside those quotes, such as `'`, `&` or `%`; the message tells you to run the
+command yourself with that value. Values you typed are not held to that rule.
+See the LLM tool-use design notes in the documentation for the exact set.
 
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.

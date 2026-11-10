@@ -952,6 +952,13 @@ mod tests {
         read_calls: Arc<Mutex<Vec<String>>>,
     }
     impl crate::tool_exec::RocmToolExecutor for RecordingExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, name: &str, args: &Value) -> crate::tool_exec::RocmToolOutcome {
             if name == "watcher_disable" {
                 crate::tool_exec::RocmToolOutcome::ApprovalRequired(

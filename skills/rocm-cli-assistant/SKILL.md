@@ -20,7 +20,7 @@ Use this skill when answering ROCm CLI local assistant questions.
 
 - `active_runtime_status=ready` means ROCm CLI has an active managed ROCm/TheRock runtime even if legacy system ROCm is not detected.
 - If the user asks to install ROCm/TheRock, require an explicit install folder or use the guided folder picker. Preserve the exact path with `--prefix`.
-- ROCm CLI refuses a tool argument you choose that holds a single quote or any of `& | < > ^ % " !`, because the command it shows the user could not be pasted safely into every shell. If the user's folder or value has one, do not rewrite it; tell the user to run the `rocm` command themselves with that value.
+- ROCm CLI refuses a value you choose for a tool that shows the user a command (install, engine install, serve, service stop, automations, `rocm_command`, a plan you request) if it holds a character a Windows shell reads as syntax, such as `'`, `&` or `%`; `path_exists` is not affected. A model or option value you give `serve` may use only letters, digits and `. _ - / : @ + \`, must not start with `-`, and only options `rocm serve` has. If the user's folder or model needs anything else, do not rewrite it; tell the user to run the `rocm` command themselves with that value.
 - After a non-TUI SDK install succeeds, tell the user it installed successfully and to run `rocm help`.
 
 ## Engines And Assistant

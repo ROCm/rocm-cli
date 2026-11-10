@@ -86,18 +86,21 @@ pub(crate) fn shell_quote(value: &str) -> String {
 /// whoever supplied the argument. A value in this shape is refused upstream
 /// rather than rendered.
 ///
-/// The predicate is [`rocm_core::terminal::is_display_altering`]: C0, DEL and
+/// The predicate is [`rocm_core::terminal::hides_or_moves_text`]: C0, DEL and
 /// C1 (so ESC and the 8-bit CSI alike); the Unicode format characters, where a
 /// bidi override such as U+202E reorders how the rest of the line is drawn and
 /// a zero-width character hides a difference between what is shown and what
 /// runs; U+2028/U+2029, at which a terminal may start a new row, letting a
 /// value forge a line of its own; and the rest of Unicode's default-ignorable
 /// set, such as the tag characters, which can carry a whole string with no
-/// glyph. It is the set `rocm chat` removes from the prose it prints
-/// ([`rocm_core::terminal::sanitize_terminal_text`]), so nothing in a refused
-/// value would have survived there either.
+/// glyph. The one exception is a single joiner, non-joiner or emoji/text
+/// presentation selector directly after a drawn character, so a folder named
+/// with `❤️` is not refused. That is exactly what `rocm chat` keeps when it
+/// prints prose ([`rocm_core::terminal::sanitize_terminal_text`]): a value is
+/// refused for precisely what printing it would remove or change, plus the
+/// newline and tab a one-line value must not carry.
 pub(crate) fn has_terminal_control_character(value: &str) -> bool {
-    value.chars().any(rocm_core::terminal::is_display_altering)
+    rocm_core::terminal::hides_or_moves_text(value)
 }
 
 /// The characters that make a value unsafe on a command line meant to be
@@ -371,12 +374,18 @@ mod tests {
     #[test]
     fn invisible_non_format_characters_are_refused_too() {
         for value in [
-            "qwen\u{3164}",  // Hangul filler, renders as blank space
-            "qwen\u{e0041}", // tag character, spells ASCII with no glyph
-            "qwen\u{fe0f}",  // variation selector
-            "qwen\u{034f}x", // combining grapheme joiner
+            "qwen\u{3164}",         // Hangul filler, renders as blank space
+            "qwen\u{e0041}",        // tag character, spells ASCII with no glyph
+            "qwen\u{fe00}",         // variation selector other than the emoji pair
+            "qwen\u{fe0f}\u{fe0f}", // a run of presentation selectors
+            "qwen\u{034f}x",        // combining grapheme joiner
         ] {
             assert!(has_terminal_control_character(value), "{value:?}");
+        }
+        // A single presentation selector or joiner on a drawn character is
+        // what an emoji is made of, and a folder a user names may hold one.
+        for value in ["C:\\Users\\me\\\u{2764}\u{fe0f}\\rocm", "👩\u{200d}💻"] {
+            assert!(!has_terminal_control_character(value), "{value:?}");
         }
     }
 

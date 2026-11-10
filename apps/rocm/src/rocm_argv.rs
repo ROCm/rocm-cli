@@ -112,8 +112,13 @@ pub(crate) fn serve_args_request_cpu_device(args: &[String]) -> bool {
 /// call, and some of its output (`rocm chat --prompt …`, the `install command:`
 /// line) is offered to be copied and run. So it has to denote the argv it was
 /// built from: quoted with [`shell_quote`], every argument splits back to
-/// itself under a shell's own word-splitting, and nothing inside a value can
-/// read as a second command.
+/// itself under a POSIX shell's own word-splitting, and nothing inside a value
+/// can read there as a second command. Windows shells read the same line
+/// differently (PowerShell an embedded `'`, `cmd.exe` characters such as `&`
+/// even inside single quotes), so a value a *model* chose is refused at
+/// validation if it holds one
+/// ([`paste_unsafe_character`](crate::shell_quote::paste_unsafe_character)); a
+/// value the user typed is rendered as typed.
 ///
 /// Values carrying terminal control characters never get here — they are
 /// refused at validation

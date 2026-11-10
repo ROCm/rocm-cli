@@ -34,7 +34,7 @@ use crate::rocm_argv::chat_cli_arg_value;
 use crate::tool_policy::{
     ChatToolApprovalRequest, chat_tool_approval_request, chat_tool_call_is_read_only, json_string,
     normalized_chat_rocm_command_args, rocm_chat_tool_requested_command, validate_chat_tool_call,
-    validate_model_chosen_tool_call,
+    validate_model_chosen_plan_result, validate_model_chosen_tool_call,
 };
 use crate::{ChatInferenceParams, chat_host_facts, providers};
 use anyhow::Result;
@@ -186,6 +186,12 @@ pub(super) fn render_chat_prompt_result_with_progress(
 /// `explanation` is the model's prose too. `args` and `display_command` are
 /// left alone: they are held to refusal at validation, and cleaning them here
 /// would make the command shown differ from the argv that runs.
+///
+/// The reply, the model name, each tool result and the follow-up answer are
+/// also cleaned where they are composed, but this pass is the one every line
+/// of `rendered` goes through, the summary built from tool output and the
+/// prompt echoed in a hint included. A string sequence left unterminated ends
+/// at its own line here, so it cannot hide the lines after it.
 fn sanitize_chat_prompt_result(result: ChatPromptResult) -> ChatPromptResult {
     ChatPromptResult {
         rendered: sanitize_terminal_text(&result.rendered),
@@ -347,7 +353,12 @@ fn render_chat_prompt_result_unsanitized(
     let mut output = String::new();
     let _ = writeln!(output, "chat response");
     let _ = writeln!(output, "  provider: {}", response.provider);
-    let _ = writeln!(output, "  model: {}", response.model);
+    // The model name comes back from the server, so it is untrusted text too.
+    let _ = writeln!(
+        output,
+        "  model: {}",
+        sanitize_terminal_text(&response.model)
+    );
     let _ = writeln!(
         output,
         "  rocm tools: {}",
@@ -356,7 +367,7 @@ fn render_chat_prompt_result_unsanitized(
     let _ = writeln!(output);
     let initial_content_is_intermediate = fallback_tool_call_used
         || local_tool_call_content_is_intermediate(provider, rocm_tools, &response);
-    let initial_content = visible_chat_content(&response.content);
+    let initial_content = sanitize_terminal_text(&visible_chat_content(&response.content));
     if initial_content_is_intermediate {
         let _ = writeln!(output, "Assistant is preparing the next step.");
     } else if !initial_content.trim().is_empty() {
@@ -419,7 +430,8 @@ fn render_chat_prompt_result_unsanitized(
             },
         )?;
         if follow_up.tool_calls.is_empty() {
-            let follow_up_content = visible_chat_content(&follow_up.content);
+            let follow_up_content =
+                sanitize_terminal_text(&visible_chat_content(&follow_up.content));
             if local_follow_up_content_is_final(&follow_up) && !follow_up_content.trim().is_empty()
             {
                 let _ = writeln!(output);
@@ -651,7 +663,7 @@ fn render_install_sdk_folder_needed_chat_text(prompt: &str, args: &[String]) -> 
     }
     let _ = writeln!(output);
     let _ = writeln!(output, "Your request");
-    let _ = writeln!(output, "  {}", prompt.trim());
+    let _ = writeln!(output, "  {}", sanitize_terminal_text(prompt.trim()));
     output.trim_end().to_owned()
 }
 
@@ -841,6 +853,12 @@ fn append_chat_tool_results(
         if chat_tool_call_is_read_only(call) {
             report_chat_tool_progress(progress, &format!("Running ROCm check: {label}."));
             let result = run_chat_read_only_tool(paths, call)?;
+            // A model's request planned into `tool_call:` lines puts values the
+            // model chose on lines meant to be pasted, so the plan is held to
+            // the same rules as a call, before any of it is shown.
+            if index < model_tool_call_count && call.name == "natural_language_plan" {
+                validate_model_chosen_plan_result(&result)?;
+            }
             ran_read_only_tool = true;
             let is_error = mcp_tool_result_is_error(&result);
             read_only_tool_error |= is_error;
@@ -860,7 +878,7 @@ fn append_chat_tool_results(
             let result_text = mcp_tool_result_text(&result);
             let _ = writeln!(follow_up_text, "{}:", call.name);
             let _ = writeln!(follow_up_text, "{result_text}");
-            for line in result_text.lines() {
+            for line in sanitize_terminal_text(&result_text).lines() {
                 let _ = writeln!(output, "    {line}");
             }
         } else {

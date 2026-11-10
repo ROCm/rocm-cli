@@ -1063,12 +1063,12 @@ async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld)
     preview_unpinned_wheel_install_into(world, QUOTED_FOLDER_NAME);
 }
 
-/// The install folder chat-19's assistant asks for, inside the scenario's root:
+/// The install folder chat-18's assistant asks for, inside the scenario's root:
 /// `&` starts a second command when a line holding it is pasted into `cmd.exe`,
 /// even inside the POSIX single quotes the CLI renders it in.
 pub(crate) const AMPERSAND_FOLDER_NAME: &str = "R&D-rocm";
 
-/// Where chat-19's folder lives, so the assistant's step and the user's own
+/// Where chat-18's folder lives, so the assistant's step and the user's own
 /// preview name the same one.
 pub(crate) fn ampersand_folder(world: &E2eWorld) -> std::path::PathBuf {
     root(world).join(AMPERSAND_FOLDER_NAME)

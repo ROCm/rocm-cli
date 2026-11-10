@@ -882,6 +882,13 @@ mod tests {
     #[derive(Debug)]
     struct FakeExec(serde_json::Value);
     impl crate::tool_exec::RocmToolExecutor for FakeExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::Result(self.0.clone())
         }
@@ -916,6 +923,13 @@ mod tests {
         approved: Arc<Mutex<Vec<String>>>,
     }
     impl crate::tool_exec::RocmToolExecutor for RecordingMutatingExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, name: &str, args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
                 title: "T".to_string(),
@@ -1045,6 +1059,13 @@ mod tests {
     struct NeedsRuntimeProgressExec;
     const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     impl crate::tool_exec::RocmToolExecutor for NeedsRuntimeProgressExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             let (tx, rx) = std::sync::mpsc::channel();
             tokio::runtime::Handle::current().spawn(async move {
@@ -1092,6 +1113,13 @@ mod tests {
     #[derive(Debug)]
     struct PanickingExec;
     impl crate::tool_exec::RocmToolExecutor for PanickingExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             panic!("executor bug");
         }
@@ -1142,6 +1170,28 @@ mod tests {
                 .expect("tool call ok"),
             json!({ "via": "execute_model_call" })
         );
+    }
+
+    /// Every tool the agent registers is a model's call, so none of them may
+    /// reach the executor through `execute`, the operator's entry point: a tool
+    /// written that way would skip the model-only rules without failing
+    /// anything else. Read from the source so a new tool is covered as well.
+    #[test]
+    fn no_agent_tool_calls_the_operators_entry_point() {
+        let source = include_str!("tools.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production part");
+        let offending: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(".execute(") && !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "agent tools must call `execute_model_call`, not `execute`: {offending:?}"
+        );
+        assert!(production.contains(".execute_model_call("));
     }
 
     /// In-memory `tracing` writer, so a test can read back what was logged.
@@ -1216,6 +1266,13 @@ mod tests {
     #[derive(Debug)]
     struct FakeErrorExec;
     impl crate::tool_exec::RocmToolExecutor for FakeErrorExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::Error("boom".to_string())
         }

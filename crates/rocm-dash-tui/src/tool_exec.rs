@@ -52,11 +52,11 @@ pub trait RocmToolExecutor: std::fmt::Debug + Send + Sync {
     /// built from what the operator typed (a slash command). The bin holds a
     /// model's values to stricter rules than the operator's own — a value the
     /// operator typed is theirs to use — so the agent's tools call this and the
-    /// slash commands call [`Self::execute`]. The default applies no extra
-    /// rules, for executors that have none (test doubles).
-    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
-        self.execute(name, args)
-    }
+    /// slash commands call [`Self::execute`]. Required, with no default, so a
+    /// new executor has to decide what a model's call is held to rather than
+    /// silently skipping the rules; one with no extra rules delegates to
+    /// [`Self::execute`].
+    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;
 
     /// Run an *approved* mutating action via the bin's captured-subprocess path
     /// (piped stdout/stderr → JSON; no printing to the TUI terminal, so it is

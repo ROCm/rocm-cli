@@ -190,9 +190,10 @@ Feature: Chat and endpoint detection
   # terminal escape sequences that conceal part of a line, retitle the window
   # or write the clipboard. `rocm chat --prompt` prints the reply to a terminal,
   # so what reaches it must be what the user sees: the concealed part shown in
-  # plain text, the sequences and their payloads gone. Runs on mock (no GPU).
+  # plain text, the sequences and their payloads gone, and a sequence left
+  # open costing only the rest of its own line. Runs on mock (no GPU).
   @id:chat-cli-reply-escapes-stripped
-  Scenario: chat-18 - The chat CLI shows a reply's hidden text instead of passing on its escape sequences
+  Scenario: chat-17 - The chat CLI shows a reply's hidden text instead of passing on its escape sequences
     Given a local chat assistant whose reply hides part of itself with terminal escape sequences
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI output carries no terminal escape sequence
@@ -206,11 +207,23 @@ Feature: Chat and endpoint detection
   # run keeps it as one argument. The pip index fixture is therock-next-15's,
   # so the preview resolves without network or GPU. Runs on mock (no GPU).
   @id:chat-assistant-value-unsafe-to-paste-refused
-  Scenario: chat-19 - A folder the chat assistant chose that a Windows shell would split is refused, not offered to paste
+  Scenario: chat-18 - A folder the chat assistant chose that a Windows shell would split is refused, not offered to paste
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     And a local chat assistant that asks to install ROCm into a folder whose name holds an ampersand
     When the user asks the chat assistant with ROCm tools a question in one-shot chat
     Then the CLI refuses the assistant's folder and tells the user to supply it themselves
-    And no command line holding that folder is offered to paste, and nothing is installed
+    And no command line holding that folder is offered to paste
     When the user previews that install into the same folder themselves
     Then the dry-run command line names the folder with an ampersand as a single argument
+
+  # The plan `natural_language_plan` returns for a request the assistant wrote
+  # turns words of that request into the values on its `tool_call:` lines,
+  # which are offered to paste, so the plan is held to the rule chat-18's call
+  # is: a folder with an ampersand in it is refused before the plan is shown.
+  # Planning runs no install, so no pip index is needed. Runs on mock (no GPU).
+  @id:chat-assistant-plan-unsafe-to-paste-refused
+  Scenario: chat-19 - A plan for the chat assistant's request that names a folder a Windows shell would split is refused, not shown
+    Given a local chat assistant that asks for a plan to install ROCm into a folder whose name holds an ampersand
+    When the user asks the chat assistant with ROCm tools a question in one-shot chat
+    Then the CLI refuses the plan for the assistant's request
+    And no command line holding that folder is offered to paste
