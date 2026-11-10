@@ -555,7 +555,16 @@ fn friendly_engine_detect_note_fallback(note: &str) -> String {
 /// (`ensure_engine_allowed_on_platform`), so the inventory cannot call an
 /// engine unsupported while those commands go ahead with it, or the reverse.
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
-    let ruled_out = engine_ruled_out_by_platform(engine);
+    runtime_status_label_with_extension_check(engine, detect, engine_ruled_out_by_platform(engine))
+}
+
+/// [`engine_runtime_status_label`] with the platform decision passed in, so the
+/// platform clause of the `installed, not usable` branch runs on any host.
+fn runtime_status_label_with_extension_check(
+    engine: &str,
+    detect: &DetectResponse,
+    ruled_out: PlatformRuleOut,
+) -> &'static str {
     if detect.installed
         && engine.eq_ignore_ascii_case("vllm")
         && ruled_out != PlatformRuleOut::NativeWindowsVllm
@@ -967,6 +976,31 @@ mod tests {
             },
             notes: Vec::new(),
         };
+        // The platform decision is passed in, so these run on every host: a vLLM
+        // that native Windows rules out is not charged with an extension problem,
+        // and a device that is available keeps the runtime `ready` whatever its
+        // reason says.
+        let broken = detect(true, false, Some("compiled extensions do not import"));
+        assert_eq!(
+            runtime_status_label_with_extension_check(
+                "vllm",
+                &broken,
+                PlatformRuleOut::NativeWindowsVllm
+            ),
+            "ready"
+        );
+        assert_eq!(
+            runtime_status_label_with_extension_check("vllm", &broken, PlatformRuleOut::Allowed),
+            "installed, not usable"
+        );
+        assert_eq!(
+            runtime_status_label_with_extension_check(
+                "vllm",
+                &detect(true, true, Some("a note")),
+                PlatformRuleOut::Allowed
+            ),
+            "ready"
+        );
         if cfg!(windows) {
             return;
         }

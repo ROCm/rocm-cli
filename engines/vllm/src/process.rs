@@ -177,6 +177,11 @@ fn spawn_vllm_server(
         bail!("vLLM launch requires ROCm GPU execution; no CPU fallback is used");
     }
 
+    // Before the host-library checks below: a torch that cannot import because a
+    // library is missing reports nothing here, so those checks still give their
+    // own guidance, and a wheel that does not match its torch is named first.
+    require_importable_extensions(runtime)?;
+
     // Fail fast when the OpenMPI runtime is missing. vLLM's ROCm torch wheel
     // dlopen()s the OpenMPI libraries during `import torch`; without them the
     // process dies with the cryptic `libmpi_cxx.so.40: cannot open shared object
@@ -223,8 +228,6 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
                 .or("run `rocm engines install vllm --yes` to install it automatically")
         );
     }
-
-    require_importable_extensions(runtime)?;
 
     if let Some(parent) = request.state_path.parent() {
         fs::create_dir_all(parent)
@@ -504,30 +507,12 @@ fn require_importable_extensions(runtime: &VllmRuntime) -> Result<()> {
 fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> Option<String> {
     let python = runtime.python_executable.as_ref()?;
     let mut command = ProcessCommand::new(python);
-    command
-        .arg("-c")
-        .arg(VLLM_EXTENSION_PROBE_SCRIPT)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    command.arg("-c").arg(VLLM_EXTENSION_PROBE_SCRIPT);
     apply_therock_env(&mut command, runtime).ok()?;
-    let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().ok()? {
-            Some(status) if status.success() => break,
-            Some(_) => return None,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    let mut stdout = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut stdout).ok()?;
-    extension_import_problem_from_probe(&stdout, runtime)
+    let output = rocm_core::process::run_with_timeout(command, timeout, "vLLM extension probe")
+        .ok()
+        .filter(|output| output.status.success())?;
+    extension_import_problem_from_probe(&String::from_utf8_lossy(&output.stdout), runtime)
 }
 
 /// Reads the probe's JSON into the guidance a user can act on.
@@ -1097,11 +1082,31 @@ mod tests {
             dir.path(),
             r#"echo '{"failures": [{"module": "vllm._C", "error": "undefined symbol: x"}]}'"#,
         )?;
-        let error = require_importable_extensions(&test_vllm_runtime(Some(python), None))
+        let request = ServeHttpRequest {
+            service_id: "svc-vllm".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11439,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: None,
+            env_id: None,
+            state_path: dir.path().join("state.json"),
+            log_path: None,
+            engine_recipe: None,
+        };
+        // Through the launch path itself, so removing the gate from it fails here
+        // rather than only the helper's own test.
+        let error = spawn_vllm_server(&request, &test_vllm_runtime(Some(python), None), None)
             .expect_err("a failing extension blocks serve")
             .to_string();
         assert!(error.contains("vllm._C"), "{error}");
-
+        assert!(error.contains("do not import"), "{error}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_extension_probe_does_not_block_serve() -> Result<()> {
         let clean = tempfile::tempdir()?;
         let python = stand_in_python(clean.path(), r#"echo '{"failures": []}'"#)?;
         require_importable_extensions(&test_vllm_runtime(Some(python), None))?;
@@ -1169,6 +1174,16 @@ mod tests {
             .expect("a failing _rocm_C is a problem");
         assert!(
             problem.contains("vllm._rocm_C: undefined symbol: boom"),
+            "{problem}"
+        );
+        // So is the stable-libtorch extension: dropping it from the probe would
+        // let a wheel that only that one breaks read as healthy.
+        let out =
+            run_probe_script("", &[("_C", ""), ("_C_stable_libtorch", fails)])?.expect("python3");
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a failing _C_stable_libtorch is a problem");
+        assert!(
+            problem.contains("vllm._C_stable_libtorch: undefined symbol: boom"),
             "{problem}"
         );
         // Everything loads.

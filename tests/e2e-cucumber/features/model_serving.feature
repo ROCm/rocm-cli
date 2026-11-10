@@ -906,3 +906,17 @@ Feature: Model serving
     And the user is told the model needs an explicit GGUF variant
     And no quantization is suggested for a repo the CLI has not inspected
     And no local server was recorded
+
+  # A vLLM wheel built against a different torch installs and reports a version,
+  # so the inventory called it `runtime: ready` and `serve` then died deep in
+  # engine start-up. The inventory now says it is installed but not usable and
+  # names the extension. Hermetic: a stand-in interpreter answers the probe, so
+  # no GPU, network or real vLLM is needed. The matching refusal in `serve` is
+  # covered at unit level (`serve_refuses_a_vllm_whose_extensions_do_not_import`)
+  # because reaching it end to end needs a GPU lane.
+  @id:serve-vllm-broken-extensions-reported-not-usable @requires-os:linux
+  Scenario: serve-57 - A vLLM install whose compiled extensions do not import is not reported as ready
+    Given a vLLM install whose compiled extensions do not import
+    When the user lists the engines of that install
+    Then vLLM is reported as installed but not usable
+    And the report names the extension that failed to import
