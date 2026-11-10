@@ -21,9 +21,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::AppPaths;
 use crate::format_http_base_url;
 use crate::unix_time_millis;
+use crate::{ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AppPaths};
 use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
 
 /// Engine state-file key recording when inference was first confirmed.
@@ -127,6 +127,15 @@ pub struct ManagedServiceRecord {
     /// readiness was gated on inference.
     #[serde(default)]
     pub inference_verified_at_unix_ms: Option<u64>,
+    /// Base URL of the Anthropic-compatible `/v1/messages` endpoint, once the
+    /// serving process has published one. Adopted from the engine state file (see
+    /// [`crate::anthropic_endpoint`]); `None` while the service is still coming up
+    /// and on records written before the endpoint existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_url: Option<String>,
+    /// How [`Self::anthropic_endpoint_url`] is provided: `proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_mode: Option<String>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -248,6 +257,8 @@ impl ManagedServiceRecord {
             startup_phase: None,
             inference_verified_at_unix_ms: None,
             inference_probe_attempted_at_unix_ms: None,
+            anthropic_endpoint_url: None,
+            anthropic_endpoint_mode: None,
             manifest_path,
             log_path,
             engine_state_path,
@@ -283,6 +294,10 @@ impl ManagedServiceRecord {
     pub fn reset_for_restart(&mut self) {
         self.inference_verified_at_unix_ms = None;
         self.inference_probe_attempted_at_unix_ms = None;
+        // The respawned process publishes its own endpoint; the old proxy port
+        // died with the previous run.
+        self.anthropic_endpoint_url = None;
+        self.anthropic_endpoint_mode = None;
         self.restart_count = self.restart_count.saturating_add(1);
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
@@ -433,6 +448,19 @@ impl ManagedServiceRecord {
         {
             self.inference_verified_at_unix_ms = Some(verified_at);
         }
+        // The endpoint belongs to the run that published it, so it is replaced
+        // rather than kept: a restarted proxy listens on a different port.
+        let published = |key: &str| {
+            state
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(url) = published(ANTHROPIC_ENDPOINT_URL_STATE_KEY) {
+            self.anthropic_endpoint_url = Some(url);
+            self.anthropic_endpoint_mode = published(ANTHROPIC_ENDPOINT_MODE_STATE_KEY);
+        }
         Ok(self.status != previous)
     }
 
@@ -502,10 +530,11 @@ impl ManagedServiceRecord {
         let storage_record = host_record.with_storage_paths();
         let bytes = serde_json::to_vec_pretty(&storage_record)
             .context("failed to serialize service record")?;
-        crate::write_atomic(&host_record.manifest_path, &bytes, "json").with_context(|| {
+        let manifest_path = &host_record.manifest_path;
+        crate::atomic_write::write_file_atomically(manifest_path, &bytes).with_context(|| {
             format!(
                 "failed to write service manifest {}",
-                host_record.manifest_path.display()
+                manifest_path.display()
             )
         })
     }
@@ -514,7 +543,8 @@ impl ManagedServiceRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{probe_test_record, temp_app_paths};
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
+    use crate::test_support::{probe_test_record, retired_temp_path, temp_app_paths};
 
     /// An unknown id reads as one plain sentence pointing at the listing
     /// command, with no OS error chained under it.
@@ -645,6 +675,33 @@ mod tests {
         record
     }
 
+    /// The serving process publishes the Anthropic endpoint in the engine state;
+    /// the record adopts it, and a restart drops it so the next run's port wins.
+    #[test]
+    fn engine_refresh_adopts_the_published_anthropic_endpoint() {
+        let record = refresh_from_state(
+            "anthropic",
+            &serde_json::json!({
+                "status": "ready",
+                "anthropic_endpoint_url": "http://127.0.0.1:40123",
+                "anthropic_endpoint_mode": "proxy",
+            }),
+        );
+        assert_eq!(
+            record.anthropic_endpoint_url.as_deref(),
+            Some("http://127.0.0.1:40123")
+        );
+        assert_eq!(record.anthropic_endpoint_mode.as_deref(), Some("proxy"));
+
+        let mut record = record;
+        record.reset_for_restart();
+        assert_eq!(record.anthropic_endpoint_url, None);
+        assert_eq!(record.anthropic_endpoint_mode, None);
+
+        let record = refresh_from_state("no-anthropic", &serde_json::json!({ "status": "ready" }));
+        assert_eq!(record.anthropic_endpoint_url, None);
+    }
+
     /// A container engine serves under a different name than the image it pulls;
     /// the record adopts that name from the engine state, and every readiness
     /// probe asks for it rather than for the image reference.
@@ -743,6 +800,45 @@ mod tests {
         assert_eq!(record.supervisor_start_ticks, expected);
         assert_eq!(record.engine_pid, Some(pid));
         assert_eq!(record.engine_start_ticks, expected);
+    }
+
+    /// Writing a service manifest never writes through a file another writer
+    /// already staged next to it. The occupied names are the ones the retired
+    /// clock-and-pid temp naming would have picked, so a write that still used
+    /// one would truncate a foreign file and rename it into place. Reading the
+    /// manifest back would pass for either writer; the foreign files are what
+    /// tell them apart.
+    #[test]
+    fn writing_a_service_manifest_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-write-foreign-temp");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-foreign-temp",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.write()?;
+        record.startup_phase = Some("loading".to_owned());
+        let manifest_path = record.manifest_path.clone();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&manifest_path, millis),
+            || record.write(),
+        )?;
+
+        let published: ManagedServiceRecord = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(published.service_id, "svc-foreign-temp");
+        assert_eq!(published.startup_phase.as_deref(), Some("loading"));
+        Ok(())
     }
 
     #[test]

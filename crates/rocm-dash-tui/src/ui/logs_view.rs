@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Logs overlay (Phase 3 Wave 3).
+//! Logs overlay.
 //!
 //! Browses recent ROCm CLI logs via `rocm logs [--search WORDS]` — read-only, so
 //! no approval gate. An optional search box filters before running. Output

@@ -211,6 +211,19 @@ fn raised_case_count(requested: Option<&str>, default: u32) -> u32 {
         .map_or(default, |requested: u32| requested.max(default))
 }
 
+/// The temp name the retired `write_atomic` picked for `destination` at
+/// `millis`: the full file name plus `.tmp-<millis>-<pid>`, with this
+/// process's pid. Unlike the names `atomic_write` picks, it was fixed by the
+/// clock and the pid alone, so a test can occupy it ahead of time.
+pub(crate) fn retired_temp_path(destination: &std::path::Path, millis: u128) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .expect("a destination has a file name")
+        .to_os_string();
+    name.push(format!(".tmp-{millis}-{}", std::process::id()));
+    destination.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

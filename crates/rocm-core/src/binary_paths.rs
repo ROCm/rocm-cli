@@ -12,9 +12,17 @@ use crate::require_nonempty;
 use crate::{current_executable_path, platform_binary_name};
 
 pub fn sibling_binary_path(binary_name: &str) -> Result<PathBuf> {
+    sibling_binary_path_from(&current_executable_path()?, binary_name)
+}
+
+/// [`sibling_binary_path`] for a caller that already holds the executable path.
+///
+/// A caller that decides something from the current executable and then looks
+/// for a sibling passes the one value to both, so the two cannot disagree: the
+/// lookup falls back to `argv[0]` where `std::env::current_exe` fails.
+pub fn sibling_binary_path_from(current_exe: &Path, binary_name: &str) -> Result<PathBuf> {
     require_nonempty(binary_name, "binary_name")?;
-    let current_exe = current_executable_path()?;
-    let candidates = sibling_binary_candidates(&current_exe, binary_name)?;
+    let candidates = sibling_binary_candidates(current_exe, binary_name)?;
     for candidate in &candidates {
         if candidate.is_file() {
             return Ok(candidate.clone());
@@ -75,4 +83,35 @@ pub fn daemon_binary_path() -> Result<PathBuf> {
         return Ok(rocm);
     }
     Ok(current_exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lookup starts from the executable it is given, not from the
+    /// process's own: a caller that chose something from one path must find the
+    /// sibling beside that same path.
+    #[test]
+    fn sibling_binary_path_from_looks_beside_the_given_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join(platform_binary_name("rocm"));
+        let sibling = dir.path().join(platform_binary_name("rocmd"));
+        std::fs::write(&sibling, b"").expect("write sibling");
+
+        assert_eq!(sibling_binary_path_from(&exe, "rocmd").unwrap(), sibling);
+
+        let error = sibling_binary_path_from(&exe, "rocm-engine-none").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("unable to locate sibling binary"), "{text}");
+        assert!(
+            text.contains(&dir.path().display().to_string()),
+            "the error names where it looked: {text}"
+        );
+    }
+
+    #[test]
+    fn sibling_binary_path_from_rejects_an_empty_name() {
+        assert!(sibling_binary_path_from(Path::new("/opt/bin/rocm"), "").is_err());
+    }
 }

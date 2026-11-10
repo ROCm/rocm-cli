@@ -133,8 +133,8 @@ where
     engine_request_with_scoped_env(paths, engine, method, request, env_root, None)
 }
 
-/// [`engine_request_with_env_root`], additionally handing the engine the 0600
-/// endpoint key file for one service via `ROCM_SERVE_API_KEY_FILE`.
+/// [`engine_request_with_env_root`], additionally handing a **built-in** engine
+/// the 0600 endpoint key file for one service via `ROCM_SERVE_API_KEY_FILE`.
 ///
 /// An engine that probes its own server's HTTP endpoint while answering a
 /// request reads that variable to authenticate
@@ -144,6 +144,22 @@ where
 /// the service as not listed - indistinguishable, from the CLI's side, from a
 /// server that is simply down. It is threaded per call rather than per process
 /// because the key is per service id.
+///
+/// **External plugin children are not given it.** The built-in engines run
+/// in-process, so the variable is set and restored around one call
+/// ([`with_scoped_builtin_engine_env`]); a plugin is a third-party binary this
+/// process spawns, and a variable put in its environment is readable from
+/// `/proc/<pid>/environ` and inherited by every grandchild it starts. That is
+/// more exposure than an informational `device:` row is worth — the only caller
+/// that passes a key file is [`fetch_service_device`]. The cost is that a
+/// plugin-backed service with endpoint auth reports no device; it is a row the
+/// summary already declares optional.
+///
+/// This is a reduction in incidental exposure, not a security boundary: a
+/// plugin child is handed `ROCM_CLI_DATA_DIR` by [`apply_app_path_env`] and the
+/// key file's location under it is a documented, deterministic convention
+/// (`rocm_engine_protocol::endpoint_key_file_path`), so a plugin that wants the
+/// key can still derive the path. What changes is that it must go looking.
 fn engine_request_with_scoped_env<T, R>(
     paths: Option<&AppPaths>,
     engine: &str,
@@ -183,12 +199,14 @@ where
     if let Some(env_root) = env_root {
         command.env("ROCM_CLI_ENGINE_ENVS_ROOT", env_root);
     }
-    if let Some(endpoint_key_file) = endpoint_key_file {
-        command.env(
-            rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV,
-            endpoint_key_file,
-        );
-    }
+    // Deliberately NOT `command.env(ENDPOINT_API_KEY_FILE_ENV, ...)`: this is
+    // the external-plugin branch, and the key file stays with the built-in
+    // engines that run in-process. See this function's doc comment, and
+    // `an_external_plugin_child_is_not_handed_the_endpoint_key_file` for the
+    // assertion that keeps it that way. The variable is also cleared rather
+    // than merely not set, so a `ROCM_SERVE_API_KEY_FILE` this process happens
+    // to have inherited is not passed through either.
+    command.env_remove(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV);
     if stream_progress {
         command.env("ROCM_ENGINE_PROGRESS_STDERR", "1");
     }
@@ -637,6 +655,16 @@ pub(crate) fn run_builtin_engine_serve_http(
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
     let parsed_policy = parse_device_policy(Some(device_policy))?;
+    // Every engine is fronted the same way, so the Anthropic endpoint is started
+    // here once rather than inside each adapter. It runs on a thread of this
+    // process, which is the service's supervisor: it ends when the service does.
+    rocmd::anthropic_proxy::spawn_alongside_engine(rocmd::anthropic_proxy::AnthropicProxyConfig {
+        host: host.clone(),
+        engine_port: port,
+        served_model: model_ref.clone(),
+        state_path: state_path.clone(),
+        probe_api_key: rocm_engine_protocol::resolve_endpoint_api_key(),
+    });
     match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
             service_id,

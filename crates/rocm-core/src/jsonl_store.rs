@@ -11,22 +11,22 @@
 //! with the store. A torn tail — crash debris, or left by a write that failed
 //! partway — is cut by the next append rather than truncated in place: that
 //! append writes the store's clean prefix plus its own new record as a single
-//! rewrite via `write_atomic`, so a lock-free reader never observes a file
-//! shrunk mid-repair. That rewrite costs O(store) rather than O(record), the
-//! same as a proposal status update, which rewrites the whole store via
-//! `write_atomic` too. Only when that rewrite itself fails (a full disk, or on
-//! Windows another program holding the store open without delete sharing) does
-//! the append cut the debris in place instead, so a store cannot be wedged by
-//! a failed repair; otherwise nothing in this module ever shrinks a store in
-//! place. Readers take no lock, and an unterminated last line that is not
-//! valid JSON — an append caught mid-write — is skipped rather than reported
-//! as corruption.
+//! rewrite via [`crate::atomic_write::write_file_atomically`], so a lock-free
+//! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
+//! rather than O(record), the same as a proposal status update, which rewrites
+//! the whole store the same way. Only when that rewrite itself fails (a full
+//! disk, or on Windows another program holding the store open without delete
+//! sharing) does the append cut the debris in place instead, so a store cannot
+//! be wedged by a failed repair; otherwise nothing in this module ever shrinks
+//! a store in place. Readers take no lock, and an unterminated last line that
+//! is not valid JSON — an append caught mid-write — is skipped rather than
+//! reported as corruption.
 //!
 //! A store can additionally be capped by size-based rotation (see
 //! [`JsonlRotation`]): the append that finds the live file at the cap renames
 //! it whole to `<store>.1` first, under the same lock — before any torn tail
 //! in it would otherwise be repaired, so an at-cap store is never paid for
-//! with a `write_atomic` rewrite only to be rotated away immediately after —
+//! with an atomic rewrite only to be rotated away immediately after —
 //! and the recent-record readers span the rotated generations.
 //!
 //! The engine is generic over the record type. Which stores exist, their
@@ -200,7 +200,7 @@ pub(crate) fn append_jsonl_record<T: Serialize>(
             file,
             tail_start,
             &line,
-            |path, content| crate::write_atomic(path, content, "jsonl"),
+            crate::atomic_write::write_file_atomically,
             truncate_jsonl_in_place,
         )?,
         TailState::ValidUnterminated(start) => {
@@ -259,12 +259,11 @@ fn repair_torn_tail_and_append(
     content.extend_from_slice(line);
     // Done with the pre-repair file's handle before replacing it, rather than
     // leaving that to whatever happens to still have `file` open at function
-    // return. The rename already succeeds with this handle open regardless —
-    // std opens files with `FILE_SHARE_DELETE` by default on Windows, so a
-    // rename isn't blocked by it (see `write_atomic`'s doc for the case that
-    // *isn't* covered: another process holding the destination open without
-    // delete-sharing) — but this states the intent rather than leaning on that
-    // default.
+    // return. The replace already succeeds with this handle open regardless —
+    // std opens files with `FILE_SHARE_DELETE` by default on Windows, so it
+    // isn't blocked by it (see the `atomic_write` module doc for how the publish
+    // treats a destination another process holds open) — but this states the
+    // intent rather than leaning on that default.
     drop(file);
     let replace_error = match replace(path, &content) {
         Ok(()) => return Ok(()),
@@ -432,7 +431,7 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 ///
 /// Returns fewer bytes if the file now ends before `end`. Nothing this
 /// module's own writers do shrinks a store in place — an append only ever
-/// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
+/// grows it, and a torn-tail repair replaces it wholesale via the atomic writer
 /// (see [`inspect_tail`] and [`TailState::Torn`]) — except the repair's
 /// fallback, taken only when that replacement fails and only under the store's
 /// lock (see [`repair_torn_tail_and_append`]); otherwise a short read here
@@ -1164,11 +1163,9 @@ mod tests {
         seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
         let before = file_identity(&path)?;
 
-        repair_store_with(
-            &path,
-            |path, content| crate::write_atomic(path, content, "jsonl"),
-            |_, _| bail!("truncate must not run when the replace succeeded"),
-        )?;
+        repair_store_with(&path, crate::atomic_write::write_file_atomically, |_, _| {
+            bail!("truncate must not run when the replace succeeded")
+        })?;
 
         let after = file_identity(&path)?;
         let text = fs::read_to_string(&path);
@@ -1185,9 +1182,11 @@ mod tests {
         let seeded = format!("{}\n{torn}", entry_line("a"));
         seed_store(&path, &seeded)?;
 
-        // Layered like the real steps (`write_atomic` and
-        // `truncate_jsonl_in_place` both wrap the OS error in a context), so
-        // the assertion fails if either cause is formatted without its chain.
+        // Layered like the real steps (`write_file_atomically` puts a context
+        // such as `failed to publish <path>` over the OS error, and
+        // `truncate_jsonl_in_place` puts `failed to truncate <path>` over its
+        // own), so the assertion fails if either cause is formatted without its
+        // chain.
         let result = repair_store_with(
             &path,
             |_, _| {

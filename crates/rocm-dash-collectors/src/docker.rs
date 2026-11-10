@@ -6,7 +6,6 @@
 //!
 //! Field-extraction logic is vendored from instinct-dash `DockerService.ts`
 //! (HIP_VISIBLE_DEVICES → gpu_ids, `--tensor-parallel-size`/`-tp`, etc.).
-//! See `../../wiki/entities/dockerode.md`.
 //!
 //! The async inherent methods are the public API. The `ServiceDiscovery` trait
 //! impl is sync-only and returns `Unsupported`: bollard requires a tokio

@@ -341,6 +341,17 @@ mod tests {
              <li><b>Every other platform</b> — real self-hosted GPU hardware; \
              non-blocking while proven out.</li>";
         assert!(html.contains(expected), "legend text changed:\n{html}");
+        // The pin above would still pass if the legend hardcoded the words while
+        // a shared constant's value moved on; these tie the rendered text to the
+        // constants themselves.
+        assert!(
+            html.contains(MOCK_GATES_PR),
+            "legend must render MOCK_GATES_PR ({MOCK_GATES_PR:?}):\n{html}"
+        );
+        assert!(
+            html.contains(OTHER_LANES_NON_BLOCKING),
+            "legend must render OTHER_LANES_NON_BLOCKING ({OTHER_LANES_NON_BLOCKING:?}):\n{html}"
+        );
     }
 
     #[test]

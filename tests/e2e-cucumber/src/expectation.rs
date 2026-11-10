@@ -838,6 +838,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lemonade_serve_failures_track_rocmai_898_without_xfailing_mock_or_windows() {
+        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        for id in [
+            "bench-load-real-serve",
+            "chat-tool-definitions-accepted",
+            "chat-end-to-end-local-model",
+            "serve-lemonade-inference",
+            "serve-stop-leaves-no-background-helper",
+        ] {
+            let scenario = decl(&[&format!("id:{id}")]);
+            assert!(
+                matches!(
+                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
+                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCMAI-898"
+                ),
+                "{id}"
+            );
+            assert_eq!(
+                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+                Some(90),
+                "{id}",
+            );
+            for platform in ["mock", "strix-windows"] {
+                assert_eq!(
+                    resolve(&scenario, &cap(platform), &matrix, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} on {platform}",
+                );
+            }
+        }
+    }
+
+    /// The rows that carry `therock_family` and `has_amd_gpu` exist so that the
+    /// no-GPU lane, where the same scenarios run against MockServer instead of a
+    /// real Lemonade serve, stays expect-pass. `cap("mock")` cannot prove that:
+    /// its `os_family` is `other`, so the `os = "linux"` condition excludes it
+    /// before either GPU guard is consulted. These hosts are Linux, so each guard
+    /// is the only thing standing between them and an xfail. The two partial
+    /// hosts isolate the guards from each other: dropping `has_amd_gpu` from a row
+    /// fails the host that reports only a gfx target, and dropping `therock_family`
+    /// fails the host that reports only a GPU.
+    #[test]
+    fn real_gpu_lemonade_rows_do_not_xfail_linux_hosts_without_a_usable_gpu() {
+        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let linux_lemonade = cap("strix-ubuntu");
+        let hosts = [
+            (
+                "linux, no GPU, no gfx target",
+                HostCapability {
+                    gfx_target: None,
+                    has_amd_gpu: false,
+                    amd_gpu_count: Some(0),
+                    ..linux_lemonade.clone()
+                },
+            ),
+            (
+                "linux, gfx target reported but no usable GPU",
+                HostCapability {
+                    has_amd_gpu: false,
+                    amd_gpu_count: Some(0),
+                    ..linux_lemonade.clone()
+                },
+            ),
+            (
+                "linux, usable GPU but no gfx target reported",
+                HostCapability {
+                    gfx_target: None,
+                    ..linux_lemonade.clone()
+                },
+            ),
+        ];
+        for id in [
+            "bench-load-real-serve",
+            "chat-tool-definitions-accepted",
+            "chat-end-to-end-local-model",
+        ] {
+            let scenario = decl(&[&format!("id:{id}")]);
+            for (label, host) in &hosts {
+                assert_eq!(
+                    resolve(&scenario, host, &matrix, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} on {label}",
+                );
+            }
+            // The full real-GPU host is the one that must still be xfailed.
+            assert!(
+                matches!(
+                    resolve(&scenario, &linux_lemonade, &matrix, Included::default()),
+                    Expectation::ExpectXfail { bug, .. } if bug == "ROCMAI-898"
+                ),
+                "{id} on a real GPU host",
+            );
+        }
+    }
+
     fn decl(tags: &[&str]) -> ScenarioDecl {
         ScenarioDecl::from_tags(tags)
     }
@@ -2257,11 +2353,47 @@ flaky = true
         ));
     }
 
+    /// The two rows for Lemonade 11.5.1's failed backend alignment apply to native
+    /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
+    /// default engine is vLLM, where the engine named is what decides), and they are not
+    /// `flaky` (an XPASS means the cause is gone and the row is stale). Neither sets
+    /// `serve_timeout_secs`: serve-06's own `@serve-timeout` tag takes precedence over a
+    /// row, so one would change nothing.
+    #[test]
+    fn lemonade_alignment_rows_apply_only_to_native_windows_with_lemonade() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        for id in [
+            "runtime-lemonade-backend-alignment-reported",
+            "serve-large-model-inference",
+        ] {
+            assert!(m.is_xfail(id, &cap("strix-windows"), "lemonade"), "{id}");
+            for linux in ["strix-ubuntu", "mi300x", "wsl2"] {
+                assert!(!m.is_xfail(id, &cap(linux), "lemonade"), "{id} on {linux}");
+            }
+            // Same Windows host, other engine: the row is about lemonade.
+            assert!(!m.is_xfail(id, &cap("strix-windows"), "vllm"), "{id} vllm");
+            let entries = m.entries_for(id);
+            assert_eq!(entries.len(), 1, "{id}");
+            assert!(!entries[0].flaky, "{id} is deterministic");
+            assert_eq!(entries[0].serve_timeout_secs, None, "{id}");
+        }
+        // The row cannot shorten serve-06's wait: its own tag wins, so the harness
+        // still hands the 2400s the feature file asks for.
+        let tags = feature_tags(
+            include_str!("../features/model_serving.feature"),
+            "serve-large-model-inference",
+        );
+        assert_eq!(
+            m.serve_timeout_override(&ScenarioDecl::from_tags(&tags), &cap("strix-windows")),
+            Some(2400)
+        );
+    }
+
     /// serve-40 serves through the same lemonade managed serve as the other
     /// lemonade serve rows, so its row is scoped the same way: xfail on a
     /// lemonade Linux host, with a 90s serve wait, and not an expected failure
-    /// on native Windows. The row must stay `flaky` (a fixed #897 would
-    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name #897.
+    /// on native Windows. The row must stay `flaky` (a fixed ROCMAI-898 would
+    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name ROCMAI-898.
     #[test]
     fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
@@ -2275,7 +2407,7 @@ flaky = true
         let entries = m.entries_for(id);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].flaky);
-        assert_eq!(entries[0].bug, "#897");
+        assert_eq!(entries[0].bug, "ROCMAI-898");
     }
 
     /// The row's 90s only matters if the harness hands it to the serve steps:

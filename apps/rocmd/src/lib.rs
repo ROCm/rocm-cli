@@ -4,9 +4,11 @@
 
 #![allow(clippy::items_after_test_module)]
 
+pub mod anthropic_proxy;
 mod cli;
 mod common;
 mod daemon;
+mod daemon_host;
 mod engine_ipc;
 mod host_snapshot;
 mod mcp;

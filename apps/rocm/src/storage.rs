@@ -370,10 +370,94 @@ pub(crate) struct RuntimeUsage {
     pub hold_reason: Option<HoldReason>,
 }
 
+/// Whether Lemonade's install record points at a tree.
+///
+/// `Unused` means unused right now: the record points at another tree that
+/// really holds an install. It says nothing about the future. Lemonade installs
+/// into the active ROCm install's folder, so a copy inside a registered ROCm
+/// install is reused the moment that install becomes active, and only the data
+/// folder's copy, which no ROCm install owns, is ever offered as reclaimable. A
+/// record that names a folder with nothing in it, or that cannot be read, leaves
+/// it unknown which copy works, so no tree is called unused. In every case the
+/// advice must not tell a user to delete a copy that a later serve would reuse,
+/// which would force a reinstall of roughly 25 GiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EngineInstallStatus {
+    /// The install record points here, and the install is there.
+    InUse,
+    /// The record points at another tree that holds an install, so nothing uses
+    /// this one.
+    Unused,
+    /// The record names a folder that holds no install, so no copy is in use.
+    RecordWithoutInstall,
+    /// A record exists but could not be read, so it is not known which copy is
+    /// in use.
+    RecordUnreadable,
+    /// Lemonade has no install record at all.
+    NotRecorded,
+}
+
+/// Decide a tree's status from the install record.
+fn classify_engine_install(
+    record: &rocm_engine_lemonade::InstallRecord,
+    tree: &Path,
+) -> EngineInstallStatus {
+    use rocm_engine_lemonade::InstallRecord;
+    match record {
+        InstallRecord::NotRecorded => EngineInstallStatus::NotRecorded,
+        InstallRecord::Unreadable(_) => EngineInstallStatus::RecordUnreadable,
+        InstallRecord::Recorded {
+            holds_install: false,
+            ..
+        } => EngineInstallStatus::RecordWithoutInstall,
+        InstallRecord::Recorded { runtime_dir, .. }
+            if rocm_core::runtime_path_is_same_or_inside(runtime_dir, tree) =>
+        {
+            EngineInstallStatus::InUse
+        }
+        InstallRecord::Recorded { .. } => EngineInstallStatus::Unused,
+    }
+}
+
+/// One Lemonade install tree found on disk.
+///
+/// A self-managed engine installs into the active ROCm runtime's own folder
+/// when one is active, and into the data folder otherwise, so the same host
+/// can carry a full copy in each. Before this row existed the only trace of a
+/// second copy was a larger runtime size and data-folder total.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EngineInstallUsage {
+    pub engine: String,
+    pub path: PathBuf,
+    /// The runtime whose folder holds this tree, `None` for the data folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_key: Option<String>,
+    pub size_bytes: u64,
+    pub size_complete: bool,
+    pub status: EngineInstallStatus,
+    /// Whether the report offers this copy for deletion: unused right now and
+    /// not inside a registered ROCm install, where it would be reused when that
+    /// install becomes active.
+    pub reclaimable: bool,
+    /// Why the status could not be decided, for the two record-problem states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_note: Option<String>,
+    /// Whether `rocm runtimes uninstall` deletes this tree along with its
+    /// runtime. Decided by the same rule uninstall applies
+    /// (`should_remove_runtime_install_root`): an external or imported runtime
+    /// is only unregistered, so its Lemonade copy stays. `false` for the data
+    /// folder's tree, which belongs to no runtime.
+    pub removed_with_runtime: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StorageReport {
     pub runtimes: Vec<RuntimeUsage>,
     pub runtimes_total_bytes: u64,
+    /// Engine installs ROCm CLI made. A tree inside a runtime folder is also
+    /// part of that runtime's size above.
+    pub engines: Vec<EngineInstallUsage>,
     pub rocm_cli: Vec<PathUsage>,
     /// Caches ROCm CLI uses but does not own. Reported, never deleted.
     pub shared_with_other_tools: Vec<PathUsage>,
@@ -417,6 +501,81 @@ fn shared_model_cache_dir() -> Option<PathBuf> {
     }
     let home = rocm_core::runtime_home_dir()?;
     Some(home.join(".cache").join("huggingface"))
+}
+
+/// Every Lemonade tree ROCm CLI could have installed: the data folder's, and
+/// one per registered runtime (where it goes while that runtime is active).
+/// Only the install parts are measured (`install_tree_dirs`), not the record,
+/// logs and server state that share the data folder's tree.
+fn lemonade_install_usages(
+    paths: &AppPaths,
+    manifests: &[therock::InstalledRuntimeManifest],
+) -> Vec<EngineInstallUsage> {
+    let record = rocm_engine_lemonade::install_record(paths);
+    let record_note = match &record {
+        rocm_engine_lemonade::InstallRecord::Unreadable(error) => Some(format!(
+            "Lemonade's install record could not be read ({error}), so it is not known which copy is in use"
+        )),
+        rocm_engine_lemonade::InstallRecord::Recorded {
+            runtime_dir,
+            holds_install: false,
+        } => Some(format!(
+            "Lemonade's install record names {}, which holds no install, so no copy is in use",
+            runtime_dir.display()
+        )),
+        _ => None,
+    };
+    let candidates = std::iter::once((
+        None,
+        rocm_engine_lemonade::install_tree_root(paths, None),
+        false,
+    ))
+    .chain(manifests.iter().map(|manifest| {
+        (
+            Some(manifest.runtime_key.clone()),
+            rocm_engine_lemonade::install_tree_root(
+                paths,
+                Some(&manifest.install_root.join("engines")),
+            ),
+            should_remove_runtime_install_root(manifest)
+                .is_ok_and(InstallRootDecision::should_remove),
+        )
+    }));
+    candidates
+        .filter_map(|(runtime_key, path, removed_with_runtime)| {
+            let parts = rocm_engine_lemonade::install_tree_dirs(&path);
+            let present = parts
+                .iter()
+                .filter(|part| part.exists())
+                .collect::<Vec<_>>();
+            if present.is_empty() {
+                return None;
+            }
+            let (size_bytes, size_complete) =
+                present
+                    .iter()
+                    .fold((0_u64, true), |(bytes, complete), part| {
+                        let measured = measure_path(part);
+                        (
+                            bytes.saturating_add(measured.bytes),
+                            complete && measured.complete,
+                        )
+                    });
+            let status = classify_engine_install(&record, &path);
+            let reclaimable = status == EngineInstallStatus::Unused && runtime_key.is_none();
+            Some(EngineInstallUsage {
+                engine: "lemonade".to_owned(),
+                path,
+                runtime_key,
+                size_bytes,
+                size_complete,
+                status,
+                reclaimable,
+                record_note: record_note.clone(),
+                removed_with_runtime,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<StorageReport> {
@@ -484,7 +643,7 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         // `<service_id>.log` beside the manifest. `ManagedServiceRecord::new`
         // only *computes* that path (via `AppPaths::service_log_path`) - it
         // writes nothing. The file is created by the launch site,
-        // `spawn_managed_engine_child` (in `service_launch.rs`) for
+        // `spawn_managed_engine_child` (in `service_launch/spawn.rs`) for
         // `rocm serve --managed` and `supervise_service` in `rocmd` on the
         // supervised/recovery path. What *fills* it differs by platform, so the
         // redirect cannot be stated unqualified: `supervise_service` redirects
@@ -532,9 +691,12 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         ));
     }
 
+    let engines = lemonade_install_usages(paths, &manifests);
+
     Ok(StorageReport {
         runtimes,
         runtimes_total_bytes,
+        engines,
         rocm_cli,
         shared_with_other_tools,
     })
@@ -579,6 +741,66 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
         "  total: {}",
         format_bytes(report.runtimes_total_bytes)
     );
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Engine installs:");
+    if report.engines.is_empty() {
+        let _ = writeln!(output, "  none");
+    }
+    for usage in &report.engines {
+        let size = if usage.size_complete {
+            format_bytes(usage.size_bytes)
+        } else {
+            format!(
+                "{} or more (part unreadable)",
+                format_bytes(usage.size_bytes)
+            )
+        };
+        let location = usage.runtime_key.as_deref().map_or_else(
+            || "data folder".to_owned(),
+            |key| format!("inside ROCm install {key}"),
+        );
+        let _ = writeln!(
+            output,
+            "  - {} ({location}): {size} ({})",
+            usage.engine,
+            usage.path.display()
+        );
+        let status = match usage.status {
+            EngineInstallStatus::InUse => "in use",
+            EngineInstallStatus::Unused => "not used right now; Lemonade runs from another install",
+            EngineInstallStatus::RecordWithoutInstall => {
+                "not known to be used; the install record names a folder with no install"
+            }
+            EngineInstallStatus::RecordUnreadable => {
+                "not known to be used; the install record could not be read"
+            }
+            EngineInstallStatus::NotRecorded => "not recorded as installed",
+        };
+        let _ = writeln!(output, "      status: {status}");
+        if usage.reclaimable {
+            let _ = writeln!(
+                output,
+                "      note: reclaimable; Lemonade installs into the active ROCm install's folder, so this copy is only used while no ROCm install is active. Nothing removes it automatically: delete its runtime, downloads and extract folders to free the space"
+            );
+        } else if usage.status == EngineInstallStatus::Unused {
+            let _ = writeln!(
+                output,
+                "      note: reused if this ROCm install becomes the active one; not marked reclaimable"
+            );
+        }
+        if let Some(note) = usage.record_note.as_deref() {
+            let _ = writeln!(output, "      note: {note}; not marked reclaimable");
+        }
+        if usage.runtime_key.is_some() {
+            let note = if usage.removed_with_runtime {
+                "also counted in that ROCm install's size above, and removed with it"
+            } else {
+                "also counted in that ROCm install's size above; ROCm CLI does not delete that install's folder (external or imported), so uninstalling it leaves this copy"
+            };
+            let _ = writeln!(output, "      note: {note}");
+        }
+    }
 
     let _ = writeln!(output);
     let _ = writeln!(output, "ROCm CLI folders:");
@@ -959,6 +1181,11 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                         format_bytes(entry.size_bytes),
                         path.display()
                     );
+                    if let Some(line) =
+                        crate::runtimes_cmd::lemonade_record_report_line(&result.lemonade_record)
+                    {
+                        println!("  lemonade: {line}");
+                    }
                 } else {
                     println!(
                         "removed the registry entry for {}, but left its folder {} in place",
@@ -1463,6 +1690,299 @@ mod tests {
         assert!(rendered.contains("status: in use"));
         assert!(rendered.contains("Shared with other tools (never removed by ROCm CLI):"));
         assert!(rendered.contains("downloaded models"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The release-test layout (ROCMAI-825): Lemonade installed into the data
+    /// folder, then a runtime activated and `rocm serve` installing a second full
+    /// copy inside it, with the record now pointing at the second. Both trees
+    /// must be listed with their sizes, and the data folder's flagged as unused.
+    #[test]
+    fn report_lists_both_lemonade_installs_and_flags_the_unused_one() -> Result<()> {
+        let (root, paths) = test_paths("report-lemonade");
+        let runtime = install_fixture(&paths, manifest("in-use", "gfx1151", "7.14.1", 20), 4096)?;
+        let base = rocm_engine_lemonade::install_tree_root(&paths, None);
+        let per_runtime = rocm_engine_lemonade::install_tree_root(
+            &paths,
+            Some(&runtime.install_root.join("engines")),
+        );
+        crate::test_support::plant_lemonade_tree(&base, 3000)?;
+        crate::test_support::plant_lemonade_tree(&per_runtime, 5000)?;
+        crate::test_support::record_lemonade_install(&paths, &per_runtime)?;
+        // Record, logs and server state share the data folder's tree; they are
+        // not part of the install and must not be counted as reclaimable.
+        std::fs::create_dir_all(base.join("state"))?;
+        std::fs::write(base.join("state").join("big.log"), vec![0_u8; 100_000])?;
+
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        assert_eq!(report.engines.len(), 2, "{:?}", report.engines);
+        let base_row = &report.engines[0];
+        assert_eq!(base_row.path, base);
+        assert_eq!(base_row.runtime_key, None);
+        assert_eq!(base_row.status, EngineInstallStatus::Unused);
+        assert!(base_row.size_bytes >= 3000 && base_row.size_bytes < 100_000);
+        let runtime_row = &report.engines[1];
+        assert_eq!(runtime_row.path, per_runtime);
+        assert_eq!(runtime_row.runtime_key.as_deref(), Some("in-use"));
+        assert_eq!(runtime_row.status, EngineInstallStatus::InUse);
+        assert!(runtime_row.size_bytes >= 5000);
+
+        let rendered = render_report(&report);
+        assert!(
+            rendered.contains("- lemonade (data folder): "),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("status: not used right now; Lemonade runs from another install"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "- lemonade (inside ROCm install in-use): {} ({})",
+                format_bytes(runtime_row.size_bytes),
+                per_runtime.display()
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("note: reclaimable"), "{rendered}");
+        assert!(base_row.reclaimable && !runtime_row.reclaimable);
+        assert!(
+            rendered
+                .contains("also counted in that ROCm install's size above, and removed with it"),
+            "a runtime ROCm CLI owns is deleted with its copy:\n{rendered}"
+        );
+
+        // With no record at all, nothing is called unused: the next install may
+        // well reuse a current tree.
+        std::fs::remove_file(paths.engine_manifests_dir("lemonade").join("runtime.json"))?;
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+        assert!(
+            report
+                .engines
+                .iter()
+                .all(|row| row.status == EngineInstallStatus::NotRecorded)
+        );
+        assert!(!render_report(&report).contains("note: reclaimable"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Two registered runtimes that each hold a Lemonade copy, with the record
+    /// pointing at one. The other copy is unused right now but is reused as soon
+    /// as its runtime becomes active, so it must not be offered for deletion:
+    /// following that advice would force a ~25 GiB reinstall. Only the data
+    /// folder's copy, which no runtime owns, is reclaimable.
+    #[test]
+    fn a_copy_inside_another_registered_runtime_is_not_offered_for_deletion() -> Result<()> {
+        let (root, paths) = test_paths("report-lemonade-two-runtimes");
+        let active = install_fixture(&paths, manifest("active", "gfx1151", "7.14.1", 20), 4096)?;
+        let idle = install_fixture(&paths, manifest("idle", "gfx1151", "7.13.0", 10), 4096)?;
+        let base = rocm_engine_lemonade::install_tree_root(&paths, None);
+        let tree_of = |runtime: &therock::InstalledRuntimeManifest| {
+            rocm_engine_lemonade::install_tree_root(
+                &paths,
+                Some(&runtime.install_root.join("engines")),
+            )
+        };
+        crate::test_support::plant_lemonade_tree(&base, 3000)?;
+        crate::test_support::plant_lemonade_tree(&tree_of(&active), 5000)?;
+        crate::test_support::plant_lemonade_tree(&tree_of(&idle), 6000)?;
+        crate::test_support::record_lemonade_install(&paths, &tree_of(&active))?;
+
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        let row = |runtime_key: Option<&str>| {
+            report
+                .engines
+                .iter()
+                .find(|row| row.runtime_key.as_deref() == runtime_key)
+                .expect("the copy is listed")
+        };
+        assert_eq!(row(Some("active")).status, EngineInstallStatus::InUse);
+        assert_eq!(row(Some("idle")).status, EngineInstallStatus::Unused);
+        assert!(
+            !row(Some("idle")).reclaimable,
+            "reused when `idle` is activated"
+        );
+        assert!(
+            row(None).reclaimable,
+            "no runtime owns the data folder's copy"
+        );
+        let rendered = render_report(&report);
+        assert_eq!(
+            rendered.matches("note: reclaimable").count(),
+            1,
+            "only the data folder's copy is offered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "note: reused if this ROCm install becomes the active one; not marked reclaimable"
+            ),
+            "{rendered}"
+        );
+        // Reporting only: every copy is still on disk.
+        assert!(tree_of(&idle).join("runtime").exists() && base.join("runtime").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A record that names a runtime folder holding no install (a runtime
+    /// uninstalled by a build that left the record behind) means nothing is in
+    /// use. The surviving data-folder copy is then the only one a later serve can
+    /// reuse, so the report must not call it unused or reclaimable: following that
+    /// advice would force a reinstall of roughly 25 GiB.
+    #[test]
+    fn a_record_naming_a_folder_with_no_install_does_not_make_the_survivor_reclaimable()
+    -> Result<()> {
+        let (root, paths) = test_paths("report-lemonade-dangling");
+        let base = rocm_engine_lemonade::install_tree_root(&paths, None);
+        crate::test_support::plant_lemonade_tree(&base, 3000)?;
+        let gone = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("removed");
+        crate::test_support::record_lemonade_install(
+            &paths,
+            &gone.join("engines").join("lemonade"),
+        )?;
+
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        assert_eq!(report.engines.len(), 1, "{:?}", report.engines);
+        let row = &report.engines[0];
+        assert_eq!(row.status, EngineInstallStatus::RecordWithoutInstall);
+        let rendered = render_report(&report);
+        assert!(!rendered.contains("note: reclaimable"), "{rendered}");
+        assert!(!rendered.contains("status: not used"), "{rendered}");
+        assert!(
+            rendered.contains("install record names a folder with no install"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("holds no install, so no copy is in use; not marked reclaimable")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// An unparseable record says nothing about which copy works, so it is not
+    /// "no record" and no copy is called unused.
+    #[test]
+    fn an_unreadable_record_leaves_every_copy_unmarked() -> Result<()> {
+        let (root, paths) = test_paths("report-lemonade-unreadable");
+        let base = rocm_engine_lemonade::install_tree_root(&paths, None);
+        crate::test_support::plant_lemonade_tree(&base, 3000)?;
+        let record = paths.engine_manifests_dir("lemonade").join("runtime.json");
+        std::fs::create_dir_all(record.parent().expect("record has a parent"))?;
+        std::fs::write(&record, b"{ not json")?;
+
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        assert_eq!(
+            report.engines[0].status,
+            EngineInstallStatus::RecordUnreadable
+        );
+        let rendered = render_report(&report);
+        assert!(!rendered.contains("note: reclaimable"), "{rendered}");
+        assert!(rendered.contains("could not be read"), "{rendered}");
+        assert!(
+            !rendered.contains("not recorded as installed"),
+            "{rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The status rule on its own, over every record state and tree position.
+    #[test]
+    fn engine_install_status_follows_the_record() {
+        use rocm_engine_lemonade::InstallRecord;
+        let tree = PathBuf::from("data").join("engines").join("lemonade");
+        let inside = InstallRecord::Recorded {
+            runtime_dir: tree.join("runtime"),
+            holds_install: true,
+        };
+        let elsewhere = InstallRecord::Recorded {
+            runtime_dir: PathBuf::from("elsewhere").join("runtime"),
+            holds_install: true,
+        };
+        let empty = InstallRecord::Recorded {
+            runtime_dir: PathBuf::from("elsewhere").join("runtime"),
+            holds_install: false,
+        };
+        assert_eq!(
+            classify_engine_install(&inside, &tree),
+            EngineInstallStatus::InUse
+        );
+        assert_eq!(
+            classify_engine_install(&elsewhere, &tree),
+            EngineInstallStatus::Unused
+        );
+        assert_eq!(
+            classify_engine_install(&empty, &tree),
+            EngineInstallStatus::RecordWithoutInstall
+        );
+        // A record at this tree whose server binary is gone is not "in use".
+        let hollow = InstallRecord::Recorded {
+            runtime_dir: tree.join("runtime"),
+            holds_install: false,
+        };
+        assert_eq!(
+            classify_engine_install(&hollow, &tree),
+            EngineInstallStatus::RecordWithoutInstall
+        );
+        assert_eq!(
+            classify_engine_install(&InstallRecord::Unreadable("x".to_owned()), &tree),
+            EngineInstallStatus::RecordUnreadable
+        );
+        assert_eq!(
+            classify_engine_install(&InstallRecord::NotRecorded, &tree),
+            EngineInstallStatus::NotRecorded
+        );
+    }
+
+    /// Uninstalling an external or imported runtime only unregisters it, so its
+    /// Lemonade copy stays. The row must not say it is "removed with" the
+    /// runtime; the claim comes from the rule uninstall itself applies.
+    #[test]
+    fn a_read_only_runtimes_lemonade_copy_is_not_said_to_be_removed_with_it() -> Result<()> {
+        let (root, paths) = test_paths("report-lemonade-read-only");
+        let mut record = manifest("external", "gfx1151", "7.14.1", 20);
+        record.read_only = true;
+        let runtime = install_fixture(&paths, record, 4096)?;
+        let tree = rocm_engine_lemonade::install_tree_root(
+            &paths,
+            Some(&runtime.install_root.join("engines")),
+        );
+        crate::test_support::plant_lemonade_tree(&tree, 5000)?;
+        crate::test_support::record_lemonade_install(&paths, &tree)?;
+
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        let row = report
+            .engines
+            .iter()
+            .find(|row| row.runtime_key.as_deref() == Some("external"))
+            .expect("the runtime's copy is listed");
+        assert!(!row.removed_with_runtime);
+        let rendered = render_report(&report);
+        assert!(!rendered.contains("and removed with it"), "{rendered}");
+        assert!(
+            rendered.contains("does not delete that install's folder (external or imported)"),
+            "{rendered}"
+        );
+        // The claim matches what uninstall then does to that copy.
+        let mut config = RocmCliConfig::default();
+        crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, "external")?;
+        assert!(tree.join("runtime").exists(), "uninstall deleted the copy");
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

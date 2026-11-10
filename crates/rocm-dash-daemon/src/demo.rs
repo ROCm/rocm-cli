@@ -6,13 +6,14 @@
 //!
 //! Simulates a single 8× AMD Instinct MI355X node serving inference traffic
 //! through three vLLM containers. Output is the same `PersistedEntry` NDJSON
-//! the daemon writes when `--persist-dir` is set, so `rocm replay` (and
-//! `rocm demo`) play it back unmodified.
+//! the daemon's session writer produces, so `rocm dash --replay` plays it back
+//! unmodified.
 //!
 //! Deterministic: the same [`DemoOptions`] always produce byte-identical
 //! output (seeded xorshift jitter + a fixed wallclock anchor), which the
-//! tests below pin as a hard invariant. `rocm gen-demo`, `rocm demo`, and the
-//! marketing screenshot/cast examples all consume this one generator.
+//! tests below pin as a hard invariant. `rocm dash --demo` is the consumer: it
+//! writes a session to a private file under the user data directory with
+//! [`generate_file`] and replays it.
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;

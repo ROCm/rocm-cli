@@ -402,7 +402,7 @@ fn write_automation_proposals(
         );
         text.push('\n');
     }
-    crate::write_atomic(&path, text.as_bytes(), "jsonl")
+    crate::atomic_write::write_file_atomically(&path, text.as_bytes())
 }
 
 fn normalize_proposal_identity(proposal: &mut AutomationProposalRecord, index: usize) {
@@ -451,9 +451,11 @@ pub fn load_recent_automation_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
     use crate::jsonl_store::jsonl_generation_path;
     use crate::test_support::{
-        audit_line, audit_messages, audit_record, seed_audit_store, temp_app_paths,
+        audit_line, audit_messages, audit_record, retired_temp_path, seed_audit_store,
+        temp_app_paths,
     };
     use std::path::Path;
 
@@ -556,6 +558,62 @@ mod tests {
         assert_eq!(updated.status, "rejected");
         assert_eq!(loaded.status, "rejected");
         assert!(loaded.reviewed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    /// A status update never writes through a file another writer already
+    /// staged next to the proposals store. The occupied names are the ones the
+    /// retired clock-and-pid temp naming would have picked, so a rewrite that
+    /// still used one would truncate a foreign file and rename it into place.
+    /// `proposal_status_update_rewrites_record` would pass for either writer;
+    /// the foreign files are what tell them apart.
+    #[test]
+    fn proposal_status_update_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("proposal-status-foreign-temp");
+        append_automation_proposal(&paths, &proposal_record("proposal-1"))?;
+        let store = paths.automation_proposals_path();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&store, millis),
+            || update_automation_proposal_status(&paths, "proposal-1", "rejected").map(|_| ()),
+        )?;
+
+        let loaded = find_automation_proposal(&paths, "proposal-1")?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(loaded.status, "rejected");
+        Ok(())
+    }
+
+    /// The torn-tail repair, the other place a store is replaced wholesale,
+    /// spares foreign staged files for the same reason. Each attempt seeds the
+    /// torn tail again, since a repair only happens once.
+    #[test]
+    fn torn_tail_repair_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-foreign-temp");
+        // Creates the store directory the foreign files go in.
+        seed_torn_tail_in_every_store(&paths)?;
+        let store = paths.automation_events_path();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&store, millis),
+            || {
+                seed_torn_tail_in_every_store(&paths)?;
+                append_automation_event(&paths, &event_record("after-repair"))
+            },
+        )?;
+
+        // Only the events store was appended to; the other two still hold the
+        // torn tails the seeding left in them.
+        let tags = fs::read_to_string(&store)?
+            .lines()
+            .map(|line| serde_json::from_str::<AutomationEventRecord>(line).map(|r| r.message))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            tags,
+            vec!["seed".to_owned(), "after-repair".to_owned()],
+            "the repair must keep the clean prefix, drop the torn tail and add the new record"
+        );
         Ok(())
     }
 

@@ -6,9 +6,9 @@
 //! helpers that derive artifact names and URLs from them.
 //!
 //! The pins live in the workspace-root `runtime-deps.toml` and are turned into
-//! the constants below by `build.rs`. Every consumer — the engine adapters and
-//! the dashboard TUI alike — derives what it needs from those constants, so a
-//! runtime version is spelled exactly once in the repository and two crates
+//! the constants below by `build.rs`. Every consumer — the `rocm` binary and
+//! the Lemonade engine adapter — derives what it needs from those constants, so
+//! a runtime version is spelled exactly once in the repository and two crates
 //! cannot disagree about it.
 
 // `pub const LEMONADE_VERSION: &str = "..."`, one per `runtime-deps.toml` field.

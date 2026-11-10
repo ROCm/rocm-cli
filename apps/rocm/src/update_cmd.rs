@@ -254,6 +254,15 @@ pub(crate) const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -
     apply || dry_run
 }
 
+/// Which planner each path takes is pinned in two places. The `--dry-run` choice,
+/// the check and not the plan, is pinned on every platform by
+/// `a_dry_run_takes_the_check_and_an_apply_takes_the_plan` below, which runs
+/// `apply_runtime_update_with`. That `runtime_update_check` is the check and
+/// `runtime_update_plan` the plan, which the two arguments below cannot tell
+/// apart by type, is pinned only on Unix: by
+/// `the_update_checks_prepare_no_python_and_the_apply_plan_does` in
+/// `therock/update.rs` and by scenario `update-10` on Linux. No test on Windows
+/// pins that pairing.
 pub(crate) fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -261,9 +270,45 @@ pub(crate) fn apply_runtime_update(
     activate: bool,
     dry_run: bool,
 ) -> Result<String> {
+    apply_runtime_update_with(
+        paths,
+        config,
+        runtime_selector,
+        activate,
+        dry_run,
+        |source, manifests| therock::runtime_update_check(paths, source, manifests, None),
+        |source, manifests| therock::runtime_update_plan(paths, source, manifests, None),
+    )
+}
+
+/// The update flow with its two planners passed in. A `--dry-run` only previews,
+/// so it takes `check`, which prepares nothing; a real apply takes `apply_plan`,
+/// which prepares the Python the install that follows needs. Taking them as
+/// arguments lets a test run the choice on every platform without a host that
+/// has no Python.
+fn apply_runtime_update_with(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    runtime_selector: Option<&str>,
+    activate: bool,
+    dry_run: bool,
+    check: impl FnOnce(
+        &therock::InstalledRuntimeManifest,
+        &[therock::InstalledRuntimeManifest],
+    ) -> Result<therock::RuntimeUpdatePlan>,
+    apply_plan: impl FnOnce(
+        &therock::InstalledRuntimeManifest,
+        &[therock::InstalledRuntimeManifest],
+    ) -> Result<therock::RuntimeUpdatePlan>,
+) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
+    let planned = if dry_run {
+        check(source, &manifests)
+    } else {
+        apply_plan(source, &manifests)
+    };
+    let plan = planned?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -289,6 +334,11 @@ pub(crate) fn apply_runtime_update(
         return Ok(output);
     }
 
+    // The plan's `python_note` is not printed here: the preview below prints its
+    // own `python_note:` from the decision a real install takes (scenario
+    // `update-10` asserts it), so a second line would say the same thing twice.
+    // A dry run that finds nothing newer returned above and prints neither; the
+    // plain `rocm update` report is where the check's note shows.
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
         let install_plan = therock::install_sdk_for_update(
@@ -439,6 +489,73 @@ mod tests {
     use super::*;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{test_paths, test_runtime_manifest_for_update};
+
+    /// A `--dry-run` takes its plan from the check and an apply from the plan,
+    /// and calls only that one: the check must never be the one that prepares a
+    /// Python, and an apply must still get the plan that does. Both planners
+    /// report nothing newer, so the flow returns before it installs or previews
+    /// anything and the test needs no host without a Python, which runs it on
+    /// every platform. Which `therock` function is the check is pinned only on
+    /// Unix, by `the_update_checks_prepare_no_python_and_the_apply_plan_does` in
+    /// `therock/update.rs`, and by scenario `update-10`.
+    #[test]
+    fn a_dry_run_takes_the_check_and_an_apply_takes_the_plan() -> Result<()> {
+        let (root, paths) = test_paths("update-takes-check-or-plan");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all",
+            "therock-release:gfx120X-all",
+            "7.13.0a20260416",
+            1,
+        )?;
+        let calls = std::cell::RefCell::new(Vec::new());
+        let planner = |name: &'static str| {
+            let calls = &calls;
+            move |source: &therock::InstalledRuntimeManifest,
+                  _: &[therock::InstalledRuntimeManifest]| {
+                calls.borrow_mut().push(name);
+                Ok(therock::RuntimeUpdatePlan {
+                    latest_version: source.version.clone(),
+                    latest_source: String::new(),
+                    format: source.format.clone(),
+                    status: "up_to_date".to_owned(),
+                    target_runtime_key: source.runtime_key.clone(),
+                    device_target: None,
+                    source_layout_generation: None,
+                    repair_required: false,
+                    update_available: false,
+                    python_note: None,
+                })
+            }
+        };
+        let take = |dry_run: bool| -> Result<(String, Vec<&'static str>)> {
+            calls.borrow_mut().clear();
+            let output = apply_runtime_update_with(
+                &paths,
+                &mut RocmCliConfig::default(),
+                None,
+                false,
+                dry_run,
+                planner("check"),
+                planner("plan"),
+            )?;
+            Ok((output, calls.borrow().clone()))
+        };
+        let (output, taken) = take(true)?;
+        assert_eq!(taken, ["check"], "a --dry-run took the plan: {output}");
+        assert!(
+            output.contains("result: no newer runtime found"),
+            "{output}"
+        );
+        let (output, taken) = take(false)?;
+        assert_eq!(taken, ["plan"], "an apply took the check: {output}");
+        assert!(
+            output.contains("result: no newer runtime found"),
+            "{output}"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
 
     #[test]
     fn render_update_text_reports_all_update_surfaces() -> Result<()> {
