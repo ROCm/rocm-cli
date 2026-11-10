@@ -10,7 +10,7 @@
 
 use serde_json::{Value, json};
 
-use rocm_dash_core::metrics::{GpuMetrics, ObservationFreshness, ObservationMetadata};
+use rocm_dash_core::metrics::{GpuMetrics, ObservationFreshness};
 
 use super::StateSnapshot;
 
@@ -43,11 +43,31 @@ pub fn gpu_status_json(snap: &StateSnapshot, gpu_index: Option<usize>) -> Value 
     }
 }
 
+/// The whole-node efficiency object shared by `list_instances` and
+/// `tokens_per_watt`, or `null` when it cannot be stated.
+///
+/// It is computed from `StateSnapshot::latest` (the daemon's last snapshot), the
+/// same source the Hardware and Observe tabs read, so it matches those screens.
+/// The per-instance entries come from `StateSnapshot::instances`, the
+/// event-driven map the Instances tab reads, which can be a tick ahead of or
+/// behind `latest`; the two are separate views, not one.
+fn node_json(snap: &StateSnapshot) -> Value {
+    snap.latest
+        .as_ref()
+        .and_then(rocm_dash_core::efficiency::node_efficiency)
+        .map_or(Value::Null, |n| {
+            json!({
+                "tokens_per_watt": n.tokens_per_watt,
+                "freshness": freshness_label(n.freshness),
+            })
+        })
+}
+
 /// `"fresh"` | `"held"` | `null` (unknown, e.g. a legacy snapshot).
-fn freshness_label(obs: Option<&ObservationMetadata>) -> Value {
-    obs.map_or(Value::Null, |m| {
+fn freshness_label(freshness: Option<ObservationFreshness>) -> Value {
+    freshness.map_or(Value::Null, |f| {
         Value::String(
-            match m.freshness {
+            match f {
                 ObservationFreshness::Fresh => "fresh",
                 ObservationFreshness::Held => "held",
             }
@@ -100,22 +120,29 @@ pub fn list_instances_json(snap: &StateSnapshot) -> Value {
                 "tokens_per_watt": i.tokens_per_watt,
                 "attributed_power_w": i.power_w,
                 "ttft_ms": i.ttft_ms,
-                "ttft_freshness": freshness_label(i.ttft_observation.as_ref()),
+                "ttft_freshness": freshness_label(i.ttft_observation.as_ref().map(|m| m.freshness)),
                 "tpot_ms": i.tpot_ms,
-                "tpot_freshness": freshness_label(i.tpot_observation.as_ref()),
+                "tpot_freshness": freshness_label(i.tpot_observation.as_ref().map(|m| m.freshness)),
                 "freshness": freshness,
                 "observed_at": observed_at,
             })
         })
         .collect();
-    json!({ "instances": arr, "instance_count": arr.len() })
+    json!({ "instances": arr, "instance_count": arr.len(), "node": node_json(snap) })
 }
 
 /// Per-instance tokens-per-watt from the daemon-provided field.
 ///
-/// Uses `Instance::tokens_per_watt` directly so this tool matches the screen
-/// truth exactly (the daemon computes the same value the TUI displays). Also
-/// includes gen_tps, freshness, and observed_at for completeness.
+/// Per-instance values come straight from `Instance::tokens_per_watt`, which
+/// the daemon computes (never recomputed here), and include gen_tps, freshness
+/// and observed_at.
+///
+/// `node` is different: it is computed here, from the latest snapshot, by the
+/// same function the Hardware and Observe tabs use (Σ tok/s over Σ board
+/// power). Its `freshness` is `"fresh"`, `"held"`, or `null` when it is unknown
+/// (no freshness metadata, e.g. an old recording), and `node` itself is `null`
+/// when it cannot be stated (no traffic, zero measured traffic, or no power
+/// telemetry), which is "no figure", not zero.
 pub fn tokens_per_watt_json(snap: &StateSnapshot) -> Value {
     let arr: Vec<Value> = snap
         .instances
@@ -143,7 +170,7 @@ pub fn tokens_per_watt_json(snap: &StateSnapshot) -> Value {
             })
         })
         .collect();
-    json!({ "instances": arr })
+    json!({ "instances": arr, "node": node_json(snap) })
 }
 
 /// Pass^N / Pass@N rollup over the cached bench rows, reusing the core rollup.
@@ -233,6 +260,63 @@ mod tests {
     }
 
     #[test]
+    fn tokens_per_watt_json_reports_the_node_figure_with_freshness() {
+        use rocm_dash_core::metrics::{ObservationMetadata, Snapshot};
+        let mut snap = fixture_snapshot();
+        let mk = |freshness| Instance {
+            container_name: "a".into(),
+            gen_tps: Some(300.0),
+            gen_tps_observation: Some(ObservationMetadata {
+                observed_at: chrono::Utc::now(),
+                freshness,
+            }),
+            ..Default::default()
+        };
+        let gpu = GpuMetrics {
+            device_id: "gpu-0".into(),
+            power_w: 600.0,
+            ..GpuMetrics::default()
+        };
+        snap.latest = Some(Snapshot {
+            instances: vec![mk(ObservationFreshness::Held)],
+            gpus: vec![gpu.clone()],
+            ..Snapshot::default()
+        });
+        let v = tokens_per_watt_json(&snap);
+        assert_eq!(v["node"]["tokens_per_watt"], 0.5);
+        assert_eq!(v["node"]["freshness"], "held");
+        snap.latest = Some(Snapshot {
+            instances: vec![mk(ObservationFreshness::Fresh)],
+            gpus: vec![gpu],
+            ..Snapshot::default()
+        });
+        assert_eq!(tokens_per_watt_json(&snap)["node"]["freshness"], "fresh");
+        // Unknown freshness (an old recording) is null, never "fresh".
+        snap.latest = Some(Snapshot {
+            instances: vec![Instance {
+                container_name: "a".into(),
+                gen_tps: Some(300.0),
+                ..Default::default()
+            }],
+            gpus: vec![GpuMetrics {
+                device_id: "gpu-0".into(),
+                power_w: 600.0,
+                ..GpuMetrics::default()
+            }],
+            ..Snapshot::default()
+        });
+        let v = tokens_per_watt_json(&snap);
+        assert_eq!(v["node"]["tokens_per_watt"], 0.5);
+        assert!(
+            v["node"]["freshness"].is_null(),
+            "freshness must not be fabricated"
+        );
+        // Nothing to state: null, not zero.
+        snap.latest = Some(Snapshot::default());
+        assert!(tokens_per_watt_json(&snap)["node"].is_null());
+    }
+
+    #[test]
     fn bench_summary_json_rolls_up_groups() {
         let v = bench_summary_json(&fixture_snapshot());
         assert_eq!(v["group_count"], 1);
@@ -291,6 +375,16 @@ mod tests {
         assert_eq!(i["tpot_ms"], 22.0);
         assert!(i["tpot_freshness"].is_null());
         assert_eq!(i["attributed_power_w"], 123.0);
+    }
+
+    #[test]
+    fn list_instances_json_carries_the_same_node_object() {
+        let snap = fixture_snapshot();
+        assert_eq!(
+            list_instances_json(&snap)["node"],
+            tokens_per_watt_json(&snap)["node"],
+            "the two tools must report one node figure"
+        );
     }
 
     #[test]

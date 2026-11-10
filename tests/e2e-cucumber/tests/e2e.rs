@@ -96,7 +96,7 @@ pub struct E2eWorld {
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
-    /// lock was still held cannot have waited for it, and `examine-45`, where an
+    /// lock was still held cannot have waited for it, and `examine-48`, where an
     /// inspection that finished long before a probe tool's background process
     /// did cannot have waited for it. Both assert the short side of a one-sided
     /// bound: the measurement brackets the whole child process, so a long elapsed
@@ -1316,8 +1316,35 @@ fn load_expectations() -> e2e_cucumber::expectation::Expectations {
         .unwrap_or_else(|e| panic!("failed to parse expectations.toml: {e}"))
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack for the thread that drives the whole suite.
+///
+/// The cucumber run is one future polled by `block_on` on the calling thread, so
+/// every step future, and the evidence-gathering futures a failing serve step
+/// awaits, is held on that thread's stack. Windows gives a main thread 1 MiB
+/// against 8 MiB on Linux, and a stalled serve-06 overflowed it (#1003) instead
+/// of reporting a failure. A spawned thread's stack is whatever is asked for here.
+const SUITE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() {
+    let suite = std::thread::Builder::new()
+        .name("e2e-suite".to_owned())
+        .stack_size(SUITE_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build the tokio runtime")
+                .block_on(run_suite());
+        })
+        .expect("failed to spawn the e2e suite thread");
+    if let Err(payload) = suite.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+// `block_on` needs no `Send`, and the cucumber writers held across awaits are not.
+#[allow(clippy::future_not_send)]
+async fn run_suite() {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
