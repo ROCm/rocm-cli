@@ -7,7 +7,9 @@
 
 use super::Examination;
 use super::library_copies::libraries_on_ld_path;
-use crate::host_gpu::{CpuFacts, read_linux_cpu_facts, read_windows_cpu_facts};
+use crate::host_gpu::{
+    CpuFacts, read_linux_cpu_facts, run_windows_system_query, windows_cpu_facts_with,
+};
 use crate::probe_exec::{MEDIUM, SHORT, read_host_text, run, truncate_to_chars};
 use crate::{runtime_is_linux, runtime_is_windows};
 
@@ -132,8 +134,26 @@ pub(super) fn probe_cpu_linux(e: &mut Examination) {
 /// The CPU on Windows, from the CPU row of the system inventory through the
 /// reader the host summary uses.
 pub(super) fn probe_cpu_windows(e: &mut Examination) {
-    record_cpu_windows(e, read_windows_cpu_facts());
+    probe_cpu_windows_with(e, run_windows_system_query);
 }
+
+/// [`probe_cpu_windows`] with the query injected, so a test on any host drives
+/// the examination's whole Windows read, the failure entry included. `query` is
+/// handed the inventory's script and time limit; see `windows_cpu_facts_with`.
+/// [`probe_cpu_windows`] passes the real PowerShell runner, which is the one
+/// argument no test on a Linux host can reach.
+pub(crate) fn probe_cpu_windows_with(
+    e: &mut Examination,
+    query: impl FnOnce(&str, std::time::Duration) -> Option<String>,
+) {
+    record_cpu_windows(e, windows_cpu_facts_with(query));
+}
+
+/// The `probe_failures` entry for a Windows read that found no CPU. It names the
+/// query that ran, the system inventory's CPU and RAM script, and fires whether
+/// that query failed, timed out, printed nothing or printed no CPU row.
+pub(crate) const WINDOWS_CPU_NOT_FOUND: &str =
+    "The Windows system inventory query (CPU and RAM) reported no CPU; cannot identify CPU.";
 
 /// [`record_cpu`], and a failure entry when no CPU could be read: on Windows the
 /// CPU comes from a query that can fail or time out, and an empty model alone
@@ -141,8 +161,7 @@ pub(super) fn probe_cpu_windows(e: &mut Examination) {
 /// of an injected query.
 pub(crate) fn record_cpu_windows(e: &mut Examination, facts: CpuFacts) {
     if facts.model.is_none() {
-        e.probe_failures
-            .push("Get-CimInstance Win32_Processor failed; cannot identify CPU.".to_owned());
+        e.probe_failures.push(WINDOWS_CPU_NOT_FOUND.to_owned());
     }
     record_cpu(e, facts);
 }
@@ -670,5 +689,33 @@ mod tests {
         assert_eq!(summary.as_deref(), Some("Planted WSL CPU"));
         assert_eq!(examined.cpu_model, "");
         assert_eq!(examined.cpu_vendor, "unknown");
+    }
+
+    /// `probe_cpu_windows` runs the system inventory's query and nothing else:
+    /// off Windows there is no PowerShell for the real runner, so the read finds
+    /// no CPU and the entry says which query that was, and the injected-query
+    /// form given a CPU row fills the fields the same way. Replacing the runner
+    /// `probe_cpu_windows` passes, or the failure entry, fails this test. On
+    /// Windows the runner is live, so it is skipped there.
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_cpu_windows_runs_the_inventory_query_and_reports_no_cpu_without_one() {
+        let mut examined = Examination::default();
+        probe_cpu_windows(&mut examined);
+        assert_eq!(
+            (examined.cpu_model.as_str(), examined.cpu_vendor.as_str()),
+            ("", "unknown")
+        );
+        assert_eq!(examined.probe_failures, [WINDOWS_CPU_NOT_FOUND]);
+
+        let mut with_cpu = Examination::default();
+        probe_cpu_windows_with(&mut with_cpu, |_, _| {
+            Some("CPU\tIntel(R) Core(TM) i5-12400\nRAM\t17179869184\n".to_owned())
+        });
+        assert_eq!(
+            (with_cpu.cpu_model.as_str(), with_cpu.cpu_vendor.as_str()),
+            ("Intel(R) Core(TM) i5-12400", "intel")
+        );
+        assert!(with_cpu.probe_failures.is_empty());
     }
 }

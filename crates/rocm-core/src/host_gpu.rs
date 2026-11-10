@@ -40,11 +40,12 @@ use anyhow::Result;
 use os_facts::detect_kernel_version;
 pub use os_facts::detect_system_ram_gib;
 pub(crate) use os_facts::{
-    CpuFacts, detect_cpu_model, detect_distro_name, read_linux_cpu_facts, read_windows_cpu_facts,
+    CpuFacts, detect_cpu_model, detect_distro_name, read_linux_cpu_facts, windows_cpu_facts_with,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+pub(crate) use windows_inventory::run_windows_system_query;
 
 mod capture;
 mod diagnostics;

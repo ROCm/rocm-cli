@@ -170,7 +170,7 @@ pub(crate) fn read_windows_cpu_facts() -> CpuFacts {
 /// drive it. `query` is handed the script and the time the inventory allows it,
 /// and answers with what the script printed, or `None` when it could not run,
 /// failed or timed out.
-pub(super) fn windows_cpu_facts_with(
+pub(crate) fn windows_cpu_facts_with(
     query: impl FnOnce(&str, std::time::Duration) -> Option<String>,
 ) -> CpuFacts {
     cpu_facts_from_windows_inventory(windows_system_inventory_with(query).as_ref())
@@ -334,7 +334,7 @@ mod tests {
     // asserts one answer. The cases that used to differ say so in their
     // comment, with what each read answered before.
 
-    use crate::examine::{Examination, record_cpu, record_cpu_windows};
+    use crate::examine::{Examination, probe_cpu_windows_with, record_cpu};
     use crate::host_gpu::windows_inventory::{
         InventoryScope, WindowsExamineInventory, WindowsInventorySources,
         assemble_windows_inventory, windows_system_inventory_with,
@@ -496,13 +496,10 @@ mod tests {
     fn examination_on_windows(output: Option<&str>) -> (Examination, Duration) {
         let mut examined = Examination::default();
         let mut asked = None;
-        record_cpu_windows(
-            &mut examined,
-            windows_cpu_facts_with(|_, timeout| {
-                asked = Some(timeout);
-                output.map(str::to_owned)
-            }),
-        );
+        probe_cpu_windows_with(&mut examined, |_, timeout| {
+            asked = Some(timeout);
+            output.map(str::to_owned)
+        });
         (examined, asked.expect("the examination ran its query"))
     }
 
@@ -615,9 +612,15 @@ mod tests {
             let (examined, _) = examination_on_windows(output);
             assert_eq!(examined.cpu_model, "", "{output:?}");
             assert_eq!(examined.cpu_vendor, "unknown", "{output:?}");
+            // The message and the state it describes are asserted together: the
+            // entry names the inventory query that ran (CPU and RAM), not a
+            // `Win32_Processor` query nothing runs any more, and it is there
+            // exactly when the model is empty and the vendor unknown.
             assert_eq!(
                 examined.probe_failures,
-                ["Get-CimInstance Win32_Processor failed; cannot identify CPU."],
+                [
+                    "The Windows system inventory query (CPU and RAM) reported no CPU; cannot identify CPU."
+                ],
                 "{output:?}"
             );
         }

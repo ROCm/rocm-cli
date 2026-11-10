@@ -38,7 +38,7 @@ use host_env::{
     probe_shared_memory,
 };
 #[cfg(test)]
-pub(crate) use host_env::{record_cpu, record_cpu_windows};
+pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
 use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};

@@ -519,7 +519,7 @@ fn detect_windows_system_inventory_from_cim() -> Option<WindowsExamineInventory>
 /// Run the system query's `script` under PowerShell for at most `timeout`, and
 /// answer with its stdout, or `None` when it could not run, failed or timed out.
 #[cfg(windows)]
-pub(super) fn run_windows_system_query(script: &str, timeout: Duration) -> Option<String> {
+pub(crate) fn run_windows_system_query(script: &str, timeout: Duration) -> Option<String> {
     capture_optional_command_with_timeout(
         "powershell",
         &[
@@ -535,7 +535,7 @@ pub(super) fn run_windows_system_query(script: &str, timeout: Duration) -> Optio
 
 /// Off Windows there is no PowerShell to run the system query.
 #[cfg(not(windows))]
-pub(super) const fn run_windows_system_query(_script: &str, _timeout: Duration) -> Option<String> {
+pub(crate) const fn run_windows_system_query(_script: &str, _timeout: Duration) -> Option<String> {
     None
 }
 
