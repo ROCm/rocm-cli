@@ -112,6 +112,13 @@ the run's wait (which also covers waiting for a GPU) is reported as
 **incomplete**; the wait can be raised for a run, up to its limit. Both always run, so a failing
 channel does not hide the other, and the lane fails if either did.
 
+A lane starts cold, so its first steps fetch from the network: the build
+packages, the rustup installer, the toolchain and the crates. The lane command
+tries each of those up to four times, and never retries a build or a test. The
+pre-warm's package downloads and the suite's model downloads are left to the
+tools doing them, so a model that downloads more slowly than its scenario waits
+fails that scenario.
+
 The queue's results are an additional signal, not a replacement: the lanes
 write only into the queue artifact, and the `e2e-gpu-<channel>-report`
 artifacts that `nightly.yml`'s consolidated report reads are not produced from
