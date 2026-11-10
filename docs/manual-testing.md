@@ -968,6 +968,10 @@ Expected result:
   and disappear **together** as the terminal is resized. A `*` on a reading
   with no legend anywhere on screen is a bug; so is the legend with nothing
   marked.
+- The Hardware tab's GPU header has no room for a legend, so it spells the
+  same condition out: `eff 0.50 tok/W (held)`. It sits right after the GPU
+  count, so on an 80-column terminal the partition and VRAM text clips before
+  it does. A held figure that shows no `(held)` there is a bug.
 
   Check this one by **starting tall and shrinking**, not at the 22-to-24 rows
   above. The legend is the first row the hero drops, and the marker is gated on
