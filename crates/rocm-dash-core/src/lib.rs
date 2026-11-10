@@ -7,7 +7,8 @@
 //! Pure types, traits, schemas, and the reducer for rocm-dash.
 //! No rendering deps. No async deps at the type boundary.
 //!
-//! See `../wiki/concepts/tea-reducer-pattern.md` for the architectural pattern.
+//! `State::apply` in `state` is the pure reducer, in the style of The Elm
+//! Architecture.
 
 pub mod bench_rollup;
 pub mod bench_schema;

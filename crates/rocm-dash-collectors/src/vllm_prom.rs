@@ -5,7 +5,7 @@
 //! vLLM Prometheus `/metrics` scraper.
 //!
 //! Field paths and the kv-cache 0..1 → 0..100 scaling are vendored from
-//! instinct-dash `VllmMetricsService.ts`. See `../../wiki/entities/vllm.md`.
+//! instinct-dash `VllmMetricsService.ts`.
 //!
 //! Sync `InstanceMetrics::fetch` returns `Unsupported` (the underlying client
 //! is async); call `fetch_async` from the runner.

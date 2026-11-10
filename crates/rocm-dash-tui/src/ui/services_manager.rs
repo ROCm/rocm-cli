@@ -2,13 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Services manager overlay (Phase 3 Wave 1).
+//! Services manager overlay.
 //!
-//! The first operational screen rebuilt on the Wave-0 primitives: it lists the
-//! managed inference services the daemon surfaces (model · port · status · live
-//! `gen_tps`) and runs stop/restart **through the approval gate and the
-//! job-bridge** — never inline. This is the pattern the remaining Wave-1 screens
-//! (serve_wizard / model_picker / engine_manager) reuse.
+//! It lists the managed inference services the daemon surfaces (model · port ·
+//! status · live `gen_tps`) and runs stop/restart **through the approval gate
+//! and the job-bridge** — never inline. The serve wizard and the engine manager
+//! follow the same pattern.
 //!
 //! Mutating actions invoke the CLI (`rocm services stop|restart <id> --yes`) as
 //! a background job; the approval *decision* is the user's, captured by the

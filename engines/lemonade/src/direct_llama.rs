@@ -100,7 +100,8 @@ fn ensure_hf_checkpoint_downloaded(
     log_path: Option<&Path>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+    if direct_llama_model_path(&paths, &runtime.manifest.runtime_dir, &request.model_ref).is_some()
+    {
         return Ok(());
     }
     let download_port = free_local_port()?;
@@ -128,7 +129,9 @@ fn ensure_hf_checkpoint_downloaded(
             log_path,
             process_env,
         )?;
-        if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+        if direct_llama_model_path(&paths, &runtime.manifest.runtime_dir, &request.model_ref)
+            .is_some()
+        {
             Ok(())
         } else {
             bail!(
@@ -150,7 +153,8 @@ pub(crate) fn ensure_direct_llama_model_available(
     log_path: Option<&Path>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+    let runtime_dir = runtime.manifest.runtime_dir.as_path();
+    if direct_llama_model_path(&paths, runtime_dir, &request.model_ref).is_some() {
         return Ok(());
     }
 
@@ -181,13 +185,12 @@ pub(crate) fn ensure_direct_llama_model_available(
             log_path,
             process_env,
         );
-        if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+        if direct_llama_model_path(&paths, runtime_dir, &request.model_ref).is_some() {
             Ok(())
         } else {
             bail!(
-                "Lemonade did not download `{}` for direct ROCm serving (searched {})",
-                request.model_ref,
-                describe_hf_cache_roots(&paths)
+                "{}",
+                unresolved_model_message(&hf_cache_roots(&paths), runtime_dir, &request.model_ref)
             )
         }
     })();
@@ -209,12 +212,14 @@ pub(crate) fn serve_direct_llama_server(
     reason: &anyhow::Error,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
-        format!(
-            "Lemonade downloaded model `{}` was not found for direct serving",
-            request.model_ref
-        )
-    })?;
+    let model_path =
+        direct_llama_model_path(&paths, &runtime.manifest.runtime_dir, &request.model_ref)
+            .with_context(|| {
+                format!(
+                    "Lemonade downloaded model `{}` was not found for direct serving",
+                    request.model_ref
+                )
+            })?;
     if !server.is_file() {
         bail!("Lemonade llama-server is missing at {}", server.display());
     }
@@ -547,22 +552,103 @@ pub(crate) fn llama_server_backend_label(server: &Path) -> String {
         .to_owned()
 }
 
-pub(crate) fn direct_llama_model_path(paths: &AppPaths, model_ref: &str) -> Option<PathBuf> {
+/// Where the GGUF for `model_ref` is cached, if it is.
+///
+/// `model_ref` may be a file path, an `owner/repo[:variant]` checkpoint, the built-in
+/// default model, or a name from the Lemonade registry shipped in `runtime_dir` (e.g.
+/// `Qwen3-0.6B-GGUF`). The runtime directory is required rather than optional so that
+/// no caller can fall back to a lookup that cannot see registered names, which is the
+/// state in which every non-default model failed to serve on Linux.
+pub(crate) fn direct_llama_model_path(
+    paths: &AppPaths,
+    runtime_dir: &Path,
+    model_ref: &str,
+) -> Option<PathBuf> {
+    direct_llama_model_path_in(&hf_cache_roots(paths), runtime_dir, model_ref)
+}
+
+/// The lookup over explicit cache `roots`, so a test is not at the mercy of whichever
+/// models the host it runs on has cached.
+fn direct_llama_model_path_in(
+    roots: &[PathBuf],
+    runtime_dir: &Path,
+    model_ref: &str,
+) -> Option<PathBuf> {
     let as_path = PathBuf::from(model_ref);
     if as_path.is_file() {
         return Some(as_path);
     }
     if let Some(checkpoint) = parse_hf_checkpoint(model_ref) {
-        return hf_cache_roots(paths)
-            .into_iter()
-            .find_map(|root| find_hf_checkpoint_gguf(&root, &checkpoint));
+        return roots
+            .iter()
+            .find_map(|root| find_hf_checkpoint_gguf(root, &checkpoint));
     }
-    if resolve_lemonade_model_ref(model_ref) != DEFAULT_MODEL {
-        return None;
+    if resolve_lemonade_model_ref(model_ref) == DEFAULT_MODEL {
+        return roots.iter().cloned().find_map(find_default_qwen_gguf);
     }
-    hf_cache_roots(paths)
-        .into_iter()
-        .find_map(find_default_qwen_gguf)
+    // A name Lemonade registers, other than the default: its registry says which
+    // checkpoint it downloads, and that checkpoint's GGUF is what ends up in the cache.
+    // Aliases (`qwen-smoke`, `tiny`, ...) name a registered model too.
+    let checkpoint = registry_checkpoint(runtime_dir, &resolve_lemonade_model_ref(model_ref))?;
+    let mut matches = hf_checkpoint_gguf_matches_in(roots, &checkpoint);
+    // Lemonade fetches the one file its registry names, so a single match is the
+    // expected case. Several (a `Q4_0` label also naming an `IQ4_0` file, say) cannot
+    // be told apart from here, and serving a different quantization than the one
+    // registered is worse than not finding the file.
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+/// Why direct ROCm serving cannot find a GGUF for `model_ref` after Lemonade loaded it,
+/// worded from the same lookup that failed so the text cannot disagree with it: several
+/// cached files matching one registered checkpoint is a different problem, with a
+/// different remedy, from none being found.
+fn unresolved_model_message(roots: &[PathBuf], runtime_dir: &Path, model_ref: &str) -> String {
+    if let Some(checkpoint) =
+        registry_checkpoint(runtime_dir, &resolve_lemonade_model_ref(model_ref))
+    {
+        let matches = hf_checkpoint_gguf_matches_in(roots, &checkpoint);
+        if matches.len() > 1 {
+            let names = matches
+                .iter()
+                .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!(
+                "`{model_ref}` is registered as `{}/{}` and {} cached files match it ({names}), so direct ROCm serving cannot tell which to use; serve the one you want by its exact file name as `{}/{}:<file>.gguf`",
+                checkpoint.owner,
+                checkpoint.repo,
+                matches.len(),
+                checkpoint.owner,
+                checkpoint.repo,
+            );
+        }
+    }
+    format!(
+        "no cached GGUF was found for `{model_ref}`, so direct ROCm serving cannot start (searched {})",
+        render_hf_cache_roots(roots)
+    )
+}
+
+/// Lemonade's model registry inside the extracted embeddable, mapping each registered
+/// model name to the Hugging Face checkpoint it downloads.
+const SERVER_MODELS_RESOURCE: &str = "resources/server_models.json";
+
+/// The Hugging Face checkpoint Lemonade's registry in `runtime_dir` records for the
+/// registered model `name` (e.g. `Qwen3-0.6B-GGUF` -> `unsloth/Qwen3-0.6B-GGUF:Q4_0`),
+/// or `None` when the registry is absent or unreadable, does not list `name`, or
+/// records something that is not a safe `owner/repo[:variant]` checkpoint.
+///
+/// The checkpoint is validated by [`parse_hf_checkpoint`], which is what keeps a
+/// hand-edited registry from steering the cache lookup outside the cache.
+fn registry_checkpoint(runtime_dir: &Path, name: &str) -> Option<HfCheckpoint> {
+    let registry = fs::read_to_string(runtime_dir.join(SERVER_MODELS_RESOURCE)).ok()?;
+    let registry = serde_json::from_str::<Value>(&registry).ok()?;
+    let checkpoint = registry.get(name)?.get("checkpoint")?.as_str()?;
+    parse_hf_checkpoint(checkpoint)
 }
 
 fn hf_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
@@ -661,10 +747,15 @@ fn collect_hf_checkpoint_ggufs(cache_root: &Path, checkpoint: &HfCheckpoint) -> 
 /// deduplicated by file name. Used to detect an ambiguous variant (more than one match)
 /// so the caller can refuse to pick arbitrarily.
 fn hf_checkpoint_gguf_matches(paths: &AppPaths, checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
+    hf_checkpoint_gguf_matches_in(&hf_cache_roots(paths), checkpoint)
+}
+
+/// [`hf_checkpoint_gguf_matches`] over explicit cache `roots`.
+fn hf_checkpoint_gguf_matches_in(roots: &[PathBuf], checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
     let mut matches = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
-    for root in hf_cache_roots(paths) {
-        let ggufs = collect_hf_checkpoint_ggufs(&root, checkpoint);
+    for root in roots {
+        let ggufs = collect_hf_checkpoint_ggufs(root, checkpoint);
         for gguf in filter_ggufs_by_variant(ggufs, checkpoint.variant.as_deref()) {
             if let Some(name) = gguf.file_name().and_then(|name| name.to_str())
                 && seen_names.insert(name.to_owned())
@@ -947,6 +1038,310 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, vec!["model-Q4_0.gguf", "model-Q8_0.gguf"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A runtime tree holding a Lemonade registry, and a hub cache holding the GGUFs
+    /// named in `cached` (`(repo_dir, file)` pairs), under one scratch directory.
+    fn registry_fixture(
+        tag: &str,
+        registry: &str,
+        cached: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch_dir(tag);
+        let runtime_dir = dir.join("runtime");
+        let resources = runtime_dir.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(resources.join("server_models.json"), registry).unwrap();
+        let hub = dir.join("hub");
+        for (repo_dir, file) in cached {
+            let snapshot = hub.join(repo_dir).join("snapshots").join("rev0");
+            fs::create_dir_all(&snapshot).unwrap();
+            fs::write(snapshot.join(file), b"gguf").unwrap();
+        }
+        (dir, runtime_dir, hub)
+    }
+
+    /// Two entries trimmed from `resources/server_models.json` as shipped in the
+    /// Lemonade 11.5.1 embeddable (checked against the real file: top-level object keyed
+    /// by model name, each with a string `checkpoint`).
+    const SMALL_MODEL_REGISTRY: &str = r#"{
+        "Qwen3-0.6B-GGUF": {"checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_0", "recipe": "llamacpp"},
+        "Qwen3-4B-Instruct-2507-GGUF": {
+            "checkpoint": "unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+            "recipe": "llamacpp"
+        }
+    }"#;
+
+    /// The failure behind the Linux Lemonade serve lanes: `rocm serve Qwen3-0.6B-GGUF
+    /// --engine lemonade` loads the model through a short-lived `lemond`, which leaves
+    /// the GGUF in the hub cache, and the serve then bailed "did not download" because
+    /// only the built-in default model and `owner/repo:variant` refs could be found.
+    #[test]
+    fn a_registered_model_name_resolves_through_its_registry_checkpoint() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-model",
+            SMALL_MODEL_REGISTRY,
+            &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+        );
+        let found =
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Qwen3-0.6B-GGUF");
+        assert_eq!(
+            found,
+            Some(
+                hub.join("models--unsloth--Qwen3-0.6B-GGUF")
+                    .join("snapshots")
+                    .join("rev0")
+                    .join("Qwen3-0.6B-Q4_0.gguf")
+            )
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_registered_model_that_is_not_cached_resolves_to_nothing() {
+        let (dir, runtime_dir, hub) =
+            registry_fixture("registered-uncached", SMALL_MODEL_REGISTRY, &[]);
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A name the registry does not list is not guessed at, and without a runtime to
+    /// read a registry from nothing but the old lookups apply.
+    #[test]
+    fn an_unregistered_name_or_a_missing_registry_resolves_to_nothing() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "unregistered",
+            SMALL_MODEL_REGISTRY,
+            &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+        );
+        let roots = std::slice::from_ref(&hub);
+        assert_eq!(
+            direct_llama_model_path_in(roots, &runtime_dir, "Not-A-Registered-Model"),
+            None
+        );
+        let no_registry = dir.join("no-registry");
+        fs::create_dir_all(&no_registry).unwrap();
+        assert_eq!(
+            direct_llama_model_path_in(roots, &no_registry, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A malformed registry degrades to "not found", never a panic or a guess.
+    #[test]
+    fn a_malformed_registry_resolves_to_nothing() {
+        for (tag, registry) in [
+            ("registry-not-json", "not json"),
+            ("registry-not-object", "[]"),
+            (
+                "registry-no-checkpoint",
+                r#"{"Qwen3-0.6B-GGUF": {"recipe": "llamacpp"}}"#,
+            ),
+            (
+                "registry-checkpoint-not-string",
+                r#"{"Qwen3-0.6B-GGUF": {"checkpoint": 7}}"#,
+            ),
+        ] {
+            let (dir, runtime_dir, hub) = registry_fixture(
+                tag,
+                registry,
+                &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+            );
+            assert_eq!(
+                direct_llama_model_path_in(
+                    std::slice::from_ref(&hub),
+                    &runtime_dir,
+                    "Qwen3-0.6B-GGUF"
+                ),
+                None,
+                "{tag}"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The registry is a file inside the runtime tree, so a hand-edited one must not be
+    /// able to point the cache lookup outside the cache: the checkpoint's components
+    /// are joined into a path, and `b/../../x` would climb out of the hub through a
+    /// directory that exists. The target here sits outside the hub and is a real file,
+    /// so only the validation in `parse_hf_checkpoint` stops it being served.
+    #[test]
+    fn a_registry_checkpoint_cannot_point_outside_the_cache() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-escape",
+            r#"{"Evil-Model": {"checkpoint": "a/b/../../x:Q4_0"}}"#,
+            &[],
+        );
+        fs::create_dir_all(hub.join("models--a--b")).unwrap();
+        let outside = dir.join("x").join("snapshots").join("rev0");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escape-Q4_0.gguf"), b"gguf").unwrap();
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Evil-Model"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The registry's variant is a substring match, so a cache holding two files it
+    /// matches (`Q4_0` also names `IQ4_0`) must not have one picked arbitrarily.
+    #[test]
+    fn a_registered_model_matching_two_cached_files_is_not_guessed() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-ambiguous",
+            SMALL_MODEL_REGISTRY,
+            &[
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf"),
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-IQ4_0.gguf"),
+            ],
+        );
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A registry entry whose variant is an exact filename resolves to that file, which
+    /// is how the built-in default model is registered.
+    #[test]
+    fn a_registry_checkpoint_naming_an_exact_file_resolves_to_that_file() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-exact-file",
+            SMALL_MODEL_REGISTRY,
+            &[
+                (
+                    "models--unsloth--Qwen3-4B-Instruct-2507-GGUF",
+                    "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                ),
+                (
+                    "models--unsloth--Qwen3-4B-Instruct-2507-GGUF",
+                    "Qwen3-4B-Instruct-2507-Q8_0.gguf",
+                ),
+            ],
+        );
+        // Registered under a name that is not the built-in default's, so only the
+        // registry lookup can find it.
+        let registry =
+            SMALL_MODEL_REGISTRY.replace("Qwen3-4B-Instruct-2507-GGUF\": {", "Other-Name\": {");
+        fs::write(
+            runtime_dir.join("resources").join("server_models.json"),
+            registry,
+        )
+        .unwrap();
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Other-Name")
+                .and_then(|path| path.file_name().map(std::borrow::ToOwned::to_owned)),
+            Some("Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The message is derived from the lookup that failed: with two cached files
+    /// matching one registered checkpoint it names both and how to pick one, and with
+    /// none it says nothing was found rather than claiming nothing was downloaded.
+    #[test]
+    fn the_unresolved_message_follows_the_reason_the_lookup_failed() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "unresolved-ambiguous",
+            SMALL_MODEL_REGISTRY,
+            &[
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf"),
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-IQ4_0.gguf"),
+            ],
+        );
+        let roots = std::slice::from_ref(&hub);
+        // The state: the lookup refuses to pick.
+        assert_eq!(
+            direct_llama_model_path_in(roots, &runtime_dir, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        // The message: it says why, and what to do.
+        let ambiguous = unresolved_model_message(roots, &runtime_dir, "Qwen3-0.6B-GGUF");
+        assert!(ambiguous.contains("2 cached files match"), "{ambiguous}");
+        assert!(
+            ambiguous.contains("Qwen3-0.6B-Q4_0.gguf")
+                && ambiguous.contains("Qwen3-0.6B-IQ4_0.gguf"),
+            "{ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("unsloth/Qwen3-0.6B-GGUF:<file>.gguf"),
+            "{ambiguous}"
+        );
+        assert!(!ambiguous.contains("did not download"), "{ambiguous}");
+
+        // Nothing cached: the lookup finds nothing, and the text does not claim a
+        // download outcome it cannot know.
+        let (empty_dir, empty_runtime, empty_hub) =
+            registry_fixture("unresolved-empty", SMALL_MODEL_REGISTRY, &[]);
+        let empty_roots = std::slice::from_ref(&empty_hub);
+        assert_eq!(
+            direct_llama_model_path_in(empty_roots, &empty_runtime, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        let none = unresolved_model_message(empty_roots, &empty_runtime, "Qwen3-0.6B-GGUF");
+        assert!(none.contains("no cached GGUF was found"), "{none}");
+        assert!(
+            none.contains(&empty_hub.display().to_string()),
+            "names the searched root: {none}"
+        );
+        assert!(!none.contains("did not download"), "{none}");
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&empty_dir).ok();
+    }
+
+    /// `rocm serve qwen-smoke` reaches the lookup under the alias, which Lemonade
+    /// registers as `Qwen3-0.6B-GGUF`: the registry is keyed by the registered name, so
+    /// the alias has to be resolved first or only the exact name would ever serve.
+    #[test]
+    fn a_model_alias_resolves_through_the_registry_like_its_registered_name() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-alias",
+            SMALL_MODEL_REGISTRY,
+            &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+        );
+        let roots = std::slice::from_ref(&hub);
+        let exact = direct_llama_model_path_in(roots, &runtime_dir, "Qwen3-0.6B-GGUF");
+        assert!(exact.is_some());
+        for alias in ["qwen-smoke", "tiny", "lemonade-tiny", "qwen3-0.6b-gguf"] {
+            assert_eq!(
+                direct_llama_model_path_in(roots, &runtime_dir, alias),
+                exact,
+                "{alias}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `direct_llama_model_path` is the entry point every serve path goes through, so it
+    /// must pass the runtime's registry on to the lookup: found here only through the
+    /// registry, in the cache directory the CLI itself owns.
+    #[test]
+    fn the_entry_point_threads_the_runtime_registry_through() {
+        let (dir, runtime_dir, _hub) = registry_fixture("entry-point", SMALL_MODEL_REGISTRY, &[]);
+        let cache_dir = dir.join("cli-cache");
+        let snapshot = cache_dir
+            .join("huggingface")
+            .join("hub")
+            .join("models--unsloth--Qwen3-0.6B-GGUF")
+            .join("snapshots")
+            .join("rev0");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("Qwen3-0.6B-Q4_0.gguf"), b"gguf").unwrap();
+        let paths = AppPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            cache_dir,
+        };
+        assert_eq!(
+            direct_llama_model_path(&paths, &runtime_dir, "Qwen3-0.6B-GGUF"),
+            Some(snapshot.join("Qwen3-0.6B-Q4_0.gguf"))
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
