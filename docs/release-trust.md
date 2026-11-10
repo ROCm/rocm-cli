@@ -325,7 +325,8 @@ configuration directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and
 `/run/modprobe.d`, the WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
 `lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
 `lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
-discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+discovered ROCm install, and `lib/librocdxg.so` again in each directory on
+`LD_LIBRARY_PATH`. The E2E suite can point those reads at a directory it populated with a
 simulated host instead, but only in builds compiled with the `e2e-test-hooks`
 Cargo feature:
 

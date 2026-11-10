@@ -1651,18 +1651,11 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
         .flat_map(|m| m["evidence"].as_array().into_iter().flatten())
         .filter_map(serde_json::Value::as_str)
         .collect();
-    // One phrase per evidence line that `amdgpu_loaded == Some(false)` produces in
-    // diagnose.rs, each copied verbatim from that check so it keeps guarding it.
-    let amdgpu_missing_evidence = [
-        // check_3_rocm_kernel_unsupported
-        "the amdgpu kernel module is not loaded",
-        // check_5_amdgpu_blacklisted
-        "amdgpu module is not loaded",
-        "Secure Boot is enabled and amdgpu didn't load",
-    ];
     for line in evidence {
         assert!(
-            !amdgpu_missing_evidence.iter().any(|p| line.contains(p)),
+            !rocm_core::diagnose::AMDGPU_MISSING_EVIDENCE
+                .iter()
+                .any(|p| line.contains(p)),
             "amdgpu was reported missing though the amdgpu PCI driver is registered: {line}"
         );
     }
