@@ -11,17 +11,49 @@ use super::capture::{
 use super::windows_inventory::{WindowsExamineInventory, windows_system_inventory_with};
 use crate::{hardware_root, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
+use std::time::Duration;
 
-pub(super) fn detect_kernel_version() -> Option<String> {
-    if runtime_is_windows() {
+/// How long `uname -r` may take.
+///
+/// 5 s, the longer of the two limits the summary (1.5 s) and the examination
+/// (5 s) used to apply separately. The release is a few bytes read from the
+/// kernel, so a `uname` that takes more than a moment is a stalled host, where
+/// waiting longer costs little and a spurious "unknown" costs more:
+/// `kernel_release` feeds the WSL version check and the kernel-dependent
+/// diagnoses, which read an empty value as "nothing to report".
+///
+/// Written out rather than borrowed from another module's constant, so a change
+/// to that constant cannot move this limit unnoticed;
+/// `the_kernel_release_timeout_is_five_seconds` pins it.
+const KERNEL_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The running kernel, as the text of `rocm examine` and `summary.kernel` show it
+/// and as `kernel_release` in the examination reports it.
+///
+/// On Linux (native and WSL), the trimmed output of `uname -r`. That is the one
+/// read of the kernel release for both stacks: `Examination`'s `kernel_release`
+/// is this value, with `None` shown as empty, and `Examination::probe_with_summary`
+/// hands the examination's value to the summary, so one `rocm examine --json` run
+/// reads it once. The read is strict:
+///
+/// - a non-zero exit gives `None`, whatever `uname` printed;
+/// - output that is not UTF-8 gives `None` rather than a string with replacement
+///   characters in it;
+/// - an empty answer gives `None`;
+/// - a `uname` that has not answered after [`KERNEL_RELEASE_TIMEOUT`] gives
+///   `None`.
+///
+/// On Windows, the trimmed output of `cmd /C ver`, under the shorter optional
+/// command timeout; the examination does not read that into `kernel_release`.
+pub(crate) fn detect_kernel_version() -> Option<String> {
+    let output = if runtime_is_windows() {
         capture_optional_command("cmd", &["/C", "ver"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
     } else {
-        capture_optional_command("uname", &["-r"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    }
+        capture_optional_command_with_timeout("uname", &["-r"], KERNEL_RELEASE_TIMEOUT)
+    };
+    output
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn detect_distro_name() -> Option<String> {
@@ -333,10 +365,8 @@ mod tests {
 
     use crate::examine::{Examination, probe_cpu_windows_with, record_cpu};
     use crate::host_gpu::windows_inventory::{
-        InventoryScope, WindowsExamineInventory, WindowsInventorySources,
-        assemble_windows_inventory, windows_system_inventory_with,
+        InventoryScope, WindowsInventorySources, assemble_windows_inventory,
     };
-    use std::time::Duration;
 
     /// One `/proc/cpuinfo` and the CPU both reads make of it.
     struct CpuinfoCase {
@@ -668,5 +698,13 @@ mod tests {
                 vendor: "amd".to_owned()
             }
         );
+    }
+
+    /// The decision recorded in `docs/host-probing.md`: one 5 s limit for the
+    /// kernel read. The timeout behaviour itself is exercised, with a stand-in
+    /// `uname`, by the `kernel_pair` tests in `examine/host_env.rs`.
+    #[test]
+    fn the_kernel_release_timeout_is_five_seconds() {
+        assert_eq!(KERNEL_RELEASE_TIMEOUT, Duration::from_secs(5));
     }
 }

@@ -22,7 +22,7 @@ e2e-test-hooks = [
 # hook that simulates a managed vLLM launch which OOM'd and never became ready,
 # so the positive OOM-guidance summary can be verified on a GPU-less CI host.
 # See `e2e_simulate_oom_launch` / `simulate_oom_managed_launch` in
-# `service_launch.rs`.
+# `service_launch/readiness.rs`.
 e2e-oom-fault-injection = []
 
 [dependencies]
@@ -83,3 +83,7 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 shlex.workspace = true
+# Test-only: build.rs's `release_tag_grammar_is_the_same_everywhere` (run
+# through tests/build_metadata.rs) evaluates the release-tag pattern that
+# release.yml and scripts/smoke_local.py carry. Already in the lockfile.
+regex = "1"

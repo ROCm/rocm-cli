@@ -197,8 +197,9 @@ pub(crate) fn build_uninstall_plan(
 }
 
 /// Plan removing the installed binaries beside the running one, which
-/// `current_exe` names, and undoing the installer's PATH change for their
-/// folder. `--keep-binaries` keeps both, and so does a cargo build's folder.
+/// `current_exe` names, undoing the installer's PATH change for their folder,
+/// and removing the fish completion script it recorded writing for them.
+/// `--keep-binaries` keeps all three, and so does a cargo build's folder.
 pub(crate) fn plan_installed_binaries(
     plan: &mut UninstallPlan,
     options: &UninstallOptions,
@@ -206,10 +207,11 @@ pub(crate) fn plan_installed_binaries(
     home: Option<&Path>,
 ) -> Result<()> {
     if options.keep_binaries {
-        // The PATH change only serves the binaries, so it stays with them.
+        // The PATH change and the completions only serve the binaries, so
+        // they stay with them.
         plan.skipped.push(
-            "binary removal disabled by --keep-binaries, so any PATH change the installer made \
-             stays too"
+            "binary removal disabled by --keep-binaries, so any PATH change and fish completions \
+             the installer made stay too"
                 .to_owned(),
         );
         return Ok(());
@@ -438,7 +440,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 pub(crate) fn confirm_uninstall() -> Result<bool> {
     rocm_core::confirm::print_prompt(&mut io::stdout(), "Proceed with uninstall? [y/N]: ")
         .context("failed to write uninstall prompt")?;
-    rocm_core::confirm::read_answer(&mut io::stdin().lock())
+    rocm_core::confirm::read_answer(&mut io::stdin().lock(), &mut io::stdout())
         .context("failed to read uninstall confirmation")
 }
 

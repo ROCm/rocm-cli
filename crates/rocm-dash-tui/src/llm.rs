@@ -4,7 +4,7 @@
 
 //! Chat LLM configuration: a pure precedence resolver plus a std-only TCP liveness probe.
 //!
-//! No HTTP client here — the Rig-built `AgentClient` (Phase 3)
+//! No HTTP client here — the Rig-built `AgentClient`
 //! lives in `agent/clients.rs`. Keeping detection in the TUI crate preserves the
 //! core's render/async-free boundary.
 

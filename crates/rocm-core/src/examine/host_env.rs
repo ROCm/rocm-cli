@@ -57,7 +57,10 @@ pub(super) fn probe_os(e: &mut Examination) {
     };
     if runtime_is_linux() {
         e.os_family = "linux".to_owned();
-        e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
+        // The summary's read, so `kernel:` and `kernel_release` come from one
+        // `uname -r`. A failed read is empty here, with no `probe_failures`
+        // entry, as before: a host without a usable `uname` is not a degraded one.
+        e.kernel_release = crate::host_gpu::detect_kernel_version().unwrap_or_default();
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
         record_distro(
             e,
@@ -717,5 +720,252 @@ mod tests {
             ("Intel(R) Core(TM) i5-12400", "intel")
         );
         assert!(with_cpu.probe_failures.is_empty());
+    }
+
+    // The kernel-release read, the second pair of `docs/host-probing.md`
+    // ("Kernel version"). It used to be two readers: `detect_kernel_version` in
+    // the summary stack (1.5 s, strict UTF-8, `None` on any failure or non-zero
+    // exit) and `probe_os` here (5 s, lossy, exit code ignored, empty on
+    // failure). `probe_os` now calls `detect_kernel_version`, so these tests pin
+    // the one reader's behaviour through both entry points: a release is read
+    // as printed, a non-zero exit, output that is not UTF-8, a silent `uname`
+    // and one that never answers read as nothing, an answer within the 5 s
+    // limit is read, and a failed read leaves no `probe_failures` entry. Each
+    // case plants a fake `uname` first on `PATH` and asks both entry points in
+    // a child copy of this test binary, because the lookup of `uname` follows
+    // the process's own `PATH`, which a test thread cannot change without
+    // disturbing every other test. The child's entry point,
+    // [`kernel_pair_child_reports_both_answers`], does nothing in a normal run.
+    // Linux only, because `probe_os` reads `uname -r` only when
+    // `runtime_is_linux()`, and the fake is a shell script; other Unix hosts are
+    // not supported platforms.
+
+    #[cfg(target_os = "linux")]
+    mod kernel_pair {
+        use super::*;
+        use std::process::Command;
+        use std::time::Instant;
+
+        const CHILD_ENV: &str = "ROCM_CORE_TEST_KERNEL_PAIR";
+        const ANSWER_PREFIX: &str = "kernel-pair-answers:";
+
+        /// What each stack read for `uname -r`.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Pair {
+            /// `detect_kernel_version`, the summary's `kernel`.
+            summary: Option<String>,
+            /// `probe_os`'s `kernel_release`.
+            examination: String,
+        }
+
+        fn pair(summary: Option<&str>, examination: &str) -> Pair {
+            Pair {
+                summary: summary.map(str::to_owned),
+                examination: examination.to_owned(),
+            }
+        }
+
+        /// The child's side of [`ask`]: print both answers as JSON.
+        #[test]
+        fn kernel_pair_child_reports_both_answers() {
+            let Some(mode) = std::env::var_os(CHILD_ENV) else {
+                return;
+            };
+            if mode == "inspect" {
+                // One inspection through the entry point `rocm examine --json` uses.
+                let (e, summary) =
+                    Examination::probe_with_summary(crate::FrameworkProbe::Skip, None)
+                        .expect("probe and gather");
+                let answers = serde_json::json!({
+                    "summary": summary.kernel,
+                    "examination": e.kernel_release,
+                    "probe_failures": e.probe_failures,
+                });
+                println!("{ANSWER_PREFIX}{answers}");
+                return;
+            }
+            let mut e = Examination::default();
+            probe_os(&mut e);
+            let answers = serde_json::json!({
+                "summary": crate::host_gpu::detect_kernel_version(),
+                "examination": e.kernel_release,
+                "probe_failures": e.probe_failures,
+            });
+            println!("{ANSWER_PREFIX}{answers}");
+        }
+
+        /// Plant a `uname` whose `-r` output is `body` (a shell fragment) and ask
+        /// both stacks. `uname -v` answers a fixed string, so `probe_os` has
+        /// nothing else to wait for.
+        fn ask(body: &str) -> Pair {
+            let (json, _release_reads) = run_child(body, "pair");
+            // A failed read is empty, not a failure: `probe_os` records no
+            // `probe_failures` entry at all in any case (whatever its wording
+            // would be), so a host with a missing or broken `uname` does not read
+            // as degraded. The fake host's os-release reads cleanly, so the list
+            // is empty rather than compared with a baseline.
+            assert_eq!(json["probe_failures"], serde_json::json!([]), "{json}");
+            Pair {
+                summary: json["summary"].as_str().map(str::to_owned),
+                examination: json["examination"]
+                    .as_str()
+                    .expect("the examination answer is a string")
+                    .to_owned(),
+            }
+        }
+
+        /// Run the child in `mode` against a fake `uname` whose `-r` output is
+        /// `body`, and return its answers and how many times `-r` was asked.
+        /// `uname -v` answers a fixed string, so `probe_os` has nothing else to
+        /// wait for.
+        fn run_child(body: &str, mode: &str) -> (serde_json::Value, usize) {
+            let scratch = tempfile::tempdir().expect("scratch directory");
+            let bin = scratch.path().join("bin");
+            std::fs::create_dir_all(&bin).expect("create the fake bin directory");
+            let calls = scratch.path().join("release-reads");
+            crate::fake_executable::write_fake_executable(
+                &bin.join("uname"),
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = -v ]; then echo '#1 SMP fake'; exit 0; fi\necho x >> '{}'\n{body}\n",
+                    calls.display()
+                ),
+            )
+            .expect("plant the fake uname");
+            let this_test = module_path!()
+                .split_once("::")
+                .expect("module path has a crate prefix")
+                .1;
+            let output = Command::new(std::env::current_exe().expect("path of the test binary"))
+                .args([
+                    "--exact",
+                    &format!("{this_test}::kernel_pair_child_reports_both_answers"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, mode)
+                // The fake first; the system directories so `sleep` and `printf`
+                // resolve inside it.
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output()
+                .expect("start the test binary again");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .find_map(|line| line.split_once(ANSWER_PREFIX).map(|(_, json)| json))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the child printed no answers (status {}):\n{stdout}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            let json: serde_json::Value = serde_json::from_str(line).expect("answers are JSON");
+            let reads = std::fs::read_to_string(&calls).map_or(0, |log| log.lines().count());
+            (json, reads)
+        }
+
+        /// One inspection reads the release once, for the examination and the
+        /// summary together, so the two fields agree and a hung `uname` costs
+        /// one timeout. The reads are counted by the fake `uname` itself, so a
+        /// second read shows even when both return the same string. A failed
+        /// read is shared too: both are empty and it is still one read.
+        #[test]
+        fn one_inspection_reads_the_kernel_release_once() {
+            let (json, reads) = run_child("echo 6.8.0-fake", "inspect");
+            assert_eq!(json["summary"], "6.8.0-fake", "{json}");
+            assert_eq!(json["examination"], "6.8.0-fake", "{json}");
+            assert_eq!(reads, 1, "{json}");
+
+            let (json, reads) = run_child("echo 6.8.0-partial; exit 3", "inspect");
+            assert_eq!(json["summary"], serde_json::Value::Null, "{json}");
+            assert_eq!(json["examination"], "", "{json}");
+            assert_eq!(reads, 1, "{json}");
+        }
+
+        #[test]
+        fn both_read_the_release_a_working_uname_prints() {
+            assert_eq!(
+                ask("echo 6.8.0-fake"),
+                pair(Some("6.8.0-fake"), "6.8.0-fake")
+            );
+        }
+
+        /// A WSL 1 and a WSL 2 style release are read as printed by both, so
+        /// `is_wsl1_kernel` (which reads `kernel_release`) sees what the summary
+        /// shows. The consumer's answer is pinned in `wsl.rs`.
+        #[test]
+        fn both_read_wsl_style_releases_as_printed() {
+            for release in [
+                "4.4.0-19041-Microsoft",
+                "5.15.167.4-microsoft-standard-WSL2",
+            ] {
+                assert_eq!(
+                    ask(&format!("echo {release}")),
+                    pair(Some(release), release),
+                    "{release}"
+                );
+            }
+        }
+
+        /// A `uname` that prints a release and exits non-zero is dropped by
+        /// both. The examination used to keep the release.
+        #[test]
+        fn a_non_zero_exit_with_output_is_dropped_by_both() {
+            assert_eq!(ask("echo 6.8.0-partial; exit 3"), pair(None, ""));
+        }
+
+        /// Both read a successful but silent `uname` as nothing: `None` in the
+        /// summary (shown as `<unknown>`), empty in the examination, with no
+        /// `probe_failures` entry in either case.
+        #[test]
+        fn a_silent_uname_reads_as_nothing_in_both() {
+            assert_eq!(ask("exit 0"), pair(None, ""));
+        }
+
+        /// Output that is not UTF-8 is dropped by both. The examination used to
+        /// keep it with the bad byte replaced.
+        #[test]
+        fn output_that_is_not_utf8_is_dropped_by_both() {
+            assert_eq!(ask("printf '6.8.0-\\377\\n'"), pair(None, ""));
+        }
+
+        /// A `uname` that answers after 2 s is read by both: the one timeout is
+        /// the longer of the two old ones, 5 s. The summary used to give up at
+        /// 1.5 s, so 2 s is past that old limit and leaves 3 s of margin to the
+        /// new one on a loaded runner.
+        #[test]
+        fn an_answer_after_two_seconds_is_read_by_both() {
+            let started = Instant::now();
+            assert_eq!(
+                ask("sleep 2; echo 6.8.0-slow"),
+                pair(Some("6.8.0-slow"), "6.8.0-slow")
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        }
+
+        /// A `uname` that never answers is read as nothing by both, each after
+        /// the one timeout. `exec` leaves no grandchild holding the pipe.
+        ///
+        /// The stand-in would exit successfully with nothing after 30 s, which is
+        /// also what a read with no timeout would turn into `None`, so the
+        /// answers alone cannot tell a timeout from no timeout. The elapsed time
+        /// can: the child reads twice in a row, each bounded by the 5 s limit, so
+        /// it takes about 10 s, and at least 9 s shows the stand-in really hung.
+        /// With the limit raised past the stand-in's 30 s it takes 60 s and the
+        /// upper bound fails.
+        #[test]
+        fn a_uname_that_never_answers_reads_as_nothing_in_both_within_the_timeout() {
+            let started = Instant::now();
+            assert_eq!(ask("exec sleep 30"), pair(None, ""));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= std::time::Duration::from_secs(9),
+                "two reads of a hung uname returned after {elapsed:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(25),
+                "the reads outlived the timeout: {elapsed:?}"
+            );
+        }
     }
 }

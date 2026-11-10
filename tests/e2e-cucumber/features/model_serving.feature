@@ -307,7 +307,7 @@ Feature: Model serving
   # `--require-api-key` reuse refusal (#604). A running server's key is read once
   # at launch; reuse cannot retroactively satisfy a demand for auth the server
   # never got, so the idempotency guard refuses instead of upgrading the record
-  # in place (see `spawn_managed_engine_child` in `service_launch.rs`). This is the
+  # in place (see `spawn_managed_engine_child` in `service_launch/spawn.rs`). This is the
   # local-side proof that the printed stop hint is not just present but correct
   # and directly runnable: the scenario stops the service with it and checks the
   # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
@@ -318,10 +318,10 @@ Feature: Model serving
   # this guard without a live GPU, same as every other `@requires-gpu` scenario
   # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
   # bind, and the serve path's `ensure_public_bind_engine_supported` guard
-  # (defined in `service_launch.rs`, called from `serve_cmd.rs`) refuses that combination
-  # for Lemonade on Windows (its server can't receive the key through the
-  # Windows detached-spawn primitive), so this scenario cannot reach the
-  # refusal it exercises there.
+  # (defined in `service_launch/endpoint_auth.rs`, called from `serve_cmd.rs`)
+  # refuses that combination for Lemonade on Windows (its server can't receive the
+  # key through the Windows detached-spawn primitive), so this scenario cannot
+  # reach the refusal it exercises there.
   @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
   Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
     Given a managed runtime is active
@@ -725,7 +725,7 @@ Feature: Model serving
   # so it cannot be combined with the attached modes, which already stay on the
   # terminal. The waiting itself (a live server that becomes ready, one that
   # exits first) is covered by `wait_past_readiness_budget_*` in
-  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  # `apps/rocm/src/service_launch/readiness.rs`, since a scenario would need a slow engine.
   @id:serve-wait-conflicts-with-attached-modes
   Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
     When the user serves a model with both --wait and --verbose
@@ -750,7 +750,7 @@ Feature: Model serving
   # "stop the service holding that port" advice is checked here by its wording
   # only; the advice is actually proven by
   # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
-  # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
+  # apps/rocm/src/service_launch/launch_transaction.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
   Scenario: serve-45 - Serving on a port another managed service already holds is refused
@@ -816,7 +816,8 @@ Feature: Model serving
   # beside the OpenAI one — the engine's own when it serves one, else a
   # translation front on its own port — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Streaming and tool use are not translated yet, so they have no scenario.
+  # Tool use is translated for non-streaming requests (serve-53); a streaming
+  # request that offers tools is refused, which only the unit tests cover.
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -839,3 +840,21 @@ Feature: Model serving
     And a model is being served on GPU
     When the CLI reports the service as ready
     Then both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy
+
+  # ROCMAI-920: tool use is translated in both directions. A request offering
+  # one tool and requiring it gets a `tool_use` block back.
+  @id:serve-anthropic-messages-tool-use @requires-gpu
+  Scenario: serve-53 - A served model handles tool use via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a tool-use request to the Anthropic messages endpoint
+    Then the response contains a tool_use content block
+    And the tool_use block names a tool and arguments from the request
+
+  @id:serve-anthropic-messages-streaming @requires-gpu
+  Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a streaming request to the Anthropic messages endpoint
+    Then the response is delivered as Anthropic-style server-sent events
+    And the streamed content reassembles into a complete reply

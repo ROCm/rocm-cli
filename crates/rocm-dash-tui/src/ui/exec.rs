@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Shared helpers for launching `rocm` sub-commands from operational screens (Phase 3 Wave 1).
+//! Shared helpers for launching `rocm` sub-commands from operational screens.
 //!
 //! Every screen that routes a mutating action through the
 //! approval gate + job-bridge resolves the binary the same way, so the logic

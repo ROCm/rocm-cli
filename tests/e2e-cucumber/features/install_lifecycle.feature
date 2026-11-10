@@ -309,9 +309,11 @@ Feature: Release install lifecycle
     And the record of the installer's PATH change is gone
 
   @id:lifecycle-linux-uninstall-keep-binaries-keeps-path @lifecycle @requires-os:linux
-  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change
+  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change and the fish completions
     Given a freshly built release tree
     And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
     And a signed bundle installed with the shell profile updated
     And the installed binary has isolated XDG directories with state
     When the user uninstalls from the installed binary keeping the binaries
@@ -319,6 +321,7 @@ Feature: Release install lifecycle
     And uninstall reports keeping the PATH change with the binaries
     And the installed rocm and rocmd binaries are present
     And the shell profile still adds the install directory to PATH
+    And the fish completions are still in place
     And the record of the installer's PATH change is still in the install directory
 
   @id:lifecycle-linux-uninstall-path-failure-keeps-binaries @lifecycle @requires-os:linux
@@ -405,3 +408,63 @@ Feature: Release install lifecycle
     And the installer output has no banner art
     And the installer next-step hint names the installed rocm binary
     And the installer output has no ANSI escapes
+
+  @id:lifecycle-linux-fish-configured-from-bash @lifecycle @requires-os:linux
+  Scenario: lifecycle-32 - Linux - a bash login shell on a machine with fish also gets fish's PATH and completions, and uninstall undoes both
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And the shell profile already holds the user's own settings
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    Then the fish config adds the install directory to PATH once
+    And the fish completions for the installed rocm are in place
+    When the signed bundle is reinstalled with the shell profile updated
+    Then the fish config adds the install directory to PATH once
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the shell profile is back to the user's own settings
+    And the fish config is back to the user's own settings
+    And the fish completions for the uninstalled rocm are gone
+    And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-fish-completions-not-ours-kept @lifecycle @requires-os:linux
+  Scenario: lifecycle-33 - Linux - uninstall leaves fish completions the installer did not write, and says so
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    And the user has replaced the fish completions with their own
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And uninstall leaves the user's own fish completions in place and says why
+
+  @id:lifecycle-linux-fish-completions-removal-failure-warns @lifecycle @requires-os:linux
+  Scenario: lifecycle-34 - Linux - fish completions that cannot be removed are a warning, and the rest of the uninstall still happens
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    And the fish completions folder cannot be written to
+    When the user uninstalls from the installed binary
+    Then uninstall warns that the fish completions could not be removed and still finishes
+    And the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-fish-existing-completions-left-alone @lifecycle @requires-os:linux
+  Scenario: lifecycle-35 - Linux - the installer leaves a rocm.fish it did not write, says so, and uninstall leaves it too
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And the user already has their own fish completions
+    And a signed bundle installed with the shell profile updated
+    Then the installer leaves the user's own fish completions and says why
+    And the fish config adds the install directory to PATH once
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the user's own fish completions are untouched
