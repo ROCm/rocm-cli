@@ -7,6 +7,9 @@
 
 use super::Examination;
 use super::library_copies::libraries_on_ld_path;
+use crate::host_gpu::{
+    CpuFacts, read_linux_cpu_facts, run_windows_system_query, windows_cpu_facts_with,
+};
 use crate::probe_exec::{MEDIUM, SHORT, read_host_text, run, truncate_to_chars};
 use crate::{runtime_is_linux, runtime_is_windows};
 
@@ -117,64 +120,53 @@ pub(super) fn parse_iommu_param(cmdline: &str) -> Option<String> {
     })
 }
 
-pub(super) fn probe_cpu_linux(e: &mut Examination) {
-    let txt = read_host_text("/proc/cpuinfo");
-    for line in txt.lines() {
-        if (e.cpu_vendor == "unknown")
-            && line.starts_with("vendor_id")
-            && let Some((_, value)) = line.split_once(':')
-        {
-            let value = value.trim();
-            e.cpu_vendor = if value.contains("AMD") {
-                "amd".to_owned()
-            } else if value.contains("Intel") {
-                "intel".to_owned()
-            } else {
-                value.to_lowercase()
-            };
-        }
-        if e.cpu_model.is_empty()
-            && line.starts_with("model name")
-            && let Some((_, value)) = line.split_once(':')
-        {
-            e.cpu_model = value.trim().to_owned();
-        }
-        if e.cpu_vendor != "unknown" && !e.cpu_model.is_empty() {
-            break;
-        }
-    }
+/// Fill the CPU fields from the shared reader's answer. A CPU that could not be
+/// read leaves the model empty and the vendor `unknown`, which is how the JSON
+/// has always said "not collected".
+pub(crate) fn record_cpu(e: &mut Examination, facts: CpuFacts) {
+    e.cpu_model = facts.model.unwrap_or_default();
+    e.cpu_vendor = facts.vendor;
 }
 
+/// The CPU on Linux, from `/proc/cpuinfo` through the reader the host summary
+/// uses. A cpuinfo with no CPU in it is not a probe failure.
+pub(super) fn probe_cpu_linux(e: &mut Examination) {
+    record_cpu(e, read_linux_cpu_facts());
+}
+
+/// The CPU on Windows, from the CPU row of the system inventory through the
+/// reader the host summary uses.
 pub(super) fn probe_cpu_windows(e: &mut Examination) {
-    let (rc, out, _) = run(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
-        ],
-        MEDIUM,
-    );
-    if rc == 0 && !out.trim().is_empty() {
-        e.cpu_model = out
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let lname = e.cpu_model.to_lowercase();
-        e.cpu_vendor = if lname.contains("amd") {
-            "amd".to_owned()
-        } else if lname.contains("intel") {
-            "intel".to_owned()
-        } else {
-            "unknown".to_owned()
-        };
-    } else {
-        e.probe_failures
-            .push("Get-CimInstance Win32_Processor failed; cannot identify CPU.".to_owned());
+    probe_cpu_windows_with(e, run_windows_system_query);
+}
+
+/// [`probe_cpu_windows`] with the query injected, so a test on any host drives
+/// the examination's whole Windows read, the failure entry included. `query` is
+/// handed the inventory's script and time limit; see `windows_cpu_facts_with`.
+/// [`probe_cpu_windows`] passes the real PowerShell runner, which is the one
+/// argument no test on a Linux host can reach.
+pub(crate) fn probe_cpu_windows_with(
+    e: &mut Examination,
+    query: impl FnOnce(&str, std::time::Duration) -> Option<String>,
+) {
+    record_cpu_windows(e, windows_cpu_facts_with(query));
+}
+
+/// The `probe_failures` entry for a Windows read that found no CPU. It names the
+/// query that ran, the system inventory's CPU and RAM script, and fires whether
+/// that query failed, timed out, printed nothing or printed no CPU row.
+pub(crate) const WINDOWS_CPU_NOT_FOUND: &str =
+    "The Windows system inventory query (CPU and RAM) reported no CPU; cannot identify CPU.";
+
+/// [`record_cpu`], and a failure entry when no CPU could be read: on Windows the
+/// CPU comes from a query that can fail or time out, and an empty model alone
+/// would not say so. Crate-visible so a test on any host can feed it the answer
+/// of an injected query.
+pub(crate) fn record_cpu_windows(e: &mut Examination, facts: CpuFacts) {
+    if facts.model.is_none() {
+        e.probe_failures.push(WINDOWS_CPU_NOT_FOUND.to_owned());
     }
+    record_cpu(e, facts);
 }
 
 pub(super) fn probe_env(e: &mut Examination) {
@@ -620,6 +612,114 @@ mod tests {
             ("fallback", "1.2")
         );
         assert_eq!(name.as_deref(), Some("Fallback 1.2"));
+    }
+
+    /// Plant `files` (path under the root, body) in a fresh directory and run
+    /// `read` with it as the simulated host root.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    fn with_planted_host_root<T>(files: &[(&str, &str)], read: impl FnOnce() -> T) -> T {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-cpu-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        for (relative, body) in files {
+            let path = root.join(relative.trim_start_matches('/'));
+            std::fs::create_dir_all(path.parent().expect("planted path has a parent"))
+                .expect("create planted directory");
+            std::fs::write(path, body).expect("write planted file");
+        }
+        let result = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            read()
+        };
+        std::fs::remove_dir_all(&root).ok();
+        result
+    }
+
+    /// CPU-model pair of docs/host-probing.md, native Linux. Both reads take
+    /// `/proc/cpuinfo` from the simulated host root, so a planted CPU no runner
+    /// has is what each reports, and both report the model with its whitespace
+    /// collapsed (the examination used to keep the runs of spaces).
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn cpu_reads_follow_the_simulated_host_root() {
+        let (summary, examined) = with_planted_host_root(
+            &[(
+                "proc/cpuinfo",
+                "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: Planted  CPU 9000   Processor\n",
+            )],
+            || {
+                let mut examined = Examination::default();
+                probe_cpu_linux(&mut examined);
+                (crate::host_gpu::detect_cpu_model(), examined)
+            },
+        );
+        assert_eq!(summary.as_deref(), Some("Planted CPU 9000 Processor"));
+        assert_eq!(examined.cpu_model, "Planted CPU 9000 Processor");
+        assert_eq!(examined.cpu_vendor, "amd");
+    }
+
+    /// CPU-model pair, WSL: the summary reads the CPU and the examination does
+    /// not. `probe_with_interpreter` returns from its WSL branch before
+    /// `probe_cpu_linux`, so on every WSL host `cpu_model` is empty and
+    /// `cpu_vendor` is `unknown` while the summary shows the CPU. Pinned as an
+    /// existing difference of the CPU-model pair, which leaves it as it is.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn on_wsl_the_summary_reads_the_cpu_and_the_examination_does_not() {
+        let (summary, examined) = with_planted_host_root(
+            &[
+                ("dev/dxg", ""),
+                (
+                    "proc/cpuinfo",
+                    "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: Planted WSL CPU\n",
+                ),
+            ],
+            || {
+                (
+                    crate::host_gpu::detect_cpu_model(),
+                    Examination::probe(crate::examine::FrameworkProbe::Skip),
+                )
+            },
+        );
+        assert!(examined.is_wsl, "the planted /dev/dxg reads as WSL");
+        assert_eq!(summary.as_deref(), Some("Planted WSL CPU"));
+        assert_eq!(examined.cpu_model, "");
+        assert_eq!(examined.cpu_vendor, "unknown");
+    }
+
+    /// `probe_cpu_windows` runs the system inventory's query and nothing else:
+    /// off Windows there is no PowerShell for the real runner, so the read finds
+    /// no CPU and the entry says which query that was, and the injected-query
+    /// form given a CPU row fills the fields the same way. Replacing the runner
+    /// `probe_cpu_windows` passes, or the failure entry, fails this test. On
+    /// Windows the runner is live, so it is skipped there.
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_cpu_windows_runs_the_inventory_query_and_reports_no_cpu_without_one() {
+        let mut examined = Examination::default();
+        probe_cpu_windows(&mut examined);
+        assert_eq!(
+            (examined.cpu_model.as_str(), examined.cpu_vendor.as_str()),
+            ("", "unknown")
+        );
+        assert_eq!(examined.probe_failures, [WINDOWS_CPU_NOT_FOUND]);
+
+        let mut with_cpu = Examination::default();
+        probe_cpu_windows_with(&mut with_cpu, |_, _| {
+            Some("CPU\tIntel(R) Core(TM) i5-12400\nRAM\t17179869184\n".to_owned())
+        });
+        assert_eq!(
+            (with_cpu.cpu_model.as_str(), with_cpu.cpu_vendor.as_str()),
+            ("Intel(R) Core(TM) i5-12400", "intel")
+        );
+        assert!(with_cpu.probe_failures.is_empty());
     }
 
     // The kernel-release read, the second pair of `docs/host-probing.md`
