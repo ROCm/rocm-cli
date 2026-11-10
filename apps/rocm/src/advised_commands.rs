@@ -694,7 +694,7 @@ pub(crate) fn command_parts(raw: &str) -> Vec<String> {
 /// Shell-like word split honouring single and double quotes. A `<…>`
 /// placeholder is one word even when it contains spaces
 /// (`<natural language request>`).
-fn split_words(text: &str) -> Vec<String> {
+pub(crate) fn split_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;

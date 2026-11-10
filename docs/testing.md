@@ -2041,8 +2041,10 @@ launch, why the key is missing (nothing stopped, so it is not told a stop
 dropped it); the `rocm serve <model> …` command it names keeps the recorded
 port (always, since a launch that leaves `--port` out is given one from
 `11435..=11535`, which a tailnet or proxy mapping that publishes the service
-does not follow), the recorded host where it is not the default loopback one,
-the public-bind opt-in and `--require-api-key`, so following it does not bring
+does not follow), the recorded host unless it is exactly the default one (a
+padded or re-cased `127.0.0.1` is a public bind to the guard and to `rocm serve`,
+so it is printed, quoted, with `--allow-public-bind`, where leaving it out would
+bring the service back on the default host with no key), the public-bind opt-in and `--require-api-key`, so following it does not bring
 the service back somewhere else; the guard takes the port the record holds, and
 the model stays a placeholder because it does not decide where the endpoint is.
 The host is printed shell-quoted (`rocm-core`'s `posix_shell_quote`, as every

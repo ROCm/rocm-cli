@@ -353,7 +353,7 @@ mod tests {
             1,
             "the refusal must name exactly one `rocm serve` command: {message}"
         );
-        spans[0].split_whitespace().map(str::to_owned).collect()
+        crate::advised_commands::split_words(spans[0])
     }
 
     /// What the real clap parse makes of an advised `rocm serve` command.
@@ -417,7 +417,7 @@ mod tests {
             1,
             "the refusal must name exactly one `rocm services stop` command: {message}"
         );
-        spans[0].split_whitespace().map(str::to_owned).collect()
+        crate::advised_commands::split_words(spans[0])
     }
 
     /// Run what `rocm serve` does with `advised` before it spawns anything — the
@@ -568,6 +568,15 @@ mod tests {
                 ("0.0.0.0", false),
                 ("192.168.1.10", false),
                 ("gpu-box.example", false),
+                // Not exactly a loopback spelling, so public to the guard and to
+                // `rocm serve`: the command has to say `--host` for them, or it
+                // brings the service back on the default host with no key.
+                (" 127.0.0.1 ", false),
+                ("127.0.0.1 ", true),
+                ("localhost ", false),
+                (" ::1", false),
+                ("Localhost", false),
+                ("127.0.0.01", false),
             ] {
                 let message = rocm_core::ensure_public_service_has_endpoint_key(
                     host,
@@ -846,6 +855,9 @@ mod tests {
             "$HOME",
             "it's",
             "gpu-box.example",
+            " 127.0.0.1 ",
+            "localhost ",
+            " ::1",
         ] {
             for start in [
                 ServiceStart::Launch,

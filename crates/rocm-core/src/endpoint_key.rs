@@ -112,8 +112,9 @@ impl ServiceStart {
 /// service's endpoint depended on, so following it does not bring the service
 /// back somewhere else: the port it recorded (always, since a port left out is
 /// chosen from `rocm serve`'s own range, and anything that publishes the service
-/// — a tailnet or proxy mapping — targets the port it had), the host where it is
-/// not the default loopback one, the public-bind opt-in where the host is public,
+/// — a tailnet or proxy mapping — targets the port it had), the host unless it is
+/// exactly the default one (any other spelling, padded or re-cased, is a different
+/// and public host), the public-bind opt-in where the host is public,
 /// and `--require-api-key` where the service asked for it. The model is the one
 /// thing left as a placeholder: the guard does not know it, and it does not
 /// decide where the endpoint is.
@@ -127,7 +128,13 @@ impl ServiceStart {
 /// printed as it is. The port is a number and needs none.
 fn serve_command(host: &str, port: u16, requires_api_key: bool) -> String {
     let mut command = String::from("rocm serve <model>");
-    if !crate::is_canonical_loopback_host(host) {
+    // Exactly the default host, with the same comparison `is_public_bind_host` and
+    // `rocm serve`'s key policy make: not `is_canonical_loopback_host`, which
+    // trims and so reads a padded ` 127.0.0.1 ` as the default although the guard
+    // (and `rocm serve`) treat it as a public bind that needs a key. Leaving
+    // `--host` out for it would bring the service back on the default host, where
+    // no key is minted.
+    if host != crate::DEFAULT_LOCAL_HOST {
         command.push_str(" --host ");
         command.push_str(&crate::posix_shell_quote(host));
     }
@@ -310,7 +317,7 @@ mod tests {
     /// The command each recorded host and requirement must be told to run: it
     /// keeps what the bind depended on, so following it does not bring the
     /// service back somewhere else. Spelled out here, not derived.
-    const ADVISED: [(&str, bool, &str); 10] = [
+    const ADVISED: [(&str, bool, &str); 16] = [
         (
             "127.0.0.1",
             true,
@@ -363,6 +370,41 @@ mod tests {
             "[::1]",
             true,
             "rocm serve <model> --host '[::1]' --port 8000 --allow-public-bind --require-api-key",
+        ),
+        // A spelling that is not exactly one of the three loopback hosts is a
+        // public bind to the guard and to `rocm serve`, whatever it would read as
+        // once trimmed or re-cased, so it is printed, quoted, with the public-bind
+        // opt-in; leaving `--host` out would bring the service back on the default
+        // host, where `rocm serve` mints no key.
+        (
+            " 127.0.0.1 ",
+            false,
+            "rocm serve <model> --host ' 127.0.0.1 ' --port 8000 --allow-public-bind",
+        ),
+        (
+            "127.0.0.1 ",
+            true,
+            "rocm serve <model> --host '127.0.0.1 ' --port 8000 --allow-public-bind --require-api-key",
+        ),
+        (
+            "localhost ",
+            false,
+            "rocm serve <model> --host 'localhost ' --port 8000 --allow-public-bind",
+        ),
+        (
+            " ::1",
+            false,
+            "rocm serve <model> --host ' ::1' --port 8000 --allow-public-bind",
+        ),
+        (
+            "Localhost",
+            false,
+            "rocm serve <model> --host Localhost --port 8000 --allow-public-bind",
+        ),
+        (
+            "127.0.0.01",
+            false,
+            "rocm serve <model> --host 127.0.0.01 --port 8000 --allow-public-bind",
         ),
     ];
 
@@ -590,6 +632,33 @@ mod tests {
                     // Only the recorded port appears, so a fixed one cannot hide behind it.
                     assert_eq!(message.matches("--port").count(), 1, "{message}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn host_is_left_out_of_the_command_only_for_exactly_the_default_host() {
+        // `rocm serve` leaves the host at `127.0.0.1` when `--host` is not given,
+        // and mints a key only for a host that is not exactly one of the loopback
+        // spellings (the guard's own test). So `--host` may be omitted for exactly
+        // that default host and for no other spelling, whatever it would read as
+        // after trimming: a padded `127.0.0.1` is a public bind, and the command
+        // that stands for it must say so.
+        assert_eq!(crate::DEFAULT_LOCAL_HOST, "127.0.0.1");
+        assert!(!is_public_bind_host(crate::DEFAULT_LOCAL_HOST));
+        for (host, requires, _) in ADVISED {
+            for start in STARTS {
+                let message = refusal(host, false, requires, start);
+                assert_eq!(
+                    message.contains(" --host "),
+                    host != crate::DEFAULT_LOCAL_HOST,
+                    "{host:?} requires={requires} {start:?}: {message}"
+                );
+                assert_eq!(
+                    message.contains(" --allow-public-bind"),
+                    is_public_bind_host(host),
+                    "{host:?} requires={requires} {start:?}: {message}"
+                );
             }
         }
     }
