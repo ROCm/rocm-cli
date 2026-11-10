@@ -11,7 +11,6 @@ use super::spawn::{
 };
 use crate::background_helper::background_helper_already_running;
 #[cfg(not(windows))]
-use crate::engine_runtime_select::apply_app_path_env;
 use crate::engine_runtime_select::managed_service_launcher_path;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
@@ -151,7 +150,7 @@ fn spawn_background_helper(paths: &AppPaths) -> Result<Result<u32>> {
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, None)?;
         detach_background_command(&mut command);
-        apply_app_path_env(&mut command, paths);
+        paths.apply_env(&mut command);
         command
             .spawn()
             .map(|child| child.id())

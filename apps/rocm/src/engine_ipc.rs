@@ -179,6 +179,7 @@ const fn stdio_options<'a>(
         endpoint_key_file: None,
         request_progress: stream_progress,
         forward_stderr: true,
+        note_failing_exit_after_answer: false,
     }
 }
 
@@ -442,6 +443,7 @@ mod tests {
         assert!(options.request_progress);
         // The terminal user watches an install through the child's stderr.
         assert!(options.forward_stderr);
+        assert!(!options.note_failing_exit_after_answer);
         // No request `rocm` makes is about a running service's endpoint.
         assert_eq!(options.endpoint_key_file, None);
 

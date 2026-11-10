@@ -213,6 +213,7 @@ const fn stdio_options<'a>(
         endpoint_key_file,
         request_progress: false,
         forward_stderr: false,
+        note_failing_exit_after_answer: true,
     }
 }
 
@@ -400,6 +401,8 @@ mod tests {
         // a daemon's terminal.
         assert!(!options.request_progress);
         assert!(!options.forward_stderr);
+        // A daemon's stderr is its log, so a failing exit after an answer leaves a note there.
+        assert!(options.note_failing_exit_after_answer);
         assert_eq!(options.env_root, None);
 
         assert_eq!(stdio_options(&paths, None).endpoint_key_file, None);

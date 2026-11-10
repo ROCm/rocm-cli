@@ -14,7 +14,6 @@ use super::launch_transaction::{
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
 #[cfg(not(windows))]
-use crate::engine_runtime_select::apply_app_path_env;
 use crate::engine_runtime_select::managed_service_launcher_path;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
@@ -510,7 +509,7 @@ fn launch_managed_engine_child_locked(
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
-        apply_app_path_env(&mut command, paths);
+        paths.apply_env(&mut command);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
             command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
         }

@@ -60,6 +60,14 @@ impl AppPaths {
         ]
     }
 
+    /// Set [`Self::env_vars`] on `command`, so the child it starts runs on these
+    /// roots.
+    pub fn apply_env(&self, command: &mut std::process::Command) {
+        for (key, value) in self.env_vars() {
+            command.env(key, value);
+        }
+    }
+
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override(DATA_DIR_ENV);
         let cache_dir_override = env_path_override(CACHE_DIR_ENV);
@@ -386,6 +394,26 @@ mod tests {
     /// `env_vars` and `discover` share one constant per name, so they cannot
     /// disagree; the names themselves are what a child process and a user's
     /// shell see, so they are pinned here.
+    #[test]
+    fn apply_env_sets_exactly_the_three_roots_on_a_command() {
+        let (_root, paths) = temp_app_paths("apply-env");
+        let mut command = std::process::Command::new("true");
+        paths.apply_env(&mut command);
+        let mut set: Vec<_> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+            .collect();
+        let expected: Vec<_> = paths
+            .env_vars()
+            .iter()
+            .map(|(key, value)| ((*key).into(), Some(value.as_os_str().to_owned())))
+            .collect();
+        let mut expected = expected;
+        set.sort();
+        expected.sort();
+        assert_eq!(set, expected);
+    }
+
     #[test]
     fn env_vars_pair_each_root_with_its_public_variable_name() {
         let (_root, paths) = temp_app_paths("env-vars");

@@ -345,6 +345,17 @@ binary whose own stderr the parent reads
 line is there with the option and absent without it). Replacing the one
 `forward_stderr.then(io::stderr)` with `None` turns the second red.
 
+A child that answers and then exits with a failing status is read as having
+answered (see the doc comment of `run_engine_stdio`), and its status is not part
+of the answer. The daemon asks the client to leave a note on its stderr, which is
+its log (`note_failing_exit_after_answer`); the CLI does not, since its stderr is a
+terminal. `a_failing_exit_after_an_answer_is_noted_only_when_asked_for` reads the
+stderr of a re-executed test binary for both settings. A failed read of the
+answer carries the child's stderr like every other failure
+(`a_failed_read_of_the_answer_reports_the_stderr_too`), and a child whose stdin or
+stdout pipe is missing is killed and reaped, not left running
+(`a_missing_pipe_kills_and_reaps_the_child`, Linux only).
+
 A child whose answer cannot be read is killed and reaped before the error is
 returned, as it is when the request cannot be written, so the long-lived daemon
 does not collect a running engine or a zombie per failure.

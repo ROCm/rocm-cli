@@ -114,6 +114,11 @@ pub struct EngineStdioOptions<'a> {
     /// terminal user watches an install. Either way the whole of it is kept and
     /// shown in the error when the request fails.
     pub forward_stderr: bool,
+    /// Say, on this process's stderr, when the child answered and then exited
+    /// with a failing status. The answer is used either way; this only leaves a
+    /// trace of the status, which the caller would otherwise never see. For a
+    /// daemon, whose stderr is its log; a terminal user has no use for it.
+    pub note_failing_exit_after_answer: bool,
 }
 
 /// Build the request envelope for `method` from `request`.
@@ -143,9 +148,7 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(paths) = options.app_paths {
-        for (key, value) in paths.env_vars() {
-            command.env(key, value);
-        }
+        paths.apply_env(&mut command);
     }
     if let Some(env_root) = options.env_root {
         command.env(ENGINE_ENVS_ROOT_ENV, env_root);
@@ -208,10 +211,8 @@ where
         .spawn()
         .with_context(|| format!("failed to spawn engine stdio process {}", program.display()))?;
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("engine stdio child did not expose stdin")?;
+    let stdin = child.stdin.take();
+    let mut stdin = require_pipe(&mut child, stdin, "stdin")?;
     // Read the child's stderr from the start, on its own thread: an engine that
     // fills the stderr pipe before it has drained a request larger than a pipe
     // buffer would otherwise block on that write while this process blocks on
@@ -239,11 +240,18 @@ where
     // End of the request: the engine reads to EOF before it answers.
     drop(stdin);
 
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .context("engine stdio child did not expose stdout")?;
-    let stdout = read_response(&mut child, stdout_pipe)?;
+    let stdout_pipe = child.stdout.take();
+    let stdout_pipe = require_pipe(&mut child, stdout_pipe, "stdout")?;
+    let stdout = match read_response(&mut child, stdout_pipe) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            return Err(read_failure_with_stderr(
+                error,
+                stderr_collector,
+                EXITED_STDERR_GRACE,
+            ));
+        }
+    };
     let status = child
         .wait()
         .context("failed waiting for engine stdio response")?;
@@ -252,6 +260,12 @@ where
         .unwrap_or_default();
 
     let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if !status.success() && !stdout.is_empty() && options.note_failing_exit_after_answer {
+        eprintln!(
+            "{} after printing its answer; the answer was used",
+            exit_note(status)
+        );
+    }
     if !status.success() && stdout.is_empty() {
         let exited = exit_note(status);
         if stderr.is_empty() {
@@ -292,6 +306,36 @@ fn unparseable_answer_message(status: ExitStatus, stderr: &str) -> String {
         message = format!("{message}; stderr: {stderr}");
     }
     message
+}
+
+/// `pipe` of `child`, or an error that also kills and reaps the child: a child
+/// whose request cannot be sent must not be left running, as on every other
+/// failure path. Unreachable while the command pipes all three streams, which is
+/// why it is a function of its own, testable with a pipe that is missing.
+fn require_pipe<T>(child: &mut Child, pipe: Option<T>, name: &str) -> Result<T> {
+    pipe.ok_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::anyhow!("engine stdio child did not expose {name}")
+    })
+}
+
+/// The error for a stdout that could not be read (the child is already killed
+/// and reaped), with what its stderr had said, as every other failure carries
+/// it: a crashing or signalled engine is where the explanation matters most.
+fn read_failure_with_stderr(
+    error: anyhow::Error,
+    stderr: Option<StderrCollector>,
+    grace: Duration,
+) -> anyhow::Error {
+    let stderr = stderr
+        .map(|collector| collector.finish(Some(Instant::now() + grace)))
+        .unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if stderr.is_empty() {
+        return error;
+    }
+    anyhow::anyhow!("{error:#}; stderr: {stderr}")
 }
 
 /// How long the stderr of a child that was killed, or had exited, is waited for
@@ -388,7 +432,7 @@ impl StderrCollector {
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()));
             }
         }
-        lock(&self.shared).bytes.clone()
+        std::mem::take(&mut lock(&self.shared).bytes)
     }
 }
 
@@ -562,6 +606,7 @@ mod tests {
                 endpoint_key_file: Some(Path::new("/keys/svc.endpoint-key")),
                 request_progress: true,
                 forward_stderr: true,
+                note_failing_exit_after_answer: false,
             },
         );
         assert_eq!(args_of(&command), ["__engine-stdio", "vllm"]);
@@ -938,6 +983,7 @@ mod tests {
                     endpoint_key_file: Some(Path::new("/keys/k")),
                     request_progress: true,
                     forward_stderr: false,
+                    note_failing_exit_after_answer: false,
                 },
             )
             .unwrap();
@@ -985,6 +1031,109 @@ mod tests {
                 run(&engine, &EngineStdioOptions::default()).unwrap(),
                 json!({"stopped": true})
             );
+        }
+
+        /// The status of a child that answered and then failed is not part of the
+        /// answer, so a caller that asks for it (the daemon) gets a note on this
+        /// process's stderr, and one that does not (the CLI) gets nothing. Run in
+        /// a re-executed test binary so the parent can read that stderr; the
+        /// decision itself is unchanged: the answer is used.
+        #[test]
+        fn a_failing_exit_after_an_answer_is_noted_only_when_asked_for() {
+            if let Some(arm) = std::env::var_os("ROCM_TEST_CLIENT_NOTE_ARM") {
+                let engine = FakeEngine::answering("client-note", STOPPED, 7);
+                let options = EngineStdioOptions {
+                    note_failing_exit_after_answer: arm == "on",
+                    ..EngineStdioOptions::default()
+                };
+                let answer = run(&engine, &options).unwrap();
+                assert_eq!(answer, json!({"stopped": true}));
+                return;
+            }
+            for (arm, expected) in [("on", true), ("off", false)] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "stdio_client::tests::child::a_failing_exit_after_an_answer_is_noted_only_when_asked_for",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("ROCM_TEST_CLIENT_NOTE_ARM", arm)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{arm}: {:?}", output.status);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let note = "engine stdio process exited with code 7 after printing its answer; the answer was used";
+                assert_eq!(stderr.contains(note), expected, "{arm}:\n{stderr}");
+            }
+        }
+
+        /// A child whose stdin or stdout pipe is missing is killed and reaped, as
+        /// on every other failure path, not left running. Linux-only for the
+        /// `/proc` entry a zombie would keep.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_missing_pipe_kills_and_reaps_the_child() {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let proc_entry = format!("/proc/{}", child.id());
+            assert!(Path::new(&proc_entry).exists());
+
+            let error =
+                require_pipe(&mut child, None::<std::process::ChildStdin>, "stdin").unwrap_err();
+
+            assert_eq!(error.to_string(), "engine stdio child did not expose stdin");
+            assert!(!Path::new(&proc_entry).exists(), "killed and reaped");
+        }
+
+        /// A pipe that is there is handed back and the child left alone.
+        #[test]
+        fn a_present_pipe_is_returned_and_the_child_left_running() {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            assert_eq!(require_pipe(&mut child, Some(5), "stdout").unwrap(), 5);
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+
+        /// A failed read of the answer reports what the engine had said on
+        /// stderr, with the read error, like every other failure; the message and
+        /// its content are asserted together.
+        #[test]
+        fn a_failed_read_of_the_answer_reports_the_stderr_too() {
+            let collector = StderrCollector::start(
+                io::Cursor::new(b"engine crashed: out of memory\n".to_vec()),
+                None::<io::Sink>,
+            );
+            // The thread ends at once on a cursor; wait for its text.
+            let error = read_failure_with_stderr(
+                anyhow::Error::new(io::Error::other("pipe went away"))
+                    .context("failed to read engine stdio response"),
+                Some(collector),
+                Duration::from_secs(5),
+            );
+            assert_eq!(
+                error.to_string(),
+                "failed to read engine stdio response: pipe went away; stderr: engine crashed: out of memory"
+            );
+
+            // With nothing on stderr the error is the read error, unchanged.
+            let quiet = read_failure_with_stderr(
+                anyhow::anyhow!("failed to read engine stdio response"),
+                None,
+                Duration::from_secs(1),
+            );
+            assert_eq!(quiet.to_string(), "failed to read engine stdio response");
         }
 
         #[test]

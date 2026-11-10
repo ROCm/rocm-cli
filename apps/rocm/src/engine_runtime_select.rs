@@ -11,8 +11,8 @@
 //! `parse_engine_recipe_json_arg`,
 //! `daemon_run_argv`, `managed_service_launcher_path`), the `ROCM_CLI_*`
 //! environment variables every managed child inherits
-//! (`app_path_env_var_values`/`app_path_env_var_refs`/
-//! `apply_app_path_env`, over [`AppPaths::env_vars`]), and polling a freshly launched service until it can
+//! (`app_path_env_var_values`/`app_path_env_var_refs`, over
+//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`), and polling a freshly launched service until it can
 //! actually answer inference requests (`wait_for_service_http_ready`,
 //! `wait_for_service_http_ready_with_progress`,
 //! `service_http_readiness_paths`, `http_get_local_service`,
@@ -64,10 +64,7 @@
 //! `engine_recipe_json_arg` is `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
-//! `apply_app_path_env` is `pub(crate)`, read from `engine_ipc.rs` and
-//! `engines_cmd.rs`,
-//! `service_launch.rs`, and `service_control.rs`'s
-//! `restart_internal_managed_service_with`; `app_path_env_var_values`/
+//! `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
 //! and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
@@ -93,7 +90,6 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
 
@@ -306,12 +302,6 @@ pub(crate) fn managed_service_launcher_path() -> Result<PathBuf> {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)
-}
-
-pub(crate) fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths) {
-    for (key, value) in paths.env_vars() {
-        command.env(key, value);
-    }
 }
 
 pub(crate) fn wait_for_service_http_ready(
