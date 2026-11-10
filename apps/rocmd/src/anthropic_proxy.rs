@@ -423,7 +423,7 @@ fn text_of(content: &Value, field: &str) -> Result<String, ProxyError> {
 fn tool_result_text(block: &Value) -> Result<String, ProxyError> {
     let text = match block.get("content") {
         None | Some(Value::Null) => String::new(),
-        Some(content) => text_of(content, "a `tool_result` content block")?,
+        Some(content) => text_of(content, "tool_result content")?,
     };
     Ok(
         if block.get("is_error").and_then(Value::as_bool) == Some(true) {
@@ -549,7 +549,7 @@ fn translate_tools(tools: Option<&Value>) -> Result<Option<Value>, ProxyError> {
             .filter(|kind| *kind != "custom")
         {
             return Err(ProxyError::unsupported(&format!(
-                "the `{kind}` server tool"
+                "a tool of type `{kind}` (only `custom` function tools are accepted)"
             )));
         }
         let name = tool
@@ -748,17 +748,27 @@ fn openai_to_anthropic(reply: &Value, served_model: &str) -> Result<Value, Proxy
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    let truncated = choice.get("finish_reason").and_then(Value::as_str) == Some("length");
+    let mut tool_uses = tool_use_blocks(calls);
+    if truncated && tool_uses.is_err() {
+        // The token limit cut the arguments off mid-object; keep the text and
+        // report `max_tokens` rather than failing the whole reply.
+        tool_uses = Ok(Vec::new());
+    }
+    let tool_uses = tool_uses?;
     // Some engines report `stop` beside tool calls, so the calls decide.
-    let stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
-        _ if !calls.is_empty() => "tool_use",
-        Some("length") => "max_tokens",
-        _ => "end_turn",
+    let stop_reason = if !tool_uses.is_empty() {
+        "tool_use"
+    } else if truncated {
+        "max_tokens"
+    } else {
+        "end_turn"
     };
     let mut content = Vec::new();
-    if !text.is_empty() || calls.is_empty() {
+    if !text.is_empty() || tool_uses.is_empty() {
         content.push(json!({ "type": "text", "text": text }));
     }
-    content.extend(tool_use_blocks(calls)?);
+    content.extend(tool_uses);
     let id = reply
         .get("id")
         .and_then(Value::as_str)
@@ -877,7 +887,7 @@ mod tests {
         ]}]});
         for (request, needle) in [
             (streaming, "streaming"),
-            (server_tool, "`web_search_20250305` server tool"),
+            (server_tool, "a tool of type `web_search_20250305`"),
             (image, "`image` content block"),
         ] {
             let error = translate(&request).unwrap_err();
@@ -927,6 +937,28 @@ mod tests {
                 "stop_sequence": null,
                 "usage": {"input_tokens": 11, "output_tokens": 2},
             })
+        );
+    }
+
+    #[test]
+    fn response_keeps_the_text_when_a_length_stop_truncates_tool_arguments() {
+        let reply = |finish: &str| {
+            json!({"choices": [{"message": {"content": "Checking.", "tool_calls": [
+                {"id": "call_1", "function": {"name": "weather", "arguments": "{\"city\":\"Os"}}
+            ]}, "finish_reason": finish}]})
+        };
+        let message = openai_to_anthropic(&reply("length"), MODEL).unwrap();
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert_eq!(
+            message["content"],
+            json!([{"type": "text", "text": "Checking."}])
+        );
+        // Without the token limit the same arguments are still a bad gateway.
+        assert_eq!(
+            openai_to_anthropic(&reply("tool_calls"), MODEL)
+                .unwrap_err()
+                .status,
+            502
         );
     }
 

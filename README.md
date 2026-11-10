@@ -975,8 +975,9 @@ prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`,
 and tool use: `tools` and `tool_choice` (including `disable_parallel_tool_use`),
 `tool_use` and `tool_result` blocks in the conversation, and `tool_use` blocks
 with the `tool_use` stop reason in the reply. Whether the model calls a tool
-depends on the engine: vLLM needs `--tool-call-parser` (and auto tool choice) for
-`tool_choice` `auto`. Streaming, extended thinking, server tools (web search and
+depends on the engine: vLLM needs `--tool-call-parser <name>` (and auto tool choice) for any
+`tool_choice` (`any` and a named tool included), and answers a request that names a
+tool with a 400 without one. Streaming, extended thinking, server tools (web search and
 the like) and image or other non-text content blocks are refused with
 an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
 marks the endpoint `(not responding)` when a ready service's endpoint does not
