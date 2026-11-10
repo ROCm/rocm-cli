@@ -816,7 +816,7 @@ Feature: Model serving
   # beside the OpenAI one — the engine's own when it serves one, else a
   # translation front on its own port — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Streaming and tool use are not translated yet, so they have no scenario.
+  # Streaming is not translated yet, so it has no scenario.
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -840,7 +840,15 @@ Feature: Model serving
     When the CLI reports the service as ready
     Then both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy
 
-
+  # ROCMAI-920: tool use is translated in both directions. A request offering
+  # one tool and requiring it gets a `tool_use` block back.
+  @id:serve-anthropic-messages-tool-use @requires-gpu
+  Scenario: serve-53 - A served model handles tool use via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a tool-use request to the Anthropic messages endpoint
+    Then the response contains a tool_use content block
+    And the tool_use block names a tool and arguments from the request
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the
@@ -857,7 +865,7 @@ Feature: Model serving
   # specifically — the only possible outcome of a scripted/CI `--verbose`
   # session, per that function's own doc comment.
   @id:serve-scripted-death-after-startup @requires-no-gpu
-  Scenario: serve-53 - A managed engine that dies after startup fails loudly
+  Scenario: serve-54 - A managed engine that dies after startup fails loudly
     Given the scripted engine is armed to die shortly after startup
     When the user serves a model expecting the engine to crash after startup
     Then serving fails with a non-zero exit and names the crash
@@ -867,13 +875,13 @@ Feature: Model serving
   # externally triggered stop in the same post-startup window must NOT be
   # treated as the crash above. `rocm services stop` run from a second
   # invocation kills the pid the attached `--verbose` session is watching,
-  # landing in the identical `AttachOutcome::ServerExited` arm serve-53
+  # landing in the identical `AttachOutcome::ServerExited` arm serve-54
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
   # Before ROCMAI-541 this made a clean, intentional, externally-triggered
-  # stop fail exactly like serve-53's crash.
+  # stop fail exactly like serve-54's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
-  Scenario: serve-54 - An externally stopped attached serve exits cleanly, not as a crash
+  Scenario: serve-55 - An externally stopped attached serve exits cleanly, not as a crash
     Given the scripted engine is armed to run until stopped
     When the user attaches to the scripted serve in the background
     And another shell stops that service while it is attached

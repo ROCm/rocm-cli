@@ -65,7 +65,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, engine_binary_path, engine_plugin_dirs};
+use rocm_core::{AppPaths, ManagedServiceRecord, engine_binary_path, engine_plugin_dirs};
 use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EnginePluginDescriptor, EngineRecipeHint, EngineRequestEnvelope,
     EngineResponseEnvelope,
@@ -502,8 +502,51 @@ fn record_engine_serve_http_failure(
             "__engine-serve-http service_id={service_id} failed: {error:#}"
         );
     }
+    if engine_stop_was_deliberate(service_id, state_path) {
+        return;
+    }
     let _ =
         rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "failed" }));
+}
+
+/// Whether this exit is an operator-requested stop rather than a crash, so the
+/// blanket `failed` stamp above must not fire.
+///
+/// Needed because the adapters disagree. `aim` makes the distinction itself
+/// (`finish_after_exit` reads `stopping`/`stopped` off its own state file,
+/// writes `stopped` and returns `Ok`), so it never reaches the stamp. `lemonade`
+/// and `vllm` have no such carve-out: a SIGTERM from `rocm services stop` makes
+/// `status.success()` false, so they write `failed` themselves and return `Err`.
+/// They were already mislabelling a deliberate stop before this change — the
+/// stamp would merely agree with them — but agreeing with a wrong answer is
+/// still wrong, so check both places an intent is recorded:
+///
+/// - the engine's own state file, which is what `aim`'s `stop_service` stamps
+///   `stopping` before it kills anything; and
+/// - the service manifest's `stop_requested_unix_ms`, which
+///   `stop_internal_managed_service_confirmed_with` writes before it signals
+///   anything, for every engine.
+///
+/// Best-effort on purpose: when neither can be read this returns `false` and the
+/// stamp proceeds, because failing to prove a stop must never swallow a crash
+/// report.
+fn engine_stop_was_deliberate(service_id: &str, state_path: &Path) -> bool {
+    let engine_status = fs::read(state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|state| {
+            state
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if matches!(engine_status.as_deref(), Some("stopping" | "stopped")) {
+        return true;
+    }
+    AppPaths::discover().is_ok_and(|paths| {
+        ManagedServiceRecord::read_manifest(&paths, service_id)
+            .is_ok_and(|record| record.stop_requested_unix_ms.is_some())
+    })
 }
 
 /// ROCMAI-541 E2E hook, armed by `ROCM_E2E_SCRIPTED_ENGINE`: stands in for
@@ -617,6 +660,35 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// The blanket `failed` stamp must not relabel an operator-requested stop.
+    ///
+    /// `aim` already makes this distinction itself and returns `Ok`, so it never
+    /// reaches the stamp; `lemonade` and `vllm` do not — a SIGTERM from
+    /// `rocm services stop` makes `status.success()` false and they return
+    /// `Err`. This is the guard that keeps the stamp from agreeing with them.
+    #[test]
+    fn a_deliberate_stop_is_not_stamped_failed_by_the_backstop() {
+        let (root, _paths) = test_paths("engine-ipc-deliberate-stop");
+        let state_path = root.join("engine-state.json");
+        fs::create_dir_all(&root).unwrap();
+
+        // What `aim`'s `stop_service` writes before it kills the container.
+        fs::write(&state_path, br#"{"status":"stopping"}"#).unwrap();
+        assert!(
+            engine_stop_was_deliberate("svc-stopping", &state_path),
+            "a `stopping` engine state is an operator stop, not a crash"
+        );
+
+        fs::write(&state_path, br#"{"status":"running"}"#).unwrap();
+        assert!(
+            !engine_stop_was_deliberate("svc-no-such-service", &state_path),
+            "a running engine with no stop recorded anywhere must still be \
+             reported as a crash — failing to prove a stop must never swallow one"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {

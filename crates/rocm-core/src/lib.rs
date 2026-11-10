@@ -110,8 +110,8 @@ pub use disk_space::{
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 pub use download::{
-    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
+    Backoff, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest,
+    download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress,
 };
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
@@ -268,6 +268,17 @@ pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT
 pub fn torch_alignment_disabled() -> bool {
     std::env::var_os(TORCH_ALIGNMENT_DISABLED_ENV).is_some()
 }
+
+/// The packages the SDK installs together with torch, in one transaction.
+///
+/// Under [`torch_alignment_disabled`] these are all treated as the user's: the SDK
+/// overwrites the lot, and vLLM pins an exact build of each, so sparing only torch
+/// leaves the others as defects whose repair reinstalls the engine's torch over the
+/// one the opt-out keeps. The CLI's dependency check and the engine's repair
+/// assessment both read this list, so they agree on which packages are spared. They
+/// still gate it differently: the engine spares them whenever the opt-out is set, the
+/// CLI only when the install settled on a torch divergence.
+pub const SDK_TORCH_STACK_PACKAGES: &[&str] = &["torch", "torchvision", "torchaudio", "triton"];
 
 pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     if value.trim().is_empty() {
