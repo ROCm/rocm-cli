@@ -582,6 +582,13 @@ async fn refuses_to_change_setting(world: &mut E2eWorld) {
         "expected the refusal to say {rename:?}, got:\n{}",
         combined_output(world)
     );
+    // The user already set the folder the first refusal suggested, so being
+    // told to set it again would be wrong.
+    assert!(
+        !stderr.contains("then also need ROCM_CLI_DATA_DIR"),
+        "the refusal repeated the ROCM_CLI_DATA_DIR advice the user already followed:\n{}",
+        combined_output(world)
+    );
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

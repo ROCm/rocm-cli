@@ -988,6 +988,10 @@ mod tests {
     /// alone; renaming it as told makes the next load start from defaults.
     #[test]
     fn load_of_an_unreadable_config_says_which_file_to_rename() -> Result<()> {
+        // The advice reads `ROCM_CLI_DATA_DIR`, which other tests set.
+        let _guard = crate::test_env::DATA_DIR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (root, paths) = temp_app_paths("config-load-advice");
         fs::create_dir_all(&paths.config_dir)?;
         let damaged = br#"{"active_runtime_key": "kept", "onboarding_dismissed": "yes"}"#;
@@ -1281,33 +1285,42 @@ last_installed_runtime_id = "therock-release"
     /// itself warns about.
     #[test]
     fn migrate_legacy_dashboard_toml_refuses_an_invalid_tick_and_writes_nothing() -> Result<()> {
-        for (value, rendered) in [
-            ("nan", "NaN"),
-            ("inf", "inf"),
-            ("-inf", "-inf"),
-            ("-1.0", "-1"),
-        ] {
-            let (root, paths) = temp_app_paths("migrate-dash-bad-tick");
-            fs::create_dir_all(&root)?;
-            let legacy = root.join("legacy-config.toml");
-            let text = format!(
-                "default_engine = \"vllm\"\n[daemon]\ndiscovery_tick = {value}\n[tui]\ntheme = \"nord\"\n"
-            );
-            fs::write(&legacy, &text)?;
+        // Every tick key, and every way a value can fail to be a Duration:
+        // not a number, infinite, negative, and finite but too large.
+        for key in ["gpu_tick", "discovery_tick", "instance_tick"] {
+            for (value, rendered) in [
+                ("nan", "NaN"),
+                ("inf", "inf"),
+                ("-inf", "-inf"),
+                ("-1.0", "-1"),
+                // Above `Duration::MAX` (about 1.8e19 seconds).
+                ("1e20", "100000000000000000000"),
+            ] {
+                let (root, paths) = temp_app_paths("migrate-dash-bad-tick");
+                fs::create_dir_all(&root)?;
+                let legacy = root.join("legacy-config.toml");
+                let text = format!(
+                    "default_engine = \"vllm\"\n[daemon]\n{key} = {value}\n[tui]\ntheme = \"nord\"\n"
+                );
+                fs::write(&legacy, &text)?;
 
-            let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
-                .expect_err("an invalid tick must not migrate");
-            let config_written = paths.config_path().exists();
-            let legacy_after = fs::read_to_string(&legacy)?;
-            let _ = fs::remove_dir_all(&root);
+                let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+                    .expect_err("an invalid tick must not migrate");
+                let config_written = paths.config_path().exists();
+                let legacy_after = fs::read_to_string(&legacy)?;
+                let _ = fs::remove_dir_all(&root);
 
-            let message = format!("{error:#}");
-            assert!(
-                message.contains(&format!("daemon.discovery_tick = {rendered}")),
-                "{value}: unexpected error: {message}"
-            );
-            assert!(!config_written, "{value}: config.json was written");
-            assert_eq!(legacy_after, text, "{value}: the legacy TOML was modified");
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(&format!("daemon.{key} = {rendered}")),
+                    "{key} = {value}: unexpected error: {message}"
+                );
+                assert!(!config_written, "{key} = {value}: config.json was written");
+                assert_eq!(
+                    legacy_after, text,
+                    "{key} = {value}: the legacy TOML was modified"
+                );
+            }
         }
 
         // The refusal warns that the window closes once config.json exists —

@@ -958,10 +958,13 @@ mod tests {
 
     /// The public method reads the same fallback discovery uses: paths whose
     /// data dir is that fallback get no override advice, and any other data
-    /// dir is named as the override to set. Reads the environment as it is
-    /// rather than setting it, so it cannot race other tests.
+    /// dir is named as the override to set. Holds the data-dir lock because the
+    /// fallback reads `ROCM_CLI_DATA_DIR`, which other tests set.
     #[test]
     fn config_rename_advice_names_an_override_only_for_a_data_dir_discovery_would_lose() {
+        let _guard = crate::test_env::DATA_DIR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (root, paths) = temp_app_paths("config-aside-advice-method");
         let rename = format!(
             "To start from default settings instead, rename {config} to {config}.broken",
@@ -982,6 +985,29 @@ mod tests {
             )
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    /// A user who already set the `ROCM_CLI_DATA_DIR` the refusal suggested is
+    /// not told to set it again: with the variable naming the data dir,
+    /// renaming config.json leaves the data dir where it is, so the advice is
+    /// the rename alone. Drives the real environment read.
+    #[test]
+    fn config_rename_advice_names_no_override_once_rocm_cli_data_dir_is_set() {
+        let _guard = crate::test_env::DATA_DIR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = temp_app_paths("config-aside-advice-env");
+        let restore = crate::test_env::RestoredEnvVar::set("ROCM_CLI_DATA_DIR", &paths.data_dir);
+        let advice = paths.config_aside_advice();
+        drop(restore);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            advice,
+            format!(
+                "To start from default settings instead, rename {config} to {config}.broken",
+                config = paths.config_path().display()
+            )
+        );
     }
 
     /// The recorded folder is recovered from a damaged file only when its

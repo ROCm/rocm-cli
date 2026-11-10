@@ -45,8 +45,10 @@
 //! destination in between cannot turn it into a deletion.
 //!
 //! Durable as well as atomic: the temp file is flushed to disk before it is
-//! published, and on Unix the directory is flushed after the rename, so a
-//! power loss leaves the old file or the new one rather than an empty one.
+//! published, so the new name never points at data still in the cache. On
+//! Unix the directory is flushed after the rename too, so a power loss leaves
+//! the old file or the new one rather than an empty one. Windows has no
+//! directory flush here; there the rename's durability is the filesystem's.
 //!
 //! Replacing a file this way must not quietly change what the user set up:
 //!
@@ -502,15 +504,19 @@ where
 /// it did not.
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-    {
+    // A bare relative name has the empty path as its parent, which cannot be
+    // opened; its folder is the current one.
+    let parent = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => return,
+    };
+    if let Ok(dir) = fs::File::open(parent) {
         let _ = dir.sync_all();
     }
 }
 
-/// Windows has no directory handle to flush; `ReplaceFileW` and `MoveFileExW`
-/// update the directory through the journaling filesystem.
+/// Not done on Windows: the rename's durability is left to the filesystem.
 #[cfg(not(unix))]
 // Platform stub. The `cfg` sibling calls non-const code, so making only this
 // arm `const` would give the two platforms different signatures and push
