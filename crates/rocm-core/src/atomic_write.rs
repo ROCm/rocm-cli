@@ -341,7 +341,7 @@ where
     // before the data would leave an empty file under the real name after a
     // crash. A full disk can surface in the flush rather than in `write_all`.
     stage_file_for_atomic_publish_with_writer(path, bytes, suffix_for_attempt, |file, bytes| {
-        file.write_all(bytes).and_then(|()| file.sync_all())
+        write_then_flush(file, bytes, fs::File::sync_all)
     })
 }
 
@@ -404,6 +404,19 @@ where
     Ok(tmp)
 }
 
+/// Write `bytes` into the staged file, then flush it to disk with `flush`, so
+/// the data reaches the disk before the rename can. A flush error fails the
+/// write like any other, so the caller removes the temp file. `flush` is
+/// injected so a test can see that it runs, and after the bytes; production
+/// passes `File::sync_all`.
+fn write_then_flush<F>(file: &mut fs::File, bytes: &[u8], flush: F) -> io::Result<()>
+where
+    F: FnOnce(&fs::File) -> io::Result<()>,
+{
+    file.write_all(bytes)?;
+    flush(file)
+}
+
 /// Give the staged file the permission bits of the file it will replace, so a
 /// `0600` file is not republished as `0644`. Nothing to keep for a new file.
 #[cfg(unix)]
@@ -417,8 +430,9 @@ fn keep_existing_permissions(path: &Path, tmp: &Path) -> Result<()> {
     }
 }
 
-/// `ReplaceFileW` already carries the replaced file's attributes and ACL over
-/// to the replacement, so there is nothing to copy by hand.
+/// Nothing is copied on Windows: a publish by rename leaves the new file with
+/// the staged file's attributes and the ACL its directory hands down (see the
+/// module doc), and no caller sets a mode-like attribute it needs kept.
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)]
 // Platform stub. The `cfg` sibling calls non-const code, so making only this
@@ -449,8 +463,24 @@ fn publish_staged_file_with<F>(tmp: &Path, path: &Path, publish: F) -> Result<()
 where
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
+    publish_staged_file_with_dir_sync(tmp, path, publish, sync_parent_dir)
+}
+
+/// [`publish_staged_file_with`] with the directory flush injected, so a test
+/// can see that a successful publish flushes the destination's directory and
+/// a failed one does not; production passes `sync_parent_dir`.
+fn publish_staged_file_with_dir_sync<F, D>(
+    tmp: &Path,
+    path: &Path,
+    publish: F,
+    sync_dir: D,
+) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+    D: FnOnce(&Path),
+{
     let Err(error) = publish(tmp, path) else {
-        sync_parent_dir(path);
+        sync_dir(path);
         return Ok(());
     };
     if removed_the_destination(&error) && tmp.exists() {
@@ -1344,26 +1374,113 @@ mod tests {
     fn staging_applies_the_kept_mode_before_writing_any_byte() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = scratch_dir("permissions-before-write");
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("config.json");
-        fs::write(&destination, b"old").unwrap();
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        // 0o604 is a mode no usual umask gives a new file (022 gives 0o644,
+        // 077 gives 0o600), so seeing it on the temp file means it was set.
+        for mode in [0o600, 0o604] {
+            let root = scratch_dir("permissions-before-write");
+            fs::create_dir_all(&root).unwrap();
+            let destination = root.join("config.json");
+            fs::write(&destination, b"old").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
 
-        let mut mode_while_writing = None;
-        stage_file_for_atomic_publish_with_writer(
-            &destination,
-            b"secret",
-            |attempt| OsString::from(format!("mode-{attempt}")),
-            |file, bytes| {
-                mode_while_writing = Some(file.metadata()?.permissions().mode() & 0o777);
-                file.write_all(bytes)
-            },
-        )
+            let mut mode_while_writing = None;
+            stage_file_for_atomic_publish_with_writer(
+                &destination,
+                b"secret",
+                |attempt| OsString::from(format!("mode-{attempt}")),
+                |file, bytes| {
+                    mode_while_writing = Some(file.metadata()?.permissions().mode() & 0o777);
+                    file.write_all(bytes)
+                },
+            )
+            .unwrap();
+            let _ = fs::remove_dir_all(&root);
+
+            assert_eq!(mode_while_writing, Some(mode), "mode {mode:o}");
+        }
+    }
+
+    /// When the existing file's permissions cannot be read, staging fails
+    /// with that error and removes its temp file. A symlink loop at the
+    /// destination makes the read fail on Unix without root or chmod;
+    /// `stage_file_for_atomic_publish` takes the path as given, so the loop
+    /// reaches the permission read rather than the link resolution.
+    #[cfg(unix)]
+    #[test]
+    fn staging_that_cannot_read_the_existing_permissions_removes_its_temp_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch_dir("permissions-unreadable");
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.json");
+        let b = root.join("b.json");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+
+        let error = stage_file_for_atomic_publish(&a, b"x").expect_err("the read must fail");
+        let names = names_in(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            format!("{error:#}").contains("failed to read the permissions of"),
+            "{error:#}"
+        );
+        assert_eq!(names, ["a.json", "b.json"], "the temp file was left behind");
+    }
+
+    /// The staged bytes are flushed, after they are written, and a flush
+    /// error fails the write. Whether the flush reaches the disk cannot be
+    /// observed from a test; that it is asked for can.
+    #[test]
+    fn staged_bytes_are_flushed_after_they_are_written() {
+        let root = scratch_dir("flush-order");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("staged");
+        let mut file = fs::File::create(&path).unwrap();
+
+        let mut seen_at_flush = None;
+        write_then_flush(&mut file, b"payload", |_| {
+            seen_at_flush = Some(fs::read(&path).unwrap());
+            Ok(())
+        })
         .unwrap();
+        let failed = write_then_flush(&mut file, b"more", |_| {
+            Err(io::Error::other("flush refused"))
+        });
+        drop(file);
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(mode_while_writing, Some(0o600));
+        assert_eq!(seen_at_flush.as_deref(), Some(&b"payload"[..]));
+        assert_eq!(failed.unwrap_err().to_string(), "flush refused");
+    }
+
+    /// A publish that succeeds flushes the destination's directory once; one
+    /// that fails does not.
+    #[test]
+    fn a_successful_publish_flushes_the_directory_and_a_failed_one_does_not() {
+        let root = scratch_dir("dir-flush");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("target.json");
+        let tmp = root.join("target.json.tmp-1");
+        fs::write(&tmp, b"new").unwrap();
+
+        let mut flushed = Vec::new();
+        publish_staged_file_with_dir_sync(&tmp, &destination, publish_temp_file, |path| {
+            flushed.push(path.to_path_buf());
+        })
+        .unwrap();
+        fs::write(&tmp, b"newer").unwrap();
+        let mut flushed_after_failure = 0;
+        publish_staged_file_with_dir_sync(
+            &tmp,
+            &destination,
+            |_, _| Err(io::Error::other("publish refused")),
+            |_| flushed_after_failure += 1,
+        )
+        .expect_err("the publish was refused");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(flushed, [destination]);
+        assert_eq!(flushed_after_failure, 0);
     }
 
     /// A destination that is a symbolic link keeps being one: the file it
@@ -1382,9 +1499,14 @@ mod tests {
         let target = dotfiles.join("rocm-config.json");
         fs::write(&target, b"old").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-        // config/config.json -> config/hop.json -> ../dotfiles/rocm-config.json
-        let hop = config_dir.join("hop.json");
-        symlink(Path::new("../dotfiles/rocm-config.json"), &hop).unwrap();
+        // config/config.json -> links/deeper/hop.json
+        //   -> ../../dotfiles/rocm-config.json, a relative hop in a directory
+        // two levels deep, so resolving it against the entry link's directory
+        // instead of the hop's own would miss the target.
+        let hop_dir = root.join("links").join("deeper");
+        fs::create_dir_all(&hop_dir).unwrap();
+        let hop = hop_dir.join("hop.json");
+        symlink(Path::new("../../dotfiles/rocm-config.json"), &hop).unwrap();
         let link = config_dir.join("config.json");
         symlink(&hop, &link).unwrap();
 
@@ -1399,6 +1521,7 @@ mod tests {
         let target_contents = fs::read(&target).unwrap();
         let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         let config_names = names_in(&config_dir);
+        let hop_names = names_in(&hop_dir);
         let dotfiles_names = names_in(&dotfiles);
         let _ = fs::remove_dir_all(&root);
 
@@ -1406,7 +1529,8 @@ mod tests {
         assert_eq!(through_link, b"new");
         assert_eq!(target_contents, b"new");
         assert_eq!(target_mode, 0o600);
-        assert_eq!(config_names, ["config.json", "hop.json"]);
+        assert_eq!(config_names, ["config.json"]);
+        assert_eq!(hop_names, ["hop.json"]);
         assert_eq!(dotfiles_names, ["rocm-config.json"]);
     }
 
