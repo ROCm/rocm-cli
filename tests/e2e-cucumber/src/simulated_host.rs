@@ -615,10 +615,10 @@ pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
             .collect::<Vec<_>>()
     };
     // `read_dir` order is the filesystem's, so sort before choosing the
-    // simulated node every real one is compared with, as the product does
-    // before it picks the first node.
+    // simulated node every real one is compared with. Numerically, as the
+    // product's `natural_node_order` does: node 10 comes after node 9.
     let sorted = |mut nodes: Vec<(PathBuf, Vec<(String, String)>)>| {
-        nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+        nodes.sort_by_key(|(path, _)| node_order(path));
         nodes
     };
     let real_gpus = sorted(gpu_nodes(real));
@@ -698,6 +698,13 @@ pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
         }
     }
     drift
+}
+
+/// A KFD node directory's sort key: its number, then its name, so `10` sorts
+/// after `9` and a name with no number sorts last.
+fn node_order(node: &Path) -> (u64, String) {
+    let name = node.file_name().unwrap_or_default().to_string_lossy();
+    (name.parse().unwrap_or(u64::MAX), name.into_owned())
 }
 
 /// Every way this WSL2 distribution under `real` (normally `/`) departs from
@@ -1164,6 +1171,112 @@ mod drift_tests {
             drift.iter().any(|line| line.contains("`location_id`")),
             "{drift:#?}"
         );
+    }
+
+    fn properties_of(root: &Path, node: &str) -> PathBuf {
+        root.join(KFD_NODES).join(node).join("properties")
+    }
+
+    /// A simulated machine that plants `/dev/kfd` and the amdgpu module is
+    /// drift on a kernel that has neither.
+    #[test]
+    fn a_kernel_without_the_kfd_device_or_the_amdgpu_module_is_drift() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        std::fs::remove_file(real.path().join("dev/kfd")).expect("drop kfd");
+        std::fs::remove_dir_all(real.path().join("sys/module/amdgpu")).expect("drop module");
+        let simulated = planted(&SimulatedHost::instinct_mi300x(1));
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert!(drift.iter().any(|l| l.contains("/dev/kfd")), "{drift:#?}");
+        assert!(
+            drift.iter().any(|l| l.contains("/sys/module/amdgpu")),
+            "{drift:#?}"
+        );
+    }
+
+    #[test]
+    fn a_gpu_node_without_a_gpu_id_file_is_drift() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        std::fs::remove_file(real.path().join(KFD_NODES).join("1/gpu_id")).expect("drop");
+        let simulated = planted(&SimulatedHost::instinct_mi300x(1));
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert_eq!(drift, ["KFD node 1 has no gpu_id file"], "{drift:#?}");
+    }
+
+    #[test]
+    fn a_render_minor_with_no_render_node_is_drift() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        std::fs::remove_file(real.path().join("dev/dri/renderD128")).expect("drop");
+        let simulated = planted(&SimulatedHost::instinct_mi300x(1));
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert_eq!(drift.len(), 1, "{drift:#?}");
+        assert!(drift[0].contains("render minor 128"), "{drift:#?}");
+    }
+
+    #[test]
+    fn a_drm_device_id_not_in_the_0xnnnn_form_is_drift() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        std::fs::write(
+            real.path().join("sys/class/drm/card0/device/device"),
+            "74a1\n",
+        )
+        .expect("rewrite");
+        let simulated = planted(&SimulatedHost::instinct_mi300x(1));
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert_eq!(drift.len(), 1, "{drift:#?}");
+        assert!(drift[0].contains("\"74a1\""), "{drift:#?}");
+    }
+
+    /// Every real node is compared with the lowest-numbered simulated GPU node,
+    /// in numeric order: node 10 sorts after node 2, so a property only node 10
+    /// states is never demanded of a real kernel.
+    #[test]
+    fn the_reference_node_is_the_lowest_numbered_one() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        let simulated = planted(&SimulatedHost::instinct_mi300x(2));
+        let nodes = simulated.path().join(KFD_NODES);
+        std::fs::rename(nodes.join("1"), nodes.join("10")).expect("renumber");
+        let extra = std::fs::read_to_string(properties_of(simulated.path(), "10")).expect("props")
+            + "only_on_node_ten 1\n";
+        std::fs::write(properties_of(simulated.path(), "10"), extra).expect("w");
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert_eq!(drift, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_listing_with_no_amd_gpu_is_drift() {
+        let listing = "0000:00:00.0 Host bridge [0600]: Advanced Micro Devices, Inc. [AMD] \
+                       Device [1022:14a4]";
+        assert_eq!(lspci_drift(listing), ["lspci -nn -D lists no AMD GPU"]);
+    }
+
+    #[test]
+    fn a_planted_wsl_machine_does_not_drift_from_itself() {
+        let real = planted(&SimulatedHost::wsl2_strix_halo());
+        assert_eq!(wsl_layout_drift(real.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_wsl_machine_without_dxg_or_dxcore_is_drift() {
+        let real = planted(&SimulatedHost::wsl2_strix_halo());
+        std::fs::remove_file(real.path().join("dev/dxg")).expect("drop dxg");
+        std::fs::remove_file(real.path().join("usr/lib/wsl/lib/libdxcore.so")).expect("drop");
+        let drift = wsl_layout_drift(real.path());
+        assert_eq!(drift.len(), 2, "{drift:#?}");
+        assert!(drift[0].contains("/dev/dxg"), "{drift:#?}");
+        assert!(drift[1].contains("libdxcore.so"), "{drift:#?}");
+    }
+
+    #[test]
+    fn a_wsl_kernel_string_the_cli_does_not_recognise_is_drift() {
+        let real = planted(&SimulatedHost::wsl2_strix_halo());
+        std::fs::write(
+            real.path().join("proc/version"),
+            "Linux version 6.6.87.2-microsoft-WSL3 (gcc 13.3.0) #1 SMP\n",
+        )
+        .expect("rewrite");
+        let drift = wsl_layout_drift(real.path());
+        assert_eq!(drift.len(), 1, "{drift:#?}");
+        assert!(drift[0].contains("microsoft-standard-WSL2"), "{drift:#?}");
     }
 
     #[test]
