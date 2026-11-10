@@ -117,7 +117,7 @@ pub use download::{
 };
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use endpoint_readiness::{
-    EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
+    EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT, SERVE_STARTUP_DEADLINE,
     engine_state_inference_verified, managed_service_endpoint_model_ready,
     managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
     openai_chat_completion_status, openai_models_endpoint_has_model,

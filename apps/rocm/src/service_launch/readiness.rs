@@ -18,6 +18,7 @@ use super::spawn::ManagedLaunchReport;
 use crate::device_policy_name;
 use crate::endpoint_keys;
 use crate::engine_runtime_select::wait_for_service_http_ready_with_progress;
+use crate::serve_progress;
 use crate::status_for_readiness;
 #[cfg(feature = "e2e-oom-fault-injection")]
 use anyhow::Context;
@@ -306,6 +307,53 @@ pub(super) fn wait_for_record_ready(
     } else {
         probe(on_wait_tick)
     }
+}
+
+/// One sample of a freshly launched service for the startup wait: the model
+/// name its endpoint answers to and the engine/process signals.
+///
+/// Read from the manifest on disk, like [`service_still_live`], so a
+/// `rocm services stop` from another terminal is seen. Liveness is
+/// [`service_pid_is_alive`]: the supervisor is an unreaped child of this
+/// process, so a dead one still passes `process_is_running`.
+fn observe_launch(
+    paths: &AppPaths,
+    held: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    pid_alive: impl Fn(u32) -> bool,
+) -> (String, serve_progress::ServeStartupSignals) {
+    let mut latest = ManagedServiceRecord::read_manifest(paths, &held.service_id)
+        .unwrap_or_else(|_| held.clone());
+    let _ = latest.refresh_from_engine_state();
+    let pids = crate::managed_service_status::recorded_service_pids(&latest);
+    let signals = serve_progress::ServeStartupSignals {
+        engine_failed: latest.status == "failed",
+        process_alive: pids.is_empty() || pids.into_iter().any(pid_alive),
+        log_line: serve_progress::latest_meaningful_log_line(&latest.log_path, endpoint_api_key),
+    };
+    (latest.served_model_name().to_owned(), signals)
+}
+
+/// Follow a fresh launch (without `--wait`) until it serves, the policy's
+/// budget runs out, or the wait stops. See [`serve_progress`].
+pub(super) fn wait_for_launch_startup(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    requested_model: &str,
+    endpoint_api_key: Option<&str>,
+    policy: &serve_progress::ServeStartupPolicy,
+    on_view: &mut dyn FnMut(&serve_progress::ServeStartupView),
+) -> Result<EndpointReadiness, serve_progress::ServeStartupStop> {
+    serve_progress::wait_for_serve_startup(
+        &record.engine,
+        requested_model,
+        &record.host,
+        record.port,
+        endpoint_api_key,
+        policy,
+        &mut || observe_launch(paths, record, endpoint_api_key, service_pid_is_alive),
+        on_view,
+    )
 }
 
 /// An equivalent service is already live. Without `--wait`, or once it is

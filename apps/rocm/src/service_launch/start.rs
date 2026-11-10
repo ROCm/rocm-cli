@@ -7,13 +7,14 @@
 
 use super::endpoint_auth::drop_orphaned_endpoint_key_on_already_running;
 use super::readiness::{
-    died_during_wait, record_wait_outcome, service_pid_is_alive, wait_for_record_ready,
-    wait_on_existing_service,
+    died_during_wait, record_wait_outcome, service_pid_is_alive, wait_for_launch_startup,
+    wait_for_record_ready, wait_on_existing_service,
 };
 #[cfg(feature = "e2e-oom-fault-injection")]
 use super::readiness::{e2e_simulate_oom_launch, simulate_oom_managed_launch};
 use super::spawn::{ManagedLaunchReport, ManagedSpawn, spawn_managed_engine_child};
 use crate::serve_port;
+use crate::serve_progress::{self, ServeStartupPhase, ServeStartupPolicy, ServeStartupView};
 use crate::{record_cli_audit_event, status_for_readiness};
 use anyhow::Result;
 use rocm_core::format_http_base_url;
@@ -22,6 +23,7 @@ use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse}
 use std::fmt::Write as _;
 #[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
 use std::time::Duration;
 
 /// Launch a managed service in the background: run the locked allocation and
@@ -55,9 +57,15 @@ pub(crate) fn start_managed_service(
     require_api_key: bool,
     gpu_refusal_waived_for_reuse: bool,
     wait_until_ready: bool,
+    policy: &ServeStartupPolicy,
     on_wait_begin: &mut dyn FnMut(&str, u16),
-    on_wait_tick: &mut dyn FnMut(Duration),
+    on_view: &mut dyn FnMut(&ServeStartupView),
 ) -> Result<ManagedLaunchReport> {
+    // `--wait` keeps the label it started with: its wait reports no stage.
+    let steady = ServeStartupView {
+        phase: ServeStartupPhase::Unreachable,
+        label: serve_progress::starting_label(requested_model, engine),
+    };
     #[cfg(feature = "e2e-oom-fault-injection")]
     if e2e_simulate_oom_launch() {
         return simulate_oom_managed_launch(
@@ -104,7 +112,9 @@ pub(crate) fn start_managed_service(
                 report,
                 wait_until_ready,
                 on_wait_begin,
-                on_wait_tick,
+                &mut |_elapsed| {
+                    on_view(&steady);
+                },
             );
         }
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
@@ -121,16 +131,28 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    if wait_until_ready {
+    if announces_wait(wait_until_ready, policy) {
         on_wait_begin(service_id, port);
     }
-    let readiness = wait_for_record_ready(
-        paths,
-        &record,
-        wait_until_ready,
-        endpoint_api_key,
-        on_wait_tick,
-    );
+    let (readiness, startup_stop) = if wait_until_ready {
+        let readiness =
+            wait_for_record_ready(paths, &record, true, endpoint_api_key, &mut |_elapsed| {
+                on_view(&steady);
+            });
+        (readiness, None)
+    } else {
+        match wait_for_launch_startup(
+            paths,
+            &record,
+            requested_model,
+            endpoint_api_key,
+            policy,
+            on_view,
+        ) {
+            Ok(readiness) => (readiness, None),
+            Err(stop) => (stop.readiness, Some(stop)),
+        }
+    };
     if let Some(error) = died_during_wait(
         paths,
         service_id,
@@ -140,12 +162,15 @@ pub(crate) fn start_managed_service(
     ) {
         return Err(error);
     }
-    let launch_status = status_for_readiness(readiness);
+    let launch_status = match &startup_stop {
+        Some(stop) => serve_progress::recorded_status_after_stop(stop),
+        None => status_for_readiness(readiness),
+    };
     record_wait_outcome(
         paths,
         &mut record,
         launch_status,
-        readiness == EndpointReadiness::Serving,
+        readiness == EndpointReadiness::Serving && startup_stop.is_none(),
     )?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
@@ -159,6 +184,14 @@ pub(crate) fn start_managed_service(
         ),
         Some(service_id),
     );
+    if let Some(stop) = startup_stop {
+        return Err(serve_progress::ServeStartupFailed(stop.user_message(
+            requested_model,
+            engine,
+            service_id,
+        ))
+        .into());
+    }
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
@@ -168,6 +201,17 @@ pub(crate) fn start_managed_service(
         log_path: Some(record.log_path),
         manifest_path: Some(record.manifest_path),
     })
+}
+
+/// Whether a fresh launch announces its wait (the server id, how to follow its
+/// log, and a public bind's key) before waiting.
+///
+/// `--wait` does, and so does the interactive wait, which can run for
+/// [`rocm_core::SERVE_STARTUP_DEADLINE`] and can end in an error that prints no
+/// summary: without the announcement a public bind's key would never be shown.
+/// The piped status budget returns a report either way and prints the key there.
+const fn announces_wait(wait_until_ready: bool, policy: &ServeStartupPolicy) -> bool {
+    wait_until_ready || policy.stop_on_give_up
 }
 
 /// Reproduce the original plain, line-by-line managed-launch output. Used for
@@ -263,6 +307,21 @@ mod tests {
     use std::fs;
     #[cfg(not(windows))]
     use std::io;
+    #[cfg(not(windows))]
+    use std::time::Duration;
+
+    /// A wait that can end in an error without a summary announces itself, so
+    /// a public bind's key is printed before it. The piped status budget
+    /// always returns a report, and the summary prints the key there.
+    #[test]
+    fn a_wait_that_can_fail_without_a_summary_is_announced() {
+        let interactive = ServeStartupPolicy::interactive();
+        let piped = ServeStartupPolicy::status_budget(serve_progress::PIPED_SERVE_STATUS_BUDGET);
+        assert!(announces_wait(false, &interactive));
+        assert!(announces_wait(true, &interactive));
+        assert!(announces_wait(true, &piped));
+        assert!(!announces_wait(false, &piped));
+    }
 
     #[test]
     fn wait_begin_shows_the_key_only_for_the_launch_it_belongs_to() {
@@ -369,8 +428,9 @@ mod tests {
             false,
             false,
             false,
+            &ServeStartupPolicy::status_budget(Duration::ZERO),
             &mut |_, _| {},
-            &mut |_elapsed| {},
+            &mut |_view| {},
         );
         let Err(error) = result else {
             let _ = fs::remove_dir_all(root);
@@ -466,8 +526,9 @@ mod tests {
                     false,
                     false,
                     false,
+                    &ServeStartupPolicy::status_budget(Duration::ZERO),
                     &mut |_, _| {},
-                    &mut |_elapsed| {},
+                    &mut |_view| {},
                 )
                 .map(|_| ())
             };
