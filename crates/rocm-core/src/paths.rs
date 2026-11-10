@@ -42,8 +42,11 @@ impl AppPaths {
     /// Errors when no data dir is given through `ROCM_CLI_DATA_DIR` and
     /// `config.json` exists but cannot be read: the managed root it records
     /// decides the data dir, so guessing the default would point every command
-    /// at the wrong runtimes. Callers that only want paths for best-effort work
-    /// (logging, diagnosis) already treat an error here as "no paths".
+    /// at the wrong runtimes. Startup logging and `rocm diagnose` treat an error
+    /// here as "no paths". Engines started by `rocm` are handed
+    /// `ROCM_CLI_DATA_DIR` and so never reach it; an engine started by hand
+    /// does, and the AIM engine then keeps its state file in the working
+    /// directory, as it already did when no data dir could be found.
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
@@ -744,6 +747,25 @@ mod tests {
                 message.contains(&suggested),
                 names_the_root,
                 "{label}: whether the recorded folder is named: {message}"
+            );
+            // What renaming does to the data dir, for the folder the file still
+            // names or, when it no longer names one, for any custom folder.
+            // That the data dir does go back to the default is the rename way
+            // out below.
+            let aside = if names_the_root {
+                format!(
+                    "resets every setting to its default, and the runtimes under {root} then \
+                     also need ROCM_CLI_DATA_DIR={root}",
+                    root = managed_root.display()
+                )
+            } else {
+                "resets every setting to its default, and runtimes installed into a custom \
+                 folder then need ROCM_CLI_DATA_DIR set to that folder"
+                    .to_owned()
+            };
+            assert!(
+                message.ends_with(&aside),
+                "{label}: missing {aside:?} at the end of: {message}"
             );
             assert_eq!(
                 fs::read(paths.config_path())?,

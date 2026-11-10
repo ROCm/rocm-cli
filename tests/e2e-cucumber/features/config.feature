@@ -87,7 +87,7 @@ Feature: Configuration mutations
     Then the CLI keeps its data in the recorded folder, on default settings
     And the settings file is left exactly as it was
     When the user changes a setting with the data folder the refusal suggested
-    Then the CLI refuses to change the setting
+    Then the CLI refuses to change the setting, naming the settings file to rename
     And the settings file is left exactly as it was
     When the user renames the settings file as the refusal said and opens the CLI without naming a data folder
     Then the CLI keeps its data in its default folder

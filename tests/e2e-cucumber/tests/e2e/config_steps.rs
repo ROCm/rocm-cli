@@ -565,13 +565,21 @@ async fn custom_folder_runtime_listed(world: &mut E2eWorld) {
     assert_ok_contains(world, CUSTOM_FOLDER_RUNTIME_KEY);
 }
 
-#[then("the CLI refuses to change the setting")]
+/// The data folder is already the one the refusal suggested, so the advice
+/// is the rename alone, naming the exact file and the name to give it; that
+/// following it works is the rename step later in the same scenario.
+#[then("the CLI refuses to change the setting, naming the settings file to rename")]
 async fn refuses_to_change_setting(world: &mut E2eWorld) {
     assert_failed(world);
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let rename = format!(
+        "To start from default settings instead, rename {} to {}",
+        settings_path(world).display(),
+        renamed_settings_path(world).display()
+    );
     assert!(
-        stderr.contains("config.json"),
-        "expected the refusal to name config.json, got:\n{}",
+        stderr.contains("Repair that file") && stderr.contains(&rename),
+        "expected the refusal to say {rename:?}, got:\n{}",
         combined_output(world)
     );
 }

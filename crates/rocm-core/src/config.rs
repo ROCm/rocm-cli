@@ -598,19 +598,27 @@ impl RocmCliConfig {
     /// permission problem, a symlink loop — is an error, just as unparseable
     /// contents are: answering with defaults would let the next save replace
     /// the user's settings with them. Data-dir discovery draws the same line.
+    ///
+    /// The error says how to recover, so every command that loads the
+    /// settings strictly gives the same advice: repair the file, or rename the
+    /// exact file it names ([`AppPaths::config_aside_advice`]).
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let path = paths.config_path();
+        let unreadable = |what: &str, error: &dyn std::fmt::Display| {
+            anyhow::anyhow!(
+                "failed to {what} {}: {error}. Repair that file, then run the command again. {}",
+                path.display(),
+                paths.config_aside_advice()
+            )
+        };
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to read {}", path.display()));
-            }
+            Err(error) => return Err(unreadable("read", &error)),
         };
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        serde_json::from_slice(&bytes).map_err(|error| unreadable("parse", &error))
     }
 
     /// Write the config so that [`Self::load`] can always read it back.
@@ -972,6 +980,47 @@ mod tests {
         let tool = loaded.tools.get("python").expect("python tool should load");
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
+        Ok(())
+    }
+
+    /// Every strict load of an unreadable file says how to recover, naming the
+    /// exact file to rename and the name to give it, and leaves the file
+    /// alone; renaming it as told makes the next load start from defaults.
+    #[test]
+    fn load_of_an_unreadable_config_says_which_file_to_rename() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-load-advice");
+        fs::create_dir_all(&paths.config_dir)?;
+        let damaged = br#"{"active_runtime_key": "kept", "onboarding_dismissed": "yes"}"#;
+        fs::write(paths.config_path(), damaged)?;
+
+        let error = RocmCliConfig::load(&paths).expect_err("a retyped field must not load");
+        let message = format!("{error:#}");
+        let after = fs::read(paths.config_path())?;
+        let rename = format!(
+            "rename {config} to {config}.broken",
+            config = paths.config_path().display()
+        );
+        let renamed = paths.config_dir.join("config.json.broken");
+        let followed = message
+            .contains(&rename)
+            .then(|| fs::rename(paths.config_path(), &renamed));
+        let reloaded = RocmCliConfig::load(&paths);
+        let kept = fs::read(&renamed);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            message.contains("failed to parse")
+                && message.contains("Repair that file")
+                && message.contains(&paths.config_aside_advice()),
+            "unexpected error: {message}"
+        );
+        assert_eq!(after, damaged, "load changed config.json");
+        assert!(
+            followed.is_some(),
+            "the error does not say {rename:?}: {message}"
+        );
+        assert_eq!(reloaded?.active_runtime_key, None);
+        assert_eq!(kept?, damaged, "the renamed file lost its contents");
         Ok(())
     }
 
