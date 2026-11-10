@@ -26,8 +26,9 @@ in the runtime's own Python. A wheel built against a different torch than the
 one beside it fails that import: `rocm engines list` then shows
 `runtime: installed, not usable` with the failing module, and
 `rocm serve --engine vllm` refuses up front with the same guidance. The check is
-best-effort and reports nothing when it cannot run (no Python beside the vLLM
-launcher, a `torch` that does not import, a probe that fails for another reason
+best-effort and reports nothing when it cannot run (a vLLM found through
+`ROCM_CLI_VLLM_COMMAND` or on `PATH`, where no Python interpreter is known, a
+`torch` that does not import, a probe that fails for another reason
 or exceeds one minute); an extension absent from the wheel is not a failure.
 
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against

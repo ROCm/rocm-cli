@@ -587,8 +587,10 @@ fn engine_reports_unusable_device(detect: &DetectResponse) -> bool {
 }
 
 /// [`engine_runtime_status_label`] with the platform decision passed in rather
-/// than re-derived, so every branch is unit-testable on any host (the same seam
-/// as `unsupported_here_for` and `platform_refusal`).
+/// than re-derived, so every platform branch is unit-testable on any host (the
+/// same seam as `unsupported_here_for` and `platform_refusal`). The vLLM
+/// extension branch sits one level up, in
+/// [`runtime_status_label_with_extension_check`].
 fn runtime_status_label_for(installed: bool, ruled_out: PlatformRuleOut) -> &'static str {
     if installed {
         "ready"

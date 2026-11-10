@@ -423,16 +423,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn detect_reports_a_runtime_whose_extensions_do_not_import_as_unavailable() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let python = dir.path().join("python");
-        std::fs::write(
+        // Not `fs::write` then run: a concurrent test's fork can keep the write fd
+        // open, and the run fails with `Text file busy`.
+        rocm_core::fake_executable::write_fake_executable(
             &python,
             "#!/bin/sh\necho '{\"failures\": [{\"module\": \"vllm._rocm_C\", \"error\": \"undefined symbol: x\"}]}'\n",
         )
         .expect("write stand-in interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod stand-in interpreter");
         let runtime = crate::runtime::VllmRuntime {
             runtime_id: "test".to_owned(),
             env_id: "test".to_owned(),

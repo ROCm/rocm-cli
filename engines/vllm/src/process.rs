@@ -1052,15 +1052,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extension_check_runs_the_probe_with_the_runtimes_python() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir()?;
-        let python = dir.path().join("python");
         // Stands in for the interpreter: ignores `-c <script>` and prints a failing probe.
-        fs::write(
-            &python,
-            "#!/bin/sh\necho '{\"failures\": [{\"module\": \"vllm._rocm_C\", \"error\": \"undefined symbol: x\"}]}'\n",
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._rocm_C", "error": "undefined symbol: x"}]}'"#,
         )?;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
         let runtime = test_vllm_runtime(Some(python), None);
         let problem = vllm_extension_import_problem(&runtime).expect("the probe failure surfaces");
         assert!(problem.contains("vllm._rocm_C"), "{problem}");
@@ -1068,10 +1065,11 @@ mod tests {
     }
     #[cfg(unix)]
     fn stand_in_python(dir: &Path, body: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        // Never `fs::write` then run: another test thread's fork can hold the
+        // write fd open and the first run fails with `Text file busy`, which the
+        // best-effort probe turns into a silent `None`.
         let python = dir.join("python");
-        fs::write(&python, format!("#!/bin/sh\n{body}\n"))?;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        rocm_core::fake_executable::write_fake_executable(&python, format!("#!/bin/sh\n{body}\n"))?;
         Ok(python)
     }
     #[cfg(unix)]
@@ -1111,6 +1109,54 @@ mod tests {
         let python = stand_in_python(clean.path(), r#"echo '{"failures": []}'"#)?;
         require_importable_extensions(&test_vllm_runtime(Some(python), None))?;
         Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_probe_exit_reports_nothing_even_with_failures_on_stdout() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'; exit 1"#,
+        )?;
+        assert_eq!(
+            extension_import_problem_within(
+                &test_vllm_runtime(Some(python), None),
+                Duration::from_secs(20)
+            ),
+            None
+        );
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_result_is_the_last_non_empty_line_of_its_output() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo 'import-time log line'; echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'; echo; echo"#,
+        )?;
+        let problem = extension_import_problem_within(
+            &test_vllm_runtime(Some(python), None),
+            Duration::from_secs(20),
+        )
+        .expect("trailing blank lines do not hide the result");
+        assert!(problem.contains("vllm._C: x"), "{problem}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_long_probe_error_is_cut_to_what_fits_in_guidance() -> Result<()> {
+        let Some(out) = run_probe_script("", &[("_C", "raise ImportError('y' * 5000)")])? else {
+            return Ok(());
+        };
+        let problem = extension_import_problem_from_probe(&out, &test_vllm_runtime(None, None))
+            .expect("a failing _C is a problem");
+        assert!(problem.len() < 1500, "{} bytes", problem.len());
+        Ok(())
+    }
+    #[test]
+    fn the_probe_gives_up_after_the_documented_minute() {
+        assert_eq!(VLLM_EXTENSION_PROBE_TIMEOUT, Duration::from_mins(1));
     }
     #[cfg(unix)]
     #[test]
