@@ -23,8 +23,8 @@ Feature: Runtime configuration
   # Dogfooding #17: re-provisioning was observed writing inside the previous
   # runtime, producing a recursively nested `runtimes/wheel/.../runtimes/wheel/`
   # path that bloats paths and breaks `services/*.log` globs. Assert the active
-  # runtime's folder path has no such recursive segment. GPU-gated (needs a real
-  # install so the folder path is populated).
+  # runtime's folder path has no such recursive segment. Real-GPU-gated (needs a
+  # real install so the folder path is populated).
   @id:runtime-path-not-nested @requires-real-gpu
   Scenario: runtime-02 - The managed runtime path is not nested inside another runtime
     Given a managed runtime is active
@@ -213,7 +213,7 @@ Feature: Runtime configuration
   # proceed, and the refusal has to name the flag the caller should actually
   # reach for: `--approve-replacing-active-default`, not `--yes`, which would
   # additionally approve a `sudo` system-package install no script can answer.
-  # GPU-gated because the precondition needs a GPU to have a runtime active.
+  # Real-GPU-gated because the precondition needs a GPU to have a runtime active.
   # The refusal is not free: the gate reports the version relation, so
   # it runs after the Python launcher is resolved and the channel index is read.
   # Both are already warm here — the `Given` installed a runtime, so the launcher
@@ -230,7 +230,7 @@ Feature: Runtime configuration
 
   # Companion to Scenario runtime-11: with --yes the same reinstall proceeds and the
   # runtime stays registered and active afterward. Nightly-gated in addition to
-  # GPU because, unlike Scenario runtime-11, this exercises a real second SDK install.
+  # real GPU because, unlike Scenario runtime-11, this exercises a real second SDK install.
   # The registered/active Thens hold from the Given alone, so the approval Then
   # is what actually distinguishes this from a no-op: it fails if --yes ever
   # regresses to a refusal or silently takes the fresh-install path.

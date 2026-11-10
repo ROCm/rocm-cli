@@ -7,8 +7,10 @@
 # host capability probe (see src/capability.rs) and is NOT encoded here.
 #
 # Resolution at runtime (see tests/e2e-cucumber/src/expectation.rs):
-#   1. A scenario whose @requires-gpu / @requires-engine / @requires-bare-metal
-#      can't be satisfied on this host is SKIPPED (not-applicable) — never listed
+#   1. A scenario whose @requires-gpu / @requires-real-gpu / @requires-engine /
+#      @requires-bare-metal can't be satisfied on this host (or, for
+#      @requires-real-gpu, in this run's E2E_HARDWARE mode) is SKIPPED
+#      (not-applicable) — never listed
 #      here. Reach for a tag, not a row, whenever the scenario simply has no
 #      premise on that host: a row here says "known BUG", so using one for
 #      designed-in behaviour (e.g. diagnose not offering a bare-metal cause on

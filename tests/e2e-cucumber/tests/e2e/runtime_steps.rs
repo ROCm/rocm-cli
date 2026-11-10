@@ -155,9 +155,10 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     // installed where there's a GPU family to select wheels for (see
     // `@id:runtime-install-sdk-active`, @requires-real-gpu), and a simulated run
     // on a GPU box must not install one for the runner's GPU. The only scenarios
-    // that reach this step without `@requires-real-gpu` (and off a simulated
-    // machine) are the mock-lane chat scenarios, whose serve
-    // is backed by MockServer and needs no runtime at all — so skip the install
+    // that reach this step without `@requires-real-gpu` or a simulated machine
+    // are the chat scenarios, whose serve is backed by MockServer off real
+    // hardware, and serve-49, whose restart is refused from the on-disk records;
+    // off real hardware neither needs a runtime at all — so skip the install
     // rather than attempt a multi-GiB SDK pull that can't succeed here.
     if !crate::real_gpu_host() {
         return;

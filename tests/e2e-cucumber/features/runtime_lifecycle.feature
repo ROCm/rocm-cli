@@ -150,8 +150,10 @@ Feature: Runtime lifecycle state machine
   # server that answers afterwards.
   #
   # Why @requires-real-gpu: `restart_internal_managed_service` stops the engine process
-  # and waits up to 45 s on a real HTTP readiness probe before returning, so no
-  # mock engine or substitution hook exists that could satisfy it on the mock lane.
+  # and waits up to 45 s on a real HTTP readiness probe before returning. The
+  # `fake-vllm` stand-in a simulated machine plants would answer that probe, but
+  # the activation's premise is moving a server between two real runtimes, which
+  # no simulated machine plants.
   # This scenario therefore only runs on the self-hosted GPU lanes defined in
   # `.github/workflows/e2e-selfhosted.yml`.
   #

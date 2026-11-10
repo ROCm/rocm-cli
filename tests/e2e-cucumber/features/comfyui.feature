@@ -307,7 +307,7 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
   # @nightly, against this scenario's own isolated runtime prefix (it must never
   # share a runtime tree with other scenarios — it may corrupt it). Gated
-  # @requires-gpu @nightly, like runtime-install-sdk-active, which also does a
+  # @requires-real-gpu @nightly, like runtime-install-sdk-active, which also does a
   # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
   # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
   # combining it with @nightly would make this scenario unreachable on every lane;

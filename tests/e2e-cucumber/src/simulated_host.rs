@@ -195,8 +195,8 @@ impl SimulatedGpu {
 /// How the GPUs reach the Linux distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// Native Linux with the in-tree amdgpu driver: `/dev/kfd`, a KFD topology,
-    /// DRM cards.
+    /// Native Linux with the amdgpu driver loaded (planted as the DKMS module's
+    /// `/sys/module/amdgpu/version`): `/dev/kfd`, a KFD topology, DRM cards.
     BareMetal,
     /// A WSL2 distribution reaching the GPU through `/dev/dxg` and the Windows
     /// host driver, with ROCDXG (the library and its linker-cache entry)
@@ -592,7 +592,11 @@ fn is_nonzero(value: Option<&str>) -> bool {
 /// simulated machine keeps passing while the product fails on hardware — the
 /// exact shape of the bug where `gfx_target_version` was read from a file no
 /// kernel has. This is the check that notices: run on a real GPU host, it holds
-/// every fixture assumption against the live `/dev` and `/sys`.
+/// the planted layout against the live `/dev` and `/sys` — the device nodes and
+/// module directory, which KFD properties each GPU node states, its `gpu_id`
+/// and render node, the CPU node's target, and the DRM cards' vendor and device
+/// files. It does not compare property values, `/proc` or canned tool output;
+/// [`lspci_drift`] covers the `lspci` line shape.
 #[must_use]
 pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
     let mut drift = Vec::new();
