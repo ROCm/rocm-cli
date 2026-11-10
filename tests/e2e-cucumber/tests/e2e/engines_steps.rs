@@ -156,3 +156,66 @@ async fn assert_engine_shell_exited(world: &mut E2eWorld) {
         "no engine shell session was opened for this scenario"
     );
 }
+
+/// A vLLM install whose compiled extensions cannot be imported.
+///
+/// The stand-in interpreter answers every probe the way a wheel built against a
+/// different torch does: `vllm._C` fails with an undefined `c10` symbol. A
+/// `vllm` launcher beside it is what makes the runtime resolve as installed.
+/// Black-box: the CLI finds it through `ROCM_CLI_VLLM_PYTHON`, exactly as a user
+/// pointing the CLI at their own vLLM environment would.
+#[given("a vLLM install whose compiled extensions do not import")]
+async fn plant_vllm_with_broken_extensions(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("broken-vllm-env").join("bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in vLLM env");
+
+    let python = bin.join("python");
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\n\
+         echo '{\"failures\": [{\"module\": \"vllm._C\", \"error\": \"undefined symbol: c10_hip_boom\"}]}'\n",
+    )
+    .expect("failed to write the stand-in interpreter");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("vllm"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the stand-in vllm launcher");
+
+    world
+        .command_env
+        .push(("ROCM_CLI_VLLM_PYTHON", python.into_os_string()));
+}
+
+#[when("the user lists the engines of that install")]
+async fn list_engines_of_that_install(world: &mut E2eWorld) {
+    let (stdout, _, rc) = crate::run_rocm_with_scenario_env(world, &["engines", "list"]);
+    assert_eq!(rc, 0, "`rocm engines list` failed:\n{stdout}");
+    world.cli_output = Some(stdout);
+}
+
+#[then("vLLM is reported as installed but not usable")]
+async fn vllm_reported_not_usable(world: &mut E2eWorld) {
+    let out = world
+        .cli_output
+        .as_deref()
+        .expect("no engines output recorded");
+    assert!(
+        out.contains("installed, not usable"),
+        "the broken vLLM was not reported as unusable:\n{out}"
+    );
+    assert!(
+        !out.contains("runtime: ready"),
+        "a runtime whose extensions do not import must not read as ready:\n{out}"
+    );
+}
+
+#[then("the report names the extension that failed to import")]
+async fn report_names_failing_extension(world: &mut E2eWorld) {
+    let out = world
+        .cli_output
+        .as_deref()
+        .expect("no engines output recorded");
+    assert!(
+        out.contains("vllm._C"),
+        "the report does not name the failing extension:\n{out}"
+    );
+}
