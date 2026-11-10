@@ -228,6 +228,11 @@ impl ExamineSummary {
     /// transient failure, and a hung `uname` costs one timeout rather than two.
     /// Everywhere else (the examination does not read the kernel on Windows) the
     /// summary reads it itself, as [`gather`](Self::gather) does.
+    ///
+    /// `examination` must come from probing this host: its kernel release is
+    /// reported as this host's. Not for one deserialised from a report or probed
+    /// for another machine. It stays `pub` because its caller, `rocm examine
+    /// --json`, is in another crate.
     pub fn gather_after(examination: &crate::Examination) -> Result<Self> {
         Self::gather_scoped(true, Some(&examination.kernel_release))
     }
