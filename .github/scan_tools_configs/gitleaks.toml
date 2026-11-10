@@ -94,13 +94,16 @@ description = "Model names and runtime keys assigned in first-party Rust code"
 # the exception out of other file types. Both `:` (struct field) and `=`
 # (assignment) are accepted for both names, and the value may hold the
 # characters a model name or a runtime key uses (`Qwen3-0.6B-GGUF`,
-# `therock-release:gfx120X-all`). A JSON-style quoted key such as
-# `"runtime_key": "..."` is not covered.
+# `therock-release:gfx120X-all`), up to 64 characters, so a long token
+# assigned to one of the two names is still reported. A JSON-style quoted key
+# such as `"runtime_key": "..."` is not covered.
+# `condition = "AND"` is load-bearing: under the default OR, the `paths` entry
+# alone would allowlist every rule in every `.rs` file. Do not remove it.
 condition = "AND"
 paths = [
   '''.*\.rs$''',
 ]
 regexTarget = "match"
 regexes = [
-  '''\b(api_model|runtime_key)\s*[:=]\s*"[A-Za-z0-9._/:-]+"''',
+  '''\b(api_model|runtime_key)\s*[:=]\s*"[A-Za-z0-9._/:-]{1,64}"''',
 ]
