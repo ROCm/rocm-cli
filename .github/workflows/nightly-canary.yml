@@ -1,0 +1,52 @@
+name: Nightly stream canary
+
+# Metadata only: resolves the canonical TheRock nightly stream with
+# `rocm install sdk --channel nightly --dry-run` and fails when the plan no
+# longer comes from that stream, or the newest build it can offer is stale.
+# No GPU and no install; see scripts/nightly_canary.py and docs/testing.md
+# ("Nightly stream canary") for what it checks, who to tell and how to rerun.
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  AWS_LC_SYS_USE_SYSTEM: "0"
+
+jobs:
+  canary:
+    name: Resolve nightly (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-key: ${{ matrix.os }}
+
+      - name: Build rocm
+        run: cargo build --release -p rocm
+
+      - name: Canary self-test
+        run: python scripts/nightly_canary.py --self-test
+
+      - name: Resolve the canonical nightly stream
+        shell: bash
+        run: python scripts/nightly_canary.py --rocm target/release/rocm
