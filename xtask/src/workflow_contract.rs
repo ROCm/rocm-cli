@@ -5690,6 +5690,46 @@ fi
         assert!(!caught("cargo build --release -p rocm --frozen"));
     }
 
+    /// `install.sh` fish setup is exercised by a hermetic shell script ahead of
+    /// the lifecycle E2E. The Linux build job must run that script: it fails
+    /// when a bash, zsh, or ksh login shell skips fish, and when a bash home
+    /// with no fish install grows a fish config.
+    ///
+    /// The step itself is checked, not the job's text: a commented-out step, a
+    /// mention in a comment, `if: false`, or `continue-on-error: true` would
+    /// all leave `tests/install-sh/run.sh` somewhere in the job while nothing
+    /// runs it as a gate.
+    #[test]
+    fn ci_linux_build_and_test_runs_the_install_sh_fish_checks() {
+        let ci = read_workflow("ci.yml");
+        let linux = job_block(&ci, "build-and-test");
+        let lines: Vec<&str> = linux.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start() == "- name: Installer fish profile checks")
+            .expect(
+                "build-and-test must have an `Installer fish profile checks` step so a \
+                 bash login shell that skips fish fails in required CI",
+            );
+        let step = step_block(&lines, at);
+        assert_eq!(
+            step_key(&step, "run"),
+            "sh tests/install-sh/run.sh",
+            "the fish profile step must run tests/install-sh/run.sh:\n{step}"
+        );
+        assert_eq!(
+            step_key(&step, "if"),
+            "needs.changes.outputs.heavy == 'true'",
+            "the fish profile step must run whenever the job's other heavy checks do:\n{step}"
+        );
+        assert_eq!(
+            step_keys(&step),
+            ["name", "if", "run"],
+            "the fish profile step must not grow keys such as continue-on-error \
+             that turn it into an advisory check:\n{step}"
+        );
+    }
+
     /// The hermetic comfyui-01/02/03 scenarios (no GPU, no network, no
     /// `e2e-test-hooks` dependency, Windows-portable since #637) must stay
     /// explicitly selected into this otherwise-`@lifecycle`-only Windows lane
