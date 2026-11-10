@@ -225,3 +225,25 @@ Feature: Stopping a managed service
     And the refusal names a serve command that rocm accepts
     And the refusal names the stop that has to come first
     And the server is left running, with no stop recorded and no key file
+
+  # The other way a server needs a key: it was launched with `--require-api-key`
+  # on a loopback bind, because something outside this machine republishes its
+  # port, and a stop dropped the key. `rocm services restart` refuses it for the
+  # same reason as the public server above, but with its own wording, which says
+  # nothing about a public host, and its own command: it carries the flag the
+  # server asked for and no `--host`, because loopback is where it was. As above
+  # the server is still running, so the refusal names the stop first; both
+  # commands are checked against the real parser, and the promise that nothing
+  # was stopped is checked on the process, the record and the missing key file.
+  #
+  # Linux-only like the scenario above, for the same reason.
+  @id:service-stop-restart-refuses-a-loopback-server-that-required-a-key
+  @requires-os:linux
+  Scenario: service-stop-10 - Restarting a loopback server that required an API key, whose key is gone, is refused and leaves it running
+    Given a loopback managed server that required an API key, whose key is gone and whose recorded process is running
+    When the user restarts it with --yes
+    Then the CLI refuses the restart because it would reopen the server that required an API key without authentication
+    And the refusal names a serve command that asks for the key again and that rocm accepts
+    And the refusal names the stop that has to come first
+    And the server is left running, with no stop recorded and no key file
+    And the server's record still says it required an API key

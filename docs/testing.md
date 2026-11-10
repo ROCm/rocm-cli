@@ -2063,7 +2063,9 @@ running record on the mock lane and the record being persisted as stopped, and
 `service-stop-02` covers the key being dropped once the daemon's `stop_server`
 confirms a stop. `service-stop-09` covers a `services restart` of a public server whose key is
 gone being refused, naming a `rocm serve` command that `rocm` accepts, with the
-running server left running; a restart that goes ahead remains unit-tested only. Reusing a running service for a
+running server left running, and `service-stop-10` covers the same restart of a
+loopback server that was launched with `--require-api-key`; a restart that goes
+ahead remains unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
 upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
 Linux-only since the Windows managed Lemonade spawn can't enforce the key)
@@ -2632,7 +2634,7 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop-0[1-689]"`. Not `-n "service-stop"`: a name filter bypasses the
+"service-stop-(0[1-689]|10)"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
@@ -2645,6 +2647,16 @@ with a bogus flag as the negative control), that the `rocm services stop` it
 names before it is this server's exact stop command and parses the same way,
 and that the recorded process is still running and the record is not marked
 stopped.
+
+`service-stop-10` (Linux, mock lane) is the same restart of the other kind of
+server that needs a key: one bound to loopback whose record says it was launched
+with `--require-api-key`, which a stop left without its key file. It checks the
+refusal's own wording (it names the key flag and says nothing about a public
+host), that the `rocm serve` command it names carries `--require-api-key` and
+no `--host` or `--allow-public-bind` and parses, that the stop named before it
+is this server's exact stop command and parses, and, in the same scenario, that
+the recorded process is still running, the record is not marked stopped, still
+says it required a key and names no stop request, and no key file was created.
 
 `features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same

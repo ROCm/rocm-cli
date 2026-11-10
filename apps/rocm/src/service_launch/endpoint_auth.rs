@@ -378,6 +378,9 @@ mod tests {
 
     /// What the real clap parse makes of an advised `rocm serve` command.
     struct ServeAdvice {
+        // Read only by the follower that goes through the spawn, which is unix-only
+        // (it needs the spawn interceptor).
+        #[cfg(not(windows))]
         model: String,
         host: String,
         port: Option<u16>,
@@ -394,6 +397,7 @@ mod tests {
             .try_get_matches_from(advised)
             .unwrap_or_else(|error| panic!("{advised:?} does not parse: {error}"));
         let Some(Command::Serve {
+            #[cfg(not(windows))]
             model,
             host,
             port,
@@ -408,6 +412,7 @@ mod tests {
             panic!("{advised:?} is not a `rocm serve` invocation");
         };
         ServeAdvice {
+            #[cfg(not(windows))]
             model,
             host,
             port,
@@ -419,6 +424,7 @@ mod tests {
 
     /// The `rocm services stop …` command a refusal tells the user to run: the
     /// backtick span that starts with it, split into words.
+    #[cfg(not(windows))]
     fn advised_stop_command(message: &str) -> Vec<String> {
         let spans: Vec<&str> = message
             .split('`')

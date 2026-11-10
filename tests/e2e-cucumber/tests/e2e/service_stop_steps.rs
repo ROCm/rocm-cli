@@ -165,6 +165,25 @@ async fn public_managed_server_without_its_key(world: &mut E2eWorld) {
     plant_server_with_running_process(world, "0.0.0.0", false);
 }
 
+/// A loopback server that was launched with `--require-api-key`, which a
+/// `rocm serve` of a loopback host does not otherwise ask for, and whose key is
+/// gone: the other way a service needs a key besides a public bind. The record
+/// says it required one; nothing else about it differs from the public server's.
+#[given(
+    "a loopback managed server that required an API key, whose key is gone and whose recorded process is running"
+)]
+async fn loopback_server_that_required_a_key_without_it(world: &mut E2eWorld) {
+    plant_server_with_running_process(world, "127.0.0.1", false);
+    let manifest = manifest_path(world);
+    let mut record = read_record(world);
+    record["requires_api_key"] = serde_json::json!(true);
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to rewrite service record");
+}
+
 fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key: bool) {
     let process = Command::new("sleep")
         .arg("300")
@@ -558,6 +577,37 @@ async fn restart_refused_without_authentication(world: &mut E2eWorld) {
     );
 }
 
+#[then(
+    "the CLI refuses the restart because it would reopen the server that required an API key without authentication"
+)]
+async fn restart_refused_for_a_required_key(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(
+        rc, 0,
+        "a restart that would reopen the server anonymously must fail:\n{combined}"
+    );
+    assert!(
+        combined.contains(
+            "managed service was launched with `--require-api-key` but has no endpoint API key, \
+             so restarting it would reopen it without authentication."
+        ),
+        "{combined}"
+    );
+    // It is the key requirement that is refused, not a public bind: the server is
+    // on loopback, and is not told it is bound to a public host.
+    assert!(!combined.contains("public host"), "{combined}");
+}
+
+/// What the refused restart must leave of the record's own claim: that the
+/// server required a key. The restart changed nothing, so it still does.
+#[then("the server's record still says it required an API key")]
+async fn record_still_requires_the_key(world: &mut E2eWorld) {
+    let record = read_record(world);
+    assert_eq!(record["requires_api_key"], true, "{record}");
+    assert_eq!(record["host"], "127.0.0.1", "{record}");
+}
+
 /// The `rocm serve` command the refusal names, run against the real parser:
 /// its `<model>` and `<port>` placeholders filled in, and `--help` last, so the parse ends in
 /// help only if every word before it was accepted. A command with a flag `rocm`
@@ -565,6 +615,25 @@ async fn restart_refused_without_authentication(world: &mut E2eWorld) {
 /// by `--help` alone.
 #[then("the refusal names a serve command that rocm accepts")]
 async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
+    check_advised_serve_command(world, "--host 0.0.0.0 --port <port> --allow-public-bind");
+}
+
+/// The same check for the server that asked for a key on a loopback bind: the
+/// command carries the flag it asked for and nothing that moves it off the
+/// default host, which is where it was.
+#[then("the refusal names a serve command that asks for the key again and that rocm accepts")]
+async fn refusal_names_an_accepted_serve_command_with_the_key_flag(world: &mut E2eWorld) {
+    let command = check_advised_serve_command(world, "rocm serve <model> --require-api-key");
+    assert!(
+        !command.contains("--host") && !command.contains("--allow-public-bind"),
+        "a loopback server is not told to bind elsewhere: {command}"
+    );
+}
+
+/// Runs the `rocm serve` command the refusal names against the real parser, and
+/// returns it. `expected` is what it must contain to bring the server back where
+/// it was.
+fn check_advised_serve_command(world: &mut E2eWorld, expected: &str) -> String {
     let combined = combined_output(world);
     let advised: Vec<&str> = combined
         .split('`')
@@ -578,8 +647,8 @@ async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
         "the refusal must name exactly one `rocm serve <model>` command:\n{combined}"
     );
     assert!(
-        advised[0].contains("--host 0.0.0.0 --port <port> --allow-public-bind"),
-        "the command must bring the server back on its public host: {}",
+        advised[0].contains(expected),
+        "the command must bring the server back where it was ({expected}): {}",
         advised[0]
     );
     let mut args: Vec<String> = advised[0]
@@ -603,6 +672,7 @@ async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
         rc, 0,
         "a flag rocm does not have must be rejected before --help: {bogus:?}"
     );
+    advised[0].to_owned()
 }
 
 /// The stop the refusal names comes before the launch it names, is the exact
