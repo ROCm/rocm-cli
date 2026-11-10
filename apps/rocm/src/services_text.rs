@@ -1150,13 +1150,13 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
     for (pid, role) in &descendants_unconfirmed {
         let _ = writeln!(
             text,
-            "  not confirmed: process {pid} ({role}) exited, but a process under it may still be running, because taking the processes under it down did not complete"
+            "  not confirmed: process {pid} ({role}) exited, but a process under it may still be running, because taking the processes under it down did not complete; rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"
         );
     }
     for (pid, role) in &exited_before_tree_kill {
         let _ = writeln!(
             text,
-            "  not confirmed: process {pid} ({role}) was already gone when the processes under it were to be taken down, and nothing else the server recorded vouches for them, so one of them may still be running"
+            "  not confirmed: process {pid} ({role}) was already gone when the processes under it were to be taken down, and nothing else the server recorded vouches for them, so one of them may still be running; rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"
         );
     }
     for (pid, role) in &unverified {

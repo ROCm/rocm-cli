@@ -2192,7 +2192,11 @@ process under it may still be running; it is not `timed_out`, which is kept for
 a root that outlived its deadline. `rocm services stop` prints it as a `not
 confirmed:` line, and `a_stop_with_an_unconfirmed_tree_kill_says_what_happened_and_keeps_the_service`
 asserts that line, that no `still running` line is printed, and the record, stop
-request and key that are kept
+request and key that are kept. The warning lasts one run, and the line says so: the
+next `rocm services stop` finds the root gone and reports the stop confirmed, and
+a listing completes the pending stop the same way, neither with new evidence about
+the processes under the root (the same test runs that second stop and asserts it);
+keeping it durably would need a marker in the record, which is not done
 (`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
 `only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found`). A
 `taskkill` that exits 128 (process not found) is judged by the root's own re-read:
@@ -2224,9 +2228,12 @@ elapsed time, the reaped child and the failed verdict; `a_helper_that_exits_in_t
 and `a_helper_that_cannot_be_started_is_an_error` are its neighbours). The report and the record
 a `timed_out` stop leaves are covered by
 `an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. The
-`taskkill` is started from `%SystemRoot%\System32`, not by a bare name `PATH`
-could resolve (`a_system_tool_is_resolved_under_system32_of_the_system_root`
-builds the path on every host; ComfyUI's own `taskkill` and `tasklist` calls use
+`taskkill` is started from the system directory that `GetSystemDirectoryW`
+returns, not by a bare name `PATH` could resolve and not from the `SystemRoot`
+environment variable a caller could redirect
+(`a_system_tool_is_resolved_under_the_system_directory` builds the path from a
+given directory on every host; the Windows call itself is run only by the
+Windows job's tests that start `taskkill`; ComfyUI's own `taskkill` and `tasklist` calls use
 the same helper). A readable
 recorded token that differs outranks a failed query
 (`a_readable_token_mismatch_outranks_a_failed_query`), but the creation time and
@@ -2278,6 +2285,15 @@ container still runs, and only the engine `Stop` decides that stop, so a listing
 does not complete it from PID evidence. The key, the marker and the recorded processes stay until a later
 `services stop` is confirmed
 (`a_pending_stop_of_a_container_engine_is_not_completed_by_a_gone_supervisor`).
+The same holds past the cleanup: the refresh does not read such a record as
+`stopped` from the supervisor's PID, and `remove` and `prune` count it as in use
+(`container_stop_unresolved`), so a listing followed by `remove --yes` or
+`prune --yes` deletes neither the record nor the key the container may still be
+enforcing (`a_pending_container_stop_survives_refresh_remove_and_prune`, for a
+record reading `ready` and one already reading `stopped`; a process engine in the
+same state is removed). A record that named no process at all, such as a `starting`
+one with a stale marker, has its key and marker cleaned as before but is not read as
+`stopped` (`a_stale_stop_marker_on_a_record_naming_no_process_is_cleaned_without_reading_it_stopped`).
 When that refresh completes a pending stop (every recorded process confirmed gone) it
 also forgets the recorded processes and reads the record as stopped, as a stop that
 confirmed the exit itself does, so a later `rocm services stop` visits no PID: a PID
@@ -2356,7 +2372,10 @@ gone completed this same stop first (the record reads `stopped` and names
 nothing). A restart, whether it has recorded new processes or is mid-launch with
 none yet (status `starting`), is not covered. The unit test
 `a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch`
-is the table; in `rocm`, `a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
+is the table, and it runs again from a stopping snapshot that names no process (an
+empty record is that stop only while it carries the stop's marker or reads
+`stopped`; an empty `starting` relaunch has cleared the marker and is not covered,
+`stop_does_not_confirm_over_an_empty_relaunch_of_an_empty_record`); in `rocm`, `a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
 persists a real liveness refresh between the termination and the final read and
 asserts a confirmed stop with the marker not restored,
 `a_restart_is_not_refused_because_a_listing_completed_its_stop` that a restart then

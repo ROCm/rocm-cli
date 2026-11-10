@@ -442,22 +442,48 @@ pub(crate) const fn classify_open_failure(code: Option<i32>) -> ProcessProbe {
     }
 }
 
-/// The path of a Windows system tool, `%SystemRoot%\System32\<name>`.
+/// The path of a Windows system tool in the system directory (`System32`).
 ///
-/// So a directory earlier on `PATH` cannot stand in for it; the bare name when
-/// `SystemRoot` is not set. `name` includes the extension (`taskkill.exe`).
+/// The directory comes from `GetSystemDirectoryW`, not from the environment, so
+/// neither a directory earlier on `PATH` nor a `SystemRoot` the caller controls
+/// can stand in for it; the bare name when the directory cannot be read (and off
+/// Windows). `name` includes the extension (`taskkill.exe`).
 #[must_use]
 pub fn windows_system_tool(name: &str) -> PathBuf {
-    system_tool_path(std::env::var_os("SystemRoot"), name)
+    system_tool_path(windows_system_directory(), name)
 }
 
-/// [`windows_system_tool`] for a given `SystemRoot`, so a test builds the path
-/// on every host.
-fn system_tool_path(system_root: Option<std::ffi::OsString>, name: &str) -> PathBuf {
-    match system_root.filter(|root| !root.is_empty()) {
-        Some(root) => PathBuf::from(root).join("System32").join(name),
+/// [`windows_system_tool`] for a given system directory, so a test builds the
+/// path on every host.
+fn system_tool_path(system_dir: Option<PathBuf>, name: &str) -> PathBuf {
+    match system_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir.join(name),
         None => PathBuf::from(name),
     }
+}
+
+/// The Windows system directory, read with `GetSystemDirectoryW`.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn windows_system_directory() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    const MAX_PATH: u32 = 260;
+    let mut buffer = [0_u16; MAX_PATH as usize];
+    // SAFETY: `buffer` is a live local valid for `MAX_PATH` wide characters, and
+    // that is the size passed, so the call cannot write past it.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), MAX_PATH) } as usize;
+    // Zero is a failure; a length that does not fit means the path was too long
+    // for the buffer, which is not a directory to trust either.
+    (length > 0 && length < buffer.len())
+        .then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])))
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::missing_const_for_fn)] // keeps the signature of the Windows arm
+fn windows_system_directory() -> Option<PathBuf> {
+    None
 }
 
 /// E2E hook: `ROCM_E2E_UNQUERYABLE_PIDS`, a comma-separated list of PIDs, makes
@@ -1415,19 +1441,14 @@ mod tests {
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
 
-    /// A system tool is started from `System32` under `SystemRoot`, never by a
-    /// bare name that `PATH` could resolve to something else; with no
-    /// `SystemRoot` it falls back to the bare name.
+    /// A system tool is started from the system directory, never by a bare name
+    /// that `PATH` could resolve to something else; with no directory it falls
+    /// back to the bare name.
     #[test]
-    fn a_system_tool_is_resolved_under_system32_of_the_system_root() {
-        let path = system_tool_path(
-            Some(std::ffi::OsString::from("C:\\Windows")),
-            "taskkill.exe",
-        );
-        let mut expected = PathBuf::from("C:\\Windows");
-        expected.push("System32");
-        expected.push("taskkill.exe");
-        assert_eq!(path, expected);
+    fn a_system_tool_is_resolved_under_the_system_directory() {
+        let dir = PathBuf::from("C:\\Windows").join("System32");
+        let path = system_tool_path(Some(dir.clone()), "taskkill.exe");
+        assert_eq!(path, dir.join("taskkill.exe"));
         assert!(path.ends_with(Path::new("System32").join("taskkill.exe")));
         assert!(!path.parent().unwrap().as_os_str().is_empty());
 
@@ -1436,9 +1457,9 @@ mod tests {
             PathBuf::from("tasklist.exe")
         );
         assert_eq!(
-            system_tool_path(Some(std::ffi::OsString::new()), "tasklist.exe"),
+            system_tool_path(Some(PathBuf::new()), "tasklist.exe"),
             PathBuf::from("tasklist.exe"),
-            "an empty SystemRoot is no SystemRoot"
+            "an empty directory is no directory"
         );
     }
 

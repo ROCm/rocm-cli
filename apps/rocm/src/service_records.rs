@@ -39,8 +39,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, ManagedServiceRecord, ProcessProbe};
 
 use crate::managed_service_status::{
-    load_managed_services, managed_service_is_live, recorded_pids_may_be_running,
-    recorded_service_pids,
+    container_stop_unresolved, load_managed_services, managed_service_is_live,
+    recorded_pids_may_be_running, recorded_service_pids,
 };
 use crate::services_text::{load_managed_service, validate_service_id};
 use crate::{cli_progress, cli_report, endpoint_keys, service_hints};
@@ -178,7 +178,9 @@ fn managed_service_record_is_in_use_with(
     record: &ManagedServiceRecord,
     probe: impl Fn(u32) -> ProcessProbe,
 ) -> bool {
-    managed_service_is_live(record) || recorded_pids_may_be_running(record, probe)
+    managed_service_is_live(record)
+        || container_stop_unresolved(record)
+        || recorded_pids_may_be_running(record, probe)
 }
 
 /// The recorded processes `--force` may remove a record over: `Some` only when
@@ -2090,6 +2092,55 @@ mod tests {
         );
         assert!(removed.text.contains("endpoint key"), "{}", removed.text);
         assert_eq!(left, 0, "every file the record owned is gone");
+        Ok(())
+    }
+
+    /// An `aim` stop whose engine `Stop` failed leaves the stop pending, and its
+    /// supervisor can be gone while the container still runs. Neither the liveness
+    /// refresh nor `remove` and `prune` may then treat the record as stopped and
+    /// delete it, with the key the container may still be enforcing: the refresh
+    /// leaves the status alone, `remove` refuses it, and `prune` skips it, all
+    /// with the supervisor confirmed gone. A process engine in the same state is
+    /// an ordinary stopped record that is removed.
+    #[test]
+    fn a_pending_container_stop_survives_refresh_remove_and_prune() -> Result<()> {
+        let gone = |_: u32| ProcessProbe::Gone;
+        let (root, paths) = test_paths("services-container-pending-stop");
+        paths.ensure()?;
+        // A record already reading `stopped` (an earlier reconciliation wrote it)
+        // is the case only the in-use guard protects.
+        for (engine, status, id, protected) in [
+            ("aim", "ready", "svc-container", true),
+            ("aim", "stopped", "svc-container-stopped", true),
+            ("vllm", "ready", "svc-process", false),
+        ] {
+            let mut record = plant_service_record(&paths, id, status, 999_999_999)?;
+            record.engine = engine.to_owned();
+            record.stop_requested_unix_ms = Some(1);
+            record.write()?;
+
+            let mut refreshed = record.clone();
+            let _ = crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                &paths,
+                &mut refreshed,
+                gone,
+            );
+            let removal = remove_managed_service_record_with(&paths, id, true, false, gone);
+            let pruned = prune_managed_service_records_with(&paths, 0, false, true, &gone)?;
+            let left = files_left(&paths, id);
+
+            if protected {
+                assert_eq!(refreshed.status, status, "{engine}: refresh");
+                assert_eq!(refreshed.supervisor_pid, 999_999_999, "{engine}: refresh");
+                assert!(removal.is_err(), "{engine}: remove must refuse");
+                assert_eq!(pruned.removed_records, 0, "{engine}: prune");
+                assert_eq!(left, 3, "{engine}: nothing was deleted");
+            } else {
+                assert!(removal.is_ok() || pruned.removed_records == 1, "{engine}");
+                assert_eq!(left, 0, "{engine}: an ordinary stopped record goes");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

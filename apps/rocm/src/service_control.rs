@@ -1251,6 +1251,46 @@ mod tests {
         assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
     }
 
+    /// The same as above when the record being stopped names no process either:
+    /// a relaunch's empty `starting` record then equals the stopping snapshot's
+    /// processes, which must not make it the stop's own. Its marker is cleared and
+    /// it reads `starting`, so the stop does not claim it, overwrite its status or
+    /// delete the key it will serve with. A stop of an empty record that nobody
+    /// relaunched is still confirmed.
+    #[test]
+    fn stop_does_not_confirm_over_an_empty_relaunch_of_an_empty_record() {
+        let (root, paths) = test_paths("stop-empty-relaunch");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-empty-relaunch";
+        let mut empty = stop_test_record(&paths, service_id);
+        empty.clear_recorded_processes();
+        empty.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut relaunch = raw_manifest(&paths, service_id);
+            relaunch.status = "starting".to_owned();
+            relaunch.stop_requested_unix_ms = None;
+            relaunch.write().unwrap();
+            bare_termination(Vec::new(), true)
+        })
+        .unwrap();
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+
+        // And with nobody relaunching, the stop of the same empty record is a stop.
+        let untouched = stop_internal_managed_service_with(&paths, service_id, |_| {
+            bare_termination(Vec::new(), true)
+        })
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(report["stopped"], false, "{report}");
+        assert_eq!(on_disk.status, "starting", "the relaunch's status stays");
+        assert_eq!(key.as_deref(), Some("key-123"), "its key is kept");
+        assert_eq!(untouched["stopped"], true, "{untouched}");
+    }
+
     #[test]
     fn stop_of_a_container_engine_is_unconfirmed_when_the_engine_stop_fails() {
         // For `aim` the recorded PID is only the supervisor; killing it says
@@ -3064,6 +3104,16 @@ mod tests {
         let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
         let on_disk = raw_manifest(&paths, service_id);
         let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        // What the report says about the warning, checked against what happens
+        // next: a later stop finds the root gone and, with no new evidence about
+        // what was under it, reports the stop confirmed.
+        let later = stop_internal_managed_service_with(&paths, service_id, |_| {
+            vec![stop_of(
+                999_999_999,
+                rocm_core::TerminationOutcome::AlreadyGone,
+            )]
+        })
+        .unwrap();
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(answer["status"], "stop_unconfirmed", "{answer}");
@@ -3073,6 +3123,14 @@ mod tests {
                 "not confirmed: process 999999999 (supervisor_and_engine) exited, but a process under it may still be running"
             ),
             "{rendered}"
+        );
+        assert!(
+            rendered.contains("rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"),
+            "the report must not imply the warning outlives this run: {rendered}"
+        );
+        assert_eq!(
+            later["stopped"], true,
+            "the claim the report makes is true: {later}"
         );
         assert!(
             !rendered.contains("still running: process")

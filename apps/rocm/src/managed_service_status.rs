@@ -207,6 +207,19 @@ pub(crate) fn recorded_pids_may_be_running(
         .any(|pid| probe(*pid).may_be_running())
 }
 
+/// Whether the record is a container-backed engine's stop that was requested and
+/// has not been confirmed.
+///
+/// Such a stop is decided by the engine `Stop` (`engine_stop_decides_confirmation`),
+/// not by the recorded supervisor, which can be gone while the container still
+/// runs. Until a `services stop` confirms it, nothing here may read the record as
+/// stopped, complete its cleanup, or let `remove`/`prune` delete it, on the
+/// evidence of the supervisor's PID alone.
+pub(crate) fn container_stop_unresolved(record: &ManagedServiceRecord) -> bool {
+    record.stop_requested_unix_ms.is_some()
+        && rocm_core::engine_stop_decides_confirmation(&record.engine)
+}
+
 /// Complete a stop that was requested but could not confirm termination, once
 /// the processes are actually observed gone: drop the endpoint key, clear the
 /// marker, forget the recorded processes and read the record as stopped. Returns
@@ -246,7 +259,7 @@ fn settle_pending_stop_key_cleanup(
     // while the container still runs, so PID evidence alone cannot say the stop
     // completed. The stop that could not confirm keeps its key, marker and
     // recorded processes, and the next `services stop` asks the engine again.
-    if rocm_core::engine_stop_decides_confirmation(&record.engine) {
+    if container_stop_unresolved(record) {
         return false;
     }
     if recorded_pids_may_be_running(record, probe) {
@@ -254,6 +267,12 @@ fn settle_pending_stop_key_cleanup(
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
     record.stop_requested_unix_ms = None;
+    // A record that named no process has no stop to complete: the key and the
+    // stale marker go, as they always did, but it is not read as stopped. It may
+    // be a launch that has not recorded its supervisor yet.
+    if recorded_service_pids(record).is_empty() {
+        return true;
+    }
     // Every recorded process is confirmed gone, so none of them is the
     // service's any more, and their PIDs are stale from here on. Left in the
     // record, a later `services stop` would signal whatever the OS has handed
@@ -338,6 +357,11 @@ pub(crate) fn refresh_managed_service_runtime_liveness_with(
         return settled_pending_stop || outcome.record_changed;
     }
 
+    // An unresolved container stop is not read as stopped from the supervisor's
+    // PID, whether or not the endpoint answers: only the engine `Stop` decides it.
+    if container_stop_unresolved(record) {
+        return settled_pending_stop || outcome.record_changed;
+    }
     let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
     let has_live_pid = recorded_pids_may_be_running(record, &probe);
@@ -1125,6 +1149,32 @@ mod tests {
             (4242, Some(5)),
             "the record keeps naming what the stop could not confirm"
         );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A record that names no process has no stop to complete: a `starting`
+    /// record with a stale stop marker gets the marker and key cleaned, as before,
+    /// but is not read as stopped, since it may be a launch that has not recorded
+    /// its supervisor yet.
+    #[test]
+    fn a_stale_stop_marker_on_a_record_naming_no_process_is_cleaned_without_reading_it_stopped()
+    -> Result<()> {
+        let (root, paths) = test_paths("liveness-pending-stop-no-process");
+        paths.ensure()?;
+        let service_id = "svc-no-process";
+        let mut record = pending_stop_record(&paths, service_id)?;
+        "starting".clone_into(&mut record.status);
+        record.clear_recorded_processes();
+
+        let changed = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+
+        assert!(changed, "the stale marker is consumed and persisted");
+        assert_eq!(record.stop_requested_unix_ms, None);
+        assert!(endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none());
+        assert_eq!(record.status, "starting", "it is not read as stopped");
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

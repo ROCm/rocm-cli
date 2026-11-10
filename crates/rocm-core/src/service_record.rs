@@ -344,11 +344,22 @@ impl ManagedServiceRecord {
     ///
     /// False for a restart that recorded new processes, and equally for one that
     /// is mid-launch with none recorded yet: that record reads `starting` (or
-    /// another live status), not `stopped`, and claiming it stopped, or dropping
-    /// the key it will serve with, would be false.
+    /// another live status) with the stop marker cleared, not `stopped`, and
+    /// claiming it stopped, or dropping the key it will serve with, would be
+    /// false. That holds when the stopping snapshot itself names no process too:
+    /// an empty record is covered only while it still carries the stop's marker,
+    /// or once it reads `stopped`.
     #[must_use]
     pub fn is_covered_by_stop_of(&self, stopping: &Self) -> bool {
-        self.names_same_processes(stopping) || (self.status == "stopped" && self.names_no_process())
+        if self.status == "stopped" && self.names_no_process() {
+            return true;
+        }
+        // The same processes. When they are none, that equality is also what a
+        // relaunch that has not recorded its supervisor yet looks like, so it
+        // proves nothing: the stop's own marker is what tells the two apart, since
+        // a restart clears it and a stop that is still finalizing has it on disk.
+        self.names_same_processes(stopping)
+            && (!stopping.names_no_process() || self.stop_requested_unix_ms.is_some())
     }
 
     /// Whether the record names neither a supervisor nor an engine process.
@@ -947,6 +958,48 @@ mod tests {
         ];
         for (name, record, covered) in rows {
             assert_eq!(record.is_covered_by_stop_of(&stopping), covered, "{name}");
+        }
+
+        // The same table from a stopping snapshot that names no process: an
+        // untouched record (the stop's own marker still on it, or completed to
+        // `stopped`) is that stop; an empty relaunch that has cleared the marker is
+        // not, and neither is one that has recorded processes.
+        let mut empty = stopping.clone();
+        empty.clear_recorded_processes();
+        empty.stop_requested_unix_ms = Some(1);
+        let with_marker = |status: &str, marker: Option<u128>, pid: u32| {
+            let mut record = empty.clone();
+            status.clone_into(&mut record.status);
+            record.stop_requested_unix_ms = marker;
+            record.supervisor_pid = pid;
+            record
+        };
+        let rows = [
+            ("empty, untouched", with_marker("ready", Some(1), 0), true),
+            ("empty, stopped", with_marker("stopped", None, 0), true),
+            (
+                "empty, starting relaunch",
+                with_marker("starting", None, 0),
+                false,
+            ),
+            (
+                "empty, recovering relaunch",
+                with_marker("recovering", None, 0),
+                false,
+            ),
+            (
+                "empty, ready relaunch",
+                with_marker("ready", None, 0),
+                false,
+            ),
+            (
+                "relaunched with a process",
+                with_marker("starting", None, 5555),
+                false,
+            ),
+        ];
+        for (name, record, covered) in rows {
+            assert_eq!(record.is_covered_by_stop_of(&empty), covered, "{name}");
         }
     }
 
