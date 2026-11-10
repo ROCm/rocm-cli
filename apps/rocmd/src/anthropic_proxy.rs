@@ -25,6 +25,8 @@
 //! chat-completion chunks as they arrive. Tool use (`tools`, `tool_choice`),
 //! extended thinking and non-text content blocks are refused with an Anthropic
 //! `invalid_request_error` that says so, rather than being dropped silently.
+//! The engine reports token usage only at the end of a stream, so `message_start`
+//! carries `input_tokens: 0` and the real figures arrive in `message_delta`.
 //! Fields that only annotate a request (`metadata`) are ignored.
 
 use std::convert::Infallible;
@@ -440,9 +442,19 @@ fn pump_stream(
             .all(|event| sender.blocking_send(Bytes::from(event)).is_ok())
     };
     for line in BufReader::new(upstream).lines() {
+        // Events are only sent when a chunk carries text, so a client that left
+        // during a long reasoning phase would otherwise go unnoticed.
+        if sender.is_closed() {
+            return;
+        }
         let events = match line {
             Ok(line) => match line.strip_prefix("data:") {
                 Some(data) => translator.feed(data.trim()),
+                // A 200 reply whose body is a plain JSON error rather than
+                // `data:` lines: surface the engine's message.
+                None if !translator.has_started() && line.trim_start().starts_with('{') => {
+                    translator.feed(line.trim())
+                }
                 None => continue,
             },
             Err(error) => translator.fail(&format!("reading the engine's stream failed: {error}")),
@@ -692,6 +704,10 @@ impl StreamTranslator {
         }
     }
 
+    const fn has_started(&self) -> bool {
+        self.started
+    }
+
     /// Whether the closing event (`message_stop` or `error`) has been produced.
     const fn is_finished(&self) -> bool {
         self.finished
@@ -703,7 +719,8 @@ impl StreamTranslator {
             return Vec::new();
         }
         if data == "[DONE]" {
-            return self.complete();
+            // `[DONE]` with no stop reason seen is an early end, like a cut stream.
+            return self.end_of_stream();
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return self.fail("the engine sent a stream chunk that was not JSON");
@@ -770,7 +787,8 @@ impl StreamTranslator {
         events
     }
 
-    /// The events for an engine stream that ended without `[DONE]`.
+    /// The events for an engine stream that is over: complete if a stop reason
+    /// arrived, an `error` otherwise.
     fn end_of_stream(&mut self) -> Vec<String> {
         if self.finished {
             return Vec::new();
@@ -1138,6 +1156,28 @@ mod tests {
         .to_string()
     }
 
+    fn pump(body: &str) -> Vec<String> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        pump_stream(
+            Box::new(std::io::Cursor::new(body.to_owned())),
+            MODEL,
+            &sender,
+        );
+        drop(sender);
+        let mut out = Vec::new();
+        while let Ok(bytes) = receiver.try_recv() {
+            out.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn a_plain_json_error_body_on_a_200_reply_reaches_the_client() {
+        let events = pump(r#"{"error": {"message": "model is loading"}}"#);
+        assert_eq!(names(&events), ["error"]);
+        assert!(events[0].contains("model is loading"), "{}", events[0]);
+    }
+
     fn names(events: &[String]) -> Vec<&str> {
         events
             .iter()
@@ -1202,7 +1242,8 @@ mod tests {
     #[test]
     fn a_reply_without_text_is_an_empty_text_block() {
         let mut translator = StreamTranslator::new(MODEL);
-        let events = translator.feed("[DONE]");
+        let mut events = translator.feed(&chunk(&json!({}), Some("stop")));
+        events.extend(translator.feed("[DONE]"));
         assert_eq!(
             names(&events),
             [
@@ -1214,6 +1255,14 @@ mod tests {
             ]
         );
         assert!(events[0].contains(MODEL), "{}", events[0]);
+    }
+
+    #[test]
+    fn done_without_a_stop_reason_is_an_error() {
+        let mut translator = StreamTranslator::new(MODEL);
+        let events = translator.feed("[DONE]");
+        assert_eq!(names(&events), ["error"]);
+        assert!(events[0].contains("ended before"), "{}", events[0]);
     }
 
     #[test]
