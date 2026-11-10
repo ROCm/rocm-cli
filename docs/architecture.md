@@ -27,7 +27,7 @@ A flat size limit backs this convention: `cargo xtask check-module-size` ([`modu
 
 Scoped to the crates that make up the shipped CLI, daemon, dashboard and engine surface, plus `crates/e2e-report`, `xtask` and `tests/e2e-cucumber`. `crates/e2e-report` is HTML and markdown reporting consumed only by `xtask` and `tests/e2e-cucumber`; those two are the repository's tooling and test harness, and `check-architecture-doc` does not check their rows.
 
-Each crate has a table with a row per source file (`rocm-dash-tui` and `tests/e2e-cucumber` have one table per directory), sorted by path with the crate roots (`main.rs`, `lib.rs`) first and a directory's `mod.rs` first within its directory. The Class column records how a file came to be, not a rule a new file is judged by: `root` (the crate root), `domain` (full domain extraction or a child module of one, the default for a new subsystem), `relocation` (mechanical relocation), `child` (split out of a larger module, with no extraction pattern recorded), `test helper` (test-only support) and `flat` (no extraction pattern recorded, which is also what a new small helper is). Under each table, **Boundaries** lists some of the facts a row cannot show, such as layering and leaf modules, deliberate privacy and shared sources of truth. It is a selection, not an inventory; the source files carry the rest.
+Each crate has a table with a row per source file (`rocm-dash-tui` and `tests/e2e-cucumber` have one table per directory), sorted by path with the crate roots (`main.rs`, `lib.rs`) first and a directory's `mod.rs` first within its directory. The Class column records how a file came to be, not a rule a new file is judged by: `domain` (full domain extraction or a child module of one, the default for a new subsystem), `relocation` (mechanical relocation) and `flat` (everything else: crate roots, files with no extraction pattern recorded, and test-only support). Under each table, **Boundaries** lists some of the facts a row cannot show, such as layering and leaf modules, deliberate privacy and shared sources of truth. It is a selection, not an inventory; the source files carry the rest.
 
 ### `apps/rocm` — main CLI binary
 
@@ -35,8 +35,8 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`main.rs`](../apps/rocm/src/main.rs) | Crate root: `main` and `run`, `dispatch()` over the clap `Command` tree, the clap command builders, freeform-invocation routing, the `version` and bare-`rocm` handlers, and the few items several modules share. | root |
-| [`advised_commands.rs`](../apps/rocm/src/advised_commands.rs) | Test-only check that every `rocm ...`/`rocmd ...` command the repository advises (help text, string literals, docs, skills, VHS tapes) exists and parses with the flags it is given. | test helper |
+| [`main.rs`](../apps/rocm/src/main.rs) | Crate root: `main` and `run`, `dispatch()` over the clap `Command` tree, the clap command builders, freeform-invocation routing, the `version` and bare-`rocm` handlers, and the few items several modules share. | flat |
+| [`advised_commands.rs`](../apps/rocm/src/advised_commands.rs) | Test-only check that every `rocm ...`/`rocmd ...` command the repository advises (help text, string literals, docs, skills, VHS tapes) exists and parses with the flags it is given. | flat |
 | [`automations.rs`](../apps/rocm/src/automations.rs) | `rocm automations` (`automations`) and the status and proposal text it prints, plus the `rocm daemon --status` summary (`render_daemon_text`). | relocation |
 | [`background_helper.rs`](../apps/rocm/src/background_helper.rs) | What the CLI can tell about the background automation helper (`rocm daemon`): whether it is running, and the note shown about it after a service stop or in an uninstall plan. | relocation |
 | [`bootstrap.rs`](../apps/rocm/src/bootstrap.rs) | `rocm bootstrap`: owns `BootstrapCommand` and its dispatch `run`, which opens the dashboard's setup flow in a terminal and otherwise prints how to run it. | domain |
@@ -60,7 +60,7 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`config_cmd.rs`](../apps/rocm/src/config_cmd.rs) | `rocm config` (`config`): applies each subcommand to the saved configuration, prompts for a provider API key, and renders `rocm config show`. | relocation |
 | [`dash.rs`](../apps/rocm/src/dash.rs) | `rocm dash` and the other ways into the dashboard TUI (launcher, chat, bench, setup): builds the telemetry daemon options and starts an embedded daemon when none is listening. | domain |
 | [`dash_seam.rs`](../apps/rocm/src/dash_seam.rs) | The binary's implementation of the dashboard's `RocmToolExecutor` seam, reusing the CLI's own command functions with plain data in and out. | domain |
-| [`deletion_properties.rs`](../apps/rocm/src/deletion_properties.rs) | Unix-only property tests for the recursive deletions behind `rocm uninstall` and `rocm storage remove-downloads`, checked against a real sandbox filesystem. | test helper |
+| [`deletion_properties.rs`](../apps/rocm/src/deletion_properties.rs) | Unix-only property tests for the recursive deletions behind `rocm uninstall` and `rocm storage remove-downloads`, checked against a real sandbox filesystem. | flat |
 | [`diagnose_cmd.rs`](../apps/rocm/src/diagnose_cmd.rs) | `rocm diagnose` and `rocm fix` (`diagnose`, `fix`), and the `--report` step that shows a prepared report and offers to deliver it. | relocation |
 | [`diagnose_model.rs`](../apps/rocm/src/diagnose_model.rs) | The binary's side of `rocm diagnose --model`'s GGUF context estimate: the `--kv-cache-type` and model flags, the `--report` note, and the device-visibility-mask caveat. | domain |
 | [`driver_install.rs`](../apps/rocm/src/driver_install.rs) | `rocm install driver` (`install_driver`, `reconcile_driver_install`): runs an approved plan's commands and persists the driver install state. | relocation |
@@ -77,7 +77,7 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`freeform_execution.rs`](../apps/rocm/src/freeform_execution.rs) | Whether a freeform plan's next action may run and the consent flags it needs (`prepare_freeform_execution`), and the header printed before it runs. | relocation |
 | [`freeform_planner.rs`](../apps/rocm/src/freeform_planner.rs) | The freeform natural-language planner: turns a prose request into a `StructuredRequestPlan` of `rocm` tool calls, deterministically or with a configured planner provider, and renders it. | domain |
 | [`gpu_policy.rs`](../apps/rocm/src/gpu_policy.rs) | `--device`/`--gpu` parsing, GPU selection under the managed-launch lock, per-GPU VRAM readings (`amd-smi`, with a DRM sysfs fallback) and the serve low-VRAM warning. | relocation |
-| [`gpu_selection_proptests.rs`](../apps/rocm/src/gpu_selection_proptests.rs) | Property tests for `--gpu` auto-selection and explicit-index validation, declared from [`gpu_policy.rs`](../apps/rocm/src/gpu_policy.rs). | test helper |
+| [`gpu_selection_proptests.rs`](../apps/rocm/src/gpu_selection_proptests.rs) | Property tests for `--gpu` auto-selection and explicit-index validation, declared from [`gpu_policy.rs`](../apps/rocm/src/gpu_policy.rs). | flat |
 | [`install_cmd.rs`](../apps/rocm/src/install_cmd.rs) | `rocm install` (`install`) for the `sdk` and `driver` targets, the `--version`/`--build-date` selector, and mapping `install sdk` arguments onto a `therock::SdkInstallRequest`. | relocation |
 | [`logging.rs`](../apps/rocm/src/logging.rs) | Client-side structured logging: a file-only, non-blocking `tracing` subscriber for the CLI and dashboard process that never writes to stdout or stderr. | relocation |
 | [`managed_service_status.rs`](../apps/rocm/src/managed_service_status.rs) | Managed-service liveness (`managed_service_is_live`, the duplicate-launch guard), loading service records, and the dashboard-sidebar status and counts. | relocation |
@@ -87,10 +87,10 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`provider_keys.rs`](../apps/rocm/src/provider_keys.rs) | Cloud provider (OpenAI, Anthropic) API keys: read from the environment or the OS keyring, stored and removed in the keyring with no plaintext fallback, and their status label. | domain |
 | [`providers.rs`](../apps/rocm/src/providers.rs) | Chat model providers: the request/response types, the `ProviderAdapter` dispatch, `LocalProvider` and `RemoteProvider`, local-service selection and the remote transport. | domain |
 | [`providers/local_http.rs`](../apps/rocm/src/providers/local_http.rs) | The local provider's hand-rolled HTTP/1.1 transport: a blocking JSON POST and a streamed POST read in chunked, `Content-Length` or close-delimited framing. | domain |
-| [`providers/local_http/proptests.rs`](../apps/rocm/src/providers/local_http/proptests.rs) | Property tests that re-chunk, truncate, stall and interrupt SSE bodies against the local transport's readers. | test helper |
+| [`providers/local_http/proptests.rs`](../apps/rocm/src/providers/local_http/proptests.rs) | Property tests that re-chunk, truncate, stall and interrupt SSE bodies against the local transport's readers. | flat |
 | [`providers/tool_schema.rs`](../apps/rocm/src/providers/tool_schema.rs) | The ROCm tool catalog advertised to a model, as OpenAI function definitions and reshaped for Anthropic's `tools` field. | domain |
 | [`providers/wire.rs`](../apps/rocm/src/providers/wire.rs) | The OpenAI-compatible and Anthropic wire formats: request bodies (with the local-model defaults), non-streaming response parsers, and the SSE emitters. | domain |
-| [`providers/wire/sse_emitter_proptests.rs`](../apps/rocm/src/providers/wire/sse_emitter_proptests.rs) | Split-invariance and panic-guard tests for the SSE emitters and line parsers in [`providers/wire.rs`](../apps/rocm/src/providers/wire.rs). | test helper |
+| [`providers/wire/sse_emitter_proptests.rs`](../apps/rocm/src/providers/wire/sse_emitter_proptests.rs) | Split-invariance and panic-guard tests for the SSE emitters and line parsers in [`providers/wire.rs`](../apps/rocm/src/providers/wire.rs). | flat |
 | [`remote/mod.rs`](../apps/rocm/src/remote/mod.rs) | `rocm remote`: owns `RemoteCommand` and its dispatch `run`, driving a remote GPU host over SSH while inference traffic goes to the remote's tailnet-published service. | domain |
 | [`remote/bootstrap.rs`](../apps/rocm/src/remote/bootstrap.rs) | Deciding whether a remote machine can host a model (GPU stack, ROCm CLI, Tailscale, known platform), refusing up front when it cannot. | domain |
 | [`remote/doctor.rs`](../apps/rocm/src/remote/doctor.rs) | Checking a remote machine's health: facts are gathered on the remote and scored here against the same failure-mode catalog the local command uses. | domain |
@@ -122,7 +122,7 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`service_launch/readiness.rs`](../apps/rocm/src/service_launch/readiness.rs) | Waiting on a launched or live managed service: the readiness budget, process liveness, how a wait ends, and the OOM fault-injection seam for end-to-end tests. | relocation |
 | [`service_launch/spawn.rs`](../apps/rocm/src/service_launch/spawn.rs) | Spawning the detached managed engine child both serve paths share: process and stdio plumbing and the serialized spawn transaction (`spawn_managed_engine_child`). | relocation |
 | [`service_launch/start.rs`](../apps/rocm/src/service_launch/start.rs) | The background launch path (`start_managed_service`) and the plain line-by-line rendering of its launch report. | relocation |
-| [`service_launch/test_support.rs`](../apps/rocm/src/service_launch/test_support.rs) | Test fixtures shared by more than one `service_launch/` child. | test helper |
+| [`service_launch/test_support.rs`](../apps/rocm/src/service_launch/test_support.rs) | Test fixtures shared by more than one `service_launch/` child. | flat |
 | [`service_records.rs`](../apps/rocm/src/service_records.rs) | Removing a managed-service record and every file it owns, and the `rocm services prune` plan, render and apply steps with their age gate. | relocation |
 | [`services_cmd.rs`](../apps/rocm/src/services_cmd.rs) | `rocm services` (`services`) for `list`, `logs`, `stop`, `restart`, `remove` and `prune`, and the approval-gated stop and restart path. | relocation |
 | [`services_text.rs`](../apps/rocm/src/services_text.rs) | Log rendering and the `rocm services` and `rocm logs` status, browser and `--follow` surfaces, managed-service record reads, and the `stop_server` answer shape. | relocation |
@@ -130,7 +130,7 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`shell_quote.rs`](../apps/rocm/src/shell_quote.rs) | The CLI's one POSIX shell quoter (`shell_quote`, over `rocm-core`'s) and `has_terminal_control_character`, the predicate the chat tool-call guards refuse on. | flat |
 | [`storage.rs`](../apps/rocm/src/storage.rs) | `rocm storage`: a read-only report of what runtimes, downloads and engine installs occupy on disk, and guarded removal of old installs and downloads. | domain |
 | [`system_packages.rs`](../apps/rocm/src/system_packages.rs) | Host system-package installs for SDK and engine installs: the distro-aware OpenMPI, libatomic and libnuma plans, the consent decision, and running them without a shell. | domain |
-| [`test_support.rs`](../apps/rocm/src/test_support.rs) | Test-only fixtures shared across the crate's module test suites, including the process-environment lock. | test helper |
+| [`test_support.rs`](../apps/rocm/src/test_support.rs) | Test-only fixtures shared across the crate's module test suites, including the process-environment lock. | flat |
 | [`therock.rs`](../apps/rocm/src/therock.rs) | TheRock SDK install orchestration (`install_sdk`, the wheel and tarball paths) and the helpers that name an install and its folders; parent of the `therock/` children. | domain |
 | [`therock/consent.rs`](../apps/rocm/src/therock/consent.rs) | The consent gate for an install that would displace the active default runtime: what it would replace, and whether to proceed, prompt or refuse. | domain |
 | [`therock/family.rs`](../apps/rocm/src/therock/family.rs) | Which TheRock package family a request targets (flag, environment, managed runtime or host GPU), refusing a GPU that has no ROCm build. | domain |
@@ -144,11 +144,11 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`therock/resolve/uv_access.rs`](../apps/rocm/src/therock/resolve/uv_access.rs) | Who may fetch `uv` while a wheel stack is resolved (`UvAccess`, `plan_version_resolution`), as a pure decision over layout, access and whether `uv` is present. | domain |
 | [`therock/resolve/wheel.rs`](../apps/rocm/src/therock/resolve/wheel.rs) | Resolving the wheel stack (`rocm`, `torch`, `torchvision`, `torchaudio`) and device payload a request installs (`resolve_pip_runtime`, `preview_pip_runtime`). | domain |
 | [`therock/source.rs`](../apps/rocm/src/therock/source.rs) | Where an install reads from: channel, hosting layout and artifact bases (with the opt-in base override), plus the pinned version selector and the resolved family. | domain |
-| [`therock/test_support.rs`](../apps/rocm/src/therock/test_support.rs) | Test-only fixtures shared by the `therock/` children's tests and the tests left in [`therock.rs`](../apps/rocm/src/therock.rs). | test helper |
+| [`therock/test_support.rs`](../apps/rocm/src/therock/test_support.rs) | Test-only fixtures shared by the `therock/` children's tests and the tests left in [`therock.rs`](../apps/rocm/src/therock.rs). | flat |
 | [`therock/update.rs`](../apps/rocm/src/therock/update.rs) | Whether an installed runtime has something newer (`runtime_update_plan`, `runtime_update_check`), the update report and JSON, and the bounded startup check. | domain |
 | [`therock/version.rs`](../apps/rocm/src/therock/version.rs) | Version grammar for TheRock runtimes: the strict install gate (`parse_version`), PEP 440 ordering, host-version parsing and the build-date helpers. | domain |
 | [`therock/wheel_plan.rs`](../apps/rocm/src/therock/wheel_plan.rs) | The `sdk install` plan a wheel install prints, from one writer for a preview and a real install, resolved or not. | domain |
-| [`therock_version_proptests.rs`](../apps/rocm/src/therock_version_proptests.rs) | Property tests for version ordering, update verdicts and update-source selection, declared from [`therock.rs`](../apps/rocm/src/therock.rs). | test helper |
+| [`therock_version_proptests.rs`](../apps/rocm/src/therock_version_proptests.rs) | Property tests for version ordering, update verdicts and update-source selection, declared from [`therock.rs`](../apps/rocm/src/therock.rs). | flat |
 | [`tool_policy.rs`](../apps/rocm/src/tool_policy.rs) | The chat assistant's tool-call policy: which `rocm` commands and bridge tools a model may request, which run at once, which need approval, and the validators that refuse unsafe calls. | flat |
 | [`uninstall.rs`](../apps/rocm/src/uninstall.rs) | `rocm uninstall` (`uninstall`): what only uninstall does beyond removing files, undoing the installer's `PATH` change and deleting the running `rocm.exe` on Windows. | relocation |
 | [`uninstall_plan.rs`](../apps/rocm/src/uninstall_plan.rs) | The uninstall plan shared with `rocm storage`: building it, rendering it for its audience, the `[y/N]` confirmation, and the `remove_path` primitive. | relocation |
@@ -205,8 +205,8 @@ The `rocmd` binary and the daemon library `rocm daemon` embeds: the watcher loop
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../apps/rocmd/src/lib.rs) | Crate root: module declarations and the entry points re-exported from [`cli.rs`](../apps/rocmd/src/cli.rs) (`run_bin_cli`, `run_from_args`, `parse_args`). | root |
-| [`main.rs`](../apps/rocmd/src/main.rs) | The `rocmd` binary's entry point: a synchronous `main` that calls `rocmd::run_bin_cli()`, which builds the Tokio runtime itself; it holds no logic of its own. | root |
+| [`lib.rs`](../apps/rocmd/src/lib.rs) | Crate root: module declarations and the entry points re-exported from [`cli.rs`](../apps/rocmd/src/cli.rs) (`run_bin_cli`, `run_from_args`, `parse_args`). | flat |
+| [`main.rs`](../apps/rocmd/src/main.rs) | The `rocmd` binary's entry point: a synchronous `main` that calls `rocmd::run_bin_cli()`, which builds the Tokio runtime itself; it holds no logic of its own. | flat |
 | [`anthropic_proxy.rs`](../apps/rocmd/src/anthropic_proxy.rs) | The Anthropic-compatible `/v1/messages` front for a served model: a translation proxy to the engine's OpenAI API, translating streaming requests and, for non-streaming ones, tool use both ways, on a port of its own, published in the engine state file (`spawn_alongside_engine`). | flat |
 | [`cli.rs`](../apps/rocmd/src/cli.rs) | The `Cli`/`Command` clap definitions, the bridge-snapshot and pretty-JSON printers, and the top-level dispatch (`run_cli`, `run_bin_cli`, `run_from_args`). | flat |
 | [`common.rs`](../apps/rocmd/src/common.rs) | Small shared helpers: the read-only `rocm update` message, the `rocm`-subprocess capture wrapper (`run_rocm_capture_for_paths`), and argument and JSON-payload utilities such as `payload_string`. | flat |
@@ -221,15 +221,15 @@ The `rocmd` binary and the daemon library `rocm daemon` embeds: the watcher loop
 | [`sandbox_tool.rs`](../apps/rocmd/src/sandbox_tool.rs) | The sandbox-tool vocabulary: the `SandboxToolArg` enum and `SandboxToolPolicy`, the artifact-download policy built from the `--allow-*` flags. | flat |
 | [`service.rs`](../apps/rocmd/src/service.rs) | Stopping a managed service: terminating its recorded processes after verifying their identity, and the stop report (`stop_managed_service`, `stop_report_confirmed`). | flat |
 | [`supervise.rs`](../apps/rocmd/src/supervise.rs) | The `rocmd supervise` entry point (`supervise_service`: launch the engine child, record it, wait for readiness, record the exit) and the recovery respawn (`restart_managed_service`). | flat |
-| [`test_support.rs`](../apps/rocmd/src/test_support.rs) | Test-only fixtures shared by the crate's module tests, including the workspace-local scratch `AppPaths`. | test helper |
+| [`test_support.rs`](../apps/rocmd/src/test_support.rs) | Test-only fixtures shared by the crate's module tests, including the workspace-local scratch `AppPaths`. | flat |
 | [`watchers.rs`](../apps/rocmd/src/watchers.rs) | Root of the built-in watchers: the registry (`reconcile_watcher_snapshots`) and the event collector and dispatcher (`evaluate_watchers`) that route each event to its watcher's handler. | flat |
-| [`watchers/cache_warm.rs`](../apps/rocmd/src/watchers/cache_warm.rs) | The `cache-warm` watcher: checks a requested recipe artifact against the model registry and queues a reviewed prefetch proposal for a known one. | child |
-| [`watchers/driver_upgrade.rs`](../apps/rocmd/src/watchers/driver_upgrade.rs) | The `driver-upgrade` watcher: turns an available driver update into a reviewed driver-plan proposal, or a read-only plan in contained mode. | child |
-| [`watchers/gpu_metrics.rs`](../apps/rocmd/src/watchers/gpu_metrics.rs) | The `gpu-metrics` watcher: records GPU telemetry and reads amd-smi monitor entries into thermal- and memory-pressure events, with the interval and thresholds they use. | child |
-| [`watchers/gpu_thermal_protect.rs`](../apps/rocmd/src/watchers/gpu_thermal_protect.rs) | The `gpu-thermal-protect` watcher: on GPU pressure, picks the one running managed service and queues a reviewed stop request unless one is pending. | child |
-| [`watchers/policy.rs`](../apps/rocmd/src/watchers/policy.rs) | What a watcher does in each mode (`watcher_policy_action`: observe, propose or run contained) and the proposals it queues (`queue_proposal`, `pending_proposal_exists`). | child |
-| [`watchers/server_recover.rs`](../apps/rocmd/src/watchers/server_recover.rs) | The `server-recover` watcher: finds a managed service that needs recovery (`find_recoverable_service`), spaces attempts with a backoff, and restarts it or queues a restart proposal. | child |
-| [`watchers/therock_update.rs`](../apps/rocmd/src/watchers/therock_update.rs) | The `therock-update` watcher: the six-hourly update check, with a reminder, a proposal or a read-only contained run depending on mode. | child |
+| [`watchers/cache_warm.rs`](../apps/rocmd/src/watchers/cache_warm.rs) | The `cache-warm` watcher: checks a requested recipe artifact against the model registry and queues a reviewed prefetch proposal for a known one. | flat |
+| [`watchers/driver_upgrade.rs`](../apps/rocmd/src/watchers/driver_upgrade.rs) | The `driver-upgrade` watcher: turns an available driver update into a reviewed driver-plan proposal, or a read-only plan in contained mode. | flat |
+| [`watchers/gpu_metrics.rs`](../apps/rocmd/src/watchers/gpu_metrics.rs) | The `gpu-metrics` watcher: records GPU telemetry and reads amd-smi monitor entries into thermal- and memory-pressure events, with the interval and thresholds they use. | flat |
+| [`watchers/gpu_thermal_protect.rs`](../apps/rocmd/src/watchers/gpu_thermal_protect.rs) | The `gpu-thermal-protect` watcher: on GPU pressure, picks the one running managed service and queues a reviewed stop request unless one is pending. | flat |
+| [`watchers/policy.rs`](../apps/rocmd/src/watchers/policy.rs) | What a watcher does in each mode (`watcher_policy_action`: observe, propose or run contained) and the proposals it queues (`queue_proposal`, `pending_proposal_exists`). | flat |
+| [`watchers/server_recover.rs`](../apps/rocmd/src/watchers/server_recover.rs) | The `server-recover` watcher: finds a managed service that needs recovery (`find_recoverable_service`), spaces attempts with a backoff, and restarts it or queues a restart proposal. | flat |
+| [`watchers/therock_update.rs`](../apps/rocmd/src/watchers/therock_update.rs) | The `therock-update` watcher: the six-hourly update check, with a reminder, a proposal or a read-only contained run depending on mode. | flat |
 | [`webhook.rs`](../apps/rocmd/src/webhook.rs) | The local webhook source: its axum routes, request validation and watcher-kind allow-list. | flat |
 
 Boundaries:
@@ -253,10 +253,10 @@ The library every first-party app and engine crate depends on. It holds host exa
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-core/src/lib.rs) | Crate root: module declarations, the crate-root re-exports, and the small cross-crate primitives listed under Boundaries plus `unix_time_millis` and `require_nonempty`. | root |
+| [`lib.rs`](../crates/rocm-core/src/lib.rs) | Crate root: module declarations, the crate-root re-exports, and the small cross-crate primitives listed under Boundaries plus `unix_time_millis` and `require_nonempty`. | flat |
 | [`amd_smi.rs`](../crates/rocm-core/src/amd_smi.rs) | Locates the `amd-smi` binary (newest managed SDK runtime first, then legacy locations, then `PATH`) and launches it through `amd_smi_json` after the `/dev/kfd` pre-flight. | domain |
 | [`anthropic_endpoint.rs`](../crates/rocm-core/src/anthropic_endpoint.rs) | The Anthropic-compatible `/v1/messages` surface of a managed service: `AnthropicEndpointMode`, its state-file keys, and the readiness check and wait on the published proxy endpoint. | domain |
-| [`archive_props.rs`](../crates/rocm-core/src/archive_props.rs) | Property-test generator and on-disk oracle for the archive extractors: nothing written outside the extraction root, no escaping links, no unsafe mode bits. | test helper |
+| [`archive_props.rs`](../crates/rocm-core/src/archive_props.rs) | Property-test generator and on-disk oracle for the archive extractors: nothing written outside the extraction root, no escaping links, no unsafe mode bits. | flat |
 | [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs) | `write_file_atomically`: stages the bytes in a unique sibling temp file and publishes it over the destination in one step (atomic, not durable). | domain |
 | [`automation.rs`](../crates/rocm-core/src/automation.rs) | Automation-daemon runtime state and its JSONL event, audit and proposal stores, with each store's rotation and compaction policy. | domain |
 | [`binary_paths.rs`](../crates/rocm-core/src/binary_paths.rs) | Locates the `rocm-engine-<name>` sibling binaries and the `rocm` CLI binary itself. | domain |
@@ -273,7 +273,7 @@ The library every first-party app and engine crate depends on. It holds host exa
 | [`diagnose/linux.rs`](../crates/rocm-core/src/diagnose/linux.rs) | Linux-only checks (kernel and amdgpu module, device-node access, package repositories, repo-native install) and the package-manager command helpers. | domain |
 | [`diagnose/report.rs`](../crates/rocm-core/src/diagnose/report.rs) | Upstream routing for a failure nothing recognised (`upstream_route`) and the human-readable report (`render_report_text`). | domain |
 | [`diagnose/scoring.rs`](../crates/rocm-core/src/diagnose/scoring.rs) | The keyword tables shared across platforms and the scoring over them, plus helpers that read an `Examination` or build a `Diagnosis`. | domain |
-| [`diagnose/test_support.rs`](../crates/rocm-core/src/diagnose/test_support.rs) | Test-only `Examination` builders shared by the tests of several `diagnose` modules. | test helper |
+| [`diagnose/test_support.rs`](../crates/rocm-core/src/diagnose/test_support.rs) | Test-only `Examination` builders shared by the tests of several `diagnose` modules. | flat |
 | [`diagnose/windows.rs`](../crates/rocm-core/src/diagnose/windows.rs) | Windows-only checks: the HIP SDK, the Adrenalin driver, the Visual C++ runtime and the display driver date. | domain |
 | [`diagnose/wsl.rs`](../crates/rocm-core/src/diagnose/wsl.rs) | WSL2-only checks: the DXCore handoff, the ROCDXG userspace, the distro floor, the Windows host driver and WSL 1. | domain |
 | [`disk_space.rs`](../crates/rocm-core/src/disk_space.rs) | Free-space preflight checks before large downloads and extractions, and the out-of-space error reporting. | flat |
@@ -289,16 +289,16 @@ The library every first-party app and engine crate depends on. It holds host exa
 | [`examine/rocm_install_probe.rs`](../crates/rocm-core/src/examine/rocm_install_probe.rs) | How ROCm was installed and which live package-repository files configure it. | domain |
 | [`examine/windows.rs`](../crates/rocm-core/src/examine/windows.rs) | Native Windows probes: the GPU query, the HIP SDK, the Adrenalin driver and the MSVC redistributable. | domain |
 | [`examine/wsl.rs`](../crates/rocm-core/src/examine/wsl.rs) | The WSL2 guest probe, and the remote probe that reads the same facts from a named distribution when `rocm examine` runs on the Windows host. | domain |
-| [`examine_driver_proptests.rs`](../crates/rocm-core/src/examine_driver_proptests.rs) | Property tests for `examine`'s driver-side text readers (WSL distro floor, device-node permissions, modprobe blacklist, `iommu=`) and gfx-family normalisation. | test helper |
-| [`fake_executable.rs`](../crates/rocm-core/src/fake_executable.rs) | `write_fake_executable`: writes a stand-in script for tests from a short-lived child, so running it does not fail with `ETXTBSY`. It is built into every build, without a `cfg(test)` gate, so dependent crates' tests can call it. | test helper |
+| [`examine_driver_proptests.rs`](../crates/rocm-core/src/examine_driver_proptests.rs) | Property tests for `examine`'s driver-side text readers (WSL distro floor, device-node permissions, modprobe blacklist, `iommu=`) and gfx-family normalisation. | flat |
+| [`fake_executable.rs`](../crates/rocm-core/src/fake_executable.rs) | `write_fake_executable`: writes a stand-in script for tests from a short-lived child, so running it does not fail with `ETXTBSY`. It is built into every build, without a `cfg(test)` gate, so dependent crates' tests can call it. | flat |
 | [`fix.rs`](../crates/rocm-core/src/fix.rs) | Root of `rocm fix`: the dispatch (`apply`) that plans, confirms and runs a catalog remediation, and the re-exports of its children's public names. | flat |
-| [`fix/catalog.rs`](../crates/rocm-core/src/fix/catalog.rs) | The closed remediation catalog: `FixRecipe`, the per-platform class table, `RECIPES`, the lookups by fix-id, and the test-only oracles. | child |
-| [`fix/consent.rs`](../crates/rocm-core/src/fix/consent.rs) | The consent decision and `confirm`, the timeouts the runners use, `current_os`, and output helpers that cannot panic on a closed pipe. | child |
-| [`fix/manifest.rs`](../crates/rocm-core/src/fix/manifest.rs) | The JSON catalog manifest `rocm fix --json` publishes, derived from `RECIPES` on every call. | child |
-| [`fix/options.rs`](../crates/rocm-core/src/fix/options.rs) | The vocabulary of `rocm fix`: the exit codes (`exit`), `FixOptions` and `FixClass`. | child |
-| [`fix/render.rs`](../crates/rocm-core/src/fix/render.rs) | Rendering the catalog for people: the listing, a recipe's plan and verify lines, the flag summary `rocm diagnose` shares, and the refusal of a diagnosis position as a fix-id. | child |
-| [`fix/runners.rs`](../crates/rocm-core/src/fix/runners.rs) | The host-mutating runners, one per auto-applicable fix, each printing the exact change, honouring `--dry-run` and asking consent first. | child |
-| [`foreign_temp_probe.rs`](../crates/rocm-core/src/foreign_temp_probe.rs) | Test probe that a writer publishing through `atomic_write` never touches another writer's temp file; built only for tests and the `test-support` feature. | test helper |
+| [`fix/catalog.rs`](../crates/rocm-core/src/fix/catalog.rs) | The closed remediation catalog: `FixRecipe`, the per-platform class table, `RECIPES`, the lookups by fix-id, and the test-only oracles. | flat |
+| [`fix/consent.rs`](../crates/rocm-core/src/fix/consent.rs) | The consent decision and `confirm`, the timeouts the runners use, `current_os`, and output helpers that cannot panic on a closed pipe. | flat |
+| [`fix/manifest.rs`](../crates/rocm-core/src/fix/manifest.rs) | The JSON catalog manifest `rocm fix --json` publishes, derived from `RECIPES` on every call. | flat |
+| [`fix/options.rs`](../crates/rocm-core/src/fix/options.rs) | The vocabulary of `rocm fix`: the exit codes (`exit`), `FixOptions` and `FixClass`. | flat |
+| [`fix/render.rs`](../crates/rocm-core/src/fix/render.rs) | Rendering the catalog for people: the listing, a recipe's plan and verify lines, the flag summary `rocm diagnose` shares, and the refusal of a diagnosis position as a fix-id. | flat |
+| [`fix/runners.rs`](../crates/rocm-core/src/fix/runners.rs) | The host-mutating runners, one per auto-applicable fix, each printing the exact change, honouring `--dry-run` and asking consent first. | flat |
+| [`foreign_temp_probe.rs`](../crates/rocm-core/src/foreign_temp_probe.rs) | Test probe that a writer publishing through `atomic_write` never touches another writer's temp file; built only for tests and the `test-support` feature. | flat |
 | [`gfx_target.rs`](../crates/rocm-core/src/gfx_target.rs) | Pure gfx-target lookups: extracting a gfx token, mapping a target to its TheRock family, the AMD PCI-id and marketing-name tables, and kernel gfx-version decoding. | domain |
 | [`gguf.rs`](../crates/rocm-core/src/gguf.rs) | Reads a GGUF model's shape (layers, heads, head width, parameter count, data offset) from its header, never the weights. | domain |
 | [`gguf_fit.rs`](../crates/rocm-core/src/gguf_fit.rs) | Pure arithmetic on whether a GGUF model fits in GPU memory at a context size: weights, KV cache, compute buffer and reserve against VRAM. | domain |
@@ -328,7 +328,7 @@ The library every first-party app and engine crate depends on. It holds host exa
 | [`probe_exec.rs`](../crates/rocm-core/src/probe_exec.rs) | Subprocess and file-read helpers for the host probes: `run` under a timeout, `which`, `read_text` and `read_host_text`. | domain |
 | [`proc_lifecycle.rs`](../crates/rocm-core/src/proc_lifecycle.rs) | Verified, bounded termination of a process by persisted PID, refusing to signal a PID whose start-time identity no longer matches. | flat |
 | [`process.rs`](../crates/rocm-core/src/process.rs) | Process spawn, run and terminate primitives: hidden-console and detached spawn, process-tree termination, `FileLock` and `run_with_timeout`. | domain |
-| [`process_tree_properties.rs`](../crates/rocm-core/src/process_tree_properties.rs) | Property tests for the process-tree traversal that decides which PIDs a `KillScope::Tree` stop signals. | test helper |
+| [`process_tree_properties.rs`](../crates/rocm-core/src/process_tree_properties.rs) | Property tests for the process-tree traversal that decides which PIDs a `KillScope::Tree` stop signals. | flat |
 | [`quoting.rs`](../crates/rocm-core/src/quoting.rs) | Quoting whose output must read back as exactly the value given: POSIX shell (`posix_shell_quote`) and PowerShell (`powershell_quote`). | domain |
 | [`report.rs`](../crates/rocm-core/src/report.rs) | The content of a Doctor report and the rule that decides whether one may be built at all, with no network or filesystem access. | flat |
 | [`report_delivery.rs`](../crates/rocm-core/src/report_delivery.rs) | How a Doctor report leaves the machine: building its link and deciding whether a browser may be started, never sending it. | flat |
@@ -339,8 +339,8 @@ The library every first-party app and engine crate depends on. It holds host exa
 | [`service_identity.rs`](../crates/rocm-core/src/service_identity.rs) | `ServiceId`, the validator every per-service id should pass before it reaches a path builder, and `generate_service_id` for a new launch. | domain |
 | [`service_record.rs`](../crates/rocm-core/src/service_record.rs) | `ManagedServiceRecord`, the on-disk manifest of a managed inference service, and the engine state-file keys that tie it to readiness probing. | domain |
 | [`terminal.rs`](../crates/rocm-core/src/terminal.rs) | One ECMA-48 walk over untrusted terminal output, and the stripping, line-splitting and quotability decisions built on it. | flat |
-| [`test_env.rs`](../crates/rocm-core/src/test_env.rs) | `RestoredEnvVar`: restores a process environment variable on drop, so a panicking test cannot leak it. | test helper |
-| [`test_support.rs`](../crates/rocm-core/src/test_support.rs) | Test fixtures for throwaway per-test `AppPaths` directories and for seeding the automation audit store. | test helper |
+| [`test_env.rs`](../crates/rocm-core/src/test_env.rs) | `RestoredEnvVar`: restores a process environment variable on drop, so a panicking test cannot leak it. | flat |
+| [`test_support.rs`](../crates/rocm-core/src/test_support.rs) | Test fixtures for throwaway per-test `AppPaths` directories and for seeding the automation audit store. | flat |
 | [`user_path.rs`](../crates/rocm-core/src/user_path.rs) | Removes the install directory from the per-user Windows `Path` that [`install.ps1`](../install.ps1) added it to. | flat |
 | [`uv.rs`](../crates/rocm-core/src/uv.rs) | Downloads a standalone `uv` into the managed cache, plus the `uv` argument and environment helpers `apps/rocm` and the vLLM engine share. | flat |
 | [`vllm_oom.rs`](../crates/rocm-core/src/vllm_oom.rs) | Picks and renders the user's failing vLLM out-of-memory line from a captured log tail, and owns the OOM marker strings. | domain |
@@ -378,7 +378,7 @@ The pure layer under the dashboard: telemetry, benchmark and protocol types, the
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-dash-core/src/lib.rs) | Crate root: module declarations, re-exports of the common types, and `AUTO_PORT_NOTE`, the wording for a serve port that is not yet resolved. | root |
+| [`lib.rs`](../crates/rocm-dash-core/src/lib.rs) | Crate root: module declarations, re-exports of the common types, and `AUTO_PORT_NOTE`, the wording for a serve port that is not yet resolved. | flat |
 | [`bench_rollup.rs`](../crates/rocm-dash-core/src/bench_rollup.rs) | Pass^N and Pass@N rollups (`rollup_pass_n`): groups benchmark rows into trial sets and gives each a strict and a lenient verdict plus mean throughput. | flat |
 | [`bench_schema.rs`](../crates/rocm-dash-core/src/bench_schema.rs) | `BenchmarkRow`, the one row type for a benchmark result, and `PassFail`, vendored from the instinct-agent-bench schema. | flat |
 | [`chat_template.rs`](../crates/rocm-dash-core/src/chat_template.rs) | The chat-template defaults a locally served model needs on an OpenAI-compatible chat request (`local_model_should_disable_thinking`). | flat |
@@ -412,7 +412,7 @@ The I/O-heavy collector implementations behind `rocm-dash-core`'s traits (amd-sm
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-dash-collectors/src/lib.rs) | Crate root: declares the public collector modules. | root |
+| [`lib.rs`](../crates/rocm-dash-collectors/src/lib.rs) | Crate root: declares the public collector modules. | flat |
 | [`amd_smi.rs`](../crates/rocm-dash-collectors/src/amd_smi.rs) | The amd-smi collector: runs `amd-smi ... --json` under a timeout after the GPU-device pre-flight and parses metrics, power limits, processes and system info tolerantly. | flat |
 | [`bench_load.rs`](../crates/rocm-dash-collectors/src/bench_load.rs) | The concurrency-sweep load generator behind `rocm bench load`: one aggregate `BenchmarkRow` per concurrency cell, appended to a CSV, with an optional auto-ramp. | flat |
 | [`bench_tail.rs`](../crates/rocm-dash-collectors/src/bench_tail.rs) | `CsvBenchTailer`: re-reads a benchmark CSV on each drain and yields the rows it has not returned yet. | flat |
@@ -439,7 +439,7 @@ The daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) driv
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-dash-daemon/src/lib.rs) | Crate root: module declarations, `DAEMON_VERSION` for the handshake, and re-exports of `RunnerOptions`, `run` and the collectors' `bench_load`. | root |
+| [`lib.rs`](../crates/rocm-dash-daemon/src/lib.rs) | Crate root: module declarations, `DAEMON_VERSION` for the handshake, and re-exports of `RunnerOptions`, `run` and the collectors' `bench_load`. | flat |
 | [`bench_ring.rs`](../crates/rocm-dash-daemon/src/bench_ring.rs) | `BenchRing`, the bounded benchmark-row history a late-joining client is sent when it subscribes. | flat |
 | [`demo.rs`](../crates/rocm-dash-daemon/src/demo.rs) | The synthetic-session generator behind `rocm dash --demo`: a deterministic recording of an 8-GPU node serving three vLLM containers, written as `PersistedEntry` lines. | flat |
 | [`persist.rs`](../crates/rocm-dash-daemon/src/persist.rs) | `SessionWriter`: appends every broadcast `Event` as a `PersistedEntry` line to one `session-*.ndjson` file per daemon session. | flat |
@@ -462,7 +462,7 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-dash-tui/src/lib.rs) | Library root: declares every module public, so `apps/rocm` runs the dashboard through `app::run` and examples drive the same modules in-process. | root |
+| [`lib.rs`](../crates/rocm-dash-tui/src/lib.rs) | Library root: declares every module public, so `apps/rocm` runs the dashboard through `app::run` and examples drive the same modules in-process. | flat |
 | [`client.rs`](../crates/rocm-dash-tui/src/client.rs) | The connection task behind the event stream, and `ClientMsg`, the one message type the app loop reads: connect, handshake, forward events, reconnect with backoff. | flat |
 | [`jobs.rs`](../crates/rocm-dash-tui/src/jobs.rs) | The one async process runner the operational screens share: runs each `SideEffect::SpawnJob`, streams its output as `StateEvent::JobLine` and kills the child on cancel. | flat |
 | [`llm.rs`](../crates/rocm-dash-tui/src/llm.rs) | Chat endpoint configuration: the precedence resolver `resolve_llm_config`, a TCP-only liveness probe and local-engine endpoint detection, with no HTTP client. | flat |
@@ -488,21 +488,21 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 | [`app/mod.rs`](../crates/rocm-dash-tui/src/app/mod.rs) | The reducer's front: `AppState` and its constructor, the theme picker, row selection, and `apply_event`, which folds daemon events into state. | flat |
 | [`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs) | `KeyAction` dispatch: maps a key press or a resolved mouse hit to a `KeyAction` and applies it to reducer state (`apply_action`). | domain |
 | [`app/chat.rs`](../crates/rocm-dash-tui/src/app/chat.rs) | Chat-backend construction, local-engine detection, and saving an accepted endpoint to the dashboard config. | relocation |
-| [`app/chat_runtime.rs`](../crates/rocm-dash-tui/src/app/chat_runtime.rs) | `ChatRuntime`, the live chat backend the tick loop owns: which agent answers the next turn, and the drains for the provider-switch, endpoint-rebuild and dispatch edges. | child |
-| [`app/chat_state.rs`](../crates/rocm-dash-tui/src/app/chat_state.rs) | An `impl AppState` block for chat consent, the local-endpoint detection offer, submitting a turn, and applying the agent's reply or error. | child |
+| [`app/chat_runtime.rs`](../crates/rocm-dash-tui/src/app/chat_runtime.rs) | `ChatRuntime`, the live chat backend the tick loop owns: which agent answers the next turn, and the drains for the provider-switch, endpoint-rebuild and dispatch edges. | flat |
+| [`app/chat_state.rs`](../crates/rocm-dash-tui/src/app/chat_state.rs) | An `impl AppState` block for chat consent, the local-endpoint detection offer, submitting a turn, and applying the agent's reply or error. | flat |
 | [`app/event_loop.rs`](../crates/rocm-dash-tui/src/app/event_loop.rs) | The tick loop: `run` (set up, run, tear down) and `event_loop`, with the frame-draw gate and the registry-probe seeding. | domain |
-| [`app/focus.rs`](../crates/rocm-dash-tui/src/app/focus.rs) | Focused-host policy: what a dashboard launched for Setup, Serve or Examine does differently (no daemon client or chat, one overlay opened at start, console close keys swallowed). | child |
-| [`app/overlays.rs`](../crates/rocm-dash-tui/src/app/overlays.rs) | An `impl AppState` block for which overlay owns the keyboard, `close_overlays`, and the gating predicates the key handlers and the renderer consult. | child |
-| [`app/quit_confirm.rs`](../crates/rocm-dash-tui/src/app/quit_confirm.rs) | An `impl AppState` block for the quit-confirm prompt: the live-instance gates, and opening, answering and resolving it. | child |
-| [`app/scroll.rs`](../crates/rocm-dash-tui/src/app/scroll.rs) | An `impl AppState` block for scroll offsets and recorded scrollbar tracks, and `ScrollState`, the shared clamped signed-delta scroll for a `u16` offset with a known bound. | child |
+| [`app/focus.rs`](../crates/rocm-dash-tui/src/app/focus.rs) | Focused-host policy: what a dashboard launched for Setup, Serve or Examine does differently (no daemon client or chat, one overlay opened at start, console close keys swallowed). | flat |
+| [`app/overlays.rs`](../crates/rocm-dash-tui/src/app/overlays.rs) | An `impl AppState` block for which overlay owns the keyboard, `close_overlays`, and the gating predicates the key handlers and the renderer consult. | flat |
+| [`app/quit_confirm.rs`](../crates/rocm-dash-tui/src/app/quit_confirm.rs) | An `impl AppState` block for the quit-confirm prompt: the live-instance gates, and opening, answering and resolving it. | flat |
+| [`app/scroll.rs`](../crates/rocm-dash-tui/src/app/scroll.rs) | An `impl AppState` block for scroll offsets and recorded scrollbar tracks, and `ScrollState`, the shared clamped signed-delta scroll for a `u16` offset with a known bound. | flat |
 | [`app/scrollbar.rs`](../crates/rocm-dash-tui/src/app/scrollbar.rs) | Mouse hit-testing: resolves a raw `MouseEvent` against recorded scrollbar tracks, the tab bar and the footer chips into a `KeyAction`. | domain |
 | [`app/slash.rs`](../crates/rocm-dash-tui/src/app/slash.rs) | Slash-command routing for the chat input (`handle_slash_command`): mutates state, raises a one-shot edge for the event loop, or pushes a usage turn, with no I/O. | relocation |
 | [`app/summary.rs`](../crates/rocm-dash-tui/src/app/summary.rs) | Pure display helpers: bounded summaries of read-only slash-tool results, and the parser of a natural-language plan into a `PlannedAction`. | relocation |
-| [`app/terminal.rs`](../crates/rocm-dash-tui/src/app/terminal.rs) | Terminal restoration and shutdown arbitration: `restore_terminal`, the `SHUTTING_DOWN` latch, the termination-signal watcher and the Ctrl+C path. | child |
-| [`app/test_support.rs`](../crates/rocm-dash-tui/src/app/test_support.rs) | Test-only helpers shared by the `app` and `ui` test modules. | test helper |
-| [`app/tool_approval.rs`](../crates/rocm-dash-tui/src/app/tool_approval.rs) | An `impl AppState` block for the chat tool-approval flow: handing a plan's action to approval, opening the modal for a mutating-tool intent, and routing the verdict. | child |
+| [`app/terminal.rs`](../crates/rocm-dash-tui/src/app/terminal.rs) | Terminal restoration and shutdown arbitration: `restore_terminal`, the `SHUTTING_DOWN` latch, the termination-signal watcher and the Ctrl+C path. | flat |
+| [`app/test_support.rs`](../crates/rocm-dash-tui/src/app/test_support.rs) | Test-only helpers shared by the `app` and `ui` test modules. | flat |
+| [`app/tool_approval.rs`](../crates/rocm-dash-tui/src/app/tool_approval.rs) | An `impl AppState` block for the chat tool-approval flow: handing a plan's action to approval, opening the modal for a mutating-tool intent, and routing the verdict. | flat |
 | [`app/types.rs`](../crates/rocm-dash-tui/src/app/types.rs) | Shared reducer types (`Focus`, `ResolvedArgs`, `Modal`, tab, chat and replay state, the slash and approval payloads) and the Esc-menu, palette and options navigation data. | domain |
-| [`app/update_check.rs`](../crates/rocm-dash-tui/src/app/update_check.rs) | The background Updates-tile check: the tick-driven `rocm update --json` job and the reducer that turns its output into an `UpdateStatus`. | child |
+| [`app/update_check.rs`](../crates/rocm-dash-tui/src/app/update_check.rs) | The background Updates-tile check: the tick-driven `rocm update --json` job and the reducer that turns its output into an `UpdateStatus`. | flat |
 
 #### `ui/`
 
@@ -520,31 +520,31 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 | [`ui/examine_manager.rs`](../crates/rocm-dash-tui/src/ui/examine_manager.rs) | The Examine overlay: runs `rocm examine` read-only, and previews a Doctor report and sends it after approval. | flat |
 | [`ui/exec.rs`](../crates/rocm-dash-tui/src/ui/exec.rs) | Helpers for launching a `rocm` sub-command from an operational screen: binary resolution, approval-preview quoting and the `rocm runtimes adopt` argv. | flat |
 | [`ui/folder_browser.rs`](../crates/rocm-dash-tui/src/ui/folder_browser.rs) | The shared directory picker: use-current, new-child, parent and sub-directory entries, with only `build_entries` touching the filesystem. | flat |
-| [`ui/footer.rs`](../crates/rocm-dash-tui/src/ui/footer.rs) | The footer: the key-hint chips, the Esc chip's context-dependent label, and the chip regions mouse hit-testing resolves against. | child |
+| [`ui/footer.rs`](../crates/rocm-dash-tui/src/ui/footer.rs) | The footer: the key-hint chips, the Esc chip's context-dependent label, and the chip regions mouse hit-testing resolves against. | flat |
 | [`ui/format.rs`](../crates/rocm-dash-tui/src/ui/format.rs) | Pure value formatters every tab uses (memory, percentages, rates, power, temperature, durations), including the held-value marker. | flat |
 | [`ui/gradient.rs`](../crates/rocm-dash-tui/src/ui/gradient.rs) | `GradientGauge`, a gauge whose fill sweeps a three-stop color ramp, and `lerp3_t`, the shared three-stop interpolation. | flat |
-| [`ui/header.rs`](../crates/rocm-dash-tui/src/ui/header.rs) | The header: the title line, the connection state, and the warning badge with its click region. | child |
-| [`ui/help_modal.rs`](../crates/rocm-dash-tui/src/ui/help_modal.rs) | The Help modals (per-tab help and the global keyboard reference), and `popup_height_for`, the content-sized popup arithmetic. | child |
+| [`ui/header.rs`](../crates/rocm-dash-tui/src/ui/header.rs) | The header: the title line, the connection state, and the warning badge with its click region. | flat |
+| [`ui/help_modal.rs`](../crates/rocm-dash-tui/src/ui/help_modal.rs) | The Help modals (per-tab help and the global keyboard reference), and `popup_height_for`, the content-sized popup arithmetic. | flat |
 | [`ui/install_manager.rs`](../crates/rocm-dash-tui/src/ui/install_manager.rs) | The Install overlay: builds a `rocm install sdk` invocation; a dry run starts directly and a real install goes through approval. | flat |
-| [`ui/instance_detail.rs`](../crates/rocm-dash-tui/src/ui/instance_detail.rs) | The instance Detail modal: a summary strip, recent throughput, and scrollable launch-args and env-var panes over a dimmed backdrop. | child |
+| [`ui/instance_detail.rs`](../crates/rocm-dash-tui/src/ui/instance_detail.rs) | The instance Detail modal: a summary strip, recent throughput, and scrollable launch-args and env-var panes over a dimmed backdrop. | flat |
 | [`ui/job_console.rs`](../crates/rocm-dash-tui/src/ui/job_console.rs) | The shared "a job is running" surface: `draw_job_console` renders the status header, streamed output and key hints, and `on_console_key` handles its keys. | flat |
 | [`ui/launcher.rs`](../crates/rocm-dash-tui/src/ui/launcher.rs) | The bare-`rocm` front door: a synchronous pre-dashboard screen with a status strip over the headline verbs, returning a `LauncherChoice`. | flat |
 | [`ui/logs_view.rs`](../crates/rocm-dash-tui/src/ui/logs_view.rs) | The Logs overlay: `rocm logs`, optionally with search terms, read-only into the job console. | flat |
-| [`ui/menu.rs`](../crates/rocm-dash-tui/src/ui/menu.rs) | The Esc main menu, the command palette and the tabbed Options panel, with the block-letter logo they share. | child |
-| [`ui/modal.rs`](../crates/rocm-dash-tui/src/ui/modal.rs) | Re-exports only, so every item that was public at `ui::modal` before its split still resolves there. | child |
+| [`ui/menu.rs`](../crates/rocm-dash-tui/src/ui/menu.rs) | The Esc main menu, the command palette and the tabbed Options panel, with the block-letter logo they share. | flat |
+| [`ui/modal.rs`](../crates/rocm-dash-tui/src/ui/modal.rs) | Re-exports only, so every item that was public at `ui::modal` before its split still resolves there. | flat |
 | [`ui/model_picker.rs`](../crates/rocm-dash-tui/src/ui/model_picker.rs) | A filterable list of model recipes the Serve form opens; choosing one fills only the model id. | flat |
 | [`ui/onboarding.rs`](../crates/rocm-dash-tui/src/ui/onboarding.rs) | The onboarding wizard: install the ROCm SDK or adopt an existing ROCm folder, both behind an approval. | flat |
 | [`ui/panel.rs`](../crates/rocm-dash-tui/src/ui/panel.rs) | The shared box chrome: `bento` and `popup` panels, scrollbars, and popup geometry and framing (`centered_rect`, `centered_width`, `draw_popup_frame`, `grey_overlay`). | flat |
-| [`ui/quit_confirm.rs`](../crates/rocm-dash-tui/src/ui/quit_confirm.rs) | The quit-confirm prompt's content (`quit_confirm_request`): the title, the body listing what is still served, and the stop hint. | child |
+| [`ui/quit_confirm.rs`](../crates/rocm-dash-tui/src/ui/quit_confirm.rs) | The quit-confirm prompt's content (`quit_confirm_request`): the title, the body listing what is still served, and the stop hint. | flat |
 | [`ui/runtime_manager.rs`](../crates/rocm-dash-tui/src/ui/runtime_manager.rs) | The Runtimes overlay: lists the registered runtimes and runs the `rocm runtimes` verbs, the mutating ones behind an approval. | flat |
 | [`ui/serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs) | The Serve form: builds a model-first `rocm serve` invocation and launches it as a job behind an approval. | flat |
 | [`ui/services_manager.rs`](../crates/rocm-dash-tui/src/ui/services_manager.rs) | The Services overlay: lists the managed inference services with live throughput, and stops or restarts one behind an approval. | flat |
 | [`ui/sparkline.rs`](../crates/rocm-dash-tui/src/ui/sparkline.rs) | `BrailleSparkline`, a history graph that packs two samples into each character column at four dot rows per cell. | flat |
 | [`ui/spinner.rs`](../crates/rocm-dash-tui/src/ui/spinner.rs) | Pure helpers for the braille spinner frame (`spinner_frame`) and progress-percentage parsing (`parse_progress_pct`) the job console renders with. | flat |
 | [`ui/theme.rs`](../crates/rocm-dash-tui/src/ui/theme.rs) | The semantic `Theme` and its catalogue, and the shared status-to-color mapping (`StatusTone`, `tone_color`, `job_status_color`, `instance_status_color`). | flat |
-| [`ui/theme_picker.rs`](../crates/rocm-dash-tui/src/ui/theme_picker.rs) | The theme picker modal: the registered themes beside a live preview of the highlighted one. | child |
+| [`ui/theme_picker.rs`](../crates/rocm-dash-tui/src/ui/theme_picker.rs) | The theme picker modal: the registered themes beside a live preview of the highlighted one. | flat |
 | [`ui/update_manager.rs`](../crates/rocm-dash-tui/src/ui/update_manager.rs) | The Update overlay: the `rocm update` check and dry-run preview start directly; applying goes through an approval. | flat |
-| [`ui/warnings_modal.rs`](../crates/rocm-dash-tui/src/ui/warnings_modal.rs) | The Warnings modal: the text behind the header's warning badge, content-sized like the Help modals. | child |
+| [`ui/warnings_modal.rs`](../crates/rocm-dash-tui/src/ui/warnings_modal.rs) | The Warnings modal: the text behind the header's warning badge, content-sized like the Help modals. | flat |
 | [`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs) | Small helpers shared across tabs, including `apply_char_key` and `apply_char_key_filtered`, the append-only text-field edit the form key handlers use. | flat |
 
 #### `ui/tabs/`
@@ -594,7 +594,7 @@ A contract surface: verify all impacted engines after any protocol change here (
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-engine-protocol/src/lib.rs) | The whole crate: protocol versions, the request/response envelopes and per-method types, device and GPU-selection policy, engine-plugin discovery, and the endpoint API key file carrier shared by `rocm` and `rocmd`. | root |
+| [`lib.rs`](../crates/rocm-engine-protocol/src/lib.rs) | The whole crate: protocol versions, the request/response envelopes and per-method types, device and GPU-selection policy, engine-plugin discovery, and the endpoint API key file carrier shared by `rocm` and `rocmd`. | flat |
 
 ### `crates/rocm-deps`
 
@@ -602,7 +602,7 @@ Pinned versions of the third-party runtimes rocm-cli manages, read from the work
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names and download URLs from them. | root |
+| [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names and download URLs from them. | flat |
 
 ### `crates/e2e-report`
 
@@ -610,7 +610,7 @@ HTML and markdown reporting for the cucumber E2E suite, consumed only by `xtask`
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/e2e-report/src/lib.rs) | Crate root: module declarations and the public API re-exports. | root |
+| [`lib.rs`](../crates/e2e-report/src/lib.rs) | Crate root: module declarations and the public API re-exports. | flat |
 | [`command_coverage.rs`](../crates/e2e-report/src/command_coverage.rs) | The CLI command-coverage audit table: which `rocm` commands a platform's run exercised and whether they passed. | domain |
 | [`components.rs`](../crates/e2e-report/src/components.rs) | Shared maud HTML fragments plus the CSS and timestamp helpers both report generators use. | flat |
 | [`consolidated/mod.rs`](../crates/e2e-report/src/consolidated/mod.rs) | The `PlatformReport` model, the reconciled scenario by platform `Grid`, the `PlatformReports` bundle and `load_platform_reports`, plus the report text both renderers share. | domain |
@@ -618,7 +618,7 @@ HTML and markdown reporting for the cucumber E2E suite, consumed only by `xtask`
 | [`consolidated/html.rs`](../crates/e2e-report/src/consolidated/html.rs) | The HTML renderer for the consolidated report. | domain |
 | [`consolidated/markdown.rs`](../crates/e2e-report/src/consolidated/markdown.rs) | The markdown renderer, including the table piped into `$GITHUB_STEP_SUMMARY`. | domain |
 | [`consolidated/sidecars.rs`](../crates/e2e-report/src/consolidated/sidecars.rs) | Schema and parsing for the `platform.json` manifest and the `commands.jsonl` record. | domain |
-| [`consolidated/test_support.rs`](../crates/e2e-report/src/consolidated/test_support.rs) | Test-only fixtures shared by the `consolidated/` tests. | test helper |
+| [`consolidated/test_support.rs`](../crates/e2e-report/src/consolidated/test_support.rs) | Test-only fixtures shared by the `consolidated/` tests. | flat |
 | [`parse.rs`](../crates/e2e-report/src/parse.rs) | The cucumber `report.json` data model, its parsing, and `@expected-failure` evaluation. | flat |
 | [`single_report.rs`](../crates/e2e-report/src/single_report.rs) | Single-platform HTML report generation. | flat |
 
@@ -635,8 +635,8 @@ The Lemonade engine adapter (`rocm-engine-lemonade`): installs the embeddable Le
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../engines/lemonade/src/lib.rs) | Crate root: CLI and envelope dispatch, the service-lifecycle orchestration that calls across the modules, and the crate-root re-exports `apps/rocm` uses. | root |
-| [`main.rs`](../engines/lemonade/src/main.rs) | The `rocm-engine-lemonade` binary's entry point; it only calls `rocm_engine_lemonade::run_cli()`. | root |
+| [`lib.rs`](../engines/lemonade/src/lib.rs) | Crate root: CLI and envelope dispatch, the service-lifecycle orchestration that calls across the modules, and the crate-root re-exports `apps/rocm` uses. | flat |
+| [`main.rs`](../engines/lemonade/src/main.rs) | The `rocm-engine-lemonade` binary's entry point; it only calls `rocm_engine_lemonade::run_cli()`. | flat |
 | [`archive_cache.rs`](../engines/lemonade/src/archive_cache.rs) | The cached embeddable-archive layer: SHA-256 verification, verified publication into the cache, and the per-archive lock `ensure_cached_archive` returns as an `ArchiveCacheGuard` to hold while using the bytes. | domain |
 | [`archive_extract.rs`](../engines/lemonade/src/archive_extract.rs) | The hardened in-process tar.gz and zip extractor for the embeddable archive, and the containment-checked `copy_tree` into the runtime directory. | domain |
 | [`backend_alignment.rs`](../engines/lemonade/src/backend_alignment.rs) | Aligning the llama.cpp backend with the ROCm SDK (Tier 1, Tier 2, revert), including the `backend_versions.json` pin and setting ROCm backend directories aside around a forced reinstall. | domain |
@@ -648,7 +648,7 @@ The Lemonade engine adapter (`rocm-engine-lemonade`): installs the embeddable Le
 | [`process.rs`](../engines/lemonade/src/process.rs) | `lemond` spawn, environment and path setup, readiness and health polling, and the background relaunch of the `serve-http` command. | domain |
 | [`runtime_dir.rs`](../engines/lemonade/src/runtime_dir.rs) | `XDG_RUNTIME_DIR` tier 1, 2 and 3 hardening for the spawned child. | domain |
 | [`state.rs`](../engines/lemonade/src/state.rs) | Service state file I/O and port and endpoint helpers. | domain |
-| [`test_support.rs`](../engines/lemonade/src/test_support.rs) | Test-only fixtures shared by the crate's module tests. | test helper |
+| [`test_support.rs`](../engines/lemonade/src/test_support.rs) | Test-only fixtures shared by the crate's module tests. | flat |
 
 Boundaries:
 
@@ -665,8 +665,8 @@ The vLLM engine adapter (`rocm-engine-vllm`): installs vLLM into a managed TheRo
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../engines/vllm/src/lib.rs) | Crate root: CLI and envelope dispatch and the few items shared across the modules, including `verified_torchaudio_release` for the `rocm` binary. | root |
-| [`main.rs`](../engines/vllm/src/main.rs) | The `rocm-engine-vllm` binary's entry point; it only calls `rocm_engine_vllm::run_cli()`. | root |
+| [`lib.rs`](../engines/vllm/src/lib.rs) | Crate root: CLI and envelope dispatch and the few items shared across the modules, including `verified_torchaudio_release` for the `rocm` binary. | flat |
+| [`main.rs`](../engines/vllm/src/main.rs) | The `rocm-engine-vllm` binary's entry point; it only calls `rocm_engine_vllm::run_cli()`. | flat |
 | [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) | The ROCm 10.x discovery table (`VLLM_ROCM_DISCOVER_BUILD_TABLE`, one row per supported `major.minor` line), its lookup and the series matcher. | domain |
 | [`install.rs`](../engines/vllm/src/install.rs) | ROCm and vLLM install execution through `uv`, by the static-pin route or the ROCm 10.x discovery route. | domain |
 | [`process.rs`](../engines/vllm/src/process.rs) | The resolve-model, launch, serve and stop handlers: recipe validation, device-policy and GPU-index resolution, the vLLM server spawn and launch environment, and readiness polling. | domain |
@@ -689,8 +689,8 @@ The AIM engine adapter (`rocm-engine-aim`) runs models as Docker containers inst
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../engines/aim/src/lib.rs) | Crate root: CLI and envelope dispatch, including the `builtin_*` entry points the `rocm` binary calls in-process, the detect and capabilities responses, and the items shared across the modules. | root |
-| [`main.rs`](../engines/aim/src/main.rs) | The `rocm-engine-aim` binary's entry point; it only calls `rocm_engine_aim::run_cli()`. | root |
+| [`lib.rs`](../engines/aim/src/lib.rs) | Crate root: CLI and envelope dispatch, including the `builtin_*` entry points the `rocm` binary calls in-process, the detect and capabilities responses, and the items shared across the modules. | flat |
+| [`main.rs`](../engines/aim/src/main.rs) | The `rocm-engine-aim` binary's entry point; it only calls `rocm_engine_aim::run_cli()`. | flat |
 | [`docker.rs`](../engines/aim/src/docker.rs) | A thin wrapper around the `docker` CLI binary, with no Docker API client, and `container_name`, a service's deterministic Docker-safe container name. | flat |
 | [`install.rs`](../engines/aim/src/install.rs) | Install for an engine whose images are self-contained: only a check that Docker is present and reachable. | flat |
 | [`process.rs`](../engines/aim/src/process.rs) | The container run, readiness and stop lifecycle, including `serve_http`, which blocks for the container's lifetime and records how it ended. | flat |
@@ -709,7 +709,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`main.rs`](../xtask/src/main.rs) | The clap command tree and its dispatch: most `cargo xtask` commands dispatch to a module of their own. | root |
+| [`main.rs`](../xtask/src/main.rs) | The clap command tree and its dispatch: most `cargo xtask` commands dispatch to a module of their own. | flat |
 | [`affected.rs`](../xtask/src/affected.rs) | `cargo xtask affected`: the crates a git range changes plus their transitive dependents, as cargo package flags, falling back to `--workspace` for any file it cannot attribute. | flat |
 | [`amd_smi_launch_contract.rs`](../xtask/src/amd_smi_launch_contract.rs) | Source-scan test pinning which call sites may resolve the `amd-smi` binary, so every launch passes the `/dev/kfd` pre-flight. | flat |
 | [`architecture_doc.rs`](../xtask/src/architecture_doc.rs) | `cargo xtask check-architecture-doc`: fails when a production source file under `apps/`, `crates/` or `engines/` has no link in this document. | flat |
@@ -738,7 +738,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 | [`report_mailbox.rs`](../xtask/src/report_mailbox.rs) | Reads Doctor reports out of exported `.eml` mail, keeping only the headers the rollup needs and reducing `Date` to a week. | flat |
 | [`report_rollup.rs`](../xtask/src/report_rollup.rs) | `cargo xtask report-rollup`: counts received Doctor reports by problem group and week from exported mail or JSON bodies; it reads and prints, and sends nothing. | flat |
 | [`rocm_releases.rs`](../xtask/src/rocm_releases.rs) | Checked-in table resolving the E2E `sdk_version` labels (`current`, `n-1`, `n-2`) to TheRock package versions, with no pin for `current`, updated by hand. | flat |
-| [`rust_source.rs`](../xtask/src/rust_source.rs) | Lexical helpers for the source-scan tests, chiefly `strip_literals_and_comments`, so every contract skips literals and comments the same way. | test helper |
+| [`rust_source.rs`](../xtask/src/rust_source.rs) | Lexical helpers for the source-scan tests, chiefly `strip_literals_and_comments`, so every contract skips literals and comments the same way. | flat |
 | [`signing.rs`](../xtask/src/signing.rs) | The `keygen`, `sign` and `verify` commands: the file I/O layer over the RSA release-artifact signing in `rocm-core`. | flat |
 | [`tpn.rs`](../xtask/src/tpn.rs) | `cargo xtask tpn`: regenerates or checks [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt) through cargo-about with the committed config and template. | flat |
 | [`verify_commits.rs`](../xtask/src/verify_commits.rs) | `cargo xtask verify-commits`: checks that every commit in a range is signed and carries a DCO `Signed-off-by` trailer, or only that signing is configured. | flat |
@@ -759,44 +759,44 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`src/lib.rs`](../tests/e2e-cucumber/src/lib.rs) | Library root for the test targets and the demo binary: declares the helper modules, re-exports `e2e-report` as `report`, and holds small shared helpers such as `cli_failure_report`. | root |
-| [`src/binary_path.rs`](../tests/e2e-cucumber/src/binary_path.rs) | Pins a relative `ROCM_CLI_BINARY` path before a scenario runs the child from another directory, and leaves a bare name for `PATH` to resolve. | test helper |
-| [`src/capability.rs`](../tests/e2e-cucumber/src/capability.rs) | Host capability probe: runs `rocm examine` and `rocm engines list` once, and re-derives the serve engine the CLI would pick and the AMD GPU count. | test helper |
-| [`src/chat_request.rs`](../tests/e2e-cucumber/src/chat_request.rs) | The chat round trip against a served endpoint (model discovery, then one chat completion), run on its own task so its timeout measures the server. | test helper |
-| [`src/device_memory.rs`](../tests/e2e-cucumber/src/device_memory.rs) | Which device memory pool (VRAM, or GTT-backed memory on an APU) the drain-wait between serve scenarios judges, how it is sampled, and the free-memory floor. | test helper |
-| [`src/expectation.rs`](../tests/e2e-cucumber/src/expectation.rs) | Resolves each scenario on this host to expected-pass, expected-fail or skip from its tags, the capability probe and the [`expectations.toml`](../tests/e2e-cucumber/expectations.toml) matrix. | test helper |
-| [`src/fixture_binary.rs`](../tests/e2e-cucumber/src/fixture_binary.rs) | Locates a fake-subprocess `[[bin]]` of this crate next to the running test binary. | test helper |
-| [`src/harness_diagnostics.rs`](../tests/e2e-cucumber/src/harness_diagnostics.rs) | Records a panic that escapes the cucumber run, which cucumber's silenced panic hook would hide, and the state of the standard streams, to stderr and a results-dir log. | test helper |
-| [`src/http_server.rs`](../tests/e2e-cucumber/src/http_server.rs) | Shared `axum` test-server plumbing: bind an ephemeral loopback port, serve a router, shut down on drop. | test helper |
-| [`src/installer_fixture.rs`](../tests/e2e-cucumber/src/installer_fixture.rs) | `with_pinned_release_keys`: a copy of the PowerShell installer with its two pinned-key assignments replaced, failing on any shape it does not expect. | test helper |
-| [`src/lemonade_diagnostics.rs`](../tests/e2e-cucumber/src/lemonade_diagnostics.rs) | Read-only backend evidence for a failed Lemonade serve, read from disk before the service stops and probed with `llama-server` after. | test helper |
-| [`src/loopback_http.rs`](../tests/e2e-cucumber/src/loopback_http.rs) | Loopback file server (`tower_http`'s `ServeDir`) that install, artifact and release-index scenarios point the real installer or CLI at. | test helper |
-| [`src/mock_server.rs`](../tests/e2e-cucumber/src/mock_server.rs) | The mock OpenAI-compatible server (fixed, scripted, rejecting or metrics-serving) and the writer for planted managed-service records. | test helper |
-| [`src/model_id.rs`](../tests/e2e-cucumber/src/model_id.rs) | `model_ids_match`: whether the model id a server reports names the requested model, across Lemonade file names and vLLM repo ids. | test helper |
-| [`src/monotonic_clock.rs`](../tests/e2e-cucumber/src/monotonic_clock.rs) | Rebuilds a non-decreasing timeline from cucumber's wall-clock event stamps so the JSON and JUnit writers never panic on a clock that stepped back. | test helper |
-| [`src/paced_download.rs`](../tests/e2e-cucumber/src/paced_download.rs) | Loopback server that serves one named file in delayed chunks, so a PTY scenario can see intermediate download-progress frames. | test helper |
-| [`src/palette_rows.rs`](../tests/e2e-cucumber/src/palette_rows.rs) | Which destination rows of the dashboard's command palette a rendered screen still lacks. | test helper |
-| [`src/panic_capture.rs`](../tests/e2e-cucumber/src/panic_capture.rs) | Panic-message extraction and mutex-poison recovery for drivers that run background threads. | test helper |
-| [`src/planted_path.rs`](../tests/e2e-cucumber/src/planted_path.rs) | The `PATH` handed to the `rocm` child when a scenario plants its own `rocminfo`, dropping runner entries that hold one. | test helper |
-| [`src/polled_deadline.rs`](../tests/e2e-cucumber/src/polled_deadline.rs) | `PolledDeadline`: a retry-loop deadline that counts only the time the loop was polled, with a wall-clock cap. | test helper |
-| [`src/powershell_text_rule.rs`](../tests/e2e-cucumber/src/powershell_text_rule.rs) | The text rule for the Windows lines `rocm fix` and `rocm diagnose` print, a copy of the rule in `rocm-core` checked against a shared fixture table. | test helper |
-| [`src/quit_and_wait.rs`](../tests/e2e-cucumber/src/quit_and_wait.rs) | Retry loop for quitting a TUI that may open a quit-confirm prompt first. | test helper |
-| [`src/reader_failure.rs`](../tests/e2e-cucumber/src/reader_failure.rs) | Failure state shared between a background terminal reader and its waiters. | test helper |
-| [`src/runtime_root.rs`](../tests/e2e-cucumber/src/runtime_root.rs) | `check_runtime_root_not_nested`: judges the active runtime folder `rocm examine` prints and rejects a doubly nested `runtimes/wheel` path. | test helper |
-| [`src/send_until.rs`](../tests/e2e-cucumber/src/send_until.rs) | Retry loop for sending an idempotent terminal input until its effect appears. | test helper |
-| [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail. | test helper |
-| [`src/serve_plan.rs`](../tests/e2e-cucumber/src/serve_plan.rs) | Explains why a `rocm serve` run printed no `resolved model:` line by keeping stderr's refusal alongside stdout. | test helper |
-| [`src/shared_runtime.rs`](../tests/e2e-cucumber/src/shared_runtime.rs) | Picks which runtime a scenario activates out of the shared pre-warmed runtime tree, which may hold more than one. | test helper |
-| [`src/terminal_size.rs`](../tests/e2e-cucumber/src/terminal_size.rs) | Validates a requested terminal size and applies it to the emulated screen before the real PTY. | test helper |
+| [`src/lib.rs`](../tests/e2e-cucumber/src/lib.rs) | Library root for the test targets and the demo binary: declares the helper modules, re-exports `e2e-report` as `report`, and holds small shared helpers such as `cli_failure_report`. | flat |
+| [`src/binary_path.rs`](../tests/e2e-cucumber/src/binary_path.rs) | Pins a relative `ROCM_CLI_BINARY` path before a scenario runs the child from another directory, and leaves a bare name for `PATH` to resolve. | flat |
+| [`src/capability.rs`](../tests/e2e-cucumber/src/capability.rs) | Host capability probe: runs `rocm examine` and `rocm engines list` once, and re-derives the serve engine the CLI would pick and the AMD GPU count. | flat |
+| [`src/chat_request.rs`](../tests/e2e-cucumber/src/chat_request.rs) | The chat round trip against a served endpoint (model discovery, then one chat completion), run on its own task so its timeout measures the server. | flat |
+| [`src/device_memory.rs`](../tests/e2e-cucumber/src/device_memory.rs) | Which device memory pool (VRAM, or GTT-backed memory on an APU) the drain-wait between serve scenarios judges, how it is sampled, and the free-memory floor. | flat |
+| [`src/expectation.rs`](../tests/e2e-cucumber/src/expectation.rs) | Resolves each scenario on this host to expected-pass, expected-fail or skip from its tags, the capability probe and the [`expectations.toml`](../tests/e2e-cucumber/expectations.toml) matrix. | flat |
+| [`src/fixture_binary.rs`](../tests/e2e-cucumber/src/fixture_binary.rs) | Locates a fake-subprocess `[[bin]]` of this crate next to the running test binary. | flat |
+| [`src/harness_diagnostics.rs`](../tests/e2e-cucumber/src/harness_diagnostics.rs) | Records a panic that escapes the cucumber run, which cucumber's silenced panic hook would hide, and the state of the standard streams, to stderr and a results-dir log. | flat |
+| [`src/http_server.rs`](../tests/e2e-cucumber/src/http_server.rs) | Shared `axum` test-server plumbing: bind an ephemeral loopback port, serve a router, shut down on drop. | flat |
+| [`src/installer_fixture.rs`](../tests/e2e-cucumber/src/installer_fixture.rs) | `with_pinned_release_keys`: a copy of the PowerShell installer with its two pinned-key assignments replaced, failing on any shape it does not expect. | flat |
+| [`src/lemonade_diagnostics.rs`](../tests/e2e-cucumber/src/lemonade_diagnostics.rs) | Read-only backend evidence for a failed Lemonade serve, read from disk before the service stops and probed with `llama-server` after. | flat |
+| [`src/loopback_http.rs`](../tests/e2e-cucumber/src/loopback_http.rs) | Loopback file server (`tower_http`'s `ServeDir`) that install, artifact and release-index scenarios point the real installer or CLI at. | flat |
+| [`src/mock_server.rs`](../tests/e2e-cucumber/src/mock_server.rs) | The mock OpenAI-compatible server (fixed, scripted, rejecting or metrics-serving) and the writer for planted managed-service records. | flat |
+| [`src/model_id.rs`](../tests/e2e-cucumber/src/model_id.rs) | `model_ids_match`: whether the model id a server reports names the requested model, across Lemonade file names and vLLM repo ids. | flat |
+| [`src/monotonic_clock.rs`](../tests/e2e-cucumber/src/monotonic_clock.rs) | Rebuilds a non-decreasing timeline from cucumber's wall-clock event stamps so the JSON and JUnit writers never panic on a clock that stepped back. | flat |
+| [`src/paced_download.rs`](../tests/e2e-cucumber/src/paced_download.rs) | Loopback server that serves one named file in delayed chunks, so a PTY scenario can see intermediate download-progress frames. | flat |
+| [`src/palette_rows.rs`](../tests/e2e-cucumber/src/palette_rows.rs) | Which destination rows of the dashboard's command palette a rendered screen still lacks. | flat |
+| [`src/panic_capture.rs`](../tests/e2e-cucumber/src/panic_capture.rs) | Panic-message extraction and mutex-poison recovery for drivers that run background threads. | flat |
+| [`src/planted_path.rs`](../tests/e2e-cucumber/src/planted_path.rs) | The `PATH` handed to the `rocm` child when a scenario plants its own `rocminfo`, dropping runner entries that hold one. | flat |
+| [`src/polled_deadline.rs`](../tests/e2e-cucumber/src/polled_deadline.rs) | `PolledDeadline`: a retry-loop deadline that counts only the time the loop was polled, with a wall-clock cap. | flat |
+| [`src/powershell_text_rule.rs`](../tests/e2e-cucumber/src/powershell_text_rule.rs) | The text rule for the Windows lines `rocm fix` and `rocm diagnose` print, a copy of the rule in `rocm-core` checked against a shared fixture table. | flat |
+| [`src/quit_and_wait.rs`](../tests/e2e-cucumber/src/quit_and_wait.rs) | Retry loop for quitting a TUI that may open a quit-confirm prompt first. | flat |
+| [`src/reader_failure.rs`](../tests/e2e-cucumber/src/reader_failure.rs) | Failure state shared between a background terminal reader and its waiters. | flat |
+| [`src/runtime_root.rs`](../tests/e2e-cucumber/src/runtime_root.rs) | `check_runtime_root_not_nested`: judges the active runtime folder `rocm examine` prints and rejects a doubly nested `runtimes/wheel` path. | flat |
+| [`src/send_until.rs`](../tests/e2e-cucumber/src/send_until.rs) | Retry loop for sending an idempotent terminal input until its effect appears. | flat |
+| [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail. | flat |
+| [`src/serve_plan.rs`](../tests/e2e-cucumber/src/serve_plan.rs) | Explains why a `rocm serve` run printed no `resolved model:` line by keeping stderr's refusal alongside stdout. | flat |
+| [`src/shared_runtime.rs`](../tests/e2e-cucumber/src/shared_runtime.rs) | Picks which runtime a scenario activates out of the shared pre-warmed runtime tree, which may hold more than one. | flat |
+| [`src/terminal_size.rs`](../tests/e2e-cucumber/src/terminal_size.rs) | Validates a requested terminal size and applies it to the emulated screen before the real PTY. | flat |
 
 #### `src/bin/`
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`src/bin/fake-docker.rs`](../tests/e2e-cucumber/src/bin/fake-docker.rs) | A `docker` stand-in that always fails, optionally logging its arguments, for the AIM Docker-unavailable scenarios. | test helper |
-| [`src/bin/fake-python.rs`](../tests/e2e-cucumber/src/bin/fake-python.rs) | A stand-in for the runtime's Python that answers the ComfyUI install's torch-stack probe and post-install GPU check. | test helper |
-| [`src/bin/fake-tailscale.rs`](../tests/e2e-cucumber/src/bin/fake-tailscale.rs) | A Tailscale CLI stand-in that serves the status document named by `FAKE_TAILSCALE_STATUS`, for the `rocm remote` scenarios. | test helper |
-| [`src/bin/fake-uv.rs`](../tests/e2e-cucumber/src/bin/fake-uv.rs) | A `uv` stand-in whose output, exit code, argument log and stdin handling are set by `FAKE_UV_*` variables, for the ComfyUI scenarios. | test helper |
+| [`src/bin/fake-docker.rs`](../tests/e2e-cucumber/src/bin/fake-docker.rs) | A `docker` stand-in that always fails, optionally logging its arguments, for the AIM Docker-unavailable scenarios. | flat |
+| [`src/bin/fake-python.rs`](../tests/e2e-cucumber/src/bin/fake-python.rs) | A stand-in for the runtime's Python that answers the ComfyUI install's torch-stack probe and post-install GPU check. | flat |
+| [`src/bin/fake-tailscale.rs`](../tests/e2e-cucumber/src/bin/fake-tailscale.rs) | A Tailscale CLI stand-in that serves the status document named by `FAKE_TAILSCALE_STATUS`, for the `rocm remote` scenarios. | flat |
+| [`src/bin/fake-uv.rs`](../tests/e2e-cucumber/src/bin/fake-uv.rs) | A `uv` stand-in whose output, exit code, argument log and stdin handling are set by `FAKE_UV_*` variables, for the ComfyUI scenarios. | flat |
 | [`src/bin/rocm-demo-env.rs`](../tests/e2e-cucumber/src/bin/rocm-demo-env.rs) | Standalone mock environment for the VHS demos: starts the mock server, plants a service record and prints the env vars `cargo xtask demos` exports. | flat |
 
 #### `tests/`
@@ -825,7 +825,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`tests/e2e/driver_steps.rs`](../tests/e2e-cucumber/tests/e2e/driver_steps.rs) | Steps for [`driver_install.feature`](../tests/e2e-cucumber/features/driver_install.feature): previewing and approving GPU driver installation plans on WSL, Linux and Windows hosts. | flat |
 | [`tests/e2e/engines_steps.rs`](../tests/e2e-cucumber/tests/e2e/engines_steps.rs) | Steps for [`engine_shell.feature`](../tests/e2e-cucumber/features/engine_shell.feature): `rocm engines shell` under a pseudo-terminal, since the defect shows only in what the terminal renders. | flat |
 | [`tests/e2e/examine_steps.rs`](../tests/e2e-cucumber/tests/e2e/examine_steps.rs) | Steps for [`examine.feature`](../tests/e2e-cucumber/features/examine.feature): `rocm examine`, version and help output, engine listing and the driver plan preview. | flat |
-| [`tests/e2e/host_guard.rs`](../tests/e2e-cucumber/tests/e2e/host_guard.rs) | The host check the Windows driver-install steps run before any CLI call, kept free of the cucumber world so a separate test can include it. | test helper |
+| [`tests/e2e/host_guard.rs`](../tests/e2e-cucumber/tests/e2e/host_guard.rs) | The host check the Windows driver-install steps run before any CLI call, kept free of the cucumber world so a separate test can include it. | flat |
 | [`tests/e2e/lemonade_install_steps.rs`](../tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs) | Steps for [`lemonade_installs.feature`](../tests/e2e-cucumber/features/lemonade_installs.feature): what the user is told about the Lemonade copies on disk, from planted trees and install records. | flat |
 | [`tests/e2e/lifecycle_steps.rs`](../tests/e2e-cucumber/tests/e2e/lifecycle_steps.rs) | Steps for [`install_lifecycle.feature`](../tests/e2e-cucumber/features/install_lifecycle.feature): `xtask package`, the root installer and the installed binaries, from install through uninstall. | flat |
 | [`tests/e2e/logs_steps.rs`](../tests/e2e-cucumber/tests/e2e/logs_steps.rs) | Steps for [`logs.feature`](../tests/e2e-cucumber/features/logs.feature): `rocm logs` searches over command-log files planted inside the tail window it reads. | flat |
@@ -841,7 +841,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`tests/e2e/skill_steps.rs`](../tests/e2e-cucumber/tests/e2e/skill_steps.rs) | Steps for [`rocm_doctor_skill.feature`](../tests/e2e-cucumber/features/rocm_doctor_skill.feature): drive `rocm` through the sequence the rocm-doctor skill prescribes and check its literal claims. | flat |
 | [`tests/e2e/storage_steps.rs`](../tests/e2e-cucumber/tests/e2e/storage_steps.rs) | Steps for [`storage.feature`](../tests/e2e-cucumber/features/storage.feature) and [`local_server_records.feature`](../tests/e2e-cucumber/features/local_server_records.feature): `rocm storage report` and the confirmation gate on `remove-downloads`. | flat |
 | [`tests/e2e/therock_steps.rs`](../tests/e2e-cucumber/tests/e2e/therock_steps.rs) | Steps for [`therock_next_generation.feature`](../tests/e2e-cucumber/features/therock_next_generation.feature) and [`download_progress_pty.feature`](../tests/e2e-cucumber/features/download_progress_pty.feature): release layouts served from a loopback server, and one real GPU install. | flat |
-| [`tests/e2e/tui_driver.rs`](../tests/e2e-cucumber/tests/e2e/tui_driver.rs) | Pseudo-terminal driver for the dash and chat TUI: spawns the real binary under `portable-pty`, sends keys and reads the emulated `vt100` screen. | test helper |
+| [`tests/e2e/tui_driver.rs`](../tests/e2e-cucumber/tests/e2e/tui_driver.rs) | Pseudo-terminal driver for the dash and chat TUI: spawns the real binary under `portable-pty`, sends keys and reads the emulated `vt100` screen. | flat |
 | [`tests/e2e/uninstall_steps.rs`](../tests/e2e-cucumber/tests/e2e/uninstall_steps.rs) | Steps for [`uninstall.feature`](../tests/e2e-cucumber/features/uninstall.feature): `rocm uninstall` confined to the scenario root with `--keep-binaries` and redirected caches. | flat |
 | [`tests/e2e/update_steps.rs`](../tests/e2e-cucumber/tests/e2e/update_steps.rs) | Steps for [`update.feature`](../tests/e2e-cucumber/features/update.feature): the report-only `rocm update`, its feed status, and a loopback catalog where runtimes are planted. | flat |
 
