@@ -222,12 +222,13 @@ Feature: Model serving
   # is distinct from scenario 13 (an index beyond the device count): here the index
   # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
   # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
-  # rejection directly. It holds on a single-GPU host too, so this stays ungated:
-  # the mask names device 0, which exists there, so the visible set still resolves
-  # to [0] and ordinal 1 is refused against it. (Contrast serve-20, whose mask
-  # names a device a single-GPU host does not have — see the note there.) Either
-  # way an honest refusal rather than a remap, which is what this asserts. Runs on
-  # a simulated two-GPU machine, the multi-GPU shape it was written for.
+  # rejection directly. It runs on a simulated two-GPU machine, the multi-GPU
+  # shape it was written for. The refusal holds on a single-GPU host too — the
+  # mask names device 0, which exists there, so the visible set still resolves to
+  # [0] and ordinal 1 is refused against it — and serve-56 is that case. (Contrast
+  # serve-20, whose mask names a device a single-GPU host does not have — see the
+  # note there.) Either way an honest refusal rather than a remap, which is what
+  # this asserts.
   @id:serve-masked-gpu-index-rejected @requires-os:linux
   Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
     Given a machine with two AMD Instinct GPUs
@@ -262,7 +263,7 @@ Feature: Model serving
   # unknown-mask fallback is deliberate (an unprobeable host must not be blocked
   # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
-  # set resolves on one GPU too and it stays ungated.
+  # set resolves on one GPU too, which serve-56 checks.
   #
   # The second device is simulated, so this no longer waits for a multi-GPU lane.
   @id:serve-rocr-reindexed-gpu-index-rejected @requires-os:linux
@@ -896,3 +897,16 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  # serve-19 on a single GPU. Its mask names device 0, which a one-GPU host has,
+  # so the visible set resolves to [0] and ordinal 1 is refused against it: a
+  # host with one device must refuse the hidden ordinal exactly as a multi-GPU one
+  # does, rather than read it as out of range or let it through. Declared here
+  # rather than beside serve-19 because the scenario index is per-feature and in
+  # declaration order.
+  @id:serve-masked-gpu-index-rejected-on-one-gpu @requires-os:linux
+  Scenario: serve-56 - Serving pinned to a GPU hidden by the visibility mask is refused on a single-GPU machine
+    Given a machine with an AMD Instinct GPU
+    When the user serves a model pinned to a GPU hidden by the visibility mask
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable

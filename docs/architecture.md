@@ -779,7 +779,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | --- | --- | --- |
 | [`src/lib.rs`](../tests/e2e-cucumber/src/lib.rs) | Library root for the test targets and the demo binary: declares the helper modules, re-exports `e2e-report` as `report`, and holds small shared helpers such as `cli_failure_report`. | flat |
 | [`src/binary_path.rs`](../tests/e2e-cucumber/src/binary_path.rs) | Pins a relative `ROCM_CLI_BINARY` path before a scenario runs the child from another directory, and leaves a bare name for `PATH` to resolve. | flat |
-| [`src/capability.rs`](../tests/e2e-cucumber/src/capability.rs) | Host capability probe: runs `rocm examine` and `rocm engines list` once, and re-derives the serve engine the CLI would pick and the AMD GPU count. | flat |
+| [`src/capability.rs`](../tests/e2e-cucumber/src/capability.rs) | Host capability probe: runs `rocm examine` and `rocm engines list` once, and re-derives the serve engine the CLI would pick. | flat |
 | [`src/chat_request.rs`](../tests/e2e-cucumber/src/chat_request.rs) | The chat round trip against a served endpoint (model discovery, then one chat completion), run on its own task so its timeout measures the server. | flat |
 | [`src/device_memory.rs`](../tests/e2e-cucumber/src/device_memory.rs) | Which device memory pool (VRAM, or GTT-backed memory on an APU) the drain-wait between serve scenarios judges, how it is sampled, and the free-memory floor. | flat |
 | [`src/expectation.rs`](../tests/e2e-cucumber/src/expectation.rs) | Resolves each scenario on this host to expected-pass, expected-fail or skip from its tags, the capability probe and the [`expectations.toml`](../tests/e2e-cucumber/expectations.toml) matrix. | flat |
@@ -879,7 +879,7 @@ Boundaries:
 - The library target depends on no product crate. `rocm-core` is a dev-dependency only, used by unit tests and the `e2e` target, so library code repeats what it needs (as `device_memory::bounded_stdout` does) rather than add an edge `cargo xtask check-crate-edges` would flag.
 - The report generator lives in [`crates/e2e-report`](../crates/e2e-report/src/lib.rs) so `xtask` can use it without this crate's dependency tree; [`src/lib.rs`](../tests/e2e-cucumber/src/lib.rs) re-exports it as `report`.
 - **Copies of product logic that drift.** A product change here means a change in the suite:
-  - [`src/capability.rs`](../tests/e2e-cucumber/src/capability.rs) re-implements the CLI's serve-engine choice and the AMD GPU count.
+  - [`src/capability.rs`](../tests/e2e-cucumber/src/capability.rs) re-implements the CLI's serve-engine choice.
   - [`src/powershell_text_rule.rs`](../tests/e2e-cucumber/src/powershell_text_rule.rs) copies the rule in [`fix/catalog.rs`](../crates/rocm-core/src/fix/catalog.rs); both are tested against [`powershell_text_rule_cases.txt`](../tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt).
   - `cargo xtask demos` parses what [`src/bin/rocm-demo-env.rs`](../tests/e2e-cucumber/src/bin/rocm-demo-env.rs) prints.
 

@@ -1596,9 +1596,8 @@ async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
 /// host ordinal 1 exists but is masked out, so the CLI must reject it against the
 /// visible set (EAI-7194). The mask names device 0, which every GPU host has, so
 /// the visible set resolves on a single-GPU host as well and ordinal 1 is refused
-/// against it there too — which is why this scenario needs no multi-GPU gate.
-/// Either way the serve must be refused rather than remapped onto the one visible
-/// device.
+/// against it there too; serve-19 plants two GPUs and serve-56 one. Either way the
+/// serve must be refused rather than remapped onto the one visible device.
 #[when("the user serves a model pinned to a GPU hidden by the visibility mask")]
 async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
     let (model, engine, _) = serve_target(world);
@@ -1617,11 +1616,11 @@ async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
 /// ordinal 0, so ordinal 1 is outside the visible HIP set and must be refused
 /// (EAI-7194) — not read as the physical token and wrongly accepted.
 ///
-/// `@requires-multi-gpu`, because on a single-GPU host the mask token names a
-/// device that is not there: the visible set cannot be resolved and `--gpu`
-/// validation falls back to amd-smi's best-effort count, which does not honour
-/// the mask — so the outcome there depends on whether amd-smi is installed
-/// rather than on the mask. See the scenario comment in
+/// Needs a second GPU, which the scenario plants: on a single-GPU host the mask
+/// token names a device that is not there, the visible set cannot be resolved
+/// and `--gpu` validation falls back to amd-smi's best-effort count, which does
+/// not honour the mask — so the outcome there depends on whether amd-smi is
+/// installed rather than on the mask. See the scenario comment in
 /// `features/model_serving.feature` for the full note on that gap.
 #[when("the user serves a model pinned past the ROCR-reindexed visible set")]
 async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
@@ -2944,10 +2943,13 @@ fn screen_without_whitespace(screen: &str) -> String {
 #[then("the user is told the pinned GPU is unavailable")]
 async fn assert_masked_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // Ordinal 1 must be named and refused by the CLI's own pre-flight: against the
-    // active visibility mask ("not available under the active visibility mask") on
-    // a multi-GPU host, or as out of range where no visible set could be
-    // enumerated. Never a silent remap onto the one visible device (ordinal 0).
+    // Ordinal 1 must be named and refused by the CLI's own pre-flight against the
+    // active visibility mask ("not available under the active visibility mask").
+    // Every scenario using this step plants a simulated machine, whose visible set
+    // the CLI can always enumerate, so "out of range" is not accepted: on the
+    // one-GPU machine ordinal 1 is out of range with or without the mask, and
+    // accepting it would let a broken mask check pass there. Never a silent
+    // remap onto the one visible device (ordinal 0).
     //
     // The accepted wording is deliberately narrow. A bare "not available" would
     // also match the ENGINE's own late rejection ("requested GPU 1 is not
@@ -2957,8 +2959,7 @@ async fn assert_masked_index_message(world: &mut E2eWorld) {
     // requested ordinal.
     assert!(
         output.contains("--gpu index 1")
-            && (output.contains("not available under the active visibility mask")
-                || output.contains("out of range")),
+            && output.contains("not available under the active visibility mask"),
         "expected the masked GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );

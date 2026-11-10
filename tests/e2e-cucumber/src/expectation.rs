@@ -27,7 +27,6 @@ const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_DOCKER_TAG: &str = "requires-docker";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_REAL_GPU_TAG: &str = "requires-real-gpu";
-const REQUIRES_MULTI_GPU_TAG: &str = "requires-multi-gpu";
 const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
@@ -143,18 +142,6 @@ pub struct ScenarioDecl {
     /// run opted into real hardware with `E2E_HARDWARE=real` (see
     /// [`HardwareMode`]).
     pub requires_real_gpu: bool,
-    /// `@requires-multi-gpu`: the scenario's premise is a host with MORE THAN ONE
-    /// AMD GPU present, so a single-GPU host is not a weaker version of it — it
-    /// is a different situation in which the assertion does not hold. Skipped
-    /// wherever the probed device count is not known to exceed one.
-    ///
-    /// `@requires-gpu` cannot express this: it asks only whether *a* device is
-    /// usable, and Strix Halo answers yes with exactly one. The distinction is
-    /// load-bearing for the visibility-mask ordinal scenarios, where a mask token
-    /// that names a device the host does not have makes the product's ordinal
-    /// probe report "unknown" rather than a visible set, and `--gpu` validation
-    /// then takes its permissive fallback instead of refusing.
-    pub requires_multi_gpu: bool,
     /// `@requires-gfx-target`: the scenario needs a detected chip name but does
     /// not access the GPU. This permits resolver dry-runs on WSL before GPU
     /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
@@ -273,7 +260,6 @@ impl ScenarioDecl {
         let mut requires_docker = false;
         let mut requires_gpu = false;
         let mut requires_real_gpu = false;
-        let mut requires_multi_gpu = false;
         let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
@@ -309,8 +295,6 @@ impl ScenarioDecl {
                 // scenario (usable device, startable engine) applies here too.
                 requires_gpu = true;
                 requires_real_gpu = true;
-            } else if tag == REQUIRES_MULTI_GPU_TAG {
-                requires_multi_gpu = true;
             } else if tag == REQUIRES_GFX_TARGET_TAG {
                 requires_gfx_target = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
@@ -337,7 +321,6 @@ impl ScenarioDecl {
             id,
             requires_gpu,
             requires_real_gpu,
-            requires_multi_gpu,
             requires_gfx_target,
             requires_no_gpu,
             requires_bare_metal,
@@ -647,8 +630,7 @@ pub struct Included {
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-docker`
 ///    scenario without a usable container runtime, a `@requires-real-gpu`
 ///    scenario outside `E2E_HARDWARE=real`, a `@requires-gpu` scenario on
-///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
-///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
+///    a host with no AMD GPU, a `@requires-bare-metal` scenario on WSL2, a
 ///    `@requires-os:<os>` scenario on a different OS, a
 ///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
 ///    or a scenario whose effective engine can't start.
@@ -704,19 +686,6 @@ pub fn resolve(
     if decl.needs_gpu() && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
-        };
-    }
-    if decl.requires_multi_gpu && cap.amd_gpu_count.is_none_or(|count| count <= 1) {
-        // An unknown count skips as well: the premise is "more than one device
-        // is present", and a host that cannot be counted has not shown that.
-        // Running there is what turned a real multi-GPU assertion into a
-        // single-GPU failure in the first place.
-        let detected = cap.amd_gpu_count.map_or_else(
-            || "the count could not be probed".to_owned(),
-            |count| format!("{count} detected"),
-        );
-        return Expectation::Skip {
-            reason: format!("requires more than one AMD GPU; {detected}"),
         };
     }
     if decl.requires_gfx_target && cap.gfx_target.is_none() {
@@ -872,7 +841,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: Some(8),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
@@ -885,7 +853,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: Some(1),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
@@ -898,7 +865,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: Some(1),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
@@ -910,17 +876,11 @@ mod tests {
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
             // it from bare metal. That is precisely why `@requires-os:linux`
             // cannot stand in for `@requires-bare-metal`.
-            //
-            // The device COUNT is unknown on every WSL host: that platform
-            // reaches the GPU through `/dev/dxg`, exposing neither a KFD
-            // topology nor an amdgpu DRM card for the count probe to read. So
-            // `@requires-multi-gpu` skips there whatever the hardware is.
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -936,7 +896,6 @@ mod tests {
                 is_wsl: true,
                 gfx_target: None,
                 has_amd_gpu: false,
-                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
@@ -951,7 +910,6 @@ mod tests {
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
-                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -964,7 +922,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: None,
                 has_amd_gpu: false,
-                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
@@ -1113,7 +1070,6 @@ reason = "r"
                 HostCapability {
                     gfx_target: None,
                     has_amd_gpu: false,
-                    amd_gpu_count: Some(0),
                     ..linux_lemonade.clone()
                 },
             ),
@@ -1121,7 +1077,6 @@ reason = "r"
                 "linux, gfx target reported but no usable GPU",
                 HostCapability {
                     has_amd_gpu: false,
-                    amd_gpu_count: Some(0),
                     ..linux_lemonade.clone()
                 },
             ),
@@ -1685,55 +1640,6 @@ serve_timeout_secs = 90
         ));
     }
 
-    #[test]
-    fn multi_gpu_tag_parses_in_both_shapes() {
-        assert!(decl(&["id:x", "requires-multi-gpu"]).requires_multi_gpu);
-        assert!(decl(&["@id:x", "@requires-multi-gpu"]).requires_multi_gpu);
-        // Absent by default, and `@requires-gpu` does not imply it — otherwise
-        // every existing GPU scenario would silently stop running on Strix.
-        let gpu_only = decl(&["id:x", "requires-gpu"]);
-        assert!(!gpu_only.requires_multi_gpu);
-        assert!(gpu_only.requires_gpu);
-        // Nor the reverse: the tags are independent flags on the same scenario.
-        assert!(!decl(&["id:x", "requires-multi-gpu"]).requires_gpu);
-    }
-
-    /// Both directions of the gate. A scenario whose premise is a second device
-    /// must RUN where one exists and SKIP where it does not — a gate that only
-    /// ever skips would silently retire the assertion everywhere.
-    #[test]
-    fn requires_multi_gpu_runs_only_where_a_second_device_is_present() {
-        let m = Expectations::default();
-        let d = decl(&[
-            "id:serve-rocr-reindexed-gpu-index-rejected",
-            "requires-gpu",
-            "requires-multi-gpu",
-            "requires-os:linux",
-        ]);
-        // MI300X has eight devices → the premise holds → the scenario runs.
-        assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, Included::default()),
-            Expectation::ExpectPass
-        );
-        // Strix Halo has exactly one. `@requires-gpu` is satisfied there, which
-        // is why the scenario used to run and fail on its premise.
-        assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, Included::default()),
-            Expectation::Skip { .. }
-        ));
-        // No GPU at all, and a host whose count could not be probed (WSL), skip
-        // too: neither has SHOWN a second device.
-        for host in ["mock", "wsl2"] {
-            assert!(
-                matches!(
-                    resolve(&d, &cap(host), &m, Included::default()),
-                    Expectation::Skip { .. }
-                ),
-                "{host} must not run a multi-GPU scenario"
-            );
-        }
-    }
-
     /// The tag line of a scenario in a real `.feature` file, by `@id:` slug.
     /// Tags share one line with the id in this suite, which is what makes the
     /// lookup exact rather than a guess about declaration order.
@@ -1775,12 +1681,29 @@ serve_timeout_secs = 90
 
     /// serve-20's premise is a host with MORE THAN ONE GPU: on one GPU its mask
     /// names a device that is not there and the refusal stops following from the
-    /// mask (see the scenario's comment). It used to hold that premise with
-    /// `@requires-multi-gpu`, which left it running only on multi-GPU lanes. It
-    /// now plants a simulated two-GPU machine instead, so the premise holds on
-    /// every Linux lane. Read from the REAL feature file, so dropping the second
-    /// simulated GPU fails here rather than quietly reinstating the single-GPU
-    /// failure the gate was added for. Its sibling serve-19 is held the same way.
+    /// mask (see the scenario's comment). It plants a simulated two-GPU machine,
+    /// so the premise holds on every Linux lane. Read from the REAL feature file,
+    /// so dropping the second simulated GPU fails here rather than quietly
+    /// reinstating that single-GPU failure. Its sibling serve-19 is held the same
+    /// way, and serve-19's single-GPU case (serve-56) must keep its one GPU.
+    /// serve-19's single-GPU case: the same masked ordinal refused on a machine
+    /// with one GPU. Read from the real feature file, so a second GPU added to it
+    /// fails here instead of quietly turning it into a copy of serve-19.
+    #[test]
+    fn the_single_gpu_masked_index_scenario_plants_one_gpu() {
+        let feature = include_str!("../features/model_serving.feature");
+        let id = "serve-masked-gpu-index-rejected-on-one-gpu";
+        let body = feature_body(feature, id);
+        assert!(
+            body.contains("Given a machine with an AMD Instinct GPU\n"),
+            "{id} must describe a one-GPU machine:\n{body}"
+        );
+        assert!(
+            body.contains("pinned to a GPU hidden by the visibility mask"),
+            "{id} must serve with serve-19's mask:\n{body}"
+        );
+    }
+
     #[test]
     fn the_rocr_reindexed_scenarios_plant_their_own_second_gpu() {
         let feature = include_str!("../features/model_serving.feature");
@@ -1795,7 +1718,7 @@ serve_timeout_secs = 90
             );
             let decl = ScenarioDecl::from_tags(&feature_tags(feature, id));
             assert!(
-                !decl.requires_gpu && !decl.requires_multi_gpu,
+                !decl.requires_gpu,
                 "{id} brings its own GPUs, so it must not wait for a lane that has them"
             );
             for host in ["strix-ubuntu", "mi300x", "wsl2"] {
@@ -1806,24 +1729,6 @@ serve_timeout_secs = 90
                 );
             }
         }
-    }
-
-    /// The single-GPU skip must name the count, not just repeat the `@requires-gpu`
-    /// reason: on Strix Halo a GPU *is* present, so "none detected" would send a
-    /// reader of the report looking for a missing device that is right there.
-    #[test]
-    fn multi_gpu_skip_reason_distinguishes_itself_from_the_no_gpu_one() {
-        let m = Expectations::default();
-        let d = decl(&["id:x", "requires-gpu", "requires-multi-gpu"]);
-        let Expectation::Skip { reason } =
-            resolve(&d, &cap("strix-ubuntu"), &m, Included::default())
-        else {
-            panic!("a single-GPU host must skip a multi-GPU scenario");
-        };
-        assert!(
-            reason.contains("more than one") && reason.contains('1'),
-            "reason should name the shortfall, got: {reason}"
-        );
     }
 
     #[test]
