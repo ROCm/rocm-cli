@@ -160,6 +160,9 @@ pub struct E2eWorld {
     /// How a simulated machine differs from the real one this scenario runs
     /// on, for the real-hardware check that keeps the fixtures honest.
     pub layout_drift: Option<Vec<String>>,
+    /// The free port a serve on a simulated machine was given with `--port`, so
+    /// the scenario can check the engine was launched on it.
+    pub simulated_serve_port: Option<u16>,
     /// Per-scenario serve-readiness timeout override (seconds), set by the
     /// `before` hook from `expectations.toml` when this scenario is a known bug
     /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
@@ -439,6 +442,7 @@ impl Default for E2eWorld {
             legacy_rocm_path: None,
             simulated_host: None,
             layout_drift: None,
+            simulated_serve_port: None,
             serve_timeout_override: None,
             expect_xfail: false,
             command_env: Vec::new(),

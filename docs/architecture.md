@@ -820,7 +820,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`src/bin/fake-python.rs`](../tests/e2e-cucumber/src/bin/fake-python.rs) | A stand-in for the runtime's Python that answers the ComfyUI install's torch-stack probe and post-install GPU check. | flat |
 | [`src/bin/fake-tailscale.rs`](../tests/e2e-cucumber/src/bin/fake-tailscale.rs) | A Tailscale CLI stand-in that serves the status document named by `FAKE_TAILSCALE_STATUS`, for the `rocm remote` scenarios. | flat |
 | [`src/bin/fake-uv.rs`](../tests/e2e-cucumber/src/bin/fake-uv.rs) | A `uv` stand-in whose output, exit code, argument log and stdin handling are set by `FAKE_UV_*` variables, for the ComfyUI scenarios. | flat |
-| [`src/bin/fake-vllm.rs`](../tests/e2e-cucumber/src/bin/fake-vllm.rs) | Stand-in for a managed runtime's `vllm` on a simulated machine: serves the mock OpenAI server on the host and port the CLI launched it with, so `rocm serve` runs its real engine selection, launch and readiness wait. | flat |
+| [`src/bin/fake-vllm.rs`](../tests/e2e-cucumber/src/bin/fake-vllm.rs) | Stand-in for a managed runtime's `vllm` on a simulated machine: serves the mock OpenAI server on the host and port the CLI launched it with, so `rocm serve` runs its real engine selection, launch and readiness wait, and records its arguments for the scenario to check the flags. | flat |
 | [`src/bin/rocm-demo-env.rs`](../tests/e2e-cucumber/src/bin/rocm-demo-env.rs) | Standalone mock environment for the VHS demos: starts the mock server, plants a service record and prints the env vars `cargo xtask demos` exports. | flat |
 
 #### `tests/`

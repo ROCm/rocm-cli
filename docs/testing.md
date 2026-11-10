@@ -832,10 +832,26 @@ filesystem.
 
 A scenario on a simulated machine proves the CLI reads that machine correctly,
 not that the real kernel still looks like it. Detection on the machine the
-suite runs on is kept by `@requires-real-gpu` scenarios such as
-`@id:examine-detects-this-machines-gpu-and-driver`, which repeats
-`@id:examine-detects-gpu-and-driver`'s assertions against a real GPU host on
-every GPU lane, the Windows one included.
+suite runs on is kept by twins that repeat a simulated scenario's assertions
+on the real machine:
+
+- `@id:examine-detects-this-machines-gpu-and-driver` repeats
+  `@id:examine-detects-gpu-and-driver` on every GPU lane, the Windows one
+  included (`@requires-real-gpu`).
+- `@id:serve-masked-devices-fail-on-this-host` repeats
+  `@id:serve-masked-devices-fail` on every Linux GPU lane
+  (`@requires-real-gpu`).
+- `@id:diagnose-real-wsl-never-reports-bare-metal-causes` repeats
+  `@id:diagnose-wsl-never-reports-bare-metal-causes` on the WSL lane
+  (`@requires-wsl`).
+- `@id:serve-no-gpu-fails-fast-on-this-host` repeats
+  `@id:serve-no-gpu-fails-fast` on any host with no AMD GPU
+  (`@requires-no-gpu`), including the GitHub-hosted Windows runner of
+  `windows-build-and-test`.
+
+The other moved scenarios have no twin: their premise (several GPUs, a WSL
+remedy, a driver install plan) runs on the real machine only where a lane has
+that hardware.
 
 A simulated machine is only worth trusting while it is laid out the way the
 kernel lays out a real one, so two `@nightly` scenarios
@@ -3503,14 +3519,15 @@ needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios and the native-Windows vLLM refusal scenarios
-`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
+scenarios, the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35`, and `serve-57`, the GPU-required refusal on a
+host with no AMD GPU (none of them `@lifecycle`), via `E2E_ALSO_RUN_IDS`, a
 comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,serve-no-gpu-fails-fast-on-this-host"
 cargo xtask e2e
 ```
 

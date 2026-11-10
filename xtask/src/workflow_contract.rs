@@ -5853,6 +5853,9 @@ fi
             "serve-vllm-refused-on-native-windows",
             "serve-vllm-install-refused-on-native-windows",
             "serve-vllm-install-with-runtime-refused-on-native-windows",
+            // The GPU-required refusal on a host with no GPU (serve-57) is
+            // `@requires-no-gpu`; this GPU-less runner is its only Windows host.
+            "serve-no-gpu-fails-fast-on-this-host",
         ] {
             assert!(
                 also_run_ids[0].contains(id),

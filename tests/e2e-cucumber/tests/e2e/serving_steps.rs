@@ -1167,9 +1167,31 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     // a GGUF-only model would legitimately fall through to lemonade regardless of
     // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
     // `--engine` so the CLI's own default selection is what's exercised.
-    ensure_serve_port_free().await;
-    let (stdout, stderr, rc) =
-        crate::run_rocm(world, &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"]);
+    //
+    // On a simulated machine the engine is the `fake-vllm` stand-in, which runs
+    // on any lane and on a developer's machine, so the serve gets a port nothing
+    // holds instead of the shared default, and nothing is killed to free one:
+    // `ensure_serve_port_free` SIGKILLs whatever listens on the serve and
+    // assistant ports, which is only right on a GPU box that runs one serve at a
+    // time.
+    let port = if world.simulated_host.is_some() {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .map_or_else(
+                |e| panic!("no free loopback port for the simulated serve: {e}"),
+                |addr| addr.port(),
+            );
+        world.simulated_serve_port = Some(port);
+        Some(port.to_string())
+    } else {
+        ensure_serve_port_free().await;
+        None
+    };
+    let mut args = vec!["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"];
+    if let Some(port) = &port {
+        args.extend(["--port", port.as_str()]);
+    }
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     // See the note in user_serves_default_engine: the rc is asserted later, so
     // stderr must be carried along to explain a non-zero one.
@@ -3161,6 +3183,47 @@ async fn assert_engine_auto_selected(world: &mut E2eWorld) {
     );
 }
 
+/// The flags the CLI launched the simulated vLLM with, as `fake-vllm` recorded
+/// them: `serve <model> --host 127.0.0.1 --port <the port asked for>`, and
+/// `--enforce-eager`, which keeps vLLM's CUDA-graph replay from hanging a
+/// gfx94x GPU on its first decode. Readiness alone would pass with any of
+/// them wrong, since the stand-in binds whatever it is given.
+fn assert_simulated_vllm_launch_args(world: &E2eWorld) {
+    let record = super::runtime_steps::simulated_vllm_argv_record(world);
+    let recorded = std::fs::read_to_string(&record).unwrap_or_else(|e| {
+        panic!(
+            "the simulated vLLM left no record of its arguments at {}: {e}",
+            record.display()
+        )
+    });
+    let args: Vec<&str> = recorded.lines().collect();
+    let port = world
+        .simulated_serve_port
+        .expect("the serve recorded no port")
+        .to_string();
+    let flag_value = |flag: &str| {
+        args.iter()
+            .position(|arg| *arg == flag)
+            .and_then(|at| args.get(at + 1).copied())
+    };
+    assert_eq!(args.first().copied(), Some("serve"), "{args:?}");
+    assert!(
+        args.get(1)
+            .is_some_and(|model| model.ends_with("Qwen2.5-0.5B-Instruct")),
+        "vLLM was not given the model that was served: {args:?}"
+    );
+    assert_eq!(flag_value("--host"), Some("127.0.0.1"), "{args:?}");
+    assert_eq!(
+        flag_value("--port"),
+        Some(port.as_str()),
+        "vLLM was not launched on the port the serve asked for: {args:?}"
+    );
+    assert!(
+        args.contains(&"--enforce-eager"),
+        "vLLM was launched without --enforce-eager: {args:?}"
+    );
+}
+
 #[then("vLLM is selected as the default engine")]
 async fn assert_vllm_default(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no serve output");
@@ -3201,6 +3264,7 @@ async fn assert_vllm_default(world: &mut E2eWorld) {
             "the simulated vLLM never became ready:\n{output}\n{}\n--- service log ---\n{service_log}",
             world.cli_stderr.as_deref().unwrap_or("")
         );
+        assert_simulated_vllm_launch_args(world);
     }
 }
 

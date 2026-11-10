@@ -1021,10 +1021,14 @@ jobs:
         # serve-33/serve-34/serve-35 (the native-Windows vLLM refusal for `serve` and
         # `engines install`) are folded in the same way: `@requires-os:windows`,
         # hermetic, and otherwise run only on the optional self-hosted lane.
+        #
+        # serve-57 (the GPU-required refusal on a host with no AMD GPU) is
+        # `@requires-no-gpu` and hermetic, and this GPU-less runner is the only
+        # Windows host any lane gives it.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
-          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,serve-no-gpu-fails-fast-on-this-host"
         run: |
           # Derive from CARGO_TARGET_DIR when it is set, falling back to the
           # default target dir, so a future job-level CARGO_TARGET_DIR cannot

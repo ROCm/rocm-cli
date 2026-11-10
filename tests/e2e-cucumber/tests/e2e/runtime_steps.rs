@@ -112,29 +112,36 @@ async fn assert_planned_folder_avoids_the_link(world: &mut E2eWorld) {
 /// is the `fake-vllm` stand-in. `rocm serve` then takes the real managed-runtime
 /// path — selection, the engine's runtime lookup, the launch and the readiness
 /// wait — and only the process at the end of it is simulated.
-fn plant_simulated_runtime(world: &mut E2eWorld) {
-    const KEY: &str = "simulated-therock-7.13.0";
-    let data = world
+/// The managed runtime a simulated machine's `a managed runtime is active` plants.
+const SIMULATED_RUNTIME_KEY: &str = "simulated-therock-7.13.0";
+
+fn simulated_runtime_data_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
         .isolated_root
         .as_ref()
         .expect("no isolated root")
         .path()
-        .join("data");
+        .join("data")
+}
+
+/// Where the planted runtime's `fake-vllm` records the arguments it was launched
+/// with (see `src/bin/fake-vllm.rs`): beside the `vllm` the CLI launches.
+pub(crate) fn simulated_vllm_argv_record(world: &E2eWorld) -> std::path::PathBuf {
+    simulated_runtime_data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(SIMULATED_RUNTIME_KEY)
+        .join("bin")
+        .join("vllm.argv")
+}
+
+fn plant_simulated_runtime(world: &mut E2eWorld) {
+    const KEY: &str = SIMULATED_RUNTIME_KEY;
+    let data = simulated_runtime_data_dir(world);
     let install_root = super::comfyui_steps::plant_ready_runtime(&data, KEY);
     // The engine accepts a managed runtime when `vllm` sits beside its python.
     let vllm = install_root.join("bin").join("vllm");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(
-        e2e_cucumber::fixture_binary::fixture_binary("fake-vllm"),
-        &vllm,
-    )
-    .unwrap_or_else(|e| panic!("failed to install the vLLM stand-in: {e}"));
-    #[cfg(not(unix))]
-    std::fs::copy(
-        e2e_cucumber::fixture_binary::fixture_binary("fake-vllm"),
-        &vllm,
-    )
-    .unwrap_or_else(|e| panic!("failed to install the vLLM stand-in: {e}"));
+    crate::install_fixture_binary("fake-vllm", &vllm);
     crate::run_rocm_ok(world, &["runtimes", "activate", KEY]);
 }
 

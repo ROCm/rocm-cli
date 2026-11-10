@@ -117,7 +117,10 @@ Feature: Model serving
   # launch goes through. Both the Instinct machine and the runtime's vLLM are
   # simulated: the CLI's own selection, runtime lookup, launch and readiness
   # wait are real, and the vLLM at the end of them answers like one without a
-  # model on a device. So this holds on every Linux lane, not only on Instinct.
+  # model on a device. It records the flags it was launched with, so the serve is
+  # also held to the host, the port it asked for (a free one, never the shared
+  # default) and `--enforce-eager`. So this holds on every Linux lane, not only
+  # on Instinct.
   @id:serve-vllm-default-on-instinct @requires-engine:vllm @requires-os:linux
   Scenario: serve-11 - vLLM is the default serving engine on Instinct
     Given a machine with an AMD Instinct GPU
@@ -910,3 +913,24 @@ Feature: Model serving
     When the user serves a model pinned to a GPU hidden by the visibility mask
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
+
+  # serve-13 without a simulated machine: the runner's own GPU-less host, so the
+  # GPU-required refusal is also held on the GPU-less Windows run, which no
+  # simulated machine describes (a simulated one is Linux). Declared here rather
+  # than beside serve-13 because the scenario index is per-feature and in
+  # declaration order.
+  @id:serve-no-gpu-fails-fast-on-this-host @requires-no-gpu
+  Scenario: serve-57 - Serving is refused on this host when it has no AMD GPU
+    When the user serves a model under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+
+  # serve-15 on a real GPU host rather than a simulated one: every real device
+  # hidden by the visibility mask must still read as "no GPU" and be refused, with
+  # the runner's own driver, sysfs and amd-smi answering. Read-only, so it is
+  # cheap on any Linux GPU lane.
+  @id:serve-masked-devices-fail-on-this-host @requires-real-gpu @requires-os:linux
+  Scenario: serve-58 - Serving is refused when every GPU of this machine is masked from view
+    When the user serves a model with every GPU masked from view
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
