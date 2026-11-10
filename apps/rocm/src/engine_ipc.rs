@@ -106,6 +106,38 @@ where
         .map(|plugin| plugin.executable_path))
 }
 
+/// The environment an **external plugin** stdio child is given.
+///
+/// Split out of [`engine_request_with_env_root`] for one reason: so the key-file
+/// exclusion below is assertable without spawning a plugin binary. `Command`
+/// records `env_remove` as an explicit `(key, None)` entry, which
+/// [`Command::get_envs`] exposes, so a test can tell "cleared" apart from
+/// "never set" — the distinction this function exists to make.
+fn apply_external_plugin_env(
+    command: &mut ProcessCommand,
+    paths: Option<&AppPaths>,
+    env_root: Option<&Path>,
+    stream_progress: bool,
+) {
+    if let Some(paths) = paths {
+        apply_app_path_env(command, paths);
+    }
+    if let Some(env_root) = env_root {
+        command.env("ROCM_CLI_ENGINE_ENVS_ROOT", env_root);
+    }
+    // Deliberately NOT `command.env(ENDPOINT_API_KEY_FILE_ENV, ...)`: this is
+    // the external-plugin branch, and the key file — mode 0600, holding a path
+    // to a live endpoint credential — stays with the built-in engines that run
+    // in-process. Cleared rather than merely left unset, so a value this
+    // process inherited is not passed through to a third-party binary either.
+    // `an_external_plugin_child_is_not_handed_the_endpoint_key_file` is the
+    // assertion that keeps it that way.
+    command.env_remove(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV);
+    if stream_progress {
+        command.env("ROCM_ENGINE_PROGRESS_STDERR", "1");
+    }
+}
+
 pub(crate) fn engine_request<T, R>(
     paths: Option<&AppPaths>,
     engine: &str,
@@ -193,23 +225,7 @@ where
     })?;
     let mut command = ProcessCommand::new(engine_binary);
     command.arg("stdio");
-    if let Some(paths) = paths {
-        apply_app_path_env(&mut command, paths);
-    }
-    if let Some(env_root) = env_root {
-        command.env("ROCM_CLI_ENGINE_ENVS_ROOT", env_root);
-    }
-    // Deliberately NOT `command.env(ENDPOINT_API_KEY_FILE_ENV, ...)`: this is
-    // the external-plugin branch, and the key file stays with the built-in
-    // engines that run in-process. See this function's doc comment, and
-    // `an_external_plugin_child_is_not_handed_the_endpoint_key_file` for the
-    // assertion that keeps it that way. The variable is also cleared rather
-    // than merely not set, so a `ROCM_SERVE_API_KEY_FILE` this process happens
-    // to have inherited is not passed through either.
-    command.env_remove(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV);
-    if stream_progress {
-        command.env("ROCM_ENGINE_PROGRESS_STDERR", "1");
-    }
+    apply_external_plugin_env(&mut command, paths, env_root, stream_progress);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -757,6 +773,37 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// The 0600 endpoint key file belongs to the built-in engines that run
+    /// in-process. An external plugin is a third-party binary, so the path to a
+    /// live credential must not reach its environment — including when *this*
+    /// process inherited the variable, which is why the production code clears
+    /// it rather than simply not setting it.
+    ///
+    /// Asserts the cleared/never-set distinction directly: `Command` records an
+    /// `env_remove` as `(key, None)`, so a bare "not present" check would pass
+    /// even with the `env_remove` deleted.
+    #[test]
+    fn an_external_plugin_child_is_not_handed_the_endpoint_key_file() {
+        let key_var = std::ffi::OsStr::new(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV);
+        let mut command = ProcessCommand::new("engine-plugin");
+        // Stand in for the value an inheriting parent would have put there.
+        command.env(key_var, "/run/secrets/endpoint-key");
+
+        apply_external_plugin_env(&mut command, None, None, false);
+
+        let entry = command
+            .get_envs()
+            .find(|(key, _)| *key == key_var)
+            .map(|(_, value)| value);
+        assert_eq!(
+            entry,
+            Some(None),
+            "the key-file variable must be explicitly CLEARED for an external plugin child, \
+             not merely left unset: {:?}",
+            command.get_envs().collect::<Vec<_>>()
+        );
+    }
 
     /// The `unknown` filter, which nothing else can reach: its caller is an RPC
     /// to a live engine, so in default CI it never runs and deleting it stays

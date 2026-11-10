@@ -14,6 +14,6 @@
 # `exp:YYYY-MM-DD` limits a suppression to that date. After it, trivy
 # reports the finding again.
 #
-# This file sits beside the configured trivy.yml, so the scan uses it.
-# A .trivyignore at the repository root applies only when this file is
-# absent; the two are never merged.
+# NOTE: trivy.yml sets `ignorefile: .trivyignore.yaml`, so this plain file
+# is NOT read by the scan. It is kept only as a format reference; add real
+# suppressions to .trivyignore.yaml.

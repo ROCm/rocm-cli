@@ -423,8 +423,8 @@ rocm model --verbose"
     },
     /// Start a local OpenAI-compatible model server.
     ///
-    /// Picks an engine and ROCm runtime automatically unless overridden. A text-only,
-    /// non-streaming Anthropic `/v1/messages` endpoint is published beside the OpenAI
+    /// Picks an engine and ROCm runtime automatically unless overridden. A non-streaming
+    /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, smoke-test metrics, and the backend device the engine
@@ -782,7 +782,8 @@ pub(crate) enum InstallTarget {
 rocm install sdk\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
 rocm install sdk --family gfx110X-all --dry-run\n  \
-rocm install sdk --devel")]
+rocm install sdk --devel\n  \
+rocm install sdk --version 10.0.0 --python-version 3.12")]
     Sdk {
         /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]
@@ -808,6 +809,17 @@ rocm install sdk --devel")]
         /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
+        /// Python version for a ROCm 10 or newer install, one of 3.10 to 3.14.
+        ///
+        /// ROCm 10 installs use Python 3.14 unless you name another, because
+        /// vLLM, flash-attn and amd-aiter for ROCm 10 are published for 3.14
+        /// only. With another version the SDK and PyTorch install and run, but
+        /// the vLLM engine does not: the engine install that follows an SDK
+        /// install on a vLLM GPU is skipped, and `rocm engines install vllm`
+        /// refuses that runtime. Re-run without this flag to switch it to 3.14.
+        /// Wheel installs only; a ROCm 7 install is built for Python 3.12.
+        #[arg(long, value_name = "X.Y")]
+        python_version: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
         /// building GPU code. Roughly doubles the wheel download; already
         /// included by `--format tarball`.

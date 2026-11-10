@@ -80,3 +80,30 @@ regexes = [
   '''[A-Z][A-Z0-9_]*SHA512\s*[=:]''',
   '''[A-Z][A-Z0-9_]*MD5\s*[=:]''',
 ]
+
+[[allowlists]]
+description = "Model names and runtime keys assigned in first-party Rust code"
+# The generic-api-key rule fires on `api_model = "Qwen3-0.6B-GGUF"` and
+# `runtime_key: "wheel-gfx942-7.13.0"` because the variable name contains
+# "key" or "api" and the value is a short mixed-case identifier. Both are
+# public identifiers (a model repository name, a runtime install key), not
+# credentials. Matched against the rule's own match, not the whole line, so
+# a real credential on the same line is still reported under its own match.
+# Only the two names `api_model` and `runtime_key` are listed, so an
+# `api_key = "..."` assignment is still scanned; the Rust-only path limit keeps
+# the exception out of other file types. Both `:` (struct field) and `=`
+# (assignment) are accepted for both names, and the value may hold the
+# characters a model name or a runtime key uses (`Qwen3-0.6B-GGUF`,
+# `therock-release:gfx120X-all`), up to 64 characters, so a long token
+# assigned to one of the two names is still reported. A JSON-style quoted key
+# such as `"runtime_key": "..."` is not covered.
+# `condition = "AND"` is load-bearing: under the default OR, the `paths` entry
+# alone would allowlist every rule in every `.rs` file. Do not remove it.
+condition = "AND"
+paths = [
+  '''.*\.rs$''',
+]
+regexTarget = "match"
+regexes = [
+  '''\b(api_model|runtime_key)\s*[:=]\s*"[A-Za-z0-9._/:-]{1,64}"''',
+]

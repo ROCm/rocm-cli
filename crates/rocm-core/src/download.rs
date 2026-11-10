@@ -26,9 +26,13 @@ use crate::disk_space;
 /// retry, so this is one initial try plus two retries.
 pub const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
 
-/// Chunk size for the streaming copy. Fixed, so peak memory is independent of
-/// the artifact size — the whole point of streaming a multi-gigabyte tarball.
-const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+/// Chunk size for the streaming copy.
+///
+/// Fixed, so peak memory is independent of the artifact size — the whole point
+/// of streaming a multi-gigabyte tarball. Public so the digest gate's tests can
+/// size a body that crosses a chunk boundary from this value rather than from a
+/// copy of it.
+pub const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Exponential backoff between download attempts.
 ///
