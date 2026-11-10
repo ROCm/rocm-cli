@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm engines shell`.
+//! Steps for `rocm engines shell`, and for the `rocm engines list` entry of a
+//! vLLM install whose compiled extensions do not import (plain piped runs).
 //!
-//! These run under a pseudo-terminal on purpose. The defect they guard — a shell
+//! The shell steps run under a pseudo-terminal on purpose. The defect they guard — a shell
 //! that is correctly activated but visually identical to the one it was launched
 //! from — exists only in what the terminal renders, so a piped run cannot see it.
 
@@ -192,18 +193,41 @@ async fn list_engines_of_that_install(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+/// The `rocm engines list` block for one engine: its heading line and the
+/// indented lines under it, up to the next engine. Other engines print their own
+/// `runtime:` line (AIM reads `ready` wherever a Docker daemon is reachable), so
+/// the assertions below must not read the whole output.
+fn engine_block(output: &str, engine: &str) -> String {
+    let mut block = Vec::new();
+    let mut inside = false;
+    for line in output.lines() {
+        // An engine's heading sits at two columns (`* ` marks the default one);
+        // its `adapter:`/`runtime:`/`note:` lines are indented under it.
+        let heading = line.replacen("* ", "  ", 1);
+        let indent = heading.len() - heading.trim_start().len();
+        if !heading.trim().is_empty() && indent <= 2 {
+            inside = heading.trim_start().starts_with(engine);
+        }
+        if inside {
+            block.push(line);
+        }
+    }
+    block.join("\n")
+}
+
 #[then("vLLM is reported as installed but not usable")]
 async fn vllm_reported_not_usable(world: &mut E2eWorld) {
     let out = world
         .cli_output
         .as_deref()
         .expect("no engines output recorded");
+    let vllm = engine_block(out, "vllm");
     assert!(
-        out.contains("installed, not usable"),
+        vllm.contains("runtime: installed, not usable"),
         "the broken vLLM was not reported as unusable:\n{out}"
     );
     assert!(
-        !out.contains("runtime: ready"),
+        !vllm.contains("runtime: ready"),
         "a runtime whose extensions do not import must not read as ready:\n{out}"
     );
 }
@@ -215,7 +239,7 @@ async fn report_names_failing_extension(world: &mut E2eWorld) {
         .as_deref()
         .expect("no engines output recorded");
     assert!(
-        out.contains("vllm._C"),
-        "the report does not name the failing extension:\n{out}"
+        engine_block(out, "vllm").contains("vllm._C"),
+        "the vLLM entry does not name the failing extension:\n{out}"
     );
 }
