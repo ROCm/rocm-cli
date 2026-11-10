@@ -248,7 +248,13 @@ jobs:
               path = f"runtimes/locks/{lock.name}"
               produced.add(path)
               additions.append({"path": path, "contents": base64.b64encode(lock.read_bytes()).decode()})
-          deletions = [{"path": p} for p in sys.argv[1].split() if p not in produced]
+          # Only locks. `deps lock` also removes other strays from
+          # runtimes/locks/, but `deps check` (run by the required tests)
+          # keeps them off `main`, so one here would be someone's deliberate
+          # change and is not this workflow's to delete.
+          deletions = [{"path": p} for p in sys.argv[1].split()
+                       if p not in produced and p.startswith("runtimes/locks/pylock.") and p.endswith(".toml")
+                       and p.count("/") == 2]
           print(json.dumps({
               "query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
               "variables": {"input": {

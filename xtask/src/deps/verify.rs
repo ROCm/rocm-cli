@@ -61,7 +61,11 @@ fn verify(root: &Path, work: &Path, fetch: &dyn Fetch) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for (name, tool) in &tools {
         for (platform, asset) in &tool.platforms {
-            if asset.provenance.is_some() {
+            // Only an attested tool's verified attestation stands in for
+            // re-hashing; `deps check` refuses provenance anywhere else.
+            if mise_lock::ATTESTED_TOOLS.contains(&name.as_str())
+                && asset.provenance.as_deref() == Some(mise_lock::ATTESTED)
+            {
                 continue;
             }
             let file = work.join(format!("{}-{platform}", tool.version));
@@ -183,6 +187,51 @@ mod tests {
                 "github:o/tool@1 linux-x64: {LINUX} has sha256 {}, but the lock records {recorded}",
                 hex(b"the real archive")
             )]
+        );
+    }
+
+    /// Only a verified build attestation skips the re-hash: any other
+    /// `provenance` value is no attestation at all.
+    #[test]
+    fn a_provenance_other_than_a_verified_attestation_is_still_rehashed() {
+        let recorded = "b".repeat(64);
+        let root = workspace(&recorded);
+        let lock_path = root.path().join(MISE_LOCK);
+        let original = std::fs::read_to_string(&lock_path).unwrap();
+        // A made-up value, and a real one on a tool that is not attested.
+        for value in ["trust-me", "github-attestations"] {
+            let lock = original.replace(
+                "checksum_source = \"mise-versions\"",
+                &format!("provenance = \"{value}\""),
+            );
+            std::fs::write(&lock_path, lock).unwrap();
+            let fake = fake();
+            let found = verify(root.path(), &root.path().join("work"), &fake).unwrap();
+            assert_eq!(*fake.fetched.borrow(), [LINUX], "{value}");
+            assert_eq!(found.len(), 1, "{value}: {found:?}");
+        }
+    }
+
+    /// An attested tool is skipped only when its value is the verified
+    /// attestation; any other value is re-hashed like everything else.
+    #[test]
+    fn an_attested_tool_with_another_provenance_is_still_rehashed() {
+        let root = workspace(&hex(b"the real archive"));
+        let lock_path = root.path().join(MISE_LOCK);
+        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+            "provenance = \"github-attestations\"",
+            "provenance = \"trust-me\"",
+        );
+        std::fs::write(&lock_path, lock).unwrap();
+        let mut fake = fake();
+        fake.bodies
+            .insert(ATTESTED.to_owned(), b"not what uv's lock records".to_vec());
+        let found = verify(root.path(), &root.path().join("work"), &fake).unwrap();
+        assert_eq!(*fake.fetched.borrow(), [ATTESTED, LINUX]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("aqua:astral-sh/uv@0.1 linux-x64:"),
+            "{found:?}"
         );
     }
 

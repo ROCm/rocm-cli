@@ -841,7 +841,10 @@ mod tests {
         let output = std::process::Command::new("python3")
             .arg("-I")
             .arg("builder.py")
-            .arg("runtimes/locks/pylock.a-linux.toml runtimes/locks/pylock.gone-linux.toml")
+            // One stray path per condition of the filter: a lock-named file
+            // that is not TOML, a TOML file not named like a lock, and a lock
+            // name one directory too deep.
+            .arg("runtimes/locks/pylock.a-linux.toml runtimes/locks/pylock.gone-linux.toml runtimes/locks/pylock.x.json runtimes/locks/other.toml runtimes/locks/pylock.x/nested.toml")
             .current_dir(dir.path())
             .env("REPO", "o/r")
             .env("BRANCH", "runtime-deps/update")
@@ -1273,7 +1276,9 @@ mod tests {
                 "    path = f\"runtimes/locks/{lock.name}\"",
                 "    produced.add(path)",
                 "    additions.append({\"path\": path, \"contents\": base64.b64encode(lock.read_bytes()).decode()})",
-                "deletions = [{\"path\": p} for p in sys.argv[1].split() if p not in produced]",
+                "deletions = [{\"path\": p} for p in sys.argv[1].split()",
+                "             if p not in produced and p.startswith(\"runtimes/locks/pylock.\") and p.endswith(\".toml\")",
+                "             and p.count(\"/\") == 2]",
                 "print(json.dumps({",
                 "    \"query\": \"mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }\",",
                 "    \"variables\": {\"input\": {",

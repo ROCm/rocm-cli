@@ -160,14 +160,20 @@ fn collect(file: &str, text: &str, into: &mut Versions) -> Result<()> {
             .with_context(|| format!("invalid {file}"))?
             .packages
         {
-            if let Some(version) = package.version {
-                // As for binaries: a re-spun artifact at an unchanged version
-                // changes the cell, so the update's table shows it.
-                let cell = match artifacts_digest(&package.wheels, package.sdist.as_ref()) {
-                    Some(digest) => format!("{version}-{digest}"),
-                    None => version,
-                };
-                into.insert((file.to_owned(), normalize_name(&package.name)), cell);
+            // `deps check` refuses both of these; the table must not hide
+            // them by dropping the row or keeping only one of two.
+            let Some(version) = package.version else {
+                bail!("{file}: {} is locked without a version", package.name);
+            };
+            // As for binaries: a re-spun artifact at an unchanged version
+            // changes the cell, so the update's table shows it.
+            let cell = match artifacts_digest(&package.wheels, package.sdist.as_ref()) {
+                Some(digest) => format!("{version}-{digest}"),
+                None => version,
+            };
+            let key = (file.to_owned(), normalize_name(&package.name));
+            if into.insert(key, cell).is_some() {
+                bail!("{file}: {} is locked more than once", package.name);
             }
         }
     }
@@ -587,6 +593,33 @@ mod tests {
             cell(&wheels(&x, &y), "numpy"),
             cell(&wheels(&y, &x), "numpy")
         );
+    }
+
+    /// What `deps check` refuses, the table must not paper over: a package
+    /// with no version, or one locked twice, is an error rather than a row
+    /// that is missing or shows only one of the two.
+    #[test]
+    fn a_package_without_a_version_or_locked_twice_is_an_error() {
+        let file = "runtimes/locks/pylock.p-linux.toml";
+        let entry = |version: &str| {
+            format!(
+                "[[packages]]\nname = \"numpy\"\n{version}wheels = [{{ url = \"https://files.pythonhosted.org/n.whl\", hashes = {{ sha256 = \"{}\" }} }}]\n",
+                "a".repeat(64)
+            )
+        };
+        let versionless = format!("lock-version = \"1.0\"\n\n{}", entry(""));
+        let twice = format!(
+            "lock-version = \"1.0\"\n\n{}\n{}",
+            entry("version = \"2.3.0\"\n"),
+            entry("version = \"2.4.0\"\n")
+        );
+        for (expected, text) in [
+            ("numpy is locked without a version", versionless),
+            ("numpy is locked more than once", twice),
+        ] {
+            let err = collect(file, &text, &mut Versions::new()).unwrap_err();
+            assert_eq!(format!("{err:#}"), format!("{file}: {expected}"));
+        }
     }
 
     #[test]

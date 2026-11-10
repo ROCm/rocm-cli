@@ -80,7 +80,9 @@ the lock. The weekly update's read-only `check` job runs it before a pull
 request is opened, and the `runtime-locks` job runs it on any pull request
 that changes `runtimes/`. `cargo xtask deps check` (below) ties the URL to
 Lemonade's own release for that version. `deps check` does not read `checksum_source`; it does require
-uv's `provenance = "github-attestations"`, ties `url_api` (which mise downloads
+uv's `provenance = "github-attestations"`, refuses a `provenance` value of any
+kind on every other tool (so no value can excuse a Lemonade download from
+re-hashing), ties `url_api` (which mise downloads
 through when set) to the same repository as `url`, and refuses any lock field
 it does not know.
 
@@ -151,6 +153,9 @@ mise's own `pypi` backend was evaluated for these stacks and cannot lock them
 - every wheel's platform tag fits the lock's OS (x86-64 Linux, or `win_amd64`),
   since the Windows locks are resolved on a Linux runner;
 - each package is locked once, with a version and at least one artifact;
+- every package name is a PEP 508 name and every version uses PEP 440's
+  characters only (ASCII letters and digits plus `. + ! _ -`, starting with a
+  digit), so no value can break the update PR's version table;
 - every lock a profile declares exists, and `runtimes/locks/` holds nothing
   else: the directory (fixed, not configurable) belongs to the tooling, so
   `deps lock` removes every entry there no profile produces — dotfiles and

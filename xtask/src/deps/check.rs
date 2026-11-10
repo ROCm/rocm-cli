@@ -125,11 +125,36 @@ pub(crate) fn lock_problems(
 
     let mut versions: BTreeMap<String, &str> = BTreeMap::new();
     for package in &lock.packages {
+        // PEP 508: letters, digits, `-`, `_` and `.`, starting and ending
+        // alphanumeric. Anything else would also be rendered as-is into the
+        // update's Markdown table.
+        let package_name = &package.name;
+        if !(package_name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && package_name.ends_with(|c: char| c.is_ascii_alphanumeric())
+            && package_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        {
+            out.push(format!("{package_name:?}: is not a valid package name"));
+            continue;
+        }
         let key = normalize_name(&package.name);
         let Some(version) = package.version.as_deref() else {
             out.push(format!("{}: no version", package.name));
             continue;
         };
+        // PEP 440's characters only, starting with a digit: the version is
+        // rendered as-is into the update's Markdown table too.
+        if !(version.starts_with(|c: char| c.is_ascii_digit())
+            && version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-')))
+        {
+            out.push(format!(
+                "{package_name}: {version:?} is not a valid version"
+            ));
+            continue;
+        }
         if versions.insert(key, version).is_some() {
             out.push(format!("{}: locked more than once", package.name));
         }
@@ -552,6 +577,79 @@ linux = "x86_64-manylinux_2_28"
                 "{key}"
             );
         }
+    }
+
+    /// A name that is not a PEP 508 name is refused: it would otherwise be
+    /// rendered as-is into the update's Markdown table.
+    #[test]
+    fn a_package_name_outside_pep_508_is_refused() {
+        for bad in ["num|py", "num`py", "-numpy", "numpy-", "num py", "numpé"] {
+            // numpy's wheel also comes from a host nothing allows, so the
+            // entry's other checks would report it if the refused entry were
+            // not skipped.
+            let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com")
+                .replacen("name = \"numpy\"", &format!("name = \"{bad}\""), 1)
+                .replace(
+                    "https://files.pythonhosted.org/numpy",
+                    "https://evil.example/numpy",
+                );
+            let found = problems_of(&text);
+            // Exactly one problem: the entry is refused and skipped.
+            assert_eq!(
+                found,
+                [format!("{bad:?}: is not a valid package name")],
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_outside_pep_440_characters_is_refused() {
+        for bad in ["2.3.0|x", "2.3.0 x", "v2.3.0", "2.3é", "2.3.0\n| `x` | y |"] {
+            let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com").replacen(
+                "version = \"2.3.0\"",
+                &format!("version = {bad:?}"),
+                1,
+            );
+            let found = problems_of(&text);
+            assert_eq!(
+                found,
+                [format!("numpy: {bad:?} is not a valid version")],
+                "{bad:?}"
+            );
+        }
+        // A refused version is skipped, not checked against the requirement
+        // too: torch is then reported as required but not locked.
+        let torch = lock_text("2.13.0|x", "stable.repo.amd.com");
+        assert_eq!(
+            problems_of(&torch),
+            [
+                "torch: \"2.13.0|x\" is not a valid version",
+                "torch: required but not locked"
+            ]
+        );
+        // Every allowed character, in names and versions, is accepted.
+        for (name, version) in [
+            ("zope.interface", "1.0-1"),
+            ("a_b", "1.0+a_b"),
+            ("a-b", "1!2.3.0"),
+        ] {
+            let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com")
+                .replacen("name = \"numpy\"", &format!("name = \"{name}\""), 1)
+                .replacen(
+                    "version = \"2.3.0\"",
+                    &format!("version = \"{version}\""),
+                    1,
+                );
+            assert_eq!(problems_of(&text), Vec::<String>::new(), "{name} {version}");
+        }
+        // An epoch (`1!2.3.0`) is a valid version.
+        let epoch = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com").replacen(
+            "version = \"2.3.0\"",
+            "version = \"1!2.3.0\"",
+            1,
+        );
+        assert_eq!(problems_of(&epoch), Vec::<String>::new());
     }
 
     #[test]

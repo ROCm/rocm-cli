@@ -37,6 +37,15 @@ const OS_TOKENS: [(&str, &[&str]); 2] = [
     ("windows", &["windows", "win64", "win_amd64", "win-x64"]),
 ];
 
+/// The `provenance` mise records when it verified a release's build
+/// attestation; the only value a lock may carry, and only on `ATTESTED_TOOLS`.
+pub(crate) const ATTESTED: &str = "github-attestations";
+
+/// Tools whose releases carry build attestations, so their locks must record
+/// that mise verified one. Any other tool may carry no `provenance` at all:
+/// its downloads are re-hashed by `deps verify-downloads` instead.
+pub(crate) const ATTESTED_TOOLS: [&str; 1] = [super::pins_gen::UV_TOOL];
+
 /// One locked platform of one tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LockedAsset {
@@ -288,13 +297,18 @@ pub(crate) fn problems(config: &MiseConfig, lock: &BTreeMap<String, LockedTool>)
             out.extend(asset_problems(name, platform, asset));
             out.extend(source_problems(name, &tool.version, platform, asset));
             out.extend(api_problems(name, platform, asset));
-            // uv's releases carry build attestations; a lock that dropped the
-            // record of verifying one is refused rather than trusted.
-            if name == super::pins_gen::UV_TOOL
-                && asset.provenance.as_deref() != Some("github-attestations")
-            {
+            // An attested tool must record that mise verified its attestation.
+            // Any other tool may record no provenance at all, whatever the
+            // value: a value would excuse it from `deps verify-downloads`.
+            if ATTESTED_TOOLS.contains(&name.as_str()) {
+                if asset.provenance.as_deref() != Some(ATTESTED) {
+                    out.push(format!(
+                        "{name}: {platform} was not locked with provenance = \"{ATTESTED}\""
+                    ));
+                }
+            } else if let Some(value) = asset.provenance.as_deref() {
                 out.push(format!(
-                    "{name}: {platform} was not locked with provenance = \"github-attestations\""
+                    "{name}: {platform} records provenance {value:?}, but only {ATTESTED_TOOLS:?} are attested; its downloads are re-hashed instead"
                 ));
             }
         }
@@ -830,6 +844,36 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
     }
 
     #[test]
+    fn a_provenance_other_than_a_verified_attestation_is_refused() {
+        let text = lock(LINUX, Some(WINDOWS)).replacen(
+            &format!("url = \"{LINUX}\"\n"),
+            &format!("url = \"{LINUX}\"\nprovenance = \"trust-me\"\n"),
+            1,
+        );
+        assert_eq!(
+            problems_of(&text),
+            [
+                "github:example/tool: linux-x64 records provenance \"trust-me\", but only [\"aqua:astral-sh/uv\"] are attested; its downloads are re-hashed instead"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_attestation_on_a_tool_that_is_not_attested_is_refused() {
+        let text = lock(LINUX, Some(WINDOWS)).replacen(
+            &format!("url = \"{LINUX}\"\n"),
+            &format!("url = \"{LINUX}\"\nprovenance = \"github-attestations\"\n"),
+            1,
+        );
+        assert_eq!(
+            problems_of(&text),
+            [
+                "github:example/tool: linux-x64 records provenance \"github-attestations\", but only [\"aqua:astral-sh/uv\"] are attested; its downloads are re-hashed instead"
+            ]
+        );
+    }
+
+    #[test]
     fn uv_must_be_locked_with_its_build_attestation() {
         let config = MiseConfig::parse(
             "[settings]\nlockfile = true\nlockfile_platforms = [\"linux-x64\", \"windows-x64\"]\n\n[tools]\n\"aqua:astral-sh/uv\" = \"0.13.6\"\n",
@@ -857,6 +901,23 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
         assert!(
             found.contains(&"aqua:astral-sh/uv: linux-x64 was not locked with provenance = \"github-attestations\"".to_owned()),
             "{found:?}"
+        );
+        // A present but wrong value is reported once per platform, not twice.
+        let mut wrong = dropped;
+        for asset in wrong
+            .get_mut("aqua:astral-sh/uv")
+            .unwrap()
+            .platforms
+            .values_mut()
+        {
+            asset.provenance = Some("trust-me".to_owned());
+        }
+        assert_eq!(
+            problems(&config, &wrong),
+            [
+                "aqua:astral-sh/uv: linux-x64 was not locked with provenance = \"github-attestations\"",
+                "aqua:astral-sh/uv: windows-x64 was not locked with provenance = \"github-attestations\"",
+            ]
         );
     }
 
