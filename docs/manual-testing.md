@@ -211,7 +211,8 @@ Expected result:
   that writes a file when run, and after the preview that file does not exist.
   It reads the folder's files instead. For your home folder with a broken
   `~/bin/python` and no `pyvenv.cfg`, `python_env:` says
-  `the install will refuse this folder`, `command:` is `none`, and a
+  `the install will refuse this folder`, `command:` is
+  `none; the install will refuse this folder`, and a
   `refusal:` line gives the install's message. For a folder with both a Python
   and `pyvenv.cfg`, it cannot tell without running that Python whether the
   venv would be reused, so `python_env:` says so, `command:` shows only the

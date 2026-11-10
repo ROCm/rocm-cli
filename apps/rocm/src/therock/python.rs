@@ -4159,7 +4159,10 @@ exit 1
         CfgAndCacheTag,
         /// Part of `bin` removed, the interpreter among it.
         PartOfBinWithPython,
-        /// Part of `bin` removed, the interpreter still there.
+        /// Part of `bin` removed (`activate`), the interpreter and
+        /// `pyvenv.cfg` still there. Nothing the venv needs is gone, so the
+        /// next run must reuse it, not rebuild it: this is the stop that pins
+        /// that a part-way clear of `bin` alone does not cost a rebuild.
         PartOfBinKeepingPython,
         /// All of `bin` removed.
         WholeBin,
@@ -4226,6 +4229,15 @@ exit 1
             fs::remove_file(log).ok();
             ensure_uv_venv(&paths, uv, launcher, &install_root)
                 .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            // Which way each stop converges: only the stop that left a whole
+            // venv is reused; every other one is rebuilt through uv.
+            let rebuilt = fs::read_to_string(log)
+                .is_ok_and(|calls| calls.lines().any(|line| line.starts_with("venv ")));
+            assert_eq!(
+                rebuilt,
+                !matches!(stop, ClearStop::PartOfBinKeepingPython),
+                "{what}: rebuilt={rebuilt}"
+            );
             assert!(
                 install_root.join("pyvenv.cfg").is_file(),
                 "{what}: no pyvenv.cfg"
@@ -4265,6 +4277,89 @@ exit 1
             );
             fs::remove_dir_all(root).ok();
         }
+    }
+
+    /// The ownership and shape decisions read only files, so they are tested on
+    /// every platform, the Windows CI job included, with `venv_python_path`'s
+    /// own layout (`Scripts\\python.exe` there, `bin/python` elsewhere). The
+    /// interpreter is an empty file nothing runs. Covers what the Unix tests
+    /// drive through shell stand-ins: an empty folder, someone else's folder
+    /// refused with the condition named and the folder untouched, a venv shape
+    /// missing `pyvenv.cfg`, and a folder the wheel marker proves ROCm CLI made.
+    #[test]
+    fn the_venv_folder_decision_reads_files_on_every_platform() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-venv-decision-{}-{}-{}",
+            std::process::id(),
+            unix_time_millis(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let plant_python = |folder: &Path| {
+            let python = venv_python_path(folder);
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(&python, b"").unwrap();
+            python
+        };
+
+        let missing = root.join("missing");
+        assert_eq!(
+            venv_folder_state(&paths, &missing, "files").unwrap(),
+            VenvFolder::Empty
+        );
+
+        let cloned = root.join("cloned");
+        let python = plant_python(&cloned);
+        fs::write(cloned.join("notes.txt"), b"the user's").unwrap();
+        let finding = venv_shape_finding(&cloned).expect("no pyvenv.cfg is certain");
+        assert_eq!(
+            finding,
+            format!(
+                "a Python at {} with no pyvenv.cfg beside it",
+                python.display()
+            )
+        );
+        let refusal = venv_folder_state(&paths, &cloned, &finding)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains(&format!("(found {finding};")), "{refusal}");
+        assert!(refusal.contains("no .rocm-cli-runtime.json"), "{refusal}");
+        assert_eq!(
+            fs::read(cloned.join("notes.txt")).unwrap(),
+            b"the user's",
+            "a refusal changes nothing"
+        );
+
+        fs::write(cloned.join("pyvenv.cfg"), b"home = x").unwrap();
+        assert_eq!(
+            venv_shape_finding(&cloned),
+            None,
+            "both files: only running it could tell"
+        );
+
+        let owned = root.join("owned");
+        plant_python(&owned);
+        let marker = serde_json::json!({
+            "runtime_key": "release-wheel-x",
+            "format": "wheel",
+            "install_root": owned,
+        });
+        fs::write(
+            owned.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            venv_folder_state(&paths, &owned, "files").unwrap(),
+            VenvFolder::Owned
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     /// The reuse check alone already refuses a Python without `pyvenv.cfg`;

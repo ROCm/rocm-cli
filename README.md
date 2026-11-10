@@ -547,8 +547,9 @@ install finished, instead.
 
 `--dry-run` runs nothing from the install folder, since the folder can hold any
 `bin/python`. It reads the folder's files and reports which of these will
-happen, with `command: none` and the install's refusal for a folder the install
-would refuse. Whether a folder holding both a Python and `pyvenv.cfg` would be
+happen, with `command: none; the install will refuse this folder` and a
+`refusal:` line holding the install's message for a folder the install would
+refuse. Whether a folder holding both a Python and `pyvenv.cfg` would be
 reused depends on running that Python, so the preview says it cannot tell and
 shows both outcomes. If the Python the preview would check first (on `PATH`, or
 `ROCM_CLI_PYTHON`) is inside the `--prefix` folder, it stops and says it did not

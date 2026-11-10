@@ -932,9 +932,12 @@ holding someone else's venv says it cannot tell and runs nothing) and
 `runtime-32` (a preview whose `ROCM_CLI_PYTHON` is inside the folder stops
 without running it) run the real
 CLI with a loopback index, a fake `uv` and planted Pythons that record every
-run. They are Linux-only because those stand-ins are shell scripts; the guard
-code is platform-neutral and the Windows CI job builds it, but no Windows test
-runs a preview against a planted interpreter.
+run. They are Linux-only because those stand-ins are shell scripts. The
+folder decision itself (empty, refused with the condition named, owned by the
+wheel marker) reads only files, so
+`the_venv_folder_decision_reads_files_on_every_platform` runs it on every
+platform, the Windows CI job included, with that platform's venv layout; no
+Windows test runs a preview or a rebuild against a planted interpreter.
 
 Then it verifies:
 

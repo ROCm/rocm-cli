@@ -2179,14 +2179,17 @@ fn install_folder(world: &E2eWorld, name: &str) -> std::path::PathBuf {
         .expect("failed to canonicalize install folder")
 }
 
+/// Written through [`rocm_core::fake_executable::write_fake_executable`], not
+/// `fs::write` and a chmod: a script exec'd while another thread's fork still
+/// holds it open for writing fails with ETXTBSY, and the shared helper is the
+/// one that avoids that race under the suite's concurrency.
 fn write_executable(path: &Path, body: &str) {
-    write_fixture(path, body);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("failed to chmod {}: {e}", path.display()));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
     }
+    rocm_core::fake_executable::write_fake_executable(path, body)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
 }
 
 /// A Python that fails, and first appends a line to [`prefix_python_log`] so a
