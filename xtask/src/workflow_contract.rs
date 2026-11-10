@@ -1668,6 +1668,86 @@ jobs:
         ]
     }
 
+    /// The names in a `$env:WSLENV = '...'` assignment inside `block`, the
+    /// variables `wsl.exe` forwards into the guest. Empty when the job has none.
+    fn wslenv_names(block: &str) -> Vec<String> {
+        block
+            .lines()
+            .map(strip_comment)
+            .filter_map(|line| line.trim().strip_prefix("$env:WSLENV ="))
+            .flat_map(|value| {
+                strip_quotes(value.trim())
+                    .split(':')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// `E2E_HARDWARE=real` is what lets a GPU lane run the `@requires-real-gpu`
+    /// scenarios. Nothing in the suite notices its absence: a lane without it
+    /// skips every one of them and stays green, so the switch's whole effect
+    /// would vanish without a red check. Derived from the workflows, so a new
+    /// self-hosted lane is covered the day it lands, and a WSL lane must also
+    /// forward the variable into the guest, which does not inherit the job's
+    /// environment. A GitHub-hosted job has no GPU to run those scenarios on,
+    /// so none may set it.
+    #[test]
+    fn every_self_hosted_lane_runs_the_real_gpu_scenarios() {
+        for (workflow, text) in self_hosted_workflows() {
+            let lanes = self_hosted_e2e_jobs(&text);
+            assert!(!lanes.is_empty(), "{workflow} has no self-hosted lane");
+            for (job, _) in lanes {
+                let block = job_block(&text, &job);
+                let env = job_mapping(block, "env");
+                assert_eq!(
+                    env.get("E2E_HARDWARE").map(String::as_str),
+                    Some("real"),
+                    "{workflow} job `{job}` runs on GPU hardware but does not set \
+                     `E2E_HARDWARE: real` in its job env, so it would skip every \
+                     @requires-real-gpu scenario and still pass"
+                );
+                if block.contains("wsl.exe") {
+                    let forwarded = wslenv_names(block);
+                    assert!(
+                        forwarded.iter().any(|name| name == "E2E_HARDWARE"),
+                        "{workflow} job `{job}` runs the suite inside WSL but does not \
+                         name E2E_HARDWARE in WSLENV (it forwards {forwarded:?}), so the \
+                         guest runs in simulated mode"
+                    );
+                }
+            }
+        }
+        for (workflow, text) in all_workflows() {
+            let self_hosted: Vec<String> = self_hosted_e2e_jobs(&text)
+                .into_iter()
+                .map(|(job, _)| job)
+                .collect();
+            for job in job_ids(&text) {
+                if self_hosted.contains(&job) {
+                    continue;
+                }
+                let block = job_block(&text, &job);
+                assert!(
+                    !block
+                        .lines()
+                        .map(strip_comment)
+                        .any(|line| line.trim_start().starts_with("E2E_HARDWARE:")),
+                    "{workflow} job `{job}` is not a self-hosted GPU lane but sets \
+                     E2E_HARDWARE; only real GPU hardware may run @requires-real-gpu scenarios"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wslenv_names_reads_the_forwarded_variables() {
+        let block =
+            "    steps:\n      - run: |\n          $env:WSLENV = 'A:E2E_HARDWARE:B' # forwarded\n";
+        assert_eq!(wslenv_names(block), ["A", "E2E_HARDWARE", "B"]);
+        assert!(wslenv_names("    steps: []\n").is_empty());
+    }
+
     #[test]
     fn every_self_hosted_lane_waits_for_an_available_gpu() {
         // `e2e-gpu-nightly` shipped without one and nothing noticed: it hung to
