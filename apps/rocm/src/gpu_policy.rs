@@ -10,10 +10,9 @@
 //! --json`, with an amdgpu DRM sysfs fallback), and building the serve-plan
 //! low-VRAM warning from it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-214) of the `main.rs` modularization (see
-//! `docs/architecture.md`). `dispatch()` calls directly into this module at
-//! one point — the `Command::EngineServeHttp` arm's
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`). `dispatch()` calls directly
+//! into this module at one point — the `Command::EngineServeHttp` arm's
 //! `parse_gpu_indices_arg(gpu.as_deref())?` — re-imported via `use
 //! crate::gpu_policy::parse_gpu_indices_arg;`; `dispatch()`'s own body is
 //! otherwise unaffected.
