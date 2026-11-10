@@ -4129,8 +4129,9 @@ that grades how the agent reads a diagnosis, or what it does on an older CLI, ne
 has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/), the
 hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
 removes it afterwards. The stub replays recorded output for `rocm --version`,
-`rocm fix --json` and `rocm diagnose`, and refuses every other command with exit
-code 2. It only prints text read from the recording, so whatever an agent asks it,
+`rocm fix --json` and `rocm diagnose`, plus `rocm examine --json` for a case that
+names a `host` (below), and refuses every other command with exit code 2. It only
+prints text read from the recording, so whatever an agent asks it,
 it cannot change a machine or send anything; that comes from answering a fixed set
 of commands, not from the refusals. It also refuses `diagnose` options the
 recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
@@ -4164,10 +4165,23 @@ changed is output the skill is now graded against. What an older CLI printed can
 generated. It was recorded once from a real older build and lives in
 [`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
 
+A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
+`examine-fails`. The stub then answers `rocm examine --json`, and a case without a
+`host` still refuses it. The reply is the recorded examination with only the fields
+the host implies changed (`is_wsl`, `has_amd_gpu` and, for `amd-found`, one GPU), and
+its `status` is recomputed by `Examination::compute_status`, the rule the probe uses,
+so a recording cannot say a status the other fields contradict. The real command prints
+those fields plus a `summary` object that only the `rocm` binary can build, so the
+replay leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in
+it. Some fields are typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+`wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
+with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
+exits 1 with a fixed message on stderr, which is what the case pins.
+
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
-case id, `current` or `older`, and the error text the agent would pass as the
-symptom), run the command above, and add the case to
+case id, `current` or `older`, the error text the agent would pass as the symptom,
+and optionally a `host`), run the command above, and add the case to
 [`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
 check also fails when a case id is not an id in `evals.json`, or when the part of the
 symptom before its first `:` does not appear in that case's prompt, because the hook
@@ -4191,7 +4205,14 @@ On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionle
 include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
 directory and Python path without spaces; a path with spaces or parentheses is not
 exercised, and neither is the agent's own shell on the amd/skills Windows leg.
-Both replay cases also say "on Linux" in the prompt: run on a Windows host, the
-agent answered that its own machine is Windows and declined to run the CLI there, so
-neither case passed (0 of 2 in a local run), while on a Linux host (WSL2) both
-passed. Treat them as Linux-host cases when reading a run.
+The two cases about the older and the current CLI name no operating system in their
+prompts. They used to say "on Linux", and on a Windows host the agent answered that its
+own machine is Windows and declined to run the CLI at all, so the recorded replies never
+printed. The vLLM cases still say Linux on purpose: their catalog entries apply on Linux
+and WSL2 only, so they are not expected to pass on a Windows host.
+
+A real `rocm` on the machine can answer before the stub. The agent's shell does not
+always keep the stub first on `PATH`, so a machine that has a `rocm` installed (a
+developer's, not a grading runner) may show the real CLI's output and miss the pins. A
+miss on the `logs_contain` pin with the agent otherwise behaving as expected is that,
+not a regression.
