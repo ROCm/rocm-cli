@@ -182,4 +182,48 @@ mod tests {
         assert_eq!(output.stdout.trim(), "marker-value");
         assert_eq!(output.stderr.trim(), "oops");
     }
+
+    /// Subprocess-runners pair of `docs/host-probing.md`, characterised before
+    /// the carrier gains a typed outcome: a child killed by a signal has no exit
+    /// code, and the carrier reports `1` for it, which is also what a child that
+    /// exits with `1` reports.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_killed_by_a_signal_reads_as_exit_status_1() {
+        let killed = capture_program(
+            Path::new("sh"),
+            &["-c", "echo partial; kill -9 $$"],
+            &[],
+            Duration::from_secs(10),
+        )
+        .expect("a signal death is captured, not an error");
+        let exited = capture_program(
+            Path::new("sh"),
+            &["-c", "echo partial; exit 1"],
+            &[],
+            Duration::from_secs(10),
+        )
+        .expect("a non-zero exit is captured, not an error");
+
+        assert_eq!(killed.exit_status, 1);
+        assert_eq!(killed.stdout.trim(), "partial");
+        assert_eq!(
+            killed.exit_status, exited.exit_status,
+            "the two cannot be told apart from the exit status"
+        );
+    }
+
+    /// A program that cannot be started is an error carrying the program, not a
+    /// capture, so a caller cannot tell "not installed" from a timeout except by
+    /// the text of the message.
+    #[test]
+    fn a_program_that_cannot_be_started_is_an_error_naming_it() {
+        let missing = Path::new("/nonexistent-dir-for-the-runner-pair/tool");
+        let error = capture_program(missing, &[], &[], Duration::from_secs(10))
+            .expect_err("a spawn failure is an error here");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("failed to run"), "{rendered}");
+        assert!(rendered.contains("failed to spawn process"), "{rendered}");
+    }
 }
