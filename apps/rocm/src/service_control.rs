@@ -1583,16 +1583,30 @@ mod tests {
         assert_eq!(after_second.engine_pid, None);
     }
 
+    // Unix only: the processes must really be running. The second stop reads the
+    // record through the liveness refresh, which forgets the PIDs of processes it
+    // observes gone (`a_stop_completed_by_a_later_listing_leaves_no_pid_for_the_next_stop`),
+    // so made-up PIDs would be forgotten and not kept.
+    #[cfg(unix)]
     #[test]
     fn an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop() {
         use rocm_core::TerminationOutcome::TimedOut;
+        let mut supervisor = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn supervisor");
+        let mut engine = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn engine");
+        let (supervisor_pid, engine_pid) = (supervisor.id(), engine.id());
         let (root, paths) = test_paths("services-stop-keeps-pids");
         paths.ensure().unwrap();
         let service_id = "svc-services-stop-keeps-pids";
         let mut record = stop_test_record(&paths, service_id);
-        record.supervisor_pid = 4242;
+        record.supervisor_pid = supervisor_pid;
         record.supervisor_start_ticks = Some(5);
-        record.engine_pid = Some(4243);
+        record.engine_pid = Some(engine_pid);
         record.engine_start_ticks = Some(77);
         record.write().unwrap();
 
@@ -1607,14 +1621,18 @@ mod tests {
         let after_first = raw_manifest(&paths, service_id);
         let _ = stop_internal_managed_service_with(&paths, service_id, stop).unwrap();
         let signalled_in_all = signalled.get();
+        let _ = supervisor.kill();
+        let _ = supervisor.wait();
+        let _ = engine.kill();
+        let _ = engine.wait();
         let _ = fs::remove_dir_all(root);
 
         // Nothing was confirmed gone, so the record still names what survived:
         // that is the only thing a later stop can find them by.
         assert_eq!(first["stopped"], false, "{first}");
-        assert_eq!(after_first.supervisor_pid, 4242);
+        assert_eq!(after_first.supervisor_pid, supervisor_pid);
         assert_eq!(after_first.supervisor_start_ticks, Some(5));
-        assert_eq!(after_first.engine_pid, Some(4243));
+        assert_eq!(after_first.engine_pid, Some(engine_pid));
         assert_eq!(after_first.engine_start_ticks, Some(77));
         assert_eq!(signalled_in_all, 4, "each stop tried both processes");
     }
@@ -2818,6 +2836,77 @@ mod tests {
             !changed,
             "nothing about the record may change while the process is unqueryable"
         );
+    }
+
+    /// An unconfirmed stop that a later listing completes (every recorded process
+    /// is observed gone) must leave a record that names no process, as a confirmed
+    /// stop does: otherwise the next `services stop` signals whatever the OS has
+    /// since given those PIDs to, and a PID with no start-time token cannot be
+    /// refuted. The same record, written back and stopped again, visits no PID.
+    #[test]
+    fn a_stop_completed_by_a_later_listing_leaves_no_pid_for_the_next_stop() {
+        let (root, paths) = test_paths("stop-completed-by-listing-clears-pids");
+        paths.ensure().unwrap();
+        let service_id = "svc-completed-by-listing";
+        let mut planted = stop_test_record(&paths, service_id);
+        planted.supervisor_pid = 4242;
+        planted.supervisor_start_ticks = None;
+        planted.engine_pid = Some(4243);
+        planted.engine_start_ticks = Some(77);
+        planted.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            vec![stop_of(4242, rocm_core::TerminationOutcome::Unverified)]
+        })
+        .unwrap();
+        assert_eq!(report["stopped"], false, "{report}");
+        let (mut record, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+        assert_eq!(
+            record.supervisor_pid, 4242,
+            "an unconfirmed stop keeps the PIDs"
+        );
+
+        // The listing that finds both processes gone completes the stop.
+        let changed = crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+            &paths,
+            &mut record,
+            |_| rocm_core::ProcessProbe::Gone,
+        );
+        assert!(changed);
+        record.write().unwrap();
+        let after_listing = raw_manifest(&paths, service_id);
+
+        let visited = std::cell::RefCell::new(Vec::new());
+        let second = stop_internal_managed_service_with(&paths, service_id, |record| {
+            rocm_core::terminate_recorded_service_pids(record, |identity| {
+                visited.borrow_mut().push(*identity);
+                rocm_core::TerminationOutcome::Graceful
+            })
+        })
+        .unwrap();
+        let visited = visited.into_inner();
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(after_listing.status, "stopped");
+        assert_eq!(after_listing.stop_requested_unix_ms, None);
+        assert_eq!(key, None, "the deferred cleanup drops the key");
+        assert_eq!(
+            (
+                after_listing.supervisor_pid,
+                after_listing.supervisor_start_ticks,
+                after_listing.engine_pid,
+                after_listing.engine_start_ticks
+            ),
+            (0, None, None, None)
+        );
+        assert!(
+            visited.is_empty(),
+            "a later stop reached a PID the listing had observed gone: {visited:?}"
+        );
+        assert_eq!(second["stopped"], true, "{second}");
+        assert_eq!(second["pid_outcomes"], serde_json::json!([]), "{second}");
     }
 
     /// A stop whose recorded process was seen to exit but whose tree kill did not

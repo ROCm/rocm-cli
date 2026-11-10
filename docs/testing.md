@@ -2248,6 +2248,17 @@ drives the refresh with an unqueryable PID and then a confirmed-gone one,
 an unverified stop and then the refresh over the record it wrote, and
 `a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
 removal guard; each takes the probe as an argument, so they run on every host.
+When that refresh completes a pending stop (every recorded process confirmed gone) it
+also forgets the recorded processes and reads the record as stopped, as a stop that
+confirmed the exit itself does, so a later `rocm services stop` visits no PID: a PID
+recorded without a token cannot be refuted, and on Windows the tree kill would take
+whatever process now holds the number. A process that may still be running stays
+named. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
+checks both halves (named while unqueryable, forgotten once gone),
+`a_completed_pending_stop_reads_stopped_whatever_live_status_it_had` that every live
+status still ends as `stopped` in that one refresh, and
+`a_stop_completed_by_a_later_listing_leaves_no_pid_for_the_next_stop` runs the real
+termination routine over the record the listing wrote and asserts it visits nothing.
 Three gaps in the scenario coverage are deliberate. `service-stop-07` records no
 token, so the path a record written by this version takes on Windows (a token
 recorded, matching, with the tree kill then running) has no scenario; it rests on

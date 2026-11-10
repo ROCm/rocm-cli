@@ -208,8 +208,9 @@ pub(crate) fn recorded_pids_may_be_running(
 }
 
 /// Complete a stop that was requested but could not confirm termination, once
-/// the processes are actually observed gone: drop the endpoint key and clear the
-/// marker. Returns whether the record changed.
+/// the processes are actually observed gone: drop the endpoint key, clear the
+/// marker, forget the recorded processes and read the record as stopped. Returns
+/// whether the record changed.
 ///
 /// This is deliberately keyed on `stop_requested_unix_ms` rather than on "the
 /// tracked pids are dead". A *crashed* service also has dead pids, but its
@@ -241,6 +242,24 @@ fn settle_pending_stop_key_cleanup(
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
     record.stop_requested_unix_ms = None;
+    // Every recorded process is confirmed gone, so none of them is the
+    // service's any more, and their PIDs are stale from here on. Left in the
+    // record, a later `services stop` would signal whatever the OS has handed
+    // those numbers to, and a PID recorded without a start-time token cannot be
+    // refuted, so on Windows the tree kill would take that process and its
+    // subtree. The same forgetting as a stop that confirmed the exit itself
+    // (`clear_recorded_processes`), and it is done only here, behind the
+    // confirmed-gone check above: a process that may still be running stays named.
+    record.clear_recorded_processes();
+    // And the status a confirmed stop leaves, set here rather than left to the
+    // reconciliation below: with no PID recorded that reconciliation has nothing
+    // to read, so a record still reading `ready` or `running` would stay live.
+    // Setting it also makes the caller's liveness gate return at once, so the one
+    // write the caller makes covers the key cleanup, the cleared processes and
+    // the status together.
+    if managed_service_is_live(record) {
+        "stopped".clone_into(&mut record.status);
+    }
     true
 }
 
@@ -998,10 +1017,25 @@ mod tests {
         paths.ensure()?;
         let service_id = "svc-unqueryable";
         let mut record = pending_stop_record(&paths, service_id)?;
+        // The dangerous shape: a supervisor recorded without a start-time token,
+        // and an engine with one.
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = None;
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
 
         let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
             ProcessProbe::Unqueryable
         });
+        assert_eq!(
+            (
+                record.supervisor_pid,
+                record.engine_pid,
+                record.engine_start_ticks
+            ),
+            (4242, Some(4243), Some(77)),
+            "a process that may still be running stays named: the record is the only thing that names it"
+        );
 
         assert!(
             endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
@@ -1028,7 +1062,42 @@ mod tests {
         );
         assert_eq!(record.stop_requested_unix_ms, None);
         assert_eq!(record.status, "stopped");
+        assert_eq!(
+            (
+                record.supervisor_pid,
+                record.supervisor_start_ticks,
+                record.engine_pid,
+                record.engine_start_ticks
+            ),
+            (0, None, None, None),
+            "the processes confirmed gone are forgotten, so a later stop cannot reach a recycled PID"
+        );
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The deferred cleanup forgets the PIDs, so the reconciliation after it has
+    /// none to read: every live status must still end as `stopped`, in the one
+    /// refresh, rather than a record such as `starting` staying live with no
+    /// process behind it.
+    #[test]
+    fn a_completed_pending_stop_reads_stopped_whatever_live_status_it_had() -> Result<()> {
+        for status in ["starting", "running", "ready", "recovering"] {
+            let (root, paths) = test_paths(&format!("liveness-pending-stop-{status}"));
+            paths.ensure()?;
+            let mut record = pending_stop_record(&paths, "svc-status")?;
+            record.status = status.to_owned();
+
+            let changed =
+                refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+                    ProcessProbe::Gone
+                });
+
+            assert!(changed, "{status}");
+            assert_eq!(record.status, "stopped", "{status}");
+            assert_eq!(record.supervisor_pid, 0, "{status}");
+            let _ = fs::remove_dir_all(root);
+        }
         Ok(())
     }
 
