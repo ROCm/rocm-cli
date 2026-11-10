@@ -35,7 +35,7 @@ const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 
 /// Interpreter `uv` provisions for a [`SourceLayout::Next`] install. See
 /// [`python_requirement`] for why this differs from the canonical default.
-const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
+pub(crate) const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
 
 #[derive(Debug, Clone)]
 pub(super) struct WheelCompatibility {
@@ -244,8 +244,8 @@ fn managed_python_bootstrap_disabled() -> bool {
 /// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PythonRequirement {
-    tag: &'static str,
-    version: &'static str,
+    pub(super) tag: &'static str,
+    pub(super) version: &'static str,
 }
 
 /// The interpreter required to install from `layout`.
@@ -271,6 +271,88 @@ pub(super) const fn python_requirement(layout: SourceLayout) -> PythonRequiremen
             tag: "cp312",
             version: DEFAULT_MANAGED_PYTHON_VERSION,
         },
+    }
+}
+
+/// The CPython versions a ROCm 10+ install can run on when nothing needs vLLM:
+/// the SDK device wheels are `py3-none` and the torch stack is published for
+/// each of these. [`NEXT_MANAGED_PYTHON_VERSION`] stays the default because
+/// vLLM, flash-attn and amd-aiter for ROCm 10 exist for it alone.
+const NEXT_SDK_PYTHONS: [PythonRequirement; 5] = [
+    PythonRequirement {
+        tag: "cp310",
+        version: "3.10",
+    },
+    PythonRequirement {
+        tag: "cp311",
+        version: "3.11",
+    },
+    PythonRequirement {
+        tag: "cp312",
+        version: "3.12",
+    },
+    PythonRequirement {
+        tag: "cp313",
+        version: "3.13",
+    },
+    PythonRequirement {
+        tag: "cp314",
+        version: NEXT_MANAGED_PYTHON_VERSION,
+    },
+];
+
+/// The interpreter `layout` requires when the user asked for `version`
+/// (`rocm install sdk --python-version`).
+///
+/// Only a [`SourceLayout::Next`] install has a choice; the canonical stream is
+/// published for one interpreter, so naming anything else for it is refused
+/// instead of ignored.
+pub(super) fn python_requirement_for_version(
+    layout: SourceLayout,
+    version: &str,
+) -> Result<PythonRequirement> {
+    let version = version.trim();
+    match layout {
+        SourceLayout::Next => NEXT_SDK_PYTHONS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.version == version)
+            .with_context(|| {
+                let supported = NEXT_SDK_PYTHONS
+                    .iter()
+                    .map(|candidate| candidate.version)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "--python-version {version} is not one ROCm 10 and newer is published for; use one of {supported}"
+                )
+            }),
+        SourceLayout::Canonical => {
+            let required = python_requirement(layout);
+            if version == required.version {
+                return Ok(required);
+            }
+            bail!(
+                "--python-version applies only to ROCm 10 and newer installs; this install uses Python {}",
+                required.version
+            )
+        }
+    }
+}
+
+/// The requirement a runtime installed from `layout` was built for, read from
+/// the wheel `tag` of the interpreter it recorded. `None` for a tag the layout
+/// is not published for, so the caller falls back to the layout's default.
+pub(super) fn python_requirement_for_tag(
+    layout: SourceLayout,
+    tag: &str,
+) -> Option<PythonRequirement> {
+    match layout {
+        SourceLayout::Next => NEXT_SDK_PYTHONS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.tag == tag),
+        SourceLayout::Canonical => None,
     }
 }
 
@@ -1103,6 +1185,75 @@ exit 1
     #[test]
     fn managed_python_defaults_to_312() {
         assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12");
+    }
+
+    /// `--python-version` is a choice among the interpreters the layout is
+    /// published for. ROCm 10 takes 3.10 to 3.14 (each with its own wheel tag and
+    /// the version `uv` is asked for); the canonical layout takes only its own 3.12;
+    /// everything else is refused with the allowed set named, not ignored.
+    #[test]
+    fn python_version_is_a_choice_among_the_layouts_published_pythons() {
+        for (version, tag) in [
+            ("3.10", "cp310"),
+            ("3.11", "cp311"),
+            ("3.12", "cp312"),
+            ("3.13", "cp313"),
+            ("3.14", "cp314"),
+            (" 3.12 ", "cp312"),
+        ] {
+            let requirement = python_requirement_for_version(SourceLayout::Next, version)
+                .unwrap_or_else(|error| panic!("{version} must be accepted: {error:#}"));
+            assert_eq!(requirement.tag, tag, "{version}");
+            assert_eq!(requirement.version, version.trim(), "{version}");
+        }
+        for version in ["3.9", "3.15", "3", "3.12.1", "cpython-3.12", ""] {
+            let error = python_requirement_for_version(SourceLayout::Next, version)
+                .expect_err("an unpublished Python must be refused");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("3.10, 3.11, 3.12, 3.13, 3.14"),
+                "{version}: {rendered}"
+            );
+        }
+
+        assert_eq!(
+            python_requirement_for_version(SourceLayout::Canonical, "3.12")
+                .expect("the canonical layout's own Python is accepted"),
+            python_requirement(SourceLayout::Canonical)
+        );
+        let error = python_requirement_for_version(SourceLayout::Canonical, "3.13")
+            .expect_err("the canonical layout has one Python");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("applies only to ROCm 10 and newer installs")
+                && rendered.contains("this install uses Python 3.12"),
+            "{rendered}"
+        );
+    }
+
+    /// An update keeps the interpreter a ROCm 10 runtime was built on. The tag
+    /// recorded in the runtime maps back to the requirement it came from for every
+    /// published Python, a tag the layout is not published for maps to none (so the
+    /// update falls back to the layout's default), and the canonical layout never
+    /// reads one.
+    #[test]
+    fn a_recorded_wheel_tag_maps_back_to_the_requirement_it_came_from() {
+        for requirement in NEXT_SDK_PYTHONS {
+            assert_eq!(
+                python_requirement_for_tag(SourceLayout::Next, requirement.tag),
+                Some(requirement)
+            );
+        }
+        assert_eq!(python_requirement_for_tag(SourceLayout::Next, "cp39"), None);
+        assert_eq!(
+            python_requirement_for_tag(SourceLayout::Canonical, "cp313"),
+            None
+        );
+        // The default stays the one vLLM needs, so a flag-less install is unchanged.
+        assert_eq!(
+            python_requirement(SourceLayout::Next),
+            python_requirement_for_tag(SourceLayout::Next, "cp314").expect("cp314 is published")
+        );
     }
 
     /// ROCm 10.x framework wheels (vLLM, flash-attn, amd-aiter) are published
