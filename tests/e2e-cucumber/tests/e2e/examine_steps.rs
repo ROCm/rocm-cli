@@ -416,13 +416,43 @@ async fn assert_gpu_detected(world: &mut E2eWorld) {
     );
 }
 
+/// The `driver_status` each platform reports when its GPU driver is usable:
+/// the amdgpu module on bare-metal Linux, ROCDXG on WSL2, the AMD display
+/// driver on Windows.
+const DRIVER_AVAILABLE_STATUSES: [&str; 3] = [
+    "amdgpu_available",
+    "wsl_rocdxg_ready",
+    "amd_display_driver_detected",
+];
+
+/// The status itself, not merely the label: `rocm examine` prints a
+/// `driver_status:` line whatever it found, `not_detected` included. On a
+/// simulated machine the planted platform decides which status is right; on
+/// the real one any platform's "available" status is.
 #[then("the inspection reports that the driver is available")]
 async fn assert_driver_available(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
-    assert!(
-        output.contains("amdgpu") || output.contains("driver_status"),
-        "driver status not found in examine output:\n{output}"
-    );
+    let status = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("driver_status:").map(str::trim))
+        .unwrap_or_else(|| panic!("no driver_status line in examine output:\n{output}"));
+    match &world.simulated_host {
+        Some(simulated) => {
+            let expected = match simulated.host.platform() {
+                e2e_cucumber::simulated_host::Platform::BareMetal => "amdgpu_available",
+                e2e_cucumber::simulated_host::Platform::Wsl2 => "wsl_rocdxg_ready",
+            };
+            assert_eq!(
+                status, expected,
+                "the simulated machine's driver is planted, so examine must report it:\n{output}"
+            );
+        }
+        None => assert!(
+            DRIVER_AVAILABLE_STATUSES.contains(&status),
+            "driver_status {status:?} is not one that means the driver is available \
+             ({DRIVER_AVAILABLE_STATUSES:?}):\n{output}"
+        ),
+    }
 }
 
 #[then("the inspection reports the install as pre-existing")]
