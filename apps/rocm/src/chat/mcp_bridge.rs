@@ -1161,7 +1161,21 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("rocm")
         );
-        assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+        // The MCP summary prefixes the command output. The expected line is
+        // assembled from the build script's separate exports rather than from
+        // `cli_version_string()`, the function the handler itself calls, so a
+        // regression in that function's content fails here too. Which leading
+        // version a tag, `main`, or an unknown ref produces is the
+        // `format_cli_version_*` tests in `build.rs` (run via
+        // `tests/build_metadata.rs`).
+        let text = mcp_tool_result_text(&result);
+        let version_line = format!(
+            "rocm-cli {} ({}, {})",
+            env!("ROCM_CLI_VERSION_NUMBER"),
+            env!("ROCM_CLI_VERSION_REF"),
+            env!("ROCM_CLI_GIT_HASH")
+        );
+        assert!(text.lines().any(|line| line == version_line), "{text}");
     }
 
     #[test]

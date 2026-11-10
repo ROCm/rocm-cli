@@ -83,3 +83,7 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 shlex.workspace = true
+# Test-only: build.rs's `release_tag_grammar_is_the_same_everywhere` (run
+# through tests/build_metadata.rs) evaluates the release-tag pattern that
+# release.yml and scripts/smoke_local.py carry. Already in the lockfile.
+regex = "1"

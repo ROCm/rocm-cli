@@ -2,11 +2,31 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Besides the Windows stack-size workaround below, embeds what `rocm version`
-//! adds to `CARGO_PKG_VERSION`: the release tag for a tag build, or the branch
-//! name otherwise (feature branches and `main` CI builds aren't tagged, and a
-//! bare commit hash isn't enough to trace a build back to its branch), plus
-//! the commit hash either way.
+//! Besides the Windows stack-size workaround below, embeds the string
+//! `rocm version` and `-V`/`--version` print. `format_cli_version` turns the
+//! ref this file already resolves (the release tag for a tag build, otherwise
+//! the branch name, otherwise `unknown`) and the commit hash into one value,
+//! `ROCM_CLI_VERSION`:
+//!
+//! - exact tag `vX.Y.Z`, optionally with a `-pre` or `+build` suffix of
+//!   ASCII letters, digits, `.`, `-` and `+` ([`RELEASE_TAG_PATTERN`]) →
+//!   `X.Y.Z (vX.Y.Z, <hash>)`, with a single leading `v` removed
+//! - any other resolved ref, including `main` and feature branches →
+//!   `0.0.0-dev (<ref>, <hash>)`, which is not a release
+//! - unresolved ref (`unknown`: no tag, no branch, no git) →
+//!   `<CARGO_PKG_VERSION> (unknown, <hash>)`
+//!
+//! `ROCM_CLI_VERSION_NUMBER` is that leading version on its own, and
+//! `ROCM_CLI_VERSION_REF` and `ROCM_CLI_GIT_HASH` stay set to the inputs.
+//!
+//! A ref that resolved to the literal name `unknown` (a branch or
+//! `ROCM_CLI_RELEASE_REF` of that name) is indistinguishable from one that did
+//! not resolve, and takes the package-version fallback.
+//! The workspace package version is shared by every crate and is not bumped
+//! per release, so it is the leading version only when the ref did not
+//! resolve. It still reads as a published version (`0.1.0` is also a release
+//! tag), so an unresolved build cannot be told apart from that release by its
+//! leading version alone; its `(unknown, <hash>)` suffix is what marks it.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -38,11 +58,127 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     println!("cargo:rerun-if-env-changed=GITHUB_HEAD_REF");
 
+    let version_ref = ref_descriptor();
     let git_hash =
         run_git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
+    // Cargo always sets this for the package whose build script is running.
+    // An empty value is not a version; `format_cli_version` substitutes one.
+    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
 
-    println!("cargo:rustc-env=ROCM_CLI_VERSION_REF={}", ref_descriptor());
+    println!("cargo:rustc-env=ROCM_CLI_VERSION_REF={version_ref}");
     println!("cargo:rustc-env=ROCM_CLI_GIT_HASH={git_hash}");
+    // The only string `-V`/`--version` and `rocm version` print. Formatting
+    // it here, once, is what keeps those surfaces from disagreeing.
+    println!(
+        "cargo:rustc-env=ROCM_CLI_VERSION={}",
+        format_cli_version(&version_ref, &git_hash, &pkg_version)
+    );
+    // Its leading version on its own, for one-token fields (`rocm update`'s
+    // `cli: installed=`, a problem report's `cli_version`). Exported from the
+    // same function rather than cut back out of the string above, so no
+    // consumer depends on how that string is laid out.
+    println!(
+        "cargo:rustc-env=ROCM_CLI_VERSION_NUMBER={}",
+        cli_version_number(&version_ref, &pkg_version)
+    );
+}
+
+/// Leading version for a build whose ref resolved and is not a release tag.
+/// Not the workspace package version: a `main` or feature-branch binary must
+/// not be presented as a release.
+const NON_RELEASE_VERSION: &str = "0.0.0-dev";
+
+/// `rocm version` / `-V` text after the `rocm-cli ` prefix.
+///
+/// See the module docs for the tag, branch, and unknown shapes. `version_ref`
+/// and `git_hash` are the values this build script already resolves; an empty
+/// input is treated as `unknown` so the result is never an empty version.
+fn format_cli_version(version_ref: &str, git_hash: &str, cargo_pkg_version: &str) -> String {
+    let version = cli_version_number(version_ref, cargo_pkg_version);
+    format!(
+        "{version} ({}, {})",
+        or_unknown(version_ref),
+        or_unknown(git_hash)
+    )
+}
+
+/// The leading version of [`format_cli_version`]'s string, which that
+/// function is built from. An empty ref is `unknown`, as there.
+fn cli_version_number(version_ref: &str, cargo_pkg_version: &str) -> String {
+    displayed_version(or_unknown(version_ref), cargo_pkg_version)
+}
+
+/// An empty ref or hash is reported as `unknown`, never as an empty field.
+const fn or_unknown(value: &str) -> &str {
+    if value.is_empty() { "unknown" } else { value }
+}
+
+fn displayed_version(version_ref: &str, cargo_pkg_version: &str) -> String {
+    if let Some(release) = release_version(version_ref) {
+        return release.to_owned();
+    }
+    if version_ref == "unknown" {
+        let package = if cargo_pkg_version.is_empty() {
+            "0.0.0"
+        } else {
+            cargo_pkg_version
+        };
+        return package.to_owned();
+    }
+    NON_RELEASE_VERSION.to_owned()
+}
+
+/// The release-tag grammar, as an anchored regular expression: `vX.Y.Z`
+/// with an optional non-empty `-pre` or `+build` suffix of ASCII letters,
+/// digits, `.`, `-` and `+`. `release_version` is its implementation, and
+/// release.yml's "Determine version" step and `scripts/smoke_local.py` carry
+/// it verbatim; `release_tag_grammar_is_the_same_everywhere` holds all three
+/// together. The suffix characters are the ones a problem report publishes
+/// (`cli_version` in `crates/rocm-core/src/report.rs`), so a release never
+/// reports itself as `unknown` there.
+// Only the test reads it: the build itself runs `release_version`, which
+// needs no regex engine.
+#[cfg(test)]
+const RELEASE_TAG_PATTERN: &str = r"^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$";
+
+/// Longest release version (the tag without its `v`), the same bound a
+/// problem report puts on `cli_version`. release.yml checks the tag against
+/// this plus one, for the `v`.
+const RELEASE_VERSION_MAX_LEN: usize = 64;
+
+/// [`RELEASE_TAG_PATTERN`], with the version at most
+/// [`RELEASE_VERSION_MAX_LEN`] long. Returns the version with that one leading
+/// `v` removed. A ref that merely starts with `v` (`vllm`) is not a release
+/// tag.
+fn release_version(version_ref: &str) -> Option<&str> {
+    let rest = version_ref.strip_prefix('v')?;
+    if rest.len() > RELEASE_VERSION_MAX_LEN {
+        return None;
+    }
+    let core = match rest.split_once(['-', '+']) {
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
+        Some(_) => return None,
+        None => rest,
+    };
+    let mut components = core.split('.');
+    let has_major_minor_patch = (0..3).all(|_| components.next().is_some_and(is_ascii_digits));
+    // Exactly three components: `v1.2` and `v1.2.3.4` are not `vX.Y.Z`.
+    if has_major_minor_patch && components.next().is_none() {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn is_ascii_digits(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The release tag for a tag build, else the branch name, else "unknown".
@@ -165,7 +301,10 @@ fn run_git_at(cwd: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::git_watch_paths;
+    use super::{
+        RELEASE_TAG_PATTERN, RELEASE_VERSION_MAX_LEN, cli_version_number, format_cli_version,
+        git_watch_paths, release_version,
+    };
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -347,6 +486,199 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with(Path::new("refs").join("heads").join("main"))),
             "the packed branch ref has no loose file anymore and must not be watched: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn format_cli_version_reports_a_release_tag_without_its_leading_v() {
+        assert_eq!(
+            format_cli_version("v0.2.1", "1cde824", "0.1.0"),
+            "0.2.1 (v0.2.1, 1cde824)"
+        );
+        // A pre-release or build suffix is still that release's version.
+        assert_eq!(
+            format_cli_version("v0.2.1-rc.1", "1cde824", "0.1.0"),
+            "0.2.1-rc.1 (v0.2.1-rc.1, 1cde824)"
+        );
+        assert_eq!(
+            format_cli_version("v0.2.1+build.1", "1cde824", "0.1.0"),
+            "0.2.1+build.1 (v0.2.1+build.1, 1cde824)"
+        );
+    }
+
+    #[test]
+    fn format_cli_version_reports_main_as_a_dev_build() {
+        assert_eq!(
+            format_cli_version("main", "abcdef1", "0.1.0"),
+            "0.0.0-dev (main, abcdef1)"
+        );
+        // Same class as `main`: a feature branch, and a name that starts with
+        // `v` but is not `vX.Y.Z`, are not releases either.
+        assert_eq!(
+            format_cli_version("fix/cli-version-string", "abcdef1", "0.1.0"),
+            "0.0.0-dev (fix/cli-version-string, abcdef1)"
+        );
+        assert_eq!(
+            format_cli_version("vllm", "abcdef1", "0.1.0"),
+            "0.0.0-dev (vllm, abcdef1)"
+        );
+        // Not an exact `vX.Y.Z`: too few components, or a separator with no
+        // pre-release or build suffix.
+        assert_eq!(
+            format_cli_version("v0.2", "abcdef1", "0.1.0"),
+            "0.0.0-dev (v0.2, abcdef1)"
+        );
+        assert_eq!(
+            format_cli_version("v1.2.3-", "abcdef1", "0.1.0"),
+            "0.0.0-dev (v1.2.3-, abcdef1)"
+        );
+    }
+
+    #[test]
+    fn format_cli_version_falls_back_to_the_package_version_only_when_the_ref_is_unknown() {
+        assert_eq!(
+            format_cli_version("unknown", "unknown", "0.1.0"),
+            "0.1.0 (unknown, unknown)"
+        );
+        // The hash can still resolve when the ref cannot (detached HEAD, no
+        // exact tag). The package version is the fallback for that case only,
+        // and an empty input does not produce an empty version.
+        assert_eq!(
+            format_cli_version("unknown", "abcdef1", "0.1.0"),
+            "0.1.0 (unknown, abcdef1)"
+        );
+        assert_eq!(format_cli_version("", "", ""), "0.0.0 (unknown, unknown)");
+    }
+
+    #[test]
+    fn format_cli_version_rejects_other_near_misses_of_a_release_tag() {
+        // Too many components, as the parser's own comment says.
+        assert_eq!(
+            format_cli_version("v1.2.3.4", "abcdef1", "0.1.0"),
+            "0.0.0-dev (v1.2.3.4, abcdef1)"
+        );
+        // A build separator with nothing after it, the `+` twin of `v1.2.3-`.
+        assert_eq!(
+            format_cli_version("v1.2.3+", "abcdef1", "0.1.0"),
+            "0.0.0-dev (v1.2.3+, abcdef1)"
+        );
+        // Three components, but one is not all digits or is empty.
+        for near_miss in ["v1.x.3", "v1..3", "vfoo.bar.baz", "v1.2.3a"] {
+            assert_eq!(
+                format_cli_version(near_miss, "abcdef1", "0.1.0"),
+                format!("0.0.0-dev ({near_miss}, abcdef1)")
+            );
+        }
+        // A pre-release and a build suffix together are still a release.
+        assert_eq!(
+            format_cli_version("v1.2.3-rc.1+build.5", "abcdef1", "0.1.0"),
+            "1.2.3-rc.1+build.5 (v1.2.3-rc.1+build.5, abcdef1)"
+        );
+    }
+
+    #[test]
+    fn cli_version_number_is_the_leading_version_of_format_cli_version() {
+        for (version_ref, hash, package) in [
+            ("v0.2.1", "1cde824", "0.1.0"),
+            ("v0.2.1-rc.1", "1cde824", "0.1.0"),
+            ("main", "abcdef1", "0.1.0"),
+            ("unknown", "abcdef1", "0.1.0"),
+            ("", "", ""),
+        ] {
+            let number = cli_version_number(version_ref, package);
+            let full = format_cli_version(version_ref, hash, package);
+            assert!(
+                full.starts_with(&format!("{number} (")),
+                "{number:?} does not lead {full:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_cli_version_uses_format_cli_version() {
+        // The build script exports one string. This ties that export to the
+        // formatter, using the ref and hash this checkout actually resolved.
+        assert_eq!(
+            env!("ROCM_CLI_VERSION"),
+            format_cli_version(
+                env!("ROCM_CLI_VERSION_REF"),
+                env!("ROCM_CLI_GIT_HASH"),
+                env!("CARGO_PKG_VERSION"),
+            )
+        );
+        assert_eq!(
+            env!("ROCM_CLI_VERSION_NUMBER"),
+            cli_version_number(env!("ROCM_CLI_VERSION_REF"), env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The release-tag grammar lives in three places: `release_version` here,
+    /// the "Determine version" check in release.yml and `is_release_tag` in
+    /// scripts/smoke_local.py. The two copies must carry
+    /// [`RELEASE_TAG_PATTERN`] and the [`RELEASE_VERSION_MAX_LEN`] bound
+    /// verbatim, and the pattern must accept exactly what `release_version`
+    /// accepts.
+    #[test]
+    fn release_tag_grammar_is_the_same_everywhere() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|err| panic!("reading {rel}: {err}"))
+                .replace("\r\n", "\n")
+        };
+        let tag_max = RELEASE_VERSION_MAX_LEN + 1;
+
+        let workflow = read(".github/workflows/release.yml");
+        let check = format!(
+            r#"[[ "${{VERSION}}" =~ {RELEASE_TAG_PATTERN} ]] || [ "${{#VERSION}}" -gt {tag_max} ]"#
+        );
+        assert!(
+            workflow.contains(&check),
+            "release.yml's tag check is not `{check}`"
+        );
+        let smoke = read("scripts/smoke_local.py");
+        for needle in [
+            format!(r#"RELEASE_TAG = re.compile(r"{RELEASE_TAG_PATTERN}")"#),
+            format!("RELEASE_TAG_MAX_LEN = {tag_max}"),
+        ] {
+            assert!(smoke.contains(&needle), "smoke_local.py lacks `{needle}`");
+        }
+
+        let pattern = regex::Regex::new(RELEASE_TAG_PATTERN).expect("pattern compiles");
+        let at_limit = format!("v1.2.3-{}", "a".repeat(RELEASE_VERSION_MAX_LEN - 6));
+        let over_limit = format!("{at_limit}a");
+        assert_eq!(at_limit.len(), tag_max);
+        for tag in [
+            "v0.2.1",
+            "v1.2.3-rc.1",
+            "v1.2.3+build.5",
+            "v1.2.3-rc.1+build.5",
+            "v0.1.0-experimental.1",
+            "v1.2.3-rc_1",
+            "v1.2.3-rc 1",
+            "v1.2.3-",
+            "v1.2.3+",
+            "v1.2",
+            "v1.2.3.4",
+            "v1.x.3",
+            "vllm",
+            "main",
+            at_limit.as_str(),
+            over_limit.as_str(),
+        ] {
+            let by_pattern = pattern.is_match(tag) && tag.len() <= tag_max;
+            assert_eq!(
+                release_version(tag).is_some(),
+                by_pattern,
+                "release_version and RELEASE_TAG_PATTERN disagree on {tag:?}"
+            );
+        }
+        // The suffix rule is the problem report's: a release must never be
+        // published as `unknown`.
+        assert!(release_version("v1.2.3-rc_1").is_none());
+        assert_eq!(
+            release_version(&at_limit).map(str::len),
+            Some(RELEASE_VERSION_MAX_LEN)
         );
     }
 }

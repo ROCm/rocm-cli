@@ -143,6 +143,44 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The leading version `rocm version` must print for a resolved `reference`,
+/// derived here from the ref alone rather than read back from the binary, so a
+/// build that reports the wrong version for its ref fails instead of agreeing
+/// with itself. Mirrors `release_version` in `apps/rocm/build.rs`: an exact
+/// `vX.Y.Z` tag, with an optional non-empty pre-release (`-rc.1`) or build
+/// (`+meta`) suffix of ASCII letters, digits, `.`, `-` and `+`, and at most 64
+/// characters after the `v` (`RELEASE_TAG_PATTERN` and
+/// `RELEASE_VERSION_MAX_LEN` there), is that version without its leading `v`; any other
+/// resolved ref (`main`, a feature branch, `vllm`, `v0.2`) is `0.0.0-dev`.
+/// The `unknown` ref is not covered: both callers reject it first.
+pub(crate) fn expected_leading_version(reference: &str) -> &str {
+    const NON_RELEASE: &str = "0.0.0-dev";
+    let Some(rest) = reference.strip_prefix('v') else {
+        return NON_RELEASE;
+    };
+    if rest.len() > 64 {
+        return NON_RELEASE;
+    }
+    let core = match rest.split_once(['-', '+']) {
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
+        Some(_) => return NON_RELEASE,
+        None => rest,
+    };
+    let components: Vec<&str> = core.split('.').collect();
+    let is_release = components.len() == 3
+        && components
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if is_release { rest } else { NON_RELEASE }
+}
+
 #[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let outputs = world.cli_outputs.as_ref().expect("no commands were run");
@@ -184,6 +222,11 @@ async fn assert_version_returned(world: &mut E2eWorld) {
     assert!(
         !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "version hash is not hexadecimal: {output}"
+    );
+    assert_eq!(
+        version,
+        expected_leading_version(reference),
+        "the leading version does not follow from the ref: {output}"
     );
 
     // `rocm version`'s own two lines beyond the build string. Both are printed
