@@ -56,6 +56,38 @@ pub(crate) struct RunSpec<'a> {
     /// `KEY=VALUE` entries go through a 0600 `--env-file`, never argv. An empty
     /// value means "forward `KEY` from this process's environment" (`-e KEY`).
     pub env: &'a BTreeMap<String, String>,
+    /// Host directories bind-mounted read-only into the container.
+    pub read_only_mounts: &'a [ReadOnlyMount<'a>],
+}
+
+/// A host directory (`source`) mounted read-only at `target` in the container.
+pub(crate) struct ReadOnlyMount<'a> {
+    pub source: &'a Path,
+    pub target: &'a str,
+}
+
+/// `--mount` arguments for `mounts`. `--mount` rather than `-v`, whose
+/// `source:target` form is ambiguous for a Windows source path with a drive
+/// letter. Its value is a comma-separated list, so a path containing a comma
+/// or a quote is refused rather than split into a different mount.
+fn mount_args(mounts: &[ReadOnlyMount<'_>]) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    for mount in mounts {
+        let source = mount.source.display().to_string();
+        for part in [source.as_str(), mount.target] {
+            if part.contains([',', '"']) {
+                bail!(
+                    "cannot bind-mount `{part}` into the container: the path contains `,` or `\"`"
+                );
+            }
+        }
+        args.push("--mount".to_owned());
+        args.push(format!(
+            "type=bind,source={source},target={},readonly",
+            mount.target
+        ));
+    }
+    Ok(args)
 }
 
 /// Splits `env` into entries destined for the `--env-file` and bare names to
@@ -89,7 +121,7 @@ fn run_args(
     wsl: bool,
     env_file: Option<&Path>,
     forwarded: &[&str],
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut args = vec![
         "run".to_owned(),
         "-d".to_owned(),
@@ -118,8 +150,9 @@ fn run_args(
         args.push("-e".to_owned());
         args.push((*key).to_owned());
     }
+    args.extend(mount_args(spec.read_only_mounts)?);
     args.push(spec.image.to_owned());
-    args
+    Ok(args)
 }
 
 fn write_env_file(entries: &[(&str, &str)]) -> Result<tempfile::NamedTempFile> {
@@ -155,7 +188,7 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> Result<()> {
         rocm_core::is_wsl_host(),
         env_file.as_ref().map(tempfile::NamedTempFile::path),
         &forwarded,
-    );
+    )?;
 
     let mut command = Command::new(DOCKER_BIN);
     command.args(&args).stdin(Stdio::null());
@@ -401,8 +434,8 @@ pub(crate) fn daemon_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, RunSpec, container_name, gpu_device_args, is_no_such, is_nothing_to_stop,
-        parse_container_state, parse_getent_gid, run_args, split_env,
+        ContainerState, ReadOnlyMount, RunSpec, container_name, gpu_device_args, is_no_such,
+        is_nothing_to_stop, parse_container_state, parse_getent_gid, run_args, split_env,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -428,6 +461,7 @@ mod tests {
             use_gpu: !gpu_indices.is_empty(),
             render_gid: Some(993),
             env,
+            read_only_mounts: &[],
         }
     }
 
@@ -441,7 +475,7 @@ mod tests {
         ] {
             let mut s = spec(&[], &env);
             s.host = host;
-            let args = run_args(&s, false, None, &[]);
+            let args = run_args(&s, false, None, &[]).unwrap();
             assert_eq!(args[4], "-p");
             assert_eq!(args[5], published);
         }
@@ -485,7 +519,7 @@ mod tests {
     fn run_args_without_gpu_or_env_is_just_name_port_and_image() {
         let env = BTreeMap::new();
         assert_eq!(
-            run_args(&spec(&[], &env), false, None, &[]),
+            run_args(&spec(&[], &env), false, None, &[]).unwrap(),
             vec![
                 "run",
                 "-d",
@@ -501,7 +535,7 @@ mod tests {
     #[test]
     fn run_args_with_gpu_sets_visible_devices_and_device_flags_before_the_image() {
         let env = BTreeMap::new();
-        let args = run_args(&spec(&[1, 3], &env), false, None, &[]);
+        let args = run_args(&spec(&[1, 3], &env), false, None, &[]).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("org/aim-foo:1"));
         assert!(
             args.windows(2)
@@ -516,7 +550,7 @@ mod tests {
         let env = BTreeMap::new();
         let mut gpu_spec = spec(&[], &env);
         gpu_spec.use_gpu = true;
-        let args = run_args(&gpu_spec, false, None, &[]);
+        let args = run_args(&gpu_spec, false, None, &[]).unwrap();
         assert!(
             !args
                 .iter()
@@ -540,7 +574,8 @@ mod tests {
             false,
             Some(Path::new("/tmp/env-file")),
             &forwarded,
-        );
+        )
+        .unwrap();
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--env-file", "/tmp/env-file"])
@@ -548,6 +583,45 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-e", "HF_TOKEN"]));
         assert!(!args.iter().any(|arg| arg.contains("secret-profile")));
         assert_eq!(args.last().map(String::as_str), Some("org/aim-foo:1"));
+    }
+
+    #[test]
+    fn run_args_mount_each_directory_read_only_before_the_image() {
+        let env = BTreeMap::new();
+        let mounts = [ReadOnlyMount {
+            source: Path::new("/data/engines/aim/python"),
+            target: "/opt/rocm-cli/python",
+        }];
+        let mut mounted = spec(&[], &env);
+        mounted.read_only_mounts = &mounts;
+        let args = run_args(&mounted, false, None, &[]).unwrap();
+        let mount = args
+            .windows(2)
+            .position(|pair| {
+                pair == [
+                    "--mount",
+                    "type=bind,source=/data/engines/aim/python,target=/opt/rocm-cli/python,readonly",
+                ]
+            })
+            .expect("a read-only bind mount");
+        assert!(
+            mount < args.len() - 2,
+            "mount comes before the image: {args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("org/aim-foo:1"));
+    }
+
+    #[test]
+    fn run_args_refuse_a_mount_path_docker_would_split() {
+        let env = BTreeMap::new();
+        let mounts = [ReadOnlyMount {
+            source: Path::new("/data/a,target=/etc,x"),
+            target: "/opt/rocm-cli/python",
+        }];
+        let mut mounted = spec(&[], &env);
+        mounted.read_only_mounts = &mounts;
+        let error = run_args(&mounted, false, None, &[]).expect_err("a comma splits --mount");
+        assert!(error.to_string().contains("/data/a,target"), "{error}");
     }
 
     #[test]
@@ -769,6 +843,7 @@ exit 0
             gpu_indices: &[],
             render_gid: None,
             env,
+            read_only_mounts: &[],
         }
     }
 
