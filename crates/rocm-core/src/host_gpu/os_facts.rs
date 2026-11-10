@@ -8,9 +8,7 @@
 use super::capture::{
     OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,
 };
-use super::windows_inventory::{
-    WindowsExamineInventory, run_windows_system_query, windows_system_inventory_with,
-};
+use super::windows_inventory::{WindowsExamineInventory, windows_system_inventory_with};
 use crate::{hardware_root, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
 
@@ -68,7 +66,8 @@ fn distro_name_from_os_release(read: &hardware_root::OsRelease) -> String {
 }
 
 /// The CPU's model and vendor, read together by the one reader both stacks use:
-/// the summary's `cpu` through [`detect_cpu_model`] and the Windows inventory,
+/// the summary's `cpu` through [`detect_cpu_model`] on Linux and the Windows
+/// inventory's CPU row on Windows,
 /// the examination's `cpu_model` and `cpu_vendor` through `probe_cpu_linux` and
 /// `probe_cpu_windows`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,20 +95,22 @@ impl CpuFacts {
     }
 }
 
-/// The CPU summary line: the model of [`read_cpu_facts`].
+/// The CPU summary line on Linux: the model of [`read_linux_cpu_facts`].
+///
+/// Linux only, on purpose. On Windows the summary's CPU is the CPU row of the
+/// inventory it already holds (`summary_cpu` in `host_gpu.rs`), and the
+/// examination's is its own injected read of the same query, so a Windows arm
+/// here would be a second PowerShell query for the same fact. It answers `None`
+/// off Linux instead, which is what a future caller on Windows gets rather than
+/// a duplicate query.
 pub(crate) fn detect_cpu_model() -> Option<String> {
-    read_cpu_facts().model
+    linux_cpu_model(runtime_is_linux(), read_linux_cpu_facts)
 }
 
-/// The CPU facts of the host this process runs on.
-pub(crate) fn read_cpu_facts() -> CpuFacts {
-    if runtime_is_windows() {
-        read_windows_cpu_facts()
-    } else if runtime_is_linux() {
-        read_linux_cpu_facts()
-    } else {
-        CpuFacts::unknown()
-    }
+/// [`detect_cpu_model`] with the host check and the reader as arguments, so a
+/// test on any host shows that nothing is read off Linux.
+fn linux_cpu_model(linux: bool, read: impl FnOnce() -> CpuFacts) -> Option<String> {
+    linux.then(read).and_then(|facts| facts.model)
 }
 
 /// The CPU facts from `/proc/cpuinfo`, read through [`host_path`].
@@ -160,14 +161,10 @@ pub(super) fn cpu_facts_from_cpuinfo(text: &str) -> CpuFacts {
     facts
 }
 
-/// The CPU facts from the Windows system inventory's `CPU` row: the one query
-/// the summary's inventory runs for its CPU and RAM.
-pub(crate) fn read_windows_cpu_facts() -> CpuFacts {
-    windows_cpu_facts_with(run_windows_system_query)
-}
-
-/// [`read_windows_cpu_facts`] with the query injected, so a test on any host can
-/// drive it. `query` is handed the script and the time the inventory allows it,
+/// The CPU facts from the Windows system inventory's `CPU` row, with the query
+/// injected, so a test on any host can drive it. The examination's
+/// `probe_cpu_windows` is the one caller that passes the real PowerShell runner.
+/// `query` is handed the script and the time the inventory allows it,
 /// and answers with what the script printed, or `None` when it could not run,
 /// failed or timed out.
 pub(crate) fn windows_cpu_facts_with(
@@ -489,6 +486,20 @@ mod tests {
             "a cpuinfo with no CPU in it is not a probe failure, {}: {:?}",
             case.name,
             examined.probe_failures
+        );
+    }
+
+    /// `detect_cpu_model` reads the CPU on Linux and nothing anywhere else, so no
+    /// Windows query can start from it: with the host check false the reader is
+    /// never called. Calling the reader whatever the host turns this red.
+    #[test]
+    fn detect_cpu_model_reads_nothing_off_linux() {
+        let never =
+            || -> CpuFacts { panic!("the CPU is read through detect_cpu_model on Linux only") };
+        assert_eq!(linux_cpu_model(false, never), None);
+        assert_eq!(
+            linux_cpu_model(true, || cpu_facts_from_cpuinfo("model name\t: A  B\n")).as_deref(),
+            Some("A B")
         );
     }
 
