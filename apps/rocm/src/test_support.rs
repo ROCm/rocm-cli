@@ -50,39 +50,14 @@ pub(crate) fn unique_suffix() -> String {
     )
 }
 
-/// Case count for a property test: `PROPTEST_CASES` (proptest's own knob,
-/// which an explicit `with_cases` would otherwise override) when it is set and
-/// above `default`, otherwise `default`.
-///
-/// Never below `default`: the counts are chosen so a property catches the
-/// defects it targets with near certainty, and some of those are hit by a
-/// small share of cases, so a lower count would pass with them present. `0`
-/// would pass vacuously.
-pub(crate) fn proptest_cases(default: u32) -> u32 {
-    case_count_from_env("PROPTEST_CASES", default)
-}
-
-/// Case count read from `var`, raising `default` but never lowering it, for
-/// the same reason as [`proptest_cases`]. The uninstall properties use it with
-/// their own knob, `ROCM_DELETION_PROP_CASES`. A value that is ignored,
-/// because it is lower or does not parse, is reported on stderr.
-pub(crate) fn case_count_from_env(var: &str, default: u32) -> u32 {
-    let requested = std::env::var(var).ok();
-    let cases = raised_case_count(requested.as_deref(), default);
-    if let Some(requested) = requested
-        && requested.parse::<u32>().ok() != Some(cases)
-    {
-        eprintln!("{var}={requested} ignored: this property runs at least {default} cases");
-    }
-    cases
-}
-
-/// The pure half of [`case_count_from_env`].
-fn raised_case_count(requested: Option<&str>, default: u32) -> u32 {
-    requested
-        .and_then(|value| value.parse().ok())
-        .map_or(default, |requested: u32| requested.max(default))
-}
+// The case-count rule for property tests that set their own count, shared with
+// `rocm-core`, its integration tests and the Lemonade engine rather than copied.
+#[path = "../../../crates/rocm-core/tests/common/proptest_cases.rs"]
+mod proptest_cases;
+pub(crate) use proptest_cases::proptest_cases;
+// Only the Unix-only uninstall properties read their own knob.
+#[cfg(unix)]
+pub(crate) use proptest_cases::case_count_from_env;
 
 /// Split `bytes` at the given (unsorted, possibly duplicated) offsets, each
 /// taken modulo `bytes.len() + 1`.
@@ -389,7 +364,7 @@ pub(crate) fn owned_argv(args: &[&str]) -> Vec<String> {
 
 /// Build an `AutomationRuntimeState` for the background-helper tests (the
 /// no-double-spawn guard in `background_helper.rs` and the autostart tests in
-/// `service_launch.rs`).
+/// `service_launch/helper_autostart.rs`).
 pub(crate) fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
     AutomationRuntimeState {
         running,
@@ -475,13 +450,44 @@ mod tests {
             (0..64).map(|_| unique_suffix()).collect();
         assert_eq!(suffixes.len(), 64, "two calls must never share a suffix");
     }
+}
 
-    #[test]
-    fn case_counts_are_raised_but_never_lowered() {
-        assert_eq!(raised_case_count(None, 256), 256);
-        assert_eq!(raised_case_count(Some("4096"), 256), 4096);
-        assert_eq!(raised_case_count(Some("16"), 256), 256);
-        assert_eq!(raised_case_count(Some("0"), 256), 256);
-        assert_eq!(raised_case_count(Some("lots"), 256), 256);
-    }
+/// Plant an extracted Lemonade tree under `tree_root` the way an install leaves
+/// one: the server binary and `payload_bytes` of backend files. Black-box on
+/// purpose (plain files, not the engine's own writer), so a test reads it the
+/// way the CLI reads a real install.
+pub(crate) fn plant_lemonade_tree(tree_root: &std::path::Path, payload_bytes: usize) -> Result<()> {
+    let runtime_dir = tree_root.join("runtime");
+    let backend = runtime_dir.join("bin").join("llamacpp").join("rocm-stable");
+    fs::create_dir_all(&backend)?;
+    let lemond = if rocm_core::runtime_is_windows() {
+        "lemond.exe"
+    } else {
+        "lemond"
+    };
+    fs::write(runtime_dir.join(lemond), b"lemond")?;
+    fs::write(backend.join("payload.bin"), vec![0_u8; payload_bytes])?;
+    Ok(())
+}
+
+/// Write Lemonade's install record pointing at `tree_root`'s runtime, in the
+/// schema the engine writes (`<data>/engines/lemonade/manifests/runtime.json`).
+pub(crate) fn record_lemonade_install(paths: &AppPaths, tree_root: &std::path::Path) -> Result<()> {
+    let runtime_dir = tree_root.join("runtime");
+    let record = paths.engine_manifests_dir("lemonade").join("runtime.json");
+    fs::create_dir_all(record.parent().expect("record has a parent"))?;
+    fs::write(
+        &record,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "env_id": "lemonade-embeddable-test",
+            "version": "test",
+            "runtime_dir": runtime_dir,
+            "lemond": runtime_dir.join("lemond"),
+            "lemonade": runtime_dir.join("lemonade"),
+            "backend_recipe": "llamacpp",
+            "backend_name": "rocm",
+            "installed_at_unix_ms": 0,
+        }))?,
+    )?;
+    Ok(())
 }

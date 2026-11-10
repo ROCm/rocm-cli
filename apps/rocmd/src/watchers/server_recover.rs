@@ -798,8 +798,8 @@ mod tests {
 
     /// The record `rocm serve` keeps when it abandons a launch whose child
     /// already ran (`abandon_failed_managed_launch` in
-    /// `apps/rocm/src/service_launch.rs`) must not be respawned: the CLI has just
-    /// reported that launch as failed. The producing side is
+    /// `apps/rocm/src/service_launch/launch_transaction.rs`) must not be respawned:
+    /// the CLI has just reported that launch as failed. The producing side is
     /// `abandoned_launch_terminates_the_spawned_child` in that file; both go
     /// through `ManagedServiceRecord::mark_launch_abandoned`.
     #[test]

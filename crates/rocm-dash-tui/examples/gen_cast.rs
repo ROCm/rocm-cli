@@ -3,13 +3,17 @@
 // SPDX-License-Identifier: MIT
 
 //! Render the TUI against a synthetic session NDJSON to an asciicast v2
-//! recording. The marketing page replays it as a real animated terminal
-//! demo — no live terminal, no external capture tools, no drift.
+//! recording — no live terminal and no external capture tools.
 //!
 //! Usage:
 //!   cargo run --release --example gen_cast -p rocm-dash-tui -- \
-//!       --input /tmp/mi355x-demo.ndjson \
-//!       --output ../marketing/asciinema/rocm-dash.cast
+//!       --input session.ndjson \
+//!       --output rocm-dash.cast
+//!
+//! `--input` is a `PersistedEntry` NDJSON session recording, the format
+//! `rocm dash --replay` reads, such as the `session-*.ndjson` that
+//! `rocm dash --demo` writes under the `demo/` folder of the user data
+//! directory. Whatever the input, the cast is marked as simulated data.
 //!
 //! Each frame is the actual `ui::draw` framebuffer for a point in a
 //! scripted storyboard (tab + modal walk), converted to a truecolor ANSI
@@ -45,13 +49,15 @@ const DEFAULT_BG: (u8, u8, u8) = (13, 15, 18);
     about = "Render TUI storyboard to an asciicast v2 recording"
 )]
 struct Args {
-    /// Synthetic session file (produced by `make demo`).
-    #[arg(long, default_value = "/tmp/mi355x-demo.ndjson")]
+    /// Session NDJSON recording to render (`PersistedEntry` lines).
+    #[arg(long)]
     input: PathBuf,
 
-    /// Output cast file. Parent dir created if absent. Default targets the
-    /// repo-root `marketing/asciinema/` directory when run from `app/`.
-    #[arg(long, default_value = "../marketing/asciinema/rocm-dash.cast")]
+    /// Output cast file. Parent dir created if absent. The default is relative
+    /// to the working directory. It is git-ignored only when produced at the
+    /// repository root; a run from elsewhere writes the file there instead,
+    /// uncovered by that rule.
+    #[arg(long, default_value = "rocm-dash.cast")]
     output: PathBuf,
 
     /// Terminal grid (cols × rows) the cast is rendered at.
@@ -365,6 +371,17 @@ const fn resolve_color(c: Option<Color>, default: (u8, u8, u8)) -> (u8, u8, u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_is_required_and_output_defaults_to_the_working_directory() {
+        let err = Args::try_parse_from(["gen_cast"])
+            .err()
+            .expect("no recording is produced at a fixed path, so --input has no default");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let args = Args::try_parse_from(["gen_cast", "--input", "session.ndjson"])
+            .expect("--input alone is enough");
+        assert_eq!(args.output, PathBuf::from("rocm-dash.cast"));
+    }
 
     #[test]
     fn generated_cast_is_marked_simulated() {

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Runtime manager overlay (Phase 3 Wave 2).
+//! Runtime manager overlay.
 //!
 //! Lists the registered ROCm runtimes (plumbed in from the bin, which owns
 //! `rocm-core` — this crate stays core-free) and runs the
@@ -12,7 +12,7 @@
 //!   job-bridge.
 //! - **activate / rollback / uninstall** — mutating, routed through the approval
 //!   gate first.
-//! - **adopt** — pick an existing ROCm env folder with the Wave-0
+//! - **adopt** — pick an existing ROCm env folder with the
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //! - **import** — type a manifest path, then approve `rocm runtimes import`.
 //!

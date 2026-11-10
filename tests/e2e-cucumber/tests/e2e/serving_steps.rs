@@ -2207,22 +2207,13 @@ async fn assert_service_still_lists_openai_endpoint(world: &mut E2eWorld) {
     );
 }
 
-#[when("the user sends a request to the Anthropic messages endpoint")]
-async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
+/// POST `body` to the served model's Anthropic endpoint and return the JSON
+/// reply, whatever its status.
+async fn post_anthropic_messages(world: &mut E2eWorld, body: serde_json::Value) {
     let base = listed_anthropic_endpoint(world)
         .await
         .expect("no Anthropic endpoint is listed for the served model");
     let budget = Duration::from_secs(crate::inference_timeout_for(world));
-    // Sent under a Claude model name on purpose: an Anthropic client names a
-    // Claude model, and the endpoint answers for the model that is served.
-    // The budget leaves room for a reasoning model (Qwen3) to finish thinking
-    // before it answers: at 32 tokens the whole reply was spent on reasoning
-    // and the text block came back empty with `stop_reason: max_tokens`.
-    let body = serde_json::json!({
-        "model": "claude-sonnet-4-5",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": "Hello"}],
-    });
     let reply = tokio::spawn(async move {
         reqwest::Client::builder()
             .timeout(budget)
@@ -2241,6 +2232,92 @@ async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
     .await
     .expect("the Anthropic request task panicked");
     world.anthropic_response = Some(reply);
+}
+
+#[when("the user sends a request to the Anthropic messages endpoint")]
+async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
+    // Sent under a Claude model name on purpose: an Anthropic client names a
+    // Claude model, and the endpoint answers for the model that is served.
+    // The budget leaves room for a reasoning model (Qwen3) to finish thinking
+    // before it answers: at 32 tokens the whole reply was spent on reasoning
+    // and the text block came back empty with `stop_reason: max_tokens`.
+    post_anthropic_messages(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }),
+    )
+    .await;
+}
+
+/// The tool the tool-use scenario offers, and the argument it requires.
+const ANTHROPIC_TOOL_NAME: &str = "get_weather";
+const ANTHROPIC_TOOL_ARGUMENT: &str = "city";
+
+#[when("the user sends a tool-use request to the Anthropic messages endpoint")]
+async fn user_sends_anthropic_tool_use_request(world: &mut E2eWorld) {
+    // The tool is named in `tool_choice` so the reply does not depend on the
+    // model choosing to call it: what is under test is the translation of the
+    // definition out and of the call back, not the model's judgement.
+    post_anthropic_messages(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "tools": [{
+                "name": ANTHROPIC_TOOL_NAME,
+                "description": "Get the current weather for a city.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {ANTHROPIC_TOOL_ARGUMENT: {"type": "string"}},
+                    "required": [ANTHROPIC_TOOL_ARGUMENT],
+                },
+            }],
+            "tool_choice": {"type": "tool", "name": ANTHROPIC_TOOL_NAME},
+            "messages": [{"role": "user", "content": "What is the weather in Oslo?"}],
+        }),
+    )
+    .await;
+}
+
+fn anthropic_tool_use_block(world: &E2eWorld) -> serde_json::Value {
+    let reply = world
+        .anthropic_response
+        .as_ref()
+        .expect("no Anthropic response");
+    reply["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no tool_use content block in the reply: {reply}"))
+}
+
+#[then("the response contains a tool_use content block")]
+async fn assert_anthropic_tool_use_block(world: &mut E2eWorld) {
+    let block = anthropic_tool_use_block(world);
+    assert!(
+        block["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the tool_use block has no id: {block}"
+    );
+    assert_eq!(
+        world.anthropic_response.as_ref().unwrap()["stop_reason"],
+        "tool_use",
+        "a reply with a tool call stops for tool use"
+    );
+}
+
+#[then("the tool_use block names a tool and arguments from the request")]
+async fn assert_anthropic_tool_use_names_request_tool(world: &mut E2eWorld) {
+    let block = anthropic_tool_use_block(world);
+    assert_eq!(block["name"], ANTHROPIC_TOOL_NAME, "{block}");
+    assert!(
+        block["input"][ANTHROPIC_TOOL_ARGUMENT]
+            .as_str()
+            .is_some_and(|city| !city.is_empty()),
+        "the tool_use input has no `{ANTHROPIC_TOOL_ARGUMENT}` argument: {block}"
+    );
 }
 
 #[then("the response is a valid Anthropic Messages API response")]
@@ -2662,7 +2739,7 @@ async fn plant_oom_launch(world: &mut E2eWorld) {
     // in the `When`, which left this step a no-op whose deletion changed nothing.
     //
     // The consumer of this variable is `e2e_simulate_oom_launch` in
-    // `apps/rocm/src/service_launch.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
+    // `apps/rocm/src/service_launch/readiness.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
     // through `e2e-report`, whose producer and consumer are both test-side), the
     // consumer here is the shipped binary's crate, which must not depend on the
     // e2e harness — so the name is spelled out on both sides. A typo fails loudly

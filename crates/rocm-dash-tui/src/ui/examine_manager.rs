@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Examine overlay (Phase 3 Wave 2).
+//! Examine overlay.
 //!
 //! Runs `rocm examine` — a read-only environment check — through the job-bridge
 //! and shows its streamed output in the shared job console. That run is

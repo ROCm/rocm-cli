@@ -14,6 +14,10 @@ workspace = true
 # Lets the E2E suite re-root the hardware probes under a simulated host; see
 # `src/hardware_root.rs`. Never enabled in a release build.
 e2e-test-hooks = []
+# Compiles the `foreign_temp_probe` test probe so a dependent crate's tests can
+# use it. Enabled only from a `[dev-dependencies]` entry; never in a shipped
+# build.
+test-support = []
 
 [build-dependencies]
 cc = "1"
@@ -45,7 +49,10 @@ ureq = { version = "2.12", features = ["native-certs"] }
 #
 # Also used by `disk_space`, for the same reason: its unit formatting, margin
 # arithmetic and mount selection are small total functions whose contracts are
-# easy to state over ALL inputs and awkward to cover with examples.
+# easy to state over ALL inputs and awkward to cover with examples. And by the
+# integration suites under `tests/` (download digest gate, signature
+# verification, model selection and readiness), whose generators aim at near
+# misses no example list enumerates.
 # Test-only, so it adds nothing to any shipped binary.
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Archive-extraction property tests (`src/archive_props.rs`) build hostile
