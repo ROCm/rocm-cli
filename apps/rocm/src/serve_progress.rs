@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use rocm_core::EndpointReadiness;
 
-use crate::engine_runtime_select::probe_service_http_readiness;
+use crate::engine_runtime_select::{service_http_inference_answers, service_http_lists_model};
 use crate::service_hints::{service_logs_hint, service_stop_hint};
 
 /// How long a download percent (or line) may stay unchanged before it is hung.
@@ -74,6 +74,74 @@ pub(crate) struct ServeStartupPolicy {
     /// Off for the piped path so a serve that exits in CI still returns a
     /// readiness status.
     pub watch_engine: bool,
+    /// How far apart inference probes are once the endpoint lists the model.
+    pub inference_backoff: InferenceProbeBackoff,
+}
+
+/// Spacing between inference probes while the endpoint lists the model but
+/// cannot answer yet.
+///
+/// Listing is a short GET; the inference probe is a real generation request
+/// that can hold the engine for up to [`rocm_core::INFERENCE_PROBE_TIMEOUT`].
+/// The first probe runs as soon as the model is listed, then the gap starts at
+/// `first` and doubles up to `max`. A zero `first` probes every poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InferenceProbeBackoff {
+    pub first: Duration,
+    pub max: Duration,
+}
+
+impl InferenceProbeBackoff {
+    /// Probe on every poll: the piped status budget, bounded at 45 seconds.
+    pub(crate) const EVERY_POLL: Self = Self {
+        first: Duration::ZERO,
+        max: Duration::ZERO,
+    };
+}
+
+/// First gap between inference probes on the interactive wait.
+pub(crate) const INFERENCE_PROBE_FIRST_GAP: Duration = Duration::from_secs(1);
+
+/// When the next inference probe may run. See [`InferenceProbeBackoff`].
+#[derive(Debug)]
+pub(crate) struct InferenceProbeThrottle {
+    backoff: InferenceProbeBackoff,
+    gap: Duration,
+    next_at: Option<Instant>,
+}
+
+impl InferenceProbeThrottle {
+    pub(crate) const fn new(backoff: InferenceProbeBackoff) -> Self {
+        Self {
+            backoff,
+            gap: backoff.first,
+            next_at: None,
+        }
+    }
+
+    /// Readiness for one poll. `probe` runs only when the model is listed and
+    /// the gap since the last failed probe has passed; the next gap is counted
+    /// from when that probe returned, read from `clock`.
+    pub(crate) fn readiness(
+        &mut self,
+        listed: bool,
+        clock: &mut dyn FnMut() -> Instant,
+        probe: impl FnOnce() -> bool,
+    ) -> EndpointReadiness {
+        if !listed {
+            return EndpointReadiness::Unreachable;
+        }
+        if self.next_at.is_some_and(|at| clock() < at) {
+            return EndpointReadiness::Listing;
+        }
+        if probe() {
+            return EndpointReadiness::Serving;
+        }
+        let returned = clock();
+        self.next_at = Some(returned.checked_add(self.gap).unwrap_or(returned));
+        self.gap = self.gap.saturating_mul(2).min(self.backoff.max);
+        EndpointReadiness::Listing
+    }
 }
 
 /// The clocks [`decide_serve_startup`] compares against.
@@ -98,6 +166,10 @@ impl ServeStartupPolicy {
             poll: POLL,
             stop_on_give_up: true,
             watch_engine: true,
+            inference_backoff: InferenceProbeBackoff {
+                first: INFERENCE_PROBE_FIRST_GAP,
+                max: rocm_core::INFERENCE_PROBE_RETRY_INTERVAL,
+            },
         }
     }
 
@@ -113,6 +185,7 @@ impl ServeStartupPolicy {
             poll: POLL,
             stop_on_give_up: false,
             watch_engine: false,
+            inference_backoff: InferenceProbeBackoff::EVERY_POLL,
         }
     }
 }
@@ -177,15 +250,19 @@ pub(crate) struct ServeStartupStop {
 
 /// The error `start_managed_service` returns when the wait stopped.
 ///
-/// The process is recorded (and may still be running), unlike a spawn
-/// failure, so the caller starts supervision for this error and no other.
-/// `Display` is [`ServeStartupStop::user_message`].
+/// `Display` is [`ServeStartupStop::user_message`], plus memory guidance when
+/// the server did not start. Only a stop that left the server running
+/// (`server_running`) has a process for the caller to supervise; a spawn
+/// failure or a server that ended has none.
 #[derive(Debug)]
-pub(crate) struct ServeStartupFailed(pub String);
+pub(crate) struct ServeStartupFailed {
+    pub message: String,
+    pub server_running: bool,
+}
 
 impl std::fmt::Display for ServeStartupFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -483,36 +560,30 @@ pub(crate) fn decide_serve_startup(
     ServeStartupDecision::Continue(view)
 }
 
-/// The status written to the service record when the wait stops.
-///
-/// Engine failure and a dead process are `failed`, which recovery is supposed
-/// to restart. Every other reason leaves the process alive and is `running`:
-/// [`decide_serve_startup`] returns `ProcessExited` before it checks any
-/// stall or the deadline, so a stall or deadline stop always has
-/// `process_alive`. A live `running` record is what
-/// `recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one`, and a
-/// live `starting` one what
-/// `recovery_leaves_a_live_starting_record_alone_until_the_startup_deadline`,
-/// leaves alone until [`rocm_core::SERVE_STARTUP_DEADLINE`], so `rocmd` does
-/// not kill the server [`ServeStartupStop::user_message`] just said is still
-/// running.
-pub(crate) const fn recorded_status_after_stop(stop: &ServeStartupStop) -> &'static str {
-    match stop.reason {
-        ServeStartupStopReason::EngineFailed | ServeStartupStopReason::ProcessExited => "failed",
-        ServeStartupStopReason::DownloadStalled
-        | ServeStartupStopReason::Silent
-        | ServeStartupStopReason::SilentLoad
-        | ServeStartupStopReason::Deadline => {
-            debug_assert!(
-                stop.process_alive,
-                "a stall or deadline stop is only reached with a live process"
-            );
-            "running"
-        }
-    }
-}
-
 impl ServeStartupStop {
+    /// The wait gave up on a server that is still up: a stall or the deadline.
+    ///
+    /// Engine failure and a dead process end the launch instead. Those are
+    /// settled like a `--wait` that saw the server exit: a dead process is
+    /// recorded `stopped`; a record the engine already marked `failed` keeps
+    /// that status, and `rocmd`'s recovery treats it like any `failed` service
+    /// (its message names the stop command while its process is still up); a
+    /// stop another terminal recorded is left alone. The CLI does not start the
+    /// background helper for either. A server left running is recorded
+    /// `running`, which `rocmd` leaves alone until
+    /// [`rocm_core::SERVE_STARTUP_DEADLINE`] (see
+    /// `recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one`),
+    /// so it does not kill the server this message says is still running.
+    /// [`decide_serve_startup`] returns `ProcessExited` before it checks any
+    /// stall or the deadline, so those stops always have `process_alive`.
+    pub(crate) const fn leaves_server_running(&self) -> bool {
+        self.process_alive
+            && !matches!(
+                self.reason,
+                ServeStartupStopReason::EngineFailed | ServeStartupStopReason::ProcessExited
+            )
+    }
+
     /// Text the CLI prints when the wait stops.
     ///
     /// A log line is quoted only when [`Self::label`] is that line. The
@@ -546,16 +617,23 @@ impl ServeStartupStop {
         }
         message.push('\n');
         let logs = service_logs_hint(service_id);
-        if self.process_alive {
+        if self.leaves_server_running() {
             let stop = service_stop_hint(service_id);
             let _ = write!(
                 message,
                 "The server is still running (service {service_id}). Follow it with `{logs}`, or stop it with `{stop}`."
             );
+        } else if self.process_alive {
+            // The engine said failed but its process has not exited yet.
+            let stop = service_stop_hint(service_id);
+            let _ = write!(
+                message,
+                "Its process is still up (service {service_id}). The log is `{logs}`; `{stop}` stops it."
+            );
         } else {
             let _ = write!(
                 message,
-                "The server process is gone (service {service_id}). The log is `{logs}`."
+                "The server did not start (service {service_id}). The log is `{logs}`."
             );
         }
         message
@@ -566,8 +644,10 @@ impl ServeStartupStop {
 ///
 /// `observe` returns the model name the probe should ask for (a container
 /// engine may not know it until it starts) and the latest engine/process
-/// sample. The same HTTP probe as the historical readiness wait is used, so
-/// "serving" still means an inference request came back.
+/// sample. The same HTTP checks as the historical readiness wait are used, so
+/// "serving" still means an inference request came back. Once the model is
+/// listed, the inference request is spaced by the policy's
+/// [`InferenceProbeBackoff`] rather than sent every poll.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wait_for_serve_startup(
     engine_name: &str,
@@ -583,6 +663,7 @@ pub(crate) fn wait_for_serve_startup(
     let mut progress_at = started;
     let mut token = String::new();
     let mut best = EndpointReadiness::Unreachable;
+    let mut throttle = InferenceProbeThrottle::new(policy.inference_backoff);
 
     // One observe, one probe, one decision and at most one status-line update
     // per poll, so the spinner advances once per tick.
@@ -595,14 +676,12 @@ pub(crate) fn wait_for_serve_startup(
         // A failed engine or a dead process is decided without waiting on a
         // probe that cannot succeed.
         if !signals.engine_failed && signals.process_alive {
-            match probe_service_http_readiness(
-                engine_name,
-                host,
-                port,
-                &probe_model,
-                endpoint_api_key,
-            ) {
-                EndpointReadiness::Serving => return Ok(EndpointReadiness::Serving),
+            let listed =
+                service_http_lists_model(engine_name, host, port, &probe_model, endpoint_api_key);
+            match throttle.readiness(listed, &mut Instant::now, || {
+                service_http_inference_answers(host, port, &probe_model, endpoint_api_key)
+            }) {
+                EndpointReadiness::Serving => best = EndpointReadiness::Serving,
                 EndpointReadiness::Listing => best = EndpointReadiness::Listing,
                 EndpointReadiness::Unreachable => {}
             }
@@ -1113,7 +1192,7 @@ mod tests {
         assert!(!stop.process_alive);
         let message = stop.user_message("qwen", "vllm", "svc-1");
         assert!(message.contains("the server process exited"), "{message}");
-        assert!(message.contains("The server process is gone"), "{message}");
+        assert!(message.contains("The server did not start"), "{message}");
         assert!(
             !message.contains("still running"),
             "a dead process must not be described as still running: {message}"
@@ -1210,7 +1289,127 @@ mod tests {
             poll: Duration::from_millis(20),
             stop_on_give_up: true,
             watch_engine: true,
+            inference_backoff: InferenceProbeBackoff::EVERY_POLL,
         }
+    }
+
+    /// The interactive wait's inference probe, under a clock that moves only
+    /// when the test says: a model listed but never answering is probed at 0,
+    /// 1, 3, 7 and 15 seconds, then every 15, never once per 250 ms poll. Each
+    /// probe takes the full 8-second timeout, and the next gap counts from
+    /// when it returned.
+    #[test]
+    fn inference_probe_backs_off_to_the_retry_interval_after_listing() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let mut clock = || now.get();
+        let mut throttle =
+            InferenceProbeThrottle::new(ServeStartupPolicy::interactive().inference_backoff);
+        let mut probed_at = Vec::new();
+        // Ten minutes of 250 ms polls.
+        while now.get() - start < Duration::from_mins(10) {
+            let readiness = throttle.readiness(true, &mut clock, || {
+                probed_at.push((now.get() - start).as_secs());
+                now.set(now.get() + rocm_core::INFERENCE_PROBE_TIMEOUT);
+                false
+            });
+            assert_eq!(readiness, EndpointReadiness::Listing);
+            now.set(now.get() + POLL);
+        }
+        let gaps: Vec<u64> = probed_at
+            .windows(2)
+            .map(|pair| pair[1] - pair[0] - rocm_core::INFERENCE_PROBE_TIMEOUT.as_secs())
+            .collect();
+        assert_eq!(&gaps[..5], &[1, 2, 4, 8, 15], "probed at {probed_at:?}");
+        assert!(
+            gaps[4..].iter().all(|gap| *gap == 15),
+            "the gap must stay at the retry interval: {gaps:?}"
+        );
+        // 2400 polls; one probe each would be 2400 eight-second requests.
+        assert!(probed_at.len() < 30, "probed {} times", probed_at.len());
+    }
+
+    /// Not listed, the probe never runs; listed, the first probe is not
+    /// delayed, and a probe that answers is ready at once.
+    #[test]
+    fn inference_probe_runs_at_once_when_listed_and_not_before() {
+        let now = Instant::now();
+        let mut clock = || now;
+        let mut throttle =
+            InferenceProbeThrottle::new(ServeStartupPolicy::interactive().inference_backoff);
+        assert_eq!(
+            throttle.readiness(false, &mut clock, || panic!("not listed, no probe")),
+            EndpointReadiness::Unreachable
+        );
+        assert_eq!(
+            throttle.readiness(true, &mut clock, || true),
+            EndpointReadiness::Serving
+        );
+    }
+
+    /// The same backoff through the real wait: an endpoint that lists the model
+    /// and refuses every chat request gets a handful of inference requests over
+    /// a second of 10 ms polls, not one per poll.
+    #[test]
+    fn wait_spaces_inference_probes_while_the_model_is_listed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let chat_requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&chat_requests);
+        let _server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 2048];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let (status_line, body) = if request.starts_with("POST /v1/chat/completions ") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    ("HTTP/1.1 503 Service Unavailable", r#"{"error":"loading"}"#)
+                } else {
+                    ("HTTP/1.1 200 OK", r#"{"data":[{"id":"qwen"}]}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let mut policy = short_policy(Duration::from_secs(1), Duration::from_secs(30));
+        policy.poll = Duration::from_millis(10);
+        policy.inference_backoff = InferenceProbeBackoff {
+            first: Duration::from_millis(100),
+            max: Duration::from_millis(200),
+        };
+        let mut polls = 0_usize;
+        let result = wait_for_serve_startup(
+            "vllm",
+            "qwen",
+            "127.0.0.1",
+            port,
+            None,
+            &policy,
+            &mut || {
+                polls += 1;
+                ("qwen".to_owned(), alive())
+            },
+            &mut |_| {},
+        );
+        let stop = result.expect_err("a model that never answers hits the deadline");
+        assert_eq!(stop.reason, ServeStartupStopReason::Deadline);
+        assert_eq!(stop.readiness, EndpointReadiness::Listing);
+        let probes = chat_requests.load(Ordering::SeqCst);
+        // 0, 100, 300, 500, 700, 900 ms: at most a few more under a slow host,
+        // where an unthrottled wait sends one per poll.
+        assert!(
+            (1..=8).contains(&probes),
+            "{probes} inference requests over {polls} polls"
+        );
     }
 
     #[test]
@@ -1237,8 +1436,11 @@ mod tests {
                     } else {
                         ("HTTP/1.1 503 Service Unavailable", r#"{"error":"loading"}"#)
                     }
-                } else {
+                } else if inference_ready {
                     ("HTTP/1.1 200 OK", r#"{"data":[{"id":"qwen"}]}"#)
+                } else {
+                    // Still downloading: the endpoint does not list the model.
+                    ("HTTP/1.1 503 Service Unavailable", r#"{"error":"loading"}"#)
                 };
                 let _ = write!(
                     stream,
@@ -1248,7 +1450,7 @@ mod tests {
             }
         });
 
-        let mut labels = Vec::new();
+        let mut views = Vec::new();
         let result = wait_for_serve_startup(
             "vllm",
             "qwen",
@@ -1266,7 +1468,7 @@ mod tests {
                     },
                 )
             },
-            &mut |view| labels.push(view.label.clone()),
+            &mut |view| views.push(view.clone()),
         );
         drop(server);
 
@@ -1276,10 +1478,11 @@ mod tests {
             "the wait returned before the server could serve"
         );
         assert!(
-            labels
+            views
                 .iter()
-                .any(|label| label == "Downloading model.safetensors: 40%"),
-            "the status line must show the download while the wait continues: {labels:?}"
+                .any(|view| view.phase == ServeStartupPhase::Downloading
+                    && view.label == "Downloading model.safetensors: 40%"),
+            "the status line must show the download while the wait continues: {views:?}"
         );
     }
 
@@ -1383,59 +1586,97 @@ mod tests {
         port
     }
 
+    /// Piped output returns a readiness status at the budget even when the
+    /// engine reports failure or the process is gone: that is the historical
+    /// 45-second contract scripts and CI read, and it has no stop.
     #[test]
-    fn stop_records_failed_only_for_a_dead_server() {
-        let stop = |reason, process_alive, readiness| ServeStartupStop {
+    fn piped_wait_ignores_engine_failure_and_a_dead_process() {
+        let port = {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+        let mut policy = ServeStartupPolicy::status_budget(Duration::from_millis(200));
+        policy.poll = Duration::from_millis(20);
+        let mut polls = 0;
+        let result = wait_for_serve_startup(
+            "vllm",
+            "qwen",
+            "127.0.0.1",
+            port,
+            None,
+            &policy,
+            &mut || {
+                polls += 1;
+                (
+                    "qwen".to_owned(),
+                    ServeStartupSignals {
+                        engine_failed: true,
+                        process_alive: false,
+                        log_line: None,
+                    },
+                )
+            },
+            &mut |_| {},
+        );
+        assert_eq!(result, Ok(EndpointReadiness::Unreachable));
+        assert!(
+            polls > 1,
+            "the piped wait must run to its budget, not stop at once"
+        );
+    }
+
+    #[test]
+    fn only_a_stall_or_the_deadline_leaves_the_server_running() {
+        let stop = |reason, process_alive| ServeStartupStop {
             phase: ServeStartupPhase::Loading,
             reason,
             label: String::new(),
             log_line: None,
             process_alive,
-            readiness,
+            readiness: EndpointReadiness::Unreachable,
         };
-        assert_eq!(
-            recorded_status_after_stop(&stop(
-                ServeStartupStopReason::EngineFailed,
-                true,
-                EndpointReadiness::Unreachable
-            )),
-            "failed"
-        );
-        assert_eq!(
-            recorded_status_after_stop(&stop(
-                ServeStartupStopReason::ProcessExited,
-                false,
-                EndpointReadiness::Listing
-            )),
-            "failed"
-        );
-        // A live server that stalled is still up: the record must not say
-        // failed while the message tells the user it is still running, and
-        // must not say `starting`, which rocmd restarts once it is stale.
-        assert_eq!(
-            recorded_status_after_stop(&stop(
-                ServeStartupStopReason::DownloadStalled,
-                true,
-                EndpointReadiness::Unreachable
-            )),
-            "running"
-        );
-        assert_eq!(
-            recorded_status_after_stop(&stop(
-                ServeStartupStopReason::Silent,
-                true,
-                EndpointReadiness::Unreachable
-            )),
-            "running"
-        );
-        assert_eq!(
-            recorded_status_after_stop(&stop(
-                ServeStartupStopReason::Deadline,
-                true,
-                EndpointReadiness::Listing
-            )),
-            "running"
-        );
+        // The engine said failed, or the process is gone: the launch is over,
+        // so the message does not say the server is still running. (That the
+        // CLI does not supervise it is
+        // `a_startup_stop_starts_supervision_and_keeps_its_own_error`.)
+        for (reason, alive) in [
+            (ServeStartupStopReason::EngineFailed, true),
+            (ServeStartupStopReason::EngineFailed, false),
+            (ServeStartupStopReason::ProcessExited, false),
+        ] {
+            let stop = stop(reason, alive);
+            assert!(!stop.leaves_server_running(), "{reason:?}");
+            let message = stop.user_message("qwen", "vllm", "svc-1");
+            assert!(!message.contains("still running"), "{reason:?}: {message}");
+            assert!(message.contains(&service_logs_hint("svc-1")), "{message}");
+            // A failed engine whose process is still up gets the command that
+            // stops it; one that is gone does not.
+            assert_eq!(
+                message.contains(&service_stop_hint("svc-1")),
+                alive,
+                "{reason:?} alive={alive}: {message}"
+            );
+            assert_eq!(
+                message.contains("Its process is still up"),
+                alive,
+                "{reason:?} alive={alive}: {message}"
+            );
+            assert_eq!(
+                message.contains("The server did not start"),
+                !alive,
+                "{reason:?} alive={alive}: {message}"
+            );
+        }
+        for reason in [
+            ServeStartupStopReason::DownloadStalled,
+            ServeStartupStopReason::Silent,
+            ServeStartupStopReason::SilentLoad,
+            ServeStartupStopReason::Deadline,
+        ] {
+            assert!(stop(reason, true).leaves_server_running(), "{reason:?}");
+        }
     }
 
     #[test]

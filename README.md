@@ -1168,7 +1168,9 @@ the message names `rocm logs --service <service-id>` and
 `rocm services stop <service-id> --yes`, and the background helper does not
 restart a live server for being slow until those 30 minutes pass. Engine log
 lines shown on the status line have credentials (the endpoint key, `--api-key`
-and token values, `hf_` tokens) masked. Piped output (not a terminal) keeps
+and token values, `hf_` tokens) masked. Once the server lists the model, the wait
+checks whether it can answer with a one-token request, first right away and
+then at growing intervals up to every 15 seconds. Piped output (not a terminal) keeps
 the 45-second wait and reports the server as it stood then. Control returns
 to your shell with the server still running; manage it later with
 `rocm services` (below).
@@ -1190,7 +1192,7 @@ can:
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
 `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), with
-no stall limit or deadline, instead of the default wait above; if the server exits first (crashes, is killed, or is stopped with
+no CLI-side stall limit or deadline, instead of the default wait above; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait

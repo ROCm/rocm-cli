@@ -72,9 +72,9 @@
 //! `service_launch.rs` and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `wait_for_service_http_ready` is `pub(crate)`, read from `service_control.rs`'s
 //! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
-//! is `pub(crate)`, read from `service_launch.rs`. `probe_service_http_readiness`
-//! is `pub(crate)`, read from `serve_progress.rs`'s `wait_for_serve_startup` and
-//! from `wait_for_service_http_ready_with_progress`. `http_post_local_service_json`
+//! is `pub(crate)`, read from `service_launch.rs`. `service_http_lists_model` and
+//! `service_http_inference_answers`, the two halves of its readiness probe, are
+//! `pub(crate)`, read from `serve_progress.rs`'s `wait_for_serve_startup`. `http_post_local_service_json`
 //! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
 //! `service_model_names_match` is `pub(crate)`, read from `chat/turn.rs`.
 //! `service_http_readiness_paths`, `http_get_local_service`,
@@ -369,17 +369,36 @@ pub(crate) fn wait_for_service_http_ready_with_progress(
 /// request comes back, [`EndpointReadiness::Listing`] when the model is
 /// advertised but that request does not, otherwise unreachable.
 ///
-/// Shared with [`crate::serve_progress::wait_for_serve_startup`] so the
-/// interactive status line and this wait cannot disagree about "ready".
-pub(crate) fn probe_service_http_readiness(
+/// Probes inference on every call. [`crate::serve_progress::wait_for_serve_startup`]
+/// spaces those probes out instead, through [`service_http_lists_model`] and
+/// [`service_http_inference_answers`], the same two checks, so the interactive
+/// status line and this wait cannot disagree about "ready".
+fn probe_service_http_readiness(
     engine: &str,
     host: &str,
     port: u16,
     canonical_model_id: &str,
     endpoint_api_key: Option<&str>,
 ) -> EndpointReadiness {
-    let endpoint = format_http_base_url(host, port);
-    let listed = service_http_readiness_paths(engine).iter().any(|path| {
+    if !service_http_lists_model(engine, host, port, canonical_model_id, endpoint_api_key) {
+        return EndpointReadiness::Unreachable;
+    }
+    if service_http_inference_answers(host, port, canonical_model_id, endpoint_api_key) {
+        return EndpointReadiness::Serving;
+    }
+    EndpointReadiness::Listing
+}
+
+/// The cheap half of a readiness probe: the endpoint answers and advertises
+/// the model (a short GET per readiness path).
+pub(crate) fn service_http_lists_model(
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    service_http_readiness_paths(engine).iter().any(|path| {
         http_get_local_service(
             host,
             port,
@@ -390,21 +409,24 @@ pub(crate) fn probe_service_http_readiness(
         .is_ok_and(|(status, body)| {
             service_http_readiness_response_ready(engine, path, status, &body, canonical_model_id)
         })
-    });
-    if !listed {
-        return EndpointReadiness::Unreachable;
-    }
-    if rocm_core::openai_chat_completion_probe(
-        &endpoint,
+    })
+}
+
+/// The expensive half: a real one-token chat request, which can wait up to
+/// [`rocm_core::INFERENCE_PROBE_TIMEOUT`] on a model that is still loading.
+pub(crate) fn service_http_inference_answers(
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    rocm_core::openai_chat_completion_probe(
+        &format_http_base_url(host, port),
         canonical_model_id,
         endpoint_api_key,
         rocm_core::INFERENCE_PROBE_TIMEOUT,
     )
     .unwrap_or(false)
-    {
-        return EndpointReadiness::Serving;
-    }
-    EndpointReadiness::Listing
 }
 
 fn service_http_readiness_paths(engine: &str) -> &'static [&'static str] {

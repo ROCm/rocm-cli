@@ -1995,16 +1995,30 @@ exits, a download percent stops for 3 minutes (`DOWNLOAD_STALL`), the port
 stays closed with no log for 2 minutes (`SILENT_UNREACHABLE`), a load line
 stops changing for 5 minutes (`SILENT_LOAD`), or after 30 minutes
 (`rocm_core::SERVE_STARTUP_DEADLINE`). Engine log lines are masked of
-credentials before they are shown (`redact_log_line`). `rocmd` does not
-restart a live `running` or `starting` service younger than that deadline.
+credentials before they are shown (`redact_log_line`). Once the endpoint lists the model,
+the one-token inference request is not sent every poll: it backs off from 1
+second to `INFERENCE_PROBE_RETRY_INTERVAL` (15 seconds), timed from when the
+previous request returned (`InferenceProbeThrottle`, tested under a fake clock
+by `inference_probe_backs_off_to_the_retry_interval_after_listing`). `rocmd` does not
+restart a live `running` service whose endpoint does not answer, or a live
+`starting` one past the stale-start window, while it is younger than that
+deadline; a recoverable engine healthcheck is still restarted.
 Piped output keeps the 45-second status budget. Like `--wait`, the
 interactive wait first prints the service id, `rocm logs --service
 <service-id> --follow` and a public bind's key (`announces_wait` in
 [start.rs](../apps/rocm/src/service_launch/start.rs)), since it can fail
-without printing a summary; `--wait` keeps its own wait, with no stall limit
-or deadline. The status line is a TTY spinner, and the harness does not allocate a
-PTY, so this is not a default-lane Gherkin scenario (a live engine would also
-be `@requires-gpu`). `decide_serve_startup` and `wait_for_serve_startup` in
+without printing a summary; `--wait` keeps its own wait, with no CLI-side
+stall limit or deadline. A wait that ends because the engine failed or the
+process exited settles the record the way a `--wait` does (`stopped`, or the
+engine's own `failed`), records an audit event and adds the same memory
+guidance (a `--wait` that sees the server exit now records the event too);
+when the engine failed but its process is still up, the message names the
+stop command. Only a stall or the
+deadline leaves the server running for the background helper to supervise.
+There is no Gherkin scenario for this yet. The harness can drive a PTY
+(`download_progress_pty.feature`), but interactive `rocm serve` needs a live
+engine: the no-GPU mock lane stubs the HTTP endpoint and never runs
+`rocm serve`, so a scenario would be `@requires-gpu`. `decide_serve_startup` and `wait_for_serve_startup` in
 [serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
 covered by:
 

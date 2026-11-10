@@ -31,8 +31,9 @@ use rocm_engine_protocol::{DevicePolicy, ResolveModelResponse};
 use std::fmt::Write as _;
 use std::time::Duration;
 
-/// How long one readiness wait polls before `rocm serve` reports `starting`.
-const READINESS_WAIT: Duration = Duration::from_secs(45);
+/// How long one `--wait` readiness pass polls: the same budget after which a
+/// piped `rocm serve` reports `starting`.
+const READINESS_WAIT: Duration = crate::serve_progress::PIPED_SERVE_STATUS_BUDGET;
 
 /// `rocm serve --wait`: keep waiting past [`READINESS_WAIT`] (a first start
 /// downloads the model, which can take far longer) until the server answers or
@@ -128,14 +129,43 @@ pub(super) fn died_during_wait(
     {
         return None;
     }
-    settle_exited_service(paths, service_id);
-    let mut message = format!(
-        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
+    let message = format!(
+        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `{}` for its output",
+        crate::service_hints::service_logs_hint(service_id)
     );
-    // A plain `serve` adds the memory guidance for a vLLM launch that ran out of
-    // VRAM; the wait's failure is the same launch, so it gets the same note.
-    // "starting" is the status the note keys on for "never became ready", which is
-    // what a `--wait` death is, whatever the settled record now says.
+    Some(anyhow!(settle_ended_launch(
+        paths,
+        service_id,
+        "exited during --wait",
+        message
+    )))
+}
+
+/// Settle a launch whose server ended before it became ready, record it in
+/// the audit log (`why` says how it ended), and return `message` with the
+/// memory guidance a plain `serve` would print for it.
+///
+/// Shared by a `--wait` that saw the server exit and the interactive wait's
+/// engine-failed or process-exited stop: the record is settled by
+/// [`settle_exited_service`] (`stopped`, or the engine's own `failed`, never
+/// over a stop already recorded), and a vLLM launch that ran out of VRAM gets
+/// the same note either way. "starting" is the status the note keys on for
+/// "never became ready", whatever the settled record now says.
+pub(super) fn settle_ended_launch(
+    paths: &AppPaths,
+    service_id: &str,
+    why: &str,
+    mut message: String,
+) -> String {
+    settle_exited_service(paths, service_id);
+    crate::record_cli_audit_event(
+        paths,
+        "service",
+        "managed_service_launch",
+        "error",
+        format!("managed service ended before it became ready: {why}"),
+        Some(service_id),
+    );
     if let Ok(record) = ManagedServiceRecord::read_manifest(paths, service_id) {
         for note in crate::serve_summary::append_oom_serve_note(
             Vec::new(),
@@ -147,7 +177,7 @@ pub(super) fn died_during_wait(
             let _ = write!(message, "\n  note: {note}");
         }
     }
-    Some(anyhow!(message))
+    message
 }
 
 /// Record the outcome of a finished wait on the manifest as it is now, changing
@@ -275,12 +305,11 @@ pub(super) fn simulate_oom_managed_launch(
     })
 }
 
-/// Probe `record`'s endpoint until it answers: once within the readiness
-/// budget, or (with `wait_until_ready`) for as long as the server stays alive.
+/// Probe `record`'s endpoint until it answers (`--wait`), for as long as the
+/// server stays alive. Each pass is one [`READINESS_WAIT`]-long readiness wait.
 pub(super) fn wait_for_record_ready(
     paths: &AppPaths,
     record: &ManagedServiceRecord,
-    wait_until_ready: bool,
     endpoint_api_key: Option<&str>,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> EndpointReadiness {
@@ -299,14 +328,10 @@ pub(super) fn wait_for_record_ready(
             on_tick,
         )
     };
-    if wait_until_ready {
-        wait_past_readiness_budget(
-            || probe(&mut *on_wait_tick),
-            || service_still_live(paths, &record.service_id, service_pid_is_alive),
-        )
-    } else {
-        probe(on_wait_tick)
-    }
+    wait_past_readiness_budget(
+        || probe(&mut *on_wait_tick),
+        || service_still_live(paths, &record.service_id, service_pid_is_alive),
+    )
 }
 
 /// One sample of a freshly launched service for the startup wait: the model
@@ -377,8 +402,7 @@ pub(super) fn wait_on_existing_service(
     // The key the caller generated belongs to a launch that did not happen; the
     // existing service answers to its own.
     let stored_key = endpoint_keys::endpoint_api_key(paths, &report.service_id);
-    let readiness =
-        wait_for_record_ready(paths, &record, true, stored_key.as_deref(), on_wait_tick);
+    let readiness = wait_for_record_ready(paths, &record, stored_key.as_deref(), on_wait_tick);
     if let Some(error) = died_during_wait(
         paths,
         &report.service_id,
@@ -404,6 +428,42 @@ mod tests {
     use crate::service_launch::test_support::reusable_record;
     use crate::tests::test_paths;
     use std::fs;
+
+    /// The startup wait's sample comes from the manifest on disk: the
+    /// engine's own `failed`, liveness by pid (supervisor or engine), and the
+    /// name the endpoint answers to.
+    #[test]
+    fn observe_launch_reads_failure_and_liveness_from_the_manifest() -> anyhow::Result<()> {
+        let (root, paths) = test_paths("observe-launch");
+        paths.ensure()?;
+        let mut held = reusable_record(&paths);
+        held.supervisor_pid = 41;
+        held.engine_pid = Some(42);
+        held.write()?;
+        let sample = |pid_alive: fn(u32) -> bool| observe_launch(&paths, &held, None, pid_alive);
+
+        let (model, signals) = sample(|pid| pid == 42);
+        assert_eq!(model, held.served_model_name());
+        assert!(!signals.engine_failed);
+        assert!(signals.process_alive, "a live engine pid is alive");
+        assert!(
+            sample(|pid| pid == 41).1.process_alive,
+            "a live supervisor is alive"
+        );
+        assert!(
+            !sample(|_| false).1.process_alive,
+            "every recorded pid dead"
+        );
+
+        // Another writer's `failed` on disk is what the wait sees, not the
+        // copy it holds.
+        let mut on_disk = ManagedServiceRecord::read_manifest(&paths, &held.service_id)?;
+        on_disk.status = "failed".to_owned();
+        on_disk.write()?;
+        assert!(sample(|_| true).1.engine_failed);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
 
     #[test]
     fn wait_past_readiness_budget_keeps_probing_a_live_starting_server() {

@@ -1178,7 +1178,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 spinner.borrow_mut().clear();
                 eprintln!(
                     "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
-                     Follow: rocm logs --service {waiting_on} --follow"
+                     Follow: {} --follow",
+                    crate::service_hints::service_logs_hint(waiting_on)
                 );
                 if let Some(config) = wait_begin_client_config(
                     waiting_on,
@@ -1434,19 +1435,23 @@ fn collect_serve_notes(
 /// left a launched server behind. Returns the warning to print when the
 /// helper itself would not start.
 ///
-/// Only a startup stop ([`serve_progress::ServeStartupFailed`]) is known to
-/// leave a process that may still be running. Other errors either come before
-/// the child exists (the claiming record is written first, as `starting`, and
-/// `rocmd` treats it as any stale start), or from a child that already exited
-/// or an I/O error writing its record, which did not start the helper before
-/// this wait existed either. The startup failure stays the error the user
-/// reads; a helper failure is a warning beside it.
+/// Only a startup stop that left the server running
+/// ([`serve_progress::ServeStartupFailed`] with `server_running`) leaves a
+/// process to supervise. A stop on an engine that failed or a process that
+/// exited has already been settled and reported as failed, so the CLI does not
+/// start the helper for it. Other errors either come before the child
+/// exists (the claiming record is written first, as `starting`, and `rocmd`
+/// treats it as any stale start), or from a child that already exited or an
+/// I/O error writing its record, which did not start the helper before this
+/// wait existed either. The startup failure stays the error the user reads; a
+/// helper failure is a warning beside it.
 fn supervise_after_launch_error(
     error: &anyhow::Error,
     start_helper: impl FnOnce() -> Result<()>,
 ) -> Option<String> {
     error
         .downcast_ref::<serve_progress::ServeStartupFailed>()
+        .filter(|stop| stop.server_running)
         .and_then(|_| start_helper().err())
         .map(|helper| {
             format!(
@@ -2230,9 +2235,10 @@ mod tests {
     fn a_startup_stop_starts_supervision_and_keeps_its_own_error() {
         use std::cell::Cell;
         let stop = || -> anyhow::Error {
-            serve_progress::ServeStartupFailed(
-                "qwen on vllm stopped making download progress".to_owned(),
-            )
+            serve_progress::ServeStartupFailed {
+                message: "qwen on vllm stopped making download progress".to_owned(),
+                server_running: true,
+            }
             .into()
         };
         // Row: startup stop, helper starts. Helper called, nothing to warn.
@@ -2246,18 +2252,29 @@ mod tests {
 
         // Row: startup stop, helper fails. The warning names the helper
         // error; the startup failure is still what the caller returns.
-        let error = stop();
-        let warning = super::supervise_after_launch_error(&error, || anyhow::bail!("no daemon"))
+        let warning = super::supervise_after_launch_error(&stop(), || anyhow::bail!("no daemon"))
             .expect("a helper that failed is reported");
         assert!(
             warning.starts_with("warning: the background helper did not start"),
             "{warning}"
         );
         assert!(warning.contains("no daemon"), "{warning}");
-        assert_eq!(
-            error.to_string(),
-            "qwen on vllm stopped making download progress"
-        );
+
+        // Row: the server ended (engine failed, process exited). It was
+        // settled and reported as failed, so no helper is started to restart
+        // it behind that error.
+        let called = Cell::new(false);
+        let ended: anyhow::Error = serve_progress::ServeStartupFailed {
+            message: "qwen on vllm failed: the server process exited".to_owned(),
+            server_running: false,
+        }
+        .into();
+        let warning = super::supervise_after_launch_error(&ended, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get(), "an ended launch starts no helper");
+        assert_eq!(warning, None);
 
         // Row: any other launch error. No helper.
         let called = Cell::new(false);

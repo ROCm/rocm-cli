@@ -343,13 +343,7 @@ pub(crate) fn find_recoverable_service(
                 &record.engine,
                 &record.service_id,
             ) else {
-                // A live process that has not opened its port is still the
-                // interactive serve wait's job. Restarting it here kills a
-                // download the CLI is reporting. A dead pid is not spared.
-                if record.status == "running" && live_startup_still_in_progress(&record, now) {
-                    continue;
-                }
-                if let Some(reason) = endpoint_service_recovery_reason(&record) {
+                if let Some(reason) = unreachable_endpoint_recovery_reason(&record, now) {
                     return Ok(Some((record, reason)));
                 }
                 continue;
@@ -360,15 +354,29 @@ pub(crate) fn find_recoverable_service(
                     format!("healthcheck_status_{}", healthcheck.status),
                 )));
             }
-            if let Some(reason) = endpoint_service_recovery_reason(&record) {
-                if record.status == "running" && live_startup_still_in_progress(&record, now) {
-                    continue;
-                }
+            if let Some(reason) = unreachable_endpoint_recovery_reason(&record, now) {
                 return Ok(Some((record, reason)));
             }
         }
     }
     Ok(None)
+}
+
+/// Why a `ready`/`running` service whose endpoint does not answer should be
+/// recovered, or `None` when it should not.
+///
+/// A live `running` process that has not opened its port is still the
+/// interactive serve wait's job: restarting it kills a download the CLI is
+/// reporting. A dead pid is not spared. One function for both places that
+/// fall back to the endpoint, so neither can drop the guard.
+fn unreachable_endpoint_recovery_reason(
+    record: &ManagedServiceRecord,
+    now_unix_ms: u128,
+) -> Option<String> {
+    if record.status == "running" && live_startup_still_in_progress(record, now_unix_ms) {
+        return None;
+    }
+    endpoint_service_recovery_reason(record)
 }
 
 /// Whether an operator asked for this service to stop and that stop is still
@@ -1176,7 +1184,7 @@ mod tests {
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
-            11461,
+            free_loopback_port(),
             "managed",
             std::process::id(),
             None,
@@ -1246,7 +1254,7 @@ mod tests {
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
-            11462,
+            free_loopback_port(),
             "managed",
             std::process::id(),
             None,
