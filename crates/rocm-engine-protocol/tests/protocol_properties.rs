@@ -23,7 +23,7 @@ use rocm_engine_protocol::{
     EngineRecipeEndpointHint, EngineRecipeHint, EngineRecipeUnsupportedCombinationHint,
     EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, HealthcheckResponse,
     LaunchRequest, LogsRequest, LogsResponse, ResolveModelRequest,
-    engine_id_from_plugin_binary_name, gpu_indices_to_csv, is_public_bind_host, launch_gpu_indices,
+    engine_id_from_plugin_binary_name, gpu_indices_to_csv, launch_gpu_indices,
 };
 use std::collections::BTreeMap;
 
@@ -479,7 +479,7 @@ proptest! {
             1 => "[ -~]{0,24}",
         ],
     ) {
-        let loopback = !is_public_bind_host(&host);
+        let loopback = !rocm_core::is_public_bind_host(&host);
         let allowlisted = LOOPBACK_SPELLINGS.contains(&host.as_str());
         prop_assert!(
             loopback == allowlisted,
