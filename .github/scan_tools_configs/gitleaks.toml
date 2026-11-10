@@ -80,3 +80,21 @@ regexes = [
   '''[A-Z][A-Z0-9_]*SHA512\s*[=:]''',
   '''[A-Z][A-Z0-9_]*MD5\s*[=:]''',
 ]
+
+[[allowlists]]
+description = "Model names and runtime keys assigned in first-party Rust code"
+# The generic-api-key rule fires on `api_model = "Qwen3-0.6B-GGUF"` and
+# `runtime_key: "wheel-gfx942-7.13.0"` because the variable name contains
+# "key" or "api" and the value is a short mixed-case identifier. Both are
+# public identifiers (a model repository name, a runtime install key), not
+# credentials. Anchored on the whole line and limited to Rust sources so an
+# `api_key = "..."` assignment is still scanned.
+condition = "AND"
+paths = [
+  '''.*\.rs$''',
+]
+regexTarget = "line"
+regexes = [
+  '''\bapi_model\s*=\s*"[A-Za-z0-9._/:-]+"''',
+  '''\bruntime_key:\s*"[A-Za-z0-9._-]+"''',
+]
