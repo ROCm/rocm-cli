@@ -107,11 +107,6 @@ async fn assert_planned_folder_avoids_the_link(world: &mut E2eWorld) {
     );
 }
 
-/// On a simulated machine there is nothing to install a real SDK for, so the
-/// runtime is planted: a registry record the CLI accepts as ready, whose `vllm`
-/// is the `fake-vllm` stand-in. `rocm serve` then takes the real managed-runtime
-/// path — selection, the engine's runtime lookup, the launch and the readiness
-/// wait — and only the process at the end of it is simulated.
 /// The managed runtime a simulated machine's `a managed runtime is active` plants.
 const SIMULATED_RUNTIME_KEY: &str = "simulated-therock-7.13.0";
 
@@ -135,6 +130,11 @@ pub(crate) fn simulated_vllm_argv_record(world: &E2eWorld) -> std::path::PathBuf
         .join("vllm.argv")
 }
 
+/// On a simulated machine there is nothing to install a real SDK for, so the
+/// runtime is planted: a registry record the CLI accepts as ready, whose `vllm`
+/// is the `fake-vllm` stand-in. `rocm serve` then takes the real managed-runtime
+/// path — selection, the engine's runtime lookup, the launch and the readiness
+/// wait — and only the process at the end of it is simulated.
 fn plant_simulated_runtime(world: &mut E2eWorld) {
     const KEY: &str = SIMULATED_RUNTIME_KEY;
     let data = simulated_runtime_data_dir(world);

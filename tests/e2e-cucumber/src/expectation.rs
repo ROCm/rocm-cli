@@ -1679,13 +1679,6 @@ serve_timeout_secs = 90
             .join("\n")
     }
 
-    /// serve-20's premise is a host with MORE THAN ONE GPU: on one GPU its mask
-    /// names a device that is not there and the refusal stops following from the
-    /// mask (see the scenario's comment). It plants a simulated two-GPU machine,
-    /// so the premise holds on every Linux lane. Read from the REAL feature file,
-    /// so dropping the second simulated GPU fails here rather than quietly
-    /// reinstating that single-GPU failure. Its sibling serve-19 is held the same
-    /// way, and serve-19's single-GPU case (serve-56) must keep its one GPU.
     /// serve-19's single-GPU case: the same masked ordinal refused on a machine
     /// with one GPU. Read from the real feature file, so a second GPU added to it
     /// fails here instead of quietly turning it into a copy of serve-19.
@@ -1704,6 +1697,13 @@ serve_timeout_secs = 90
         );
     }
 
+    /// serve-20's premise is a host with MORE THAN ONE GPU: on one GPU its mask
+    /// names a device that is not there and the refusal stops following from the
+    /// mask (see the scenario's comment). It plants a simulated two-GPU machine,
+    /// so the premise holds on every Linux lane. Read from the REAL feature file,
+    /// so dropping the second simulated GPU fails here rather than quietly
+    /// reinstating that single-GPU failure. Its sibling serve-19 is held the same
+    /// way; serve-19's single-GPU case is serve-56, held to one GPU above.
     #[test]
     fn the_rocr_reindexed_scenarios_plant_their_own_second_gpu() {
         let feature = include_str!("../features/model_serving.feature");
@@ -1833,8 +1833,8 @@ serve_timeout_secs = 90
         // (the assertion reads back a shell rc file) that is ALSO not WSL (the
         // only auto-applicable fix reaching the consent gate does not apply
         // there). diagnose-08 itself now plants a simulated bare-metal machine
-        // instead, but diagnose-20/28 and driver-install-07/08 still carry the
-        // pair. Neither tag says that alone, so the pair has to compose — and a
+        // instead, but other diagnose, driver-install and examine scenarios still
+        // carry the pair. Neither tag says that alone, so the pair has to compose — and a
         // `-n` filtered local run bypasses this resolution entirely, which makes
         // it worth pinning here rather than trusting a hand-run of the suite.
         let m = Expectations::default();

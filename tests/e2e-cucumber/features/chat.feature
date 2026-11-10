@@ -58,8 +58,9 @@ Feature: Chat and endpoint detection
     When the user lists running services
     Then the served model endpoint is listed
 
-  # Runs on every lane: on a GPU host `a model is served in the background` does a
-  # real `rocm serve`, on the no-GPU mock lane it's backed by MockServer. The
+  # Runs on every lane: on a real-hardware run (`E2E_HARDWARE=real`) on a GPU host
+  # `a model is served in the background` does a real `rocm serve`; otherwise,
+  # including a simulated run on a GPU box, it's backed by MockServer. The
   # assertion (a tools-bearing request is accepted) is engine-agnostic, so no GPU
   # is required — dropping @requires-gpu gave this per-PR mock-lane coverage.
   @id:chat-tool-definitions-accepted
@@ -69,8 +70,8 @@ Feature: Chat and endpoint detection
     When a chat request with tool definitions is sent
     Then the chat response is successful
 
-  # Runs on every lane (see chat-06): real serve on a GPU host, MockServer on
-  # the no-GPU mock lane. Asserts only that a served model returns a non-empty
+  # Runs on every lane (see chat-06): real serve on a real-hardware GPU run,
+  # MockServer otherwise. Asserts only that a served model returns a non-empty
   # reply, which is engine-agnostic — real generation is covered by the
   # @requires-real-gpu serve-*-inference scenarios.
   @id:chat-end-to-end-local-model

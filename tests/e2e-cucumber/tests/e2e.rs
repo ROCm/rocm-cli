@@ -997,6 +997,17 @@ fn stop_managed_services(root: &std::path::Path) -> String {
 
 // ── Shared helpers ─────────────────────────────────────────────────
 
+/// Whether a step may use the runner's own GPU.
+///
+/// True when the run opted into real hardware (`E2E_HARDWARE=real`) and this
+/// host has a usable AMD GPU. A simulated run on a GPU box takes the same GPU-less path a GitHub-hosted
+/// runner does, so the GPU it happens to sit on cannot change what it checks.
+pub fn real_gpu_host() -> bool {
+    e2e_cucumber::expectation::HardwareMode::from_env()
+        == e2e_cucumber::expectation::HardwareMode::Real
+        && e2e_cucumber::capability::host_capability().has_amd_gpu
+}
+
 /// The suite's artifact directory.
 ///
 /// This is the ONLY path CI uploads (see the `upload-artifact` steps in
@@ -1007,16 +1018,6 @@ fn stop_managed_services(root: &std::path::Path) -> String {
 /// Unlike [`results_dir`] this only computes the path and never creates it, so
 /// it is safe to call from a failure path where a second panic would replace the
 /// report being written.
-/// Whether a step may use the runner's own GPU: the run opted into real
-/// hardware (`E2E_HARDWARE=real`) and this host has a usable AMD GPU. A
-/// simulated run on a GPU box takes the same GPU-less path a GitHub-hosted
-/// runner does, so the GPU it happens to sit on cannot change what it checks.
-pub fn real_gpu_host() -> bool {
-    e2e_cucumber::expectation::HardwareMode::from_env()
-        == e2e_cucumber::expectation::HardwareMode::Real
-        && e2e_cucumber::capability::host_capability().has_amd_gpu
-}
-
 pub fn results_path() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"))
 }

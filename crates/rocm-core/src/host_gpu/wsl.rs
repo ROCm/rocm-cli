@@ -192,7 +192,9 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 ///
 /// Deliberately not routed through [`host_path`]: these are programs this
 /// process executes, not files it reads to describe the machine, and a
-/// simulated host root holds no working linker to run.
+/// simulated host root holds no working linker to run. The e2e suite answers
+/// the bare `ldconfig` with a stand-in on `PATH` instead; the absolute
+/// fallbacks still reach the real host's linker when `PATH` has none.
 pub(crate) fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
         if let Some(text) = capture_optional_command(program, &["-p"]) {

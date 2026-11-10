@@ -120,8 +120,9 @@ Feature: Model serving
   # model on a device. It records the flags it was launched with, so the serve is
   # also held to the host, the port it asked for (a free one, never the shared
   # default) and `--enforce-eager`. So this holds on every Linux lane, not only
-  # on Instinct.
-  @id:serve-vllm-default-on-instinct @requires-engine:vllm @requires-os:linux
+  # on Instinct. No `@requires-engine:vllm`: the engine follows the simulated
+  # Instinct GPU, not the runner's, so a Lemonade-default host runs it too.
+  @id:serve-vllm-default-on-instinct @requires-os:linux
   Scenario: serve-11 - vLLM is the default serving engine on Instinct
     Given a machine with an AMD Instinct GPU
     And a managed runtime is active

@@ -1168,29 +1168,31 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
     // `--engine` so the CLI's own default selection is what's exercised.
     //
-    // On a simulated machine the engine is the `fake-vllm` stand-in, which runs
-    // on any lane and on a developer's machine, so the serve gets a port nothing
-    // holds instead of the shared default, and nothing is killed to free one:
+    // Only serve-11 uses this step, and it always plants a simulated machine:
+    // the engine is the `fake-vllm` stand-in, which runs on any lane and on a
+    // developer's machine, so the serve gets a port nothing holds instead of
+    // the shared default, and nothing is killed to free one (the GPU lanes'
     // `ensure_serve_port_free` SIGKILLs whatever listens on the serve and
-    // assistant ports, which is only right on a GPU box that runs one serve at a
-    // time.
-    let port = if world.simulated_host.is_some() {
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .and_then(|listener| listener.local_addr())
-            .map_or_else(
-                |e| panic!("no free loopback port for the simulated serve: {e}"),
-                |addr| addr.port(),
-            );
-        world.simulated_serve_port = Some(port);
-        Some(port.to_string())
-    } else {
-        ensure_serve_port_free().await;
-        None
-    };
-    let mut args = vec!["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"];
-    if let Some(port) = &port {
-        args.extend(["--port", port.as_str()]);
-    }
+    // assistant ports).
+    assert!(
+        world.simulated_host.is_some(),
+        "this step serves on a simulated machine; plant one first"
+    );
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map_or_else(
+            |e| panic!("no free loopback port for the simulated serve: {e}"),
+            |addr| addr.port(),
+        );
+    world.simulated_serve_port = Some(port);
+    let port = port.to_string();
+    let args = [
+        "serve",
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--managed",
+        "--port",
+        port.as_str(),
+    ];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     // See the note in user_serves_default_engine: the rc is asserted later, so
@@ -3246,26 +3248,22 @@ async fn assert_vllm_default(world: &mut E2eWorld) {
         engine, "vllm",
         "expected vLLM as the default engine on an Instinct GPU, got '{engine}':\n{output}"
     );
-    // `rocm serve` exits 0 whatever the readiness, so on a simulated machine —
-    // where the vLLM stand-in answers at once — require the launch to have
-    // actually come up. A real model's cold load may outlast the CLI's wait, so
-    // this holds only where the engine is simulated.
-    if world.simulated_host.is_some() {
-        // The service log is the stand-in's own stdout/stderr, so it is what
-        // says why it never answered; it is gone with the scenario's root once
-        // this step returns.
-        let service_log = output
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("log_path: "))
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default();
-        assert!(
-            output.lines().any(|line| line.trim() == "readiness: ready"),
-            "the simulated vLLM never became ready:\n{output}\n{}\n--- service log ---\n{service_log}",
-            world.cli_stderr.as_deref().unwrap_or("")
-        );
-        assert_simulated_vllm_launch_args(world);
-    }
+    // `rocm serve` exits 0 whatever the readiness, so require the launch to
+    // have actually come up: the vLLM stand-in on the simulated machine answers
+    // at once. The service log is the stand-in's own stdout/stderr, so it is
+    // what says why it never answered; it is gone with the scenario's root once
+    // this step returns.
+    let service_log = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("log_path: "))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    assert!(
+        output.lines().any(|line| line.trim() == "readiness: ready"),
+        "the simulated vLLM never became ready:\n{output}\n{}\n--- service log ---\n{service_log}",
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert_simulated_vllm_launch_args(world);
 }
 
 #[then("the model is reachable")]

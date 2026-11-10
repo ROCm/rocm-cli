@@ -811,7 +811,9 @@ produces) honours it — see [release-trust.md](release-trust.md).
 
 The programs the CLI asks about the machine — `uname`, `lsmod`, `modinfo`,
 `ldconfig`, `lspci`, `rocminfo`, `rocm_agent_enumerator`, `amd-smi`, `mpirun`,
-the kernel log, and on WSL `powershell.exe` — are taken off the real `PATH`.
+`mokutil`, the kernel log (`journalctl`, `dmesg`), and the WSL interop shells
+(`powershell.exe`, `powershell`, `pwsh.exe`, `cmd.exe`) — are taken off the
+real `PATH` (`HOST_TOOLS` in the same file).
 The ones the simulated machine has come back as the `fake-host-tool` stand-in,
 answering from canned output stored in the same directory; the ones it lacks
 are simply absent. The runner's own GPU scoping (`HIP_VISIBLE_DEVICES`,
@@ -3143,7 +3145,7 @@ tool and requires it gets a `tool_use` block back) and `serve-54`
 checks the reply is an event stream that reassembles into text, with usage in
 `message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
-They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
+They run on the GPU lanes (`@requires-real-gpu`), with whichever engine the host
 serves with. The proxy's unit tests cover the stream event sequence, a stream
 that ends early, an engine refusal before the first byte, and the refusal of a
 streaming request that offers `tools` (no scenario covers that refusal). The
