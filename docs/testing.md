@@ -2463,15 +2463,19 @@ cargo test -p rocm --bin rocm anthropic_endpoint
 
 The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
 (a real Messages request is answered by the served model) and `serve-52`
-(`services list` reports both endpoints healthy), and `serve-53` (a request that offers a
-tool and requires it gets a `tool_use` block back) in
+(`services list` reports both endpoints healthy), `serve-53` (a request that offers a
+tool and requires it gets a `tool_use` block back) and `serve-54`
+(`@id:serve-anthropic-messages-streaming`, which sends `stream: true` and
+checks the reply is an event stream that reassembles into text, with usage in
+`message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. Streaming is not translated yet, so no scenario covers it; a request
-for it is refused, and the unit tests above pin that. The tool-use translation
-(`tools`, `tool_choice`, `tool_use` and `tool_result` blocks, the `tool_use` stop
-reason) is unit-tested against a fake engine in the same module; `serve-53` is the
-real-engine check.
+serves with. The proxy's unit tests cover the stream event sequence, a stream
+that ends early, an engine refusal before the first byte, and the refusal of a
+streaming request that offers `tools` (no scenario covers that refusal). The
+tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
+blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
+same module; `serve-53` is the real-engine check.
 
 Natural-language plan handoff tests:
 
