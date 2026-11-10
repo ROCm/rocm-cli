@@ -646,7 +646,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// For every `config.json` that `load` accepts, discovery reads the
     /// recorded folder as `load` does: the saved `therock_venv`, trimmed, and
     /// nothing when it is absent or blank.
