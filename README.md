@@ -81,9 +81,20 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
-removes the binaries, and undoes the `PATH` change too when no other program
-lives in that directory.
+directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
+`PATH`, or fish's config folder already exists), the installer also adds that
+directory to `PATH` in fish's `config.fish` and installs fish completions,
+including when the login shell is bash, zsh, or ksh. Fish's config folder is
+`$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
+`~/.config/fish`. A `completions/rocm.fish` that is already there and that the
+installer did not write (your own file, or a link) is left as it is: the
+installer prints a note that completions were not installed, and
+`rocm uninstall` leaves it too.
+Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
+its completions included. Rerun the installer any time to upgrade.
+`rocm uninstall` removes the binaries and the fish completions the installer
+wrote for them, and undoes the `PATH` change too when no other program lives
+in that directory.
 
 ### Linux and WSL2 (x86_64)
 
@@ -1703,6 +1714,16 @@ be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
 Each step is reported as it finishes, so if a later step fails, the output
 still shows what was already removed.
 
+On Linux it also removes the fish completion script (`completions/rocm.fish`
+in fish's config folder) that the installer recorded writing, even when the
+`PATH` change stays for other programs, and keeps it with `--keep-binaries`.
+The installer starts that file with a line naming the folder it installed into,
+and uninstall removes the file only when that line names its own folder. A
+`rocm.fish` you wrote yourself, a link, or one another install folder wrote
+since is left in place, and the review says so under `Left alone:`. If the
+file cannot be removed, uninstall prints a warning naming it and carries on,
+since the completions are only a convenience; delete it yourself then.
+
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.
@@ -1753,6 +1774,10 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 #   autoload -Uz compinit && compinit
 
 # fish
+# The Linux installer writes this file when fish is installed (under
+# $XDG_CONFIG_HOME/fish when that is an absolute path). To refresh it, run the
+# installer again. A file you write with the command below carries no
+# installer marker line, so `rocm uninstall` leaves it in place:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 
