@@ -110,6 +110,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/update"
           cargo xtask deps diff --base HEAD > "$RUNNER_TEMP/update/summary.md"
           cp -r runtimes/mise.toml runtimes/mise.lock runtimes/locks "$RUNNER_TEMP/update/"
+          # The launchers only when mise moved: `deps launchers` writes them
+          # in git's LF form, and an untouched mise.cmd is a CRLF checkout.
+          if ! git diff --quiet -- runtimes/bin; then
+            mkdir "$RUNNER_TEMP/update/bin"
+            cp runtimes/bin/mise runtimes/bin/mise.cmd "$RUNNER_TEMP/update/bin/"
+          fi
           cat "$RUNNER_TEMP/update/summary.md" >> "$GITHUB_STEP_SUMMARY"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
@@ -134,6 +140,11 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      # As in `propose`: the base launcher must apply its embedded checksums.
+      MISE_VERSION: ""
+      # GitHub API lookups in `mise latest`; read-only.
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -153,6 +164,12 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I scripts/validate_runtime_update.py "$RUNNER_TEMP/update" runtimes/mise.toml
+          # This commit's launchers, kept to regenerate the proposed ones with.
+          mkdir "$RUNNER_TEMP/base-launchers"
+          cp runtimes/bin/mise runtimes/bin/mise.cmd "$RUNNER_TEMP/base-launchers/"
+          if [ -d "$RUNNER_TEMP/update/bin" ]; then
+            cp "$RUNNER_TEMP/update/bin/mise" "$RUNNER_TEMP/update/bin/mise.cmd" runtimes/bin/
+          fi
           cp "$RUNNER_TEMP/update/mise.toml" "$RUNNER_TEMP/update/mise.lock" runtimes/
           rm -rf runtimes/locks
           cp -r "$RUNNER_TEMP/update/locks" runtimes/locks
@@ -160,6 +177,9 @@ jobs:
           # Lemonade's digests come from mise's version index, not a build
           # attestation: re-hash each such download against the lock.
           cargo xtask deps verify-downloads
+          # The launchers must be exactly what this commit's mise generates
+          # for the version they pin, at a release past the cooldown.
+          cargo xtask deps verify-launchers --base "$RUNNER_TEMP/base-launchers" --cooldown-days 7
           # The pull request body must be the table this commit's own code
           # computes from these files, not whatever `propose` wrote.
           cargo xtask deps diff --base HEAD | cmp - "$RUNNER_TEMP/update/summary.md"
@@ -243,6 +263,12 @@ jobs:
           for name in ("mise.toml", "mise.lock"):
               additions.append({"path": f"runtimes/{name}",
                                 "contents": base64.b64encode((root / name).read_bytes()).decode()})
+          # The launchers replace committed files, so the POSIX one keeps its
+          # executable mode (createCommitOnBranch keeps an existing file's).
+          for name in ("mise", "mise.cmd"):
+              if (root / "bin" / name).is_file():
+                  additions.append({"path": f"runtimes/bin/{name}",
+                                    "contents": base64.b64encode((root / "bin" / name).read_bytes()).decode()})
           produced = set()
           for lock in sorted((root / "locks").glob("pylock.*.toml")):
               path = f"runtimes/locks/{lock.name}"

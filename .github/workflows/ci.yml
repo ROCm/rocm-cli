@@ -786,18 +786,28 @@ jobs:
 
       # runtimes/bin/mise.cmd, the Windows bootstrap launcher, runs on no other
       # job: download the pinned mise through it (checked against the digest
-      # embedded in the launcher) and check that it reports the pinned
-      # version. xtask's `the_launchers_pin_the_same_mise` ties the version
-      # here to both launchers.
+      # embedded in the launcher) and check that it reports the version the
+      # launcher pins. The version is read from the launcher, not spelled
+      # here: the weekly runtime-deps-update moves the launchers, and its
+      # token cannot change a workflow file.
+      - name: Read the mise version the Windows launcher pins
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: |
+          $match = Select-String -Path runtimes/bin/mise.cmd -Pattern '^set "pinned_version=([0-9.]+)"$' | Select-Object -First 1
+          if (-not $match) { Write-Error 'runtimes/bin/mise.cmd pins no mise version'; exit 1 }
+          "MISE_PINNED=$($match.Matches[0].Groups[1].Value)" >> $env:GITHUB_ENV
+
       - name: Bootstrap mise through the Windows launcher
         if: needs.changes.outputs.heavy == 'true'
         shell: cmd
         env:
           MISE_INSTALL_PATH: ${{ runner.temp }}\mise-bootstrap.exe
         run: |
+          if not defined MISE_PINNED exit /b 1
           call runtimes\bin\mise.cmd --version > "%RUNNER_TEMP%\mise-version.txt" || exit /b 1
           type "%RUNNER_TEMP%\mise-version.txt"
-          findstr /b /c:"2026.10.25 " "%RUNNER_TEMP%\mise-version.txt" || exit /b 1
+          findstr /b /c:"%MISE_PINNED% " "%RUNNER_TEMP%\mise-version.txt" || exit /b 1
 
       # The `clippy` job runs on Linux only, so it compiles the `cfg(unix)` side
       # of every platform conditional and never sees the `cfg(windows)` side.

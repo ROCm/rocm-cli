@@ -549,8 +549,14 @@ a profile's first lock" there):
   workflow uses to refuse an update artifact that changes anything but
   versions, or whose pull-request summary is not `cargo xtask deps diff`
   output. The commit step's payload builder is run on a fixture by the xtask
-  test `the_update_commit_replaces_the_pins_and_deletes_only_dropped_locks`;
-  the rest of that workflow runs only from `main`, weekly or when dispatched.
+  test `the_update_commit_replaces_the_pins_and_deletes_only_dropped_locks`,
+  including the mise launchers it commits when mise moved; the rest of that
+  workflow runs only from `main`, weekly or when dispatched.
+- `cargo test -p xtask` covers `deps launchers` and `deps verify-launchers`
+  ([launchers.rs](../xtask/src/deps/launchers.rs)) with a fake mise: moving
+  past the cooldown, keeping the POSIX launcher executable, and refusing a
+  launcher that differs from mise's own, a downgrade, or a release inside the
+  cooldown. Against real mise they run only in the weekly update.
 - The Windows bootstrap launcher, [`runtimes/bin/mise.cmd`](../runtimes/bin/mise.cmd), is run by the
   "Bootstrap mise through the Windows launcher" step of the `windows-debug`
   CI job, which downloads the pinned mise through it and checks its version.

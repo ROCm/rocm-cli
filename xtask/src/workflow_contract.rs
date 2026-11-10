@@ -900,6 +900,45 @@ mod tests {
                 .unwrap()
                 .contains("Signed-off-by: github-actions[bot]")
         );
+
+        // When mise moved, the artifact carries both launchers, and they are
+        // committed over the existing files (which keeps the POSIX one's
+        // executable mode); when it did not, they are left alone, as above.
+        std::fs::create_dir_all(update.join("bin")).unwrap();
+        std::fs::write(update.join("bin/mise"), "posix").unwrap();
+        std::fs::write(update.join("bin/mise.cmd"), "windows").unwrap();
+        let output = std::process::Command::new("python3")
+            .arg("-I")
+            .arg("builder.py")
+            .arg("runtimes/locks/pylock.a-linux.toml")
+            .current_dir(dir.path())
+            .env("REPO", "o/r")
+            .env("BRANCH", "runtime-deps/update")
+            .env("BASE_SHA", "abc123")
+            .output()
+            .expect("python3 must be on PATH");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let paths: Vec<&str> = payload["variables"]["input"]["fileChanges"]["additions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "runtimes/mise.toml",
+                "runtimes/mise.lock",
+                "runtimes/bin/mise",
+                "runtimes/bin/mise.cmd",
+                "runtimes/locks/pylock.a-linux.toml",
+            ]
+        );
     }
 
     #[test]
@@ -1042,6 +1081,10 @@ mod tests {
                 "mkdir -p \"$RUNNER_TEMP/update\"",
                 "cargo xtask deps diff --base HEAD > \"$RUNNER_TEMP/update/summary.md\"",
                 "cp -r runtimes/mise.toml runtimes/mise.lock runtimes/locks \"$RUNNER_TEMP/update/\"",
+                "if ! git diff --quiet -- runtimes/bin; then",
+                "mkdir \"$RUNNER_TEMP/update/bin\"",
+                "cp runtimes/bin/mise runtimes/bin/mise.cmd \"$RUNNER_TEMP/update/bin/\"",
+                "fi",
                 "cat \"$RUNNER_TEMP/update/summary.md\" >> \"$GITHUB_STEP_SUMMARY\"",
                 "echo \"changed=true\" >> \"$GITHUB_OUTPUT\"",
             ]
@@ -1078,8 +1121,18 @@ mod tests {
                 "runs-on",
                 "timeout-minutes",
                 "permissions",
+                "env",
                 "steps"
             ],
+        );
+        // The base launcher runs here: it must apply its embedded checksums,
+        // and `mise latest` reads releases with a read-only token.
+        assert_eq!(
+            job_mapping(&check_job, "env"),
+            std::collections::BTreeMap::from([
+                ("MISE_VERSION".to_owned(), String::new()),
+                ("GITHUB_TOKEN".to_owned(), "${{ github.token }}".to_owned()),
+            ]),
         );
         assert!(has_line(&check_job, "    needs: propose"));
         assert!(has_line(
@@ -1132,14 +1185,20 @@ mod tests {
             [
                 "set -euo pipefail",
                 "python3 -I scripts/validate_runtime_update.py \"$RUNNER_TEMP/update\" runtimes/mise.toml",
+                "mkdir \"$RUNNER_TEMP/base-launchers\"",
+                "cp runtimes/bin/mise runtimes/bin/mise.cmd \"$RUNNER_TEMP/base-launchers/\"",
+                "if [ -d \"$RUNNER_TEMP/update/bin\" ]; then",
+                "  cp \"$RUNNER_TEMP/update/bin/mise\" \"$RUNNER_TEMP/update/bin/mise.cmd\" runtimes/bin/",
+                "fi",
                 "cp \"$RUNNER_TEMP/update/mise.toml\" \"$RUNNER_TEMP/update/mise.lock\" runtimes/",
                 "rm -rf runtimes/locks",
                 "cp -r \"$RUNNER_TEMP/update/locks\" runtimes/locks",
                 "cargo xtask deps check",
                 "cargo xtask deps verify-downloads",
+                "cargo xtask deps verify-launchers --base \"$RUNNER_TEMP/base-launchers\" --cooldown-days 7",
                 "cargo xtask deps diff --base HEAD | cmp - \"$RUNNER_TEMP/update/summary.md\"",
             ],
-            "the check must validate the artifact, run deps check on it, and recompute its summary"
+            "the check must validate the artifact, run deps check and verify the launchers on it, and recompute its summary"
         );
 
         // `open-pr` holds the write token: exactly these three steps, none of
@@ -1271,6 +1330,10 @@ mod tests {
                 "for name in (\"mise.toml\", \"mise.lock\"):",
                 "    additions.append({\"path\": f\"runtimes/{name}\",",
                 "                      \"contents\": base64.b64encode((root / name).read_bytes()).decode()})",
+                "for name in (\"mise\", \"mise.cmd\"):",
+                "    if (root / \"bin\" / name).is_file():",
+                "        additions.append({\"path\": f\"runtimes/bin/{name}\",",
+                "                          \"contents\": base64.b64encode((root / \"bin\" / name).read_bytes()).decode()})",
                 "produced = set()",
                 "for lock in sorted((root / \"locks\").glob(\"pylock.*.toml\")):",
                 "    path = f\"runtimes/locks/{lock.name}\"",
@@ -7395,11 +7458,22 @@ fi
             ),
             (
                 "windows-debug",
+                "Read the mise version the Windows launcher pins",
+                &[
+                    "Select-String -Path runtimes/bin/mise.cmd -Pattern '^set \"pinned_version=([0-9.]+)\"$'",
+                    "if (-not $match) { Write-Error 'runtimes/bin/mise.cmd pins no mise version'; exit 1 }",
+                    "\"MISE_PINNED=$($match.Matches[0].Groups[1].Value)\" >> $env:GITHUB_ENV",
+                ],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
                 "Bootstrap mise through the Windows launcher",
                 &[
+                    "if not defined MISE_PINNED exit /b 1",
                     "call runtimes\\bin\\mise.cmd --version > \"%RUNNER_TEMP%\\mise-version.txt\" || exit /b 1",
-                    "findstr /b /c:",
-                    "\"%RUNNER_TEMP%\\mise-version.txt\" || exit /b 1\n",
+                    "findstr /b /c:\"%MISE_PINNED% \" \"%RUNNER_TEMP%\\mise-version.txt\" || exit /b 1\n",
                 ],
                 &[],
                 HEAVY,
