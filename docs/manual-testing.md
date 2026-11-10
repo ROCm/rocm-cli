@@ -111,6 +111,20 @@ Expected result:
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
+Optional: an unreadable settings file. Copy `config.json` from the config
+directory aside, cut the original off part-way through, and run `rocm version`
+without `ROCM_CLI_DATA_DIR` set. Expected result:
+
+- The command fails and names `config.json`, saying it cannot be read, and
+  explains the three ways out: repair it; set `ROCM_CLI_DATA_DIR` (it names the
+  folder if the damaged file still shows it), after which commands that change
+  settings still stop and others either stop or run on default settings; or
+  rename it to the `config.json.broken` path it names, which resets every
+  setting and leaves runtimes in a custom folder reachable only through
+  `ROCM_CLI_DATA_DIR`.
+- `config.json` is byte-for-byte what you left; nothing was saved over it.
+- Restoring the copy makes `rocm runtimes list` show the same runtimes as before.
+
 ## 2. TheRock SDK Command-Line Install
 
 This tests the command-line install path without using the TUI:
@@ -1252,21 +1266,39 @@ rocm uninstall
 Expected result:
 
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
-  as the command exits) and, under
-  `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing, and at a
+  as the command exits), on Linux the `shell completions` file
+  `completions/rocm.fish` in fish's config folder (`$XDG_CONFIG_HOME/fish`
+  when that is an absolute path, else `~/.config/fish`) when the installer
+  wrote one, and, under `PATH changes from the installer that would be
+  undone:`, each shell profile the installer wrote (Linux, including fish's
+  `config.fish` when fish was installed) or the user `PATH` entry (Windows).
+  It removes nothing, and at a
   terminal ends with `Nothing was removed. To remove these items, run it again
   without --dry-run.` Running the same command again without `--dry-run` asks
   `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
   its output piped to a file or another command, or its input redirected, it
   lists the same items and omits that last line (scenario `uninstall-08`).
-- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+- After confirming, the install folder holds no `rocm`/`rocmd` files, the
+  fish completion script is gone (its `completions` folder stays), and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
 - If another program lives in the install folder, the review instead says
-  `PATH change left in place` and names it, and the `PATH` change stays.
-- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
-  stays too, and it does.
+  `PATH change left in place` and names it, and the `PATH` change stays; the
+  fish completion script still goes.
+- If you already have your own `completions/rocm.fish` (or a link there) when
+  you run the installer, it prints `note: fish completions not installed: …
+  already exists and was not written by this installer`, changes nothing, and
+  a later uninstall leaves the file (scenario `lifecycle-35`).
+- If you replace `rocm.fish` with your own file before uninstalling (for
+  example `rocm completions fish > <that path>`, which writes no installer
+  marker line), the review lists it under `Left alone:` as not written by the
+  installer, and the file stays (scenario `lifecycle-33`).
+- If the `completions` folder cannot be written to (`chmod 0555` it), the
+  uninstall prints `warning: could not remove shell completions <path>`,
+  still removes everything else, and ends with `uninstall complete`
+  (scenario `lifecycle-34`).
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change and
+  fish completions stay too, and they do (scenario `lifecycle-25`).
 - On a home folder ROCm CLI never touched, the dry run says
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run

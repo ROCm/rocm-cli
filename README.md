@@ -81,9 +81,20 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
-removes the binaries, and undoes the `PATH` change too when no other program
-lives in that directory.
+directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
+`PATH`, or fish's config folder already exists), the installer also adds that
+directory to `PATH` in fish's `config.fish` and installs fish completions,
+including when the login shell is bash, zsh, or ksh. Fish's config folder is
+`$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
+`~/.config/fish`. A `completions/rocm.fish` that is already there and that the
+installer did not write (your own file, or a link) is left as it is: the
+installer prints a note that completions were not installed, and
+`rocm uninstall` leaves it too.
+Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
+its completions included. Rerun the installer any time to upgrade.
+`rocm uninstall` removes the binaries and the fish completions the installer
+wrote for them, and undoes the `PATH` change too when no other program lives
+in that directory.
 
 ### Linux and WSL2 (x86_64)
 
@@ -1626,6 +1637,27 @@ rocm config set-provider-key <provider>
 rocm config clear-provider-key <provider>
 ```
 
+Settings live in `config.json` in the config directory and are replaced in one
+step, so an interrupted save leaves the previous file rather than a truncated
+one. On Windows, a replace that fails part-way can instead leave the new
+settings in a `config.json.tmp-*` file beside it, which the error names: rename
+it back to `config.json` before running another command. If the file exists
+but cannot be read — a bad hand edit, for example —
+rocm-cli reports it and does not save over it, so the settings in it are never
+replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
+where runtimes are kept; when it is too damaged to read even that, commands stop
+and say how to recover (`rocm diagnose` still runs). Repairing the file
+restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
+when the file still shows it) points commands back at your runtimes' folder
+meanwhile; until the file is repaired, any command that changes settings still
+stops on it, and other commands either stop too or run on default settings.
+To start over instead, rename the file yourself: the error names the exact
+file it read (under `ROCM_CLI_CONFIG_DIR` when that is set) and a name to give
+it, `config.json.broken` beside it, and rocm-cli does not rename or move it for
+you. That resets every setting to its default, and runtimes in a custom folder
+then need `ROCM_CLI_DATA_DIR`, which the error names when the file recorded
+that folder.
+
 ### Setup
 
 ```
@@ -1703,6 +1735,16 @@ be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
 Each step is reported as it finishes, so if a later step fails, the output
 still shows what was already removed.
 
+On Linux it also removes the fish completion script (`completions/rocm.fish`
+in fish's config folder) that the installer recorded writing, even when the
+`PATH` change stays for other programs, and keeps it with `--keep-binaries`.
+The installer starts that file with a line naming the folder it installed into,
+and uninstall removes the file only when that line names its own folder. A
+`rocm.fish` you wrote yourself, a link, or one another install folder wrote
+since is left in place, and the review says so under `Left alone:`. If the
+file cannot be removed, uninstall prints a warning naming it and carries on,
+since the completions are only a convenience; delete it yourself then.
+
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.
@@ -1753,6 +1795,10 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 #   autoload -Uz compinit && compinit
 
 # fish
+# The Linux installer writes this file when fish is installed (under
+# $XDG_CONFIG_HOME/fish when that is an absolute path). To refresh it, run the
+# installer again. A file you write with the command below carries no
+# installer marker line, so `rocm uninstall` leaves it in place:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 
