@@ -87,14 +87,17 @@ description = "Model names and runtime keys assigned in first-party Rust code"
 # `runtime_key: "wheel-gfx942-7.13.0"` because the variable name contains
 # "key" or "api" and the value is a short mixed-case identifier. Both are
 # public identifiers (a model repository name, a runtime install key), not
-# credentials. Anchored on the whole line and limited to Rust sources so an
-# `api_key = "..."` assignment is still scanned.
+# credentials. Matched against the rule's own match, not the whole line, so
+# a real credential on the same line is still reported under its own match,
+# and limited to Rust sources so an `api_key = "..."` assignment is still
+# scanned. Both `:` (struct field) and `=` (assignment) are accepted for both
+# names, and the value may hold the characters a model name or a runtime key
+# uses (`Qwen3-0.6B-GGUF`, `therock-release:gfx120X-all`).
 condition = "AND"
 paths = [
   '''.*\.rs$''',
 ]
-regexTarget = "line"
+regexTarget = "match"
 regexes = [
-  '''\bapi_model\s*=\s*"[A-Za-z0-9._/:-]+"''',
-  '''\bruntime_key:\s*"[A-Za-z0-9._-]+"''',
+  '''\b(api_model|runtime_key)\s*[:=]\s*"[A-Za-z0-9._/:-]+"''',
 ]
