@@ -644,3 +644,39 @@ Feature: Runtime configuration
     And a host with no uv and no usable Python
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
     Then the preview says it did not resolve the ROCm 10 package versions, as it says
+
+  # ROCm 10 installs use Python 3.14 because vLLM, flash-attn and amd-aiter for
+  # ROCm 10 exist for it alone, but the SDK and PyTorch wheels are published for
+  # older Pythons too. `--python-version` lets an install that does not need vLLM
+  # pick one. The preview must plan what the install would do with it: the
+  # requested interpreter and its wheel tag, not the default's, with the same
+  # resolution as runtime-27. Only the plan is asserted here; no scenario runs
+  # resolution with the chosen interpreter.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23.
+  @id:runtime-install-preview-of-rocm-10-honours-python-version @requires-os:linux
+  Scenario: runtime-29 - Previewing a ROCm 10 SDK install with --python-version plans that Python and not the default
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a host with no usable Python and a recording uv
+    And the recording uv answers uv pip compile with the ROCm 10 fixture's versions
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 on Python 3.12
+    Then the preview plans Python 3.12 and its cp312 wheel tag and not the default
+
+  # The flag is a choice among the interpreters the layout is published for, so a
+  # request for one it is not published for is refused instead of ignored: a
+  # canonical (ROCm 7) install, whose one interpreter is 3.12. This scenario covers
+  # that refusal; the ROCm 10 refusal (a Python the index has no wheels for) is
+  # unit-tested only. The refusal names the Python that is allowed, and nothing is
+  # prepared on the way to it.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. Each combination of
+  # layout and version is also unit-tested on every platform
+  # (`python_version_is_a_choice_among_the_layouts_published_pythons` in
+  # `apps/rocm/src/therock/python.rs`).
+  @id:runtime-install-refuses-python-version-it-cannot-honour @requires-os:linux
+  Scenario: runtime-30 - Previewing an SDK install with a --python-version the layout is not published for is refused
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin on Python 3.13
+    Then the install fails
+    And the preview is refused because the layout has no wheels for that Python, and prepared none

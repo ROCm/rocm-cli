@@ -623,13 +623,16 @@ Feature: Interactive dashboard
   # placeholder shown before the first snapshot arrives at all, is not covered
   # here (the unit test `gpu_telemetry_pending_while_connected_but_no_snapshot_yet`
   # pins it): it closes in well under a second and there's no hook to freeze the daemon
-  # mid-handshake, so asserting on it would be asserting on a race.
+  # mid-handshake, so asserting on it would be asserting on a race. Nothing is
+  # served either, so the T/S row must read "—" too: an empty sum of rates is
+  # -0.0 in Rust, which used to render as "-0".
   @id:dash-reports-no-gpu-telemetry @requires-os:linux
   Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
     Given a machine with no GPU
     When the user opens the dashboard
     Then the dashboard home view is displayed
     And the hero reports no GPU telemetry available
+    And the hero reports no generation throughput
     When the user quits the dashboard
     Then the dashboard exits successfully
 
