@@ -1139,13 +1139,10 @@ pub(crate) enum ServicesCommand {
     /// confirmed gone. Otherwise it reports on stderr that the stop was not
     /// confirmed and exits with an error, keeping the record, which still names
     /// the processes, and any endpoint key, which the server may still be
-    /// enforcing. It names each process that did not exit (on Windows also one
-    /// that exited, or was already gone, when taking the processes under it
-    /// down did not complete or found nothing and no other recorded process is
-    /// confirmed gone), and for one it could not verify (its recorded
-    /// start-time can no longer be read back, or, on Windows, it cannot be
-    /// queried at all) it signals nothing and names an operating-system
-    /// command to check on it. It does not suggest running the stop again.
+    /// enforcing. It names each process that did not exit (on Windows, also one
+    /// whose child processes may still be running), and for one it could not
+    /// verify it signals nothing and names an operating-system command to check
+    /// on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
@@ -1167,12 +1164,11 @@ pub(crate) enum ServicesCommand {
     },
     /// Delete one local server record and its files.
     ///
-    /// Only works on a record that is not running: stop the server first. A
-    /// server counts as running while any process it recorded may be running,
-    /// which on Windows includes one `rocm` cannot query (a live process the
-    /// account may not open). The record's details file, log, engine state file,
-    /// and endpoint key file are all deleted, so its log can no longer be read
-    /// and it can no longer be restarted.
+    /// Only works on a record that is not running: stop the server first (on
+    /// Windows a process `rocm` cannot query counts as running). The record's
+    /// details file, log, engine state file, and endpoint key file are all
+    /// deleted, so its log can no longer be read and it can no longer be
+    /// restarted.
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -1181,22 +1177,19 @@ pub(crate) enum ServicesCommand {
         yes: bool,
         /// Remove a record whose recorded process `rocm` cannot query.
         ///
-        /// For the one case with no other way out: a stop was requested, no
-        /// recorded process is confirmed running, and at least one could not be
-        /// queried (on Windows, a live process the account may not open, which
-        /// can be a dead server's PID taken by another program). The record, its
-        /// log, engine state and endpoint key are deleted, the command says
-        /// which process could not be queried, and a process that is still
-        /// running keeps running. Refused for any process confirmed running.
+        /// Only when a stop was requested, no recorded process is confirmed
+        /// running, and at least one could not be queried (on Windows, a live
+        /// process the account may not open). Deletes the record, log, engine
+        /// state and endpoint key, and says which process; if it is still
+        /// running it keeps running. Refused for a process confirmed running.
         #[arg(long)]
         force: bool,
     },
     /// Delete local server records that are no longer running.
     ///
     /// Running servers are always left alone; a record held only by a process
-    /// `rocm` cannot query (on Windows) is listed with the `remove --force`
-    /// command that clears it. Leftover files whose record is already gone are
-    /// cleaned up too.
+    /// `rocm` cannot query (Windows) is listed with the `remove --force` command.
+    /// Leftover files whose record is already gone are cleaned up too.
     ///
     /// Waits for a managed launch already under way to publish its record
     /// before reading the directory, and waits as long as that launch takes.
