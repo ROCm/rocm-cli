@@ -484,9 +484,10 @@ mod tests {
         // Uses the test's own live PID rather than a fixed placeholder so that,
         // on Linux, the `start_ticks` assertion below exercises the real
         // `rocm_core::process_start_ticks` lookup rather than only checking
-        // the field is present. On other platforms `process_start_ticks` is a
-        // stub that always returns `None`, so there the assertion only checks
-        // `None == None`.
+        // the field is present. On Windows it is the process creation time and
+        // the assertion still compares like with like; on any other platform
+        // `process_start_ticks` is a stub that always returns `None`, so there
+        // the assertion only checks `None == None`.
         let own_pid = std::process::id();
         let state_path = probe_state_path("therock-env");
         let request = ServeHttpRequest {

@@ -1315,8 +1315,9 @@ mod tests {
     /// calls `std::process::exit`, which inside a test binary would take the
     /// whole suite with it.
     ///
-    /// Linux-only: `rocm_core::process_start_ticks` reads `/proc` and returns
-    /// `None` everywhere else, so on other platforms there is no token to write.
+    /// Linux-only here: `rocm_core::process_start_ticks` gives a token on Linux
+    /// and on Windows (the creation time) and `None` elsewhere, and this test has
+    /// not been taken to Windows.
     #[cfg(target_os = "linux")]
     #[test]
     fn supervise_service_persists_the_supervisor_identity_token() -> Result<()> {

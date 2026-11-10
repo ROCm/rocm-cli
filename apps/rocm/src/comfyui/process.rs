@@ -419,7 +419,7 @@ fn process_is_running(pid: u32) -> bool {
 
 fn windows_process_is_running(pid: u32) -> bool {
     let filter = format!("PID eq {pid}");
-    let mut command = Command::new("tasklist");
+    let mut command = Command::new(rocm_core::windows_system_tool("tasklist.exe"));
     command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
     let Ok(output) = capture_configured_command(command, "check ComfyUI process") else {
         return false;
@@ -468,7 +468,7 @@ fn terminate_process_tree(pid: u32) -> Result<()> {
 }
 
 fn terminate_windows_process_tree(pid: u32) -> Result<()> {
-    let status = Command::new("taskkill")
+    let status = Command::new(rocm_core::windows_system_tool("taskkill.exe"))
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

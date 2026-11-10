@@ -606,12 +606,77 @@ rocm services restart <service-id> --yes
 `stop` prints `Local server stopped` only once every recorded process is
 confirmed gone; otherwise it prints `Local server stop not confirmed` on stderr,
 keeps the record and any endpoint key, and exits non-zero. It names each
-process that, or a process under it, did not exit, and for one it could not
-verify, an operating-system command to check on it. It never prints a `retry:`
-line.
+process that, or a process under it, did not exit. On Windows it also names one
+that did exit while taking the processes under it down did not complete
+(`not confirmed: process <pid> (<role>) exited, but a process under it may still
+be running`), and one that was already gone when that step ran with no other
+recorded process confirmed gone (`not confirmed: process <pid> (<role>) was
+already gone when the processes under it were to be taken down`). For one it
+could not verify, it names an operating-system command to check on it. It never
+prints a `retry:` line.
 
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
+
+On Windows the stop takes the engine's process tree down with the recorded
+process (`taskkill /T /F`, which has to finish within the stop's grace period of
+10 seconds, or the stop is not confirmed), and it checks the recorded process
+against the creation time written when the server started, so a process that has
+since taken the same PID is left alone and reported as `identity_mismatch`. A
+process it cannot verify, on either platform, is not signalled and is named with
+the check the host has: `ps -p <pid> -o pid,args` on Linux and WSL, and
+`tasklist /FI "PID eq <pid>"` on Windows. There are two ways to be unverifiable:
+the recorded start-time can no longer be read back from a running process, or
+(Windows only) the PID cannot be queried at all, as for a live process the
+account may not open. The text of `rocm services stop` does not list a per-process
+outcome for the stopping process itself; the JSON answer of the sandbox
+`stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
+as stopped).
+
+#### Windows host check
+
+The Windows build-and-test job runs the workspace unit tests, which include two
+`#[cfg(windows)]` tests in `proc_lifecycle.rs` that stop a real `ping` process
+through the PID hold, the creation-time read and the System32 `taskkill`. It does
+not run any scenario, and nothing there stages the unrun parts: the end-to-end
+tree kill of a parent with a child (`service-stop-07`), a real unopenable
+process (the `OpenProcess` failure codes), and `taskkill` exiting 128 or failing
+or stalling. None of these has been run on a Windows host, and no Windows result
+is claimed. On a Windows host with a `--features rocm/e2e-test-hooks` debug
+build and `ROCM_CLI_BINARY` set, run the scenarios that apply to Windows:
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-0[178]"` (`-01`
+plants PID 0, `-07` is Windows-only, `-08` runs on every OS) and
+`cargo test -p e2e-cucumber --test e2e -- -n "service-unqueryable-01"`, and
+record the result. Do not select `service-stop-02` to `-06` or
+`service-unqueryable-02`: they are Linux-only (they need `sleep` or `/proc`),
+and `-n` bypasses the harness's OS filter, so they would fail for want of the
+platform rather than for any defect.
+
+#### A record that stays unverified
+
+If the server is gone but its recorded PID has been taken by a process this
+account cannot open, `rocm` cannot tell the two apart, and it treats that as
+possibly running, which is the safe direction: the record never reconciles to
+`stopped`, `rocm services remove` and `rocm services prune` refuse it, and
+`rocm services stop` keeps reporting `unverified`. To clear it:
+
+1. Run the check command the stop printed. If the process is this server's, end it
+   yourself (from an elevated prompt if the account may not), then run
+   `rocm services`; the record reconciles and its endpoint key is dropped.
+2. If it is an unrelated process, run `rocm services remove <service-id> --force
+   --yes`. The refusal of a plain `remove` names exactly this command. `--force`
+   applies only when a stop was requested (the stop that reported `unverified`
+   did that), no recorded process is confirmed running, and at least one could
+   not be queried; a process `rocm` can see running is never forced past. The
+   command says which process could not be queried and that, if it is still
+   running, it keeps running, and it deletes the record, its log, its engine
+   state and its endpoint key. The server can no longer be restarted afterwards.
+   `rocm services prune` has no `--force`: it leaves such a record alone and lists it
+   under `Left alone` with this exact command.
+   If the record still reads `ready` and nobody has run `rocm services stop` on it,
+   `--force` is refused and the refusal names that stop first; run it (it reports
+   the process unverified and records the request), then the forced removal. This is
+   the intended order, not a gap: `--force` never removes a record nobody tried to stop.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
