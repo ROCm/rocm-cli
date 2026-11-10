@@ -289,7 +289,7 @@ form works depends on the engine your GPU selects.
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
-| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus a text-only Anthropic `/v1/messages` endpoint) |
+| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus an Anthropic `/v1/messages` endpoint, streaming or not) |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
@@ -450,6 +450,7 @@ hardware, not something an install or a setting can put right.
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
+                    [--python-version X.Y]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -533,10 +534,40 @@ already there no longer runs its own Python, it is removed outright and rebuilt.
 The approval prompt doesn't cover this, because it asks only about changing the
 active default runtime, not about what a named prefix loses.
 
+#### Which Python `install sdk` uses
+
+ROCm CLI picks the Python from the ROCm version it installs. ROCm 7.14 installs
+use Python 3.12. ROCm 10 and newer use Python 3.14 by default, because vLLM,
+flash-attn and amd-aiter for ROCm 10 are published for 3.14 only. The ROCm 10
+SDK and PyTorch wheels are also published for 3.10 to 3.14, so an install that
+doesn't need vLLM can choose one:
+
+```
+rocm install sdk --version 10.1.0 --family gfx1200 --python-version 3.12
+```
+
+With a Python other than 3.14, the SDK and PyTorch install and run, but vLLM
+doesn't: the engine install that normally follows an SDK install on a vLLM GPU
+is skipped with a note, and `rocm engines install vllm` refuses that runtime.
+Re-run the install without `--python-version` to move it to 3.14. An update
+keeps the Python the runtime was installed with.
+
+`--python-version` applies to ROCm 10 and newer wheel installs only. A ROCm 7
+install is built for Python 3.12 and refuses any other. A Python that doesn't
+match the install is refused rather than used, so `ROCM_CLI_PYTHON` (an
+interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the version
+ROCm CLI prepares itself) must name a Python the install accepts.
+
+If you see Python 3.14 without asking for it, the install resolved to ROCm 10
+or newer. That happens with `--version 10.x.y`, and also when the channel's
+newest build is ROCm 10, as the nightly channel's is today. The install prints
+which Python it chose, and `--dry-run` shows it without changing anything.
+
 #### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version`. These versions select their device payload by exact
+version with `--version` (an unpinned nightly install also gets ROCm 10 while
+that channel's newest build is one, from the nightly sources as before). These versions select their device payload by exact
 GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
 a family of GPUs, or none), or you want to target a different GPU, also pass
 `--family` with the raw `gfx` code instead of a family label:
@@ -577,8 +608,9 @@ dependency metadata alongside the pinned torchaudio. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
+Nothing about this happens on its own on the release channel. Without a
+`--version` of 10 or newer, `install sdk` resolves the same release and nightly
+sources as before. It doesn't
 quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
 you what it couldn't find instead.
 
@@ -997,7 +1029,7 @@ Alongside the OpenAI-compatible endpoint, a served model gets an
 Anthropic-compatible `/v1/messages` endpoint, shown as `anthropic endpoint:` in
 `rocm services list` and in the interactive `rocm serve` summary (a fresh launch
 waits briefly for it; if it is not there yet, check `rocm services list`). It is
-a text-only, non-streaming endpoint. It is a base URL: point an
+a text-and-tools endpoint that answers both plain and `stream: true` requests. It is a base URL: point an
 Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
 if the service has one, as `x-api-key` (the translation front also accepts a
 bearer token). `rocm` runs a
@@ -1005,9 +1037,15 @@ translation front on its own port, inside the serving process, so it starts and
 stops with the service; it fronts the engine even when the engine has its own
 `/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
 answers, and the reply names it. The translation covers text turns, system
-prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`;
-streaming, tool use (`tools`, `tool_choice`), extended thinking and image or
-other non-text content blocks are refused with
+prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`,
+and tool use: `tools` and `tool_choice` (including `disable_parallel_tool_use`),
+`tool_use` and `tool_result` blocks in the conversation, and `tool_use` blocks
+with the `tool_use` stop reason in the reply. Whether the model calls a tool
+depends on the engine: vLLM needs `--tool-call-parser <name>` (and auto tool choice) for any
+`tool_choice` (`any` and a named tool included), and answers a request that names a
+tool with a 400 without one. A streaming request is answered with Anthropic server-sent events built from the
+engine's streamed chunks, but streaming a request that defines `tools` is refused. Extended thinking, server tools (web search and
+the like) and image or other non-text content blocks are refused with
 an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
 marks the endpoint `(not responding)` when a ready service's endpoint does not
 answer.
@@ -1613,8 +1651,11 @@ non-zero too, after printing its log.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
-and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
+do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
+Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
+exits with code 0. Any other answer cancels the same way, after a line saying
+that the answer was not understood and is treated as no. Use `--dry-run` to only
+list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
 is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal

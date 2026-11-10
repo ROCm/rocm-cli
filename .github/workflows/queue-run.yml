@@ -1,0 +1,56 @@
+# GPU E2E on the shared queue — start a run, wait for it, publish it.
+#
+# This job runs on the queue-report runner, which sits next to the queue. It asks
+# for a run of one branch of this repository (main when scheduled), waits for
+# every lane to finish (up to 4 h 10 min), then prints the run's report and
+# lane matrix, uploads the lanes' files, and passes or fails with the run's
+# verdict. It needs no credential and no permission: the runner asks from where
+# it stands. The runner is set up to run only this workflow and nightly-queue.yml
+# as they are on main; that is enforced on the runner, outside this repository.
+# What that protects is in docs/nightly-on-the-queue.md.
+name: E2E on the queue
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "The branch of this repository to test"
+        type: string
+        default: main
+  # Whether this is a required check is a repository setting, not set here.
+  schedule:
+    - cron: "17 2 * * *"
+
+# Nothing here reads the repository. Uploading files uses the per-job runtime
+# token GitHub issues to every job regardless of these permissions.
+permissions: {}
+
+# One run at a time; the queue side refuses a second while one is unfinished.
+concurrency:
+  group: queue-run
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run and publish
+    runs-on: [queue-report]
+    # The lanes' wait is at most 15000 s (4 h 10 min); finishing and publishing
+    # the run can take 30 min more, and the rest is margin.
+    timeout-minutes: 330
+    steps:
+      - name: Run on the queue and publish
+        env:
+          # Empty when scheduled.
+          BRANCH: ${{ inputs.branch }}
+        # One line: the workflow contract forbids backslashes in this file.
+        run: /opt/queue/bin/queue-publish --out "${RUNNER_TEMP}/results" --start "${BRANCH:-main}"
+
+      - name: Upload lane results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: queue-run-results
+          path: ${{ runner.temp }}/results
+          # The publisher's files only; a lane's hidden files are not published.
+          include-hidden-files: false
+          if-no-files-found: warn

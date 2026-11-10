@@ -194,6 +194,19 @@ Expected result:
   with the install's own message. Its output before the failure states only
   what was found (for example that the `PATH` Python is not usable) and never
   says a real install would prepare or use a managed Python.
+- `rocm install sdk --version 10.0.0 --family gfx1200 --python-version 3.12
+  --dry-run` plans Python 3.12 (`python_wheel_tag: cp312`, and a managed Python
+  3.12 in the note on a host with none), and nothing in the plan says 3.14.
+  `--python-version 3.13` on an unpinned ROCm 7 install is refused, naming
+  Python 3.12 as the one that install uses, and `--python-version 3.9` on a
+  ROCm 10 install is refused naming 3.10 to 3.14. A real ROCm 10 install on a
+  vLLM GPU family with `--python-version 3.12` skips the engine auto-install
+  with a note, while a real ROCm 7 install on that family with `--python-version
+  3.12` (the redundant, accepted value) still auto-installs vLLM.
+- On the ROCm 10 runtime installed on Python 3.12 (including an unpinned
+  nightly install that resolved to ROCm 10), `rocm engines install vllm` names
+  the wheel tag it needs, and `rocm update` of that runtime builds the new one
+  on Python 3.12 again.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
@@ -323,7 +336,7 @@ Expected result:
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
-- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. A request with `"stream":true` or `tools` is refused with an `invalid_request_error`.
+- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.
 
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
@@ -532,6 +545,40 @@ Expected result:
   with `the server exited before it became ready` and a `rocm logs --service`
   pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
+- The log views tell an empty log from one they could not show, and each view
+  reads its own files, so check each separately. In a Linux or WSL shell,
+  `head -c 5000000 /dev/zero | tr '\0' x > <file>` makes a file that is one line
+  of more than 4 MiB without a line break:
+  - A server's log. Write that file over the log file named on the `Log file:`
+    line of `rocm services logs <service-id>` (by default `services/<service-id>.log`
+    under the data folder), then run `rocm services logs <service-id>` or
+    `rocm logs --service <service-id>`: both print `Recent output: none shown;
+    the newest line is longer than the 4 MiB a log view reads`, not `no output
+    yet`. Truncate the file to nothing and both print `Recent output: no output
+    yet` again.
+  - The `rocm logs` browser, which does not read a server's log: it lists the
+    activity log and the files under `logs/cli/` and `logs/tui/` in the data
+    folder (the `Folder:` and `Command logs:` lines of `rocm logs` name them).
+    Write that file to `logs/cli/probe.log` there, run `rocm logs`, and expect
+    `command log probe.log: <no output shown from CLI action log: the newest line
+    is longer than the 4 MiB a log view reads>` in the `Lines:` list, not `No logs
+    found yet.`. The same file written over the activity log instead gives
+    `Recent activity: none shown; the newest line is longer than the 4 MiB a log
+    view reads`, not `no activity yet`.
+  - `rocm comfyui logs`, which reads the saved ComfyUI logs: write the file under
+    `apps/comfyui/logs/` in the data folder and expect `No output shown: the
+    newest line is longer than the 4 MiB a log view reads.`; an empty file there
+    gives `The saved log is empty.`.
+  - A stray byte that is not valid text in any of these logs shows the readable
+    lines with a replacement character, not a `failed to read` line.
+- The `service_logs` tool (`rocm mcp-call service_logs --arguments-json
+  '{"service_id":"<service-id>","lines":50}'`) reads the same server log as
+  `rocm services logs` and answers with one of three summaries: `has no log
+  output yet` for an empty log, `has log output, but none is shown` with the same
+  4 MiB clause for the over-long line above, or `Read the last N line(s)`. Its
+  structured reply carries `lines` (the number returned, such as 3 for a
+  three-line log), `lines_requested` (the 50 asked for) and
+  `newest_line_exceeds_read_bound`.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the
   row's note points at `rocm services prune` to reclaim the space.
@@ -874,6 +921,8 @@ Expected result:
   present. With more than one adapter (for example a hybrid laptop) VRAM
   total stays unmeasured and shows `—` in the Home hero and in the GPU wall
   sidebar, never `0.0%`.
+- The hero's `T/S` row reads `—`, never `0` or `-0`: Windows has no
+  serving-instance view, so no throughput is ever measured there.
 - Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
   back when it ends.
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
@@ -881,6 +930,36 @@ Expected result:
   unmeasured values, with no crash.
 - No other output of this section needs a daemon: `rocm dash` must not report
   a failed daemon connection.
+
+### 4c. Dashboard Hero In A Short Terminal
+
+**Any platform.** The hero's row dropping is terminal layout, not a
+Windows-specific path, so this reproduces on Linux and WSL too.
+
+Open a terminal about 22 to 24 rows tall — the VS Code panel is one — and
+run:
+
+```
+rocm dash
+```
+
+Expected result:
+
+- The hero still shows utilization, VRAM, temperature and power. It never
+  renders as an empty box with only its "Node throughput · …" title.
+- As the terminal gets shorter the hero loses rows from the bottom only: the
+  held legend first, then `T/S`. Enlarging it brings them back.
+- With a model served whose figures are a scrape window old, the `*` held
+  marker and the `* = held (prior scrape window)` legend explaining it appear
+  and disappear **together** as the terminal is resized. A `*` on a reading
+  with no legend anywhere on screen is a bug; so is the legend with nothing
+  marked.
+
+  Check this one by **starting tall and shrinking**, not at the 22-to-24 rows
+  above. The legend is the first row the hero drops, and the marker is gated on
+  the legend fitting — so at 22 to 24 rows neither is on screen and there is
+  nothing to compare. Start around 30 rows, confirm both are present, then
+  shrink past the drop and confirm both go at once.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
@@ -1210,7 +1289,13 @@ Expected result:
   HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
   ```
 
-  At a terminal, the same command asks `[y/N]` and treats Enter as no.
+  At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
+  `maybe` and it cancels after printing `"maybe" is not yes or no; treating it
+  as no.`; an answer longer than 40 characters is shown cut to its first 40,
+  with `...` after the closing quote. Press Ctrl-D and `uninstall cancelled`
+  appears on a line of its own, not after the prompt. Nothing is removed in
+  either case. The same prompt is shared by `rocm fix` and the SDK-overwrite
+  prompt, so the same answers behave the same way there.
 
 ## 11. AIM (Docker) Engine Verification
 

@@ -38,13 +38,14 @@ cargo xtask check-module-size
 ```
 
 It exits non-zero and names each offending file with its count. There is one limit for
-every file: no flag, baseline or exemption. For now the check is advisory in the `clippy`
-CI job and in the `cargo-module-size` pre-commit hook, which run
-`cargo xtask check-module-size` and `cargo xtask check-module-size-advisory` and report
-offenders without failing (in CI the step shows red in the job's step list while the job
-stays green); the second is the same check that exits successfully even
-when the check itself cannot run. That holds once xtask has built: a commit that leaves
-xtask or `rocm-core` not compiling still fails the hook.
+every file: no flag, baseline or exemption. The `clippy` CI job runs
+`cargo xtask check-module-size` and fails when any file is over the limit; `clippy` is a
+required check and also runs on merge-queue runs. The failure text names each file and
+points at the split rule in [architecture.md](architecture.md). The `cargo-module-size`
+pre-commit hook still only reports: it runs `cargo xtask check-module-size-advisory`, the
+same check, but it exits successfully even when the check itself cannot run. That holds
+once xtask has built: a commit that leaves xtask or `rocm-core` not compiling still fails
+the hook.
 The counting rules are unit-tested in `xtask/src/module_size.rs`:
 
 ```bash
@@ -379,11 +380,14 @@ PROPTEST_CASES=10000 cargo test -p rocm --bin rocm proptests
 ```
 
 An explicit case count overrides `PROPTEST_CASES`, so a module that sets one
-reads the variable back itself: through the `proptest_cases` helper in each
-crate's test support, [rocm's](../apps/rocm/src/test_support.rs) and
-[rocm-core's](../crates/rocm-core/src/test_support.rs), and through
-`run_property` in [archive_props.rs](../crates/rocm-core/src/archive_props.rs),
-which keeps its own copy because three crates include it by `#[path]`. All of
+reads the variable back itself: through the `proptest_cases` helper in
+[tests/common/proptest_cases.rs](../crates/rocm-core/tests/common/proptest_cases.rs),
+which [rocm's](../apps/rocm/src/test_support.rs) and
+[rocm-core's](../crates/rocm-core/src/test_support.rs) test support, the
+`rocm-core` and `rocm-engine-protocol` integration tests and the Lemonade
+engine's unit tests all include by `#[path]`; and through `run_property` in
+[archive_props.rs](../crates/rocm-core/src/archive_props.rs), which keeps its
+own copy because three crates include it by `#[path]`. All of
 them only ever raise the module's count: a `PROPTEST_CASES` below it is
 ignored, because some of these properties catch their target defect in a small
 share of cases and would pass with it present on a short run. The uninstall properties read their own
@@ -892,6 +896,18 @@ order and the interpreter probes, whose stand-ins are shell scripts as in the
 other resolver tests, and no end-to-end run covers the Windows preview, so the
 Windows search order (`python`, `python3`, `py` with `PATHEXT`) is not covered
 by any test.
+`rocm install sdk --python-version` is covered by scenarios `runtime-29` (a ROCm
+10 preview plans the requested Python and its wheel tag, and not 3.14) and
+`runtime-30` (a version the canonical layout is not published for is refused,
+preparing nothing; the ROCm 10 refusal is unit-tested only). The rest is unit-tested in [python.rs](../apps/rocm/src/therock/python.rs):
+`python_version_is_a_choice_among_the_layouts_published_pythons` is the matrix of
+layout against requested version, and
+`a_recorded_wheel_tag_maps_back_to_the_requirement_it_came_from` is what lets an
+update keep a runtime's Python. That a ROCm 10 runtime on another Python skips the vLLM
+auto-install is `auto_install_skips_vllm_on_an_sdk_moved_off_its_python` in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs), and that a ROCm 7 runtime never does (whatever `--python-version` it was given) is `recorded_python_version_is_only_reported_for_a_rocm_10_runtime` in [update.rs](../apps/rocm/src/therock/update.rs); a tarball install refusing the flag is `python_version_is_refused_for_a_tarball_install` in [therock.rs](../apps/rocm/src/therock.rs). A real
+install and an update on a non-default Python are not covered by a scenario: they
+need a ROCm 10 SDK download.
 `a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
 [python.rs](../apps/rocm/src/therock/python.rs) is the state matrix: every
 combination of `PATH` Python (usable, unusable, absent), saved Python (usable,
@@ -1563,6 +1579,13 @@ is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
 its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
 ends differently, since it has no flag to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
+`uninstall-13` to `uninstall-15` drive the confirmation prompt under a
+pseudo-terminal, which is the only way to reach it, and pin the shared `[y/N]`
+helper's behaviour for an answer that is neither yes nor no, for ending the input
+with Ctrl-D, and for a plain no, each together with the config folder being left
+in place. They run on the default mock lane; the helper's other callers (`rocm fix`,
+the SDK-overwrite prompt) share it and are covered by its unit tests in
+[confirm.rs](../crates/rocm-core/src/confirm.rs).
 The `uninstall` command does not start the file logger, which would otherwise
 create the data folder's `logs` folder before the plan is built:
 
@@ -1705,6 +1728,29 @@ second terminal to watch the download.
 
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
+
+The log views read the end of a log through one bounded routine,
+`rocm_core::tail_log_decoded`, and decode invalid text lossily. Scenario `logs-08`
+plants an action log with a byte that is not valid text and checks that
+`rocm logs --search` still finds every matching line. Scenarios `logs-09` and
+`logs-10` (`rocm services logs`) and `logs-11` and `logs-12` (`rocm comfyui logs`)
+plant an over-long single line and an empty file and check that only the empty
+file is reported as having no output, with the wording checked against the file
+on disk. Scenario `logs-15` plants a command log whose only line is that long and
+checks that `rocm logs` lists it with a line saying no output could be shown
+rather than printing `No logs found yet.`. The routine itself is covered by `cargo test -p rocm-core --lib log_tail`.
+
+The `service_logs` tool (what the assistant and MCP clients call to read a
+server's log) answers through `rocm_core::service_log_tool_summary`, so an empty
+log (`has no log output yet`) and a log whose newest line is longer than the
+4 MiB a log view reads (`none is shown: the newest line is longer than ...`, with
+`newest_line_exceeds_read_bound` set in the structured reply) are not both
+reported as zero lines read. The structured `lines` is the number of lines
+returned and `lines_requested` the number asked for (scenario `logs-16` asks for
+50 lines of a three-line log). The CLI's copy of the tool is run by scenarios
+`logs-13`, `logs-14` and `logs-16` through `rocm mcp-call service_logs`; the daemon's copy
+is covered by `cargo test -p rocmd --lib service_logs`, because the harness
+drives only the `rocm` binary.
 
 TUI log pagination focused tests:
 
@@ -2417,11 +2463,19 @@ cargo test -p rocm --bin rocm anthropic_endpoint
 
 The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
 (a real Messages request is answered by the served model) and `serve-52`
-(`services list` reports both endpoints healthy) in
+(`services list` reports both endpoints healthy), `serve-53` (a request that offers a
+tool and requires it gets a `tool_use` block back) and `serve-54`
+(`@id:serve-anthropic-messages-streaming`, which sends `stream: true` and
+checks the reply is an event stream that reassembles into text, with usage in
+`message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. Streaming and tool use are not translated yet, so no scenario
-covers them; a request for either is refused, and the unit tests above pin that.
+serves with. The proxy's unit tests cover the stream event sequence, a stream
+that ends early, an engine refusal before the first byte, and the refusal of a
+streaming request that offers `tools` (no scenario covers that refusal). The
+tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
+blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
+same module; `serve-53` is the real-engine check.
 
 Natural-language plan handoff tests:
 
@@ -2547,6 +2601,36 @@ index that publishes the other,
 because its runtime key and package specs carry the index's spelling.
 `generator_reach_report` prints how often each hard case is generated (run it
 with `-- --nocapture`), and fails if the generator stops reaching them.
+
+Artifact integrity and engine protocol property tests:
+
+```bash
+cargo test -p rocm-core --test digest_gate_properties --test integrity_properties --test model_selector_properties
+cargo test -p rocm-engine-protocol --test protocol_properties
+cargo test -p rocm-engine-lemonade --lib archive_digest
+cargo test -p xtask verify_pinned_keys
+```
+
+These check the code that decides whether a download, a signature or the
+pinned release key is authentic, and the code that decodes engine output. The
+generators aim at near misses — a digest one nibble off or sharing a correct
+prefix, a signature with one byte changed or leading zeros, a loopback spelling
+padded or re-cased, a model id with a variant suffix — because a uniformly
+random input is rejected by any implementation, correct or not. The pinned-key
+tests run the real check over a scratch repository root and walk every
+position of the committed key. `model_selector_properties` also pins, rather
+than asserts away, two shapes where readiness accepts an engine's reported name
+for a different model: a bare family word such as `qwen` reads as ready for
+other models of that family, in the catalog and beyond, and a catalog alias
+that spells another catalog model's basename (`qwen3-32b`, an alias of
+`Qwen/Qwen3-32B-FP8` and the basename of `Qwen/Qwen3-32B`) reads as ready for
+that other model. The second is checked against a list of the catalog's
+current collisions, so a catalog change that adds one fails the test.
+The pinned-key tests also pin that a character outside the base64 alphabet
+(a space, `!` or `.`) inserted into an installer's copy of the key is refused
+as a malformed key block, in either installer, rather than ignored by the
+comparison: an installer that embeds such a key cannot load it.
+`non_base64_noise_in_an_embedded_key_is_refused_as_malformed` holds that.
 
 Model recipe engine metadata checks:
 
@@ -2953,7 +3037,7 @@ the per-PR mock lane. The host predicate itself is the shared
 than restated in either, so the test cannot drift from the production rule.
 
 The bypass decision's other arguments are in the same position — the unit tests
-in `apps/rocm/src/service_launch.rs` pin `managed_service_reuse_refusal` itself,
+in [`launch_transaction.rs`](../apps/rocm/src/service_launch/launch_transaction.rs) pin `managed_service_reuse_refusal` itself,
 not which values `serve()` hands it — so each one has a scenario instead:
 serve-30 for `require_api_key`, serve-32 for the requested recipe. The device
 policy needs neither: the predicate takes it by value rather than as an
