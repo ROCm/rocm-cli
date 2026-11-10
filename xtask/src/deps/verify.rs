@@ -2,16 +2,17 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `cargo xtask deps verify-downloads`: re-hash the binaries `runtimes/mise.lock`
-//! records without a build attestation.
+//! `cargo xtask deps verify-downloads`: re-hash every binary
+//! `runtimes/mise.lock` records.
 //!
-//! mise locks uv with `provenance = "github-attestations"`: it verified the
-//! release's build attestation. Lemonade publishes none, so its digests come
-//! from mise's own version index (`checksum_source = "mise-versions"`), and
-//! that digest is the only check the Lemonade adapter applies to a download.
-//! This command downloads each such asset from its locked URL and compares
-//! its SHA-256 with the lock, so a digest a weekly update changes is checked
-//! against the real release asset rather than taken on trust.
+//! Lemonade publishes no build attestation, so its digests come from mise's
+//! own version index (`checksum_source = "mise-versions"`), and that digest
+//! is the only check the Lemonade adapter applies to a download. mise locks
+//! uv with `provenance = "github-attestations"`, but that string is written
+//! by the weekly update's job that runs upstream code, so nothing here takes
+//! it on trust. This command downloads each asset from its locked URL and
+//! compares its SHA-256 with the lock, so a digest an update changes is
+//! checked against the real release asset.
 
 use std::path::Path;
 use std::time::Duration;
@@ -51,8 +52,8 @@ pub(crate) fn run() -> Result<()> {
     )
 }
 
-/// Every locked asset without a build attestation, re-hashed; one message per
-/// mismatch. A download that fails is an error, never a pass.
+/// Every locked asset, re-hashed; one message per mismatch. A download that
+/// fails is an error, never a pass.
 fn verify(root: &Path, work: &Path, fetch: &dyn Fetch) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(root.join(MISE_LOCK))
         .with_context(|| format!("failed to read {MISE_LOCK}"))?;
@@ -61,13 +62,6 @@ fn verify(root: &Path, work: &Path, fetch: &dyn Fetch) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for (name, tool) in &tools {
         for (platform, asset) in &tool.platforms {
-            // Only an attested tool's verified attestation stands in for
-            // re-hashing; `deps check` refuses provenance anywhere else.
-            if mise_lock::ATTESTED_TOOLS.contains(&name.as_str())
-                && asset.provenance.as_deref() == Some(mise_lock::ATTESTED)
-            {
-                continue;
-            }
             let file = work.join(format!("{}-{platform}", tool.version));
             let actual = fetched_sha256(fetch, asset, &file)?;
             if actual == asset.sha256 {
@@ -135,45 +129,49 @@ mod tests {
         sha256_hex(bytes)
     }
 
-    const ATTESTED: &str =
+    const UV: &str =
         "https://github.com/astral-sh/uv/releases/download/0.1/uv-x86_64-unknown-linux-gnu.tar.gz";
     const LINUX: &str = "https://github.com/o/tool/releases/download/v1/tool-1-ubuntu-x64.tar.gz";
 
-    fn workspace(lemonade_sum: &str) -> tempfile::TempDir {
+    /// uv locked with its attestation string and the digest `uv_sum`,
+    /// and a Lemonade-like tool locked with `lemonade_sum`.
+    fn workspace_with(uv_sum: &str, lemonade_sum: &str) -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("runtimes")).unwrap();
         let lock = format!(
             "lockfile_version = 3\n\n\
              [[tools.\"aqua:astral-sh/uv\"]]\nversion = \"0.1\"\nbackend = \"aqua:astral-sh/uv\"\n\n\
              [tools.\"aqua:astral-sh/uv\".\"platforms.linux-x64\"]\n\
-             checksum = \"sha256:{}\"\nurl = \"{ATTESTED}\"\nprovenance = \"github-attestations\"\n\n\
+             checksum = \"sha256:{uv_sum}\"\nurl = \"{UV}\"\nprovenance = \"github-attestations\"\n\n\
              [[tools.\"github:o/tool\"]]\nversion = \"1\"\nbackend = \"github:o/tool\"\n\n\
              [tools.\"github:o/tool\".\"platforms.linux-x64\"]\n\
-             checksum = \"sha256:{lemonade_sum}\"\nchecksum_source = \"mise-versions\"\nurl = \"{LINUX}\"\n",
-            "a".repeat(64)
+             checksum = \"sha256:{lemonade_sum}\"\nchecksum_source = \"mise-versions\"\nurl = \"{LINUX}\"\n"
         );
         std::fs::write(root.path().join(MISE_LOCK), lock).unwrap();
         root
     }
 
+    fn workspace(lemonade_sum: &str) -> tempfile::TempDir {
+        workspace_with(&hex(b"the uv archive"), lemonade_sum)
+    }
+
     fn fake() -> Fake {
         Fake {
-            bodies: BTreeMap::from([(LINUX.to_owned(), b"the real archive".to_vec())]),
+            bodies: BTreeMap::from([
+                (UV.to_owned(), b"the uv archive".to_vec()),
+                (LINUX.to_owned(), b"the real archive".to_vec()),
+            ]),
             fetched: RefCell::default(),
         }
     }
 
     #[test]
-    fn a_digest_that_matches_the_download_passes_and_attested_assets_are_skipped() {
+    fn every_locked_download_is_rehashed_and_matching_digests_pass() {
         let root = workspace(&hex(b"the real archive"));
         let fake = fake();
         let found = verify(root.path(), &root.path().join("work"), &fake).unwrap();
         assert_eq!(found, Vec::<String>::new());
-        assert_eq!(
-            *fake.fetched.borrow(),
-            [LINUX],
-            "uv is attested and not fetched"
-        );
+        assert_eq!(*fake.fetched.borrow(), [UV, LINUX]);
     }
 
     #[test]
@@ -190,48 +188,20 @@ mod tests {
         );
     }
 
-    /// Only a verified build attestation skips the re-hash: any other
-    /// `provenance` value is no attestation at all.
+    /// The `provenance` string is written by the job that ran upstream code,
+    /// so it excuses nothing: uv locked "with its attestation" but with a
+    /// swapped digest is reported like any other mismatch.
     #[test]
-    fn a_provenance_other_than_a_verified_attestation_is_still_rehashed() {
-        let recorded = "b".repeat(64);
-        let root = workspace(&recorded);
-        let lock_path = root.path().join(MISE_LOCK);
-        let original = std::fs::read_to_string(&lock_path).unwrap();
-        // A made-up value, and a real one on a tool that is not attested.
-        for value in ["trust-me", "github-attestations"] {
-            let lock = original.replace(
-                "checksum_source = \"mise-versions\"",
-                &format!("provenance = \"{value}\""),
-            );
-            std::fs::write(&lock_path, lock).unwrap();
-            let fake = fake();
-            let found = verify(root.path(), &root.path().join("work"), &fake).unwrap();
-            assert_eq!(*fake.fetched.borrow(), [LINUX], "{value}");
-            assert_eq!(found.len(), 1, "{value}: {found:?}");
-        }
-    }
-
-    /// An attested tool is skipped only when its value is the verified
-    /// attestation; any other value is re-hashed like everything else.
-    #[test]
-    fn an_attested_tool_with_another_provenance_is_still_rehashed() {
-        let root = workspace(&hex(b"the real archive"));
-        let lock_path = root.path().join(MISE_LOCK);
-        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
-            "provenance = \"github-attestations\"",
-            "provenance = \"trust-me\"",
-        );
-        std::fs::write(&lock_path, lock).unwrap();
-        let mut fake = fake();
-        fake.bodies
-            .insert(ATTESTED.to_owned(), b"not what uv's lock records".to_vec());
-        let found = verify(root.path(), &root.path().join("work"), &fake).unwrap();
-        assert_eq!(*fake.fetched.borrow(), [ATTESTED, LINUX]);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(
-            found[0].starts_with("aqua:astral-sh/uv@0.1 linux-x64:"),
-            "{found:?}"
+    fn a_provenance_string_never_skips_the_rehash() {
+        let swapped = "c".repeat(64);
+        let root = workspace_with(&swapped, &hex(b"the real archive"));
+        let found = verify(root.path(), &root.path().join("work"), &fake()).unwrap();
+        assert_eq!(
+            found,
+            [format!(
+                "aqua:astral-sh/uv@0.1 linux-x64: {UV} has sha256 {}, but the lock records {swapped}",
+                hex(b"the uv archive")
+            )]
         );
     }
 

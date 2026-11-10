@@ -157,8 +157,9 @@ jobs:
           rm -rf runtimes/locks
           cp -r "$RUNNER_TEMP/update/locks" runtimes/locks
           cargo xtask deps check
-          # Lemonade's digests come from mise's version index, not a build
-          # attestation: re-hash each such download against the lock.
+          # Re-hash every locked download: Lemonade's digests come from mise's
+          # version index, and uv's `provenance` string is only what
+          # `propose`, which ran upstream code, wrote.
           cargo xtask deps verify-downloads
           # The pull request body must be the table this commit's own code
           # computes from these files, not whatever `propose` wrote.
@@ -217,7 +218,7 @@ jobs:
           # fixup) is never discarded: the run stops instead.
           if gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
             others=$(gh api "repos/$REPO/compare/$base_sha...$BRANCH" \
-              --jq '[.commits[] | select(.author.login != "github-actions[bot]")] | length')
+              --jq '[.commits[] | select((.author.login == "github-actions[bot]" or (.author == null and .commit.author.email == "41898282+github-actions[bot]@users.noreply.github.com")) | not)] | length')
             if [ "$others" != "0" ]; then
               echo "::error::$BRANCH has $others commit(s) this workflow did not make. Merge or close its pull request, or move the fixups to main, before the next update."
               exit 1

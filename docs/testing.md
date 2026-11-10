@@ -544,8 +544,8 @@ a profile's first lock" there):
   path-filtered, does not run on pushes or in the merge queue, and runs on a
   GitHub-hosted runner rather than locally. The same job, and the weekly
   update's `check` job, also run `cargo xtask deps verify-downloads`, which
-  downloads every binary `runtimes/mise.lock` records without a build
-  attestation (Lemonade) and fails if its SHA-256 differs from the lock; its
+  downloads every binary `runtimes/mise.lock` records (uv as well as
+  Lemonade) and fails if its SHA-256 differs from the lock; its
   own tests use a fake download and run with `cargo test -p xtask`.
 - `python scripts/validate_runtime_update.py --self-test`
   ([script](../scripts/validate_runtime_update.py); run by the
@@ -562,7 +562,7 @@ a profile's first lock" there):
 
 ```bash
 cargo xtask deps check                       # offline
-cargo xtask deps verify-downloads            # network; re-hashes Lemonade
+cargo xtask deps verify-downloads            # network; re-hashes every locked binary
 runtimes/bin/mise run --cd runtimes lock    # network; slow, see above
 ```
 
@@ -621,9 +621,10 @@ cargo xtask affected --base origin/main
 which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
 or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
-file, the workspace root manifest, CI config, a doc an xtask test reads —
+file, the workspace root manifest, CI config, a file an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`, [`docs/runtime-dependencies.md`](runtime-dependencies.md) —
+`tests/e2e-cucumber/README.md`, [`docs/runtime-dependencies.md`](runtime-dependencies.md),
+[`engines/vllm/src/discover_builds.rs`](../engines/vllm/src/discover_builds.rs) —
 or code xtask compiles in by path, [`crates/rocm-deps/src/pins_gen.rs`](../crates/rocm-deps/src/pins_gen.rs)). Two further rules add `xtask`, which holds
 the proptest seed guard and which no other crate depends on: a changed file under
 a `proptest-regressions` directory, and a changed Rust file whose diff adds or

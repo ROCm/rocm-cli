@@ -47,7 +47,7 @@ with `--cd runtimes`.
 | `runtimes/bin/mise run --cd runtimes lock` | Re-lock binaries at the current pins and every Python profile at the cutoff its lock records (network; see below) |
 | `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown (AMD-only Python packages are not held back; see *Cooldown*), then re-lock |
 | `cargo xtask deps check` | Verify every lock, offline (also run by `cargo test -p xtask`) |
-| `cargo xtask deps verify-downloads` | Download every binary locked without a build attestation (Lemonade) and check its SHA-256 against `mise.lock` (network) |
+| `cargo xtask deps verify-downloads` | Download every binary `mise.lock` records and check its SHA-256 against the lock (network) |
 | `cargo xtask deps diff --base <rev>` | Markdown table of versions changed since `<rev>`. Every row carries a short digest after the version (of the asset for a binary, of all its artifacts' hashes for a Python package), so an artifact re-uploaded at the same version shows up too |
 
 The mise tasks install the pinned tools first, Lemonade included, so even
@@ -69,20 +69,22 @@ so no binary has to be repackaged or re-hosted.
 
 Where each digest came from is recorded in the lock, and differs by tool. For
 uv, the lock records `provenance = "github-attestations"`: mise verified the
-release's build attestation when it locked it. For Lemonade, which publishes
-no attestation, the lock records `checksum_source = "mise-versions"`: the
-digest is the one mise's own version index lists for that release asset, not
-one GitHub signed. That digest is what
-[`install.rs`](../engines/lemonade/src/install.rs) checks a download against,
-so it is not taken on trust: `cargo xtask deps verify-downloads` downloads
-every locked asset without a build attestation and compares its SHA-256 with
-the lock. The weekly update's read-only `check` job runs it before a pull
+release's build attestation when it locked it. That string is only what the
+locking job wrote, though, and the weekly update writes it in the job that
+runs upstream code, so nothing re-reads it as proof. For Lemonade, which
+publishes no attestation, the lock records `checksum_source = "mise-versions"`:
+the digest is the one mise's own version index lists for that release asset,
+not one GitHub signed. That digest is what
+[`install.rs`](../engines/lemonade/src/install.rs) checks a download against.
+Neither is taken on trust: `cargo xtask deps verify-downloads` downloads every
+locked asset, uv's included, and compares its SHA-256 with the lock. The weekly update's read-only `check` job runs it before a pull
 request is opened, and the `runtime-locks` job runs it on any pull request
 that changes `runtimes/`. `cargo xtask deps check` (below) ties the URL to
 Lemonade's own release for that version. `deps check` does not read `checksum_source`; it does require
-uv's `provenance = "github-attestations"`, refuses a `provenance` value of any
-kind on every other tool (so no value can excuse a Lemonade download from
-re-hashing), ties `url_api` (which mise downloads
+uv's `provenance = "github-attestations"` (a presence check: it refuses a
+lock mise wrote without verifying the attestation, while `verify-downloads` is
+what checks the digest), refuses a `provenance` value of any
+kind on every other tool, ties `url_api` (which mise downloads
 through when set) to the same repository as `url`, and refuses any lock field
 it does not know.
 
