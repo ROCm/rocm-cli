@@ -276,12 +276,15 @@ wheel runtime whose device target was not resolved exactly has no target), or,
 for the source, when a legacy record has no index URL. What
 a lane skips on a given platform follows from the `@requires-*` tags above.
 
-To reproduce a lane's result locally, install the runtime the Platform cell
-names (`rocm install sdk --channel release|nightly`, adding `--family` or
-`--version` to match it) and run the scenario by its name prefix, for example
-`cargo xtask e2e -- -n "serve-28"`. The anchors in the report are `@id:` slugs,
-which `-n` does not match; see [testing.md](testing.md) for how to select a
-scenario.
+To reproduce a lane's result locally, install a runtime from the same target
+and source the Platform cell names (`rocm install sdk --channel release|nightly`;
+`--family` takes a family label such as `gfx110X-all`, not the exact target, and
+no flag selects the package source, so treat the cell as what to compare
+against, not what to pass), then run a scenario that exercises it, for example
+`cargo xtask e2e -- -n "serve-05"` (`-n` is a regex over the scenario name, not
+a prefix, and not the `@id:` slug the report anchors show). `-n` skips the
+host capability checks, so pick a scenario whose `@requires-*` tags your host
+meets; see [testing.md](testing.md) for how to select a scenario.
 
 `nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
 via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows

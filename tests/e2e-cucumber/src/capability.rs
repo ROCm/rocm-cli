@@ -369,8 +369,12 @@ fn active_runtime_install_root(runtimes_dir: &std::path::Path) -> Option<ActiveR
         .get("index_url")
         .and_then(serde_json::Value::as_str)
         .map(|url| {
+            // Same two-level fallback as the CLI's `manifest_source_layout`: a
+            // manifest older than the top-level field carries the generation on
+            // its wheel composition.
             match json
                 .get("source_layout_generation")
+                .or_else(|| json.pointer("/wheel_composition/source_layout_generation"))
                 .and_then(serde_json::Value::as_str)
             {
                 Some(generation) => format!("{url} ({generation})"),
@@ -1358,6 +1362,38 @@ Local model engines
 
         let runtime = active_runtime_install_root(dir).expect("one runtime");
         assert_eq!(runtime.gfx_target.as_deref(), Some("gfx1100"));
+    }
+
+    /// A manifest older than the top-level `source_layout_generation` carries it
+    /// on its wheel composition; the source still names the generation, as the
+    /// CLI's `manifest_source_layout` does.
+    #[test]
+    fn source_generation_falls_back_to_the_wheel_composition() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        let key = "release-wheel-multi-arch-7-14-0";
+        let registry = dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": "7.14.0",
+                "install_root": install_root,
+                "index_url": "https://example.test/whl",
+                "wheel_composition": { "source_layout_generation": "multi-arch-v2" },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let runtime = active_runtime_install_root(dir).expect("one runtime");
+        assert_eq!(
+            runtime.source.as_deref(),
+            Some("https://example.test/whl (multi-arch-v2)")
+        );
     }
 
     /// Several runtimes and no marker: report nothing rather than guess. An
