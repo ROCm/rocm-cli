@@ -21,7 +21,7 @@ use super::super::source::{
     select_source_layout, selector_is_release_line,
 };
 use super::super::version::{compare_version_strings, is_stable_runtime_version};
-use super::wheel::next_layout_unsatisfied_hint;
+use super::next_hint::{NextLayoutRecovery, RecoveryFormat, next_layout_unsatisfied_hint};
 use anyhow::{Context, Result, bail};
 use rocm_core::AppPaths;
 use serde::Deserialize;
@@ -91,8 +91,12 @@ pub(in crate::therock) fn resolve_tarball_artifact_with_timeout(
     )?
     .text;
     let files = parse_tarball_index_html(&html).with_context(|| {
+        let catalog = match layout {
+            SourceLayout::Canonical => "canonical",
+            SourceLayout::Next => "next-layout",
+        };
         format!(
-            "unknown canonical TheRock tarball catalog layout at {}",
+            "unknown {catalog} TheRock tarball catalog layout at {}",
             source.tarball_catalog
         )
     })?;
@@ -221,6 +225,13 @@ fn select_tarball_candidate(
     candidates.pop()
 }
 
+/// The context added when [`select_tarball_candidate`] finds no archive.
+///
+/// That is the only failure it wraps, and a different `--version` can clear
+/// it, so on the next layout it is always followed by the list of releases to
+/// try. No archive was picked, so no release counts as attempted. The
+/// suggested command is a tarball install. It carries no `devel` extras,
+/// because a tarball has none.
 fn tarball_resolution_failure_context(
     channel: TheRockChannel,
     layout: SourceLayout,
@@ -234,7 +245,12 @@ fn tarball_resolution_failure_context(
             next_layout_unsatisfied_hint(
                 version_selector,
                 Some(published),
-                family_resolution.raw_arch.as_deref(),
+                None,
+                NextLayoutRecovery {
+                    format: RecoveryFormat::Tarball,
+                    exact_arch: family_resolution.raw_arch.as_deref(),
+                    include_devel: false,
+                },
                 Some(&family_resolution.family),
             ),
         ),
@@ -588,6 +604,28 @@ mod tests {
             "{next}"
         );
         assert!(!next.contains("nightly"), "{next}");
+        // An archive catalog has no package stack to speak of.
+        assert!(
+            next.contains("No archive for gfx120X-all was found for version 10.1"),
+            "{next}"
+        );
+        assert!(!next.contains("package stack"), "{next}");
+
+        // `rocm update` re-resolves a tarball runtime with no pin. The command
+        // it is given installs a tarball, not the default wheel.
+        let update = tarball_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            &family,
+            None,
+            &["10.0.0".to_owned()],
+        );
+        assert!(
+            update.contains(
+                "`rocm install sdk --channel release --format tarball --version 10.0.0 --family gfx1200`"
+            ),
+            "{update}"
+        );
 
         let canonical = tarball_resolution_failure_context(
             TheRockChannel::Release,

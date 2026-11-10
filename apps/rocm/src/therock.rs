@@ -227,7 +227,7 @@ pub(crate) fn install_sdk(
                 && !next_layout_requested(selector)
             {
                 bail!(
-                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin, exact or a `major.minor` line (e.g. `--version 10.0.0` or `--version 10.1`); for any other version, use `--format wheel`"
                 )
             }
             install_tarball_runtime(

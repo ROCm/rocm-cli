@@ -43,10 +43,13 @@ use super::super::python::WheelCompatibility;
 use super::super::slugify;
 use super::super::source::{
     FamilyResolution, RuntimeVersionSelector, SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel,
-    next_layout_requested, resolve_source, select_source_layout,
+    resolve_source, select_source_layout,
 };
 use super::super::version::{
     ParsedVersion, compare_version_strings, is_stable_runtime_version, parse_version,
+};
+use super::next_hint::{
+    NextLayoutRecovery, RecoveryFormat, VersionUnsatisfied, next_layout_unsatisfied_hint,
 };
 use super::uv_access::{
     UvAccess, UvPolicy, VersionResolution, plan_version_resolution, uv_for_compile,
@@ -763,8 +766,12 @@ fn resolve_pip_runtime_plan(
     let root_html =
         download_text_cached(paths, &root_cache_key, &root_url, download_timeout_secs)?.text;
     validate_aggregate_index_layout(&root_html).with_context(|| {
+        let source_label = match layout {
+            SourceLayout::Canonical => "canonical source",
+            SourceLayout::Next => "next-layout source",
+        };
         format!(
-            "failed to resolve TheRock {} wheel runtime from canonical source {}",
+            "failed to resolve TheRock {} wheel runtime from {source_label} {}",
             channel.as_str(),
             source.wheel_index
         )
@@ -791,7 +798,11 @@ fn resolve_pip_runtime_plan(
     };
     // Loaded here rather than inside `resolve_pip_runtime_from_index` so a
     // failure further down can name the releases this index does publish.
-    let exact_arch = family_resolution.raw_arch.as_deref();
+    let recovery = NextLayoutRecovery {
+        format: RecoveryFormat::Wheel,
+        exact_arch: family_resolution.raw_arch.as_deref(),
+        include_devel,
+    };
     let rocm_versions = load_simple_index_versions(
         paths,
         &source.index_url,
@@ -806,7 +817,8 @@ fn resolve_pip_runtime_plan(
             &source.index_url,
             version_selector,
             None,
-            exact_arch,
+            None,
+            recovery,
         )
     })?;
     resolve_pip_runtime_from_index(
@@ -821,15 +833,17 @@ fn resolve_pip_runtime_plan(
         download_timeout_secs,
         &uv,
     )
-    .with_context(|| {
-        wheel_resolution_failure_context(
+    .map_err(|error| {
+        let context = wheel_resolution_failure_context(
             channel,
             layout,
             &source.index_url,
             version_selector,
             Some(&rocm_versions),
-            exact_arch,
-        )
+            VersionUnsatisfied::find(&error),
+            recovery,
+        );
+        error.context(context)
     })
 }
 
@@ -924,12 +938,15 @@ fn resolve_pip_runtime_from_index(
                 }
             };
             let rocm_version = select_rocm_version(channel, rocm_versions, version_selector)
-                .with_context(|| {
+                .ok_or_else(|| {
                     let requested = version_selector.map_or_else(
                         || "latest compatible version".to_owned(),
                         RuntimeVersionSelector::describe,
                     );
-                    format!("no TheRock rocm package was found for {requested} in {index_url}")
+                    VersionUnsatisfied::new(
+                        None,
+                        format!("no TheRock rocm package was found for {requested} in {index_url}"),
+                    )
                 })?;
             // Chosen here, not by `uv`: see `published_pip_requirements`.
             let torchaudio_versions = load_simple_index_versions(
@@ -980,6 +997,7 @@ fn resolve_pip_runtime_from_index(
             let versions = resolve_published_pip_package_versions(
                 paths,
                 &compile_uv,
+                &rocm_version,
                 index_url,
                 &requirements,
                 wheel_compatibility,
@@ -1112,6 +1130,7 @@ fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageV
 fn resolve_published_pip_package_versions(
     paths: &AppPaths,
     uv: &Path,
+    rocm_version: &str,
     index_url: &str,
     requirements: &[String],
     compatibility: &WheelCompatibility,
@@ -1160,10 +1179,29 @@ fn resolve_published_pip_package_versions(
     let output = wait_with_output_bounded(child, timeout)
         .context("failed to wait for ROCm X metadata resolution")?;
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!("published ROCm X package metadata is not jointly installable: {detail}");
+        return Err(uv_compile_failure(
+            rocm_version,
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
     parse_uv_compiled_package_versions(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// What `uv pip compile` failing means for the release it was given.
+///
+/// `uv` reports a requirement set nothing satisfies as "No solution found",
+/// which another ROCm release can clear, so that one is a
+/// [`VersionUnsatisfied`]. Any other failure, such as an index it could not
+/// reach or a timeout, is left plain: a different `--version` would meet it
+/// again. The message is the same either way.
+fn uv_compile_failure(rocm_version: &str, stderr: &str) -> anyhow::Error {
+    let detail = stderr.trim();
+    let message = format!("published ROCm X package metadata is not jointly installable: {detail}");
+    if detail.contains("No solution found") {
+        VersionUnsatisfied::new(Some(rocm_version), message).into()
+    } else {
+        anyhow::Error::msg(message)
+    }
 }
 
 fn select_matching_pip_package_versions(
@@ -1347,9 +1385,15 @@ fn torchaudio_pin(
 ) -> Result<TorchaudioPin> {
     let built_for_rocm = package_versions_matching_rocm(published, rocm_version);
     if built_for_rocm.is_empty() {
-        bail!(
-            "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
-        );
+        // Another ROCm release can publish a torchaudio this host can install,
+        // so a different `--version` can clear this one.
+        return Err(VersionUnsatisfied::new(
+            Some(rocm_version),
+            format!(
+                "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
+            ),
+        )
+        .into());
     }
     let pin = |version, basis| TorchaudioPin {
         version,
@@ -1535,123 +1579,63 @@ fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
     hint
 }
 
-/// The sentence appended when wheel resolution fails.
+/// The context added when wheel resolution fails.
 ///
 /// A ROCm >= 10 pin already refused `--channel nightly` before resolution
 /// (`select_source_layout`), so the canonical hint's nightly suggestion must
-/// not be what that failure prints. The next-layout branch points at the
-/// layout that was searched and at the releases it does publish; see
-/// [`next_layout_unsatisfied_hint`]. `published` is `None` when the `rocm`
-/// listing itself could not be read.
+/// not be what a next-layout failure prints. On the next layout:
+/// - `published` is `None` when the `rocm` listing itself could not be read,
+///   and the context says no other version can be suggested.
+/// - `unsatisfied` is the [`VersionUnsatisfied`] in the failure's chain. Only
+///   such a failure is followed by [`next_layout_unsatisfied_hint`]'s list of
+///   releases to try, because only it can be cleared by another `--version`.
+/// - Any other failure gets the source line alone. Its own message (an
+///   undetermined device target, a `uv` that could not run, an unreachable
+///   index) is the advice, and a version suggestion would send the user to a
+///   re-run that meets the same failure.
 fn wheel_resolution_failure_context(
     channel: TheRockChannel,
     layout: SourceLayout,
     index_url: &str,
     version_selector: Option<&RuntimeVersionSelector>,
     published: Option<&[String]>,
-    exact_arch: Option<&str>,
+    unsatisfied: Option<&VersionUnsatisfied>,
+    recovery: NextLayoutRecovery<'_>,
 ) -> String {
     let (source_label, hint) = match layout {
-        SourceLayout::Next => (
-            "next-layout source",
-            next_layout_unsatisfied_hint(version_selector, published, exact_arch, None),
+        SourceLayout::Next => {
+            let hint = match (published, unsatisfied) {
+                (None, _) => Some(next_layout_unsatisfied_hint(
+                    version_selector,
+                    None,
+                    None,
+                    recovery,
+                    None,
+                )),
+                (Some(published), Some(unsatisfied)) => Some(next_layout_unsatisfied_hint(
+                    version_selector,
+                    Some(published),
+                    unsatisfied.attempted(),
+                    recovery,
+                    None,
+                )),
+                (Some(_), None) => None,
+            };
+            ("next-layout source", hint)
+        }
+        SourceLayout::Canonical => (
+            "canonical source",
+            Some(canonical_wheel_resolution_hint(channel)),
         ),
-        SourceLayout::Canonical => ("canonical source", canonical_wheel_resolution_hint(channel)),
     };
-    format!(
-        "failed to resolve TheRock {} wheel runtime from {source_label} {index_url}\n\n{hint}",
+    let head = format!(
+        "failed to resolve TheRock {} wheel runtime from {source_label} {index_url}",
         channel.as_str()
-    )
-}
-
-/// How many published releases a next-layout failure lists by name.
-const NEXT_LAYOUT_HINT_MAX_LISTED: usize = 5;
-
-/// Recovery guidance when a ROCm >= 10 request cannot be satisfied on the next layout.
-///
-/// Does not offer `--channel nightly`: that channel refuses these pins, and
-/// the refusal tells the user to come back to the release channel.
-///
-/// The suggested `--version` is one the next layout actually publishes, never
-/// the request that just failed. `published` is that layout's version listing
-/// (`None` when the listing itself could not be read), narrowed to one GPU
-/// family when `family_scope` names it. The release the failed request
-/// resolved to is derived with [`select_rocm_version`], the function that
-/// chose it, and left out: a line pin that failed on `10.1.2` must not be told
-/// to try `10.1.2` again. Only releases [`next_layout_requested`] would route
-/// back to this layout are offered, so a re-run with the suggestion searches
-/// the same layout rather than the canonical one. When nothing else qualifies
-/// the hint says so and names no command, because no `--version` pin could
-/// succeed. `exact_arch` is the arch the failed request resolved with, so the
-/// suggested command repeats it. Without one this layout cannot resolve any
-/// version, so the hint asks for `--family` instead of a version.
-pub(in crate::therock) fn next_layout_unsatisfied_hint(
-    version_selector: Option<&RuntimeVersionSelector>,
-    published: Option<&[String]>,
-    exact_arch: Option<&str>,
-    family_scope: Option<&str>,
-) -> String {
-    let layout = format!("the ROCm {THEROCK_NEXT_MIN_MAJOR}+ next layout");
-    let Some(published) = published else {
-        return format!(
-            "Could not read the releases {layout} publishes, so no other version can be suggested."
-        );
-    };
-    let requested = version_selector.map_or_else(
-        || "the requested release".to_owned(),
-        RuntimeVersionSelector::describe,
     );
-    let lead =
-        format!("No complete compatible package stack was found for {requested} on {layout}.");
-    let Some(exact_arch) = exact_arch else {
-        return format!(
-            "{lead} That layout needs an exact GPU arch: re-run with `--family` set to the raw `gfx` code `rocm examine` reports."
-        );
-    };
-    let scope = family_scope.map_or_else(String::new, |family| format!(" for {family}"));
-    let attempted = select_rocm_version(TheRockChannel::Release, published, version_selector);
-    let mut alternatives = published
-        .iter()
-        .filter(|version| attempted.as_deref() != Some(version.as_str()))
-        .filter(|version| {
-            next_layout_requested(&RuntimeVersionSelector::Version((*version).clone()))
-        })
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    alternatives.sort_by(|left, right| compare_version_strings(right, left));
-    alternatives.dedup();
-    let other = if attempted.is_some() { " other" } else { "" };
-    let Some(newest) = alternatives.first() else {
-        return format!(
-            "{lead} It publishes no{other} stable release{scope}, so no `--version` pin can install from it yet."
-        );
-    };
-    let mut listed = alternatives
-        .iter()
-        .take(NEXT_LAYOUT_HINT_MAX_LISTED)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if alternatives.len() > NEXT_LAYOUT_HINT_MAX_LISTED {
-        let older = alternatives.len() - NEXT_LAYOUT_HINT_MAX_LISTED;
-        listed.push_str(", and ");
-        listed.push_str(&older.to_string());
-        listed.push_str(" older");
+    match hint {
+        Some(hint) => format!("{head}\n\n{hint}"),
+        None => head,
     }
-    let command = match version_selector {
-        Some(_) => format!(
-            "Re-run with one of them, for example `--version {newest} --family {exact_arch}`."
-        ),
-        None => format!(
-            "Install one of them, for example `rocm install sdk --channel release --version {newest} --family {exact_arch}`."
-        ),
-    };
-    let label = if attempted.is_some() {
-        "Other stable releases it publishes"
-    } else {
-        "Stable releases it publishes"
-    };
-    format!("{lead} {label}{scope}: {listed}. {command}")
 }
 
 #[cfg(test)]
@@ -3309,6 +3293,12 @@ sdk install
         }
     }
 
+    const WHEEL_AT_GFX1201: NextLayoutRecovery<'static> = NextLayoutRecovery {
+        format: RecoveryFormat::Wheel,
+        exact_arch: Some("gfx1201"),
+        include_devel: false,
+    };
+
     /// The wording is produced by [`wheel_resolution_failure_context`], which
     /// `resolve_pip_runtime_plan` appends when resolution fails. The
     /// install that prints it, and the re-run that proves its suggestion
@@ -3317,13 +3307,16 @@ sdk install
     fn unsatisfied_rocm_10_line_pin_does_not_suggest_nightly() {
         let line = RuntimeVersionSelector::version("10.1").unwrap();
         let published = vec!["10.0.0".to_owned()];
+        let unsatisfied =
+            VersionUnsatisfied::new(None, "no TheRock rocm package was found".to_owned());
         let message = wheel_resolution_failure_context(
             TheRockChannel::Release,
             SourceLayout::Next,
             THEROCK_NEXT_PIP_INDEX_BASE,
             Some(&line),
             Some(&published),
-            Some("gfx1201"),
+            Some(&unsatisfied),
+            WHEEL_AT_GFX1201,
         );
         assert!(
             !message.contains("nightly"),
@@ -3349,171 +3342,104 @@ sdk install
             None,
             Some(&published),
             None,
+            WHEEL_AT_GFX1201,
         );
         assert!(canonical.contains("--channel nightly"), "{canonical}");
         assert!(canonical.contains("canonical source"), "{canonical}");
     }
 
-    /// Every state [`next_layout_unsatisfied_hint`] can be reached in. The
-    /// rule under test: the hint never suggests the release the failed
-    /// request resolved to, and never names a command when the index offers
-    /// nothing else.
+    /// A next-layout failure a different `--version` cannot clear gets no
+    /// version advice: only the source it searched. An undetermined device
+    /// target, a `uv` that could not be fetched and an unreachable index each
+    /// fail again on any release, so naming one would send the user to a
+    /// re-run that meets the same error. The end-to-end case, an update whose
+    /// runtime records no exact arch, is therock-next-20.
     #[test]
-    fn next_layout_unsatisfied_hint_only_suggests_releases_that_were_not_tried() {
-        let versions = |list: &[&str]| list.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+    fn a_next_layout_failure_no_version_can_clear_suggests_no_version() {
         let line = RuntimeVersionSelector::version("10.1").unwrap();
-        let exact = RuntimeVersionSelector::version("10.1.0").unwrap();
-
-        // A line pin whose newest release (10.1.2) was found but could not be
-        // installed: the other 10.1 release is still worth trying, 10.1.2 is not.
-        let hint = next_layout_unsatisfied_hint(
+        let published = vec!["10.0.0".to_owned(), "10.1.0".to_owned()];
+        let context = wheel_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            THEROCK_NEXT_PIP_INDEX_BASE,
             Some(&line),
-            Some(&versions(&["10.0.0", "10.1.0", "10.1.2"])),
-            Some("gfx1200"),
+            Some(&published),
             None,
+            WHEEL_AT_GFX1201,
         );
-        assert!(
-            hint.contains("Other stable releases it publishes: 10.1.0, 10.0.0."),
-            "{hint}"
+        assert_eq!(
+            context,
+            format!(
+                "failed to resolve TheRock release wheel runtime from next-layout source {THEROCK_NEXT_PIP_INDEX_BASE}"
+            )
         );
-        assert!(
-            hint.contains("`--version 10.1.0 --family gfx1200`"),
-            "{hint}"
-        );
-        assert!(!hint.contains("10.1.2"), "{hint}");
-        // A pinned request re-runs its own command with a different
-        // `--version`, so it is told to re-run, not handed a whole install
-        // command. The unpinned `rocm update --apply` case below gets the full
-        // command instead.
-        assert!(
-            hint.contains("Re-run with one of them, for example `--version 10.1.0"),
-            "{hint}"
-        );
-        assert!(!hint.contains("Install one of them"), "{hint}");
-        assert!(!hint.contains("rocm install sdk"), "{hint}");
 
-        // An exact pin that is published but failed is not suggested again.
-        let hint = next_layout_unsatisfied_hint(
-            Some(&exact),
-            Some(&versions(&["10.0.0", "10.1.0"])),
-            Some("gfx1200"),
-            None,
-        );
-        assert!(
-            hint.contains("`--version 10.0.0 --family gfx1200`"),
-            "{hint}"
-        );
-        assert!(!hint.contains("--version 10.1.0"), "{hint}");
-
-        // An exact pin that is the only release: nothing else to suggest, so
-        // no command is named.
-        let hint = next_layout_unsatisfied_hint(
-            Some(&exact),
-            Some(&versions(&["10.1.0"])),
-            Some("gfx1200"),
-            None,
-        );
-        assert!(
-            hint.contains("It publishes no other stable release"),
-            "{hint}"
-        );
-        assert!(!hint.contains("--version 10"), "{hint}");
-
-        // An index with no stable release at all; prereleases are not offered.
-        let hint = next_layout_unsatisfied_hint(
+        // The listing itself could not be read: say so, still without a version.
+        let unreadable = wheel_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            THEROCK_NEXT_PIP_INDEX_BASE,
             Some(&line),
-            Some(&versions(&["10.1.0a20260822"])),
-            Some("gfx1200"),
             None,
-        );
-        assert!(hint.contains("It publishes no stable release"), "{hint}");
-        assert!(!hint.contains("10.1.0a20260822"), "{hint}");
-        assert!(!hint.contains("--version 10"), "{hint}");
-
-        // `rocm update --apply` reaches the next layout with no selector. The
-        // newest release is the one it tried; the hint offers the full
-        // install command for an older one.
-        let hint = next_layout_unsatisfied_hint(
             None,
-            Some(&versions(&["10.0.0", "10.1.0"])),
-            Some("gfx1200"),
+            WHEEL_AT_GFX1201,
+        );
+        assert!(
+            unreadable.contains("so no other version can be suggested"),
+            "{unreadable}"
+        );
+        assert!(!unreadable.contains("--version"), "{unreadable}");
+    }
+
+    /// The three failures a different release can clear are raised as the
+    /// marker, each recording the release it tried where there was one, and
+    /// each keeping its own message.
+    #[test]
+    fn the_version_clearable_failures_are_marked_and_the_rest_are_not() {
+        // No torchaudio for this release on this platform.
+        let error = torchaudio_pin(
+            &["2.11.0+rocm10.1.0".to_owned()],
+            "10.0.0",
             None,
-        );
-        assert!(hint.contains("the requested release"), "{hint}");
+            "https://index.test",
+        )
+        .expect_err("no torchaudio is built for ROCm 10.0.0");
+        let marker = VersionUnsatisfied::find(&error).expect("a missing torchaudio is marked");
+        assert_eq!(marker.attempted(), Some("10.0.0"));
         assert!(
-            hint.contains("`rocm install sdk --channel release --version 10.0.0 --family gfx1200`"),
-            "{hint}"
-        );
-        assert!(
-            hint.contains("Install one of them, for example `rocm install sdk"),
-            "{hint}"
-        );
-        assert!(!hint.contains("Re-run with one of them"), "{hint}");
-        assert!(!hint.contains("--version 10.1.0"), "{hint}");
-        assert!(!hint.contains("nightly"), "{hint}");
-
-        // No exact arch (only reachable through `rocm update --apply`): this
-        // layout cannot resolve any version without one, so the hint asks for
-        // `--family` and suggests no version.
-        let hint =
-            next_layout_unsatisfied_hint(Some(&line), Some(&versions(&["10.0.0"])), None, None);
-        assert!(hint.contains("needs an exact GPU arch"), "{hint}");
-        assert!(hint.contains("`--family`"), "{hint}");
-        assert!(!hint.contains("--version 10"), "{hint}");
-
-        // The listing itself could not be read: say that, not "no stack was
-        // found", and suggest nothing.
-        let hint = next_layout_unsatisfied_hint(Some(&line), None, Some("gfx1200"), None);
-        assert!(
-            hint.starts_with("Could not read the releases the ROCm 10+ next layout publishes"),
-            "{hint}"
-        );
-        assert!(
-            !hint.contains("No complete compatible package stack"),
-            "{hint}"
-        );
-        assert!(!hint.contains("--version 10"), "{hint}");
-
-        // Only releases a re-run would route back to this layout are offered.
-        // A four-component or sub-10 publish would re-resolve against the
-        // canonical index, so suggesting it could not clear the failure.
-        let hint = next_layout_unsatisfied_hint(
-            Some(&line),
-            Some(&versions(&["9.9.0", "10.0.0", "10.0.1.12345"])),
-            Some("gfx1200"),
-            None,
-        );
-        assert!(
-            hint.contains("Stable releases it publishes: 10.0.0. "),
-            "{hint}"
-        );
-        assert!(!hint.contains("10.0.1.12345"), "{hint}");
-        assert!(!hint.contains("9.9.0"), "{hint}");
-
-        // A family-scoped listing (the tarball catalog) says so.
-        let hint = next_layout_unsatisfied_hint(
-            Some(&line),
-            Some(&versions(&[])),
-            Some("gfx1200"),
-            Some("gfx120X-all"),
-        );
-        assert!(
-            hint.contains("It publishes no stable release for gfx120X-all"),
-            "{hint}"
+            error
+                .to_string()
+                .starts_with("no torchaudio built for ROCm 10.0.0 is published"),
+            "{error}"
         );
 
-        // A long listing is capped, newest first.
-        let hint = next_layout_unsatisfied_hint(
-            Some(&line),
-            Some(&versions(&[
-                "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
-            ])),
-            Some("gfx1200"),
-            None,
+        // `uv` found no solution for the release: marked.
+        let unsatisfiable = uv_compile_failure(
+            "10.1.0",
+            "  x No solution found when resolving dependencies:\n  torch==2.11.0 is unavailable\n",
+        );
+        assert_eq!(
+            VersionUnsatisfied::find(&unsatisfiable).and_then(VersionUnsatisfied::attempted),
+            Some("10.1.0")
         );
         assert!(
-            hint.contains("10.0.6, 10.0.5, 10.0.4, 10.0.3, 10.0.2, and 2 older."),
-            "{hint}"
+            unsatisfiable.to_string().starts_with(
+                "published ROCm X package metadata is not jointly installable: x No solution found"
+            ),
+            "{unsatisfiable}"
+        );
+
+        // `uv` could not reach the index: not marked, same message shape.
+        let unreachable = uv_compile_failure(
+            "10.1.0",
+            "error: Failed to fetch: `http://127.0.0.1:9/next/torch/`\n  Connection refused\n",
+        );
+        assert!(VersionUnsatisfied::find(&unreachable).is_none());
+        assert!(
+            unreachable
+                .to_string()
+                .starts_with("published ROCm X package metadata is not jointly installable: error: Failed to fetch"),
+            "{unreachable}"
         );
     }
 }

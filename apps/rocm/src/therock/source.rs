@@ -597,6 +597,30 @@ mod tests {
             "{nightly_error}"
         );
 
+        // A post-release is not a release of the line: the release channel
+        // installs only `X.Y.Z` stables (`is_stable_runtime_version`), and a
+        // line pin must not reach what an unpinned pick on that channel skips.
+        assert!(!line.matches_version("10.1.0.post1"));
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Release,
+                &["10.1.0".to_owned(), "10.1.0.post1".to_owned()],
+                Some(&line),
+            )
+            .as_deref(),
+            Some("10.1.0")
+        );
+
+        // PEP 440 reads release components as integers, so `10.01` is `10.1`,
+        // as `uv` and pip read it. It routes and matches as the 10.1 line.
+        let zero_padded = RuntimeVersionSelector::version("10.01").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&zero_padded)).unwrap(),
+            SourceLayout::Next
+        );
+        assert!(zero_padded.matches_version("10.1.2"));
+        assert!(!zero_padded.matches_version("10.10.0"));
+
         // A line pin's refusals name its own major, not the ROCm 10 floor.
         let later_line = RuntimeVersionSelector::version("11.2").unwrap();
         let later_nightly_error =
