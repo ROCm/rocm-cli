@@ -449,7 +449,7 @@ The daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) driv
 | [`bench_ring.rs`](../crates/rocm-dash-daemon/src/bench_ring.rs) | `BenchRing`, the bounded benchmark-row history a late-joining client is sent when it subscribes. | flat |
 | [`demo.rs`](../crates/rocm-dash-daemon/src/demo.rs) | The synthetic-session generator behind `rocm dash --demo`: a deterministic recording of an 8-GPU node serving three vLLM containers, written as `PersistedEntry` lines. | flat |
 | [`persist.rs`](../crates/rocm-dash-daemon/src/persist.rs) | `SessionWriter`: appends every broadcast `Event` as a `PersistedEntry` line to one `session-*.ndjson` file per daemon session. | flat |
-| [`registry.rs`](../crates/rocm-dash-daemon/src/registry.rs) | Reads the managed-service records `rocm serve` writes and turns the live ones into `DiscoveredService` scrape targets, telling a confirmed-empty registry from an unreadable one. | flat |
+| [`registry.rs`](../crates/rocm-dash-daemon/src/registry.rs) | Reads the managed-service records `rocm serve` writes and turns the live ones into `DiscoveredService` scrape targets, telling a registry read in full, an empty or absent one included, from one that could not be read in full. | flat |
 | [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) | The owner task: drives the collectors on their tick cadences, reconciles discovered services, derives rates and efficiency, and broadcasts `Snapshot`s. | flat |
 | [`server.rs`](../crates/rocm-dash-daemon/src/server.rs) | The listener, the per-client task loop and the broadcast from the runner to every client, including the history replay on subscribe. | flat |
 | [`snapshot_ring.rs`](../crates/rocm-dash-daemon/src/snapshot_ring.rs) | `SnapshotRing`, the bounded snapshot history a late-joining client is sent when it subscribes. | flat |
@@ -457,7 +457,7 @@ The daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) driv
 
 Boundaries:
 
-- **A failed registry read retires nothing.** When a pass cannot read the registry in full, the runner retires no service; the records that did read still add and refresh their services, and the header warns until a read succeeds. Only a confirmed-empty registry retires what it lacks.
+- **A failed registry read retires nothing.** When a pass cannot read the registry in full, the runner retires no service; the records that did read still add and refresh their services, and the header warns until a read succeeds. A registry read in full, an empty one included, retires every known service it no longer holds and keeps the rest (a registry that goes from A and B to A retires B).
 - **Framing is copied, not shared.** [`transport.rs`](../crates/rocm-dash-daemon/src/transport.rs) and the TUI's [`transport.rs`](../crates/rocm-dash-tui/src/transport.rs) hold the same two functions because the TUI does not depend on the daemon crate, so a framing change must be made in both.
 
 ### `crates/rocm-dash-tui` — dashboard TUI
