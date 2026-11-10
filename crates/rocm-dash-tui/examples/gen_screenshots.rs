@@ -41,8 +41,9 @@ struct Args {
     input: PathBuf,
 
     /// Output directory. Created if absent. SVGs are named per view. The
-    /// default is relative to the working directory and is git-ignored at the
-    /// repository root, so a run from another directory leaves the files there.
+    /// default is relative to the working directory. It is git-ignored only
+    /// when produced at the repository root; a run from elsewhere writes the
+    /// files there instead, uncovered by that rule.
     #[arg(long, default_value = "screenshots")]
     output_dir: PathBuf,
 
