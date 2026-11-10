@@ -7,7 +7,7 @@
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
+use rocm_dash_core::metrics::{GpuMetrics, Instance};
 
 use crate::ui::theme::Theme;
 
@@ -129,29 +129,6 @@ pub fn instances_on_gpu<'a>(device_id: &str, instances: &'a [Instance]) -> Vec<&
         .collect()
 }
 
-/// Node-level energy efficiency: total generation throughput divided by total board power, in tokens per watt.
-///
-/// `None` when there is no traffic
-/// (`sum gen_tps == 0`) or no power telemetry (`sum power_w == 0`), or when the
-/// result is non-finite.
-pub fn node_efficiency(snap: &Snapshot) -> Option<f64> {
-    // A single NaN/Inf `gen_tps` sample must not poison the whole sum —
-    // same guard commit 0bf99ac added to `home.rs`'s hero aggregates.
-    let tps: f64 = snap
-        .instances
-        .iter()
-        .filter_map(|i| i.gen_tps)
-        .filter(|v| v.is_finite())
-        .sum();
-    let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
-    if tps > 0.0 && power > 0.0 {
-        let eff = tps / power;
-        eff.is_finite().then_some(eff)
-    } else {
-        None
-    }
-}
-
 /// One-line GPU stats: id, util, vram, temp, power.
 pub fn gpu_stats_line<'a>(g: &'a GpuMetrics, theme: &Theme) -> Line<'a> {
     let vram_pct = if g.vram_total_mb > 0 {
@@ -199,14 +176,6 @@ mod tests {
                 .map(std::string::ToString::to_string)
                 .collect(),
             gen_tps,
-            ..Default::default()
-        }
-    }
-
-    fn gpu(device_id: &str, power_w: f32) -> GpuMetrics {
-        GpuMetrics {
-            device_id: device_id.into(),
-            power_w,
             ..Default::default()
         }
     }
@@ -316,56 +285,6 @@ mod tests {
         let xs = vec![inst("vllm-a", &["0"], Some(10.0))];
         assert!(instances_on_gpu("gpu-7", &xs).is_empty());
         assert!(instances_on_gpu("gpu-7", &[]).is_empty());
-    }
-
-    #[test]
-    fn node_efficiency_divides_tps_by_power() {
-        let snap = Snapshot {
-            gpus: vec![gpu("gpu-0", 400.0), gpu("gpu-1", 600.0)],
-            instances: vec![
-                inst("a", &["0"], Some(300.0)),
-                inst("b", &["1"], Some(200.0)),
-            ],
-            ..Default::default()
-        };
-        // (300 + 200) / (400 + 600) = 0.5 tok/W
-        let eff = node_efficiency(&snap).expect("some");
-        assert!((eff - 0.5).abs() < 1e-9, "got {eff}");
-    }
-
-    #[test]
-    fn node_efficiency_none_without_power_or_traffic() {
-        // no power
-        let no_power = Snapshot {
-            gpus: vec![gpu("gpu-0", 0.0)],
-            instances: vec![inst("a", &["0"], Some(100.0))],
-            ..Default::default()
-        };
-        assert_eq!(node_efficiency(&no_power), None);
-        // no traffic
-        let no_traffic = Snapshot {
-            gpus: vec![gpu("gpu-0", 500.0)],
-            instances: vec![inst("a", &["0"], None)],
-            ..Default::default()
-        };
-        assert_eq!(node_efficiency(&no_traffic), None);
-    }
-
-    #[test]
-    fn node_efficiency_ignores_non_finite_gen_tps() {
-        // A NaN sample from one instance must not poison the sum for the
-        // whole node — the same class of bug commit 0bf99ac fixed for
-        // `home.rs`'s hero aggregates.
-        let snap = Snapshot {
-            gpus: vec![gpu("gpu-0", 500.0)],
-            instances: vec![
-                inst("finite", &["0"], Some(250.0)),
-                inst("poisoned", &["0"], Some(f64::NAN)),
-            ],
-            ..Default::default()
-        };
-        let eff = node_efficiency(&snap).expect("finite gen_tps must still produce a result");
-        assert!((eff - 0.5).abs() < 1e-9, "got {eff}");
     }
 
     #[test]
