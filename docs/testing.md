@@ -3948,6 +3948,24 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
 `fix_offered`. This path has not been exercised against real hardware in CI;
 verifying it needs a lane whose GPU architecture is on the allowlist.
+`cli_version` is the leading version `rocm version` prints (`X.Y.Z` for a
+`vX.Y.Z` tag build, `0.0.0-dev` for any other resolved ref), never the ref and hash
+after it. A tag counts as a release only when its suffix uses letters,
+digits, `.`, `-` and `+` and its version is at most 64 characters, the same
+rule the report applies before publishing, so a release version is never
+published as `unknown`; `release_tag_grammar_is_the_same_everywhere` in
+[build.rs](../apps/rocm/build.rs) holds that rule equal in build.rs,
+[release.yml](../.github/workflows/release.yml) and
+[smoke_local.py](../scripts/smoke_local.py). Scenario
+`diagnose-58` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
+the field equals that leading version and that the version is the one the ref
+calls for, on a simulated host whose planted GPU is on the allowlist, so it
+prepares a report on every Linux lane, GPU or not. Those lanes build from a
+branch, so they check the `0.0.0-dev` half; the tag half is checked on the
+shipped binaries by the "Check the release binary's version" steps in
+[release.yml](../.github/workflows/release.yml). On real hardware, compare the
+field with the first word after `rocm-cli` in `rocm version`.
 
 Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
 answer with a word rather than a value, and the words are not interchangeable.
