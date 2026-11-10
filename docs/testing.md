@@ -2577,7 +2577,8 @@ relaunch is still detected; `rocmd` has the same three (`a_stop_completed_by_a_c
 `a_stop_does_not_clear_processes_recorded_while_it_ran`) plus
 `a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed`, the
 listing's write made directly in those that need it because the refresh lives in the
-`rocm` binary.
+`rocm` binary (in the last one it is made in the engine `Stop` callback, the only
+step that runs for a record naming no PID, and the test asserts it ran).
 
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded

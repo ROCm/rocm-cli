@@ -900,7 +900,10 @@ mod tests {
     /// The listing's cleanup of an empty record (see above) leaves a `starting` or
     /// `failed` record at its status with the marker gone and the marker's stamp
     /// kept: that is the stop's own marker consumed, not a relaunch, so the stop
-    /// is confirmed. `rocm` has the test that runs the real refresh.
+    /// is confirmed. A record naming no process has no PID to terminate, so the
+    /// per-PID callback never runs; the engine `Stop` does (for every engine but
+    /// lemonade), and that is where the listing's write is made, with an assertion
+    /// that it happened. `rocm` has the test that runs the real refresh.
     #[test]
     fn a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed() -> Result<()>
     {
@@ -913,17 +916,29 @@ mod tests {
             empty.clear_recorded_processes();
             status.clone_into(&mut empty.status);
             empty.write()?;
+            let interleaved = std::cell::Cell::new(false);
 
-            let result = stop_managed_service_with(&paths, service_id, |_| {
-                let mut on_disk = load_service_record(&paths, service_id).expect("record");
-                on_disk.settled_stop_unix_ms = on_disk.stop_requested_unix_ms.take();
-                on_disk.write().expect("concurrent listing write");
-                rocm_core::TerminationOutcome::Graceful
-            });
+            let result = stop_managed_service_via(
+                &paths,
+                service_id,
+                |_| unreachable!("a record naming no process has no PID to terminate"),
+                |_, _| {
+                    let mut on_disk = load_service_record(&paths, service_id).expect("record");
+                    assert!(on_disk.stop_requested_unix_ms.is_some(), "{status}");
+                    on_disk.settled_stop_unix_ms = on_disk.stop_requested_unix_ms.take();
+                    on_disk.write().expect("concurrent listing write");
+                    interleaved.set(true);
+                    Ok(StopResponse {
+                        stopped: true,
+                        graceful: true,
+                    })
+                },
+            );
             let key_removed = !key_path.exists();
             let reloaded = load_service_record(&paths, service_id);
             fs::remove_dir_all(root).ok();
 
+            assert!(interleaved.get(), "{status}: premise: the listing ran");
             let value = result?;
             assert_eq!(
                 value.get("stopped").and_then(Value::as_bool),
