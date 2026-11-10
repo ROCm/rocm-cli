@@ -2254,6 +2254,284 @@ directly, exits 0, and records whether that signal worked, adding a second
 stderr `note:` when it did not (`cargo test -p rocm --bin rocm services_stop_` and
 `cargo test -p rocm --bin rocm attached_ctrl_c_`).
 
+`rocm services stop` and `rocmd`'s `stop_server` terminate the processes a
+record names through one routine,
+[`terminate_recorded_service_pids`](../crates/rocm-core/src/proc_lifecycle.rs),
+and wait `MANAGED_STOP_GRACE` for each; neither binary keeps a copy. The
+routine is tested in `rocm-core` (`cargo test -p rocm-core proc_lifecycle::`):
+the supervisor is visited before the engine, each PID with its own start-time,
+a PID recorded under both roles once, and the stopping process's own PID is
+reported as `self` in `pid_outcomes` and never signalled, in both commands.
+On Windows the verified root is preceded by `taskkill /PID <pid> /T /F`, because
+`terminate_verified` cannot walk a process tree there; that step is tested
+through injected functions that run on every host (`the_tree_is_killed_before_the_root_is_terminated`
+and its neighbours) and, against a real tree, by a Windows-only scenario
+(`service-stop-07`, below). The callers' own tests check
+that each reaches the routine and reports what it returns
+(`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
+`cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
+that no private copy of the routine or its constant has come back. Those checks
+pin names only: they are a tripwire for a copy returning under the same name, not
+coverage of what either stop does. A confirmed
+stop also clears the PIDs and start-time tokens it stopped from the record
+(`ManagedServiceRecord::clear_recorded_processes`, one call from both
+binaries), and an unconfirmed one keeps them; a PID recorded without a token is
+signalled on trust alone once the OS has recycled it, so a stale one must not
+survive for a second stop to find.
+`a_confirmed_stop_clears_the_recorded_processes_so_a_second_stop_signals_nothing`
+runs the real routine with the per-PID signal injected, and asserts the
+persisted record after the first stop and that a second stop signals nothing;
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop` is the
+other direction. `service-stop-07`
+(`@requires-os:windows`, no GPU) is the live coverage of the Windows tree kill when it is run on a Windows host, which no CI job does:
+it records a PowerShell parent that has started a `ping` child, runs `rocm
+services stop --yes`, and asserts that both processes are gone together with the
+report (`Local server stopped`, `stopped processes: 1`) and the record (stopped,
+no process, no stop request, key file gone). The child is the tree kill's own
+work: with the `taskkill /T` step removed the stop ends only the recorded
+process and the scenario fails on the surviving child. The scenario keeps the
+child's own identity (`E2eWorld::recorded_descendant`) and teardown ends it when
+it is still that process, so a stop that fails to take it down does not leave
+`ping` running for its five minutes behind a dead parent; the decision is
+`e2e_cucumber::stray_process::leftover_action`, which a table test covers on
+every host (ended only while it is still the recorded process, never once gone,
+reused or unconfirmed). `service-stop-01` plants
+PID 0 and `service-stop-02` is Linux-only, so neither reaches that step; the
+injected unit tests above cover its ordering and verdicts on every host.
+
+The tree kill is behind the same identity gate as the rest of the stop. On
+Windows `process_start_ticks` is the process creation time (`GetProcessTimes`, a
+`FILETIME`), so a record written by this version refutes a PID that an unrelated
+process has taken, and the stop reports `identity_mismatch` without running
+`taskkill` on it; only a record written before Windows recorded a token has
+nothing to refute: a stop refuses a PID only when a token was recorded and the
+live one differs, and `what_a_stop_does_for_each_recorded_and_live_token` pins
+that for every case on every host (no token, which is also the shape
+`service-stop-07` records; a token that matches; one that differs; one that
+cannot be read back), asserting whether the tree kill runs and the verdict the
+stop reports together. `a_filetime_is_its_high_word_above_its_low_word` runs the
+conversion on every host. `terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
+runs the real stop against this test's own PID with a wrong token on Linux and
+Windows (a stop that went ahead would end the test process), and
+`terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+repeats it against a bystander on Windows only and then stops that bystander
+with its true token. `service-stop-08` is the live version on every OS: it
+records a running process under a token no live process has, stops the server,
+and asserts that the process is still running and the record names no process.
+None of the Windows-only paths has been run on a Windows host for this change,
+and I am not claiming a Windows result for this head. What the CI configuration
+does and does not run there, read from `.github/workflows/ci.yml`: the
+`windows-debug` job (`Windows build and test (debug)`), when Rust files change,
+runs clippy, the build, `cargo test --workspace --all-targets` and the harness
+self-tests. That test run includes unit tests in `proc_lifecycle.rs` that stop a
+real process on Windows: `terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+and `terminate_recorded_pid_stops_a_process_recorded_without_a_token` are
+`#[cfg(windows)]` and start a real `ping` child and stop it through
+`terminate_recorded_pid`, which takes the PID hold, reads the creation time,
+applies the identity gate (a wrong token leaves the process running; a matching
+or absent token stops it) and runs the System32 `taskkill /T /F`. The e2e target
+is excluded from `cargo test`, so no scenario runs there: the `service-stop-*`
+and `service-unqueryable-*` scenarios do not run on that job.
+`service-stop-07` (`@requires-os:windows`) and the Windows half of
+`service-stop-08` can run only through the harness on a Windows host, which is a
+manual step (see "Windows host check" in [manual-testing.md](manual-testing.md));
+on the Linux e2e jobs `-07` is skipped and `-08` runs its Linux half. Not covered
+by any CI job: the end-to-end tree kill of a parent with a child (`-07`), the
+failure cases that cannot be staged (an `OpenProcess` access-denied process, a
+failing or stalled `taskkill`, `taskkill` exiting 128), and the launch-cleanup
+branch run against a real Windows child. The failed-launch cleanup terminates its
+child through the same routine as a stop (`terminate_recorded_pid_within`, so on
+Windows the tree kill runs too), and what it asks of the termination is tested
+through an injected function on every host
+(`abandoned_launch_asks_the_termination_for_the_spawned_child_with_its_token`:
+the child's PID with the token captured at spawn, and nothing at all for a child
+with no token where tokens are recorded); that the production wiring reaches the tree
+kill is not observable on Linux, where the termination walks the tree itself, so it
+rests on the routine's own tests and on review. The unit tests above stop a `ping` that has no child of its own, so they
+do not show a descendant being taken down. A stop that cannot
+verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
+eq <pid>"` on Windows (`process_check_command`).
+Three further Windows paths of that stop are tested through injected functions
+that run on every host; no scenario forces their failure cases. A PID that cannot be
+queried (`ProcessProbe::Unqueryable`, which on Windows includes a live process
+the stop may not open) is `Indeterminate`, so the stop reports it unverified
+instead of already gone (`a_pid_that_cannot_be_queried_is_unverified_not_already_gone`,
+`a_stop_of_a_live_process_it_cannot_query_is_not_confirmed`, and
+`a_failed_open_is_gone_only_for_no_such_process` for the error codes). The PID is
+held open from before the identity read until the stop returns, so the creation
+time that was compared is that of the process the kill then reaches
+(`the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop`). A PID
+that could not be held (the process could not be opened) while its identity still
+reads as matching is not signalled either: nothing would reserve it between the
+read and `taskkill`, so the stop is `unverified` and neither the tree kill nor the
+termination runs
+(`a_tree_kill_is_not_run_for_a_pid_that_could_not_be_held_even_when_its_identity_matches`;
+a gone, recycled or unreadable PID keeps its own refusal,
+`an_unheld_pid_that_is_gone_recycled_or_unverifiable_keeps_its_refusal`, and
+where there is no tree-kill step the missing hold changes nothing,
+`without_a_tree_kill_step_an_unheld_pid_is_still_terminated`). And a
+`taskkill` that failed to start or exited nonzero leaves the stop unconfirmed,
+whatever the root's own termination says, because only the root's exit is
+watched on Windows. When the root itself was seen to exit (or was already gone)
+the outcome is `descendants_unconfirmed`, which says the root is gone and a
+process under it may still be running; it is not `timed_out`, which is kept for
+a root that outlived its deadline. `rocm services stop` prints it as a `not
+confirmed:` line, and `a_stop_with_an_unconfirmed_tree_kill_says_what_happened_and_keeps_the_service`
+asserts that line, that no `still running` line is printed, and the record, stop
+request and key that are kept. The warning lasts one run, and the line says so: the
+next `rocm services stop` finds the root gone and reports the stop confirmed, and
+a listing completes the pending stop the same way, neither with new evidence about
+the processes under the root (the same test runs that second stop and asserts it);
+keeping it durably would need a marker in the record, which is not done
+(`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
+`only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found`). A
+`taskkill` that exits 128 (process not found) is judged by the root's own re-read:
+with the root still there the kill counts as failed
+(`a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill`); with
+the root gone it exited by itself, and the outcome is `exited_before_tree_kill`,
+not a stop on its own, because `taskkill /T` reaches children only through a live
+parent and nothing recorded what was under the root
+(`a_tree_kill_that_found_no_process_with_the_root_gone_is_not_a_stop_by_itself`).
+Across the record, such a root becomes `already_gone`, and the stop confirmed,
+only when another recorded process is confirmed gone (`a_parent_that_exits_alone_is_confirmed_when_the_recorded_engine_is_confirmed_gone`,
+`two_roots_that_both_exited_alone_are_a_confirmed_stop`); with nothing else
+recorded, or the engine still running or unconfirmed, it stays unconfirmed
+(`a_parent_that_exits_alone_with_nothing_else_recorded_is_not_a_confirmed_stop`,
+`a_parent_that_exits_alone_stays_unconfirmed_while_the_recorded_engine_is_not_gone`,
+`the_stopping_process_does_not_corroborate_a_root_that_exited_alone`). Both
+callers fold every row, so the record, PIDs and key are kept unless every
+recorded role is confirmed
+(`a_root_that_exited_alone_confirms_the_stop_only_when_the_engine_role_does` in
+`rocm` and in `rocmd`, `a_lone_root_that_exited_alone_leaves_the_stop_unconfirmed`
+in both). A failed tree kill with the root gone stays unconfirmed
+(`a_failed_tree_kill_with_the_root_gone_is_still_unconfirmed`). That `taskkill` runs under
+a deadline of `MANAGED_STOP_GRACE`: one that stalls is killed and reaped and
+counts as a failed tree kill, so it cannot hang `rocm services stop`, `restart`
+or the attached Ctrl-C stop
+(`a_helper_that_stalls_is_killed_and_reaped_at_its_deadline` runs a long-sleeping
+child under a 200 ms deadline on every host and asserts the error, the bounded
+elapsed time, the reaped child and the failed verdict; `a_helper_that_exits_in_time_gives_its_exit_code`
+and `a_helper_that_cannot_be_started_is_an_error` are its neighbours). The report and the record
+a `timed_out` stop leaves are covered by
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. The
+`taskkill` is started from the system directory that `GetSystemDirectoryW`
+returns, not by a bare name `PATH` could resolve and not from the `SystemRoot`
+environment variable a caller could redirect
+(`a_system_tool_is_resolved_under_the_system_directory` builds the path from a
+given directory on every host; the Windows call itself is run only by the
+Windows job's tests that start `taskkill`; ComfyUI's own `taskkill` and `tasklist` calls use
+the same helper). A readable
+recorded token that differs outranks a failed query
+(`a_readable_token_mismatch_outranks_a_failed_query`), but the creation time and
+the query are read with the same access right, so on Windows this only reaches a
+process that opens and then fails the exit-code query; a process that cannot be
+opened has no readable token, stays unverifiable, and is cleared with
+`rocm services remove <id> --force --yes` (see "A record that stays unverified"
+in [manual-testing.md](manual-testing.md); the unit tests
+`force_removes_a_record_held_by_an_unqueryable_process_and_says_so`,
+`a_record_held_by_an_unqueryable_process_is_refused_naming_the_forced_removal`,
+`force_is_refused_for_a_running_process_and_without_a_requested_stop` and
+`force_on_a_record_that_is_not_running_is_an_ordinary_removal`,
+`a_forced_removal_missing_yes_names_the_command_that_completes_it` and
+`prune_names_the_forced_removal_for_a_record_held_by_an_unqueryable_process` (prune
+lists the record with the command, and running that command clears it) cover it with the
+probe injected, and `service-unqueryable-01` and `-02` drive the stop, the
+refusal naming `--force`, and the forced removal through the real binary, with
+the `e2e-test-hooks` variable `ROCM_E2E_UNQUERYABLE_PIDS` making the listed PIDs
+read as unqueryable; `-02` is Linux-only because it starts a real process). On
+Windows the happy paths of the PID hold, the creation-time read and the System32
+`taskkill` are exercised by the two `#[cfg(windows)]` unit tests named above when
+`windows-debug` runs the workspace tests (no result for this head is claimed
+here). What no test reaches there is the failure side of the Windows API: the
+`OpenProcess` failure codes against a real unopenable process, `taskkill`
+exiting 128 or failing or stalling, and a descendant actually being taken down;
+none of those has been run on a Windows host. What was moved out of the FFI so
+that it is unit-tested on Linux and, as plain `cargo test`, on the Windows unit
+job: the open-failure code mapping (`classify_open_failure`), the exit-code query
+mapping (`classify_exit_query`), the `taskkill` result and arguments
+(`classify_taskkill`, `taskkill_args`), the `System32` path building, the
+FILETIME join, and the deadline wait (a real child). The ordering of the hold,
+the identity read, the tree kill and the termination is tested through injected
+functions.
+
+The same unqueryable-process rule holds wherever a service's liveness decides
+something destructive. The deferred key cleanup and the reconciliation to
+`stopped` in the liveness refresh (`refresh_managed_service_runtime_liveness`) and
+the in-use check behind `rocm services remove` and `prune` read each recorded PID
+through `probe_process` and treat anything but a confirmed exit as possibly
+running. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
+drives the refresh with an unqueryable PID and then a confirmed-gone one,
+`an_unverified_stop_keeps_its_key_and_marker_through_a_later_liveness_refresh` runs
+an unverified stop and then the refresh over the record it wrote, and
+`a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
+removal guard; each takes the probe as an argument, so they run on every host.
+A pending stop of a container-backed engine (`engine_stop_decides_confirmation`,
+today `aim`) is never completed that way: its supervisor can be gone while the
+container still runs, and only the engine `Stop` decides that stop, so a listing
+does not complete it from PID evidence. The key, the marker and the recorded processes stay until a later
+`services stop` is confirmed
+(`a_pending_stop_of_a_container_engine_is_not_completed_by_a_gone_supervisor`).
+The same holds past the cleanup: the refresh does not read such a record as
+`stopped` from the supervisor's PID, and `remove` and `prune` count it as in use
+(`container_stop_unresolved`), so a listing followed by `remove --yes` or
+`prune --yes` deletes neither the record nor the key the container may still be
+enforcing (`a_pending_container_stop_survives_refresh_remove_and_prune`, for a
+record reading `ready` and one already reading `stopped`; a process engine in the
+same state is removed). A record that named no process at all, such as a `starting`
+one with a stale marker, has its key and marker cleaned as before but is not read as
+`stopped` (`a_stale_stop_marker_on_a_record_naming_no_process_is_cleaned_without_reading_it_stopped`).
+When that refresh completes a pending stop (every recorded process confirmed gone) it
+also forgets the recorded processes and reads the record as stopped, as a stop that
+confirmed the exit itself does, so a later `rocm services stop` visits no PID: a PID
+recorded without a token cannot be refuted, and on Windows the tree kill would take
+whatever process now holds the number. A process that may still be running stays
+named. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
+checks both halves (named while unqueryable, forgotten once gone),
+`a_completed_pending_stop_reads_stopped_whatever_live_status_it_had` that every live
+status, and `failed`, still ends as `stopped` in that one refresh (a `failed` record
+cleared but left `failed` would not be covered by `is_covered_by_stop_of`, and the stop
+finalizing would report itself unconfirmed), and
+`a_stop_completed_by_a_later_listing_leaves_no_pid_for_the_next_stop` runs the real
+termination routine over the record the listing wrote and asserts it visits nothing.
+Three gaps in the scenario coverage are deliberate. `service-stop-07` records no
+token, so the path a record written by this version takes on Windows (a token
+recorded, matching, with the tree kill then running) has no scenario; it rests on
+`what_a_stop_does_for_each_recorded_and_live_token` and the other injected tests,
+and on the `#[cfg(windows)]` unit tests that stop a real process with its true token. And
+the `self` row that `rocm` now puts in `pid_outcomes` has no scenario: it appears
+only in the JSON answer of the hidden `sandbox-run stop_server` and the sandbox
+tool, never in the text of `rocm services stop`, and it names the stopping
+process's own PID, which a scenario cannot plant in a record before the process
+that will read it exists. `a_stop_reports_its_own_pid_as_self` and
+`a_self_row_adds_no_line_to_an_unconfirmed_report` cover the answer and the report.
+Third, the `check:` line an unverified stop prints is a diagnostic, not a
+remediation: it shows whether the process is still running, and what clears the
+condition is that process ending (or, for a record held by a process `rocm`
+cannot open, `rocm services remove <id> --force --yes`; for a record still reading
+`ready` that nobody has tried to stop, `--force` is refused and names
+`rocm services stop <id> --yes` first, which reports the process unverified and
+records the request, so the clearing is those two commands, on purpose:
+`--force` never removes a record nobody tried to stop, and
+`a_ready_record_held_by_an_unqueryable_process_is_cleared_by_stop_then_force`
+runs the chain), after which a stop or a
+service listing confirms and drops the key. The command is a stock one the host
+has, pinned by `the_process_check_command_is_the_one_the_host_has`, and
+`service-stop-07` uses the same `tasklist /FI "PID eq <pid>"` filter (in CSV
+form, which does not depend on the display language) to see whether a process is
+running. A `tasklist` that does not exit successfully is no answer: the scenario
+fails instead of reading the missing row as an exit
+(`tasklist_reports_running` in `tests/e2e-cucumber/src/tasklist.rs`, a pure read of
+the status and output covered by `a_failed_run_is_no_answer_whatever_it_printed` on
+every host). No test follows the printed command on a Windows host and reads its
+default table output, because that output is localised. What follows once the
+process is gone is covered by
+`a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`.
+`service-stop-06` (Linux) is the same stop of a real recorded process through
+`rocm services stop`, checking the persisted state: the process exited and the
+record names none. Run the Windows scenario on a Windows host with
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-07"`
+and a prebuilt `ROCM_CLI_BINARY`.
+
 No scenario drives the attached Ctrl-C stop end to end. Attaching needs a real
 `rocm serve` launch — an engine and a runtime the mock lane does not have,
 which is why the chat scenarios there plant a record behind a mock server
@@ -2273,7 +2551,46 @@ verdict to the JSON; `rocm services stop` exits 1. The stop
 records the request in the manifest before it signals anything, and applies its
 result to the manifest as it is once the stop ends, so a write made meanwhile is
 kept — and a restart that recorded new processes meanwhile makes the stop
-unconfirmed rather than having its PIDs cleared.
+unconfirmed rather than having its PIDs cleared. What the stop's verdict still
+covers is decided by `ManagedServiceRecord::is_covered_by_stop_of`: the same
+processes, or none recorded because a liveness refresh that saw every process
+gone completed this same stop first (the record reads `stopped` and names
+nothing). A restart, whether it has recorded new processes or is mid-launch with
+none yet (status `starting`), is not covered, and neither is the empty `stopped`
+record a `rocm services restart` leaves between its own confirmed stop and the
+publication of its child: the restart stamps a relaunch generation
+(`relaunch_started_unix_ms`) before it restores the endpoint key or spawns, a
+stop covers only the generation it read, and publishing the child clears it
+(`an_older_stop_finalizing_before_a_restart_publishes_does_not_delete_its_key`
+finalizes an older stop in that window and asserts the restored key survives;
+`a_stop_does_not_cover_a_record_in_another_relaunch_generation` is the unit
+table; `a_restart_publishing_its_child_ends_the_relaunch_generation_and_respects_a_moved_one`
+covers the publication guard). The unit test
+`a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch`
+is the table, and it runs again from a stopping snapshot that names no process (an
+empty record is that stop only while it carries the stop's marker, reads
+`stopped`, or a liveness refresh consumed that marker and left its stamp in
+`settled_stop_unix_ms`; an empty `starting` relaunch has cleared the marker
+without leaving the stamp and is not covered,
+`stop_does_not_confirm_over_an_empty_relaunch_of_an_empty_record`); in `rocm`,
+`a_listing_clearing_the_marker_of_an_empty_stop_does_not_make_it_unconfirmed` runs the
+real refresh between the termination and the final read of an empty `starting` and an
+empty `failed` record (which the refresh leaves at their status) and asserts a confirmed
+stop, `a_relaunch_after_a_listing_consumed_the_marker_is_still_not_the_stop` that a
+restart following that listing is still not covered (it wipes the stamp), and
+`a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
+persists a real liveness refresh between the termination and the final read and
+asserts a confirmed stop with the marker not restored,
+`a_restart_is_not_refused_because_a_listing_completed_its_stop` that a restart then
+carries on past its stop, and `stop_does_not_confirm_over_a_restart_that_has_recorded_no_process_yet`
+and `stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile` that a real
+relaunch is still detected; `rocmd` has the same three (`a_stop_completed_by_a_concurrent_listing_is_still_confirmed`,
+`a_stop_does_not_claim_a_restart_that_has_recorded_no_process_yet`,
+`a_stop_does_not_clear_processes_recorded_while_it_ran`) plus
+`a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed`, the
+listing's write made directly in those that need it because the refresh lives in the
+`rocm` binary (in the last one it is made in the engine `Stop` callback, the only
+step that runs for a record naming no PID, and the test asserts it ran).
 
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded
@@ -2293,7 +2610,9 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop"`.
+"service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
+suite's own host filter, so it would also run the Windows-only
+`service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
 `features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same
