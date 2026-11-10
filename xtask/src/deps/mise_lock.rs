@@ -42,8 +42,9 @@ const OS_TOKENS: [(&str, &[&str]); 2] = [
 pub(crate) const ATTESTED: &str = "github-attestations";
 
 /// Tools whose releases carry build attestations, so their locks must record
-/// that mise verified one. Any other tool may carry no `provenance` at all:
-/// its downloads are re-hashed by `deps verify-downloads` instead.
+/// that mise verified one. Any other tool may carry no `provenance` at all.
+/// The string is not proof by itself: `deps verify-downloads` re-hashes every
+/// locked download, these tools' included.
 pub(crate) const ATTESTED_TOOLS: [&str; 1] = [super::pins_gen::UV_TOOL];
 
 /// One locked platform of one tool.
@@ -298,8 +299,8 @@ pub(crate) fn problems(config: &MiseConfig, lock: &BTreeMap<String, LockedTool>)
             out.extend(source_problems(name, &tool.version, platform, asset));
             out.extend(api_problems(name, platform, asset));
             // An attested tool must record that mise verified its attestation.
-            // Any other tool may record no provenance at all, whatever the
-            // value: a value would excuse it from `deps verify-downloads`.
+            // Any other tool may record no provenance at all: a value there
+            // would claim a check that never ran.
             if ATTESTED_TOOLS.contains(&name.as_str()) {
                 if asset.provenance.as_deref() != Some(ATTESTED) {
                     out.push(format!(
@@ -308,7 +309,7 @@ pub(crate) fn problems(config: &MiseConfig, lock: &BTreeMap<String, LockedTool>)
                 }
             } else if let Some(value) = asset.provenance.as_deref() {
                 out.push(format!(
-                    "{name}: {platform} records provenance {value:?}, but only {ATTESTED_TOOLS:?} are attested; its downloads are re-hashed instead"
+                    "{name}: {platform} records provenance {value:?}, but only {ATTESTED_TOOLS:?} are attested"
                 ));
             }
         }
@@ -853,7 +854,7 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
         assert_eq!(
             problems_of(&text),
             [
-                "github:example/tool: linux-x64 records provenance \"trust-me\", but only [\"aqua:astral-sh/uv\"] are attested; its downloads are re-hashed instead"
+                "github:example/tool: linux-x64 records provenance \"trust-me\", but only [\"aqua:astral-sh/uv\"] are attested"
             ]
         );
     }
@@ -868,7 +869,7 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
         assert_eq!(
             problems_of(&text),
             [
-                "github:example/tool: linux-x64 records provenance \"github-attestations\", but only [\"aqua:astral-sh/uv\"] are attested; its downloads are re-hashed instead"
+                "github:example/tool: linux-x64 records provenance \"github-attestations\", but only [\"aqua:astral-sh/uv\"] are attested"
             ]
         );
     }

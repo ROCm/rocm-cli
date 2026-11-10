@@ -183,6 +183,9 @@ jobs:
               - 'docs/ci-hardware-testing.md'
               # Read by `the_remediation_command_is_spelled_the_same_in_its_checked_files`.
               - 'docs/runtime-dependencies.md'
+              # Read as text by `the_vllm_profile_matches_the_adapters_build_row`
+              # (xtask); `cargo xtask affected` forces the workspace for it.
+              - 'engines/vllm/src/discover_builds.rs'
               # Run by `the_summary_passes_the_update_validator` (on real
               # `deps diff` output) and read by the update-workflow contract
               # test; both are Linux-only, so the Windows lane cannot backstop it.
@@ -1868,10 +1871,11 @@ jobs:
       - name: Re-lock at the committed pins
         run: runtimes/bin/mise run --cd runtimes lock
 
-      # Lemonade's digests come from mise's version index, not a build
-      # attestation, and the Lemonade adapter trusts them: re-hash each such
-      # download against the lock, so a pin bump is checked on its own PR.
-      - name: Check unattested downloads against the lock
+      # Re-hash every locked download against the lock, so a pin bump is
+      # checked on its own PR: Lemonade's digests come from mise's version
+      # index, which the Lemonade adapter trusts, and uv's `provenance` string
+      # is only what the locking job wrote.
+      - name: Check every locked download against the lock
         run: cargo xtask deps verify-downloads
 
       - name: Fail if any lock changed

@@ -59,8 +59,8 @@ pub(crate) enum DepsCommand {
     },
     /// Verify, offline, that every runtime lock is complete and consistent.
     Check,
-    /// Download every binary `runtimes/mise.lock` records without a build
-    /// attestation (Lemonade) and check its SHA-256 against the lock (network).
+    /// Download every binary `runtimes/mise.lock` records and check its
+    /// SHA-256 against the lock (network).
     VerifyDownloads,
     /// Regenerate the mise bootstrap launchers in `runtimes/bin/` for the
     /// newest mise release at least `--cooldown-days` old, if that is newer

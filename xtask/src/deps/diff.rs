@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use super::launchers;
 use super::mise_lock::{self, MISE_LOCK};
 use super::profiles::{LOCK_DIR, Profiles, normalize_name, slash_path};
-use super::pylock::PyLock;
+use super::pylock::{self, PyLock};
 
 /// The whole summary when nothing moved. `scripts/validate_runtime_update.py`
 /// accepts exactly this, and `the_summary_passes_the_update_validator` ties
@@ -182,11 +182,31 @@ fn collect(file: &str, text: &str, into: &mut Versions) -> Result<()> {
             .with_context(|| format!("invalid {file}"))?
             .packages
         {
-            // `deps check` refuses both of these; the table must not hide
-            // them by dropping the row or keeping only one of two.
+            // `deps check` refuses all of these. The table is built without
+            // relying on it having run: it must not hide a package by
+            // dropping its row or keeping one of two, render a name or
+            // version that breaks the Markdown, or show a source its digest
+            // does not cover as unchanged.
+            if !pylock::is_valid_name(&package.name) {
+                bail!("{file}: {:?} is not a valid package name", package.name);
+            }
+            let sources = package.unchecked_sources();
+            if !sources.is_empty() {
+                bail!(
+                    "{file}: {} is locked from its `{}` source, which deps check refuses",
+                    package.name,
+                    sources.join("` and `")
+                );
+            }
             let Some(version) = package.version else {
                 bail!("{file}: {} is locked without a version", package.name);
             };
+            if !pylock::is_valid_version(&version) {
+                bail!(
+                    "{file}: {}: {version:?} is not a valid version",
+                    package.name
+                );
+            }
             // As for binaries: a re-spun artifact at an unchanged version
             // changes the cell, so the update's table shows it.
             let cell = match artifacts_digest(&package.wheels, package.sdist.as_ref()) {
@@ -668,6 +688,54 @@ mod tests {
         let posix = "mise_version=\"${MISE_VERSION:-2026.11.1}\"\n";
         assert!(row(launchers::POSIX, posix).starts_with("2026.11.1-"));
         assert!(collect(launchers::POSIX, "no version", &mut Versions::new()).is_err());
+    }
+
+    /// The table does not rely on `deps check` having run: a name or version
+    /// that would break the Markdown, and a source the row's digest does not
+    /// cover, are errors here too.
+    #[test]
+    fn a_package_deps_check_refuses_is_an_error_in_the_table_too() {
+        let file = "runtimes/locks/pylock.p-linux.toml";
+        let entry = |name: &str, version: &str, source: &str| {
+            format!(
+                "lock-version = \"1.0\"\n\n[[packages]]\nname = {name:?}\nversion = {version:?}\n{source}wheels = [{{ url = \"https://files.pythonhosted.org/n.whl\", hashes = {{ sha256 = \"{}\" }} }}]\n",
+                "a".repeat(64)
+            )
+        };
+        assert!(collect(file, &entry("numpy", "2.3.0", ""), &mut Versions::new()).is_ok());
+        for (expected, text) in [
+            (
+                "\"num|py\" is not a valid package name".to_owned(),
+                entry("num|py", "2.3.0", ""),
+            ),
+            (
+                "numpy: \"2.3.0|x\" is not a valid version".to_owned(),
+                entry("numpy", "2.3.0|x", ""),
+            ),
+            (
+                "numpy is locked from its `vcs` source, which deps check refuses".to_owned(),
+                entry(
+                    "numpy",
+                    "2.3.0",
+                    "vcs = { type = \"git\", url = \"https://x.example/r\" }\n",
+                ),
+            ),
+            (
+                "numpy is locked from its `directory` source, which deps check refuses".to_owned(),
+                entry("numpy", "2.3.0", "directory = { path = \"src\" }\n"),
+            ),
+            (
+                "numpy is locked from its `archive` source, which deps check refuses".to_owned(),
+                entry(
+                    "numpy",
+                    "2.3.0",
+                    "archive = { url = \"https://x.example/a.tgz\" }\n",
+                ),
+            ),
+        ] {
+            let err = collect(file, &text, &mut Versions::new()).unwrap_err();
+            assert_eq!(format!("{err:#}"), format!("{file}: {expected}"));
+        }
     }
 
     #[test]

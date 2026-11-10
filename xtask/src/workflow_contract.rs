@@ -803,6 +803,66 @@ mod tests {
             .collect()
     }
 
+    /// The update refuses to reset its branch over a commit it did not make.
+    /// Its own commits are recognised by the bot's login, or, only when
+    /// GitHub leaves the commit's user unresolved, by the bot's commit email;
+    /// a maintainer's fixup is counted either way, even one carrying the
+    /// bot's email. Runs the workflow's own jq
+    /// filter on compare-API shaped input.
+    #[test]
+    #[cfg_attr(windows, ignore = "needs jq on PATH; covered on the Linux CI jobs")]
+    fn the_update_counts_only_commits_the_workflow_did_not_make() {
+        let workflow = read_workflow("runtime-deps-update.yml");
+        let filter = workflow
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("--jq '"))
+            .and_then(|l| l.strip_suffix("')"))
+            .expect("the ownership check passes a --jq filter");
+        let bot_email = "41898282+github-actions[bot]@users.noreply.github.com";
+        let commit = |login: Option<&str>, email: &str| {
+            serde_json::json!({
+                "author": login.map(|l| serde_json::json!({"login": l})),
+                "commit": {"author": {"email": email}},
+            })
+        };
+        for (commits, expected) in [
+            (vec![commit(Some("github-actions[bot]"), bot_email)], "0"),
+            // The login alone decides when GitHub resolved one.
+            (
+                vec![commit(Some("github-actions[bot]"), "x@example.com")],
+                "0",
+            ),
+            (vec![commit(Some("a-maintainer"), bot_email)], "1"),
+            // The email decides only when the author is unresolved.
+            (vec![commit(None, bot_email)], "0"),
+            (vec![commit(Some("a-maintainer"), "m@example.com")], "1"),
+            (vec![commit(None, "m@example.com")], "1"),
+            (
+                vec![
+                    commit(None, bot_email),
+                    commit(Some("a-maintainer"), "m@example.com"),
+                ],
+                "1",
+            ),
+        ] {
+            let input = serde_json::json!({ "commits": commits }).to_string();
+            let mut child = std::process::Command::new("jq")
+                .arg(filter)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("jq must be on PATH");
+            std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{input}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
     /// Runs the commit step's own payload builder — the Python heredoc, taken
     /// from the workflow — on a fixture, so what it commits and deletes is
     /// checked as behaviour and not only as pinned text.
@@ -1309,7 +1369,7 @@ mod tests {
                 "base_sha=\"$BASE_SHA\"",
                 "if gh api \"repos/$REPO/git/ref/heads/$BRANCH\" >/dev/null 2>&1; then",
                 "  others=$(gh api \"repos/$REPO/compare/$base_sha...$BRANCH\" \\",
-                "    --jq '[.commits[] | select(.author.login != \"github-actions[bot]\")] | length')",
+                "    --jq '[.commits[] | select((.author.login == \"github-actions[bot]\" or (.author == null and .commit.author.email == \"41898282+github-actions[bot]@users.noreply.github.com\")) | not)] | length')",
                 "  if [ \"$others\" != \"0\" ]; then",
                 "    echo \"::error::$BRANCH has $others commit(s) this workflow did not make. Merge or close its pull request, or move the fixups to main, before the next update.\"",
                 "    exit 1",
@@ -1465,7 +1525,7 @@ mod tests {
                 "",
                 "Free disk space for wheel downloads",
                 "Re-lock at the committed pins",
-                "Check unattested downloads against the lock",
+                "Check every locked download against the lock",
                 "Fail if any lock changed",
                 "Upload the re-locked files"
             ]
@@ -1473,7 +1533,7 @@ mod tests {
         assert_eq!(
             run_lines(pinned_step(
                 &steps,
-                "Check unattested downloads against the lock",
+                "Check every locked download against the lock",
                 ""
             )),
             ["cargo xtask deps verify-downloads"]

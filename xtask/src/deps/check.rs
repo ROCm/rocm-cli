@@ -125,16 +125,8 @@ pub(crate) fn lock_problems(
 
     let mut versions: BTreeMap<String, &str> = BTreeMap::new();
     for package in &lock.packages {
-        // PEP 508: letters, digits, `-`, `_` and `.`, starting and ending
-        // alphanumeric. Anything else would also be rendered as-is into the
-        // update's Markdown table.
         let package_name = &package.name;
-        if !(package_name.starts_with(|c: char| c.is_ascii_alphanumeric())
-            && package_name.ends_with(|c: char| c.is_ascii_alphanumeric())
-            && package_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        {
+        if !pylock::is_valid_name(package_name) {
             out.push(format!("{package_name:?}: is not a valid package name"));
             continue;
         }
@@ -143,13 +135,7 @@ pub(crate) fn lock_problems(
             out.push(format!("{}: no version", package.name));
             continue;
         };
-        // PEP 440's characters only, starting with a digit: the version is
-        // rendered as-is into the update's Markdown table too.
-        if !(version.starts_with(|c: char| c.is_ascii_digit())
-            && version
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-')))
-        {
+        if !pylock::is_valid_version(version) {
             out.push(format!(
                 "{package_name}: {version:?} is not a valid version"
             ));
@@ -403,6 +389,57 @@ linux = "x86_64-manylinux_2_28"
              artifact; see docs/runtime-dependencies.md.",
             remediation(problems.len())
         );
+    }
+
+    /// A field `deps check` does not know is refused at every level, as in
+    /// `mise.lock`; the fields uv writes today are accepted.
+    #[test]
+    fn a_python_lock_field_this_check_does_not_understand_is_refused() {
+        let known = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com")
+            .replacen(
+                "lock-version = \"1.0\"\n",
+                "lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \"==3.14.*\"\n",
+                1,
+            )
+            .replacen(
+                "name = \"numpy\"\n",
+                "name = \"numpy\"\nmarker = \"sys_platform == 'linux'\"\n",
+                1,
+            )
+            .replacen(
+                &format!("hashes = {{ sha256 = \"{SUM}\" }} }}]\n"),
+                &format!(
+                    "hashes = {{ sha256 = \"{SUM}\" }}, upload-time = 2026-01-01T00:00:00Z, size = 1 }}]\n"
+                ),
+                1,
+            );
+        assert_eq!(problems_of(&known), Vec::<String>::new());
+        for (level, text) in [
+            (
+                "top",
+                known.replacen(
+                    "lock-version = \"1.0\"\n",
+                    "lock-version = \"1.0\"\nextra = 1\n",
+                    1,
+                ),
+            ),
+            (
+                "package",
+                known.replacen("name = \"numpy\"\n", "name = \"numpy\"\nextra = 1\n", 1),
+            ),
+            (
+                "artifact",
+                known.replacen(", size = 1 }]", ", size = 1, extra = 1 }]", 1),
+            ),
+        ] {
+            assert_ne!(text, known, "{level}: the field was added");
+            let found = problems_of(&text);
+            assert_eq!(found.len(), 1, "{level}: {found:?}");
+            assert!(
+                found[0].contains("unknown field `extra`"),
+                "{level}: {found:?}"
+            );
+        }
     }
 
     #[test]
