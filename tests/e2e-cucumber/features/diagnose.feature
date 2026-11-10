@@ -974,3 +974,15 @@ Feature: Diagnosing failures and listing fixes
     Then every listed cause is reported as not contributed to by a paste
     When the user asks for a diagnosis without pasting an error
     Then no listed cause is marked as found from the host alone
+
+  # diagnose-17 on a real WSL2 distribution rather than a simulated one: the same
+  # guard on the platform split, held against what a real WSL kernel and the
+  # Windows host's driver actually expose, which no simulated machine can vouch
+  # for. Declared here rather than beside diagnose-17 because the scenario index
+  # is per-feature and in declaration order.
+  @id:diagnose-real-wsl-never-reports-bare-metal-causes @requires-wsl
+  Scenario: diagnose-65 - A real WSL machine is never given a bare-metal cause
+    Given a user who hit a known ROCm failure
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then no reported cause is one that only exists on bare-metal Linux
+    And the result says this platform is covered

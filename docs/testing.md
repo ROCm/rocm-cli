@@ -1019,10 +1019,28 @@ filesystem.
 
 A scenario on a simulated machine proves the CLI reads that machine correctly,
 not that the real kernel still looks like it. Detection on the machine the
-suite runs on is kept by `@requires-real-gpu` scenarios such as
-`@id:examine-detects-this-machines-gpu-and-driver`, which repeats
-`@id:examine-detects-gpu-and-driver`'s assertions against a real GPU host on
-every GPU lane, the Windows one included.
+suite runs on is kept by twins that repeat a simulated scenario's assertions
+on the real machine:
+
+- `@id:examine-detects-this-machines-gpu-and-driver` repeats
+  `@id:examine-detects-gpu-and-driver` on every GPU lane, the Windows one
+  included (`@requires-real-gpu`).
+- `@id:serve-masked-devices-fail-on-this-host` repeats
+  `@id:serve-masked-devices-fail` on every Linux GPU lane
+  (`@requires-real-gpu`).
+- `@id:diagnose-real-wsl-never-reports-bare-metal-causes` repeats
+  `@id:diagnose-wsl-never-reports-bare-metal-causes` on the WSL lane
+  (`@requires-wsl`).
+- `@id:serve-no-gpu-fails-fast-on-this-host` repeats
+  `@id:serve-no-gpu-fails-fast` on any Linux host with no AMD GPU
+  (`@requires-no-gpu @requires-os:linux`), such as the GitHub-hosted Linux
+  runner. It is Linux only because off Linux there is no usable-GPU probe: a
+  GPU-less Windows host is not refused today, so the GPU-required refusal has no
+  Windows coverage.
+
+The other moved scenarios have no twin: their premise (several GPUs, a WSL
+remedy, a driver install plan) runs on the real machine only where a lane has
+that hardware.
 
 A simulated machine is only worth trusting while it is laid out the way the
 kernel lays out a real one, so two `@nightly` scenarios
