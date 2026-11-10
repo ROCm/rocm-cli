@@ -111,8 +111,8 @@ pub use disk_space::{
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 pub use download::{
-    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
+    Backoff, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest,
+    download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress,
 };
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
@@ -150,7 +150,11 @@ use host_gpu::{
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
 pub use jsonl_store::jsonl_lock_path;
-pub use log_tail::tail_lines;
+pub use log_tail::{
+    LOG_VIEW_MAX_TAIL_READ, LogDecode, LogTail, newest_line_exceeds_bound_notice,
+    service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
+    tail_log_decoded,
+};
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,

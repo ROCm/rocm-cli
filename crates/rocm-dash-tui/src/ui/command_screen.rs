@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Command runner overlay (Phase 3 Wave 3).
+//! Command runner overlay.
 //!
 //! A general escape hatch: type any `rocm …` subcommand and run it through the
 //! job-bridge. Because arbitrary subcommands can't be statically classified as
