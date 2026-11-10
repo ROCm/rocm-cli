@@ -275,7 +275,12 @@ follow-ups, each its own change with its own scenarios:
 1. `rocm install sdk` (release channel) installs from the SDK lock for the
    host's arch instead of resolving at install time.
 2. vLLM installs from its lock, replacing the tables in
-   [`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs).
+   [`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs). The vLLM 0.29.1
+   and flash-attn 2.8.3 builds that lock holds have known HIGH CVEs and are
+   the newest AMD publishes for ROCm 10.1, so the pull-request security scan
+   suppresses them for that one file, with an expiry, in
+   [.trivyignore.yaml](../.github/scan_tools_configs/.trivyignore.yaml). This
+   step must not ship them unpatched.
 3. uv itself is downloaded at the version and digest in `mise.lock` instead
    of `latest`.
 4. ComfyUI and the llama.cpp backend Lemonade aligns move into `mise.toml`.
