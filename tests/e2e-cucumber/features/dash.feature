@@ -918,7 +918,7 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-real-gpu @requires-engine:lemonade
   Scenario: dash-52 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
     Given a managed runtime is active
     And the dashboard watches only managed services
