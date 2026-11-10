@@ -472,6 +472,7 @@ fn launch_managed_engine_child_locked(
         endpoint_key_file.is_some(),
         record.requires_api_key,
         rocm_core::ServiceStart::Launch,
+        &record.service_id,
     )?;
     // Hand the port over: close the probe socket immediately before the spawn,
     // still under the caller's launch lock, so no other ROCm transaction can
@@ -967,6 +968,7 @@ mod tests {
                 false,
                 true,
                 rocm_core::ServiceStart::Launch,
+                "lemonade-qwen-3000",
             )
             .unwrap_err()
             .to_string()

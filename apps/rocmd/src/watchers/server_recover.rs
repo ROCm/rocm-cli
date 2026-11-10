@@ -210,6 +210,7 @@ fn handle_server_recover_event_with_record(
                 crate::engine_ipc::has_usable_endpoint_key(paths, &record.service_id),
                 record.requires_api_key,
                 rocm_core::ServiceStart::Respawn,
+                &record.service_id,
             ) {
                 return crate::persistence::record_event(
                     paths,
@@ -958,6 +959,7 @@ mod tests {
             false,
             false,
             rocm_core::ServiceStart::Respawn,
+            "svc-public-no-key",
         )
         .unwrap_err()
         .to_string();
@@ -1057,6 +1059,7 @@ mod tests {
             false,
             true,
             rocm_core::ServiceStart::Respawn,
+            "svc-recover-key-site",
         )
         .unwrap_err()
         .to_string();

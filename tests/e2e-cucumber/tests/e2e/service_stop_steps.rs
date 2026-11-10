@@ -605,6 +605,51 @@ async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
     );
 }
 
+/// The stop the refusal names comes before the launch it names, is the exact
+/// command for this server, and is one `rocm` accepts: run with `--help` last,
+/// with a bogus flag as the negative control, so nothing is stopped by it. That
+/// the server is still running afterwards is what the next step checks.
+#[then("the refusal names the stop that has to come first")]
+async fn refusal_names_the_stop_first(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    let stops: Vec<&str> = combined
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.starts_with("rocm services stop"))
+        .collect();
+    assert_eq!(
+        stops.len(),
+        1,
+        "the refusal must name exactly one `rocm services stop` command:\n{combined}"
+    );
+    assert_eq!(
+        stops[0],
+        format!("rocm services stop {SERVICE_ID} --yes"),
+        "{combined}"
+    );
+    assert!(
+        combined.find(stops[0]).unwrap() < combined.find("rocm serve <model>").unwrap(),
+        "the stop must come before the launch:\n{combined}"
+    );
+    let mut args: Vec<String> = stops[0]
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    args.push("--help".to_owned());
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &words);
+    assert_eq!(rc, 0, "rocm rejected {words:?}:\n{stdout}\n{stderr}");
+    let mut bogus = words.clone();
+    bogus.insert(bogus.len() - 1, "--no-such-flag");
+    let (_, _, rc) = crate::run_rocm(world, &bogus);
+    assert_ne!(
+        rc, 0,
+        "a flag rocm does not have must be rejected before --help: {bogus:?}"
+    );
+}
+
 #[then("the server is left running, with no stop recorded and no key file")]
 async fn server_left_as_it_was(world: &mut E2eWorld) {
     let pid = recorded_pid(world);

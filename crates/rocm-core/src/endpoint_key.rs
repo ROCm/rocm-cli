@@ -164,13 +164,17 @@ fn serve_command(host: &str, requires_api_key: bool) -> String {
 /// canonical loopback host), a public host carries `--allow-public-bind`, and a
 /// service that asked for a key carries `--require-api-key`. What the start
 /// changes is only the wording of the action and of why the key is missing: a
-/// service being brought back lost its key when it stopped, a fresh launch
-/// stored a key file that is missing or unusable and has started nothing.
+/// service being brought back lost its key when it stopped, and may still be
+/// running, in which case a launch would reuse it and discard the new key, so the
+/// refusal names the stop (`rocm services stop <id> --yes`, for `service_id`)
+/// before the launch; a fresh launch stored a key file that is missing or
+/// unusable and has started nothing, and names no stop.
 pub fn ensure_public_service_has_endpoint_key(
     host: &str,
     key_present: bool,
     requires_api_key: bool,
     start: ServiceStart,
+    service_id: &str,
 ) -> anyhow::Result<()> {
     if key_present {
         return Ok(());
@@ -206,10 +210,21 @@ pub fn ensure_public_service_has_endpoint_key(
         } else {
             ""
         };
+        // A recorded service may still be running: its key file can go missing
+        // without a confirmed stop. `rocm serve` reuses a running service for the
+        // same engine and model and discards the key it generated for that
+        // attempt, so launching again over it would leave the service as keyless
+        // as it was and this refusal would come back at the next start. The stop
+        // is what clears the condition, and is harmless for one that has stopped.
+        let stop = format!(
+            "rocm services stop {} --yes",
+            crate::posix_shell_quote(service_id)
+        );
         anyhow::bail!(
             "{lead}, so {would_open} without authentication. {republished}The key is dropped \
-             when a service stops and cannot be recovered. Launch it again with `{command}` \
-             {choose_key}."
+             when a service stops and cannot be recovered. Launching it again while it is \
+             still running would reuse the running server and discard the new key, so stop it \
+             first with `{stop}`, then launch it again with `{command}` {choose_key}."
         );
     }
     anyhow::bail!(
@@ -246,8 +261,10 @@ mod tests {
         ServiceStart::Respawn,
     ];
 
+    const SERVICE_ID: &str = "vllm-qwen-1000";
+
     fn refusal(host: &str, key_present: bool, requires: bool, start: ServiceStart) -> String {
-        ensure_public_service_has_endpoint_key(host, key_present, requires, start)
+        ensure_public_service_has_endpoint_key(host, key_present, requires, start, SERVICE_ID)
             .expect_err("this state must be refused")
             .to_string()
     }
@@ -401,11 +418,11 @@ mod tests {
     fn a_service_that_needs_no_key_or_has_one_is_not_refused() {
         for start in STARTS {
             for host in ["127.0.0.1", "localhost", "::1"] {
-                ensure_public_service_has_endpoint_key(host, false, false, start)
+                ensure_public_service_has_endpoint_key(host, false, false, start, SERVICE_ID)
                     .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
             }
             for (host, requires) in [("0.0.0.0", false), ("127.0.0.1", true), ("0.0.0.0", true)] {
-                ensure_public_service_has_endpoint_key(host, true, requires, start)
+                ensure_public_service_has_endpoint_key(host, true, requires, start, SERVICE_ID)
                     .unwrap_or_else(|error| panic!("{host} has its key: {error:#}"));
             }
         }
@@ -435,9 +452,18 @@ mod tests {
         // `Restart` and `Respawn` differ from each other only in the clause naming
         // the action; a fresh `Launch` has nothing that stopped, so it says so
         // instead of repeating "the key is dropped when a service stops" and tells
-        // the user to run the command again rather than to "launch it again".
+        // the user to run the command again rather than to "launch it again". A
+        // service being brought back may still be running, so it is told to stop
+        // it first; a launch has no recorded service to stop.
         for (host, requires, _) in ADVISED {
             let restart = refusal(host, false, requires, ServiceStart::Restart);
+            assert!(
+                restart.contains(
+                    "so stop it first with `rocm services stop vllm-qwen-1000 --yes`, then launch \
+                     it again with `rocm serve <model>"
+                ),
+                "{host} requires={requires}: {restart}"
+            );
             assert_eq!(
                 refusal(host, false, requires, ServiceStart::Respawn),
                 restart.replace(
@@ -452,6 +478,8 @@ mod tests {
                 "Launch it again",
                 "still be publishing",
                 "managed service",
+                "rocm services stop",
+                "still running",
             ] {
                 assert!(
                     !launch.contains(stale),
@@ -469,7 +497,9 @@ mod tests {
             "managed service was launched with `--require-api-key` but has no endpoint API key, \
              so restarting it would reopen it without authentication. Something outside this \
              machine may still be publishing its port. The key is dropped when a service stops \
-             and cannot be recovered. Launch it again with `rocm serve <model> \
+             and cannot be recovered. Launching it again while it is still running would reuse \
+             the running server and discard the new key, so stop it first with `rocm services \
+             stop vllm-qwen-1000 --yes`, then launch it again with `rocm serve <model> \
              --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the \
              key instead of generating one)."
         );
@@ -477,9 +507,11 @@ mod tests {
             refusal("0.0.0.0", false, false, ServiceStart::Respawn),
             "managed service is bound to the public host `0.0.0.0` but has no endpoint API key, \
              so respawning it would reopen it without authentication. The key is dropped when a \
-             service stops and cannot be recovered. Launch it again with `rocm serve <model> \
-             --host 0.0.0.0 --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
-             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
+             service stops and cannot be recovered. Launching it again while it is still \
+             running would reuse the running server and discard the new key, so stop it first \
+             with `rocm services stop vllm-qwen-1000 --yes`, then launch it again with `rocm \
+             serve <model> --host 0.0.0.0 --port <port> --allow-public-bind` (add `--api-key \
+             <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
         assert_eq!(
             refusal("127.0.0.1", false, true, ServiceStart::Launch),
@@ -496,6 +528,25 @@ mod tests {
              key file this launch stored is missing or unusable. Run `rocm serve <model> --host \
              0.0.0.0 --port <port> --allow-public-bind` again (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
+        );
+    }
+
+    #[test]
+    fn the_stop_it_names_quotes_a_service_id_that_is_not_one_word() {
+        // The line is meant to be pasted into a shell, so an id with a space or a
+        // quote must stay one word, as `rocm`'s own stop hints do.
+        let message = ensure_public_service_has_endpoint_key(
+            "0.0.0.0",
+            false,
+            false,
+            ServiceStart::Restart,
+            "odd id's",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("`rocm services stop 'odd id'\\''s' --yes`"),
+            "{message}"
         );
     }
 

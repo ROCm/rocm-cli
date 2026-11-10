@@ -488,6 +488,7 @@ fn restart_internal_managed_service_inner(
         preserved_endpoint_key.is_some(),
         record.requires_api_key,
         rocm_core::ServiceStart::Restart,
+        service_id,
     )?;
     let (stop_report, stopped) =
         stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
@@ -964,6 +965,7 @@ mod tests {
                 false,
                 false,
                 rocm_core::ServiceStart::Restart,
+                "vllm-public-2000",
             )
             .unwrap_err()
             .to_string()
@@ -1075,6 +1077,7 @@ mod tests {
                 false,
                 true,
                 rocm_core::ServiceStart::Restart,
+                "svc-restart-key-site",
             )
             .unwrap_err()
             .to_string()

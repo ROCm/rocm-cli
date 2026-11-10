@@ -258,6 +258,7 @@ mod tests {
             key_present,
             requires_api_key,
             rocm_core::ServiceStart::Restart,
+            "svc-restart-guard",
         )
     }
 
@@ -358,11 +359,16 @@ mod tests {
     /// names the port as a placeholder, as it does the model, and the real parser
     /// takes only a number there.
     fn with_port_filled(advised: &[String]) -> Vec<String> {
+        with_port_filled_to(advised, 8000)
+    }
+
+    /// [`with_port_filled`] with the port the service recorded.
+    fn with_port_filled_to(advised: &[String], port: u16) -> Vec<String> {
         advised
             .iter()
             .map(|word| {
                 if word == "<port>" {
-                    "8000".to_owned()
+                    port.to_string()
                 } else {
                     word.clone()
                 }
@@ -370,17 +376,17 @@ mod tests {
             .collect()
     }
 
-    /// Run what `rocm serve` does with `advised` before it spawns anything — the
-    /// real clap parse, `validate_bind_host`, `resolve_endpoint_auth`, and the
-    /// key file `serve()` stores — and return the guard's answer for the service
-    /// that launch would record. Nothing is spawned.
-    fn guard_after_following(
-        advised: &[String],
-        paths: &AppPaths,
-        service_id: &str,
-        start: rocm_core::ServiceStart,
-        service: (&str, bool),
-    ) -> Result<()> {
+    /// What the real clap parse makes of an advised `rocm serve` command.
+    struct ServeAdvice {
+        model: String,
+        host: String,
+        port: Option<u16>,
+        allow_public_bind: bool,
+        require_api_key: bool,
+        api_key: Option<String>,
+    }
+
+    fn parse_serve_advice(advised: &[String]) -> ServeAdvice {
         use crate::{Cli, Command, cli_command};
         use clap::FromArgMatches as _;
 
@@ -388,16 +394,71 @@ mod tests {
             .try_get_matches_from(advised)
             .unwrap_or_else(|error| panic!("{advised:?} does not parse: {error}"));
         let Some(Command::Serve {
+            model,
             host,
             port,
             allow_public_bind,
             require_api_key,
             api_key,
             ..
-        }) = Cli::from_arg_matches(&matches)?.command
+        }) = Cli::from_arg_matches(&matches)
+            .unwrap_or_else(|error| panic!("{advised:?} does not parse: {error}"))
+            .command
         else {
             panic!("{advised:?} is not a `rocm serve` invocation");
         };
+        ServeAdvice {
+            model,
+            host,
+            port,
+            allow_public_bind,
+            require_api_key,
+            api_key,
+        }
+    }
+
+    /// The `rocm services stop …` command a refusal tells the user to run: the
+    /// backtick span that starts with it, split into words.
+    fn advised_stop_command(message: &str) -> Vec<String> {
+        let spans: Vec<&str> = message
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("rocm services stop"))
+            .collect();
+        assert_eq!(
+            spans.len(),
+            1,
+            "the refusal must name exactly one `rocm services stop` command: {message}"
+        );
+        spans[0].split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// Run what `rocm serve` does with `advised` before it spawns anything — the
+    /// real clap parse, `validate_bind_host`, `resolve_endpoint_auth`, and the
+    /// key file `serve()` stores — and return the guard's answer for the service
+    /// that launch would record. Nothing is spawned.
+    ///
+    /// The key is stored under `service_id`, the id the launch would record, so
+    /// this follows a command whose service is not already recorded: a fresh
+    /// launch. A recorded service that is still running is followed by
+    /// [`follow_serve_through_the_spawn`], where `serve` stores the key under a
+    /// new id and the spawn decides what becomes of it.
+    fn guard_after_following(
+        advised: &[String],
+        paths: &AppPaths,
+        service_id: &str,
+        start: rocm_core::ServiceStart,
+        service: (&str, bool),
+    ) -> Result<()> {
+        let ServeAdvice {
+            host,
+            port,
+            allow_public_bind,
+            require_api_key,
+            api_key,
+            ..
+        } = parse_serve_advice(advised);
         // Following the advice brings the service back where it was: on the host
         // it recorded, asking for the key again if it had asked for one. A command
         // that cleared the guard by quietly binding somewhere else (the default
@@ -428,13 +489,69 @@ mod tests {
             key_present,
             require_api_key,
             start,
+            service_id,
         )
+    }
+
+    /// What `rocm serve` does with `advised` when it gets as far as the spawn: the
+    /// same front half, then the real `spawn_managed_engine_child` under a *new*
+    /// service id with the key stored under that id, and, as `serve` does when
+    /// the spawn finds an equivalent service already running, the new key
+    /// dropped. Returns what the spawn decided, and whether the new key was still
+    /// on disk once the spawn had decided.
+    #[cfg(not(windows))]
+    fn follow_serve_through_the_spawn(
+        advised: &[String],
+        paths: &AppPaths,
+        new_service_id: &str,
+        resolve: &rocm_engine_protocol::ResolveModelResponse,
+    ) -> (Result<super::super::spawn::ManagedSpawn>, bool) {
+        let ServeAdvice {
+            model,
+            host,
+            port,
+            allow_public_bind,
+            require_api_key,
+            api_key,
+        } = parse_serve_advice(advised);
+        validate_bind_host(&host, allow_public_bind).unwrap();
+        let port_request = crate::serve_port::PortRequest::from_flag(port);
+        crate::serve_port::validate_port_request(&host, port_request).unwrap();
+        let key = resolve_endpoint_auth(&host, api_key.as_deref(), require_api_key).unwrap();
+        if let Some(key) = key.as_deref() {
+            endpoint_keys::store_endpoint_api_key(paths, new_service_id, key).unwrap();
+        }
+        let spawned = super::super::spawn::spawn_managed_engine_child(
+            paths,
+            "vllm",
+            new_service_id,
+            &model,
+            resolve,
+            &host,
+            port_request,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            require_api_key,
+            false,
+        );
+        if matches!(
+            spawned,
+            Ok(super::super::spawn::ManagedSpawn::AlreadyRunning(_))
+        ) {
+            drop_orphaned_endpoint_key_on_already_running(paths, new_service_id, key.as_deref());
+        }
+        let key_kept = endpoint_keys::endpoint_key_file_if_present(paths, new_service_id).is_some();
+        (spawned, key_kept)
     }
 
     /// The command a refusal names is the same for every action that can print
     /// it — `rocm services restart`, a fresh launch, and the daemon's respawn,
     /// whose text is the same shared guard's — so each is followed here, from
-    /// the refused state, through the real `rocm serve` front half.
+    /// the refused state, through the real `rocm serve` front half. A service
+    /// that is recorded, and may still be running, is the next test's.
     #[test]
     fn the_command_a_respawn_refusal_names_clears_the_refusal() -> Result<()> {
         use rocm_core::ServiceStart;
@@ -459,6 +576,7 @@ mod tests {
                     false,
                     requires_api_key,
                     start,
+                    "lemonade-qwen-3000",
                 )
                 .expect_err("a keyless service in this state is refused")
                 .to_string();
@@ -488,6 +606,11 @@ mod tests {
                     runnable.iter().all(|word| !word.starts_with('<')),
                     "every placeholder in {advised:?} must be filled: {runnable:?}"
                 );
+                if start != ServiceStart::Launch {
+                    // A restart or respawn is of a recorded service, which a launch
+                    // under a new id does not replace while it still runs.
+                    continue;
+                }
                 let (root, paths) = test_paths("respawn-advice-clears");
                 paths.ensure()?;
                 fs::create_dir_all(paths.services_dir())?;
@@ -509,6 +632,181 @@ mod tests {
                 assert!(
                     endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
                     "following the advice leaves the service a key to respawn with"
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+        Ok(())
+    }
+
+    /// A recorded service whose key file is gone while the service still runs.
+    /// `rocm serve` of the same engine and model reuses it and drops the key it
+    /// generated for that attempt, so following only the `rocm serve` command
+    /// leaves the service keyless and the next restart refused again. The refusal
+    /// therefore names the stop first; this follows both, through the real stop,
+    /// the real reuse in the spawn and the key `serve` stores under a new id.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_running_service_is_stopped_before_its_relaunch_so_the_advice_clears_the_refusal()
+    -> Result<()> {
+        use super::super::spawn::{ManagedSpawn, TEST_SPAWN_HOOK};
+        use rocm_core::ServiceStart;
+        use rocm_engine_protocol::{DevicePolicy, ResolveModelResponse};
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        for start in [ServiceStart::Restart, ServiceStart::Respawn] {
+            for (host, requires_api_key) in [
+                ("127.0.0.1", true),
+                ("localhost", true),
+                ("0.0.0.0", true),
+                ("0.0.0.0", false),
+                ("gpu-box.example", false),
+            ] {
+                let (root, paths) = test_paths("running-service-advice");
+                paths.ensure()?;
+                fs::create_dir_all(paths.services_dir())?;
+                let service_id = "vllm-qwen-1000";
+                let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+                    .local_addr()?
+                    .port();
+                // The staged state of `service-stop-09`: recorded, running, and
+                // with no key file.
+                let mut existing = rocm_core::ManagedServiceRecord::new(
+                    &paths,
+                    service_id,
+                    "vllm",
+                    "qwen",
+                    "qwen-canonical",
+                    host,
+                    port,
+                    "managed",
+                    std::process::id(),
+                    None,
+                    None,
+                    None,
+                );
+                existing.status = "ready".to_owned();
+                existing.engine_pid = Some(std::process::id());
+                existing.requires_api_key = requires_api_key;
+                existing.write()?;
+                let message = rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    requires_api_key,
+                    start,
+                    service_id,
+                )
+                .expect_err("a keyless service is refused")
+                .to_string();
+                let serve = with_port_filled_to(&advised_serve_command(&message), port);
+                let runnable: Vec<String> = serve
+                    .iter()
+                    .map(|word| match word.as_str() {
+                        "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
+                        _ => word.clone(),
+                    })
+                    .collect();
+                let stop = advised_stop_command(&message);
+                let case = format!("{host} requires={requires_api_key} {start:?}");
+
+                // The stop is the CLI's own hint, and a command `rocm` accepts.
+                assert_eq!(
+                    stop.join(" "),
+                    crate::service_hints::service_stop_hint(service_id),
+                    "{case}"
+                );
+                assert_eq!(
+                    crate::advised_commands::rocm_verdict(&stop[1..]),
+                    crate::advised_commands::Verdict::Parses,
+                    "{case}"
+                );
+                // It comes before the launch in the sentence that names both.
+                assert!(
+                    message.find("rocm services stop").unwrap()
+                        < message.find("rocm serve <model>").unwrap(),
+                    "{case}: {message}"
+                );
+
+                // Only the launch, while the service still runs: `serve` reuses the
+                // running service and drops the key it generated, so the recorded
+                // service is exactly as keyless as before and is refused again.
+                let (spawned, key_kept) =
+                    follow_serve_through_the_spawn(&runnable, &paths, "vllm-qwen-2000", &resolve);
+                assert!(
+                    matches!(spawned, Ok(ManagedSpawn::AlreadyRunning(_))),
+                    "{case}: the launch must find the running service"
+                );
+                assert!(!key_kept, "{case}: the unused key is dropped");
+                assert!(
+                    endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none(),
+                    "{case}: the running service did not gain a key"
+                );
+                assert!(
+                    rocm_core::ensure_public_service_has_endpoint_key(
+                        host,
+                        endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
+                        requires_api_key,
+                        start,
+                        service_id,
+                    )
+                    .is_err(),
+                    "{case}: launching without stopping first does not clear the refusal"
+                );
+
+                // The advised order: the stop, then the launch.
+                let report = crate::service_control::stop_internal_managed_service_with(
+                    &paths,
+                    service_id,
+                    |_| Vec::new(),
+                )?;
+                assert_eq!(report["stopped"], true, "{case}: {report}");
+                let recorded = crate::managed_service_status::load_managed_services(&paths)?;
+                assert!(
+                    recorded
+                        .iter()
+                        .all(|record| record.service_id != service_id || record.status == "stopped"),
+                    "{case}: the stop leaves the service stopped"
+                );
+                // The launch now finds nothing to reuse, so it goes on to spawn,
+                // which is where this stops it: the guard that refused a keyless
+                // start admitted this one because the key `serve` stored for it
+                // is on disk.
+                let reached_spawn = std::rc::Rc::new(std::cell::Cell::new(false));
+                let observed = reached_spawn.clone();
+                TEST_SPAWN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(std::rc::Rc::new(move |_command| {
+                        observed.set(true);
+                        Err(std::io::Error::other("spawn intercepted by test"))
+                    }));
+                });
+                let (spawned, _) =
+                    follow_serve_through_the_spawn(&runnable, &paths, "vllm-qwen-3000", &resolve);
+                TEST_SPAWN_HOOK.with(|hook| *hook.borrow_mut() = None);
+                let error = spawned
+                    .err()
+                    .unwrap_or_else(|| panic!("{case}: the intercepted spawn fails"));
+                assert!(
+                    format!("{error:#}").contains("spawn intercepted by test"),
+                    "{case}: {error:#}"
+                );
+                assert!(
+                    reached_spawn.get(),
+                    "{case}: after the stop the launch reaches the spawn with its key"
                 );
                 let _ = fs::remove_dir_all(root);
             }

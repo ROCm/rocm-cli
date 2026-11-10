@@ -202,9 +202,13 @@ Feature: Stopping a managed service
   # serve` command to launch the server again, and the command is checked
   # against the real parser with a model filled in for its `<model>`
   # placeholder (`--help` ends the parse after every other word has been
-  # accepted, so nothing is started). That running it clears the condition is
-  # covered by the unit tests, which follow it through `serve`'s own policy and
-  # the key file it stores; here it is only shown to be a command `rocm` accepts.
+  # accepted, so nothing is started). The server is still running, and `rocm
+  # serve` reuses a running server and discards the key it generated, so the
+  # refusal names the stop that has to come first, and that is checked the same
+  # way. That running both clears the condition is covered by the unit tests,
+  # which follow them through the real stop, the spawn's reuse of a running
+  # service and `serve`'s own policy and key file; here they are only shown to
+  # be commands `rocm` accepts.
   #
   # The refusal comes before the stop, so the promise it makes is the one checked
   # last: the running server is left running, not marked stopped and with no
@@ -219,4 +223,5 @@ Feature: Stopping a managed service
     When the user restarts it with --yes
     Then the CLI refuses the restart because it would reopen the public server without authentication
     And the refusal names a serve command that rocm accepts
+    And the refusal names the stop that has to come first
     And the server is left running, with no stop recorded and no key file
