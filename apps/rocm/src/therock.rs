@@ -40,8 +40,10 @@ pub(crate) use self::probe::{
     probe_runtime_devices, probe_torch_alignment, requirement_pinned_version, split_local_version,
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
+pub(crate) use self::python::NEXT_MANAGED_PYTHON_VERSION;
 use self::python::{
     ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
+    python_requirement_for_version,
 };
 use self::resolve::{
     AggregateDeviceTarget, PipRuntimePlan, canonical_auto_select_needs_next_python,
@@ -56,8 +58,8 @@ use self::source::{
     requested_source_layout, select_source_layout,
 };
 pub(crate) use self::update::{
-    RuntimeUpdatePlan, maybe_refresh_startup_update_check, render_update_json,
-    render_update_report, runtime_update_check, runtime_update_plan,
+    RuntimeUpdatePlan, maybe_refresh_startup_update_check, recorded_python_version,
+    render_update_json, render_update_report, runtime_update_check, runtime_update_plan,
 };
 pub(crate) use self::version::runtime_version_display;
 use self::version::{
@@ -143,6 +145,9 @@ struct InstallSourceOverride<'a> {
     family: Option<&'a str>,
     device_target: Option<&'a str>,
     layout: Option<SourceLayout>,
+    /// `--python-version`: the interpreter a ROCm 10+ install runs on in place
+    /// of the layout's default.
+    python_version: Option<&'a str>,
 }
 
 /// What to install, as resolved from the `rocm install sdk` arguments.
@@ -157,6 +162,9 @@ pub(crate) struct SdkInstallRequest<'a> {
     pub prefix: Option<PathBuf>,
     pub version_selector: Option<RuntimeVersionSelector>,
     pub family_override: Option<&'a str>,
+    /// `--python-version`: the Python a ROCm 10+ install runs on, when not the
+    /// default one. Only a wheel install has a Python to choose.
+    pub python_version: Option<&'a str>,
     pub dry_run: bool,
     /// Install the compiler and headers alongside the runtime libraries.
     pub include_devel: bool,
@@ -177,6 +185,7 @@ impl Default for SdkInstallRequest<'_> {
             prefix: None,
             version_selector: None,
             family_override: None,
+            python_version: None,
             dry_run: false,
             include_devel: false,
             // Withholding consent is the safe default: a caller that leaves it
@@ -198,11 +207,15 @@ pub(crate) fn install_sdk(
         prefix,
         version_selector,
         family_override,
+        python_version,
         dry_run,
         include_devel,
         consent,
     } = request;
     let channel = TheRockChannel::parse(channel)?;
+    if python_version.is_some() && format != "wheel" {
+        bail!("--python-version applies only to wheel installs; a tarball install uses no Python");
+    }
     ensure_install_format_supported(format)?;
     match format {
         "wheel" => install_wheel_runtime(
@@ -211,6 +224,7 @@ pub(crate) fn install_sdk(
             prefix,
             InstallSourceOverride {
                 family: family_override,
+                python_version,
                 ..InstallSourceOverride::default()
             },
             version_selector.as_ref(),
@@ -268,6 +282,7 @@ pub(crate) fn install_sdk_for_update(
     device_target: Option<&str>,
     source_layout_generation: Option<&str>,
     include_devel: bool,
+    python_version: Option<&str>,
     dry_run: bool,
     activate_after_install: bool,
 ) -> Result<SdkInstallResult> {
@@ -286,22 +301,28 @@ pub(crate) fn install_sdk_for_update(
                 family: Some(family),
                 device_target,
                 layout,
+                python_version,
             },
             None,
             dry_run,
             include_devel,
             consent,
         ),
-        "tarball" => install_tarball_runtime(
-            paths,
-            channel,
-            None,
-            Some(family),
-            None,
-            layout,
-            dry_run,
-            consent,
-        ),
+        "tarball" => {
+            if python_version.is_some() {
+                bail!("a tarball install uses no Python, so it has no --python-version");
+            }
+            install_tarball_runtime(
+                paths,
+                channel,
+                None,
+                Some(family),
+                None,
+                layout,
+                dry_run,
+                consent,
+            )
+        }
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -334,6 +355,7 @@ fn install_wheel_runtime(
         family: family_override,
         device_target: device_target_override,
         layout: layout_override,
+        python_version: python_version_override,
     } = source_override;
     // `device_target_override` (an update apply's exact recorded arch) is only
     // otherwise consulted after `resolve_pip_runtime` returns — too late for the
@@ -359,15 +381,19 @@ fn install_wheel_runtime(
     // the canonical/nightly feed's own "latest" has rotated past that major on
     // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
     // peeks the channel's own `rocm` listing to catch that case.
-    let python_requirement = match requested_source_layout(layout_override, version_selector) {
-        SourceLayout::Next => python_requirement(SourceLayout::Next),
+    let python_layout = match requested_source_layout(layout_override, version_selector) {
+        SourceLayout::Next => SourceLayout::Next,
         SourceLayout::Canonical => {
             if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
-                python_requirement(SourceLayout::Next)
+                SourceLayout::Next
             } else {
-                python_requirement(SourceLayout::Canonical)
+                SourceLayout::Canonical
             }
         }
+    };
+    let python_requirement = match python_version_override {
+        Some(version) => python_requirement_for_version(python_layout, version)?,
+        None => python_requirement(python_layout),
     };
     // A preview promises nothing here: whether a Python would be prepared, and
     // which, is only known once the search below has run (a version override can
@@ -1080,6 +1106,35 @@ mod tests {
     use super::test_support::workspace_test_artifact_dir;
     use super::test_support::{test_paths, test_runtime_manifest};
     use super::*;
+
+    /// `--format tarball` installs no Python, so a Python choice cannot be honoured
+    /// and is refused before anything is resolved or downloaded. The refusal comes
+    /// ahead of the platform's tarball check so it reads the same on every host.
+    #[test]
+    fn python_version_is_refused_for_a_tarball_install() {
+        let (_root, paths) = test_paths("tarball-python-version-refused");
+        let error = install_sdk(
+            &paths,
+            SdkInstallRequest {
+                channel: "release",
+                format: "tarball",
+                prefix: None,
+                version_selector: None,
+                family_override: None,
+                python_version: Some("3.12"),
+                dry_run: true,
+                include_devel: false,
+                consent: SdkInstallConsent::Ask,
+            },
+        )
+        .expect_err("a tarball install has no Python to choose");
+        assert!(
+            error
+                .to_string()
+                .contains("--python-version applies only to wheel installs"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn download_space_requirement_includes_the_safety_margin() {
