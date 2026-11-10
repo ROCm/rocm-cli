@@ -1282,7 +1282,6 @@ dependencies = [
  "rand 0.10.3",
  "reqwest 0.13.4",
  "rocm-core",
- "rocm-deps",
  "serde",
  "serde_json",
  "sha2",

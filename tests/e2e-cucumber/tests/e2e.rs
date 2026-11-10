@@ -707,8 +707,9 @@ impl E2eWorld {
     /// performs. `env_id` is the one field that cannot be a sentinel: `serve`
     /// skips its own install only when `Detect` reports the id
     /// `managed_engine_runtime_id` builds for the pinned version, and a
-    /// placeholder makes it quietly run the real install instead. So it is
-    /// derived from `rocm_deps` rather than copied.
+    /// placeholder makes it quietly run the real install instead. So its
+    /// version is read from the workspace pin file, `runtime-deps.toml`, the
+    /// same file the product builds that id from, rather than copied.
     ///
     /// It goes under the scenario's own `data/engines/lemonade`, because this
     /// scenario does not call [`Self::use_shared_runtimes`]: with an empty
@@ -748,9 +749,10 @@ impl E2eWorld {
         install_fixture_binary("fake-lemonade", &lemond);
         install_fixture_binary("fake-lemonade", &lemonade);
 
+        let version = e2e_cucumber::runtime_pins::pinned_version("lemonade");
         let manifest = serde_json::json!({
-            "env_id": format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
-            "version": rocm_deps::LEMONADE_VERSION,
+            "env_id": format!("lemonade-embeddable-{version}"),
+            "version": version,
             "runtime_dir": runtime_dir,
             "lemond": lemond,
             "lemonade": lemonade,
