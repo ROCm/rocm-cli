@@ -783,7 +783,11 @@ The cucumber suite runs in one of two hardware modes, chosen by
   usable AMD GPU.
 
 Any other value aborts the run, so a misspelt `real` cannot silently skip the
-real-GPU scenarios. To run them locally on a GPU host:
+real-GPU scenarios. A missing one would skip them just as quietly, so
+`every_self_hosted_lane_runs_the_real_gpu_scenarios` in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs) fails when a
+self-hosted lane does not set `E2E_HARDWARE: real`, when a WSL lane does not
+forward it through `WSLENV`, or when a GitHub-hosted job sets it. To run them locally on a GPU host:
 
 ```bash
 E2E_HARDWARE=real cargo xtask e2e
