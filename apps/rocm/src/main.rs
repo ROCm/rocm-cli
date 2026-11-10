@@ -17,6 +17,7 @@ mod chat;
 mod chat_cmd;
 mod chat_host_facts;
 mod cli;
+mod cli_args;
 mod cli_audit;
 mod cli_progress;
 mod cli_report;
