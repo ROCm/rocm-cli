@@ -161,7 +161,7 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI explains that temperature cannot be negative
 
-  # The masked-device path: on a real GPU host where every device is hidden, the
+  # The masked-device path: on a GPU host where every device is hidden, the
   # GPU-required serve must treat it as "no GPU" and refuse, not fall back. The
   # GPU host is simulated; the refusal happens before any engine would touch it.
   @id:serve-masked-devices-fail @requires-os:linux
@@ -222,7 +222,7 @@ Feature: Model serving
   # on the host but is hidden by an active visibility mask
   # (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES) must be validated against the
   # VISIBLE set and refused — never silently remapped onto a visible device. This
-  # is distinct from scenario 13 (an index beyond the device count): here the index
+  # is distinct from serve-16 (an index beyond the device count): here the index
   # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
   # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
   # rejection directly. It runs on a simulated two-GPU machine, the multi-GPU
@@ -478,7 +478,7 @@ Feature: Model serving
   # Lemonade specifically, because it is the engine that manages its own runtime
   # and therefore the one whose preparation is user-visible; the planted record
   # names lemonade too, so the engine matches and the MODEL is the only thing
-  # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
+  # keeping the pre-gate shut. serve-13 already covers the plain refusal with
   # no service planted at all, and serve-28 plants the SAME model, so neither
   # discriminates the model keying — this one does.
   #

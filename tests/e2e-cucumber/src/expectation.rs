@@ -1734,7 +1734,7 @@ serve_timeout_secs = 90
     #[test]
     fn requires_no_gpu_runs_only_on_hosts_without_a_gpu() {
         let m = Expectations::default();
-        let d = decl(&["id:serve-no-gpu-fails-fast", "requires-no-gpu"]);
+        let d = decl(&["id:serve-no-gpu-fails-fast-on-this-host", "requires-no-gpu"]);
         // The mock host has no AMD GPU → the no-GPU premise applies → runs.
         assert_eq!(
             resolve(
@@ -1829,12 +1829,14 @@ serve_timeout_secs = 90
 
     #[test]
     fn combining_requires_os_and_requires_bare_metal_narrows_to_native_linux() {
-        // diagnose-08's exact tag set. It needs a Linux host (the assertion reads
-        // back a shell rc file) that is ALSO not WSL (the only auto-applicable
-        // fix reaching the consent gate does not apply there). Neither tag says
-        // that alone, so the pair has to compose — and a `-n` filtered local run
-        // bypasses this resolution entirely, which makes it worth pinning here
-        // rather than trusting a hand-run of the suite.
+        // The tag set a premise like diagnose-08's needs on the real host: Linux
+        // (the assertion reads back a shell rc file) that is ALSO not WSL (the
+        // only auto-applicable fix reaching the consent gate does not apply
+        // there). diagnose-08 itself now plants a simulated bare-metal machine
+        // instead, but diagnose-20/28 and driver-install-07/08 still carry the
+        // pair. Neither tag says that alone, so the pair has to compose — and a
+        // `-n` filtered local run bypasses this resolution entirely, which makes
+        // it worth pinning here rather than trusting a hand-run of the suite.
         let m = Expectations::default();
         let d = decl(&[
             "id:diagnose-fix-requires-agreement-before-changing-anything",
@@ -1870,7 +1872,10 @@ serve_timeout_secs = 90
     #[test]
     fn requires_wsl_runs_only_on_wsl_hosts() {
         let m = Expectations::default();
-        let d = decl(&["id:examine-detects-wsl", "requires-wsl"]);
+        let d = decl(&[
+            "id:diagnose-real-wsl-never-reports-bare-metal-causes",
+            "requires-wsl",
+        ]);
         assert!(d.requires_wsl);
         for wsl in ["wsl", "wsl2"] {
             assert_eq!(

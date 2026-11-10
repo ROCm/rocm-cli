@@ -2173,7 +2173,7 @@ mod tests {
 
     /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually
     /// trips the serve-plan low-VRAM warning on a non-APU (vLLM-lane) host, and
-    /// stay inert when the var is unset. This is what the `@requires-gpu`
+    /// stay inert when the var is unset. This is what the `@requires-real-gpu`
     /// `serve-vllm-low-vram-oom-guidance` scenario relies on to fire the note
     /// deterministically on cards that are really free.
     #[cfg(feature = "e2e-test-hooks")]

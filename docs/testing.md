@@ -794,7 +794,8 @@ E2E_HARDWARE=real cargo xtask e2e
 ```
 
 A scenario describes its machine with a Given step — `a machine with an AMD
-Instinct GPU`, `a machine with eight AMD Instinct GPUs`, `a bare-metal Linux
+Instinct GPU`, `a machine with two AMD Instinct GPUs`, `a machine with eight AMD
+Instinct GPUs`, `a bare-metal Linux
 machine with an AMD GPU`, `a WSL machine with an AMD GPU passed through`, `a
 Linux machine with no AMD GPU` (see
 [simulated_host_steps.rs](../tests/e2e-cucumber/tests/e2e/simulated_host_steps.rs)).
@@ -856,9 +857,12 @@ that hardware.
 A simulated machine is only worth trusting while it is laid out the way the
 kernel lays out a real one, so two `@nightly` scenarios
 (`@id:examine-simulated-machine-matches-the-kernel`,
-`@id:examine-simulated-wsl-machine-matches-wsl`) hold every fixture assumption
-against the live `/dev`, `/sys`, `/proc/version` and `lspci` of a real GPU host
-and a real WSL2 distribution. When a kernel or driver update moves something,
+`@id:examine-simulated-wsl-machine-matches-wsl`) hold the planted layout
+against a real GPU host and a real WSL2 distribution: on bare metal the device
+nodes, the KFD properties each GPU node states, its `gpu_id` and render node,
+the DRM cards and the shape of the `lspci` lines; on WSL2 `/dev/dxg`, DXCore and
+the kernel string in `/proc/version`. They do not compare property values,
+other `/proc` files or the stand-ins' canned output. When a kernel or driver update moves something,
 they fail with the exact difference; update
 [simulated_host.rs](../tests/e2e-cucumber/src/simulated_host.rs) to match.
 

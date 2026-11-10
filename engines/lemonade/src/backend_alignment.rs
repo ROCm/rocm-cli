@@ -106,7 +106,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
 /// pin file, and the `lemond`-spawning backend probe) so this crate's own unit tests
 /// can drive the disabled early return and the probe-error fallback -- the two
 /// branches that decide whether any alignment is even attempted, and previously had
-/// no coverage outside a `@nightly @requires-gpu` e2e lane. `disabled` is
+/// no coverage outside a `@nightly @requires-real-gpu` e2e lane. `disabled` is
 /// [`lemonade_backend_alignment_disabled`]'s resolved value, passed in for the same
 /// reason `align` (below) takes it as a parameter: a test can drive both branches
 /// without touching process environment. `unsupported_platform` is likewise resolved
@@ -114,7 +114,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
 /// here, so a test can drive the OS-gate branch without depending on the real
 /// platform the suite happens to run on -- previously this gate called the
 /// `const fn` platform checks directly and had no coverage outside a
-/// `@nightly @requires-gpu` e2e lane.
+/// `@nightly @requires-real-gpu` e2e lane.
 ///
 /// This function, not `align`, is the real production enforcement point for the
 /// opt-out: the single production call site passes `disabled` straight through to
@@ -1334,7 +1334,7 @@ mod tests {
     #[test]
     fn prepare_disabled_early_return_skips_every_lookup_and_installs_unforced() {
         // The real production gate for the opt-out: previously this was covered only
-        // by a @nightly @requires-gpu e2e scenario, which every per-PR and
+        // by a @nightly @requires-real-gpu e2e scenario, which every per-PR and
         // merge-queue lane skips -- so a regression that silently re-enabled
         // alignment here shipped green everywhere that actually gates a merge. Every
         // lookup the disabled path is supposed to skip panics if reached; the
@@ -1370,7 +1370,7 @@ mod tests {
         // verifiable there, so every lookup below it must be skipped the same way the
         // disabled path skips them. Previously this branch called the `const fn`
         // platform checks directly and had no coverage outside a
-        // `@nightly @requires-gpu` e2e lane that never runs on such a host.
+        // `@nightly @requires-real-gpu` e2e lane that never runs on such a host.
         let mut manifest = test_manifest(PathBuf::from("unused-runtime-dir"));
 
         let result = prepare_llamacpp_backend_for_active_rocm_impl(

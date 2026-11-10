@@ -6,10 +6,11 @@
 //!
 //! The CLI learns about the machine partly from files (redirected by
 //! `ROCM_CLI_TEST_HOST_ROOT`, see `rocm_core::host_path`) and partly by running
-//! programs: `uname`, `lsmod`, `modinfo`, `ldconfig`, `lspci`, `rocminfo`,
-//! `rocm_agent_enumerator`, `amd-smi`. A simulated-host scenario links this one
-//! binary into a directory at the front of `PATH` under each of those names, so
-//! the real host's answers cannot leak into the simulated one.
+//! programs ([`HOST_TOOLS`](e2e_cucumber::simulated_host::HOST_TOOLS)). A
+//! simulated-host scenario takes all of those off `PATH` and links this one
+//! binary, at the front of it, under the name of each tool the simulated machine
+//! has, so the real host's answers cannot leak into the simulated one and a tool
+//! the machine lacks is simply absent.
 //!
 //! It answers from `$ROCM_CLI_TEST_HOST_ROOT/.fake-tools/`: the file named after
 //! the exact command line (`uname -r`, `lspci -nn -D`). Its contents are printed

@@ -644,10 +644,11 @@ jobs:
         # `amdgpu_present_on_host`, `driver_states` and the three
         # `probe_modules_reports_*` tests). The other routed
         # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
-        # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
-        # ROCDXG checks) have no planted-root unit assertion; they are covered
-        # end to end only by the e2e simulated-machine scenarios
-        # (tests/e2e-cucumber/src/simulated_host.rs).
+        # `/proc` files, the `/usr/lib/wsl/lib` and ROCDXG checks) have no
+        # planted-root unit assertion; they are covered end to end only by the
+        # e2e simulated-machine scenarios (tests/e2e-cucumber/src/simulated_host.rs).
+        # The modprobe directories are planted by no simulated machine, so
+        # nothing covers their routed read.
         #
         # nextest, like the step above, so each test is its own process: the
         # planted-root test sets the root for the whole process while it runs,

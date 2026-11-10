@@ -761,8 +761,10 @@ Feature: GPU detection and system inspection
   # trusting while they are laid out the way the kernel lays out a real one. If a
   # kernel moved a property, every simulated scenario would keep passing while the
   # CLI failed on hardware -- the shape of the bug examine-04 pins, where the
-  # target was read from a file no kernel has. So on a real GPU host, every
-  # fixture assumption is held against the live /dev, /sys and `lspci`. Nightly,
+  # target was read from a file no kernel has. So on a real GPU host, the planted
+  # layout (device nodes, the KFD properties each GPU node states, render nodes,
+  # DRM cards, the `lspci` line shape) is held against the live /dev, /sys and
+  # `lspci`. Nightly,
   # because kernels change on the scale of runner reimages, not pull requests.
   @id:examine-simulated-machine-matches-the-kernel @requires-real-gpu @requires-bare-metal @requires-os:linux @nightly
   Scenario: examine-50 - The simulated GPU machine is laid out like a real GPU host
