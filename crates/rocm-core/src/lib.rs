@@ -85,7 +85,9 @@ pub use binary_paths::{
     daemon_binary_path, engine_binary_path, sibling_binary_path, sibling_binary_path_from,
 };
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
-pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
+pub use command_capture::{
+    CommandCapture, CommandOutcome, command_capture_text, run_rocm_capture_with_env,
+};
 pub use config::{
     AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
     DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,

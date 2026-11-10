@@ -598,3 +598,20 @@ Feature: GPU detection and system inspection
     Given a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH
     When the user inspects that machine in machine-readable form
     Then both reports say rocminfo is installed
+
+  # The host probes' subprocess helpers used to read a tool's output until every
+  # holder of the pipe had closed it, so a tool that left a background process
+  # behind (a helper the tool starts and does not wait for) held the whole
+  # inspection until that process exited, however quickly the tool itself did.
+  # They now stop reading shortly after the tool exits, and the inspection keeps
+  # what the tool printed before that. The stand-in `lspci` prints one AMD GPU,
+  # exits 0 and leaves a `sleep` holding its output for 30 seconds; the
+  # inspection must finish well inside that and still list the GPU, so what the
+  # tool printed before it exited is still collected. It does not pin the length
+  # of the grace: that is the unit tests' (`subprocess_runners_pair`).
+  @id:examine-lspci-leaving-a-background-process-does-not-hold-up-the-inspection @requires-os:linux
+  Scenario: examine-39 - A PCI listing tool that leaves a background process behind does not hold up the inspection
+    Given a machine whose lspci prints a GPU and leaves a background process holding its output open
+    When the user inspects that machine in machine-readable form and the time it takes is measured
+    Then the inspection finishes long before the background process does
+    And the inspection lists the GPU that lspci printed

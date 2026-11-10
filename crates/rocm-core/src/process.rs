@@ -17,14 +17,18 @@
 //! abandoned rather than joined, so a grandchild holding the pipe's write end
 //! open cannot outlast the deadline either. The timeout error quotes a bounded
 //! head of the child's own output, because that text reaches persisted
-//! automation logs. `Capture`, `run_captured`, `wait_bounded`, `Waitable` and
-//! `assemble_output` exist to serve it.
+//! automation logs. `Capture`, `settle`, `run_captured`, `wait_bounded`,
+//! `Waitable` and `assemble_output` exist to serve it.
 //!
-//! It is not yet the only such helper in the tree; converging the remaining
-//! capture helpers onto it is tracked in
+//! `run_bounded` is the same executor for a caller that wants the run as a
+//! [`CommandCapture`] with a typed [`CommandOutcome`] and the raw bytes, a
+//! timeout included, instead of an `Err`. The host probes' `run` and
+//! `capture_optional_command*` are thin adapters over it. It is not yet the only
+//! such helper in the tree; converging the others onto it is tracked in
 //! [#623](https://github.com/ROCm/rocm-cli/issues/623).
 
 use crate::DEFAULT_LOCAL_HOST;
+use crate::command_capture::{self, CommandCapture, CommandOutcome};
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
 use std::collections::BTreeMap;
@@ -833,8 +837,26 @@ fn windows_environment_block(env_overrides: &[(&str, &Path)]) -> Vec<u16> {
     block
 }
 
-/// How often the wait loop polls for the child's exit.
+/// The longest the wait loop sleeps between polls for the child's exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The first sleep of the wait loop, before [`next_poll_interval`] backs it off.
+///
+/// A host probe is usually a child that exits within a few milliseconds, and a
+/// flat 50 ms sleep made every such call take 50 ms: the probes that older
+/// helpers polled every 20 to 25 ms would then each have got slower for taking
+/// this executor on, and `rocm examine` runs dozens of them one after another.
+const FIRST_POLL: Duration = Duration::from_millis(5);
+
+/// The sleep after `current`: doubled, up to [`POLL_INTERVAL`].
+const fn next_poll_interval(current: Duration) -> Duration {
+    let doubled = current.saturating_mul(2);
+    if doubled.as_millis() > POLL_INTERVAL.as_millis() {
+        POLL_INTERVAL
+    } else {
+        doubled
+    }
+}
 
 /// How much a reader accumulates before publishing it to the shared buffer.
 const READ_CHUNK: usize = 16 * 1024;
@@ -1027,17 +1049,6 @@ impl Capture {
         };
         (bytes, self.failure().take())
     }
-
-    /// Mark the capture abandoned and release what it holds, for an error path
-    /// that returns before `take()` would.
-    ///
-    /// `take()` is the only place that sets `abandoned`, so going through it
-    /// keeps "marked" and "emptied" a single step with one implementation. The
-    /// bytes and any read error are dropped because a caller on this path is
-    /// already reporting something else.
-    fn abandon(&self) {
-        drop(self.take());
-    }
 }
 
 /// Run `command` to completion with both output streams captured, giving up
@@ -1074,75 +1085,220 @@ impl Capture {
 /// `label` names the subject in error messages (e.g. `"process"`,
 /// `"sandbox process"`).
 pub fn run_with_timeout(mut command: Command, timeout: Duration, label: &str) -> Result<Output> {
+    let (child, stdout, stderr) =
+        spawn_captured(&mut command).with_context(|| format!("failed to spawn {label}"))?;
+    run_captured(child, stdout, stderr, timeout, label)
+}
+
+/// [`run_with_timeout`] for a caller that wants to know how the run ended
+/// rather than to have a timeout or a failure turned into an error: the same
+/// executor, with the result as a [`CommandCapture`].
+///
+/// Nothing is an `Err` here. A program that cannot be started, a timeout and a
+/// failure to wait are each an [`CommandOutcome`] of the capture, and a timeout
+/// keeps what the child had written, so a caller that reads `stdout_raw` after
+/// one gets the partial output [`run_with_timeout`] only quotes. The bounds are
+/// [`run_with_timeout`]'s: the readers are abandoned after [`DRAIN_GRACE`], so
+/// a descendant that keeps a pipe open does not extend the call.
+pub(crate) fn run_bounded(mut command: Command, timeout: Duration, label: &str) -> CommandCapture {
+    let argv = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    match spawn_captured(&mut command) {
+        Err(error) => CommandCapture::from_run(
+            argv,
+            CommandOutcome::from_spawn_error(error.kind()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(error.to_string()),
+        ),
+        Ok((child, stdout, stderr)) => {
+            capture_of(argv, settle(child, stdout, stderr, timeout, label))
+        }
+    }
+}
+
+/// Start `command` with null stdin and both output pipes drained from the first
+/// moment, which is what lets the wait loop be bounded at all.
+fn spawn_captured(command: &mut Command) -> std::io::Result<(Child, Capture, Capture)> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn {label}"))?;
-
+        .spawn()?;
     // Taking the pipes here is what obliges us to assemble `Output` by hand
-    // below: `wait_with_output` reads the handles it owns, and these are gone.
+    // later: `wait_with_output` reads the handles it owns, and these are gone.
     let stdout = Capture::draining(child.stdout.take());
     let stderr = Capture::draining(child.stderr.take());
-
-    run_captured(child, stdout, stderr, timeout, label)
+    Ok((child, stdout, stderr))
 }
 
-/// The rest of [`run_with_timeout`] once the child is spawned and both readers
-/// are running.
+/// How a run ended and what it left behind, before it is turned into either a
+/// `Result<Output>` or a [`CommandCapture`].
+enum Settled {
+    /// The child was waited for: it exited, or the deadline killed it.
+    Waited {
+        status: ExitStatus,
+        timed_out: bool,
+        /// Whether both readers reached end of output before the drain grace
+        /// ended. When not, something other than the child still holds a pipe
+        /// and the bytes are what arrived by then.
+        drained: bool,
+        stdout: (Vec<u8>, Option<std::io::Error>),
+        stderr: (Vec<u8>, Option<std::io::Error>),
+    },
+    /// Polling or reaping the child failed, and it was killed.
+    WaitFailed {
+        error: anyhow::Error,
+        stdout: (Vec<u8>, Option<std::io::Error>),
+        stderr: (Vec<u8>, Option<std::io::Error>),
+    },
+}
+
+/// The wait, the drain grace and the `take()` of both captures: everything
+/// between a child being spawned and its result being formed.
 ///
 /// Generic over [`Waitable`] rather than taking a `Child` so that the wait
 /// loop's two failure paths — which are the only ways out of this function that
-/// skip the normal `take()` — are reachable from a test.
-fn run_captured<C: Waitable>(
+/// skip the drain grace — are reachable from a test.
+fn settle<C: Waitable>(
     mut child: C,
     stdout: Capture,
     stderr: Capture,
     timeout: Duration,
     label: &str,
-) -> Result<Output> {
-    // The single error path between `Capture::draining` above and the `take()`
-    // pair below, and it must abandon both captures before it propagates.
-    // `take()` is what marks a reader abandoned, and an abandoned reader is
-    // what stops a buffer nobody will read again from growing for as long as a
-    // grandchild holds the pipe open. Returning the error straight out of the
-    // wait loop — the shape this replaced — left both readers appending
-    // forever, in a daemon that probes every 60 seconds.
-    let (status, timed_out) = match wait_bounded(&mut child, timeout, label) {
+) -> Settled {
+    // The single error path between `Capture::draining` and the `take()` pair
+    // below, and it must take both captures before it returns. `take()` is
+    // what marks a reader abandoned, and an abandoned reader is what stops a
+    // buffer nobody will read again from growing for as long as a grandchild
+    // holds the pipe open. Returning straight out of the wait loop — the shape
+    // this replaced — left both readers appending forever, in a daemon that
+    // probes every 60 seconds.
+    let (status, timed_out) = match wait_bounded(&mut child, timeout, label, thread::sleep) {
         Ok(outcome) => outcome,
         Err(error) => {
-            stdout.abandon();
-            stderr.abandon();
-            return Err(error);
+            return Settled::WaitFailed {
+                error,
+                stdout: stdout.take(),
+                stderr: stderr.take(),
+            };
         }
     };
 
-    let drained_by = Instant::now() + DRAIN_GRACE;
-    while !(stdout.is_finished() && stderr.is_finished()) && Instant::now() < drained_by {
-        thread::sleep(POLL_INTERVAL.min(DRAIN_GRACE / 4));
-    }
-    assemble_output(
+    let drained = wait_for_readers(&stdout, &stderr, DRAIN_GRACE, thread::sleep);
+    Settled::Waited {
         status,
         timed_out,
-        stdout.take(),
-        stderr.take(),
-        label,
-        timeout,
-    )
+        drained,
+        stdout: stdout.take(),
+        stderr: stderr.take(),
+    }
+}
+
+/// Give both readers up to `grace` to reach end of output, looking again after
+/// each `sleep` of the back-off schedule, and say whether they did.
+///
+/// `sleep` is a parameter so a test can see the schedule the loop really
+/// follows instead of inferring it from [`next_poll_interval`] alone.
+fn wait_for_readers(
+    stdout: &Capture,
+    stderr: &Capture,
+    grace: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> bool {
+    let drained_by = Instant::now() + grace;
+    let mut pause = FIRST_POLL;
+    while !(stdout.is_finished() && stderr.is_finished()) && Instant::now() < drained_by {
+        sleep(pause);
+        pause = next_poll_interval(pause);
+    }
+    stdout.is_finished() && stderr.is_finished()
+}
+
+/// The rest of [`run_with_timeout`] once the child is spawned and both readers
+/// are running.
+fn run_captured<C: Waitable>(
+    child: C,
+    stdout: Capture,
+    stderr: Capture,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output> {
+    match settle(child, stdout, stderr, timeout, label) {
+        Settled::WaitFailed { error, .. } => Err(error),
+        Settled::Waited {
+            status,
+            timed_out,
+            stdout,
+            stderr,
+            ..
+        } => assemble_output(status, timed_out, stdout, stderr, label, timeout),
+    }
+}
+
+/// A [`Settled`] run as a [`CommandCapture`], keeping the bytes a timeout or a
+/// read error would otherwise have turned into an error.
+fn capture_of(argv: Vec<String>, settled: Settled) -> CommandCapture {
+    match settled {
+        Settled::WaitFailed {
+            error,
+            stdout,
+            stderr,
+        } => CommandCapture::from_run(
+            argv,
+            CommandOutcome::WaitFailed,
+            None,
+            stdout.0,
+            stderr.0,
+            Some(format!("{error:#}")),
+        ),
+        Settled::Waited {
+            status,
+            timed_out,
+            drained,
+            stdout: (stdout, stdout_failure),
+            stderr: (stderr, stderr_failure),
+        } => {
+            let outcome = if timed_out {
+                CommandOutcome::TimedOut
+            } else {
+                command_capture::outcome_of_status(status)
+            };
+            // What cut the output short, if anything: a pipe that failed to
+            // read, and/or a descendant still writing when the grace ended. The
+            // outcome stays what the child did, and the bytes are what arrived.
+            let notes: Vec<String> = [
+                stdout_failure.map(|error| format!("failed to read stdout: {error}")),
+                stderr_failure.map(|error| format!("failed to read stderr: {error}")),
+                (!drained).then(|| STILL_ARRIVING.to_owned()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let detail = (!notes.is_empty()).then(|| notes.join("; "));
+            CommandCapture::from_run(argv, outcome, Some(status), stdout, stderr, detail)
+        }
+    }
 }
 
 /// Wait for `child` to exit, killing it once `timeout` has passed.
 ///
 /// Returns the status and whether the deadline is what ended the wait. Kept
 /// free of the captures so that it has exactly one caller to get the
-/// abandon-on-error handling right, rather than one per `?`.
+/// abandon-on-error handling right, rather than one per `?`. `sleep` is what
+/// the loop waits with between polls, a parameter so a test can see the
+/// back-off schedule it follows.
 fn wait_bounded<C: Waitable>(
     child: &mut C,
     timeout: Duration,
     label: &str,
+    mut sleep: impl FnMut(Duration),
 ) -> Result<(ExitStatus, bool)> {
     let deadline = Instant::now() + timeout;
+    let mut pause = FIRST_POLL;
     loop {
         let polled = child.try_wait();
         if polled.is_err() {
@@ -1164,15 +1320,21 @@ fn wait_bounded<C: Waitable>(
                 .with_context(|| format!("failed to reap timed-out {label}"))?;
             return Ok((status, true));
         }
-        thread::sleep(POLL_INTERVAL);
+        sleep(pause);
+        pause = next_poll_interval(pause);
     }
 }
+
+/// What a capture's `detail` says when the drain grace ended with a reader still
+/// waiting for end of output, so the caller can tell a complete capture from a
+/// short one.
+const STILL_ARRIVING: &str = "output was still arriving when the drain grace ended";
 
 /// The three child operations [`wait_bounded`] needs.
 ///
 /// A trait only so a test can fail `try_wait` or the post-kill `wait` on
-/// demand: both are error paths that skip the normal `take()`, and provoking
-/// either from a real child needs the kernel to refuse to reap a process.
+/// demand: both are error paths that skip the drain grace, and provoking either
+/// from a real child needs the kernel to refuse to reap a process.
 trait Waitable {
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
     fn kill(&mut self) -> std::io::Result<()>;
@@ -2058,6 +2220,396 @@ mod tests {
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt as _;
         ExitStatus::from_raw(0)
+    }
+
+    #[test]
+    fn the_poll_interval_backs_off_from_a_few_milliseconds_to_the_flat_one() {
+        // The flat 50 ms this loop had would make a probe that exits at once take
+        // 50 ms, where the helpers it replaces polled every 20 to 25 ms.
+        let mut pause = FIRST_POLL;
+        let mut seen = vec![pause];
+        for _ in 0..5 {
+            pause = next_poll_interval(pause);
+            seen.push(pause);
+        }
+        let millis: Vec<u128> = seen.iter().map(Duration::as_millis).collect();
+        assert_eq!(millis, [5, 10, 20, 40, 50, 50]);
+        assert!(FIRST_POLL < Duration::from_millis(20));
+    }
+
+    /// A child that has not exited for its first `remaining` polls.
+    struct ExitsAfterPolls {
+        remaining: usize,
+    }
+
+    impl Waitable for ExitsAfterPolls {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            if self.remaining == 0 {
+                return Ok(Some(success_status()));
+            }
+            self.remaining -= 1;
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            Ok(success_status())
+        }
+    }
+
+    fn millis(slept: &[Duration]) -> Vec<u128> {
+        slept.iter().map(Duration::as_millis).collect()
+    }
+
+    #[test]
+    fn the_wait_loop_sleeps_the_back_off_schedule_between_polls() {
+        // The sleeps are recorded, not taken, so the schedule the loop really
+        // follows is what is asserted. A loop that slept `POLL_INTERVAL` every
+        // time would charge a probe that exits at once the full 50 ms.
+        let mut slept = Vec::new();
+        let mut child = ExitsAfterPolls { remaining: 6 };
+
+        let (status, timed_out) =
+            wait_bounded(&mut child, Duration::from_mins(1), "process", |pause| {
+                slept.push(pause);
+            })
+            .expect("the child exits on the seventh poll");
+
+        assert!(status.success() && !timed_out);
+        assert_eq!(millis(&slept), [5, 10, 20, 40, 50, 50]);
+    }
+
+    /// Two readers over [`EndlessPipe`]s that stop when `stop` is raised.
+    fn two_endless_captures(stop: &Arc<AtomicBool>) -> (Capture, Capture) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipe = || EndlessPipe {
+            reads: Arc::clone(&reads),
+            stop: Arc::clone(stop),
+        };
+        (
+            Capture::draining(Some(pipe())),
+            Capture::draining(Some(pipe())),
+        )
+    }
+
+    #[test]
+    fn the_drain_wait_sleeps_the_back_off_schedule_until_both_readers_finish() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stdout, stderr) = two_endless_captures(&stop);
+        let mut slept = Vec::new();
+
+        let drained = wait_for_readers(&stdout, &stderr, Duration::from_secs(30), |pause| {
+            slept.push(pause);
+            if slept.len() == 3 {
+                // End the pipes, and give the reader threads real time to see it.
+                stop.store(true, Ordering::Release);
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        assert!(drained, "both readers reached the end of their pipes");
+        assert_eq!(millis(&slept[..3]), [5, 10, 20]);
+    }
+
+    #[test]
+    fn a_drain_wait_that_runs_out_of_grace_says_the_readers_were_still_going() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stdout, stderr) = two_endless_captures(&stop);
+
+        let drained = wait_for_readers(&stdout, &stderr, Duration::ZERO, |_| {
+            unreachable!("no grace, so no sleep")
+        });
+
+        stop.store(true, Ordering::Release);
+        assert!(!drained);
+    }
+
+    /// Drive `settle` for a child that fails the wait loop the way
+    /// [`FailingChild`] says, over two readers that are accumulating.
+    fn settle_a_failing_child(fail_poll: bool, timeout: Duration) -> (Settled, bool) {
+        let killed = Arc::new(AtomicBool::new(false));
+        let child = FailingChild {
+            fail_poll,
+            killed: Arc::clone(&killed),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        // One counter per stream: a single shared one is satisfied by one reader
+        // doing all the reads, which leaves the other stream's bytes to chance.
+        let out_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let err_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipe = |reads: &Arc<std::sync::atomic::AtomicUsize>| EndlessPipe {
+            reads: Arc::clone(reads),
+            stop: Arc::clone(&stop),
+        };
+        let stdout = Capture::draining(Some(pipe(&out_reads)));
+        let stderr = Capture::draining(Some(pipe(&err_reads)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (out_reads.load(Ordering::Acquire) < 4 || err_reads.load(Ordering::Acquire) < 4)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            out_reads.load(Ordering::Acquire) >= 4 && err_reads.load(Ordering::Acquire) >= 4,
+            "both readers must have started"
+        );
+
+        let settled = settle(child, stdout, stderr, timeout, "process");
+
+        stop.store(true, Ordering::Release);
+        (settled, killed.load(Ordering::Acquire))
+    }
+
+    #[test]
+    fn a_failure_to_wait_is_a_capture_that_keeps_the_bytes_that_had_arrived() {
+        // `run_raw` returned `124` with the bytes joined after a failed poll, so
+        // the capture keeps them rather than dropping them with the error, and
+        // the child is killed on the way out.
+        for (fail_poll, timeout, expected) in [
+            (true, Duration::from_secs(30), "failed to poll process"),
+            (false, Duration::ZERO, "failed to reap timed-out process"),
+        ] {
+            let (settled, killed) = settle_a_failing_child(fail_poll, timeout);
+            assert!(killed, "{expected}: the child must be killed");
+
+            let capture = capture_of(vec!["fake".to_owned()], settled);
+
+            assert_eq!(capture.outcome, CommandOutcome::WaitFailed, "{expected}");
+            assert!(capture.status.is_none(), "{expected}");
+            assert!(
+                capture.stdout_raw.len() >= 4096 && capture.stdout_raw.iter().all(|&b| b == b'x'),
+                "{expected}: stdout bytes: {}",
+                capture.stdout_raw.len()
+            );
+            assert!(
+                capture.stderr_raw.len() >= 4096 && capture.stderr_raw.iter().all(|&b| b == b'x'),
+                "{expected}: stderr bytes: {}",
+                capture.stderr_raw.len()
+            );
+            assert_eq!(capture.exit_status, 1, "{expected}");
+            let detail = capture.detail.expect("the wait error is kept in words");
+            assert!(detail.contains(expected), "{detail}");
+        }
+    }
+
+    fn waited(
+        timed_out: bool,
+        drained: bool,
+        stdout: (Vec<u8>, Option<std::io::Error>),
+        stderr: (Vec<u8>, Option<std::io::Error>),
+    ) -> Settled {
+        Settled::Waited {
+            status: success_status(),
+            timed_out,
+            drained,
+            stdout,
+            stderr,
+        }
+    }
+
+    #[test]
+    fn a_timed_out_settle_is_a_capture_with_the_partial_output_and_the_outcome() {
+        let capture = capture_of(
+            vec!["fake".to_owned()],
+            waited(
+                true,
+                true,
+                (b"partial".to_vec(), None),
+                (b"warning".to_vec(), None),
+            ),
+        );
+
+        assert_eq!(capture.outcome, CommandOutcome::TimedOut);
+        assert_eq!(capture.stdout_raw, b"partial");
+        assert_eq!(capture.stderr, "warning");
+        assert_eq!(capture.exit_status, 1, "a timeout has no exit code");
+        assert!(capture.detail.is_none());
+    }
+
+    #[test]
+    fn a_read_failure_on_either_stream_keeps_the_bytes_and_the_outcome_the_child_had() {
+        // `run_with_timeout` turns this into an error and drops the bytes
+        // (`a_read_failure_without_a_timeout_is_reported_rather_than_returned_as_output`);
+        // the capture keeps both, as the older helpers did with `let _ =`.
+        let stdout_only = capture_of(
+            vec!["fake".to_owned()],
+            waited(
+                false,
+                true,
+                (b"partial".to_vec(), read_failure()),
+                (Vec::new(), None),
+            ),
+        );
+        assert_eq!(stdout_only.outcome, CommandOutcome::Exited(0));
+        assert_eq!(stdout_only.stdout, "partial");
+        let detail = stdout_only.detail.expect("the read error is kept in words");
+        assert!(detail.contains("failed to read stdout"), "{detail}");
+        assert!(!detail.contains("stderr"), "{detail}");
+
+        let stderr_only = capture_of(
+            vec!["fake".to_owned()],
+            waited(
+                false,
+                true,
+                (b"out".to_vec(), None),
+                (b"partial".to_vec(), read_failure()),
+            ),
+        );
+        assert_eq!(stderr_only.outcome, CommandOutcome::Exited(0));
+        assert_eq!(stderr_only.stderr, "partial");
+        let detail = stderr_only.detail.expect("the read error is kept in words");
+        assert!(detail.contains("failed to read stderr"), "{detail}");
+        assert!(!detail.contains("stdout"), "{detail}");
+
+        let both = capture_of(
+            vec!["fake".to_owned()],
+            waited(
+                false,
+                true,
+                (Vec::new(), read_failure()),
+                (Vec::new(), read_failure()),
+            ),
+        );
+        let detail = both.detail.expect("both read errors are kept in words");
+        assert!(
+            detail.contains("failed to read stdout") && detail.contains("failed to read stderr"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_capture_says_when_a_reader_was_still_going_at_the_end_of_the_grace() {
+        let short = capture_of(
+            vec!["fake".to_owned()],
+            waited(false, false, (b"early".to_vec(), None), (Vec::new(), None)),
+        );
+        assert_eq!(short.outcome, CommandOutcome::Exited(0));
+        assert_eq!(short.stdout, "early");
+        assert_eq!(short.detail.as_deref(), Some(STILL_ARRIVING));
+
+        let complete = capture_of(
+            vec!["fake".to_owned()],
+            waited(false, true, (b"early".to_vec(), None), (Vec::new(), None)),
+        );
+        assert!(complete.detail.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_written_after_the_grace_is_missing_and_the_capture_says_so() {
+        // The descendant writes 0.5 s after the child exits, which is past the
+        // 200 ms grace: the capture holds `early`, and `detail` says it is short.
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo early; (sleep 0.5; echo late) &"]);
+
+        let capture = run_bounded(command, Duration::from_secs(20), "process");
+
+        assert_eq!(capture.outcome, CommandOutcome::Exited(0));
+        assert_eq!(capture.stdout, "early\n");
+        assert_eq!(capture.detail.as_deref(), Some(STILL_ARRIVING));
+    }
+
+    #[test]
+    fn a_program_that_cannot_be_started_is_a_capture_not_an_error() {
+        let missing = "/nonexistent-dir-for-the-runner-pair/tool";
+        let mut command = Command::new(missing);
+        command.arg("--flag");
+
+        let capture = run_bounded(command, Duration::from_secs(5), "process");
+
+        assert_eq!(capture.outcome, CommandOutcome::NotFound);
+        assert_eq!(capture.argv, [missing, "--flag"]);
+        assert!(capture.stdout_raw.is_empty() && capture.stderr_raw.is_empty());
+        assert_eq!(capture.exit_status, 1);
+        assert!(capture.status.is_none());
+        assert!(capture.detail.is_some(), "the OS error is kept in words");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_exists_but_cannot_be_executed_is_a_spawn_failure_not_not_found() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("not-executable");
+        std::fs::write(&path, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // Not skipped for root: `execve` refuses a file with no execute bit for
+        // every user.
+        let capture = run_bounded(Command::new(&path), Duration::from_secs(5), "process");
+
+        assert_eq!(
+            capture.outcome,
+            CommandOutcome::SpawnFailed(ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_is_a_capture_with_its_exit_code_or_its_signal_and_both_streams() {
+        let capture = run_bounded(
+            {
+                let mut command = Command::new("sh");
+                command.args(["-c", "echo out; echo err >&2; exit 3"]);
+                command
+            },
+            Duration::from_secs(10),
+            "process",
+        );
+        assert_eq!(capture.outcome, CommandOutcome::Exited(3));
+        assert_eq!(capture.exit_status, 3);
+        assert_eq!(capture.stdout, "out\n");
+        assert_eq!(capture.stderr_raw, b"err\n");
+        assert_eq!(capture.argv, ["sh", "-c", "echo out; echo err >&2; exit 3"]);
+        assert_eq!(capture.status.and_then(|status| status.code()), Some(3));
+        assert!(capture.detail.is_none());
+
+        let capture = run_bounded(
+            {
+                let mut command = Command::new("sh");
+                command.args(["-c", "echo partial; kill -9 $$"]);
+                command
+            },
+            Duration::from_secs(10),
+            "process",
+        );
+        assert_eq!(capture.outcome, CommandOutcome::Signaled(Some(9)));
+        assert_eq!(capture.exit_status, 1);
+        assert_eq!(capture.stdout, "partial\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_is_a_capture_with_its_exit_code_and_both_streams() {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "echo out&echo err 1>&2&exit 3"]);
+
+        let capture = run_bounded(command, Duration::from_secs(10), "process");
+
+        assert_eq!(capture.outcome, CommandOutcome::Exited(3));
+        assert_eq!(capture.stdout.trim(), "out");
+        assert_eq!(capture.stderr.trim(), "err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_is_a_capture_with_what_the_child_had_written() {
+        // `exec` so killing the shell leaves nothing on the pipe: what is under
+        // test is the partial output and the outcome, not the join.
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo before; exec sleep 30"]);
+
+        // Room for a loaded host to start the shell and run its `echo` before the
+        // deadline, since the assertion is on what the child had written by then.
+        let started = Instant::now();
+        let capture = run_bounded(command, Duration::from_secs(3), "process");
+
+        assert_eq!(capture.outcome, CommandOutcome::TimedOut);
+        assert_eq!(capture.stdout, "before\n");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     fn read_failure() -> Option<std::io::Error> {

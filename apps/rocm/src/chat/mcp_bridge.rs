@@ -467,14 +467,14 @@ fn run_rocm_command_for_paths(
     _timeout: Duration,
 ) -> Result<CommandCapture> {
     match run_rocm_read_only_in_process(paths, args) {
-        Ok(stdout) => Ok(CommandCapture {
-            argv: std::iter::once("rocm".to_owned())
+        Ok(stdout) => Ok(CommandCapture::from_text(
+            std::iter::once("rocm".to_owned())
                 .chain(args.iter().cloned())
                 .collect(),
-            exit_status: 0,
+            0,
             stdout,
-            stderr: String::new(),
-        }),
+            String::new(),
+        )),
         Err(error) => Err(error).with_context(|| {
             format!(
                 "read-only assistant command is not implemented in-process: {}",
