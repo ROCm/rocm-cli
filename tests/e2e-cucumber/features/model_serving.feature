@@ -820,3 +820,27 @@ Feature: Model serving
     And a stopped managed service is recorded on the default serve port
     When the user restarts the stopped service
     Then the restart is refused naming the service that holds the port
+
+  # ROCMAI-550, and the evidence that the Vulkan remediation is not a dead end.
+  # `rocm install sdk` on a gfx90c APU refuses and tells the user to run `rocm
+  # serve <model> --engine lemonade`; AGENTS.md section 3 only allows that if
+  # serve's no-usable-GPU pre-flight accepts the very host the refusal was
+  # printed on. That host is a Renoir/Cezanne laptop: the iGPU is on the bus and
+  # bound to amdgpu, but the kernel's KFD topology lists no compute node for it,
+  # so the target can only have come from the DRM ip-discovery read.
+  #
+  # The assertion is positive rather than "the GPU refusal is absent": an
+  # out-of-range `--gpu` is validated AFTER the pre-flight and prints the usable
+  # ordinals it found, so the refusal text here can only be produced by a
+  # pre-flight that resolved exactly one usable GPU on this host. Take away
+  # `combine_amd_gpu_counts`'s zero-KFD fallback to DRM and this turns into "no
+  # usable AMD GPU detected", which is what the step rejects by name.
+  #
+  # Linux only, and needs no AMD hardware: the host is planted under
+  # ROCM_CLI_TEST_HOST_ROOT (an `e2e-test-hooks` build), so the GPU-less mock
+  # lane is where this runs.
+  @id:serve-accepts-an-apu-the-kernel-gives-no-compute-node @requires-os:linux
+  Scenario: serve-50 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
+    Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
+    When the user is told to serve on Lemonade because this GPU has no ROCm build
+    Then serving got past the no-GPU pre-flight and reported this host's usable GPU

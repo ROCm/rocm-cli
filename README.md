@@ -1024,12 +1024,14 @@ the running service, or stop it first to serve on the new port.
 
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the engine and the backend device it actually selected (for
+with the status, the engine and the backend device the engine reports (for
 example `rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)`
-where the engine pinned no GPU ordinal — read back from the running engine), the
-full inference endpoint, the API-qualified model name, and a quick smoke test
-(time to first token and approximate tokens per second). `rocm services` reports
-the same `device` for each running service.
+where the engine pinned no GPU ordinal). It is read back from the running
+engine, so it is that engine's own account of the backend it was launched on
+rather than an independent measurement of the hardware. The summary also carries
+the full inference endpoint, the API-qualified model name, and a quick smoke
+test (time to first token and approximate tokens per second). `rocm services`
+reports the same `device` for each running service.
 
 The device line is omitted when the engine cannot say yet. A server is reported
 ready as soon as it answers, which can be before it has finished loading the

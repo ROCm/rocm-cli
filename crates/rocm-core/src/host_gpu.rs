@@ -449,11 +449,20 @@ pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
 /// no name.
 #[must_use]
 pub fn pinned_gpu_name(gpu_indices: &[u32]) -> Option<String> {
+    // One Windows display-inventory read per call, shared by the two questions
+    // that need it. Both the count and the name come from the same `pnputil` /
+    // CIM query, and asking twice meant two PowerShell/WMI probes on the serve
+    // launch path. The read is eager rather than lazy only on the platform that
+    // uses it: off Windows nothing is probed here at all, and on Windows the
+    // count already needed it before any of the decisions below could run.
+    let windows_inventory = runtime_is_windows()
+        .then(detect_windows_examine_inventory)
+        .flatten();
     gpu_name_for_single_gpu_host(
         gpu_indices,
-        amd_gpu_count_for_naming(),
+        amd_gpu_count_for_naming(windows_inventory.as_ref()),
         gpu_visibility_mask_in_effect(),
-        host_primary_gpu_name,
+        || host_primary_gpu_name(windows_inventory.as_ref()),
     )
 }
 
@@ -488,7 +497,11 @@ where
 /// How many AMD GPUs this host presents, for [`pinned_gpu_name`]'s
 /// "could this name belong to another card?" test. `None` when it cannot be
 /// established, which declines the name rather than guessing.
-fn amd_gpu_count_for_naming() -> Option<usize> {
+///
+/// `windows_inventory` is the display listing the caller already read, or
+/// `None` off Windows (and when the listing failed); see [`pinned_gpu_name`]
+/// for why it is passed in rather than read here.
+fn amd_gpu_count_for_naming(windows_inventory: Option<&WindowsExamineInventory>) -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
         if !runtime_is_windows() {
@@ -504,14 +517,14 @@ fn amd_gpu_count_for_naming() -> Option<usize> {
             );
         }
     }
-    detect_windows_examine_inventory().map(|inventory| inventory.amd_display_count())
+    windows_inventory.map(WindowsExamineInventory::amd_display_count)
 }
 
 /// The host's primary/preferred AMD GPU name — correct only on a host with one
 /// AMD GPU, which is why [`pinned_gpu_name`] is the only caller.
-fn host_primary_gpu_name() -> Option<String> {
+fn host_primary_gpu_name(windows_inventory: Option<&WindowsExamineInventory>) -> Option<String> {
     if runtime_is_windows() {
-        return detect_windows_examine_inventory().and_then(|i| i.amd_display_name());
+        return windows_inventory.and_then(WindowsExamineInventory::amd_display_name);
     }
     detect_host_gpu_summary(None).name
 }

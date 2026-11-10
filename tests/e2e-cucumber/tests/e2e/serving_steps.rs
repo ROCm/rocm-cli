@@ -1287,12 +1287,7 @@ fn docker_call_log(world: &E2eWorld) -> std::path::PathBuf {
 /// by `e2e-test-hooks` builds) so the family the CLI detects does not depend on the
 /// runner's hardware. `gfx_target_version` is the kernel's decimal encoding.
 fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
-    let host_root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path()
-        .join("host-root");
+    let host_root = planted_host_root(world);
     let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
     std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
     // `cpu_cores_count 0` with a nonzero `simd_count` makes the node a GPU.
@@ -1301,9 +1296,7 @@ fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
         format!("cpu_cores_count 0\nsimd_count 56\ngfx_target_version {gfx_target_version}\n"),
     )
     .expect("failed to write the planted KFD node properties");
-    world
-        .command_env
-        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+    use_planted_host_root(world);
 }
 
 /// gfx942, TheRock family `gfx94X-dcgpu`.
@@ -1316,6 +1309,119 @@ async fn host_with_an_mi300x(world: &mut E2eWorld) {
 #[given("a host whose only GPU is an AMD Radeon PRO W7900")]
 async fn host_with_a_w7900(world: &mut E2eWorld) {
     plant_single_gpu(world, 110_000);
+}
+
+/// A Renoir/Cezanne laptop, planted under the simulated host root: the Vega
+/// iGPU is on the PCI bus and bound to `amdgpu`, and the kernel's KFD topology
+/// lists **only a CPU node** for it.
+///
+/// Not `plant_single_gpu`: that writes a KFD GPU node, which is precisely the
+/// thing this host does not have. With no compute node the target can only be
+/// named by the DRM `ip_discovery` read (GC 9.0.12 -> `gfx90c`), and the usable
+/// GPU count can only come from `combine_amd_gpu_counts`' zero-KFD fallback to
+/// the DRM card count. Both are driven off this one directory, which is what
+/// makes the scenario a statement about one host rather than two.
+fn plant_gfx90c_apu_without_a_kfd_node(world: &mut E2eWorld) {
+    let host_root = planted_host_root(world);
+    let device = host_root.join("sys/class/drm/card0/device");
+    std::fs::create_dir_all(&device).expect("failed to create the planted DRM card");
+    std::fs::write(device.join("vendor"), "0x1002\n").expect("failed to write the planted vendor");
+    let gc = device.join("ip_discovery/die/0/GC/0");
+    std::fs::create_dir_all(&gc).expect("failed to create the planted GC IP block");
+    for (file, value) in [("major", "9"), ("minor", "0"), ("revision", "12")] {
+        std::fs::write(gc.join(file), value).expect("failed to write the planted GC IP version");
+    }
+    let cpu_node = host_root.join("sys/class/kfd/kfd/topology/nodes/0");
+    std::fs::create_dir_all(&cpu_node).expect("failed to create the planted KFD node");
+    std::fs::write(
+        cpu_node.join("properties"),
+        "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n",
+    )
+    .expect("failed to write the planted KFD node properties");
+    use_planted_host_root(world);
+}
+
+/// Where a scenario's simulated `/` lives, by the same convention
+/// [`plant_single_gpu`] uses.
+fn planted_host_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("host-root")
+}
+
+/// Point the *next* `rocm` invocation at the planted host.
+///
+/// Needed once per invocation: `run_rocm_with_scenario_env` takes
+/// `world.command_env` by `mem::take`, so a step that runs two commands would
+/// silently run the second one against the real machine — which for this
+/// scenario would mean asserting the serve pre-flight's answer for the runner's
+/// own hardware instead of for the host the refusal was printed on.
+fn use_planted_host_root(world: &mut E2eWorld) {
+    let host_root = planted_host_root(world);
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+#[given("a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for")]
+async fn host_with_a_kfd_less_gfx90c(world: &mut E2eWorld) {
+    plant_gfx90c_apu_without_a_kfd_node(world);
+}
+
+/// Take the route the CLI itself sends this host down: let the SDK install
+/// refuse, then run the command that refusal names.
+///
+/// Both halves run against the same planted host, in order, so the scenario
+/// cannot pass by printing the advice on one machine and testing it on another.
+/// `--gpu 99` is what makes the result readable: it is validated *after* the
+/// no-usable-GPU pre-flight and reports the ordinals that pre-flight resolved,
+/// turning "the host was accepted" into something the output states rather than
+/// something inferred from the absence of a refusal. The model ref is arbitrary
+/// and nothing is launched: both bails are reached before any runtime or engine
+/// work.
+#[when("the user is told to serve on Lemonade because this GPU has no ROCm build")]
+async fn user_follows_the_lemonade_advice(world: &mut E2eWorld) {
+    let (install_stdout, install_stderr, install_rc) =
+        crate::run_rocm_with_scenario_env(world, &["install", "sdk", "--dry-run"]);
+    let refusal = format!("{install_stdout}\n{install_stderr}");
+    assert_ne!(
+        install_rc, 0,
+        "a gfx90c host has no ROCm SDK build to install:\n{refusal}"
+    );
+    assert!(
+        refusal.contains("gfx90c") && refusal.contains("rocm serve <model> --engine lemonade"),
+        "the planted host must be detected as gfx90c and advised to serve on \
+         Lemonade; without that this scenario is testing nothing:\n{refusal}"
+    );
+
+    use_planted_host_root(world);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["serve", "some-model", "--engine", "lemonade", "--gpu", "99"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("serving got past the no-GPU pre-flight and reported this host's usable GPU")]
+async fn assert_serve_accepted_the_drm_only_gpu(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("no usable AMD GPU"),
+        "`rocm install sdk` told this host to run `rocm serve --engine lemonade`, \
+         and serve's pre-flight refused it for having no GPU - advice that cannot \
+         clear the condition it was printed for:\n{output}"
+    );
+    assert!(
+        output.contains("--gpu index 99 is not present on this host")
+            && output.contains("usable GPU indices: [0]"),
+        "the pre-flight must have resolved exactly the iGPU's ordinal, and said \
+         so where `--gpu` is validated:\n{output}"
+    );
 }
 
 fn run_serve_aim(world: &mut E2eWorld, args: &[&str]) {

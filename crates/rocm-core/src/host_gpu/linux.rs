@@ -204,7 +204,21 @@ fn natural_node_order(name: &str) -> (u64, String) {
 /// DRM class dir can't be read; `Some(0)` when it is readable with no AMD card.
 #[cfg(target_os = "linux")]
 pub(super) fn linux_drm_amdgpu_card_count() -> Option<usize> {
-    let entries = fs::read_dir(host_path("/sys/class/drm")).ok()?;
+    linux_drm_amdgpu_card_count_in(&host_path("/sys/class/drm"))
+}
+
+/// The DRM card count, against a caller-supplied `/sys/class/drm`.
+///
+/// Split out for the same reason as `linux_kfd_gpu_node_count_in`: this half of
+/// the serve pre-flight's "is there a GPU here" answer is what carries a host
+/// whose KFD reports no compute node — the gfx90c APUs
+/// `unsupported_host_gpu_message` sends to Lemonade among them — and no CI lane
+/// has that hardware. Planting the directory is the only way the composed
+/// answer can be asserted at all; see
+/// `a_gfx90c_host_the_kernel_gives_no_compute_node_still_has_a_usable_gpu`.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn linux_drm_amdgpu_card_count_in(class_dir: &Path) -> Option<usize> {
+    let entries = fs::read_dir(class_dir).ok()?;
     let count = entries
         .flatten()
         .filter(|entry| {
@@ -236,7 +250,7 @@ pub(crate) fn linux_kfd_gpu_node_count() -> Option<usize> {
 /// branch is driven by tests -- the unreadable branches key off the real
 /// `/dev/kfd`, which a planted directory cannot stand in for.
 #[cfg(any(target_os = "linux", test))]
-fn linux_kfd_gpu_node_count_in(nodes_dir: &Path) -> Option<usize> {
+pub(super) fn linux_kfd_gpu_node_count_in(nodes_dir: &Path) -> Option<usize> {
     match fs::read_dir(nodes_dir) {
         Ok(entries) => Some(
             entries
@@ -305,8 +319,22 @@ fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_drm_ip_discovery_gfx_target() -> Option<String> {
-    let drm_dir = host_path("/sys/class/drm");
-    let entries = fs::read_dir(drm_dir).ok()?;
+    detect_linux_drm_ip_discovery_gfx_target_in(&host_path("/sys/class/drm"))
+}
+
+/// The DRM ip-discovery target read, against a caller-supplied `/sys/class/drm`.
+///
+/// Split out for the same reason as [`linux_drm_amdgpu_card_count_in`], and
+/// against the *same* directory on purpose: on a host whose KFD exposes no
+/// compute node this is the only route left that can name a target, so it is
+/// what puts a GPU in front of `unsupported_host_gpu_message` — and it walks
+/// `card*/device` under `is_amdgpu_device`, exactly the cards that count then
+/// hands to the serve pre-flight. Pointing one planted tree at both is what
+/// makes "the host that gets the Lemonade advice is a host serve accepts"
+/// assertable rather than argued.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn detect_linux_drm_ip_discovery_gfx_target_in(class_dir: &Path) -> Option<String> {
+    let entries = fs::read_dir(class_dir).ok()?;
     for entry in entries.flatten() {
         let card_path = entry.path();
         let Some(card_name) = card_path.file_name().and_then(|value| value.to_str()) else {

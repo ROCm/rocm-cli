@@ -306,7 +306,8 @@ rocm serve qwen --engine lemonade --device gpu_required --foreground --port 1143
 Expected result:
 
 - The engine uses ROCm GPU execution. The deployment summary's `device:` row
-  reports what the engine actually selected, so check it by reading that row
+  is the engine's own account of the backend it was launched on (Lemonade reads
+  back the `backend_requested` it recorded), so check it by reading that row
   rather than inferring it from the absence of a fallback warning. Every engine
   reports it in the same `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect
   something like `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted

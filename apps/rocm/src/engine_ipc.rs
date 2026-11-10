@@ -321,11 +321,23 @@ pub(crate) fn fetch_service_device(
         endpoint_key_file.as_deref(),
     )
     .ok()?;
-    // `"unknown"` is the engines' own device value when no state is on disk for
-    // this service id yet (see `engines/vllm/src/state.rs` and
-    // `engines/lemonade/src/lib.rs`), which is not more informative than
-    // showing nothing.
-    (!response.device.is_empty() && response.device != "unknown").then_some(response.device)
+    device_worth_reporting(response.device)
+}
+
+/// The engine's reported device, or `None` when it said nothing usable.
+///
+/// `"unknown"` is the engines' own device value when no state is on disk for
+/// this service id yet (see `engines/vllm/src/state.rs` and
+/// `engines/lemonade/src/lib.rs`), and it is not more informative than showing
+/// nothing — a `device: unknown` row claims the CLI asked and learned
+/// something, which is the opposite of what happened.
+///
+/// A named function rather than an inline `then_some` because the only caller
+/// is an RPC to a live engine: in default CI that call never succeeds, so the
+/// filter is unreachable there and deleting it would be invisible until a
+/// freshly-launched Lemonade service printed `device: unknown` on a GPU lane.
+fn device_worth_reporting(device: String) -> Option<String> {
+    (!device.trim().is_empty() && device != "unknown").then_some(device)
 }
 
 /// How long `rocm serve`'s deployment summary may keep asking the engine which
@@ -717,6 +729,70 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// The `unknown` filter, which nothing else can reach: its caller is an RPC
+    /// to a live engine, so in default CI it never runs and deleting it stays
+    /// green.
+    #[test]
+    fn a_device_the_engine_does_not_know_is_not_reported_as_one() {
+        for nothing in ["unknown", "", "   "] {
+            assert_eq!(
+                device_worth_reporting(nothing.to_owned()),
+                None,
+                "`{nothing}` is the engine saying it has no answer yet, and a \
+                 `device:` row would claim otherwise"
+            );
+        }
+        for device in ["rocm gpu 0", "vulkan (AMD Radeon Graphics)"] {
+            assert_eq!(
+                device_worth_reporting(device.to_owned()),
+                Some(device.to_owned())
+            );
+        }
+    }
+
+    /// The endpoint key file reaches a built-in engine through the process
+    /// environment, and is gone again afterwards.
+    ///
+    /// Both halves matter and neither was covered. Without the variable a
+    /// `--require-api-key` service's own `/v1/models` probe answers 401, the
+    /// engine reports the service as unlisted, and the `device:` row silently
+    /// vanishes for exactly the protected services. Without the restore, one
+    /// service's key would leak into the next service's probe in the same
+    /// `rocm services list` — `with_scoped_builtin_engine_env` mutates
+    /// process-wide state, which is why the probes are serialized in the first
+    /// place.
+    #[test]
+    fn the_endpoint_key_file_is_scoped_to_one_builtin_engine_call() {
+        let key = rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV;
+        // SAFETY-adjacent: the scoped setter takes the same process-wide lock
+        // this test observes through, so no other engine call can interleave.
+        let before = std::env::var_os(key);
+        let seen = with_scoped_builtin_engine_env(
+            None,
+            None,
+            Some(Path::new("/tmp/rocm-e2e-endpoint-key")),
+            || std::env::var_os(key),
+        );
+        assert_eq!(
+            seen.as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/rocm-e2e-endpoint-key")),
+            "the engine must be able to read the key file path it was given"
+        );
+        assert_eq!(
+            std::env::var_os(key),
+            before,
+            "the key must not outlive the call it was scoped to"
+        );
+
+        // And nothing is set when no key file was supplied: a loopback service
+        // has none, and inventing one would point the engine at a file that
+        // does not exist.
+        assert_eq!(
+            with_scoped_builtin_engine_env(None, None, None, || std::env::var_os(key)),
+            before
+        );
+    }
 
     /// Every service inside the budget is probed and reported.
     #[test]

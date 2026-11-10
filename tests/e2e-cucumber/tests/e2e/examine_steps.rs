@@ -2531,27 +2531,58 @@ async fn assert_support_level_agrees_with_detection(world: &mut E2eWorld) {
 }
 
 /// AGENTS.md wants a line that tells the user what they can do, and a named
-/// command that can actually clear the condition it was printed for. The
-/// specific pairing checked here is the one this round fixed: a host whose
-/// managed SDK is already installed must not be told to install it.
+/// command that can actually clear the condition it was printed for.
+///
+/// So the assertion is the *specific* command each tier owes, not "some `rocm`
+/// word appears": `contains("rocm ")` is satisfied by `rocm examine` echoing
+/// its own name, by a stray `rocm diagnose` on a ROCm-capable host, and by
+/// every wrong-tier command there is. Which tier applies is read from the same
+/// three fields the renderer classifies on, so this says something different —
+/// and falsifiable — on each lane rather than collapsing to one weak check.
+///
+/// The placeholders those fields fall back to are pinned by
+/// `rocm_core`'s `examine_render_spells_its_absent_value_placeholders`, so this
+/// cannot silently start reading every host as "nothing detected" if the
+/// renderer's wording changes.
 #[then("the support level leaves a command that fits this host")]
 async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     let line = rocm_support_line(output).expect("no rocm_support line");
-    assert!(
-        line.contains("rocm "),
-        "the support line must leave the user somewhere to go: {line}\n{output}"
-    );
-
-    // `detected_therock_family` is the managed SDK that is installed, as
+    let (detected, family) = detected_gpu_facts(output);
+    // `detected_therock_family` is the managed SDK that *is* installed, as
     // opposed to `compatible_therock_family`, which is what this GPU could run.
-    let sdk_installed = field_value(output, "detected_therock_family")
-        .is_some_and(|value| value != "<not detected>" && value != "<unknown>");
-    if sdk_installed {
+    let installed_sdk = field_value(output, "detected_therock_family")
+        .filter(|value| *value != "<not detected>" && *value != "<unknown>");
+
+    let (expected, forbidden): (&str, &[&str]) = match (detected, family, installed_sdk) {
+        // ROCm-capable with the managed SDK already in place: installing one
+        // clears nothing, so the line must point at serving instead.
+        (_, Some(_), Some(_)) => ("rocm serve <model>", &["rocm install sdk"]),
+        // ROCm-capable with no managed SDK yet: that install is the next step.
+        (_, Some(_), None) => ("rocm install sdk", &[]),
+        // A GPU no package family covers — confirmed Vulkan-only (gfx90c) or
+        // merely unrecognized. Either way the SDK has nothing for it and
+        // Lemonade's Vulkan backend is what can serve on it.
+        (Some(_), None, _) => (
+            "rocm serve <model> --engine lemonade",
+            &["rocm install sdk"],
+        ),
+        // Nothing detected: `rocm serve` is refused outright by the
+        // no-usable-GPU pre-flight, so naming it would be advice that cannot
+        // clear the condition it is printed for.
+        (None, None, _) => ("rocm diagnose", &["rocm serve", "rocm install sdk"]),
+    };
+
+    assert!(
+        line.contains(expected),
+        "this host's support tier owes `{expected}`, and the line has to name a \
+         command that can actually clear the condition it was printed for: \
+         {line}\n{output}"
+    );
+    for command in forbidden {
         assert!(
-            !line.contains("rocm install sdk"),
-            "this host already has a managed ROCm SDK, so installing one clears \
-             nothing: {line}\n{output}"
+            !line.contains(command),
+            "`{command}` cannot clear anything on this host: {line}\n{output}"
         );
     }
 }
