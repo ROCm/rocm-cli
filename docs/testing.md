@@ -2039,8 +2039,12 @@ Both binaries apply the same guard, `rocm-core`'s
 launch, a restart and a daemon respawn bar the action it names and, for a fresh
 launch, why the key is missing (nothing stopped, so it is not told a stop
 dropped it); the `rocm serve <model> …` command it names keeps the recorded
-host, the public-bind opt-in and `--require-api-key`, so following it does not
-bring the service back somewhere else. A restart or respawn is of a recorded
+port (always, since a launch that leaves `--port` out is given one from
+`11435..=11535`, which a tailnet or proxy mapping that publishes the service
+does not follow), the recorded host where it is not the default loopback one,
+the public-bind opt-in and `--require-api-key`, so following it does not bring
+the service back somewhere else; the guard takes the port the record holds, and
+the model stays a placeholder because it does not decide where the endpoint is. A restart or respawn is of a recorded
 service that may still be running, and `rocm serve` reuses a running service
 for the same engine and model and discards the key it generated for that
 attempt, so the refusal names `rocm services stop <id> --yes` before the launch
@@ -2642,8 +2646,8 @@ suite's own host filter, so it would also run the Windows-only
 refusal it covers comes before any stop. It plants a publicly bound server with
 a running recorded process and no key file and runs `rocm services restart
 --yes`: it checks the refusal's text and exit status, that the `rocm serve`
-command it names parses (its `<model>` and `<port>` filled in, `--help` last,
-with a bogus flag as the negative control), that the `rocm services stop` it
+command it names parses (its `<model>` filled in, `--help` last, with a bogus
+flag as the negative control) and carries the port the server was recorded on, that the `rocm services stop` it
 names before it is this server's exact stop command and parses the same way,
 and that the recorded process is still running and the record is not marked
 stopped.

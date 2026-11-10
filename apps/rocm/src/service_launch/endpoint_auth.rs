@@ -259,6 +259,7 @@ mod tests {
             requires_api_key,
             rocm_core::ServiceStart::Restart,
             "svc-restart-guard",
+            8000,
         )
     }
 
@@ -355,27 +356,6 @@ mod tests {
         spans[0].split_whitespace().map(str::to_owned).collect()
     }
 
-    /// `advised` with a number in the place of `<port>`: the printed command
-    /// names the port as a placeholder, as it does the model, and the real parser
-    /// takes only a number there.
-    fn with_port_filled(advised: &[String]) -> Vec<String> {
-        with_port_filled_to(advised, 8000)
-    }
-
-    /// [`with_port_filled`] with the port the service recorded.
-    fn with_port_filled_to(advised: &[String], port: u16) -> Vec<String> {
-        advised
-            .iter()
-            .map(|word| {
-                if word == "<port>" {
-                    port.to_string()
-                } else {
-                    word.clone()
-                }
-            })
-            .collect()
-    }
-
     /// What the real clap parse makes of an advised `rocm serve` command.
     struct ServeAdvice {
         // Read only by the follower that goes through the spawn, which is unix-only
@@ -455,7 +435,7 @@ mod tests {
         paths: &AppPaths,
         service_id: &str,
         start: rocm_core::ServiceStart,
-        service: (&str, bool),
+        service: (&str, bool, u16),
     ) -> Result<()> {
         let ServeAdvice {
             host,
@@ -466,11 +446,18 @@ mod tests {
             ..
         } = parse_serve_advice(advised);
         // Following the advice brings the service back where it was: on the host
-        // it recorded, asking for the key again if it had asked for one. A command
-        // that cleared the guard by quietly binding somewhere else (the default
-        // loopback host) would not be advice that restores the service.
-        let (recorded_host, recorded_requires_api_key) = service;
+        // and port it recorded, asking for the key again if it had asked for one. A
+        // command that cleared the guard by quietly binding somewhere else (the
+        // default loopback host, or a port `rocm serve` chooses itself, which a
+        // mapping that publishes the service does not follow) would not be advice
+        // that restores the service.
+        let (recorded_host, recorded_requires_api_key, recorded_port) = service;
         assert_eq!(host, recorded_host, "{advised:?} binds another host");
+        assert_eq!(
+            port,
+            Some(recorded_port),
+            "{advised:?} does not bind the port the service had"
+        );
         assert_eq!(
             require_api_key, recorded_requires_api_key,
             "{advised:?} does not carry the service's key requirement"
@@ -496,6 +483,7 @@ mod tests {
             require_api_key,
             start,
             service_id,
+            recorded_port,
         )
     }
 
@@ -562,11 +550,15 @@ mod tests {
     fn the_command_a_respawn_refusal_names_clears_the_refusal() -> Result<()> {
         use rocm_core::ServiceStart;
 
-        for start in [
-            ServiceStart::Launch,
-            ServiceStart::Restart,
-            ServiceStart::Respawn,
-        ] {
+        // A port outside `rocm serve`'s own range (a service published behind a
+        // mapping), and one inside it.
+        for (recorded_port, start) in [8000_u16, 11436].into_iter().flat_map(|port| {
+            [
+                (port, ServiceStart::Launch),
+                (port, ServiceStart::Restart),
+                (port, ServiceStart::Respawn),
+            ]
+        }) {
             for (host, requires_api_key) in [
                 ("127.0.0.1", true),
                 ("localhost", true),
@@ -583,6 +575,7 @@ mod tests {
                     requires_api_key,
                     start,
                     "lemonade-qwen-3000",
+                    recorded_port,
                 )
                 .expect_err("a keyless service in this state is refused")
                 .to_string();
@@ -592,7 +585,7 @@ mod tests {
                 // a placeholder, and parses as printed.
                 assert_eq!(advised[2], "<model>", "{advised:?}");
                 assert_eq!(
-                    crate::advised_commands::rocm_verdict(&with_port_filled(&advised)[1..]),
+                    crate::advised_commands::rocm_verdict(&advised[1..]),
                     crate::advised_commands::Verdict::Parses,
                     "{advised:?}"
                 );
@@ -601,11 +594,11 @@ mod tests {
                 // asks for what the refusal needs (`--require-api-key` for the
                 // first rule, the public bind for the second), and what it stores
                 // satisfies the guard that refused.
-                let runnable: Vec<String> = with_port_filled(&advised)
-                    .into_iter()
+                let runnable: Vec<String> = advised
+                    .iter()
                     .map(|word| match word.as_str() {
                         "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
-                        _ => word,
+                        _ => word.clone(),
                     })
                     .collect();
                 assert!(
@@ -630,7 +623,7 @@ mod tests {
                     &paths,
                     service_id,
                     start,
-                    (host, requires_api_key),
+                    (host, requires_api_key, recorded_port),
                 )
                 .unwrap_or_else(|error| {
                     panic!("{runnable:?} does not clear {host} ({start:?}): {error:#}")
@@ -716,10 +709,17 @@ mod tests {
                     requires_api_key,
                     start,
                     service_id,
+                    port,
                 )
                 .expect_err("a keyless service is refused")
                 .to_string();
-                let serve = with_port_filled_to(&advised_serve_command(&message), port);
+                let serve = advised_serve_command(&message);
+                assert!(
+                    serve
+                        .windows(2)
+                        .any(|pair| pair == ["--port", &port.to_string()]),
+                    "{host} {start:?}: the launch must be on the recorded port {port}: {serve:?}"
+                );
                 let runnable: Vec<String> = serve
                     .iter()
                     .map(|word| match word.as_str() {
@@ -769,6 +769,7 @@ mod tests {
                         requires_api_key,
                         start,
                         service_id,
+                        port,
                     )
                     .is_err(),
                     "{case}: launching without stopping first does not clear the refusal"

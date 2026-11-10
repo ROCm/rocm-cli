@@ -107,20 +107,24 @@ impl ServiceStart {
     }
 }
 
-/// The `rocm serve` command that gives a service with this recorded `host` and
-/// requirement a key again. The command keeps everything the service's bind
-/// depended on, so following it does not bring the service back somewhere else:
-/// the host (with the `--port` that `rocm serve` demands on any host but the
-/// canonical loopback one, since only there can it choose a free port), the
-/// public-bind opt-in where the host is public, and `--require-api-key` where the
-/// service asked for it.
-fn serve_command(host: &str, requires_api_key: bool) -> String {
+/// The `rocm serve` command that gives a service with this recorded `host`,
+/// `port` and requirement a key again. The command keeps everything the
+/// service's endpoint depended on, so following it does not bring the service
+/// back somewhere else: the port it recorded (always, since a port left out is
+/// chosen from `rocm serve`'s own range, and anything that publishes the service
+/// — a tailnet or proxy mapping — targets the port it had), the host where it is
+/// not the default loopback one, the public-bind opt-in where the host is public,
+/// and `--require-api-key` where the service asked for it. The model is the one
+/// thing left as a placeholder: the guard does not know it, and it does not
+/// decide where the endpoint is.
+fn serve_command(host: &str, port: u16, requires_api_key: bool) -> String {
     let mut command = String::from("rocm serve <model>");
     if !crate::is_canonical_loopback_host(host) {
         command.push_str(" --host ");
         command.push_str(host);
-        command.push_str(" --port <port>");
     }
+    command.push_str(" --port ");
+    command.push_str(&port.to_string());
     if is_public_bind_host(host) {
         command.push_str(" --allow-public-bind");
     }
@@ -158,11 +162,12 @@ fn serve_command(host: &str, requires_api_key: bool) -> String {
 /// Both refusals name the command that restores the service — `rocm serve
 /// <model> …` — because the key is dropped when a service stops and cannot be
 /// recovered, only issued again by a new launch. The command is built from the
-/// recorded host and requirement ([`serve_command`]) and keeps what the bind
-/// depended on: a host other than the canonical loopback one carries `--host`
-/// and `--port <port>` (`rocm serve` takes automatic port selection only on the
-/// canonical loopback host), a public host carries `--allow-public-bind`, and a
-/// service that asked for a key carries `--require-api-key`. What the start
+/// recorded host, port and requirement ([`serve_command`]) and keeps what the
+/// endpoint depended on: the recorded `--port` always (a launch that leaves it
+/// out gets a port from `rocm serve`'s own range, which a mapping that publishes
+/// the service does not follow), a host other than the default loopback one
+/// carries `--host`, a public host carries `--allow-public-bind`, and a service
+/// that asked for a key carries `--require-api-key`. What the start
 /// changes is only the wording of the action and of why the key is missing: a
 /// service being brought back lost its key when it stopped, and may still be
 /// running, in which case a launch would reuse it and discard the new key, so the
@@ -175,6 +180,7 @@ pub fn ensure_public_service_has_endpoint_key(
     requires_api_key: bool,
     start: ServiceStart,
     service_id: &str,
+    port: u16,
 ) -> anyhow::Result<()> {
     if key_present {
         return Ok(());
@@ -198,7 +204,7 @@ pub fn ensure_public_service_has_endpoint_key(
         return Ok(());
     };
     let would_open = start.would_open();
-    let command = serve_command(host, requires_api_key);
+    let command = serve_command(host, port, requires_api_key);
     let choose_key = "(add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key \
                       instead of generating one)";
     if start.brings_back_a_service() {
@@ -262,9 +268,12 @@ mod tests {
     ];
 
     const SERVICE_ID: &str = "vllm-qwen-1000";
+    /// A port no automatic selection would pick (`rocm serve` chooses from its own
+    /// range), as a service published behind a mapping would have.
+    const PORT: u16 = 8000;
 
     fn refusal(host: &str, key_present: bool, requires: bool, start: ServiceStart) -> String {
-        ensure_public_service_has_endpoint_key(host, key_present, requires, start, SERVICE_ID)
+        ensure_public_service_has_endpoint_key(host, key_present, requires, start, SERVICE_ID, PORT)
             .expect_err("this state must be refused")
             .to_string()
     }
@@ -294,42 +303,46 @@ mod tests {
     /// keeps what the bind depended on, so following it does not bring the
     /// service back somewhere else. Spelled out here, not derived.
     const ADVISED: [(&str, bool, &str); 8] = [
-        ("127.0.0.1", true, "rocm serve <model> --require-api-key"),
+        (
+            "127.0.0.1",
+            true,
+            "rocm serve <model> --port 8000 --require-api-key",
+        ),
         (
             "localhost",
             true,
-            "rocm serve <model> --host localhost --port <port> --require-api-key",
+            "rocm serve <model> --host localhost --port 8000 --require-api-key",
         ),
         (
             "::1",
             true,
-            "rocm serve <model> --host ::1 --port <port> --require-api-key",
+            "rocm serve <model> --host ::1 --port 8000 --require-api-key",
         ),
         (
             "0.0.0.0",
             true,
-            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind --require-api-key",
+            "rocm serve <model> --host 0.0.0.0 --port 8000 --allow-public-bind --require-api-key",
         ),
         (
             "gpu-box.example",
             true,
-            "rocm serve <model> --host gpu-box.example --port <port> --allow-public-bind \
+            "rocm serve <model> --host gpu-box.example --port 8000 --allow-public-bind \
              --require-api-key",
         ),
         (
             "0.0.0.0",
             false,
-            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind",
+            "rocm serve <model> --host 0.0.0.0 --port 8000 --allow-public-bind",
         ),
         (
             "192.168.1.10",
             false,
-            "rocm serve <model> --host 192.168.1.10 --port <port> --allow-public-bind",
+            "rocm serve <model> --host 192.168.1.10 --port 8000 --allow-public-bind",
         ),
         (
             "LOCALHOST",
             false,
-            "rocm serve <model> --host LOCALHOST --port <port> --allow-public-bind",
+            "rocm serve <model> --host LOCALHOST --port 8000 --allow-public-bind",
         ),
     ];
 
@@ -402,7 +415,7 @@ mod tests {
                     names_command(
                         &message,
                         &format!(
-                            "rocm serve <model> --host {host} --port <port> --allow-public-bind"
+                            "rocm serve <model> --host {host} --port 8000 --allow-public-bind"
                         ),
                         start
                     ),
@@ -418,12 +431,14 @@ mod tests {
     fn a_service_that_needs_no_key_or_has_one_is_not_refused() {
         for start in STARTS {
             for host in ["127.0.0.1", "localhost", "::1"] {
-                ensure_public_service_has_endpoint_key(host, false, false, start, SERVICE_ID)
+                ensure_public_service_has_endpoint_key(host, false, false, start, SERVICE_ID, PORT)
                     .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
             }
             for (host, requires) in [("0.0.0.0", false), ("127.0.0.1", true), ("0.0.0.0", true)] {
-                ensure_public_service_has_endpoint_key(host, true, requires, start, SERVICE_ID)
-                    .unwrap_or_else(|error| panic!("{host} has its key: {error:#}"));
+                ensure_public_service_has_endpoint_key(
+                    host, true, requires, start, SERVICE_ID, PORT,
+                )
+                .unwrap_or_else(|error| panic!("{host} has its key: {error:#}"));
             }
         }
     }
@@ -439,7 +454,7 @@ mod tests {
             assert!(!message.contains("public host"), "{message}");
             assert!(
                 message.contains(
-                    "`rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind \
+                    "`rocm serve <model> --host 0.0.0.0 --port 8000 --allow-public-bind \
                      --require-api-key`"
                 ),
                 "{start:?}: {message}"
@@ -500,7 +515,7 @@ mod tests {
              and cannot be recovered. Launching it again while it is still running would reuse \
              the running server and discard the new key, so stop it first with `rocm services \
              stop vllm-qwen-1000 --yes`, then launch it again with `rocm serve <model> \
-             --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the \
+             --port 8000 --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the \
              key instead of generating one)."
         );
         assert_eq!(
@@ -510,7 +525,7 @@ mod tests {
              service stops and cannot be recovered. Launching it again while it is still \
              running would reuse the running server and discard the new key, so stop it first \
              with `rocm services stop vllm-qwen-1000 --yes`, then launch it again with `rocm \
-             serve <model> --host 0.0.0.0 --port <port> --allow-public-bind` (add `--api-key \
+             serve <model> --host 0.0.0.0 --port 8000 --allow-public-bind` (add `--api-key \
              <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
         assert_eq!(
@@ -518,7 +533,7 @@ mod tests {
             "this launch asks for `--require-api-key` but has no usable endpoint API key, so \
              launching it would open it without authentication. Nothing was started, and the \
              key file this launch stored is missing or unusable. Run `rocm serve <model> \
-             --require-api-key` again (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to \
+             --port 8000 --require-api-key` again (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to \
              choose the key instead of generating one)."
         );
         assert_eq!(
@@ -526,9 +541,37 @@ mod tests {
             "this launch binds the public host `0.0.0.0` but has no usable endpoint API key, so \
              launching it would open it without authentication. Nothing was started, and the \
              key file this launch stored is missing or unusable. Run `rocm serve <model> --host \
-             0.0.0.0 --port <port> --allow-public-bind` again (add `--api-key <key>`, or set \
+             0.0.0.0 --port 8000 --allow-public-bind` again (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
+    }
+
+    #[test]
+    fn the_command_a_refusal_names_carries_the_port_the_service_recorded() {
+        // Whatever the host, the relaunch has to land on the port the service had:
+        // a `rocm serve` that leaves `--port` out picks one from its own range, and
+        // a tailnet or proxy mapping that publishes the service keeps targeting the
+        // recorded one. So the recorded port is printed as it is, for every start,
+        // host and requirement, and not a placeholder for the user to fill in.
+        for port in [8000_u16, 11435, 1, 65535] {
+            for start in STARTS {
+                for (host, requires, _) in ADVISED {
+                    let message = ensure_public_service_has_endpoint_key(
+                        host, false, requires, start, SERVICE_ID, port,
+                    )
+                    .unwrap_err()
+                    .to_string();
+                    assert!(
+                        message.contains(&format!(" --port {port} "))
+                            || message.contains(&format!(" --port {port}`")),
+                        "{host} requires={requires} {start:?} port={port}: {message}"
+                    );
+                    assert!(!message.contains("<port>"), "{message}");
+                    // Only the recorded port appears, so a fixed one cannot hide behind it.
+                    assert_eq!(message.matches("--port").count(), 1, "{message}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -541,6 +584,7 @@ mod tests {
             false,
             ServiceStart::Restart,
             "odd id's",
+            PORT,
         )
         .unwrap_err()
         .to_string();

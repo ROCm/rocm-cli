@@ -67,6 +67,7 @@ fn refuse_keyless_respawn(record: &ManagedServiceRecord, key_present: bool) -> R
         record.requires_api_key,
         rocm_core::ServiceStart::Respawn,
         &record.service_id,
+        record.port,
     )
 }
 
@@ -1149,6 +1150,7 @@ mod tests {
                     requires_api_key,
                     rocm_core::ServiceStart::Respawn,
                     &service_id,
+                    11434,
                 )
                 .unwrap_err()
                 .to_string(),
@@ -1205,6 +1207,7 @@ mod tests {
                 true,
                 rocm_core::ServiceStart::Respawn,
                 "svc-needs-key",
+                11434,
             )
             .unwrap_err()
             .to_string()
@@ -1249,6 +1252,7 @@ mod tests {
                 false,
                 rocm_core::ServiceStart::Respawn,
                 "svc-public",
+                11434,
             )
             .unwrap_err()
             .to_string()

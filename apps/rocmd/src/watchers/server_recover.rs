@@ -211,6 +211,7 @@ fn handle_server_recover_event_with_record(
                 record.requires_api_key,
                 rocm_core::ServiceStart::Respawn,
                 &record.service_id,
+                record.port,
             ) {
                 return crate::persistence::record_event(
                     paths,
@@ -960,6 +961,7 @@ mod tests {
             false,
             rocm_core::ServiceStart::Respawn,
             "svc-public-no-key",
+            11452,
         )
         .unwrap_err()
         .to_string();
@@ -989,7 +991,7 @@ mod tests {
         test: &str,
         requires_api_key: bool,
         key_file: Option<&str>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, u16)> {
         let (root, paths) = temp_app_paths(test);
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
@@ -1044,7 +1046,7 @@ mod tests {
         let logged = serde_json::from_str::<AutomationEventRecord>(event_text.trim())?;
         fs::remove_dir_all(root).ok();
         drop(occupant);
-        Ok((logged.action, logged.message))
+        Ok((logged.action, logged.message, port))
     }
 
     /// The watcher's guard call passes the record's `requires_api_key`: a
@@ -1052,7 +1054,7 @@ mod tests {
     /// service without the requirement is let through to the restart.
     #[test]
     fn server_recover_passes_the_recorded_key_requirement_to_the_guard() -> Result<()> {
-        let (action, message) = recovery_action_for("recover-site-requires", true, None)?;
+        let (action, message, port) = recovery_action_for("recover-site-requires", true, None)?;
         assert_eq!(action, "restart_managed_service_refused");
         let expected = rocm_core::ensure_public_service_has_endpoint_key(
             "127.0.0.1",
@@ -1060,12 +1062,19 @@ mod tests {
             true,
             rocm_core::ServiceStart::Respawn,
             "svc-recover-key-site",
+            port,
         )
         .unwrap_err()
         .to_string();
         assert!(message.ends_with(&expected), "{message}");
+        // The relaunch it names is for the port the record had, which is the one the
+        // watcher read off the record and not one the guard could pick itself.
+        assert!(
+            message.contains(&format!("--port {port} ")),
+            "the refusal must name the recorded port {port}: {message}"
+        );
 
-        let (action, message) = recovery_action_for("recover-site-not-required", false, None)?;
+        let (action, message, _) = recovery_action_for("recover-site-not-required", false, None)?;
         assert_eq!(action, "restart_managed_service_failed", "{message}");
         assert!(message.contains("recorded port is in use"), "{message}");
         Ok(())
@@ -1076,7 +1085,7 @@ mod tests {
     /// empty or malformed one.
     #[test]
     fn server_recover_passes_whether_the_key_file_is_usable_to_the_guard() -> Result<()> {
-        let (action, message) =
+        let (action, message, _) =
             recovery_action_for("recover-site-key-usable", true, Some("a-usable-key\n"))?;
         assert_eq!(action, "restart_managed_service_failed", "{message}");
         assert!(message.contains("recorded port is in use"), "{message}");
@@ -1085,7 +1094,7 @@ mod tests {
             ("recover-site-key-empty", ""),
             ("recover-site-key-blank", "  \n"),
         ] {
-            let (action, message) = recovery_action_for(test, true, Some(contents))?;
+            let (action, message, _) = recovery_action_for(test, true, Some(contents))?;
             assert_eq!(
                 action, "restart_managed_service_refused",
                 "an unusable key file ({contents:?}) is no key: {message}"

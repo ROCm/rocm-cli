@@ -489,6 +489,7 @@ fn restart_internal_managed_service_inner(
         record.requires_api_key,
         rocm_core::ServiceStart::Restart,
         service_id,
+        record.port,
     )?;
     let (stop_report, stopped) =
         stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
@@ -966,6 +967,7 @@ mod tests {
                 false,
                 rocm_core::ServiceStart::Restart,
                 "vllm-public-2000",
+                12000,
             )
             .unwrap_err()
             .to_string()
@@ -1037,11 +1039,26 @@ mod tests {
         requires_api_key: bool,
         key: Option<&str>,
     ) -> String {
+        restart_outcome_on_port(test, host, requires_api_key, key, RESTART_SITE_PORT)
+    }
+
+    /// The port the planted record has unless a test is about the port.
+    const RESTART_SITE_PORT: u16 = 8123;
+
+    /// [`restart_outcome_for`] for a record on `port`.
+    fn restart_outcome_on_port(
+        test: &str,
+        host: &str,
+        requires_api_key: bool,
+        key: Option<&str>,
+        port: u16,
+    ) -> String {
         let (root, paths) = test_paths(test);
         paths.ensure().unwrap();
         let service_id = "svc-restart-key-site";
         let mut record = stop_test_record(&paths, service_id);
         record.host = host.to_owned();
+        record.port = port;
         record.requires_api_key = requires_api_key;
         record.write().unwrap();
         if let Some(key) = key {
@@ -1078,6 +1095,7 @@ mod tests {
                 true,
                 rocm_core::ServiceStart::Restart,
                 "svc-restart-key-site",
+                RESTART_SITE_PORT,
             )
             .unwrap_err()
             .to_string()
@@ -1086,6 +1104,37 @@ mod tests {
         // through to the stop and the lock wait.
         let error = restart_outcome_for("restart-site-not-required", "127.0.0.1", false, None);
         assert!(error.contains("stopped but NOT restarted"), "{error}");
+    }
+
+    #[test]
+    fn restart_passes_the_recorded_port_to_the_guard() {
+        // The command the refusal names has to land on the port the service had,
+        // so the port the restart reads off the record is what the guard prints.
+        for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
+            for port in [8123_u16, 9001] {
+                let error = restart_outcome_on_port(
+                    "restart-site-port",
+                    host,
+                    requires_api_key,
+                    None,
+                    port,
+                );
+                assert_eq!(
+                    error,
+                    rocm_core::ensure_public_service_has_endpoint_key(
+                        host,
+                        false,
+                        requires_api_key,
+                        rocm_core::ServiceStart::Restart,
+                        "svc-restart-key-site",
+                        port,
+                    )
+                    .unwrap_err()
+                    .to_string()
+                );
+                assert!(error.contains(&format!("--port {port}")), "{error}");
+            }
+        }
     }
 
     #[test]

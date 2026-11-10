@@ -21,6 +21,8 @@ use crate::E2eWorld;
 
 /// Id of the record this scenario plants.
 const SERVICE_ID: &str = "vllm-e2e-stop";
+/// The port the planted record in `plant_server_record` was started on.
+const SERVER_PORT: u16 = 9;
 /// Engine name, which also picks the engine state directory the record's
 /// third file lives in (`<data>/engines/<engine>/state/`).
 const ENGINE: &str = "vllm";
@@ -367,9 +369,11 @@ fn plant_server_record(
         "model_ref": "qwen",
         "canonical_model_id": "Qwen/Qwen3.5",
         "host": host,
-        // Discard port: closed, so nothing can answer on the server's behalf.
-        "port": 9,
-        "endpoint_url": format!("http://{host}:9/v1"),
+        // Discard port: closed, so nothing can answer on the server's behalf, and
+        // outside the range `rocm serve` chooses from itself, as a server that was
+        // started on an explicit port and published behind a mapping would be.
+        "port": SERVER_PORT,
+        "endpoint_url": format!("http://{host}:{SERVER_PORT}/v1"),
         "mode": "managed",
         "status": "ready",
         "supervisor_pid": pid,
@@ -609,13 +613,16 @@ async fn record_still_requires_the_key(world: &mut E2eWorld) {
 }
 
 /// The `rocm serve` command the refusal names, run against the real parser:
-/// its `<model>` and `<port>` placeholders filled in, and `--help` last, so the parse ends in
+/// its `<model>` placeholder filled in, and `--help` last, so the parse ends in
 /// help only if every word before it was accepted. A command with a flag `rocm`
 /// does not have is shown to be rejected the same way, so the check cannot pass
 /// by `--help` alone.
 #[then("the refusal names a serve command that rocm accepts")]
 async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
-    check_advised_serve_command(world, "--host 0.0.0.0 --port <port> --allow-public-bind");
+    check_advised_serve_command(
+        world,
+        &format!("rocm serve <model> --host 0.0.0.0 --port {SERVER_PORT} --allow-public-bind"),
+    );
 }
 
 /// The same check for the server that asked for a key on a loopback bind: the
@@ -623,7 +630,10 @@ async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
 /// default host, which is where it was.
 #[then("the refusal names a serve command that asks for the key again and that rocm accepts")]
 async fn refusal_names_an_accepted_serve_command_with_the_key_flag(world: &mut E2eWorld) {
-    let command = check_advised_serve_command(world, "rocm serve <model> --require-api-key");
+    let command = check_advised_serve_command(
+        world,
+        &format!("rocm serve <model> --port {SERVER_PORT} --require-api-key"),
+    );
     assert!(
         !command.contains("--host") && !command.contains("--allow-public-bind"),
         "a loopback server is not told to bind elsewhere: {command}"
@@ -647,8 +657,8 @@ fn check_advised_serve_command(world: &mut E2eWorld, expected: &str) -> String {
         "the refusal must name exactly one `rocm serve <model>` command:\n{combined}"
     );
     assert!(
-        advised[0].contains(expected),
-        "the command must bring the server back where it was ({expected}): {}",
+        advised[0].starts_with(expected),
+        "the command must bring the server back where it was, on the port it recorded ({expected}): {}",
         advised[0]
     );
     let mut args: Vec<String> = advised[0]
@@ -656,7 +666,6 @@ fn check_advised_serve_command(world: &mut E2eWorld, expected: &str) -> String {
         .skip(1)
         .map(|word| match word {
             "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
-            "<port>" => "8000".to_owned(),
             other => other.to_owned(),
         })
         .collect();
