@@ -2357,6 +2357,141 @@ async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user sends a streaming request to the Anthropic messages endpoint")]
+async fn user_sends_streaming_anthropic_messages_request(world: &mut E2eWorld) {
+    let base = listed_anthropic_endpoint(world)
+        .await
+        .expect("no Anthropic endpoint is listed for the served model");
+    let budget = Duration::from_secs(crate::inference_timeout_for(world));
+    // Same budget and model name as the non-streaming request above.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+    let (content_type, events) = tokio::spawn(async move {
+        let response = reqwest::Client::builder()
+            .timeout(budget)
+            .build()
+            .expect("failed to build HTTP client")
+            .post(format!("{base}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages failed: {error}"));
+        assert!(
+            response.status().is_success(),
+            "streaming request answered HTTP {}",
+            response.status()
+        );
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let events = response
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("reading the event stream failed: {error}"));
+        (content_type, events)
+    })
+    .await
+    .expect("the Anthropic streaming request task panicked");
+    world.anthropic_stream = Some(format!("content-type: {content_type}\n\n{events}"));
+}
+
+/// The content type and `(event name, data)` pairs of the streamed response.
+fn parse_anthropic_stream(world: &E2eWorld) -> (String, Vec<(String, serde_json::Value)>) {
+    let raw = world
+        .anthropic_stream
+        .as_deref()
+        .expect("no Anthropic streaming response");
+    let (header, body) = raw.split_once("\n\n").expect("stream capture is malformed");
+    let events = body
+        .split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .map(|frame| {
+            let event = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .unwrap_or_else(|| panic!("an SSE frame has no `event:` line:\n{frame}"));
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("an SSE frame has no `data:` line:\n{frame}"));
+            let data = serde_json::from_str(data)
+                .unwrap_or_else(|error| panic!("SSE data is not JSON ({error}):\n{frame}"));
+            (event.to_owned(), data)
+        })
+        .collect();
+    (header.to_owned(), events)
+}
+
+#[then("the response is delivered as Anthropic-style server-sent events")]
+async fn assert_anthropic_server_sent_events(world: &mut E2eWorld) {
+    let (header, events) = parse_anthropic_stream(world);
+    assert!(
+        header.contains("text/event-stream"),
+        "the streaming response is not an event stream: {header}"
+    );
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names.first(), Some(&"message_start"), "{names:?}");
+    assert_eq!(names.last(), Some(&"message_stop"), "{names:?}");
+    for required in [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+    ] {
+        assert!(
+            names.contains(&required),
+            "no `{required}` event: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"error"),
+        "the stream carried an error: {events:?}"
+    );
+    let model = events[0].1["message"]["model"].as_str().unwrap_or("");
+    let expected = world.model_name.as_deref().unwrap_or("");
+    assert!(
+        model_ids_match(model, expected),
+        "the streamed message model '{model}' does not identify '{expected}'"
+    );
+}
+
+#[then("the streamed content reassembles into a complete reply")]
+async fn assert_anthropic_stream_reassembles(world: &mut E2eWorld) {
+    let (_, events) = parse_anthropic_stream(world);
+    let text: String = events
+        .iter()
+        .filter(|(name, _)| name == "content_block_delta")
+        .filter_map(|(_, data)| data["delta"]["text"].as_str())
+        .collect();
+    assert!(
+        !text.is_empty(),
+        "the streamed deltas carry no text: {events:?}"
+    );
+    let delta = events
+        .iter()
+        .find(|(name, _)| name == "message_delta")
+        .map(|(_, data)| data)
+        .expect("no message_delta");
+    assert!(
+        delta["delta"]["stop_reason"].is_string(),
+        "message_delta has no stop_reason: {delta}"
+    );
+    assert!(
+        delta["usage"]["output_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "message_delta reports no output tokens: {delta}"
+    );
+}
+
 #[then("both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy")]
 async fn assert_both_endpoints_healthy(world: &mut E2eWorld) {
     // `services list` probes each endpoint it shows and marks one that does not
