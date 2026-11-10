@@ -94,29 +94,23 @@ const NON_RELEASE_VERSION: &str = "0.0.0-dev";
 /// and `git_hash` are the values this build script already resolves; an empty
 /// input is treated as `unknown` so the result is never an empty version.
 fn format_cli_version(version_ref: &str, git_hash: &str, cargo_pkg_version: &str) -> String {
-    let resolved_ref = if version_ref.is_empty() {
-        "unknown"
-    } else {
-        version_ref
-    };
-    let resolved_hash = if git_hash.is_empty() {
-        "unknown"
-    } else {
-        git_hash
-    };
-    let version = cli_version_number(resolved_ref, cargo_pkg_version);
-    format!("{version} ({resolved_ref}, {resolved_hash})")
+    let version = cli_version_number(version_ref, cargo_pkg_version);
+    format!(
+        "{version} ({}, {})",
+        or_unknown(version_ref),
+        or_unknown(git_hash)
+    )
 }
 
 /// The leading version of [`format_cli_version`]'s string, which that
 /// function is built from. An empty ref is `unknown`, as there.
 fn cli_version_number(version_ref: &str, cargo_pkg_version: &str) -> String {
-    let resolved_ref = if version_ref.is_empty() {
-        "unknown"
-    } else {
-        version_ref
-    };
-    displayed_version(resolved_ref, cargo_pkg_version)
+    displayed_version(or_unknown(version_ref), cargo_pkg_version)
+}
+
+/// An empty ref or hash is reported as `unknown`, never as an empty field.
+const fn or_unknown(value: &str) -> &str {
+    if value.is_empty() { "unknown" } else { value }
 }
 
 fn displayed_version(version_ref: &str, cargo_pkg_version: &str) -> String {
