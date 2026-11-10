@@ -2602,7 +2602,7 @@ exit 1
     /// The reuse path: a usable managed Python is already recorded, so
     /// `ensure_managed_python` returns early. Meeting an unreadable config
     /// there must fail — not report success with the record silently skipped
-    /// — before anything is installed, and leave the file as it was.
+    /// — before `uv` is run at all, and leave the file as it was.
     #[cfg(unix)]
     #[test]
     fn ensure_managed_python_reuse_path_fails_on_an_unreadable_config() -> Result<()> {
@@ -2648,8 +2648,8 @@ exit 1
         assert_names_the_file_to_rename(&message, &paths);
         assert_eq!(after, damaged, "config.json was rewritten");
         assert!(
-            !uv_calls.contains("python install"),
-            "the reuse path installed Python before failing: {uv_calls}"
+            uv_calls.is_empty(),
+            "uv ran before the unreadable config stopped the step: {uv_calls}"
         );
         Ok(())
     }
