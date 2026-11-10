@@ -1646,8 +1646,8 @@ async fn home_view_displayed(world: &mut E2eWorld) {
 #[then("the hero reports no GPU telemetry available")]
 async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     let tui = session(world);
-    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
-    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
+    // The VRAM/TEMP/POWER/T/S rows sit low in the hero, and a short pty
+    // squeezes the hero until `hero_rows` drops its bottom rows; enlarge first.
     tui.use_wide_size()
         .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
 
@@ -1698,6 +1698,38 @@ async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
         lacking
     })
     .await;
+}
+
+#[then("the hero reports no generation throughput")]
+async fn hero_reports_no_generation_throughput(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Self-contained rather than relying on a preceding step: cucumber matches
+    // step text globally, so this has to hold wherever it is written. The T/S
+    // row sits low in the hero and a short pty drops it, so enlarge and wait
+    // for the redraw before reading the screen.
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen_where(
+        "the hero's T/S row",
+        |screen| screen.contains("T/S"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the hero's T/S row did not render: {e}"));
+
+    let screen = tui.screen_text();
+    let row = screen
+        .lines()
+        .find(|line| line.contains("T/S"))
+        .unwrap_or_else(|| panic!("no T/S row on screen:\n{screen}"));
+    let value = row
+        .split_once("T/S")
+        .and_then(|(_, rest)| rest.split('│').next())
+        .map_or_else(|| panic!("no text after T/S on row:\n{row}"), str::trim);
+    assert_eq!(
+        value, "—",
+        "T/S should show the \"—\" placeholder when nothing is served:\n{row}"
+    );
 }
 
 #[then("the dashboard reports live GPU telemetry")]
