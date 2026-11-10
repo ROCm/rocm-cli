@@ -93,6 +93,56 @@ mod tests {
         Ok(())
     }
 
+    /// A launch that cannot write the module must fail naming the path, never
+    /// start a server without the middleware it asked for.
+    #[test]
+    fn write_middleware_module_fails_naming_a_directory_that_is_a_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("python");
+        fs::write(&dir, "not a directory")?;
+        let error = format!("{:#}", write_middleware_module(&dir).unwrap_err());
+        assert!(
+            error.contains(&format!("failed to create {}", dir.display())),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_middleware_module_fails_naming_a_module_path_taken_by_a_directory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(format!("{MIDDLEWARE_MODULE_NAME}.py"));
+        fs::create_dir_all(path.join("occupied"))?;
+        let error = format!("{:#}", write_middleware_module(temp.path()).unwrap_err());
+        assert!(
+            error.contains(&format!("failed to write {}", path.display())),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// Asserts nothing as root, which can create files in a read-only
+    /// directory: the probe write then succeeds and the check is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn write_middleware_module_fails_naming_a_directory_it_cannot_write() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("python");
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))?;
+        if fs::write(dir.join("probe"), "").is_err() {
+            let result = write_middleware_module(&dir);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains(&format!("failed to stage a file in {}", dir.display())),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
+
     /// A container bind-mounting the directory may run as another user, so
     /// both the directory and the module must be readable by anyone.
     #[cfg(unix)]
@@ -190,11 +240,8 @@ mod tests {
             !output.status.success(),
             "constructing without a key must fail"
         );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("VLLM_API_KEY is empty"),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("VLLM_API_KEY is empty"), "stderr: {stderr}");
         Ok(())
     }
 
