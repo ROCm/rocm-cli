@@ -554,6 +554,10 @@ fn publish(
     }
 }
 
+/// U+FFFD in UTF-8, as bytes: a literal here would be a non-ASCII string in
+/// production code, which the output contract forbids.
+const REPLACEMENT_CHARACTER: &[u8] = &[0xEF, 0xBF, 0xBD];
+
 /// Turns arbitrary chunks of a byte stream into text that is valid UTF-8 at every
 /// boundary, for a sink that requires it. Rust's stdio on a Windows console
 /// refuses a write that is not valid UTF-8, so a chunk that ends in the middle of
@@ -589,7 +593,7 @@ impl Utf8Carry {
                             return out;
                         }
                         Some(len) => {
-                            out.extend_from_slice("\u{FFFD}".as_bytes());
+                            out.extend_from_slice(REPLACEMENT_CHARACTER);
                             rest.drain(..valid_up_to + len);
                         }
                     }
