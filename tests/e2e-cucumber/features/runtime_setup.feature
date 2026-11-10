@@ -640,8 +640,8 @@ Feature: Runtime configuration
   # older Pythons too. `--python-version` lets an install that does not need vLLM
   # pick one. The preview must plan what the install would do with it: the
   # requested interpreter and its wheel tag, not the default's, with the same
-  # resolution as runtime-27. Whether the choice moves resolution onto that
-  # interpreter's tags is unit-tested in `apps/rocm/src/therock/python.rs`.
+  # resolution as runtime-27. Only the plan is asserted here; no scenario runs
+  # resolution with the chosen interpreter.
   #
   # Linux only, for the same empty-`PATH` host as runtime-23.
   @id:runtime-install-preview-of-rocm-10-honours-python-version @requires-os:linux

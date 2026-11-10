@@ -202,8 +202,11 @@ Expected result:
   ROCm 10 install is refused naming 3.10 to 3.14. A real ROCm 10 install on a
   vLLM GPU family with `--python-version 3.12` skips the engine auto-install
   with a note, while a real ROCm 7 install on that family with `--python-version
-  3.12` (the redundant, accepted value) still auto-installs vLLM; `rocm engines install vllm` on it names the wheel tag it needs,
-  and `rocm update` of that runtime builds the new one on Python 3.12 again.
+  3.12` (the redundant, accepted value) still auto-installs vLLM.
+- On the ROCm 10 runtime installed on Python 3.12 (including an unpinned
+  nightly install that resolved to ROCm 10), `rocm engines install vllm` names
+  the wheel tag it needs, and `rocm update` of that runtime builds the new one
+  on Python 3.12 again.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests

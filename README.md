@@ -566,7 +566,8 @@ which Python it chose, and `--dry-run` shows it without changing anything.
 #### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version`. These versions select their device payload by exact
+version with `--version` (an unpinned nightly install also gets ROCm 10 while
+that channel's newest build is one, from the nightly sources as before). These versions select their device payload by exact
 GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
 a family of GPUs, or none), or you want to target a different GPU, also pass
 `--family` with the raw `gfx` code instead of a family label:
@@ -607,8 +608,9 @@ dependency metadata alongside the pinned torchaudio. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
+Nothing about this happens on its own on the release channel. Without a
+`--version` of 10 or newer, `install sdk` resolves the same release and nightly
+sources as before. It doesn't
 quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
 you what it couldn't find instead.
 
