@@ -117,11 +117,19 @@ impl ServiceStart {
 /// and `--require-api-key` where the service asked for it. The model is the one
 /// thing left as a placeholder: the guard does not know it, and it does not
 /// decide where the endpoint is.
+///
+/// The line is meant to be pasted into a shell, and the host is a string the
+/// record holds, so it is quoted like every other value `rocm` prints in a
+/// command (`posix_shell_quote`): a host such as `[::1]` is a glob pattern to
+/// bash and zsh (an error in zsh, a match for a one-character file name in bash),
+/// and one with a space or a `;` would split into more words. A host made only of
+/// letters, digits and `-_./:=` (`127.0.0.1`, `localhost`, `::1`, a DNS name) is
+/// printed as it is. The port is a number and needs none.
 fn serve_command(host: &str, port: u16, requires_api_key: bool) -> String {
     let mut command = String::from("rocm serve <model>");
     if !crate::is_canonical_loopback_host(host) {
         command.push_str(" --host ");
-        command.push_str(host);
+        command.push_str(&crate::posix_shell_quote(host));
     }
     command.push_str(" --port ");
     command.push_str(&port.to_string());
@@ -302,7 +310,7 @@ mod tests {
     /// The command each recorded host and requirement must be told to run: it
     /// keeps what the bind depended on, so following it does not bring the
     /// service back somewhere else. Spelled out here, not derived.
-    const ADVISED: [(&str, bool, &str); 8] = [
+    const ADVISED: [(&str, bool, &str); 10] = [
         (
             "127.0.0.1",
             true,
@@ -343,6 +351,18 @@ mod tests {
             "LOCALHOST",
             false,
             "rocm serve <model> --host LOCALHOST --port 8000 --allow-public-bind",
+        ),
+        // Not one of the three loopback spellings, so a public bind; and a glob
+        // pattern in a shell, so it is printed quoted.
+        (
+            "[::1]",
+            false,
+            "rocm serve <model> --host '[::1]' --port 8000 --allow-public-bind",
+        ),
+        (
+            "[::1]",
+            true,
+            "rocm serve <model> --host '[::1]' --port 8000 --allow-public-bind --require-api-key",
         ),
     ];
 
@@ -570,6 +590,35 @@ mod tests {
                     // Only the recorded port appears, so a fixed one cannot hide behind it.
                     assert_eq!(message.matches("--port").count(), 1, "{message}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_host_it_names_is_quoted_so_a_shell_reads_it_as_one_word() {
+        // Pasted into bash or zsh, an unquoted `[::1]` is a glob pattern (zsh stops
+        // with "no matches found"; bash may match a one-character file name and
+        // relaunch the service on that host), and a space or `;` would split the
+        // value into more words. `rocm`'s other printed commands quote through
+        // `posix_shell_quote`, and so does this one.
+        for (host, quoted) in [
+            ("[::1]", "'[::1]'"),
+            ("*", "'*'"),
+            ("gpu box", "'gpu box'"),
+            ("a;b", "'a;b'"),
+            ("$HOME", "'$HOME'"),
+            ("it's", "'it'\\''s'"),
+            ("::1", "::1"),
+            ("localhost", "localhost"),
+            ("gpu-box.example", "gpu-box.example"),
+            ("192.168.1.10", "192.168.1.10"),
+        ] {
+            for start in STARTS {
+                let message = refusal(host, false, true, start);
+                assert!(
+                    message.contains(&format!(" --host {quoted} --port 8000 ")),
+                    "{host:?} {start:?}: {message}"
+                );
             }
         }
     }

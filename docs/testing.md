@@ -2044,7 +2044,13 @@ port (always, since a launch that leaves `--port` out is given one from
 does not follow), the recorded host where it is not the default loopback one,
 the public-bind opt-in and `--require-api-key`, so following it does not bring
 the service back somewhere else; the guard takes the port the record holds, and
-the model stays a placeholder because it does not decide where the endpoint is. A restart or respawn is of a recorded
+the model stays a placeholder because it does not decide where the endpoint is.
+The host is printed shell-quoted (`rocm-core`'s `posix_shell_quote`, as every
+other printed command quotes a value), because a host such as `[::1]` is a glob
+pattern to bash and zsh and would otherwise relaunch the service on another host
+or not at all; a test reads the printed command back through a real `sh` in a
+directory with files a glob could match and parses the words with the real
+`rocm serve` parser. A restart or respawn is of a recorded
 service that may still be running, and `rocm serve` reuses a running service
 for the same engine and model and discards the key it generated for that
 attempt, so the refusal names `rocm services stop <id> --yes` before the launch

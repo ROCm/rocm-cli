@@ -820,4 +820,83 @@ mod tests {
         }
         Ok(())
     }
+
+    /// The command a refusal names is pasted into a shell, and the host in it is a
+    /// string the record holds. Read back through a real `sh` (which is what the
+    /// printed quoting has to survive) in a directory with files a glob could
+    /// match, every value must come out as the one word the record had, and the
+    /// words must parse through the real `rocm serve` parser to the recorded host
+    /// and port.
+    #[cfg(unix)]
+    #[test]
+    fn the_command_a_refusal_names_reaches_the_recorded_host_through_a_real_shell() -> Result<()> {
+        use rocm_core::ServiceStart;
+
+        let (root, _paths) = test_paths("refusal-command-shell");
+        fs::create_dir_all(&root)?;
+        for file in ["1", "x", ":"] {
+            fs::write(root.join(file), "")?;
+        }
+        for host in [
+            "::1",
+            "[::1]",
+            "*",
+            "gpu box",
+            "a;b",
+            "$HOME",
+            "it's",
+            "gpu-box.example",
+        ] {
+            for start in [
+                ServiceStart::Launch,
+                ServiceStart::Restart,
+                ServiceStart::Respawn,
+            ] {
+                let message = rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    true,
+                    start,
+                    "lemonade-qwen-3000",
+                    8000,
+                )
+                .expect_err("a keyless service is refused")
+                .to_string();
+                let printed: Vec<&str> = message
+                    .split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|span| span.starts_with("rocm serve"))
+                    .collect();
+                assert_eq!(printed.len(), 1, "{message}");
+                let script = format!("printf '%s\\n' {}", printed[0].replace("<model>", "qwen"));
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .current_dir(&root)
+                    .output()?;
+                assert!(output.status.success(), "{host:?} {script}: {output:?}");
+                let words: Vec<String> = String::from_utf8(output.stdout)?
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                // The host is one word, and it is the recorded one.
+                let at = words
+                    .iter()
+                    .position(|word| word == "--host")
+                    .unwrap_or_else(|| panic!("{host:?} {start:?}: no --host in {words:?}"));
+                assert_eq!(words[at + 1], host, "{start:?}: {words:?} from {script}");
+                // And the real parser reads the same host and port out of it.
+                let ServeAdvice {
+                    host: parsed_host,
+                    port,
+                    ..
+                } = parse_serve_advice(&words);
+                assert_eq!(parsed_host, host, "{start:?}: {words:?}");
+                assert_eq!(port, Some(8000), "{start:?}: {words:?}");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
 }
