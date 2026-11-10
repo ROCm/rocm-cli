@@ -636,12 +636,25 @@ fn settle_roots_that_exited_alone(stops: &mut [RecordedPidStop]) {
 /// cannot see exit, and reporting the stop confirmed would clear the record and
 /// the endpoint key while a worker may still hold the device.
 pub fn terminate_recorded_pid(identity: &ProcessIdentity) -> TerminationOutcome {
+    terminate_recorded_pid_within(identity, MANAGED_STOP_GRACE)
+}
+
+/// [`terminate_recorded_pid`] with the root's grace chosen by the caller.
+///
+/// For a process that has nothing to flush, such as a launch child cleaned up
+/// because its record could not be published. Everything else is the same
+/// routine: the PID hold, the identity gate, and on Windows the descendant kill,
+/// whose own deadline stays [`MANAGED_STOP_GRACE`].
+pub fn terminate_recorded_pid_within(
+    identity: &ProcessIdentity,
+    grace: std::time::Duration,
+) -> TerminationOutcome {
     terminate_recorded_pid_with(
         identity,
         platform_tree_kill(),
         hold_pid,
         identity_state,
-        |identity| terminate_verified(identity, KillScope::Tree, MANAGED_STOP_GRACE, true),
+        |identity| terminate_verified(identity, KillScope::Tree, grace, true),
     )
 }
 

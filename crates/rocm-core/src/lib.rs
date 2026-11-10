@@ -183,7 +183,8 @@ pub use paths::{AppPaths, engine_plugin_dirs};
 pub use proc_lifecycle::{
     IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
     RecordedPidStop, TerminationOutcome, identity_state, process_start_ticks,
-    terminate_recorded_pid, terminate_recorded_service_pids, terminate_verified,
+    terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
+    terminate_verified,
 };
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
