@@ -18,6 +18,13 @@
 //! when the committed copy differs, so a catalog change cannot leave a stale
 //! recording behind, the same guard `cargo xtask catalog --check` gives the manifest.
 //!
+//! A case may also name a `host`, which makes the stub answer `rocm examine --json`.
+//! The reply is the recorded examination with the few fields the host implies
+//! edited, and its `status` recomputed by [`rocm_core::Examination::compute_status`],
+//! the rule the probe itself uses. The real command prints those fields plus a
+//! `summary` of the host that only the `rocm` binary can build, so the replay
+//! leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in it.
+//!
 //! Two things are not rendered. What an OLDER CLI printed was recorded once from a
 //! real older binary and is committed under `recorded/`. And the current CLI's
 //! `--version` line is fixed text ([`CURRENT_VERSION`]): it is not the real
@@ -54,6 +61,13 @@ const EVALS_FILE: &str = "skills/rocm-doctor/evals/evals.json";
 const CURRENT_VERSION: &str = "rocm-cli 0.1.0 (recorded for evals)\n";
 /// An older CLI rejects `--json` with a usage error, and clap's usage-error code is 2.
 const USAGE_ERROR_RC: i32 = 2;
+/// What the replay prints when `host` says `rocm examine` itself fails. Fixed
+/// text, not recorded from a real failure: the skill reacts to the non-zero exit
+/// and relays whatever was printed, and the marker is what the eval pins in
+/// `logs_contain`, since only the replay prints it.
+const EXAMINE_FAILS_STDERR: &str = "error: failed to read the host (recorded for evals)\n";
+/// A genuine inability to examine propagates as an error, which exits 1.
+const EXAMINE_FAILS_RC: i32 = 1;
 
 /// The part of the dataset this module reads: which prompt each case id has.
 #[derive(Debug, Deserialize)]
@@ -80,6 +94,26 @@ struct Case {
     cli: Cli,
     /// The symptom the diagnosis replay was run with.
     symptom: String,
+    /// The machine `rocm examine --json` describes, for a case that needs it. A
+    /// case without one gets no examine reply, and the stub refuses the command.
+    #[serde(default)]
+    host: Option<Host>,
+}
+
+/// The host a replayed `rocm examine --json` describes. Each is the recorded
+/// examination with only the fields the host implies changed.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum Host {
+    /// Linux with no AMD GPU found: status `no-amd-gpu`.
+    NoAmdGpu,
+    /// WSL2 where the Windows host has no AMD GPU: status `wsl`, `has_amd_gpu`
+    /// false. On WSL the status never says `no-amd-gpu`, so the skill reads the field.
+    WslHostGpuHidden,
+    /// Linux with an AMD GPU found: status `ok`.
+    AmdFound,
+    /// `rocm examine` itself fails and exits non-zero.
+    ExamineFails,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +150,10 @@ struct Replies {
     fix_json: Reply,
     diagnose_json: Reply,
     diagnose_text: Reply,
+    /// Only for a case that names a `host`; left out of the file otherwise, so a
+    /// case without one is recorded exactly as it was before this existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    examine_json: Option<Reply>,
 }
 
 /// Regenerate (or, with `check`, verify) the committed fixtures.
@@ -171,8 +209,52 @@ fn load_examination(root: &Path) -> Result<rocm_core::Examination> {
         .with_context(|| format!("{} is not a valid examination", path.display()))
 }
 
+/// The recorded examination, edited to be the machine `host` names. Only the
+/// fields the host implies change, and `status` is recomputed from them by the
+/// probe's own rule, never typed.
+fn examination_for(base: &rocm_core::Examination, host: Host) -> rocm_core::Examination {
+    let mut examination = base.clone();
+    match host {
+        Host::NoAmdGpu | Host::ExamineFails => {
+            examination.is_wsl = false;
+            examination.has_amd_gpu = false;
+        }
+        Host::WslHostGpuHidden => {
+            examination.is_wsl = true;
+            examination.has_amd_gpu = false;
+            // A WSL2 distro whose Windows host exposes a GPU to it (`/dev/dxg`,
+            // DXCore) but not an AMD one, so nothing ROCm-side is installed. Typed,
+            // not probed: the probe fills this from the distro it runs in.
+            examination.wsl = Some(rocm_core::examine::WslFacts {
+                version: 2,
+                dxg_device: true,
+                dxcore: true,
+                wsl_lib_dir: true,
+                ..rocm_core::examine::WslFacts::default()
+            });
+        }
+        Host::AmdFound => {
+            examination.is_wsl = false;
+            examination.has_amd_gpu = true;
+            examination.has_discrete_amd = true;
+            examination.gpus = vec![rocm_core::examine::Gpu {
+                name: "AMD Radeon RX 7900 XTX".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+                pci_id: "1002:744c".to_owned(),
+                is_apu: Some(false),
+                is_amd: true,
+            }];
+        }
+    }
+    examination.status = examination.compute_status();
+    examination
+}
+
 /// Everything the stub says for one case.
-fn replies_for(root: &Path, case: &Case, examination: &rocm_core::Examination) -> Result<Replies> {
+fn replies_for(root: &Path, case: &Case, recorded: &rocm_core::Examination) -> Result<Replies> {
+    let examination = &case
+        .host
+        .map_or_else(|| recorded.clone(), |host| examination_for(recorded, host));
     let report = rocm_core::run_diagnose(examination, &case.symptom);
     let diagnose_json = Reply::ok(
         serde_json::to_string_pretty(&report).context("failed to render the diagnosis")? + "\n",
@@ -195,11 +277,25 @@ fn replies_for(root: &Path, case: &Case, examination: &rocm_core::Examination) -
             },
         ),
     };
+    let examine_json = match case.host {
+        None => None,
+        Some(Host::ExamineFails) => Some(Reply {
+            stdout: String::new(),
+            stderr: EXAMINE_FAILS_STDERR.to_owned(),
+            rc: EXAMINE_FAILS_RC,
+        }),
+        Some(_) => Some(Reply::ok(
+            serde_json::to_string_pretty(examination)
+                .context("failed to render the examination")?
+                + "\n",
+        )),
+    };
     Ok(Replies {
         version,
         fix_json,
         diagnose_json,
         diagnose_text,
+        examine_json,
     })
 }
 
@@ -370,6 +466,63 @@ mod tests {
         let (_tmp, root) = scratch();
         generate(&root).expect("generate");
         verify(&root).expect("a freshly generated tree must verify");
+    }
+
+    #[test]
+    fn a_host_replays_the_status_the_probe_would_compute() {
+        let root = paths::workspace_root().expect("workspace root");
+        let recorded = load_examination(&root).expect("examination");
+        let mut seen = Vec::new();
+        for case in cases(&root) {
+            let Some(host) = case.host else { continue };
+            seen.push(host);
+            let replies = replies_for(&root, &case, &recorded).expect("replies");
+            let examine = replies
+                .examine_json
+                .unwrap_or_else(|| panic!("{} names a host but replays no examine", case.id));
+            let (status, has_amd_gpu) = match host {
+                Host::ExamineFails => {
+                    assert_eq!(examine.rc, EXAMINE_FAILS_RC, "{}", case.id);
+                    assert!(examine.stdout.is_empty(), "{}", case.id);
+                    assert_eq!(examine.stderr, EXAMINE_FAILS_STDERR, "{}", case.id);
+                    continue;
+                }
+                Host::NoAmdGpu => ("no-amd-gpu", false),
+                Host::WslHostGpuHidden => ("wsl", false),
+                Host::AmdFound => ("ok", true),
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&examine.stdout).expect("an examination is JSON");
+            assert_eq!(value["status"], status, "{}", case.id);
+            assert_eq!(value["has_amd_gpu"], has_amd_gpu, "{}", case.id);
+            // The status in the file is what the probe's own rule says for the
+            // edited fields, not text typed beside them.
+            let examination = examination_for(&recorded, host);
+            assert_eq!(examination.status, examination.compute_status());
+        }
+        for host in [
+            Host::NoAmdGpu,
+            Host::WslHostGpuHidden,
+            Host::AmdFound,
+            Host::ExamineFails,
+        ] {
+            assert!(seen.contains(&host), "no case replays the host {host:?}");
+        }
+    }
+
+    #[test]
+    fn a_case_with_no_host_records_no_examine_reply() {
+        // So the cases recorded before `host` existed are byte-for-byte what they
+        // were, and the stub keeps refusing `examine` for them.
+        let root = paths::workspace_root().expect("workspace root");
+        let mut checked = 0;
+        for case in cases(&root).iter().filter(|case| case.host.is_none()) {
+            let path = fixtures_dir(&root).join(&case.id).join(REPLIES_FILE);
+            let text = fs::read_to_string(&path).expect("replies");
+            assert!(!text.contains("examine_json"), "{}", case.id);
+            checked += 1;
+        }
+        assert!(checked > 0, "no case without a host to check");
     }
 
     #[test]
