@@ -4,8 +4,9 @@
 
 //! Given steps that describe the machine a scenario runs on by planting a
 //! simulated one (see `e2e_cucumber::simulated_host`). The CLI then reads its
-//! hardware from that machine on every lane, so the scenario behaves the same
-//! on a GitHub-hosted runner, a GPU box, and a WSL2 laptop.
+//! hardware from that machine on every lane: a GitHub-hosted runner, a GPU box
+//! or a WSL2 laptop. The few probes it does not replace are listed under
+//! "Simulated and real GPU hardware" in `docs/testing.md`.
 
 use std::path::Path;
 

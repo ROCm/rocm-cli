@@ -771,7 +771,11 @@ The cucumber suite runs in one of two hardware modes, chosen by
 
 - `simulated` (the default, and what every GitHub-hosted run uses) — a scenario
   that needs a GPU describes the host it wants itself, by planting a simulated
-  one, so it behaves the same on a laptop, a GitHub-hosted runner and a GPU box.
+  one. Steps that would otherwise use the runner's own GPU — `a model is served
+  in the background` and `a managed runtime is active` off a simulated machine —
+  take the GPU-less path a GitHub-hosted runner takes (a mock server, no SDK
+  install), so a GPU box runs the same checks. The host probes a simulated
+  machine does not replace are listed below.
 - `real` — set by the self-hosted GPU lanes. Scenarios tagged
   `@requires-real-gpu`, whose premise a simulated host cannot provide (a model
   generating tokens on a device, a runtime really installed for it, the real
@@ -815,7 +819,10 @@ and the identity of the user running the suite. The CLI still reads `$USER`, run
 the real `id -Gn` for the user's groups, and runs the real `stat` on the planted
 device nodes, which are plain files owned by that user, so group membership
 (`render`, `video`) and device access describe the runner, not the simulated
-machine. No simulated scenario asserts on any of these. Simulated scenarios
+machine. The per-GPU VRAM fallback `serve` uses to pick a device when `amd-smi`
+is missing reads the real `/sys/class/drm` (`gpu_vram_usage_sysfs` in
+[gpu_policy.rs](../apps/rocm/src/gpu_policy.rs)), so on a GPU box it sees the
+runner's cards. No simulated scenario asserts on any of these. Simulated scenarios
 carry `@requires-os:linux`: the Windows lane probes the registry, not a
 filesystem.
 

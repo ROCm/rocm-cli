@@ -67,12 +67,16 @@ pub enum Expectation {
 /// Which hardware a run exercises — the `E2E_HARDWARE` switch.
 ///
 /// `simulated` (the default) is the per-PR shape: a scenario that needs a GPU
-/// describes the host it wants itself, by planting a simulated one, so it runs
-/// identically on a GitHub-hosted runner and on a GPU box. Scenarios whose
-/// premise cannot be simulated — a model generating tokens on a device, a
-/// runtime really installed for it — are tagged `@requires-real-gpu` and only
-/// run when a lane on real hardware opts in with `E2E_HARDWARE=real`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// describes the host it wants itself, by planting a simulated one, and steps
+/// that would otherwise reach the runner's GPU (a real serve, a real SDK
+/// install) take their GPU-less path, so a GPU box runs what a GitHub-hosted
+/// runner runs. The hardware probes a simulated machine does not replace are
+/// listed in `docs/testing.md`. Scenarios whose premise cannot be simulated — a
+/// model generating tokens on a device, a runtime really installed for it —
+/// are tagged `@requires-real-gpu` and only run when a lane on real hardware
+/// opts in with `E2E_HARDWARE=real`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HardwareMode {
     #[default]
     Simulated,
@@ -96,6 +100,26 @@ impl HardwareMode {
                 Self::ENV
             )),
         }
+    }
+
+    /// The mode this process runs in, read from [`HardwareMode::ENV`].
+    ///
+    /// # Panics
+    ///
+    /// On a value [`HardwareMode::parse`] rejects, including one that is not
+    /// valid Unicode: a lane must never fall back to a mode it did not ask for.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let value = std::env::var_os(Self::ENV).map(|value| {
+            value.into_string().unwrap_or_else(|raw| {
+                panic!(
+                    "{}={} is not a hardware mode; use `simulated` or `real`",
+                    Self::ENV,
+                    raw.display()
+                )
+            })
+        });
+        Self::parse(value.as_deref()).unwrap_or_else(|err| panic!("{err}"))
     }
 
     /// Stable lowercase name, as accepted by [`HardwareMode::parse`].
@@ -361,11 +385,28 @@ pub struct Condition {
     pub has_amd_gpu: Option<bool>,
     #[serde(default)]
     pub is_wsl: Option<bool>,
+    /// The run's [`HardwareMode`]. A scenario that reaches the runner's GPU only
+    /// in a `real` run — chat-06 and chat-07 serve a real model there and talk to
+    /// the mock server otherwise — can only hit a real-serve bug in that mode, so
+    /// its row says `hardware = "real"` and a simulated run on the same GPU box
+    /// expects it to pass.
+    #[serde(default)]
+    pub hardware: Option<HardwareMode>,
 }
 
 impl Condition {
     /// Does this condition hold for the given host + resolved engine?
-    fn matches(&self, cap: &HostCapability, effective_engine: &str) -> bool {
+    fn matches(
+        &self,
+        cap: &HostCapability,
+        effective_engine: &str,
+        hardware: HardwareMode,
+    ) -> bool {
+        if let Some(mode) = self.hardware
+            && mode != hardware
+        {
+            return false;
+        }
         if let Some(e) = &self.effective_engine
             && !e.eq_ignore_ascii_case(effective_engine)
         {
@@ -437,10 +478,11 @@ impl Expectations {
         id: &str,
         cap: &HostCapability,
         effective_engine: &str,
+        hardware: HardwareMode,
     ) -> Option<u64> {
         self.entries_for(id)
             .iter()
-            .filter(|e| e.when.matches(cap, effective_engine))
+            .filter(|e| e.when.matches(cap, effective_engine, hardware))
             .filter_map(|e| e.serve_timeout_secs)
             .min()
     }
@@ -451,10 +493,15 @@ impl Expectations {
     /// `@serve-timeout:<secs>` tag on an expected-pass scenario wins, else the
     /// shortest matching xfail `serve_timeout_secs`. `None` for a scenario with
     /// no `@id:` tag or with neither, which keeps the step default.
-    pub fn serve_timeout_override(&self, decl: &ScenarioDecl, cap: &HostCapability) -> Option<u64> {
+    pub fn serve_timeout_override(
+        &self,
+        decl: &ScenarioDecl,
+        cap: &HostCapability,
+        hardware: HardwareMode,
+    ) -> Option<u64> {
         let id = decl.id.as_deref()?;
         decl.serve_timeout_secs
-            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap)))
+            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap), hardware))
     }
 
     /// Whether any declared condition for this scenario matches this host — the
@@ -465,10 +512,16 @@ impl Expectations {
     /// re-deriving applicability. Steps use it to spend effort where it changes
     /// a result: a serve backing an expect-pass scenario is worth relaunching
     /// after a stall, one backing a known bug is not.
-    pub fn is_xfail(&self, id: &str, cap: &HostCapability, effective_engine: &str) -> bool {
+    pub fn is_xfail(
+        &self,
+        id: &str,
+        cap: &HostCapability,
+        effective_engine: &str,
+        hardware: HardwareMode,
+    ) -> bool {
         self.entries_for(id)
             .iter()
-            .any(|e| e.when.matches(cap, effective_engine))
+            .any(|e| e.when.matches(cap, effective_engine, hardware))
     }
 }
 
@@ -732,7 +785,7 @@ pub fn resolve(
     // (2) xfail override.
     if let Some(id) = &decl.id {
         for entry in matrix.entries_for(id) {
-            if entry.when.matches(cap, engine) {
+            if entry.when.matches(cap, engine, hardware) {
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
                     reason: entry.reason.clone(),
@@ -925,6 +978,11 @@ mod tests {
     #[test]
     fn lemonade_serve_failures_track_rocmai_898_without_xfailing_mock_or_windows() {
         let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        // The lanes these rows describe run on real hardware.
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
         for id in [
             "bench-load-real-serve",
             "chat-tool-definitions-accepted",
@@ -935,24 +993,100 @@ mod tests {
             let scenario = decl(&[&format!("id:{id}")]);
             assert!(
                 matches!(
-                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
+                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, real),
                     Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCMAI-898"
                 ),
                 "{id}"
             );
             assert_eq!(
-                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade", HardwareMode::Real),
                 Some(90),
                 "{id}",
             );
             for platform in ["mock", "strix-windows"] {
                 assert_eq!(
-                    resolve(&scenario, &cap(platform), &matrix, Included::default()),
+                    resolve(&scenario, &cap(platform), &matrix, real),
                     Expectation::ExpectPass,
                     "{id} on {platform}",
                 );
             }
         }
+    }
+
+    /// chat-06 and chat-07 serve a real model only in an `E2E_HARDWARE=real`
+    /// run; in the default simulated mode they talk to the mock server and pass
+    /// on any host. Their xfail rows must follow the mode, or a simulated run on
+    /// a GPU box reads that pass as a stale XPASS and fails the run.
+    #[test]
+    fn chat_rows_xfail_only_in_a_real_hardware_run() {
+        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+        for (id, host) in [
+            ("chat-tool-definitions-accepted", "mi300x"),
+            ("chat-tool-definitions-accepted", "strix-ubuntu"),
+            ("chat-end-to-end-local-model", "strix-ubuntu"),
+        ] {
+            let scenario = decl(&[&format!("id:{id}")]);
+            assert!(
+                matches!(
+                    resolve(&scenario, &cap(host), &matrix, real),
+                    Expectation::ExpectXfail { .. }
+                ),
+                "{id} on {host} in a real run"
+            );
+            assert_eq!(
+                resolve(&scenario, &cap(host), &matrix, Included::default()),
+                Expectation::ExpectPass,
+                "{id} on {host} in a simulated run",
+            );
+            let engine = scenario.effective_engine(&cap(host)).to_owned();
+            assert!(!matrix.is_xfail(id, &cap(host), &engine, HardwareMode::Simulated));
+            assert_eq!(
+                matrix.serve_timeout_for(id, &cap(host), &engine, HardwareMode::Simulated),
+                None,
+                "{id} on {host}: no fail-fast serve window for a serve that does not happen",
+            );
+            assert_eq!(
+                matrix.serve_timeout_override(&scenario, &cap(host), HardwareMode::Simulated),
+                None,
+                "{id} on {host}: the before hook's override follows the mode too",
+            );
+            assert_eq!(
+                matrix.serve_timeout_override(&scenario, &cap(host), HardwareMode::Real),
+                Some(90),
+                "{id} on {host} in a real run",
+            );
+        }
+        // The vLLM row also needs a usable GPU: a real run on a vLLM host
+        // without one never serves for real, so chat-06 passes there.
+        let vllm_without_gpu = HostCapability {
+            has_amd_gpu: false,
+            ..cap("mi300x")
+        };
+        let scenario = decl(&["id:chat-tool-definitions-accepted"]);
+        assert_eq!(
+            resolve(&scenario, &vllm_without_gpu, &matrix, real),
+            Expectation::ExpectPass,
+            "chat-06 on a vLLM host with no usable GPU in a real run",
+        );
+    }
+
+    #[test]
+    fn a_condition_rejects_an_unknown_hardware_mode() {
+        let err = Expectations::parse(
+            r#"
+[["x"]]
+when = { hardware = "Real" }
+bug = "B"
+reason = "r"
+"#,
+        )
+        .unwrap_err();
+        // The message embeds the source line, so ask for serde's own words.
+        assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     /// The rows that carry `therock_family` and `has_amd_gpu` exist so that the
@@ -968,6 +1102,11 @@ mod tests {
     fn real_gpu_lemonade_rows_do_not_xfail_linux_hosts_without_a_usable_gpu() {
         let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         let linux_lemonade = cap("strix-ubuntu");
+        // A real-hardware run, so only the GPU and target guards decide.
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
         let hosts = [
             (
                 "linux, no GPU, no gfx target",
@@ -1002,7 +1141,7 @@ mod tests {
             let scenario = decl(&[&format!("id:{id}")]);
             for (label, host) in &hosts {
                 assert_eq!(
-                    resolve(&scenario, host, &matrix, Included::default()),
+                    resolve(&scenario, host, &matrix, real),
                     Expectation::ExpectPass,
                     "{id} on {label}",
                 );
@@ -1010,7 +1149,7 @@ mod tests {
             // The full real-GPU host is the one that must still be xfailed.
             assert!(
                 matches!(
-                    resolve(&scenario, &linux_lemonade, &matrix, Included::default()),
+                    resolve(&scenario, &linux_lemonade, &matrix, real),
                     Expectation::ExpectXfail { bug, .. } if bug == "ROCMAI-898"
                 ),
                 "{id} on a real GPU host",
@@ -2393,7 +2532,12 @@ serve_timeout_secs = 90
         .unwrap();
         // MI300X: effective engine vllm → override applies (fail fast).
         assert_eq!(
-            m.serve_timeout_for("serve-default-engine-inference", &cap("mi300x"), "vllm"),
+            m.serve_timeout_for(
+                "serve-default-engine-inference",
+                &cap("mi300x"),
+                "vllm",
+                HardwareMode::Real
+            ),
             Some(90)
         );
         // Strix Windows: lemonade default → condition doesn't match → no override
@@ -2402,12 +2546,16 @@ serve_timeout_secs = 90
             m.serve_timeout_for(
                 "serve-default-engine-inference",
                 &cap("strix-windows"),
-                "lemonade"
+                "lemonade",
+                HardwareMode::Real
             ),
             None
         );
         // Unknown id → no override.
-        assert_eq!(m.serve_timeout_for("nope", &cap("mi300x"), "vllm"), None);
+        assert_eq!(
+            m.serve_timeout_for("nope", &cap("mi300x"), "vllm", HardwareMode::Real),
+            None
+        );
     }
 
     #[test]
@@ -2421,15 +2569,21 @@ reason = "vLLM readiness gap"
 "#,
         )
         .unwrap();
-        assert!(m.is_xfail("serve-default-engine-inference", &cap("mi300x"), "vllm"));
+        assert!(m.is_xfail(
+            "serve-default-engine-inference",
+            &cap("mi300x"),
+            "vllm",
+            HardwareMode::Real
+        ));
         // A condition that doesn't match this host leaves the scenario expect-pass.
         assert!(!m.is_xfail(
             "serve-default-engine-inference",
             &cap("strix-windows"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
         // No entry at all → expect-pass.
-        assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm"));
+        assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm", HardwareMode::Real));
     }
 
     #[test]
@@ -2448,12 +2602,14 @@ flaky = true
         assert!(m.is_xfail(
             "chat-end-to-end-local-model",
             &cap("strix-ubuntu"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
         assert!(!m.is_xfail(
             "chat-end-to-end-local-model",
             &cap("wsl-no-passthrough"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
     }
 
@@ -2468,7 +2624,12 @@ flaky = true
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         for host in ["wsl-no-passthrough", "wsl"] {
             assert!(
-                !m.is_xfail("examine-both-forms-agree-on-gpu", &cap(host), "lemonade"),
+                !m.is_xfail(
+                    "examine-both-forms-agree-on-gpu",
+                    &cap(host),
+                    "lemonade",
+                    HardwareMode::Real
+                ),
                 "examine-08 must run, not xfail, on the {host} host"
             );
         }
@@ -2487,7 +2648,8 @@ flaky = true
         assert!(!m.is_xfail(
             "serve-hf-checkpoint-inference",
             &cap("strix-windows"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
     }
 
@@ -2504,12 +2666,21 @@ flaky = true
             "runtime-lemonade-backend-alignment-reported",
             "serve-large-model-inference",
         ] {
-            assert!(m.is_xfail(id, &cap("strix-windows"), "lemonade"), "{id}");
+            assert!(
+                m.is_xfail(id, &cap("strix-windows"), "lemonade", HardwareMode::Real),
+                "{id}"
+            );
             for linux in ["strix-ubuntu", "mi300x", "wsl2"] {
-                assert!(!m.is_xfail(id, &cap(linux), "lemonade"), "{id} on {linux}");
+                assert!(
+                    !m.is_xfail(id, &cap(linux), "lemonade", HardwareMode::Real),
+                    "{id} on {linux}"
+                );
             }
             // Same Windows host, other engine: the row is about lemonade.
-            assert!(!m.is_xfail(id, &cap("strix-windows"), "vllm"), "{id} vllm");
+            assert!(
+                !m.is_xfail(id, &cap("strix-windows"), "vllm", HardwareMode::Real),
+                "{id} vllm"
+            );
             let entries = m.entries_for(id);
             assert_eq!(entries.len(), 1, "{id}");
             assert!(!entries[0].flaky, "{id} is deterministic");
@@ -2522,7 +2693,11 @@ flaky = true
             "serve-large-model-inference",
         );
         assert_eq!(
-            m.serve_timeout_override(&ScenarioDecl::from_tags(&tags), &cap("strix-windows")),
+            m.serve_timeout_override(
+                &ScenarioDecl::from_tags(&tags),
+                &cap("strix-windows"),
+                HardwareMode::Real
+            ),
             Some(2400)
         );
     }
@@ -2536,12 +2711,12 @@ flaky = true
     fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         let id = "serve-stop-leaves-no-background-helper";
-        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
+        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade", HardwareMode::Real));
         assert_eq!(
-            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade", HardwareMode::Real),
             Some(90)
         );
-        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade"));
+        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade", HardwareMode::Real));
         let entries = m.entries_for(id);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].flaky);
@@ -2564,11 +2739,17 @@ flaky = true
         );
         let decl = ScenarioDecl::from_tags(&tags);
         assert_eq!(
-            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
+            m.serve_timeout_override(&decl, &cap("strix-ubuntu"), HardwareMode::Real),
             Some(90)
         );
-        assert_eq!(m.serve_timeout_override(&decl, &cap("mi300x")), Some(90));
-        assert_eq!(m.serve_timeout_override(&decl, &cap("strix-windows")), None);
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("mi300x"), HardwareMode::Real),
+            Some(90)
+        );
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("strix-windows"), HardwareMode::Real),
+            None
+        );
     }
 
     #[test]
@@ -2581,13 +2762,13 @@ flaky = true
             "serve-timeout:2400",
         ]);
         assert_eq!(
-            m.serve_timeout_override(&tagged, &cap("strix-ubuntu")),
+            m.serve_timeout_override(&tagged, &cap("strix-ubuntu"), HardwareMode::Real),
             Some(2400)
         );
         // No `@id:` tag, nothing to look up: the step default stays.
         let anonymous = decl(&["requires-engine:lemonade"]);
         assert_eq!(
-            m.serve_timeout_override(&anonymous, &cap("strix-ubuntu")),
+            m.serve_timeout_override(&anonymous, &cap("strix-ubuntu"), HardwareMode::Real),
             None
         );
     }

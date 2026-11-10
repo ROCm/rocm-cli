@@ -992,14 +992,14 @@ async fn setup_background_model(world: &mut E2eWorld) {
     // This precondition backs behavioural chat scenarios (tool-defs accepted,
     // end-to-end reply) whose When/Then talk to the served endpoint over HTTP and
     // never assert on real generation — only that a served model answers. So it
-    // doesn't need a real GPU serve: on a host WITH an AMD GPU we still exercise
-    // the real `rocm serve --managed` path (extra real coverage where hardware
-    // exists), but on a no-GPU host we back it with the in-process MockServer +
-    // a planted managed-service record. This lets the scenarios drop
-    // `@requires-gpu` and run on the GitHub-hosted mock lane every PR, with no
-    // coverage loss. Real inference stays covered by the `@requires-real-gpu`
-    // serve-*-inference scenarios.
-    if e2e_cucumber::capability::host_capability().has_amd_gpu {
+    // doesn't need a real GPU serve: on a real-hardware run with an AMD GPU we
+    // still exercise the real `rocm serve --managed` path (extra real coverage
+    // where hardware exists), but everywhere else — a no-GPU host, or a simulated
+    // run on a GPU box — we back it with the in-process MockServer + a planted
+    // managed-service record. This lets the scenarios run on the GitHub-hosted
+    // mock lane every PR, with no coverage loss. Real inference stays covered by
+    // the `@requires-real-gpu` serve-*-inference scenarios.
+    if crate::real_gpu_host() {
         setup_gpu_model(world).await;
     } else {
         let mock = MockServer::start("TestModel/E2E-1B").await;

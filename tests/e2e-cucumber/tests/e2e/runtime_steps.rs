@@ -144,14 +144,15 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
         plant_simulated_runtime(world);
         return;
     }
-    // On a no-GPU host this is a no-op: a managed TheRock SDK runtime can only be
+    // Off real hardware this is a no-op: a managed TheRock SDK runtime can only be
     // installed where there's a GPU family to select wheels for (see
-    // `@id:runtime-install-sdk-active`, @requires-real-gpu). The only scenarios
+    // `@id:runtime-install-sdk-active`, @requires-real-gpu), and a simulated run
+    // on a GPU box must not install one for the runner's GPU. The only scenarios
     // that reach this step without `@requires-real-gpu` (and off a simulated
     // machine) are the mock-lane chat scenarios, whose serve
     // is backed by MockServer and needs no runtime at all — so skip the install
     // rather than attempt a multi-GiB SDK pull that can't succeed here.
-    if !e2e_cucumber::capability::host_capability().has_amd_gpu {
+    if !crate::real_gpu_host() {
         return;
     }
     // This precondition only needs *a* runtime present — it does not assert a

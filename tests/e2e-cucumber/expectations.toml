@@ -24,6 +24,11 @@
 #   [[<scenario-id>]]                 one table per condition (arrays = OR)
 #   when = { effective_engine = "vllm", os = "linux", has_amd_gpu = true }
 #                                     all present keys must match (AND)
+#   when = { ..., hardware = "real" } the run's E2E_HARDWARE mode; for a scenario
+#                                     that reaches the runner's GPU only in a
+#                                     `real` run (chat-06/07 talk to the mock
+#                                     server otherwise), so a simulated run on the
+#                                     same box expects it to pass
 #   bug = "EAI-NNNN"                  ticket reference (shown in the report)
 #   reason = "..."                    human explanation (shown in the report)
 #   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
@@ -184,14 +189,15 @@ flaky = true
 
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
-when = { effective_engine = "vllm" }
+when = { effective_engine = "vllm", has_amd_gpu = true, hardware = "real" }
 bug = "EAI-7223"
 reason = "Chat requests carrying tool definitions are not accepted by the served vLLM model."
 serve_timeout_secs = 90
 
-# Chat's mock lane must remain expect-pass: only a real GPU serve is affected.
+# Chat's mock lane must remain expect-pass: only a real GPU serve is affected,
+# and chat-06/07 serve for real only in an E2E_HARDWARE=real run.
 [["chat-tool-definitions-accepted"]]
-when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true, hardware = "real" }
 bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
@@ -205,7 +211,7 @@ flaky = true
 # path works. Only the real Lemonade Linux serve stays xfail under ROCMAI-898;
 # the no-GPU MockServer path and native Windows remain expect-pass.
 [["chat-end-to-end-local-model"]]
-when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true, hardware = "real" }
 bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90

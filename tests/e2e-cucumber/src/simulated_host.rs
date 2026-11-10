@@ -44,9 +44,14 @@ pub const TOOL_OUTPUT_DIR: &str = ".fake-tools";
 /// dev-dependency of this crate, so the library cannot re-export it.)
 pub const TEST_HOST_ROOT_ENV: &str = "ROCM_CLI_TEST_HOST_ROOT";
 
-/// Every program the CLI runs to learn about the machine. None of them is
-/// reachable from a simulated machine's `PATH` except through the stand-in, and
-/// only when the simulated machine has it.
+/// The programs the CLI runs to learn about the machine's GPU, driver and
+/// kernel.
+///
+/// None of them is reachable from a simulated machine's `PATH` except
+/// through the stand-in, and only when the simulated machine has it. The
+/// programs that describe the user and the package manager (`id`, `stat`,
+/// `dpkg`, `rpm`) are not on this list and still answer for the runner; see
+/// "Simulated and real GPU hardware" in `docs/testing.md`.
 pub const HOST_TOOLS: &[&str] = &[
     "uname",
     "lsmod",
