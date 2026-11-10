@@ -870,7 +870,7 @@ Feature: Model serving
   # landing in the identical `AttachOutcome::ServerExited` arm serve-53
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
-  # Before ROCMAI-541 B2 this made a clean, intentional, externally-triggered
+  # Before ROCMAI-541 this made a clean, intentional, externally-triggered
   # stop fail exactly like serve-53's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
   Scenario: serve-54 - An externally stopped attached serve exits cleanly, not as a crash

@@ -205,7 +205,7 @@ pub struct E2eWorld {
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
     /// The scripted-engine `service_id` a serve step captured from the CLI's
-    /// own printed output (ROCMAI-541 N5) — not by scanning the services dir
+    /// own printed output (ROCMAI-541) — not by scanning the services dir
     /// for "the newest record" after the fact, which a concurrent recovery
     /// mechanism could make ambiguous. Set as soon as the id is known; read
     /// by the later `Then` steps instead of re-deriving it.

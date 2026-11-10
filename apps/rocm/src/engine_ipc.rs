@@ -359,9 +359,12 @@ pub(crate) fn builtin_engine_available(engine: &str) -> bool {
 /// caller that spawns this subcommand some other way) would otherwise lose an
 /// engine's failure reason completely, since nothing else reads a detached
 /// child's output. So this wrapper does not rely on that attachment alone: on
-/// any error from the engine dispatch below, it appends the full error chain
-/// directly to the service log file named by `--log-path` (the same file
-/// `rocm logs <service_id>` tails) and to this process's own structured log,
+/// any error from the engine dispatch below, it appends a one-line summary of
+/// the error chain directly to the service log file named by `--log-path` (the
+/// same file `rocm logs <service_id>` tails) — one line, because this process's
+/// stderr reaches that same file, so the full chain is already there whenever
+/// the attachment worked — and the full chain to this process's own
+/// structured log,
 /// and marks the engine state file `failed` — regardless of whether the
 /// engine already did either on this particular error path. A later success
 /// (this function only runs once per process, so there is no later state to
@@ -503,7 +506,7 @@ fn record_engine_serve_http_failure(
         rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "failed" }));
 }
 
-/// ROCMAI-541 (B3) E2E hook, armed by `ROCM_E2E_SCRIPTED_ENGINE`: stands in for
+/// ROCMAI-541 E2E hook, armed by `ROCM_E2E_SCRIPTED_ENGINE`: stands in for
 /// every real engine so a scenario can exercise a managed child dying (or being
 /// stopped) *after* its early-startup window, on a host with no GPU — the gap
 /// the original ROCMAI-541 fix left uncovered (see

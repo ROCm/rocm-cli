@@ -563,7 +563,7 @@ fn launch_managed_engine_child_locked(
             .try_wait()
             .context("failed to check managed engine startup state")?
         {
-            // ROCMAI-541 B2/AC3: this is the literal original symptom — the
+            // ROCMAI-541/AC3: this is the literal original symptom — the
             // engine died before the readiness wait even started, so nothing
             // else is ever going to mark this manifest or the engine's own
             // state file anything other than the `starting`/0 defaults

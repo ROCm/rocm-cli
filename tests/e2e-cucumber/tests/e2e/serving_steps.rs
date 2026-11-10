@@ -3297,7 +3297,7 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
 // without any GPU. Both attach with `--verbose` under piped (non-TTY) stdio,
 // so both exercise `stream_attached_logs_no_tty` and
 // `run_attached_service`'s `AttachOutcome::ServerExited` arm specifically —
-// the ROCMAI-541 B1/B2 code path, not the background-launch readiness wait
+// the ROCMAI-541 code path, not the background-launch readiness wait
 // (covered by unit tests instead: a real HTTP readiness wait never completes
 // early against an engine that never binds a port, so driving that path here
 // would cost the full 45s timeout for no extra coverage).
@@ -3353,7 +3353,7 @@ fn read_json_file(path: &std::path::Path) -> serde_json::Value {
 ///
 /// Reads the manifest by its known `service_id` (`<service_id>.json` — see
 /// `AppPaths::service_manifest_path`) rather than scanning the services dir
-/// for "the newest record" (ROCMAI-541 N5): a concurrent recovery mechanism
+/// for "the newest record" (ROCMAI-541): a concurrent recovery mechanism
 /// could otherwise make that ambiguous.
 fn scripted_engine_record_and_state_for(
     world: &E2eWorld,
@@ -3375,7 +3375,7 @@ fn record_and_state_from(record: serde_json::Value) -> (serde_json::Value, serde
 
 /// Extract the `service_id` the CLI printed for an attached managed launch
 /// (`println!("  service_id: {service_id}");` in `run_attached_service`) from
-/// its captured stdout (ROCMAI-541 N5). Deterministic and tied to this exact
+/// its captured stdout (ROCMAI-541). Deterministic and tied to this exact
 /// invocation, unlike scanning the services dir afterward for "the newest
 /// record".
 fn parse_service_id_from_output(output: &str) -> Option<String> {
@@ -3429,7 +3429,7 @@ async fn user_serves_expecting_scripted_crash(world: &mut E2eWorld) {
             "--verbose",
         ],
     );
-    // Captured from the CLI's own printed output (ROCMAI-541 N5) — right here,
+    // Captured from the CLI's own printed output (ROCMAI-541) — right here,
     // before any `Then` step would otherwise need to re-derive it by scanning
     // the services dir for "the newest record", which a concurrent recovery
     // mechanism could make ambiguous.
@@ -3524,7 +3524,7 @@ async fn scripted_engine_armed_to_run(world: &mut E2eWorld) {
 
 /// Kill `child` and collect its combined stdout+stderr, best-effort. Used to
 /// diagnose a hung wait before it falls through to a generic timeout panic
-/// (ROCMAI-541 N5).
+/// (ROCMAI-541).
 fn kill_and_collect_combined_output(mut child: std::process::Child) -> String {
     let _ = child.kill();
     match child.wait_with_output() {
@@ -3596,7 +3596,7 @@ async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
             break service_id;
         }
         if Instant::now() >= deadline {
-            // Diagnose before the generic timeout panic (ROCMAI-541 N5): a
+            // Diagnose before the generic timeout panic (ROCMAI-541): a
             // binary under test built without the `rocm/e2e-test-hooks`
             // feature never reaches the scripted engine at all, so this loop
             // would otherwise just spin for the full 30s and panic with a
@@ -3621,7 +3621,7 @@ async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
 #[when("another shell stops that service while it is attached")]
 async fn another_shell_stops_scripted_service(world: &mut E2eWorld) {
     // The id captured when `user_attaches_scripted_serve_in_background` first
-    // saw this exact record `running` (ROCMAI-541 N3) — not re-derived here by
+    // saw this exact record `running` (ROCMAI-541) — not re-derived here by
     // scanning the services dir for "the newest record", which a concurrent
     // recovery mechanism could make ambiguous.
     let service_id = world
@@ -3667,7 +3667,7 @@ async fn assert_attached_serve_reports_stop(world: &mut E2eWorld) {
 
 #[then("the service record does not read failed")]
 async fn assert_scripted_stop_not_marked_failed(world: &mut E2eWorld) {
-    // Read by the id captured at attach time (ROCMAI-541 N3), not by scanning
+    // Read by the id captured at attach time (ROCMAI-541), not by scanning
     // for "the newest record" — see `another_shell_stops_scripted_service`.
     let service_id = world
         .scripted_service_id

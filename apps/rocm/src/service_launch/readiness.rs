@@ -412,7 +412,7 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// loop, or a background launch/restart's readiness wait) cares about by
 /// signalling it directly, after writing `stop_requested_unix_ms` first —
 /// which is what lands here, in `ServerExited`, rather than `Stop`, and is
-/// otherwise indistinguishable from a crash (ROCMAI-541 B1/B2). `rocmd`'s own
+/// otherwise indistinguishable from a crash (ROCMAI-541). `rocmd`'s own
 /// restart-recovery watcher (`restart_managed_service` in
 /// `apps/rocmd/src/watchers.rs`) is a different case: it only ever fires once
 /// the manifest or the endpoint already shows the service dead or
@@ -427,7 +427,7 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// stop": that is itself anomalous, and silently treating it as a clean stop
 /// would risk masking a real crash.
 ///
-/// # Known residual race (ROCMAI-541 review, tracked separately)
+/// # Known residual race (ROCMAI-541 review)
 ///
 /// The `status == "stopped"` term is **not** sound proof of an intentional
 /// stop. `managed_service_status::refresh_managed_service_runtime_liveness`
@@ -555,7 +555,7 @@ impl StopWatch {
 /// A dead-and-not-`Serving` child is still ambiguous one level further: it
 /// could be a crash, or it could be a `rocm services stop`/`rocm dash` stop
 /// that landed during this readiness wait — see
-/// [`managed_service_stop_was_requested`]'s doc comment (ROCMAI-541 B1). That
+/// [`managed_service_stop_was_requested`]'s doc comment (ROCMAI-541). That
 /// check is read fresh from disk, never from `record`, which was captured at
 /// spawn time and cannot reflect a stop requested since. When it fires,
 /// `record` is refreshed from disk too — rather than left as that stale
@@ -636,7 +636,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// ROCMAI-541 B2: `AttachOutcome::Stop` only ever fires from this
+    /// ROCMAI-541: `AttachOutcome::Stop` only ever fires from this
     /// session's own keystroke reader, never from `rocm services stop`
     /// another shell issued, `rocm dash`, or `rocmd`'s restart-recovery — all
     /// of which kill the watched pid directly and so land in `ServerExited`.
@@ -876,7 +876,7 @@ mod tests {
         Ok(())
     }
 
-    /// ROCMAI-541 B1: a `rocm services stop`/`rocm dash` stop that lands
+    /// ROCMAI-541: a `rocm services stop`/`rocm dash` stop that lands
     /// during the 45s launch readiness wait must not be reported as a crash —
     /// no `failed` status, no non-zero exit — and the in-memory `record` must
     /// come back refreshed from disk so a caller's own follow-up write cannot

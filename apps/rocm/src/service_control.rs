@@ -764,7 +764,7 @@ fn restart_internal_managed_service_inner(
                     record.service_id
                 );
             }
-            // The manifest alone is not enough (ROCMAI-541 N2): the engine
+            // The manifest alone is not enough (ROCMAI-541): the engine
             // process that owns `engine_state_path` is gone and cannot mark
             // it `failed` itself, so this does it on the engine's behalf —
             // the same reasoning as `finalize_managed_launch_readiness` on the
@@ -826,7 +826,7 @@ fn restart_internal_managed_service_inner(
     // A readiness wait that never reaches `Serving` is ambiguous (still
     // loading vs. already dead) without checking whether the restarted child
     // is still alive — same ROCMAI-541 gap `finalize_managed_launch_readiness`
-    // closes on the launch path (N2). Backed by `liveness`, not a bare
+    // closes on the launch path. Backed by `liveness`, not a bare
     // `process_is_running` pid probe: see `ManagedChildLiveness`'s doc comment
     // for why a probe alone is inert against a zombie on Unix.
     record_restart_readiness(
@@ -913,7 +913,7 @@ fn record_restarted_child(
 /// (`finalize_managed_launch_readiness`, ROCMAI-541): the restarted engine
 /// could still be loading, or could already be dead — a restarted engine that
 /// dies during its own readiness wait used to record `starting` forever, with
-/// no liveness check at all to tell the two apart (N2). `child_is_alive`
+/// no liveness check at all to tell the two apart. `child_is_alive`
 /// resolves it the same way: on the failure branch this marks both the
 /// manifest and the engine's own state file `failed` and fails loudly,
 /// mirroring the launch path's contract.
@@ -923,7 +923,7 @@ fn record_restarted_child(
 /// could be a `rocm services stop`/`rocm dash` stop landing during this
 /// restart's own readiness wait — see
 /// [`crate::service_launch::managed_service_stop_was_requested`]'s doc
-/// comment (ROCMAI-541 B1). That check is consulted first and, when it
+/// comment (ROCMAI-541). That check is consulted first and, when it
 /// fires, this returns the record as it is on disk now — whatever the stop
 /// already recorded — rather than falling through to stamp `failed` over it.
 fn record_restart_readiness(
@@ -1854,7 +1854,7 @@ mod tests {
         );
     }
 
-    /// ROCMAI-541 N2: a restarted engine that dies during its own readiness
+    /// ROCMAI-541: a restarted engine that dies during its own readiness
     /// wait must fail the restart and land `failed` on both the manifest and
     /// the engine's own state file — mirroring
     /// `finalize_managed_launch_readiness_fails_closed_when_the_child_died`
@@ -1891,7 +1891,7 @@ mod tests {
         assert_eq!(engine_state["status"], "failed");
     }
 
-    /// ROCMAI-541 B1: a `rocm services stop`/`rocm dash` stop that lands
+    /// ROCMAI-541: a `rocm services stop`/`rocm dash` stop that lands
     /// during a restart's own readiness wait must not be reported as a
     /// crash — mirroring
     /// `finalize_managed_launch_readiness_treats_a_requested_stop_as_clean`
@@ -1947,7 +1947,7 @@ mod tests {
             .spawn()
     }
 
-    /// ROCMAI-541 N2 on the restart's *early-exit* branch, which no test used
+    /// ROCMAI-541 on the restart's *early-exit* branch, which no test used
     /// to drive at all.
     ///
     /// The branch runs before `record_restarted_child` publishes `running`, so

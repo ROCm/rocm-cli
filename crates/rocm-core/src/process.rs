@@ -1654,7 +1654,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// ROCMAI-541 N3: pins the core contract `ManagedChildLiveness` exists
+    /// ROCMAI-541: pins the core contract `ManagedChildLiveness` exists
     /// for — a child that has exited must read as not-running, and a second
     /// call after it has already been reaped must keep reading that way
     /// rather than panicking or erroring (this type's whole reason to exist

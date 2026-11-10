@@ -162,7 +162,7 @@ pub(crate) fn start_managed_service(
     // vs. already dead) without checking whether the child is still alive — see
     // `finalize_managed_launch_readiness`'s doc comment (ROCMAI-541). This bails
     // with a non-zero exit and the service log's tail when it is not — unless a
-    // stop was requested concurrently (B1), in which case it returns `false` and
+    // stop was requested concurrently, in which case it returns `false` and
     // has already refreshed `record` from disk, so the bookkeeping below is
     // skipped entirely rather than writing this stale snapshot back over
     // whatever the stop just recorded. Backed by `liveness` (the retained
