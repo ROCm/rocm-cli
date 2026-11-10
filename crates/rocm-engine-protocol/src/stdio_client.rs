@@ -508,6 +508,7 @@ fn collect_stderr_into(
     shared: &Mutex<Captured>,
 ) {
     let mut chunk = [0_u8; 4096];
+    let mut carry = Utf8Carry::default();
     loop {
         let bytes: Vec<u8> = match stderr.read(&mut chunk) {
             Ok(0) => break,
@@ -515,16 +516,29 @@ fn collect_stderr_into(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 let message = format!("failed to read engine progress: {error}\n").into_bytes();
-                publish(shared, forward.as_mut(), &message);
+                publish(shared, forward.as_mut(), &mut carry, &message);
                 break;
             }
         };
-        publish(shared, forward.as_mut(), &bytes);
+        publish(shared, forward.as_mut(), &mut carry, &bytes);
+    }
+    // What the pipe ended in the middle of a character of is forwarded lossily.
+    if let Some(sink) = forward.as_mut()
+        && !lock(shared).abandoned
+    {
+        forward_best_effort(sink, &carry.finish());
     }
 }
 
-/// Keep `bytes` and forward them, unless the capture has been abandoned.
-fn publish(shared: &Mutex<Captured>, forward: Option<&mut impl Write>, bytes: &[u8]) {
+/// Keep `bytes` and forward the complete UTF-8 of them, unless the capture has
+/// been abandoned. The kept copy is the raw bytes; only what is forwarded is
+/// held back at an incomplete trailing character.
+fn publish(
+    shared: &Mutex<Captured>,
+    forward: Option<&mut impl Write>,
+    carry: &mut Utf8Carry,
+    bytes: &[u8],
+) {
     {
         let mut captured = lock(shared);
         if captured.abandoned {
@@ -533,7 +547,61 @@ fn publish(shared: &Mutex<Captured>, forward: Option<&mut impl Write>, bytes: &[
         captured.bytes.extend_from_slice(bytes);
     }
     if let Some(sink) = forward {
-        forward_best_effort(sink, bytes);
+        let complete = carry.push(bytes);
+        if !complete.is_empty() {
+            forward_best_effort(sink, &complete);
+        }
+    }
+}
+
+/// Turns arbitrary chunks of a byte stream into text that is valid UTF-8 at every
+/// boundary, for a sink that requires it. Rust's stdio on a Windows console
+/// refuses a write that is not valid UTF-8, so a chunk that ends in the middle of
+/// a multi-byte character would fail, and the forwarding discards that error,
+/// losing valid output. The incomplete trailing sequence is carried to the next
+/// chunk instead; bytes that can never be valid are replaced with U+FFFD, and
+/// what is still carried when the stream ends is flushed the same way.
+#[derive(Default)]
+struct Utf8Carry {
+    pending: Vec<u8>,
+}
+
+impl Utf8Carry {
+    /// The part of `pending + bytes` that is complete UTF-8 (with invalid bytes
+    /// replaced), keeping an incomplete trailing sequence for the next call.
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::with_capacity(self.pending.len());
+        let mut rest = std::mem::take(&mut self.pending);
+        loop {
+            match std::str::from_utf8(&rest) {
+                Ok(valid) => {
+                    out.extend_from_slice(valid.as_bytes());
+                    return out;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    out.extend_from_slice(&rest[..valid_up_to]);
+                    match error.error_len() {
+                        // The input ends inside a character: wait for the rest.
+                        None => {
+                            self.pending = rest[valid_up_to..].to_vec();
+                            return out;
+                        }
+                        Some(len) => {
+                            out.extend_from_slice("\u{FFFD}".as_bytes());
+                            rest.drain(..valid_up_to + len);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// What is carried at the end of the stream, replaced lossily.
+    fn finish(&mut self) -> Vec<u8> {
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned().into_bytes()
     }
 }
 
@@ -803,6 +871,83 @@ mod tests {
             b"before the failure\n",
             "nothing is forwarded after the request has ended"
         );
+    }
+
+    /// The multi-byte text the tests split: two, three and four byte characters.
+    const MULTIBYTE: &str = "caf\u{e9} \u{2192} \u{1f4e6} done\n";
+
+    /// A stream split at every possible boundary is forwarded whole: every chunk
+    /// handed to the sink is valid UTF-8 on its own, and together they are the
+    /// input. Pure, so it runs on the Windows job too.
+    #[test]
+    fn text_split_across_chunks_is_forwarded_whole_and_valid_at_every_boundary() {
+        let bytes = MULTIBYTE.as_bytes();
+        for first in 1..bytes.len() {
+            for second in first..bytes.len() {
+                let mut carry = Utf8Carry::default();
+                let mut forwarded = Vec::new();
+                for part in [&bytes[..first], &bytes[first..second], &bytes[second..]] {
+                    let out = carry.push(part);
+                    assert!(
+                        std::str::from_utf8(&out).is_ok(),
+                        "split {first}/{second}: a chunk was not valid UTF-8: {out:?}"
+                    );
+                    forwarded.extend(out);
+                }
+                forwarded.extend(carry.finish());
+                assert_eq!(forwarded, bytes, "split {first}/{second}: bytes were lost");
+            }
+        }
+    }
+
+    /// Bytes that can never be text are replaced, and a character cut off by the
+    /// end of the stream is flushed lossily, never dropped.
+    #[test]
+    fn bytes_that_are_not_text_are_replaced_and_a_cut_off_tail_is_flushed() {
+        let mut carry = Utf8Carry::default();
+        assert_eq!(
+            carry.push(b"ok \xff\xfe done"),
+            "ok \u{fffd}\u{fffd} done".as_bytes()
+        );
+        // A lead byte of a three-byte character with nothing after it.
+        assert_eq!(carry.push(b"tail \xe2\x86"), b"tail ");
+        assert_eq!(carry.finish(), "\u{fffd}".as_bytes());
+        assert!(carry.finish().is_empty());
+    }
+
+    /// The collector forwards a character split across reads in one piece, and
+    /// keeps the raw bytes for the error. The source hands out one byte at a time.
+    #[test]
+    fn the_collector_forwards_a_split_character_whole_and_keeps_the_raw_bytes() {
+        struct OneByte(std::vec::IntoIter<u8>);
+        impl Read for OneByte {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                match self.0.next() {
+                    Some(byte) => {
+                        buffer[0] = byte;
+                        Ok(1)
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+        let chunks = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let sink = FnSink(|bytes: &[u8]| {
+            chunks.borrow_mut().push(bytes.to_vec());
+            Ok(bytes.len())
+        });
+        let collected = collect_stderr(
+            OneByte(MULTIBYTE.as_bytes().to_vec().into_iter()),
+            Some(sink),
+        );
+        assert_eq!(collected, MULTIBYTE.as_bytes());
+        let chunks = chunks.into_inner();
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| std::str::from_utf8(chunk).is_ok())
+        );
+        assert_eq!(chunks.concat(), MULTIBYTE.as_bytes());
     }
 
     /// A status that is neither an exit nor a signal (a stopped process, on

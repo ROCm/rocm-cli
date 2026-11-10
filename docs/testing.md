@@ -367,6 +367,20 @@ answer carries the child's stderr like every other failure
 stdout pipe is missing is killed and reaped, not left running
 (`a_missing_pipe_kills_and_reaps_the_child`, Linux only).
 
+What is forwarded to the terminal is complete UTF-8: stderr is read in chunks
+that can end in the middle of a multi-byte character, and Rust's stdio on a
+Windows console refuses a write that is not valid UTF-8, an error the best-effort
+forwarding discards, so a split character would silently lose output. The
+collector carries an incomplete trailing sequence to the next chunk (invalid
+bytes become U+FFFD, and a character cut off by the end of the stream is flushed
+lossily) while still publishing the raw bytes at once for the error. The logic is
+the pure `Utf8Carry`, tested on every platform by
+`text_split_across_chunks_is_forwarded_whole_and_valid_at_every_boundary` (every
+two-point split of a string with two-, three- and four-byte characters),
+`bytes_that_are_not_text_are_replaced_and_a_cut_off_tail_is_flushed` and
+`the_collector_forwards_a_split_character_whole_and_keeps_the_raw_bytes` (a source
+that hands out one byte at a time).
+
 A child whose answer cannot be read is killed and reaped before the error is
 returned, as it is when the request cannot be written, so the long-lived daemon
 does not collect a running engine or a zombie per failure.
