@@ -144,24 +144,29 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the error explains which install types can be adopted
 
-  # Both channels now resolve from one canonical aggregate index each, so the
-  # provenance the preview prints is the whole of what the user can check before
-  # committing to a multi-GiB install. This pins the nightly half: the source that
-  # was selected, the version that came back from it, and the layout generation
-  # that source was read as. `--family` is supplied so the scenario needs no GPU,
-  # and `@nightly` because it resolves the real index over the network — the same
-  # cost that keeps scenario runtime-06 off the unserialized mock lane.
+  # Both channels resolve from one aggregate index each, so the provenance the
+  # preview prints is the whole of what the user can check before committing to a
+  # multi-GiB install. This pins the nightly half: the source that was selected,
+  # the version that came back from it, and the layout generation that source was
+  # read as. With no pin that is the newest layout's nightly index
+  # (`nightly.repo.amd.com`); runtime-31 pins the earlier stream. `--family` is
+  # an exact arch so the scenario needs no GPU, and `@nightly` because it
+  # resolves the real index over the network — the same cost that keeps scenario
+  # runtime-06 off the unserialized mock lane.
   @id:runtime-resolve-canonical-nightly @nightly
-  Scenario: runtime-08 - Previewing a nightly SDK install reports canonical provenance
+  Scenario: runtime-08 - Previewing a nightly SDK install reports the newest layout's provenance
+    Given a uv is already installed
     When the user dry-runs a nightly SDK install for a known family
-    Then the SDK preview reports canonical nightly provenance
+    Then the SDK preview reports next-layout nightly provenance
 
   # The release channel is where this went wrong in the field (rocm-cli#271). The
   # resolver read a per-family index, `repo.amd.com/rocm/whl/{family}`, which is
   # frozen at 7.13.0 and has no device payloads at all, so every release install
   # got a stale SDK and a bare `rocm[libraries,devel]` — no GPU backend in it.
-  # Both halves are fixed by the same canonical model: one flat aggregate index
-  # for the channel, and the device payload for the chip this host actually has.
+  # Both halves are fixed by the same model: one flat aggregate index for the
+  # channel (now `stable.repo.amd.com` for an unpinned install; runtime-32 pins
+  # the earlier release stream), and the device payload for the chip this host
+  # actually has.
   #
   # The obvious regression test for that history is the one that does not work.
   # Asserting the broken per-family URL is *absent* passes with the bug present:
@@ -182,10 +187,11 @@ Feature: Runtime configuration
   # WSL hosts that can read the Windows-side target before ROCm passthrough is
   # ready, while mock hosts with no target skip it.
   @id:runtime-resolve-canonical-release @requires-gfx-target
-  Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
+  Scenario: runtime-09 - Previewing a release SDK install resolves the newest layout's aggregate for this GPU
     Given a machine with an AMD GPU
+    And a uv is already installed
     When the user dry-runs a release SDK install for this host
-    Then the SDK preview reports canonical release provenance
+    Then the SDK preview reports next-layout release provenance
     And the SDK preview requests the device payload for this host's GPU
 
   # `rollback` can only ever undo one step, not walk a history. A unit test on
@@ -429,8 +435,8 @@ Feature: Runtime configuration
   # network are needed and this runs on the ordinary E2E lane.
   #
   # Technical details: the host install is planted under the scenario's root
-  # and exported as ROCM_PATH; its `.info/version` reads `7.20.1-33`. The
-  # catalog serves one release tarball, ROCm 7.10.0, for `gfx120X-all`.
+  # and exported as ROCM_PATH; its `.info/version` reads `10.5.1-33`. The
+  # catalog serves one release tarball, ROCm 10.0.0, for `gfx120X-all`.
   @id:runtime-install-preview-notes-newer-host-rocm @requires-os:linux
   Scenario: runtime-20 - Previewing an install on a host with newer ROCm explains why the older SDK is selected
     Given a release tarball catalog whose newest ROCm is older than the host's
@@ -445,8 +451,8 @@ Feature: Runtime configuration
   # evidence: it shows the same preview printing the note when the host
   # version is readable and newer.
   #
-  # Technical details: `.info/version` reads `7.20.1-33rc1`, which with its
-  # suffix dropped would be `7.20.1`, newer than the catalog's 7.10.0.
+  # Technical details: `.info/version` reads `10.5.1-33rc1`, which with its
+  # suffix dropped would be `10.5.1`, newer than the catalog's 10.0.0.
   @id:runtime-install-preview-ignores-unreadable-host-rocm @requires-os:linux
   Scenario: runtime-21 - Previewing an install on a host whose ROCm version cannot be read makes no newer-host claim
     Given a release tarball catalog whose newest ROCm is older than the host's
@@ -515,7 +521,7 @@ Feature: Runtime configuration
   Scenario: runtime-23 - Previewing an SDK install on a host with no usable Python prepares no Python
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
-    When the user previews a wheel SDK install for arch gfx1200 with no version pin
+    When the user previews a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
     Then the preview says a real install would prepare a managed Python
     And the preview prepared no Python, as it says
 
@@ -535,7 +541,7 @@ Feature: Runtime configuration
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
     And the managed Python version is overridden to 3.13
-    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
     Then the install fails
     And the preview is refused because the install would refuse that Python
 
@@ -559,7 +565,7 @@ Feature: Runtime configuration
     And a host with no usable Python and a recording uv
     And the only Python on the host's path is not usable
     And managed Python bootstrap is disabled
-    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
     Then the install fails
     And the preview is refused because managed Python is disabled, without a promise
 
@@ -667,6 +673,27 @@ Feature: Runtime configuration
   Scenario: runtime-30 - Previewing an SDK install with a --python-version the layout is not published for is refused
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
-    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin on Python 3.13
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release on Python 3.13
     Then the install fails
     And the preview is refused because the layout has no wheels for that Python, and prepared none
+
+  # The other half of runtime-08. The newest layout took over the nightly channel
+  # on 2026-08-23; the earlier stream (`rocm.nightlies.amd.com`) stopped the day
+  # before, so a build from before then exists only there. Pinning one must
+  # keep resolving it, from that stream and read as that stream's layout, rather
+  # than failing against the newest layout's index. `@nightly` for the same
+  # reason as runtime-08: it resolves the real index.
+  @id:runtime-resolve-earlier-nightly @nightly
+  Scenario: runtime-31 - Previewing a nightly SDK install pinned to an earlier build reports the earlier stream's provenance
+    When the user dry-runs a nightly SDK install pinned to a build from the earlier stream
+    Then the SDK preview reports canonical nightly provenance
+
+  # The other half of runtime-09: an earlier ROCm 7 release is published only on
+  # the earlier stream (`repo.amd.com`), so pinning one has to keep reading it,
+  # while the unpinned install of runtime-09 reads the newest layout. Same
+  # `@requires-gfx-target` as runtime-09, since the preview detects the chip.
+  @id:runtime-resolve-earlier-release @requires-gfx-target
+  Scenario: runtime-32 - Previewing a release SDK install pinned to an earlier ROCm 7 release reports the earlier stream's provenance
+    Given a machine with an AMD GPU
+    When the user dry-runs a release SDK install pinned to an earlier ROCm 7 release
+    Then the SDK preview reports canonical release provenance

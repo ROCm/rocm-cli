@@ -1024,10 +1024,12 @@ download could start. The printed `command:` line then shows
 `uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
 so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
 with a different Python 3.12 it can choose that one rather than the managed one
-a real install prepares. That scenario is a canonical-layout preview.
+a real install prepares. That scenario is a canonical-layout preview, pinned to
+an earlier ROCm 7 release because an unpinned install now reads the newest layout.
 
-A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
-to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later, a
+nightly built since 2026-08-23, or any install with no pin, which now reads that
+layout) is held to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
 is the one step that chooses the `torch` and `torchvision` versions (the CLI
 picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
@@ -1049,6 +1051,29 @@ preview runs it exactly once, for the compile, and prints the resolved plan. The
 `therock-next` scenarios that print resolved package specs start from `And a uv
 is already installed`, which installs the managed `uv` into the scenario's data
 folder the way a real install would have.
+
+Which source an install reads is covered by the `therock-next` scenarios against
+loopback fixtures served through the trust gate (the
+`ROCM_CLI_THEROCK_*_BASE` variables, see [release-trust.md](release-trust.md)).
+`therock-next-01` is the default (an unpinned release install reads the newest
+layout) and `therock-next-16` its other half (a pin to an earlier ROCm 7 release
+reads the canonical stream); `therock-next-17` refuses a group family with no
+pin and then runs the earlier-release pin the refusal names; `therock-next-18`
+and `therock-next-19` are the same two shapes for a tarball install;
+`therock-next-20` to `therock-next-22` are the nightly channel: no pin reads the
+newest layout at its newest build that has PyTorch wheels, and a build date on
+either side of the 2026-08-22/2026-08-23 boundary reads the stream that holds
+it; `therock-next-23` is the tarball refusal for a nightly pin before that
+boundary, run together with the wheel install it points to. `update-11` holds
+that an update installs from the layout its runtime recorded: a runtime of the
+earlier release stream recorded with only a family label still updates, instead
+of being refused for an exact arch. The live counterparts, which resolve the real indexes and so run on the
+`@nightly` lane, are `runtime-08` and `runtime-31` (nightly) and `runtime-09`
+and `runtime-32` (release, which needs a detected GPU target). The routing rule
+itself, `layout_serving`, is a table of every request shape on both channels in
+[source.rs](../apps/rocm/src/therock/source.rs), including the boundary dates.
+The paced tarball download in `download-progress-01` reads the newest layout's
+catalog with an exact arch for the same reason.
 The decision is unit-tested on every platform, Windows included
 (`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
 [uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
