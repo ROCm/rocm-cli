@@ -1985,8 +1985,6 @@ cargo test -p rocm --bin rocm resolve_endpoint_auth
 cargo test -p rocm --bin rocm endpoint_client_config
 cargo test -p rocm --bin rocm api_key_client_config
 cargo test -p rocm --bin rocm public_bind_fails_closed
-cargo test -p rocm --bin rocm respawn_fails_closed
-cargo test -p rocm --bin rocm respawn_allows_loopback
 cargo test -p rocm --bin rocm restart_refuses_a_public_service
 cargo test -p rocm-core generate_endpoint_api_key
 cargo test -p rocm-engine-protocol endpoint_api_key
