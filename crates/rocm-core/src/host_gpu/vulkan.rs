@@ -342,14 +342,7 @@ fn detect_vulkan_devices() -> Vec<VulkanDevice> {
 /// A host that genuinely has no Vulkan driver is the second case: `vulkaninfo`
 /// is installed and fails. Only the first is a gap in the probe.
 fn vulkan_enumeration_available() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        crate::probe_exec::tool_path_candidates("vulkaninfo")
-            .iter()
-            .any(|name| dir.join(name).is_file())
-    })
+    crate::probe_exec::which("vulkaninfo")
 }
 
 /// Whether this platform's Vulkan surfaces can be read at all.
