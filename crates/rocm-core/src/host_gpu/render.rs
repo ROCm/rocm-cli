@@ -348,7 +348,7 @@ mod tests {
     /// The exact placeholders the report prints for the three GPU fields when
     /// it has no value, pinned because they are read back as data.
     ///
-    /// examine-39 decides which support tier a host is in by filtering these
+    /// examine-48 decides which support tier a host is in by filtering these
     /// out of `detected_gfx_target`, `compatible_therock_family` and
     /// `detected_therock_family`. Reword one and that scenario stops seeing an
     /// absent value as absent: a lane would be classified into the wrong tier
