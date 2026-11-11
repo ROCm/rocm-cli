@@ -2879,6 +2879,25 @@ catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 ([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
+fix-4 has one verify line, not two: the catalog recipe and the `Fix` that
+`rocm diagnose` builds both read `RENDER_GROUP_VERIFY` in
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs), so the two cannot
+drift apart again. `the_render_group_fix_verify_matches_the_catalog_copy` in
+[linux.rs](../crates/rocm-core/src/diagnose/linux.rs) keeps either side from
+going back to its own copy, and `diagnose-59` asserts the line that
+`rocm fix fix-4-render-group --dry-run` prints, which lists `/dev/kfd` to show
+the group that owns it. The line's exit status checks only that the user is
+in `render` or `video` and that `/dev/kfd` exists; the owning group is for the
+user to read. `diagnose-60` asserts that fix-8's title names the
+`X.Y` release, which is what `check_8_wheel_rocm_mismatch` compares
+(`the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). Both run on every lane,
+because the plan prints before the platform gate. `diagnose-61` asserts the
+other copy, the fix-8 cause `rocm diagnose` prints: its title and plan name the
+`X.Y` release and no line of it says "major". A library-load error in the
+symptom raises that cause on its own, on Linux, Windows and WSL alike, so it
+also runs on every lane.
+
 Provider audit focused test:
 
 ```bash

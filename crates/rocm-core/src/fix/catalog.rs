@@ -23,6 +23,20 @@ use super::runners;
 /// apart in wording before they shared this constant.
 pub(crate) const COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED: &str = "Neither option is recommended over the other: which is right depends on which stack you mean to keep, and removing the wrong one breaks a working environment.";
 
+/// fix-4's verify line, shared verbatim by this recipe and the `Fix` that
+/// `diagnose/linux.rs`'s `check_4_render_group` builds, so `rocm fix` and
+/// `rocm diagnose` cannot tell the user to check two different things. The two
+/// copies had drifted: only the diagnosis listed `/dev/kfd`.
+///
+/// What its exit status checks: that the user is in `render` or `video`, and
+/// that `/dev/kfd` exists. It does not check that the user is in the group that
+/// owns `/dev/kfd`, and it does not check `rocminfo`: `rocminfo | head` reports
+/// `head`'s status. `ls -l /dev/kfd` is there for the user to read: the
+/// diagnosis also fires when `/dev/kfd` belongs to a group other than `render`,
+/// and its output names the owning group and the mode.
+pub(crate) const RENDER_GROUP_VERIFY: &str =
+    "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && ls -l /dev/kfd && rocminfo | head -n 5";
+
 /// One operating system a recipe applies on, and what it does there.
 ///
 /// Scope and class are held together rather than in two parallel lists because
@@ -162,7 +176,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         rationale: "Your GPU's gfx target is not in the framework wheel's compiled kernel list. Re-install the framework from an index that includes this gfx, OR rebuild llama.cpp with AMDGPU_TARGETS=<gfx>.",
         commands: &[
             "# PyTorch (Linux): a nightly often carries kernels a release has not shipped yet.",
-            "# Pick the nightly for the ROCm major you have, not an older one.",
+            "# Pick the nightly for the ROCm X.Y release you have, not an older one.",
             "pip uninstall -y torch torchvision torchaudio",
             "pip install --pre torch torchvision torchaudio \\",
             "  --index-url https://download.pytorch.org/whl/nightly/rocm7.14",
@@ -248,7 +262,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: true,
-        verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && rocminfo | head -n 5",
+        verify: RENDER_GROUP_VERIFY,
         verify_linux: None,
         notes: &[],
         doc_url: None,
@@ -342,15 +356,15 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     },
     FixRecipe {
         fix_id: "fix-8-wheel-rocm",
-        title: "Reinstall the framework against the system ROCm/HIP major",
+        title: "Reinstall the framework against the system ROCm/HIP X.Y release",
         rationale: "The framework's bundled HIP version doesn't match the system ROCm (Linux) or HIP SDK (Windows). libamdhip64.so.X / amdhip64_X.dll load failures are the usual signal.",
         commands: &[
             "pip uninstall -y torch torchvision torchaudio",
-            "# Linux: install the index for the ROCm major `rocm examine` reports:",
+            "# Linux: install the index for the ROCm X.Y release `rocm examine` reports:",
             "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14",
             "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:",
             "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0",
-            "# Windows: use TheRock's wheels matching your HIP SDK major:",
+            "# Windows: use TheRock's wheels matching your HIP SDK X.Y release:",
             "#   https://github.com/ROCm/TheRock",
         ],
         needs_sudo: false,
@@ -483,7 +497,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         title: "Install the AMD HIP SDK for Windows",
         rationale: "Your framework links against HIP but the HIP SDK isn't installed on this host. The runtime DLLs (amdhip64_X.dll, hipblas.dll, hsa-runtime64.dll) and hipInfo.exe ship inside the SDK installer.",
         commands: &[
-            "# Download and install the HIP SDK (matched to your framework's HIP major):",
+            "# Download and install the HIP SDK (matched to your framework's HIP X.Y release):",
             "#   https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html",
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.",
         ],

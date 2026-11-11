@@ -867,3 +867,32 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine whose only GPU is a released one
     When the user asks the CLI what that machine's report would carry in machine-readable form
     Then the report names the CLI version that `rocm version` leads with
+
+  # fix-4's verify line was kept in two copies, and only the one `rocm diagnose`
+  # printed listed `/dev/kfd`, so `rocm fix` told the user to check less than the
+  # diagnosis did. Both now print one line. Like diagnose-43 to -45 this sees
+  # `rocm fix <id> --dry-run`, which prints the plan before the platform gate, so
+  # it runs on every lane. That `rocm diagnose` prints the same line is held by a
+  # unit test, because the diagnosis only fires on a Linux host.
+  @id:diagnose-render-group-verify-line-shows-who-owns-the-gpu-device
+  Scenario: diagnose-59 - The verify line printed for the render-group fix shows who owns the GPU compute device
+    Given a user who has chosen the fix for a missing render group
+    When the user previews that fix without applying it
+    Then the printed verify line checks the user's groups and shows who owns the GPU compute device
+
+  # fix-8 compares the framework's ROCm version with the system's at X.Y, the
+  # granularity PyTorch's wheel indexes are published at, but its titles said
+  # "major". Text only; the comparison itself is unit tested.
+  @id:diagnose-wheel-mismatch-fix-names-the-release-it-compares
+  Scenario: diagnose-60 - The fix for a mismatched framework wheel names the part of the version it compares
+    Given a user who has chosen the fix for a framework wheel built for another ROCm release
+    When the user previews that fix without applying it
+    Then the printed title names the X.Y release, not the major version
+
+  # diagnose-60 sees the `rocm fix` plan; this is the other copy, the cause that
+  # `rocm diagnose` prints. The library-load error in the report raises it on
+  # its own, so it is listed on every lane whatever ROCm the runner has.
+  @id:diagnose-wheel-mismatch-cause-names-the-release-it-compares
+  Scenario: diagnose-61 - Diagnosing a failed load of the ROCm runtime library names the release the framework and the system must share
+    When the user diagnoses this machine with a ROCm runtime library load failure
+    Then the wheel mismatch cause and its plan name the X.Y release, not the major version

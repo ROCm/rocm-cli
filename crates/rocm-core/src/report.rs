@@ -594,6 +594,10 @@ fn engine_and_version(examination: &Examination) -> (String, String) {
 /// engine release without its minor does not group: 7.0 and 7.1 are different
 /// problems, while 22.04 and 22.10 are the same population. Anything past the
 /// minor is a build, which narrows toward one machine, so it is dropped.
+///
+/// Not `diagnose/host.rs`'s `major_minor`: that one takes the first `X.Y`
+/// anywhere in the string (`hip=6.4.43482`) and returns `None` without a
+/// minor; this one reads only a leading all-digit component.
 fn major_minor(version: &str) -> String {
     let mut parts = version.trim().split(['.', '-', '+', '_']);
     let major = parts.next().unwrap_or_default();
