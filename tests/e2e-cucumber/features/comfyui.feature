@@ -135,14 +135,15 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # use and have no shell dependency of their own, so they now run on both
   # platforms too (#697).
   #
-  # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
-  # cannot read it either, so it must not block the reinstall; the reinstall
-  # says it could not tell.
+  # rocm-cli's saved record of a ComfyUI it started is unreadable here. It
+  # names no process, so `stop` cannot stop one either (it only sets the
+  # record aside, comfyui-20); the record must not block the reinstall, and
+  # the reinstall says it could not tell.
   @id:comfyui-reinstall-keeps-user-data
   Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
-    And rocm-cli's saved record of the ComfyUI it started cannot be read
+    And rocm-cli's saved record of the ComfyUI it started cannot be parsed
     When the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
@@ -416,3 +417,54 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     When the user previews a ComfyUI install without choosing a runtime
     Then the preview selects the registered runtime
     And the runtime registry holds only the registered runtime
+
+  # A truncated or empty record of the ComfyUI rocm-cli started used to make
+  # `status`, `logs` and `stop` fail outright, and nothing the CLI offered
+  # cleared it. `status` and the plain-words status answer now say the running
+  # state is unknown and name `rocm comfyui stop` as the next step; the
+  # scenario runs that step as `status` printed it and proves what it
+  # promises: with nothing answering on ComfyUI's default address the record
+  # is moved aside to `running.json.unreadable`, no process is stopped (the
+  # record names none), and `status` afterwards no longer reports it. The
+  # default address is pointed at a free port so a ComfyUI the host runs
+  # itself cannot change the outcome. Unit tests pin the rest:
+  # `comfyui/process.rs` (stop over an empty record, a record that cannot be
+  # moved aside, and that no process is stopped) and `comfyui.rs` (status and
+  # the chat answer over an empty record, a read error that is not a parse
+  # error, and the atomic writes that stop `start` leaving a record cut short).
+  @id:comfyui-unreadable-run-record-keeps-status-logs-and-stop-working
+  Scenario: comfyui-20 - ComfyUI status, logs and stop keep working when rocm-cli's record of the ComfyUI it started cannot be parsed
+    Given ComfyUI is installed
+    And a saved ComfyUI run log
+    And rocm-cli's saved record of the ComfyUI it started cannot be parsed
+    And nothing answers on ComfyUI's default address
+    When the user checks ComfyUI status
+    Then status says it cannot tell whether the ComfyUI rocm-cli started is running
+    When the user asks in plain words for ComfyUI's status
+    Then the answer says it cannot tell whether ComfyUI is running and does not advise starting it
+    When the user reads the ComfyUI logs
+    Then the logs show the saved run log
+    When the user runs the stop that status advised
+    Then stop says it stopped nothing and set the unreadable record aside
+    And ComfyUI status no longer reports an unreadable record
+
+  # With something answering on ComfyUI's default address, rocm-cli cannot
+  # tell whether that is the ComfyUI its unreadable record was about, so
+  # `stop` keeps the record, says only that address was checked, and exits
+  # non-zero, telling the user to stop what answers there first or, if it is
+  # not that ComfyUI, to move the record aside by hand. The scenario takes the
+  # first way and proves the same stop then goes through; the unit test
+  # `stop_over_an_unreadable_record_keeps_it_while_something_answers` in
+  # `comfyui/process.rs` proves the second.
+  @id:comfyui-unreadable-run-record-kept-while-something-answers
+  Scenario: comfyui-21 - ComfyUI stop keeps an unreadable record while something answers on ComfyUI's default address
+    Given rocm-cli's saved record of the ComfyUI it started cannot be parsed
+    And something answers on ComfyUI's default address
+    When the user checks ComfyUI status
+    Then status says something answers there and advises stopping it before running stop again
+    When the user stops ComfyUI while its record cannot be parsed
+    Then stop fails, keeps the record and says to stop what answers there first
+    Given what answered on ComfyUI's default address has stopped
+    When the user stops ComfyUI while its record cannot be parsed
+    Then stop says it stopped nothing and set the unreadable record aside
+    And ComfyUI status no longer reports an unreadable record

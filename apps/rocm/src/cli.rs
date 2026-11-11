@@ -1098,7 +1098,9 @@ pub(crate) enum ComfyuiCommand {
         /// what its release shipped instead replaces whatever has the names the new release
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
         /// running or still starting, checked before the download and again just before the code
-        /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// is replaced, unless rocm-cli's saved record of it cannot be parsed, which it then says;
+        /// a record that cannot be read at all (a directory at its path, permission denied) is an
+        /// error naming the file.
         /// Over an existing install, a download that is not a ComfyUI release (no main.py) is
         /// discarded and the install is left as it was.
         #[arg(long)]
@@ -1126,6 +1128,13 @@ pub(crate) enum ComfyuiCommand {
         yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
+    ///
+    /// If rocm-cli's saved record of the ComfyUI it started cannot be parsed, it
+    /// stops no process, since the record names none, and checks only the
+    /// default address: if nothing answers there it moves the record aside to
+    /// `running.json.unreadable`; if something does, it keeps the record and
+    /// exits non-zero. A record that cannot be read at all (a directory at its
+    /// path, permission denied) is an error naming the file.
     Stop {
         /// Accepted for consistency with other mutating commands; stopping never prompts.
         #[arg(long)]

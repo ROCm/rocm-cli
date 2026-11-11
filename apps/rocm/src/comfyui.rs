@@ -26,6 +26,7 @@ mod runtime_env;
 mod source_swap;
 
 pub(crate) use install::install;
+use process::StopReport;
 pub(crate) use process::{start, stop};
 
 const APP_ID: &str = "comfyui";
@@ -197,32 +198,60 @@ pub(crate) fn run(command: Option<ComfyuiCommand>) -> Result<()> {
                 Err(error)
             }
         },
-        ComfyuiCommand::Stop { yes: _ } => match stop(&paths) {
-            Ok(text) => {
-                print!("{text}");
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_stop",
-                    "info",
-                    "ComfyUI stop requested",
-                    None,
-                );
-                Ok(())
-            }
-            Err(error) => {
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_stop",
-                    "error",
-                    format!("ComfyUI stop failed: {error}"),
-                    None,
-                );
-                Err(error)
-            }
-        },
+        ComfyuiCommand::Stop { yes: _ } => {
+            report_stop(&paths, stop(&paths), &mut io::stdout().lock())
+        }
     }
+}
+
+/// Prints what `stop` reports and records its audit event. A stop that did
+/// not reach "stopped" is printed in full and then returned as an error, so
+/// the command exits non-zero after saying why.
+fn report_stop(
+    paths: &AppPaths,
+    outcome: Result<StopReport>,
+    out: &mut dyn io::Write,
+) -> Result<()> {
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            record_cli_audit_event(
+                paths,
+                "app",
+                "comfyui_stop",
+                "error",
+                format!("ComfyUI stop failed: {error}"),
+                None,
+            );
+            return Err(error);
+        }
+    };
+    // The stop has happened whether or not its report reaches the reader (a
+    // closed pipe, say), so it is audited first.
+    match &report.failure {
+        Some(failure) => record_cli_audit_event(
+            paths,
+            "app",
+            "comfyui_stop",
+            "error",
+            format!("ComfyUI stop did not stop it: {failure}"),
+            None,
+        ),
+        None => record_cli_audit_event(
+            paths,
+            "app",
+            "comfyui_stop",
+            "info",
+            "ComfyUI stop requested",
+            None,
+        ),
+    }
+    out.write_all(report.text.as_bytes())?;
+    out.flush()?;
+    if let Some(failure) = report.failure {
+        bail!("{failure}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,35 +338,65 @@ struct StatusSummary {
     starting: bool,
     /// What `status` and `start` say about a reinstall that stopped part-way.
     interrupted_reinstall: Option<String>,
+    /// The note about a saved record of the ComfyUI rocm-cli started that
+    /// cannot be parsed; whether that ComfyUI runs is then unknown.
+    unreadable_state: Option<String>,
+    /// The step that clears that record, worded for what answers on the
+    /// default address.
+    unreadable_next_step: Option<String>,
 }
 
-fn status_summary(paths: &AppPaths) -> Result<StatusSummary> {
+fn status_summary(
+    paths: &AppPaths,
+    check_default_address: impl Fn() -> DefaultAddressCheck,
+) -> Result<StatusSummary> {
     let manifest = load_manifest(paths)?;
     let interrupted_reinstall = manifest
         .as_ref()
         .filter(|manifest| source_swap::swap_interrupted(&manifest.source_path))
         .map(|manifest| interrupted_reinstall_advice(&manifest.runtime_key));
-    let (running_url, starting) = match load_state(paths)? {
-        Some(state) => match evaluate_running_state(&state).state {
+    let mut unreadable_state = None;
+    let mut unreadable_step = None;
+    let (running_url, starting) = match read_saved_state(paths)? {
+        SavedRunState::Saved(state) => match evaluate_running_state(&state).state {
             ComfyUiRunState::Running => (Some(state.url), false),
             ComfyUiRunState::Starting => (None, true),
             ComfyUiRunState::Stopped => (None, false),
         },
-        None => (default_unmanaged_running_url(), false),
+        SavedRunState::Absent => (check_default_address().answering_url(), false),
+        SavedRunState::Unreadable(unreadable) => {
+            unreadable_state = Some(unreadable.note());
+            let answering = check_default_address().answering_url();
+            unreadable_step = Some(unreadable_next_step(&unreadable.path, answering.as_deref()));
+            (answering, false)
+        }
     };
     Ok(StatusSummary {
         installed: manifest.is_some(),
         running_url,
         starting,
         interrupted_reinstall,
+        unreadable_state,
+        unreadable_next_step: unreadable_step,
     })
 }
 
 /// The chat's answer to "what is ComfyUI's status". It advises `start` only
-/// when nothing is running or starting and `start` would not refuse; it passes
-/// on the interrupted-reinstall note, which names the command to run instead.
+/// when nothing is running or starting, rocm-cli's record of what it started
+/// can be parsed, and `start` would not refuse; it passes on the
+/// interrupted-reinstall and unreadable-record notes, which name the command
+/// to run instead.
 pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
-    let summary = status_summary(paths)?;
+    render_chat_status_answer_with(paths, check_default_address)
+}
+
+/// [`render_chat_status_answer`] with the check of ComfyUI's default address
+/// passed in, so tests decide what answers there.
+fn render_chat_status_answer_with(
+    paths: &AppPaths,
+    check_default_address: impl Fn() -> DefaultAddressCheck,
+) -> Result<String> {
+    let summary = status_summary(paths, check_default_address)?;
     let mut output = String::new();
     writeln!(output, "ComfyUI status")?;
     writeln!(output)?;
@@ -346,7 +405,12 @@ pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
     } else {
         writeln!(output, "ComfyUI: not installed yet")?;
     }
-    if let Some(url) = &summary.running_url {
+    if summary.unreadable_state.is_some() {
+        writeln!(output, "Running: unknown")?;
+        if let Some(url) = &summary.running_url {
+            writeln!(output, "Note: {}.", something_answers_note(url))?;
+        }
+    } else if let Some(url) = &summary.running_url {
         writeln!(output, "Running: yes")?;
         writeln!(output, "URL: {url}")?;
     } else if summary.starting {
@@ -357,6 +421,12 @@ pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
     if let Some(note) = &summary.interrupted_reinstall {
         writeln!(output, "Note: {note}.")?;
     }
+    if let Some(note) = &summary.unreadable_state {
+        writeln!(output, "Note: {note}.")?;
+        if let Some(step) = &summary.unreadable_next_step {
+            writeln!(output, "Next step: {step}.")?;
+        }
+    }
     if !summary.installed {
         writeln!(
             output,
@@ -365,6 +435,7 @@ pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
     } else if summary.running_url.is_none()
         && !summary.starting
         && summary.interrupted_reinstall.is_none()
+        && summary.unreadable_state.is_none()
     {
         writeln!(
             output,
@@ -377,6 +448,16 @@ pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
 }
 
 pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
+    render_status_with(paths, config, check_default_address)
+}
+
+/// [`render_status`] with the check of ComfyUI's default address passed in,
+/// so tests decide what answers there.
+fn render_status_with(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    check_default_address: impl Fn() -> DefaultAddressCheck,
+) -> Result<String> {
     let mut output = String::new();
     writeln!(output, "{APP_NAME}")?;
     writeln!(output)?;
@@ -417,40 +498,55 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
         writeln!(output, "  next step: rocm comfyui install")?;
     }
 
-    if let Some(state) = load_state(paths)? {
-        let run_report = evaluate_running_state(&state);
-        writeln!(output)?;
-        writeln!(output, "Running")?;
-        writeln!(
-            output,
-            "  status: {}",
-            comfyui_run_state_cli_label(run_report.state)
-        )?;
-        writeln!(output, "  url: {}", state.url)?;
-        match run_report.state {
-            ComfyUiRunState::Running => {}
-            ComfyUiRunState::Starting => {
-                writeln!(output, "  note: starting")?;
-            }
-            // `start` refuses an interrupted reinstall; the note above names
-            // the command to run first.
-            ComfyUiRunState::Stopped if !interrupted => {
-                writeln!(output, "  next step: rocm comfyui start")?;
-            }
-            ComfyUiRunState::Stopped => {}
-        }
-    } else {
-        writeln!(output)?;
-        writeln!(output, "Running")?;
-        if let Some(url) = default_unmanaged_running_url() {
-            writeln!(output, "  status: running outside rocm-cli")?;
-            writeln!(output, "  url: {url}")?;
+    writeln!(output)?;
+    writeln!(output, "Running")?;
+    match read_saved_state(paths)? {
+        SavedRunState::Saved(state) => {
+            let run_report = evaluate_running_state(&state);
             writeln!(
                 output,
-                "  note: ROCm CLI did not start this ComfyUI process"
+                "  status: {}",
+                comfyui_run_state_cli_label(run_report.state)
             )?;
-        } else {
-            writeln!(output, "  status: not started by rocm-cli")?;
+            writeln!(output, "  url: {}", state.url)?;
+            match run_report.state {
+                ComfyUiRunState::Running => {}
+                ComfyUiRunState::Starting => {
+                    writeln!(output, "  note: starting")?;
+                }
+                // `start` refuses an interrupted reinstall; the note above
+                // names the command to run first.
+                ComfyUiRunState::Stopped if !interrupted => {
+                    writeln!(output, "  next step: rocm comfyui start")?;
+                }
+                ComfyUiRunState::Stopped => {}
+            }
+        }
+        SavedRunState::Unreadable(unreadable) => {
+            writeln!(output, "  status: unknown")?;
+            writeln!(output, "  note: {}", unreadable.note())?;
+            let answering = check_default_address().answering_url();
+            if let Some(url) = &answering {
+                writeln!(output, "  url: {url}")?;
+                writeln!(output, "  note: {}", something_answers_note(url))?;
+            }
+            writeln!(
+                output,
+                "  next step: {}",
+                unreadable_next_step(&unreadable.path, answering.as_deref())
+            )?;
+        }
+        SavedRunState::Absent => {
+            if let Some(url) = check_default_address().answering_url() {
+                writeln!(output, "  status: running outside rocm-cli")?;
+                writeln!(output, "  url: {url}")?;
+                writeln!(
+                    output,
+                    "  note: ROCm CLI did not start this ComfyUI process"
+                )?;
+            } else {
+                writeln!(output, "  status: not started by rocm-cli")?;
+            }
         }
     }
 
@@ -486,12 +582,68 @@ pub(crate) fn render_models_path(paths: &AppPaths) -> Result<String> {
     Ok(format!("{}\n", path.display()))
 }
 
-fn default_unmanaged_running_url() -> Option<String> {
-    unmanaged_running_url(COMFYUI_DEFAULT_HOST, COMFYUI_DEFAULT_PORT)
+/// What answers on ComfyUI's default address, the one address `status`, the
+/// chat's status answer and `stop` check for a ComfyUI rocm-cli has no
+/// readable record of. A bare TCP connect, so anything listening there counts.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DefaultAddressCheck {
+    url: String,
+    answers: bool,
 }
 
-fn unmanaged_running_url(host: &str, port: u16) -> Option<String> {
-    endpoint_is_reachable(host, port).then(|| format_http_base_url(host, port))
+impl DefaultAddressCheck {
+    fn answering_url(self) -> Option<String> {
+        self.answers.then_some(self.url)
+    }
+}
+
+fn check_default_address() -> DefaultAddressCheck {
+    check_default_address_on(default_address_port())
+}
+
+/// The real check, on `port` of ComfyUI's default host.
+fn check_default_address_on(port: u16) -> DefaultAddressCheck {
+    DefaultAddressCheck {
+        url: format_http_base_url(COMFYUI_DEFAULT_HOST, port),
+        answers: endpoint_is_reachable(COMFYUI_DEFAULT_HOST, port),
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-hooks"))]
+const DEFAULT_ADDRESS_PORT_OVERRIDE: &str = "ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE";
+
+/// The port an override value names: the default when it is unset, an error
+/// when it is set to anything that is not a port (empty, garbage, or not
+/// Unicode).
+#[cfg(any(test, feature = "e2e-test-hooks"))]
+fn parse_default_address_port_override(
+    value: Option<&std::ffi::OsStr>,
+) -> std::result::Result<u16, String> {
+    let Some(value) = value else {
+        return Ok(COMFYUI_DEFAULT_PORT);
+    };
+    let text = value.to_str().ok_or_else(|| {
+        format!(
+            "{DEFAULT_ADDRESS_PORT_OVERRIDE}={} is not a port: not Unicode",
+            value.display()
+        )
+    })?;
+    text.parse()
+        .map_err(|error| format!("{DEFAULT_ADDRESS_PORT_OVERRIDE}={text:?} is not a port: {error}"))
+}
+
+/// The port of that default address, overridable only in `e2e-test-hooks`
+/// builds so a scenario decides whether anything answers there. A value that
+/// is set but is not a port is a broken fixture, so it panics rather than
+/// probing the host's real ComfyUI port.
+#[cfg(feature = "e2e-test-hooks")]
+fn default_address_port() -> u16 {
+    parse_default_address_port_override(std::env::var_os(DEFAULT_ADDRESS_PORT_OVERRIDE).as_deref())
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn default_address_port() -> u16 {
+    COMFYUI_DEFAULT_PORT
 }
 
 fn render_logs_with_options(
@@ -629,7 +781,11 @@ fn recent_log_paths(paths: &AppPaths) -> Result<Vec<PathBuf>> {
     if let Some(manifest) = load_manifest(paths)? {
         push_log_path(&mut paths_seen, manifest.log_path);
     }
-    if let Some(state) = load_state(paths)? {
+    // A record that cannot be parsed names no log; a start log under the
+    // app's own `logs` folder is still found by the scan below. One that
+    // cannot be read at all (a directory at its path, say) is an error, as it
+    // is for `status` and `stop`.
+    if let SavedRunState::Saved(state) = read_saved_state(paths)? {
         push_log_path(&mut paths_seen, state.log_path);
     }
     let logs_root = app_root(paths).join("logs");
@@ -716,39 +872,126 @@ fn reused_source_url(paths: &AppPaths) -> String {
 
 fn save_manifest(paths: &AppPaths, manifest: &ComfyUiManifest) -> Result<()> {
     let path = manifest_path(paths);
-    fs::create_dir_all(
-        path.parent()
-            .context("ComfyUI manifest path has no parent directory")?,
-    )?;
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(manifest).context("failed to serialize ComfyUI manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
+    let bytes =
+        serde_json::to_vec_pretty(manifest).context("failed to serialize ComfyUI manifest")?;
+    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn load_state(paths: &AppPaths) -> Result<Option<ComfyUiState>> {
-    let path = state_path(paths);
-    if !path.is_file() {
-        return Ok(None);
+/// What rocm-cli's saved record of the ComfyUI it started holds. `start`
+/// writes it; `stop` removes a record it can parse and moves one it cannot
+/// aside (see [`unreadable_state_aside_path`]). Every reader goes through
+/// [`read_saved_state`], so an unreadable record reads the same everywhere.
+#[derive(Debug)]
+enum SavedRunState {
+    /// No record: rocm-cli has not started a ComfyUI, or `stop` cleared it.
+    Absent,
+    Saved(ComfyUiState),
+    /// A record is there but cannot be parsed, so which process rocm-cli
+    /// started is unknown.
+    Unreadable(UnreadableRunState),
+}
+
+#[derive(Debug)]
+struct UnreadableRunState {
+    path: PathBuf,
+    cause: String,
+}
+
+impl UnreadableRunState {
+    /// The one wording of an unreadable record: `status`, the chat's status
+    /// answer, `stop` and a reinstall's warning all print this.
+    fn note(&self) -> String {
+        format!(
+            "rocm-cli's record of the ComfyUI it started cannot be parsed ({}: {}), so whether \
+             that ComfyUI is running is unknown",
+            self.path.display(),
+            self.cause
+        )
     }
-    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// What a check of the default address found, worded once for `status`, the
+/// chat's status answer and `stop`.
+fn something_answers_note(url: &str) -> String {
+    format!(
+        "something answers at {url}, the only address rocm-cli checked; it cannot tell whether \
+         that is the ComfyUI it started"
+    )
+}
+
+/// What `status` and the chat's status answer advise over an unreadable
+/// record, given what answers on the default address; `stop` refuses with the
+/// second form. `process`'s `stop_sets_an_unreadable_record_aside_and_stops_no_process`
+/// and `stop_over_an_unreadable_record_keeps_it_while_something_answers` prove
+/// both.
+fn unreadable_next_step(record: &Path, answering: Option<&str>) -> String {
+    match answering {
+        None => "run `rocm comfyui stop`, which moves the unreadable record aside and stops no \
+                 process"
+            .to_owned(),
+        Some(url) => format!(
+            "stop what answers at {url} yourself, then run `rocm comfyui stop` again; if what \
+             answers there is not the ComfyUI rocm-cli started, move {} aside yourself instead",
+            record.display()
+        ),
+    }
+}
+
+/// Where `stop` moves an unreadable record, replacing one moved there before.
+fn unreadable_state_aside_path(paths: &AppPaths) -> PathBuf {
+    state_path(paths).with_file_name("running.json.unreadable")
+}
+
+/// Reads the record. Only a record that cannot be parsed (an empty or cut-off
+/// file, say) is [`SavedRunState::Unreadable`]; a read that fails for another
+/// reason (permission denied, a sharing violation) is an error, because the
+/// record may be intact.
+///
+/// There is no existence check first: a missing record is the read's own
+/// `NotFound`, so a directory at the path, a dangling link or a `state`
+/// folder that cannot be listed are errors rather than "no record".
+fn read_saved_state(paths: &AppPaths) -> Result<SavedRunState> {
+    let path = state_path(paths);
+    let read = fs::read(&path).map_err(|error| {
+        // A link whose target is gone reads as `NotFound`, but a record was
+        // put there; it is not "no record".
+        if error.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(&path).is_ok() {
+            io::Error::other(format!("{error} (it is a link whose target is missing)"))
+        } else {
+            error
+        }
+    });
+    classify_saved_state(path, read)
+}
+
+fn classify_saved_state(path: PathBuf, read: io::Result<Vec<u8>>) -> Result<SavedRunState> {
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SavedRunState::Absent);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    Ok(match serde_json::from_slice(&bytes) {
+        Ok(state) => SavedRunState::Saved(state),
+        Err(error) => SavedRunState::Unreadable(UnreadableRunState {
+            path,
+            cause: error.to_string(),
+        }),
+    })
+}
+
+/// Writes the record through a temporary file renamed over it, so a write
+/// that is cut short leaves the previous record or none, never a truncated
+/// one.
 fn save_state(paths: &AppPaths, state: &ComfyUiState) -> Result<()> {
     let path = state_path(paths);
-    fs::create_dir_all(
-        path.parent()
-            .context("ComfyUI state path has no parent directory")?,
-    )?;
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(state).context("failed to serialize ComfyUI state")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
+    let bytes = serde_json::to_vec_pretty(state).context("failed to serialize ComfyUI state")?;
+    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn probe_comfyui(
@@ -1337,17 +1580,6 @@ mod tests {
     }
 
     #[test]
-    fn unmanaged_running_url_reports_reachable_loopback_endpoint() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-
-        let url = unmanaged_running_url("127.0.0.1", port);
-
-        assert_eq!(url, Some(format!("http://127.0.0.1:{port}")));
-        Ok(())
-    }
-
-    #[test]
     fn status_reports_stopped_when_saved_comfyui_pid_is_gone() -> Result<()> {
         let paths = test_paths("comfyui-stale-state");
         let logs = app_root(&paths).join("logs");
@@ -1373,6 +1605,620 @@ mod tests {
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("next step: rocm comfyui start"));
         assert!(!rendered.contains("status: starting or running"));
+        Ok(())
+    }
+
+    /// Truncated (cut off mid-write) and empty: the two shapes an interrupted
+    /// in-place write of the record leaves behind.
+    pub(super) const UNREADABLE_RECORDS: [&str; 2] = ["{\"app_id\": \"comfy", ""];
+
+    /// The default address as a check finds it with nothing listening there.
+    pub(super) fn quiet_default_address() -> DefaultAddressCheck {
+        DefaultAddressCheck {
+            url: "http://127.0.0.1:8188".to_owned(),
+            answers: false,
+        }
+    }
+
+    /// The default address as a check finds it with something listening.
+    pub(super) fn answering_default_address() -> DefaultAddressCheck {
+        DefaultAddressCheck {
+            answers: true,
+            ..quiet_default_address()
+        }
+    }
+
+    /// Plants `text` where `start` saves its record of the ComfyUI it started.
+    pub(super) fn plant_unreadable_record(paths: &AppPaths, text: &str) -> Result<PathBuf> {
+        let path = state_path(paths);
+        fs::create_dir_all(path.parent().context("state path has no parent")?)?;
+        fs::write(&path, text)?;
+        Ok(path)
+    }
+
+    /// The names in `path`'s directory other than `keep`: a staging file a
+    /// replacement left behind would show up here.
+    #[cfg(unix)]
+    fn other_entries(path: &Path, keep: &str) -> Result<Vec<String>> {
+        Ok(fs::read_dir(path.parent().context("no parent")?)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != keep)
+            .collect())
+    }
+
+    /// `start` writes the record a `status`, `stop` or reinstall later reads;
+    /// a write cut short in place would leave the truncated record these
+    /// commands must then cope with. Swapping `write_file_atomically` for a
+    /// bare `fs::write` keeps the bytes right and loses that, so the test reads
+    /// the inode, which is why it is Unix-only; `rocm-core`'s atomic-write
+    /// tests cover the publish itself on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn saving_the_run_record_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = test_paths("comfyui-state-atomic");
+        let path = plant_unreadable_record(&paths, UNREADABLE_RECORDS[0])?;
+        let before_ino = fs::metadata(&path)?.ino();
+        let state = ComfyUiState {
+            app_id: APP_ID.to_owned(),
+            url: "http://127.0.0.1:8188".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 8188,
+            pid: 42,
+            source_path: source_path(&paths),
+            python_executable: paths.data_dir.join("python"),
+            log_path: paths.data_dir.join("start.log"),
+            started_at_unix_ms: 1,
+        };
+
+        let saved = save_state(&paths, &state).and_then(|()| {
+            Ok((
+                fs::metadata(&path)?.ino(),
+                read_saved_state(&paths)?,
+                other_entries(&path, "running.json")?,
+            ))
+        });
+        remove_test_root(&paths);
+        let (after_ino, saved, leftovers) = saved?;
+
+        assert_ne!(
+            before_ino, after_ino,
+            "the record must be published as a new file, not rewritten in place"
+        );
+        assert!(
+            matches!(saved, SavedRunState::Saved(ref saved) if saved.pid == 42),
+            "{saved:?}"
+        );
+        assert!(
+            leftovers.is_empty(),
+            "no staging file is left: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    /// The manifest gets the same atomic replacement as the run record: a cut
+    /// short in-place write would leave `status` and `start` unable to parse
+    /// it. Unix-only for the same reason as the run-record test above.
+    #[cfg(unix)]
+    #[test]
+    fn saving_the_manifest_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = test_paths("comfyui-manifest-atomic");
+        let path = manifest_path(&paths);
+        fs::create_dir_all(path.parent().context("manifest path has no parent")?)?;
+        fs::write(&path, "{\"app_id\": \"comfy")?;
+        let before_ino = fs::metadata(&path)?.ino();
+        let manifest = test_manifest_with_source_url(&paths, "https://example.test/comfy.tar.gz");
+
+        let saved = save_manifest(&paths, &manifest).and_then(|()| {
+            Ok((
+                fs::metadata(&path)?.ino(),
+                load_manifest(&paths)?,
+                other_entries(&path, "current.json")?,
+            ))
+        });
+        remove_test_root(&paths);
+        let (after_ino, loaded, leftovers) = saved?;
+
+        assert_ne!(
+            before_ino, after_ino,
+            "the manifest must be published as a new file, not rewritten in place"
+        );
+        assert_eq!(
+            loaded.map(|manifest| manifest.source_url).as_deref(),
+            Some("https://example.test/comfy.tar.gz")
+        );
+        assert!(
+            leftovers.is_empty(),
+            "no staging file is left: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    /// Only a record that cannot be parsed is unreadable. One whose read
+    /// fails for another reason may be intact, so it is an error rather than
+    /// something `stop` would set aside; one that vanished before the read is
+    /// absent.
+    #[test]
+    fn only_a_record_that_cannot_be_parsed_counts_as_unreadable() -> Result<()> {
+        let path = PathBuf::from("state").join("running.json");
+        for text in UNREADABLE_RECORDS {
+            let classified = classify_saved_state(path.clone(), Ok(text.as_bytes().to_vec()))?;
+            assert!(
+                matches!(classified, SavedRunState::Unreadable(ref unreadable) if unreadable.path == path),
+                "{text:?}: {classified:?}"
+            );
+        }
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+        ] {
+            let error = classify_saved_state(path.clone(), Err(io::Error::from(kind)))
+                .expect_err("a failed read is an error");
+            assert!(
+                format!("{error:#}").starts_with(&format!("failed to read {}", path.display())),
+                "{error:#}"
+            );
+        }
+        let vanished = classify_saved_state(path, Err(io::Error::from(io::ErrorKind::NotFound)))?;
+        assert!(matches!(vanished, SavedRunState::Absent), "{vanished:?}");
+        Ok(())
+    }
+
+    /// Something other than a file where the record belongs is not "no
+    /// record": `status` and `stop` fail naming the path rather than report
+    /// nothing started. A directory fails the read even as `root` (Linux
+    /// reports "is a directory"; Windows refuses to open a directory as a
+    /// file with "access denied"), so this runs everywhere.
+    #[test]
+    fn something_other_than_a_file_at_the_record_is_an_error_not_no_record() -> Result<()> {
+        let paths = test_paths("comfyui-record-is-a-directory");
+        let path = state_path(&paths);
+        fs::create_dir_all(path.join("inside"))?;
+
+        let read = read_saved_state(&paths);
+        let status = render_status_with(&paths, &RocmCliConfig::default(), quiet_default_address);
+        let stop = process::stop_with(&paths, quiet_default_address);
+        remove_test_root(&paths);
+
+        let expected = format!("failed to read {}", path.display());
+        let read = read.expect_err("a directory is not a record");
+        assert!(format!("{read:#}").starts_with(&expected), "{read:#}");
+        let status = status.expect_err("status must not report no record");
+        assert!(format!("{status:#}").starts_with(&expected), "{status:#}");
+        let stop = stop.expect_err("stop must not report nothing running");
+        assert!(format!("{stop:#}").starts_with(&expected), "{stop:#}");
+        Ok(())
+    }
+
+    /// A link at the record whose target is gone is an error too, though the
+    /// read itself says `NotFound`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_at_the_record_is_an_error_not_no_record() -> Result<()> {
+        let paths = test_paths("comfyui-record-dangling-link");
+        let path = state_path(&paths);
+        fs::create_dir_all(path.parent().context("no parent")?)?;
+        std::os::unix::fs::symlink(path.with_file_name("gone.json"), &path)?;
+
+        let read = read_saved_state(&paths);
+        remove_test_root(&paths);
+
+        let error = read.expect_err("a dangling link is not \"no record\"");
+        assert!(
+            format!("{error:#}").starts_with(&format!("failed to read {}", path.display())),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// `logs` over something that cannot be read at all where the record
+    /// belongs fails naming it, as `status` and `stop` do, rather than
+    /// showing the logs as if there were no record.
+    #[test]
+    fn logs_over_a_record_that_cannot_be_read_fails_naming_it() -> Result<()> {
+        let paths = test_paths("comfyui-logs-record-is-a-directory");
+        let logs = app_root(&paths).join("logs");
+        fs::create_dir_all(&logs)?;
+        fs::write(logs.join("start-200.log"), "run 1\n")?;
+        let path = state_path(&paths);
+        fs::create_dir_all(path.join("inside"))?;
+
+        let rendered = render_logs(&paths, 10);
+        remove_test_root(&paths);
+
+        let error = rendered.expect_err("a directory is not a record");
+        assert!(
+            format!("{error:#}").starts_with(&format!("failed to read {}", path.display())),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// The real default-address check: a port something listens on answers,
+    /// with its URL; the same port once freed does not.
+    #[test]
+    fn the_default_address_check_finds_a_listener_and_only_a_listener() -> Result<()> {
+        let listener = TcpListener::bind((COMFYUI_DEFAULT_HOST, 0))?;
+        let port = listener.local_addr()?.port();
+
+        let listening = check_default_address_on(port);
+        drop(listener);
+        let freed = check_default_address_on(port);
+
+        let url = format!("http://127.0.0.1:{port}");
+        assert_eq!(
+            listening,
+            DefaultAddressCheck {
+                url: url.clone(),
+                answers: true
+            }
+        );
+        assert_eq!(
+            freed,
+            DefaultAddressCheck {
+                url,
+                answers: false
+            }
+        );
+        Ok(())
+    }
+
+    /// The port override: unset means ComfyUI's default port, a port is
+    /// used as given, and anything else set (empty, garbage, not Unicode) is
+    /// an error naming the variable, so a broken fixture never probes the
+    /// host's real port.
+    #[test]
+    fn the_default_address_port_override_is_a_port_or_an_error() {
+        use std::ffi::OsStr;
+
+        assert_eq!(parse_default_address_port_override(None), Ok(8188));
+        assert_eq!(
+            parse_default_address_port_override(Some(OsStr::new("9123"))),
+            Ok(9123)
+        );
+        for bad in ["", "8l88", "70000", " 9123"] {
+            let error = parse_default_address_port_override(Some(OsStr::new(bad))).expect_err(bad);
+            assert!(
+                error.starts_with(&format!(
+                    "ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE={bad:?} is not a port: "
+                )),
+                "{error}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let error = parse_default_address_port_override(Some(OsStr::from_bytes(b"91\xff23")))
+                .expect_err("not Unicode");
+            assert!(error.ends_with("is not a port: not Unicode"), "{error}");
+        }
+    }
+
+    /// A stop that failed outright is audited as a failure and returned;
+    /// nothing is written, since there is no report to print.
+    #[test]
+    fn a_stop_that_failed_is_audited_and_returned_without_a_report() -> Result<()> {
+        let paths = test_paths("comfyui-report-stop-error");
+        let mut out = Vec::new();
+
+        let outcome = report_stop(&paths, Err(anyhow::anyhow!("boom")), &mut out);
+        let audit = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        remove_test_root(&paths);
+
+        let error = outcome.expect_err("the stop's error is returned");
+        assert_eq!(format!("{error:#}"), "boom");
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert!(
+            audit.contains("\"level\":\"error\"") && audit.contains("ComfyUI stop failed: boom"),
+            "{audit}"
+        );
+        Ok(())
+    }
+
+    /// The audit event is recorded before the report is written, so a reader
+    /// that has gone away (`rocm comfyui stop | head`) does not lose it.
+    #[test]
+    fn a_stop_is_audited_even_when_its_report_cannot_be_written() -> Result<()> {
+        struct ClosedPipe;
+        impl io::Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let paths = test_paths("comfyui-report-stop-closed-pipe");
+
+        let outcome = report_stop(
+            &paths,
+            Ok(StopReport {
+                text: "ComfyUI\n  status: stopped\n".to_owned(),
+                failure: None,
+            }),
+            &mut ClosedPipe,
+        );
+        let audit = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        remove_test_root(&paths);
+
+        assert!(outcome.is_err(), "the failed write is still reported");
+        assert!(audit.contains("ComfyUI stop requested"), "{audit}");
+        Ok(())
+    }
+
+    /// Over a truncated or empty record `status` still succeeds, says it
+    /// cannot tell, names the file and advises the step that clears it, which
+    /// depends on whether anything answers on the default address. Both steps
+    /// are proved by `process`'s
+    /// `stop_sets_an_unreadable_record_aside_and_stops_no_process` and
+    /// `stop_over_an_unreadable_record_keeps_it_while_something_answers`.
+    #[test]
+    fn status_over_an_unreadable_record_reports_unknown_and_names_the_file() -> Result<()> {
+        for (index, text) in UNREADABLE_RECORDS.iter().enumerate() {
+            for answering in [false, true] {
+                let paths = test_paths(&format!("comfyui-status-unreadable-{index}-{answering}"));
+                let path = plant_unreadable_record(&paths, text)?;
+                let check = if answering {
+                    answering_default_address
+                } else {
+                    quiet_default_address
+                };
+
+                let rendered = render_status_with(&paths, &RocmCliConfig::default(), check);
+
+                remove_test_root(&paths);
+                let rendered = rendered?;
+                assert!(
+                    rendered.contains("Running\n  status: unknown\n"),
+                    "{rendered}"
+                );
+                assert!(
+                    rendered.contains(&format!(
+                        "  note: rocm-cli's record of the ComfyUI it started cannot be parsed \
+                         ({}: EOF while parsing",
+                        path.display()
+                    )),
+                    "{rendered}"
+                );
+                if answering {
+                    assert!(
+                        rendered.contains(&format!(
+                            "  url: http://127.0.0.1:8188\n  note: something answers at \
+                             http://127.0.0.1:8188, the only address rocm-cli checked; it cannot \
+                             tell whether that is the ComfyUI it started\n  next step: stop what \
+                             answers at http://127.0.0.1:8188 yourself, then run `rocm comfyui \
+                             stop` again; if what answers there is not the ComfyUI rocm-cli \
+                             started, move {} aside yourself instead\n",
+                            path.display()
+                        )),
+                        "{rendered}"
+                    );
+                } else {
+                    assert!(
+                        rendered.contains(
+                            "  next step: run `rocm comfyui stop`, which moves the unreadable record \
+                             aside and stops no process\n"
+                        ),
+                        "{rendered}"
+                    );
+                    assert!(!rendered.contains("answers at"), "{rendered}");
+                }
+                assert!(!rendered.contains("comfyui start"), "{rendered}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The chat's status answer, and the summary of a `status` tool call, say
+    /// the running state is unknown, pass on why and the step that clears it,
+    /// and do not advise `start`, which could launch a second ComfyUI. With
+    /// something answering on the default address the answer says so, and
+    /// does not call it running.
+    #[test]
+    fn chat_status_answer_over_an_unreadable_record_says_unknown_and_does_not_advise_start()
+    -> Result<()> {
+        for (index, text) in UNREADABLE_RECORDS.iter().enumerate() {
+            for answering in [false, true] {
+                let paths = test_paths(&format!("comfyui-chat-unreadable-{index}-{answering}"));
+                // Installed, so the answer would otherwise advise `start`.
+                save_manifest(
+                    &paths,
+                    &test_manifest_with_source_url(&paths, &comfyui_source_archive_url()),
+                )?;
+                let path = plant_unreadable_record(&paths, text)?;
+                let check = if answering {
+                    answering_default_address
+                } else {
+                    quiet_default_address
+                };
+
+                let answer = render_chat_status_answer_with(&paths, check);
+                let status = render_status_with(&paths, &RocmCliConfig::default(), check);
+                remove_test_root(&paths);
+                let (answer, status) = (answer?, status?);
+
+                assert!(answer.contains("ComfyUI: installed\n"), "{answer}");
+                assert!(answer.contains("Running: unknown\n"), "{answer}");
+                let note_prefix = format!(
+                    "Note: rocm-cli's record of the ComfyUI it started cannot be parsed ({}: ",
+                    path.display()
+                );
+                assert!(answer.contains(&note_prefix), "{answer}");
+                let next_step = if answering {
+                    assert!(
+                        answer.contains(
+                            "Note: something answers at http://127.0.0.1:8188, the only address \
+                             rocm-cli checked; it cannot tell whether that is the ComfyUI it \
+                             started.\n"
+                        ),
+                        "{answer}"
+                    );
+                    format!(
+                        "stop what answers at http://127.0.0.1:8188 yourself, then run `rocm \
+                         comfyui stop` again; if what answers there is not the ComfyUI rocm-cli \
+                         started, move {} aside yourself instead",
+                        path.display()
+                    )
+                } else {
+                    assert!(!answer.contains("answers at"), "{answer}");
+                    "run `rocm comfyui stop`, which moves the unreadable record aside and stops no \
+                     process"
+                        .to_owned()
+                };
+                assert!(
+                    answer.contains(&format!("Next step: {next_step}.\n")),
+                    "{answer}"
+                );
+                assert!(!answer.contains("comfyui start"), "{answer}");
+                assert!(!answer.contains("Running: no"), "{answer}");
+                assert!(!answer.contains("Running: yes"), "{answer}");
+
+                let summary = crate::chat::deterministic_comfyui_tool_summary(&status)
+                    .context("a status summary")?;
+                assert!(summary.contains("  Running: unknown."), "{summary}");
+                assert!(summary.contains(&format!("  {note_prefix}")), "{summary}");
+                assert!(
+                    summary.contains(&format!("  Next step: {next_step}.")),
+                    "{summary}"
+                );
+                assert!(!summary.contains("not running"), "{summary}");
+            }
+        }
+        Ok(())
+    }
+
+    /// With no record, `status` and the chat's status answer report what the
+    /// default-address check finds: something answering there is a ComfyUI
+    /// running outside rocm-cli, and `start` is not advised; nothing
+    /// answering is not running, and `start` is advised.
+    #[test]
+    fn with_no_record_status_and_the_chat_answer_report_what_answers_on_the_default_address()
+    -> Result<()> {
+        for answering in [true, false] {
+            let paths = test_paths(&format!("comfyui-no-record-{answering}"));
+            // Installed, so `start` is advised when nothing answers.
+            save_manifest(
+                &paths,
+                &test_manifest_with_source_url(&paths, &comfyui_source_archive_url()),
+            )?;
+            let check = if answering {
+                answering_default_address
+            } else {
+                quiet_default_address
+            };
+
+            let answer = render_chat_status_answer_with(&paths, check);
+            let status = render_status_with(&paths, &RocmCliConfig::default(), check);
+            remove_test_root(&paths);
+            let (answer, status) = (answer?, status?);
+
+            if answering {
+                assert!(
+                    answer.contains("Running: yes\nURL: http://127.0.0.1:8188\n"),
+                    "{answer}"
+                );
+                assert!(!answer.contains("comfyui start"), "{answer}");
+                assert!(
+                    status.contains(
+                        "Running\n  status: running outside rocm-cli\n  url: \
+                         http://127.0.0.1:8188\n  note: ROCm CLI did not start this ComfyUI \
+                         process\n"
+                    ),
+                    "{status}"
+                );
+            } else {
+                assert!(answer.contains("Running: no\n"), "{answer}");
+                assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
+                assert!(
+                    status.contains("Running\n  status: not started by rocm-cli\n"),
+                    "{status}"
+                );
+            }
+            assert!(!answer.contains("unknown"), "{answer}");
+        }
+        Ok(())
+    }
+
+    /// An unreadable record names no log, and `logs` still shows the run log
+    /// under the app's `logs` folder rather than failing on the record.
+    #[test]
+    fn logs_over_an_unreadable_record_still_show_the_saved_log() -> Result<()> {
+        for (index, text) in UNREADABLE_RECORDS.iter().enumerate() {
+            let paths = test_paths(&format!("comfyui-logs-unreadable-{index}"));
+            let logs = app_root(&paths).join("logs");
+            fs::create_dir_all(&logs)?;
+            let run_log = logs.join("start-200.log");
+            fs::write(&run_log, "run 1\nrun 2\n")?;
+            plant_unreadable_record(&paths, text)?;
+
+            let rendered = render_logs(&paths, 10);
+
+            remove_test_root(&paths);
+            let rendered = rendered?;
+            assert!(
+                rendered.contains(&format!(
+                    "Run log\n  saved file: {}\n  latest output:\n    run 1\n    run 2\n",
+                    run_log.display()
+                )),
+                "{rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `rocm comfyui stop` prints its report either way. One that did not
+    /// reach "stopped" is then an error, so the command exits non-zero, and
+    /// is audited as one; one that did is audited as a request.
+    #[test]
+    fn a_stop_that_did_not_stop_prints_its_report_then_fails() -> Result<()> {
+        let paths = test_paths("comfyui-report-stop");
+        let mut failed_out = Vec::new();
+        let failed = report_stop(
+            &paths,
+            Ok(StopReport {
+                text: "ComfyUI\n  status: unknown\n".to_owned(),
+                failure: Some("something still answers".to_owned()),
+            }),
+            &mut failed_out,
+        );
+        let failed_audit = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        let mut stopped_out = Vec::new();
+        let stopped = report_stop(
+            &paths,
+            Ok(StopReport {
+                text: "ComfyUI\n  status: stopped\n".to_owned(),
+                failure: None,
+            }),
+            &mut stopped_out,
+        );
+        let audit = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        remove_test_root(&paths);
+
+        let error = failed.expect_err("a stop that did not stop must fail");
+        assert_eq!(format!("{error:#}"), "something still answers");
+        assert_eq!(
+            String::from_utf8(failed_out)?,
+            "ComfyUI\n  status: unknown\n"
+        );
+        assert!(
+            failed_audit.contains("\"level\":\"error\"")
+                && failed_audit.contains("something still answers"),
+            "{failed_audit}"
+        );
+        stopped?;
+        assert_eq!(
+            String::from_utf8(stopped_out)?,
+            "ComfyUI\n  status: stopped\n"
+        );
+        assert!(
+            audit.contains("\"level\":\"info\"") && audit.contains("ComfyUI stop requested"),
+            "{audit}"
+        );
         Ok(())
     }
 

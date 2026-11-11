@@ -1632,8 +1632,25 @@ downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
 launched is running or still starting, and its dry run says so; stop it with
 `rocm comfyui stop` first. This is checked before the download and again just
 before the code is replaced, so a ComfyUI started during the download is
-caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
-reinstall says so and is not refused, since `stop` cannot read it either. If a
+caught too. If rocm-cli's saved record of that ComfyUI cannot be parsed (a
+`running.json` that is truncated, empty or otherwise not a record rocm-cli
+wrote), the reinstall says so and is not refused, since the record names no
+process that `stop` could stop either. `status` and
+the answer to `rocm "what is the comfyui status"` then report the running state
+as unknown, naming the file, and `logs` still shows the saved logs. To tell
+whether anything else might be the ComfyUI it started, `status`, that answer
+and `rocm comfyui stop` check only ComfyUI's default address,
+`http://127.0.0.1:8188`. If nothing answers there, `rocm comfyui stop` moves
+the record aside to `running.json.unreadable` in the same `state` folder
+(replacing one moved there before) without stopping any process. If something
+does answer, rocm-cli cannot tell whether that is the ComfyUI it started, so
+`stop` leaves the record in place and exits non-zero, saying to stop what
+answers there yourself and run `rocm comfyui stop` again, or, if what answers
+is not that ComfyUI, to move the record aside yourself. A reinstall over such a
+record does not wait for any of this: it goes ahead even if a ComfyUI is still
+running from the folder, and may replace its code under it. A `running.json`
+that cannot be read at all (permission denied, say), or something other than a
+file at its path, is reported as an error rather than as no record. If a
 reinstall is interrupted part-way, or stops part-way (because a file it must
 delete or move is in use, say), `start` refuses to launch the half-replaced
 folder, and `start`, `status`, the answer to

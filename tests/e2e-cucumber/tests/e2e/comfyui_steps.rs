@@ -89,6 +89,15 @@
 //! isolated managed runtime and asserts the runtime's torch stack is unchanged, no
 //! `nvidia-*` distributions appeared, and the install really added packages. It
 //! reuses `comfyui-03`'s argument-less `comfyui install` When step.
+//!
+//! `comfyui-20` and `comfyui-21` cover a saved record of the ComfyUI
+//! rocm-cli started that cannot be parsed: they plant a `running.json` cut
+//! off mid-write and, for `comfyui-20`, a manifest saying ComfyUI is
+//! installed. Both point the default address `status` and `stop` check at a
+//! port the scenario chooses (`ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`,
+//! read only by `e2e-test-hooks` builds): `comfyui-20` at a free one, so
+//! `stop` moves the record aside, and `comfyui-21` at one it holds open, so
+//! `stop` keeps it until the listener is dropped.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -464,7 +473,7 @@ async fn install_folder_line_names_source_checkout(world: &mut E2eWorld) {
 
 #[when("the user checks ComfyUI status")]
 async fn user_checks_comfyui_status(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "status"]);
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -1587,6 +1596,9 @@ async fn stop_comfyui(world: &mut E2eWorld) {
         rc, 0,
         "`rocm comfyui stop` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
 }
 
 /// Leaves the installed folder as a reinstall killed part-way through
@@ -1783,30 +1795,303 @@ async fn answer_clear_of_interruption(world: &mut E2eWorld) {
     }
 }
 
-#[given("rocm-cli's saved record of the ComfyUI it started cannot be read")]
+/// The note `status`, `stop` and a reinstall print over the unreadable
+/// record, up to the parse error that follows the path.
+fn unreadable_state_note_prefix(world: &E2eWorld) -> String {
+    format!(
+        "rocm-cli's record of the ComfyUI it started cannot be parsed ({}: ",
+        running_state_path(world).display()
+    )
+}
+
+/// What the unreadable-record fixture plants: a record cut off mid-write.
+const UNREADABLE_RECORD: &str = "{\"app_id\": \"comfy";
+
+/// Where `stop` moves an unreadable record it sets aside.
+fn unreadable_record_aside_path(world: &E2eWorld) -> PathBuf {
+    running_state_path(world).with_file_name("running.json.unreadable")
+}
+
+/// Points the address `status`, the chat's status answer and `stop` check for
+/// a ComfyUI rocm-cli has no readable record of at `port`, instead of
+/// ComfyUI's default port, which a host may be using itself.
+fn check_default_address_on(world: &mut E2eWorld, port: u16) {
+    world.command_env.push((
+        "ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE",
+        port.to_string().into(),
+    ));
+}
+
+fn default_address_url(world: &E2eWorld) -> String {
+    let port = world
+        .command_env
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == "ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE")
+        .map(|(_, port)| port.to_string_lossy().into_owned())
+        .expect("the scenario chose what answers on ComfyUI's default address");
+    format!("http://127.0.0.1:{port}")
+}
+
+#[given("rocm-cli's saved record of the ComfyUI it started cannot be parsed")]
 async fn unreadable_saved_state(world: &mut E2eWorld) {
+    write_fixture(&running_state_path(world), UNREADABLE_RECORD);
+}
+
+/// What `rocm comfyui install` leaves for `status` and the chat's status
+/// answer to read: a manifest saying ComfyUI is installed. Nothing here runs
+/// it.
+#[given("ComfyUI is installed")]
+async fn comfyui_is_installed(world: &mut E2eWorld) {
+    let data = data_dir(world);
+    let app = data.join("apps").join("comfyui");
+    let manifest = serde_json::json!({
+        "app_id": "comfyui",
+        "runtime_key": RUNTIME_KEY,
+        "runtime_id": RUNTIME_KEY,
+        "runtime_version": "7.0.0",
+        "runtime_root": data.join("runtimes").join(RUNTIME_KEY),
+        "python_executable": data.join("runtimes").join(RUNTIME_KEY).join("python"),
+        "source_url": "https://example.invalid/comfyui.tar.gz",
+        "source_path": app.join("source"),
+        "requirements_path": app.join("source").join("requirements.txt"),
+        "pip_cache_dir": null,
+        "log_path": app.join("logs").join("install-e2e.log"),
+        "torch_version": null,
+        "torch_cuda_available": true,
+        "installed_at_unix_ms": 1,
+    });
     write_fixture(
-        &data_dir(world)
-            .join("apps")
-            .join("comfyui")
-            .join("state")
-            .join("running.json"),
-        "{\"app_id\": \"comfy",
+        &app.join("manifests").join("current.json"),
+        &serde_json::to_string_pretty(&manifest).expect("manifest serializes"),
+    );
+    disable_startup_update_check(world);
+}
+
+/// A loopback port that was free a moment ago and has nothing bound to it.
+#[given("nothing answers on ComfyUI's default address")]
+async fn nothing_answers_on_the_default_address(world: &mut E2eWorld) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("failed to find a free loopback port")
+        .port();
+    check_default_address_on(world, port);
+}
+
+#[given("something answers on ComfyUI's default address")]
+async fn something_answers_on_the_default_address(world: &mut E2eWorld) {
+    let port = hold_answering_port(world);
+    check_default_address_on(world, port);
+}
+
+#[given("what answered on ComfyUI's default address has stopped")]
+async fn what_answered_has_stopped(world: &mut E2eWorld) {
+    world.comfyui_port_listener = None;
+}
+
+#[then("status says it cannot tell whether the ComfyUI rocm-cli started is running")]
+async fn status_says_running_state_unknown(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "`rocm comfyui status` must not fail over an unreadable record\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Running\n  status: unknown\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("  note: {}", unreadable_state_note_prefix(world))),
+        "status must name the unreadable record, got:\n{stdout}"
+    );
+    // The next step it names is the one the scenario runs next.
+    assert!(
+        stdout.contains(
+            "  next step: run `rocm comfyui stop`, which moves the unreadable record aside and stops \
+             no process\n"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("comfyui start"), "{stdout}");
+    // Reading the status changed nothing.
+    assert!(running_state_path(world).is_file());
+}
+
+/// What `status` and `stop` advise over an unreadable record while something
+/// answers on the default address. The scenario takes the first way out it
+/// names; the second, moving the record aside by hand, is proved by the unit
+/// test `stop_over_an_unreadable_record_keeps_it_while_something_answers` in
+/// `apps/rocm/src/comfyui/process.rs`.
+fn what_answers_next_step(world: &E2eWorld) -> String {
+    let url = default_address_url(world);
+    format!(
+        "stop what answers at {url} yourself, then run `rocm comfyui stop` again; if what \
+         answers there is not the ComfyUI rocm-cli started, move {} aside yourself instead",
+        running_state_path(world).display()
+    )
+}
+
+#[then("status says something answers there and advises stopping it before running stop again")]
+async fn status_says_something_answers(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let url = default_address_url(world);
+    assert_eq!(world.cli_rc, Some(0), "{stdout}");
+    assert!(stdout.contains("Running\n  status: unknown\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "  url: {url}\n  note: something answers at {url}, the only address rocm-cli \
+             checked; it cannot tell whether that is the ComfyUI it started\n  next step: {}\n",
+            what_answers_next_step(world)
+        )),
+        "{stdout}"
+    );
+}
+
+#[then("the answer says it cannot tell whether ComfyUI is running and does not advise starting it")]
+async fn answer_says_running_state_unknown(world: &mut E2eWorld) {
+    let answer = world.cli_output.clone().unwrap_or_default();
+    assert!(answer.contains("ComfyUI: installed\n"), "{answer}");
+    assert!(answer.contains("Running: unknown\n"), "{answer}");
+    assert!(
+        answer.contains(&format!("Note: {}", unreadable_state_note_prefix(world))),
+        "{answer}"
+    );
+    assert!(
+        answer.contains(
+            "Next step: run `rocm comfyui stop`, which moves the unreadable record aside and stops no \
+             process.\n"
+        ),
+        "{answer}"
+    );
+    assert!(!answer.contains("comfyui start"), "{answer}");
+}
+
+/// Runs the command `status`'s next step names, as printed: the words of its
+/// first backtick span.
+#[when("the user runs the stop that status advised")]
+async fn run_the_stop_status_advised(world: &mut E2eWorld) {
+    let (status, _, _) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    let line = status
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("next step:"))
+        .unwrap_or_else(|| panic!("status names no next step:\n{status}"));
+    let command = line.split('`').nth(1).unwrap_or_default();
+    let words: Vec<&str> = command.split_whitespace().collect();
+    assert_eq!(
+        words.first(),
+        Some(&"rocm"),
+        "the next step is not a rocm command: {line}"
+    );
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &words[1..]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Records what `stop` printed without judging its exit code, which over an
+/// unreadable record depends on what answers on the default address; the
+/// `Then` steps judge it.
+#[when("the user stops ComfyUI while its record cannot be parsed")]
+async fn stop_comfyui_over_unreadable_record(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &["comfyui", "stop"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("stop says it stopped nothing and set the unreadable record aside")]
+async fn stop_set_the_unreadable_record_aside(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let aside = unreadable_record_aside_path(world);
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("  status: unknown\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("  note: {}", unreadable_state_note_prefix(world))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("  moved aside to: {}\n", aside.display())),
+        "{stdout}"
+    );
+    // This pins the wording only: the scenario starts no process. That stop
+    // ends none over an unreadable record is proved by the unit test
+    // `stop_sets_an_unreadable_record_aside_and_stops_no_process` in
+    // `apps/rocm/src/comfyui/process.rs`, whose record names the test's own
+    // process.
+    assert!(
+        stdout.contains(&format!(
+            "  note: no process was stopped; rocm-cli checked only {}, where nothing answers, \
+             so a ComfyUI started on another address is not covered; the moved-aside record is \
+             kept at {}\n",
+            default_address_url(world),
+            unreadable_record_aside_path(world).display()
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("status: stopped"), "{stdout}");
+    // What it says it did: the record moved, unchanged, to the place named.
+    assert!(!running_state_path(world).exists(), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&aside).ok().as_deref(),
+        Some(UNREADABLE_RECORD)
+    );
+}
+
+#[then("stop fails, keeps the record and says to stop what answers there first")]
+async fn stop_kept_the_unreadable_record(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let url = default_address_url(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "  note: no process was stopped, and the record was left in place\n  next step: {}\n",
+            what_answers_next_step(world)
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("something answers at {url}")),
+        "{stderr}"
+    );
+    // What it says it did: the record is where it was, and nothing was moved.
+    assert_eq!(
+        std::fs::read_to_string(running_state_path(world))
+            .ok()
+            .as_deref(),
+        Some(UNREADABLE_RECORD)
+    );
+    assert!(!unreadable_record_aside_path(world).exists());
+}
+
+#[then("ComfyUI status no longer reports an unreadable record")]
+async fn status_no_longer_reports_unreadable_record(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("status: unknown"), "{stdout}");
+    assert!(!stdout.contains("cannot be parsed"), "{stdout}");
+    assert!(
+        stdout.contains("  status: not started by rocm-cli\n"),
+        "{stdout}"
     );
 }
 
 #[then("the reinstall says it could not tell whether ComfyUI was running")]
 async fn reinstall_notes_unreadable_state(world: &mut E2eWorld) {
     let stdout = world.cli_output.clone().unwrap_or_default();
-    let state = data_dir(world)
-        .join("apps")
-        .join("comfyui")
-        .join("state")
-        .join("running.json");
-    let prefix = format!("Note: failed to parse {}", state.display());
+    let prefix = format!("Note: {}", unreadable_state_note_prefix(world));
     let suffix = format!(
-        "; whether a ComfyUI started by rocm-cli is running from {} is unknown, so the \
-         reinstall is not refused for it",
+        "so whether that ComfyUI is running is unknown; it names no process `rocm comfyui stop` \
+         could stop, so the reinstall of {} is not refused for it, and a ComfyUI still running \
+         from there may have its code replaced under it",
         comfyui_source_dir(world).display()
     );
     assert!(

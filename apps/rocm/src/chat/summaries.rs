@@ -498,6 +498,8 @@ pub(crate) fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<Stri
             "running".to_owned()
         } else if status.eq_ignore_ascii_case("starting") {
             "starting".to_owned()
+        } else if status.eq_ignore_ascii_case("unknown") {
+            "unknown".to_owned()
         } else {
             format!("not running ({status})")
         };
@@ -518,6 +520,24 @@ pub(crate) fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<Stri
             && !note.is_empty()
         {
             lines.push(format!("  Note: {note}."));
+        }
+    }
+    // An unknown running state is not summed up by the `Running:` line: its
+    // notes say why it is unknown and what answers, and its next step how to
+    // clear it, so they are passed on.
+    if chat_tool_value(tool_text, "status").is_some_and(|status| status == "unknown") {
+        for line in tool_text
+            .lines()
+            .skip_while(|line| line.trim() != "Running")
+            .skip(1)
+            .take_while(|line| line.starts_with("  "))
+        {
+            let line = line.trim();
+            if let Some(note) = line.strip_prefix("note:").map(str::trim) {
+                lines.push(format!("  Note: {note}."));
+            } else if let Some(step) = line.strip_prefix("next step:").map(str::trim) {
+                lines.push(format!("  Next step: {step}."));
+            }
         }
     }
     (!lines.is_empty()).then(|| lines.join("\n"))

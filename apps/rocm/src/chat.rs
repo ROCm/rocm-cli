@@ -27,9 +27,9 @@ mod turn;
 // `deterministic_comfyui_tool_summary` lives in `summaries.rs` and stays
 // reachable here as `chat::deterministic_comfyui_tool_summary` for
 // `comfyui.rs`'s tests, which are its only readers outside `summaries.rs`.
-// Those tests are all `#[cfg(unix)]`, so the re-export is gated the same way:
-// on Windows it would be an unused import.
-#[cfg(all(test, unix))]
+// One of them runs on every platform, so the re-export is gated on `test`
+// alone.
+#[cfg(test)]
 pub(crate) use self::summaries::deterministic_comfyui_tool_summary;
 // `run_internal_mcp_call` lives in `mcp_bridge.rs` and stays reachable here as
 // `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.

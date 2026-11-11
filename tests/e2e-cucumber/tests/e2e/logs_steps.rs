@@ -125,6 +125,14 @@ async fn command_log_with_an_oversize_line(world: &mut E2eWorld) {
     std::fs::write(&log, bytes).expect("failed to write the command log");
 }
 
+/// The lines the saved ComfyUI run log holds.
+const COMFYUI_RUN_LOG: &str = "Starting server\nTo see the GUI go to: http://127.0.0.1:8188\n";
+
+#[given("a saved ComfyUI run log")]
+async fn comfyui_with_a_run_log(world: &mut E2eWorld) {
+    plant_comfyui_log(world, COMFYUI_RUN_LOG.as_bytes());
+}
+
 #[given("a ComfyUI log file that is empty")]
 async fn comfyui_with_an_empty_log(world: &mut E2eWorld) {
     plant_comfyui_log(world, b"");
@@ -308,6 +316,22 @@ async fn lists_the_log_as_not_shown(world: &mut E2eWorld) {
             && !on_disk[..on_disk.len() - 1].contains(&b'\n'),
         "the log on disk should be one line past the bound, is {} bytes",
         on_disk.len()
+    );
+}
+
+#[then("the logs show the saved run log")]
+async fn comfyui_logs_show_the_run_log(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let mut expected = format!(
+        "Run log\n  saved file: {}\n  latest output:\n",
+        comfyui_log_path(world).display()
+    );
+    for line in COMFYUI_RUN_LOG.lines() {
+        writeln!(expected, "    {line}").expect("writing to a String");
+    }
+    assert!(
+        out.contains(&expected),
+        "expected:\n{expected}\ngot:\n{out}"
     );
 }
 
