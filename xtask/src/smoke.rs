@@ -1853,6 +1853,63 @@ mod tests {
         );
     }
 
+    /// [`Bin::stem`] names both the binary the gate looks for and the cargo
+    /// package the release build passes to `-p`. Hold the two together: each
+    /// stem must be a workspace package that builds a binary of that same
+    /// name, so a package or binary rename fails here rather than only under
+    /// `--profile release`, which no CI job runs.
+    #[test]
+    fn every_smoked_binary_is_built_by_the_package_its_stem_names() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits in the workspace root");
+        let read = |path: &Path| -> toml::Table {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            text.parse()
+                .unwrap_or_else(|error| panic!("parsing {}: {error}", path.display()))
+        };
+        let workspace = read(&root.join("Cargo.toml"));
+        let members: Vec<&str> = workspace["workspace"]["members"]
+            .as_array()
+            .expect("workspace members")
+            .iter()
+            .map(|member| member.as_str().expect("a member is a path"))
+            .collect();
+        for bin in Bin::ALL {
+            let stem = bin.stem();
+            let found: Vec<(&str, toml::Table)> = members
+                .iter()
+                .map(|member| (*member, read(&root.join(member).join("Cargo.toml"))))
+                .filter(|(_, manifest)| manifest["package"]["name"].as_str() == Some(stem))
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "no single workspace package is named {stem}"
+            );
+            let (member, manifest) = &found[0];
+            let bins: Vec<&str> = manifest
+                .get("bin")
+                .and_then(toml::Value::as_array)
+                .map(|bins| {
+                    bins.iter()
+                        .filter_map(|bin| bin.get("name").and_then(toml::Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let builds_stem = if bins.is_empty() {
+                root.join(member).join("src/main.rs").is_file()
+            } else {
+                bins.contains(&stem)
+            };
+            assert!(
+                builds_stem,
+                "package {stem} ({member}) builds no binary named {stem}"
+            );
+        }
+    }
+
     /// `--profile release` must build the profile it then smokes, and a
     /// `--target-dir` must reach the build too: otherwise the flags build one
     /// place and look in another.
