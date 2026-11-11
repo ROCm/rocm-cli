@@ -36,9 +36,9 @@ differs is when each runs and what hardware it covers.
 
 | Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
 |---|---|---|---|---|
-| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below, except `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` (and W7900 also `merge_group`; see below) | No — absent from the required-status-check list |
+| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below, except `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` and `merge_group` (see below) | No — absent from the required-status-check list |
 | Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same self-hosted platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
-| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The full self-hosted matrix: every platform in the table below, including `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` (W7900 also `merge_group`, but a `release/**` push runs both) | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
+| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The full self-hosted matrix: every platform in the table below, including `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` and `merge_group` but run on a `release/**` push | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
 
 R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
@@ -402,10 +402,13 @@ has merged) when the workflow's own `changes` job's
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
-lane: they run only on the other lanes, and the only vLLM serve before a change
-lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
-matches. `push` fires on `main` and on any `release/**` branch, so pushing to
-a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
+lane: they run only on the Windows Strix Halo lanes, and the only vLLM serve
+before a change lands is the per-PR canary (`serve-05`), which runs when the
+`serve` filter matches. **The merge queue has no native Linux GPU lane**: MI300X,
+Strix Ubuntu and W7900 all skip `merge_group`, so it runs only Windows Strix and
+WSL2. `push` fires on `main` and on any `release/**` branch, so pushing to a
+release branch runs the full self-hosted matrix (all five lanes) ahead of
+cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
 branch. Merging or closing a pull request also starts a run (`closed` is a
 listed `pull_request` activity type) that joins that PR's group and runs only a
@@ -443,8 +446,8 @@ plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust chang
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix (minus MI300X, Strix Ubuntu and W7900 in the merge queue)
-always runs there. Unlike the
+filter is forced `true`, so the full matrix (minus MI300X, Strix Ubuntu and
+W7900 in the merge queue) always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and

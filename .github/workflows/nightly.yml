@@ -673,8 +673,9 @@ jobs:
 
   # W7900 counterpart to e2e-gpu-nightly. Mirrors the e2e-gpu-w7900 lane (which
   # no longer runs on pull_request) in e2e-selfhosted.yml (w7900 label, shared
-  # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step: the report crate asserts
-  # the nightly lanes publish the same platforms as the per-PR lanes.
+  # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in
+  # step: the report crate asserts the nightly lanes publish the same platforms
+  # as the lanes in e2e-selfhosted.yml.
   e2e-gpu-nightly-w7900:
     name: E2E tests (W7900, incl. nightly-only)
     timeout-minutes: 90
@@ -769,10 +770,10 @@ jobs:
     # does not, no nightly lane runs AIM serve and a pool-based one is needed.
     timeout-minutes: 120
     # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
-    # e2e-selfhosted.yml, which runs on push, merge_group and dispatch but not on
-    # pull_request (pinned by workflow_contract.rs). This lane used
-    # to target the static `native` host, which is offline: every nightly sat
-    # queued until the 12h run cap and the lane never ran. Pool hosts are cold,
+    # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request
+    # or merge_group (pinned by workflow_contract.rs). This lane used to target
+    # the static `native` host, which is offline: every nightly sat queued until
+    # the 12h run cap and the lane never ran. Pool hosts are cold,
     # so there are no host-specific HOME or cache-dir overrides.
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     continue-on-error: true

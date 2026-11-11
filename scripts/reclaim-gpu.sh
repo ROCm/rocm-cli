@@ -49,9 +49,9 @@ set -euo pipefail
 # `std::env::temp_dir()` and so follows TMPDIR; a lane on a host that redirects
 # it (the nightly Strix lane did, to `$HOME/actions-runner/tmp`, before it moved
 # to the pool) is the case this handles. A bare `/tmp/rocm-e2e` kept matching
-# there only by accident — that directory is itself named `tmp`, so the substring
-# still appeared — and would silently stop matching under any redirect not
-# named `tmp`. Deriving the redirected form fixes that for ANY target.
+# there only by accident — that directory is itself named `tmp`, so the
+# substring still appeared — and would silently stop matching under any
+# redirect not named `tmp`. Deriving the redirected form fixes that for ANY target.
 #
 # WHAT THE ANCHORING DOES AND DOES NOT BUY. Roots are matched as unanchored
 # substrings of the WHOLE command line, so any root also matches a process that
