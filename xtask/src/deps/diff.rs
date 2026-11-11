@@ -148,7 +148,16 @@ fn collect(file: &str, text: &str, into: &mut Versions) -> Result<()> {
             mise_lock::parse_lock(text).with_context(|| format!("invalid {file}"))?
         {
             for (platform, asset) in &tool.platforms {
-                let digest = asset.sha256.get(..12).unwrap_or(&asset.sha256);
+                // As for Python rows, the table does not rely on `deps check`
+                // having run: the same rules are applied here, so the name,
+                // platform, version and digest rendered are plain segments or
+                // hex.
+                let problems = mise_lock::row_problems(&name, &tool.version, platform, asset);
+                if !problems.is_empty() {
+                    bail!("{file}: {}", problems.join("; "));
+                }
+                // `row_problems` refused anything but 64 hex digits.
+                let digest = &asset.sha256[..12];
                 into.insert(
                     (file.to_owned(), format!("{name}/{platform}")),
                     format!("{}-{digest}", tool.version),
@@ -639,6 +648,78 @@ mod tests {
         ] {
             let err = collect(file, &text, &mut Versions::new()).unwrap_err();
             assert_eq!(format!("{err:#}"), format!("{file}: {expected}"));
+        }
+    }
+
+    /// A binary row is rendered only once the asset passes the same rules as
+    /// `deps check`, so nothing in it can break the Markdown table.
+    #[test]
+    fn a_binary_row_passes_the_lock_rules_before_it_is_rendered() {
+        let lock = |name: &str, version: &str, platform: &str, sum: &str| {
+            let repo = name.split_once(':').map_or(name, |(_, repo)| repo);
+            format!(
+                "lockfile_version = 3\n\n[[tools.{name:?}]]\nversion = {version:?}\nbackend = {name:?}\n\n\
+                 [tools.{name:?}.\"platforms.{platform}\"]\nchecksum = \"sha256:{sum}\"\n\
+                 url = \"https://github.com/{repo}/releases/download/{version}/t-linux-x64.tar.gz\"\n"
+            )
+        };
+        let hex = "0123456789abcdef".repeat(4);
+        // Every character a plain segment allows, in the name and the version.
+        let mut into = Versions::new();
+        collect(
+            MISE_LOCK,
+            &lock("github:o.a/t_b-c", "1.2.3+rocm_1-x", "linux-x64", &hex),
+            &mut into,
+        )
+        .unwrap();
+        assert_eq!(
+            into.into_iter().collect::<Vec<_>>(),
+            [(
+                (
+                    MISE_LOCK.to_owned(),
+                    "github:o.a/t_b-c/linux-x64".to_owned()
+                ),
+                "1.2.3+rocm_1-x-0123456789ab".to_owned()
+            )]
+        );
+        for (refused, text) in [
+            (
+                "is not a release tag",
+                lock("github:o/t", "1|2", "linux-x64", &hex),
+            ),
+            (
+                "is not a `github:` or `aqua:` owner/repo",
+                lock("github:o/t|x", "1.2.3", "linux-x64", &hex),
+            ),
+            (
+                "is not a platform name",
+                lock("github:o/t", "1.2.3", "linux|x64", &hex),
+            ),
+            (
+                "checksum is not a sha256 hex digest",
+                lock("github:o/t", "1.2.3", "linux-x64", "aaaa|`[x](h"),
+            ),
+            (
+                "checksum is not a sha256 hex digest",
+                lock("github:o/t", "1.2.3", "linux-x64", ""),
+            ),
+            (
+                "checksum is not a sha256 hex digest",
+                lock("github:o/t", "1.2.3", "linux-x64", &hex.to_uppercase()),
+            ),
+            (
+                "checksum is not a sha256 hex digest",
+                lock("github:o/t", "1.2.3", "linux-x64", &format!("{hex}0")),
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                collect(MISE_LOCK, &text, &mut Versions::new()).unwrap_err()
+            );
+            assert!(
+                err.starts_with(&format!("{MISE_LOCK}: ")) && err.contains(refused),
+                "{refused}: {err}"
+            );
         }
     }
 

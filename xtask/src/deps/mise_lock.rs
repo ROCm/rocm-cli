@@ -354,6 +354,45 @@ fn release_prefix(backend: &str) -> Option<String> {
         .then(|| format!("https://github.com/{owner}/{name}/releases/download/"))
 }
 
+/// The values `deps diff` renders for one locked asset, checked with the
+/// same building blocks `deps check` uses: the tool is a `github:`/`aqua:`
+/// owner/repo of plain segments ([`release_prefix`]), the platform and the
+/// version are plain segments, and the digest is 64 lowercase hex digits.
+/// `deps check` ties the version to its release tag (the tag, or the tag less
+/// a leading `v`), so a version it accepts is a plain segment too, except a
+/// degenerate one such as `.`, which this refuses. Each rendered value is
+/// made only of plain-segment characters or hex, so none can break the
+/// Markdown table; the update's validator may still refuse a row as not a
+/// version change (it wants a version starting with a digit).
+pub(crate) fn row_problems(
+    name: &str,
+    version: &str,
+    platform: &str,
+    asset: &LockedAsset,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if release_prefix(name).is_none() {
+        out.push(format!("{name:?} is not a `github:` or `aqua:` owner/repo"));
+    }
+    if !is_plain_segment(platform) {
+        out.push(format!("{name}: {platform:?} is not a platform name"));
+    }
+    if !is_plain_segment(version) {
+        out.push(format!("{name}: {version:?} is not a release tag"));
+    }
+    if !is_sha256_hex(&asset.sha256) {
+        out.push(format!(
+            "{name}: {platform} checksum is not a sha256 hex digest"
+        ));
+    }
+    out
+}
+
+/// 64 lowercase hex digits, as mise records a SHA-256.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// A URL path segment that means only itself: no `.`/`..`, no `%` escape, no
 /// separator or other character a URL parser could reinterpret.
 fn is_plain_segment(s: &str) -> bool {
@@ -424,12 +463,7 @@ fn asset_problems(name: &str, platform: &str, asset: &LockedAsset) -> Vec<String
             asset.url
         ));
     }
-    if !(asset.sha256.len() == 64
-        && asset
-            .sha256
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-    {
+    if !is_sha256_hex(&asset.sha256) {
         out.push(format!(
             "{name}: {platform} checksum is not a sha256 hex digest"
         ));
