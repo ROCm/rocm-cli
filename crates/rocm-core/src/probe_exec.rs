@@ -10,16 +10,17 @@
 //! [`crate::examine`] so `fix`, `process` and `host_gpu` can reach them without
 //! importing the module that owns the `Examination` document.
 
+use crate::command_capture::{CommandCapture, CommandOutcome};
+use crate::process::run_bounded;
 use crate::runtime_is_windows;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
-/// Run a command with a timeout. Returns `(rc, stdout, stderr)`. `rc` is `127`
-/// when the program can't be spawned and `124` on timeout.
+/// Run a command with a timeout. Returns `(rc, stdout, stderr)`. `rc` is the
+/// exit code, `-1` for a child killed by a signal, `127` when the program can't
+/// be spawned and `124` on timeout or when the child could not be waited for.
 pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, String, String) {
     run_with_env(program, args, &[], timeout)
 }
@@ -40,66 +41,36 @@ pub(crate) fn run_with_env(
 }
 
 /// [`run`] without the UTF-8 assumption, for output that is not UTF-8.
+///
+/// A thin adapter over [`run_bounded`]: the executor drains both pipes as bytes
+/// (so one stray byte cannot empty a capture, which would read downstream as
+/// "the command printed nothing") and bounds the wait, and [`run_result`] turns
+/// how the run ended into the `rc` this module has always returned.
 fn run_raw(
     program: &str,
     args: &[&str],
     envs: &[(String, OsString)],
     timeout: Duration,
 ) -> (i32, Vec<u8>, Vec<u8>) {
-    let Ok(mut child) = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
-        .envs(envs.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    else {
-        return (127, Vec::new(), Vec::new());
+        .envs(envs.iter().map(|(key, value)| (key, value)));
+    run_result(run_bounded(command, timeout, "process"))
+}
+
+/// `(rc, stdout, stderr)` of a finished run: the exit code when there is one,
+/// `-1` for a child killed by a signal, `124` for a timeout or a failure to
+/// wait, and `127` for a program that could not be started. The bytes are what
+/// arrived, a timeout and a pipe that failed to read included.
+fn run_result(capture: CommandCapture) -> (i32, Vec<u8>, Vec<u8>) {
+    let rc = match capture.outcome {
+        CommandOutcome::Exited(code) => code,
+        CommandOutcome::Signaled(_) => -1,
+        CommandOutcome::TimedOut | CommandOutcome::WaitFailed => 124,
+        CommandOutcome::NotFound | CommandOutcome::SpawnFailed(_) => 127,
     };
-    // Bytes, then a lossy conversion at the end. `read_to_string` FAILS on
-    // invalid UTF-8 and the error was discarded, so a single stray byte silently
-    // emptied the whole capture — which reads downstream as "the command printed
-    // nothing", not as "the output could not be decoded".
-    let stdout_handle = child.stdout.take().map(|mut stdout| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut stderr| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break None,
-        }
-    };
-    let stdout: Vec<u8> = stdout_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr: Vec<u8> = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let rc = match status {
-        Some(status) => status.code().unwrap_or(-1),
-        None => 124,
-    };
-    (rc, stdout, stderr)
+    (rc, capture.stdout_raw, capture.stderr_raw)
 }
 
 /// Run a command whose output is UTF-16LE, as `wsl.exe`'s is.
@@ -310,6 +281,58 @@ mod tests {
         assert!(
             out.starts_with("ok") && out.ends_with("done"),
             "the undecodable byte must not take the rest of the output with it: {out:?}"
+        );
+    }
+
+    fn capture_that(outcome: CommandOutcome, detail: Option<&str>) -> CommandCapture {
+        CommandCapture::from_run(
+            vec!["tool".to_owned()],
+            outcome,
+            None,
+            b"out".to_vec(),
+            b"err".to_vec(),
+            detail.map(str::to_owned),
+        )
+    }
+
+    #[test]
+    fn a_run_reads_as_the_rc_run_raw_has_always_returned() {
+        // Each outcome with the bytes it carries: the rc is the whole translation,
+        // and the bytes arrive whatever the outcome (a timeout's partial output
+        // included), as `run_raw` returned them after joining its readers.
+        let cases = [
+            (CommandOutcome::Exited(0), 0),
+            (CommandOutcome::Exited(3), 3),
+            (CommandOutcome::Signaled(Some(9)), -1),
+            (CommandOutcome::Signaled(None), -1),
+            (CommandOutcome::TimedOut, 124),
+            (CommandOutcome::WaitFailed, 124),
+            (CommandOutcome::NotFound, 127),
+            (
+                CommandOutcome::SpawnFailed(std::io::ErrorKind::PermissionDenied),
+                127,
+            ),
+        ];
+        for (outcome, rc) in cases {
+            assert_eq!(
+                run_result(capture_that(outcome, None)),
+                (rc, b"out".to_vec(), b"err".to_vec()),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pipe_that_failed_to_read_does_not_change_what_run_returns() {
+        // The executor reports a read error in `detail` and keeps the bytes that
+        // arrived with the child's real status; `run_with_timeout` turns that into
+        // an error, and `run` has always discarded it (`let _ = read_to_end`).
+        assert_eq!(
+            run_result(capture_that(
+                CommandOutcome::Exited(0),
+                Some("failed to read the output: broken pipe")
+            )),
+            (0, b"out".to_vec(), b"err".to_vec())
         );
     }
 
