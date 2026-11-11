@@ -3857,7 +3857,6 @@ the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
 
-
 ## The Reported Backend Device And Support Level
 
 ROCMAI-550 made two surfaces report what this host can actually do instead of a

@@ -101,12 +101,20 @@ impl ExamineSummary {
             // nor its absence" in both arms was length without information.
             // The distinction it was carrying lives in this comment and in
             // `GpuSupportLevel`'s own docs, which is where it is load-bearing.
+            // The command is deliberately NOT `--engine lemonade`. An
+            // unrecognised target is a gap in this build's catalog, and a newer
+            // ROCm-capable GPU falls into it just as readily as a Vulkan-only
+            // one — naming the Vulkan backend would make exactly the kind of
+            // unestablished claim this level exists to avoid, only in the other
+            // direction. Plain `rocm serve` lets the engine choose, and the
+            // `device:` row then reports what it actually used, which is the
+            // answer this host needs and nothing here can predict.
             GpuSupportLevel::Unknown => match detected {
                 Some(gfx) => format!(
                     "  rocm_support: unknown - {gfx} is not in this build's \
-                     catalog; serve with `rocm serve <model> --engine lemonade`, \
-                     then read the `device:` row of `rocm services list` for the \
-                     backend it used\n"
+                     catalog; serve with `rocm serve <model>`, then read the \
+                     `device:` row of `rocm services list` for the backend it \
+                     used\n"
                 ),
                 None => "  rocm_support: unknown - no AMD GPU was detected; run \
                          `rocm diagnose` to find out why none is visible\n"
@@ -556,7 +564,11 @@ mod tests {
         // distinction against the behaviour rather than the wording.
         for (detected, expected_command) in [
             (None, "rocm diagnose"),
-            (Some("gfx803"), "rocm serve <model> --engine lemonade"),
+            // Plain `rocm serve`, not `--engine lemonade`: see the arm's own
+            // comment. The reasoning this test already gave — "`rocm serve`
+            // runs and its `device:` row settles the backend" — is only true of
+            // the unpinned command.
+            (Some("gfx803"), "rocm serve <model>"),
         ] {
             let rendered = examine_summary_with_gpu(detected, None).render_text();
             let line = rendered
