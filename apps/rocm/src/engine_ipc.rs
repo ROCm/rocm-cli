@@ -289,11 +289,10 @@ pub(crate) fn builtin_engine_available(engine: &str) -> bool {
 /// child's output. So this wrapper does not rely on that attachment alone: on
 /// any error from the engine dispatch below, it appends a one-line summary of
 /// the error chain directly to the service log file named by `--log-path` (the
-/// same file `rocm logs <service_id>` tails) — one line, because this process's
+/// same file `rocm services logs <service_id>` tails) — one line, because this process's
 /// stderr reaches that same file, so the full chain is already there whenever
 /// the attachment worked — and the full chain to this process's own
-/// structured log,
-/// and marks the engine state file `failed` — regardless of whether the
+/// structured log, and marks the engine state file `failed` — regardless of whether the
 /// engine already did either on this particular error path. A later success
 /// (this function only runs once per process, so there is no later state to
 /// race against) is unaffected; only the error path writes anything here.
@@ -412,6 +411,12 @@ fn record_engine_serve_http_failure(
 ) {
     let detail = format!("{error:?}");
     tracing::error!(service_id, %detail, "managed engine serve-http failed");
+    // Decided before anything is written: `lemonade` and `vllm` return `Err`
+    // for a SIGTERM from `rocm services stop` too, and a line reading
+    // "failed:" in `rocm services logs` is wrong for a stop the operator
+    // asked for — the state file was already being spared, but the log was
+    // not.
+    let deliberate = engine_stop_was_deliberate(service_id, state_path);
     if let Some(log_path) = log_path
         && let Ok(mut file) = fs::OpenOptions::new()
             .create(true)
@@ -422,15 +427,17 @@ fn record_engine_serve_http_failure(
         // this process's stderr is attached to this same log, so whatever the
         // binary prints on its way out already lands here. The backstop still
         // has to exist — that attach is exactly what can be missing — but
-        // writing the identical multi-line chain made `rocm logs` show it
-        // twice. A single `service_id`-tagged summary stays legible beside the
-        // real stderr copy, and is still the only record when there is none.
+        // writing the identical multi-line chain made `rocm services logs`
+        // show it twice. A single `service_id`-tagged summary stays legible
+        // beside the real stderr copy, and is still the only record when
+        // there is none.
+        let outcome = if deliberate { "stopped" } else { "failed" };
         let _ = writeln!(
             file,
-            "__engine-serve-http service_id={service_id} failed: {error:#}"
+            "__engine-serve-http service_id={service_id} {outcome}: {error:#}"
         );
     }
-    if engine_stop_was_deliberate(service_id, state_path) {
+    if deliberate {
         return;
     }
     let _ =
@@ -602,6 +609,62 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// The backstop itself, which nothing covered directly: on Linux the same
+    /// text also arrives through the stderr attach, so deleting the file write
+    /// would have stayed green on every lane that runs.
+    ///
+    /// Pins all three of its outputs together — the log line, the `failed`
+    /// stamp, and the fact that a deliberate stop gets neither verdict.
+    #[test]
+    fn the_serve_http_backstop_writes_the_log_line_and_the_stamp() {
+        let (root, _paths) = test_paths("engine-ipc-backstop");
+        let state_path = root.join("engine-state.json");
+        let log_path = root.join("service.log");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&state_path, br#"{"status":"running"}"#).unwrap();
+        let error = anyhow::anyhow!("engine blew up").context("while serving");
+
+        record_engine_serve_http_failure(
+            "svc-backstop",
+            &state_path,
+            Some(log_path.as_path()),
+            &error,
+        );
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(
+            log.contains("svc-backstop") && log.contains("failed:"),
+            "the crash must reach the service log even with no stderr attach: {log}"
+        );
+        assert!(
+            log.contains("engine blew up"),
+            "and it must carry the engine's own reason: {log}"
+        );
+        assert_eq!(state["status"], "failed");
+
+        // A deliberate stop gets neither verdict: not stamped, and not called
+        // "failed" in a log the user reads.
+        fs::write(&state_path, br#"{"status":"stopping"}"#).unwrap();
+        fs::write(&log_path, b"").unwrap();
+        record_engine_serve_http_failure(
+            "svc-backstop",
+            &state_path,
+            Some(log_path.as_path()),
+            &error,
+        );
+        let log = fs::read_to_string(&log_path).unwrap();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            !log.contains("failed:"),
+            "a stop the operator asked for must not read as a failure: {log}"
+        );
+        assert_ne!(state["status"], "failed");
+    }
 
     /// The blanket `failed` stamp must not relabel an operator-requested stop.
     ///

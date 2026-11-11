@@ -197,7 +197,7 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
-            println!("  logs: rocm logs {service_id}");
+            println!("  logs: rocm services logs {service_id}");
             println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             Ok(())
         }
@@ -233,7 +233,7 @@ pub(crate) fn run_attached_service(
             if stop_seen_while_attached || managed_service_stop_was_requested(paths, &service_id) {
                 println!("server process exited");
                 println!("  service_id: {service_id}");
-                println!("  recent logs: rocm logs {service_id}");
+                println!("  recent logs: rocm services logs {service_id}");
                 return Ok(());
             }
             // Mark both the manifest and the engine state file `failed` (the

@@ -394,7 +394,7 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
     } else {
         format!(
             "managed engine for service `{service_id}` exited unexpectedly; inspect {} \
-             (or `rocm logs {service_id}`)\n\nrecent service log output:\n{}",
+             (or `rocm services logs {service_id}`)\n\nrecent service log output:\n{}",
             log_path.display(),
             recent_lines.join("\n")
         )
@@ -607,6 +607,11 @@ pub(super) fn finalize_managed_launch_readiness(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::service_launch::test_support::reusable_record;
+    use crate::tests::test_paths;
+    use std::fs;
+
     /// ROCMAI-541: the service log tail must reach the user, and a missing log
     /// must still name the service and where to look rather than being silent.
     #[test]
@@ -1016,10 +1021,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
-    use super::*;
-    use crate::service_launch::test_support::reusable_record;
-    use crate::tests::test_paths;
-    use std::fs;
 
     #[test]
     fn wait_past_readiness_budget_keeps_probing_a_live_starting_server() {
