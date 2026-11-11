@@ -55,8 +55,8 @@ pub(crate) use self::source::RuntimeVersionSelector;
 #[cfg(test)]
 use self::source::resolve_source;
 use self::source::{
-    SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel, next_layout_requested,
-    requested_source_layout, select_source_layout,
+    SourceLayout, THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE, TheRockChannel, gate_install_layout,
+    layout_serving, requested_source_layout,
 };
 pub(crate) use self::update::{
     RuntimeUpdatePlan, maybe_refresh_startup_update_check, recorded_python_version,
@@ -235,14 +235,15 @@ pub(crate) fn install_sdk(
         ),
         "tarball" => {
             // A tarball catalog lists whole archives, not a resolvable package
-            // graph, so there is nothing to pin a version against — except the
-            // ROCm 10 catalog, which is reachable *only* by naming a version,
-            // because nothing else distinguishes it from the canonical one.
+            // graph, so there is nothing to pin a version against — except in
+            // the next layout's catalogs, whose archives are named by the
+            // version they carry. The canonical catalogs do not support a pin,
+            // so an earlier version is a wheel install.
             if let Some(selector) = version_selector.as_ref()
-                && !next_layout_requested(selector)
+                && layout_serving(channel, Some(selector)) == SourceLayout::Canonical
             {
                 bail!(
-                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                    "specific TheRock version selection for tarball installs is supported only for the newer package layout: a stable ROCm 10+ release (e.g. `--version 10.0.0`) or a nightly built on or after {THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE}; for any earlier version, use `--format wheel`"
                 )
             }
             install_tarball_runtime(
@@ -369,20 +370,21 @@ fn install_wheel_runtime(
     // channel, or a grouped family with no exact arch) before paying for Python
     // provisioning below, which can mean a real download for a layout this host
     // or channel can never actually use.
-    select_source_layout(
+    gate_install_layout(
         channel,
         &resolve_family(paths, recovered_family_override.as_deref())?,
         version_selector,
+        layout_override,
     )?;
     // The interpreter has to be picked before `resolve_pip_runtime`, which
     // selects wheels using that interpreter's own tags. `requested_source_layout`
-    // only answers from the *request*: an explicit stable ROCm 10+ pin already
-    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
-    // nightly build-date/prerelease pin always reports `Canonical`, even once
-    // the canonical/nightly feed's own "latest" has rotated past that major on
-    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
-    // peeks the channel's own `rocm` listing to catch that case.
-    let python_layout = match requested_source_layout(layout_override, version_selector) {
+    // only answers from the *request*: a plain auto-select, a stable ROCm 10+
+    // pin and a nightly built since the next layout began all route to `Next`
+    // and get `cp314` that way. A pin into the canonical layout can still
+    // resolve a ROCm 10+ build on that feed (the legacy nightlies carry ROCm 10
+    // alphas), so `canonical_auto_select_needs_next_python` peeks the feed's own
+    // `rocm` listing to catch that case.
+    let python_layout = match requested_source_layout(channel, layout_override, version_selector) {
         SourceLayout::Next => SourceLayout::Next,
         SourceLayout::Canonical => {
             if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
