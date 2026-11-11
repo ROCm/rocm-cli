@@ -189,14 +189,15 @@ fn supervise_service_on(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err));
-    // Re-thread the endpoint key file (public bind only) onto the engine child,
-    // same as the initial `rocm serve` spawn. This path also runs on daemon
-    // recovery (`restart_managed_service` re-execs `rocmd supervise`), so
-    // without this a previously-authenticated public service would come back
-    // up anonymous after a crash/recover cycle.
-    // If the key is gone the child would listen on the recorded public host with
-    // no auth, so fail closed instead — an unreachable service is recoverable,
-    // an anonymous public one is not.
+    // Re-thread the service's endpoint key file onto the engine child, same as
+    // the initial `rocm serve` spawn. This path also runs on daemon recovery
+    // (`restart_managed_service` re-execs `rocmd supervise`), so without this a
+    // previously-authenticated service would come back up anonymous after a
+    // crash/recover cycle.
+    // If the key is gone and the service needs one (a public bind, or one
+    // launched with `--require-api-key`), the child would listen with no auth, so
+    // fail closed instead — an unreachable service is recoverable, an anonymous
+    // one that was meant to be protected is not.
     let endpoint_key_applied =
         crate::engine_ipc::apply_endpoint_key_env(&mut command, paths, &record.service_id);
     refuse_keyless_respawn(&record, endpoint_key_applied)?;

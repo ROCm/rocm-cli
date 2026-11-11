@@ -53,15 +53,17 @@ pub(crate) fn healthcheck_response_recoverable(response: &HealthcheckResponse) -
     )
 }
 
-/// Re-thread the endpoint key file (public bind only) onto an engine child's
-/// environment, mirroring the initial `rocm serve` spawn. A loopback service
-/// with no stored key leaves the command's environment untouched, matching the
-/// unauthenticated default.
+/// Re-thread the service's endpoint key file onto an engine child's
+/// environment, mirroring the initial `rocm serve` spawn. A service with no
+/// usable stored key leaves the command's environment untouched, which is
+/// right only for a service that does not need one: a loopback bind that did
+/// not ask for `--require-api-key`, the unauthenticated default.
 ///
 /// Returns whether a key was applied. Callers that spawn a *listener* must
-/// check it against the service's host — a public bind with no key would come
-/// up anonymous (see [`rocm_core::ensure_public_service_has_endpoint_key`]). Callers that
-/// only make a stdio plugin call can ignore it.
+/// check it against the service's record — a service that needs a key (a public
+/// bind, or one launched with `--require-api-key`) and has none would come up
+/// anonymous (see [`rocm_core::ensure_public_service_has_endpoint_key`], which
+/// refuses it). Callers that only make a stdio plugin call can ignore it.
 ///
 /// The file must hold a *usable* key, not merely exist: the engine adapters
 /// resolve it with `endpoint_api_key_from_file` and enforce nothing when that

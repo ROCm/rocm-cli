@@ -200,8 +200,10 @@ fn handle_server_recover_event_with_record(
             {
                 return Ok(());
             }
-            // A public service whose endpoint key is gone can never be recovered:
-            // the respawn guard in `supervise_service` refuses it by design.
+            // A service that needs a key (a public bind, or one launched with
+            // `--require-api-key`) and whose endpoint key is gone can never be
+            // recovered: the respawn guard in `supervise_service` refuses it by
+            // design.
             // Report it and stop, rather than letting a permanent failure
             // propagate out of `evaluate_watchers` and take the whole daemon —
             // and every other watcher — down on each 30s recovery tick.
