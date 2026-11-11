@@ -96,7 +96,7 @@ mod update_cmd;
 // for other root-level commands outside `dispatch()` that call it directly.
 // `select_runtime_manifest` is no longer needed here:
 // `single_ready_runtime_key`/`resolve_runtime_selector_to_exact_key` moved out
-// to `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
+// to `engine_runtime_select.rs`, reaching it via that
 // module's own grouped `use crate::runtimes_cmd::{...}` import instead.
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
@@ -104,8 +104,8 @@ mod update_cmd;
 // `detach_background_command`, `managed_engine_startup_failure_detail`, and
 // `managed_service_process_command` are no longer needed here either: their
 // only caller outside `dispatch()`, `restart_internal_managed_service`, moved
-// out to `services_text.rs` in ROCMAI-209 (Phase 6f) and has since moved on to
-// `service_control.rs`, which reaches them via its own imports instead.
+// out to `services_text.rs` and has since moved on to `service_control.rs`,
+// which reaches them via its own imports instead.
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`.
