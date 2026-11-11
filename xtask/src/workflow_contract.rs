@@ -9987,4 +9987,337 @@ permissions:
         );
         assert!(!out.exists());
     }
+
+    // ---- Self-hosted lane queue watchdog -------------------------------------
+    //
+    // GitHub cancels a job no runner picked up after 24 hours and a cancelled job
+    // is neutral to merge gates, so a lane with no runner vanishes silently. Each
+    // workflow carries a hosted watchdog job that runs
+    // `scripts/lane-queue-watchdog.sh` and fails past a queue budget. These tests
+    // pin that every self-hosted lane is covered by it and that the job is
+    // schedulable, then run the script itself.
+
+    /// The longest a GitHub-hosted job may run, in minutes.
+    const HOSTED_JOB_LIMIT_MINUTES: u32 = 360;
+
+    /// The runner labels the watchdog job in `workflow` passes to the script.
+    fn watchdog_labels(workflow: &str, job: &str) -> Vec<String> {
+        let text = read_workflow(workflow);
+        let block = job_block(&text, job);
+        assert!(
+            block.contains("scripts/lane-queue-watchdog.sh"),
+            "{workflow} `{job}` must run scripts/lane-queue-watchdog.sh:\n{block}"
+        );
+        let values = flattened_values(block, "WATCH_LABELS");
+        assert_eq!(
+            values.len(),
+            1,
+            "{workflow} `{job}` must set WATCH_LABELS once:\n{block}"
+        );
+        values[0].split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// Every self-hosted lane in `workflow` must carry a label the watchdog
+    /// watches, or a stuck lane in it would still fade to `cancelled` unseen.
+    fn assert_watchdog_covers_every_lane(workflow: &str, job: &str) {
+        let watched = watchdog_labels(workflow, job);
+        let text = read_workflow(workflow);
+        let lanes = self_hosted_e2e_jobs(&text);
+        assert!(!lanes.is_empty(), "{workflow} has self-hosted lanes");
+        for (lane, runs_on) in lanes {
+            let labels = flattened_list_items(&runs_on);
+            assert!(
+                labels.iter().any(|label| watched.contains(label)),
+                "{workflow} lane `{lane}` (runs-on: {runs_on}) carries none of the labels \
+                 `{job}` watches ({watched:?}), so a lane with no runner would be cancelled \
+                 after 24h with no red check"
+            );
+        }
+        assert!(
+            !self_hosted_e2e_jobs(&text).iter().any(|(id, _)| id == job),
+            "`{job}` must not itself wait for a self-hosted runner"
+        );
+    }
+
+    /// The watchdog job runs on a hosted runner and its timeout covers the budget
+    /// without exceeding what GitHub allows a hosted job.
+    fn assert_watchdog_is_schedulable(workflow: &str, job: &str) {
+        let text = read_workflow(workflow);
+        let block = job_block(&text, job);
+        assert!(
+            runs_only_on_ubuntu(block),
+            "{workflow} `{job}` must run on a GitHub-hosted runner, or it would queue \
+             behind the same offline fleet it watches:\n{block}"
+        );
+        let timeout: u32 = job_scalar(block, "timeout-minutes")
+            .parse()
+            .unwrap_or_else(|e| panic!("{workflow} `{job}` timeout-minutes is a number: {e}"));
+        let budget: u32 = job_mapping(block, "env")
+            .get("LANE_QUEUE_BUDGET_MINUTES")
+            .unwrap_or_else(|| panic!("{workflow} `{job}` sets LANE_QUEUE_BUDGET_MINUTES"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{workflow} budget is a number: {e}"));
+        assert!(
+            timeout <= HOSTED_JOB_LIMIT_MINUTES,
+            "{workflow} `{job}` timeout-minutes {timeout} exceeds the \
+             {HOSTED_JOB_LIMIT_MINUTES}-minute hosted job limit"
+        );
+        assert!(
+            timeout > budget,
+            "{workflow} `{job}` timeout-minutes {timeout} must exceed the {budget}-minute queue \
+             budget, or the job is killed before it can report"
+        );
+        assert!(
+            budget < 24 * 60,
+            "a {budget}-minute budget outlasts GitHub's own 24h cancellation"
+        );
+    }
+
+    #[test]
+    fn selfhosted_watchdog_covers_every_lane() {
+        assert_watchdog_covers_every_lane("e2e-selfhosted.yml", "lane-queue-watchdog");
+    }
+
+    #[test]
+    fn selfhosted_watchdog_is_schedulable() {
+        assert_watchdog_is_schedulable("e2e-selfhosted.yml", "lane-queue-watchdog");
+    }
+
+    #[test]
+    fn nightly_watchdog_covers_every_lane() {
+        assert_watchdog_covers_every_lane("nightly.yml", "e2e-nightly-queue-watchdog");
+    }
+
+    #[test]
+    fn nightly_watchdog_is_schedulable() {
+        assert_watchdog_is_schedulable("nightly.yml", "e2e-nightly-queue-watchdog");
+    }
+
+    /// 2026-01-01T00:00:00Z, the `created_at` every canned job carries.
+    #[cfg(unix)]
+    const WATCHDOG_JOB_EPOCH: u64 = 1_767_225_600;
+
+    /// One canned job as the jobs API reports it.
+    #[cfg(unix)]
+    fn canned_job(name: &str, status: &str, labels: &[&str]) -> String {
+        serde_json::json!({
+            "name": name,
+            "status": status,
+            "labels": labels,
+            "created_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string()
+    }
+
+    /// What the stubbed `gh` does on its Nth call: print these jobs, or fail.
+    #[cfg(unix)]
+    enum Call<'a> {
+        Jobs(&'a [String]),
+        ApiError,
+    }
+
+    /// Run the real watchdog script against a stub `gh` that answers its calls in
+    /// order (the last answer repeats). `age_minutes` is how old every canned job
+    /// is when the script looks. Returns the exit code and stdout plus stderr.
+    #[cfg(unix)]
+    fn run_watchdog(
+        calls: &[Call<'_>],
+        age_minutes: u64,
+        extra_env: &[(&str, &str)],
+    ) -> (i32, String) {
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        assert!(
+            has_jq,
+            "`jq` is not on PATH, so the watchdog script cannot be exercised; install it"
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (i, call) in calls.iter().enumerate() {
+            let n = i + 1;
+            match call {
+                Call::Jobs(jobs) => {
+                    std::fs::write(dir.path().join(format!("jobs-{n}")), jobs.join("\n") + "\n")
+                        .expect("write canned jobs");
+                }
+                Call::ApiError => {
+                    std::fs::write(dir.path().join(format!("fail-{n}")), "")
+                        .expect("write failure marker");
+                }
+            }
+        }
+        std::fs::write(dir.path().join("last"), calls.len().to_string()).expect("write last");
+        // Answers call N from `jobs-N` or fails when `fail-N` exists; past the
+        // last scripted call it repeats the last answer.
+        let body = r#"#!/bin/bash
+n=$(( $(cat "$STUB_DIR/count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$STUB_DIR/count"
+last=$(cat "$STUB_DIR/last")
+[ "$n" -gt "$last" ] && n=$last
+if [ -e "$STUB_DIR/fail-$n" ]; then echo 'HTTP 502' >&2; exit 1; fi
+cat "$STUB_DIR/jobs-$n"
+"#;
+        rocm_core::fake_executable::write_fake_executable(&dir.path().join("gh"), body)
+            .expect("plant gh stub");
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(repo_root().join("scripts/lane-queue-watchdog.sh"))
+            .args(["self-hosted"])
+            .env("PATH", path)
+            .env("STUB_DIR", dir.path())
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .env("LANE_QUEUE_BUDGET_MINUTES", "300")
+            .env("LANE_QUEUE_POLL_SECONDS", "60")
+            .env(
+                "LANE_QUEUE_NOW",
+                (WATCHDOG_JOB_EPOCH + age_minutes * 60).to_string(),
+            )
+            // Never really sleep: the script's clock is `LANE_QUEUE_NOW`.
+            .env("LANE_QUEUE_SLEEP", "true");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("running the watchdog script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status
+                .code()
+                .expect("watchdog exited with a status code"),
+            log,
+        )
+    }
+
+    #[cfg(unix)]
+    const WATCHDOG_LANE: &[&str] = &["self-hosted", "linux", "mi300x"];
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_passes_when_every_lane_was_scheduled_or_skipped() {
+        let jobs = [
+            canned_job("E2E tests (MI300X)", "in_progress", WATCHDOG_LANE),
+            canned_job(
+                "E2E tests (Strix)",
+                "completed",
+                &["self-hosted", "windows"],
+            ),
+            canned_job("changes", "completed", &["ubuntu-24.04"]),
+        ];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 600, &[]);
+        assert_eq!(rc, 0, "{log}");
+        assert!(!log.contains("::error::"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_fails_a_lane_queued_past_the_budget_and_names_it() {
+        let jobs = [
+            canned_job("E2E tests (MI300X, current)", "queued", WATCHDOG_LANE),
+            canned_job(
+                "E2E tests (W7900)",
+                "completed",
+                &["self-hosted", "linux", "w7900"],
+            ),
+        ];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 360, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains(
+                "::error::E2E tests (MI300X, current) has been queued for 360 minutes (budget 300)"
+            ),
+            "{log}"
+        );
+        assert!(
+            log.contains("no runner picked it up; this lane provided no coverage"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("W7900"),
+            "a finished lane is not blamed:\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_ignores_a_queued_job_that_is_not_on_a_self_hosted_runner() {
+        let jobs = [
+            canned_job("Build", "queued", &["ubuntu-24.04"]),
+            canned_job("E2E tests (MI300X)", "completed", WATCHDOG_LANE),
+        ];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 600, &[]);
+        assert_eq!(rc, 0, "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_waits_while_a_lane_is_queued_inside_the_budget() {
+        // Queued at 10 minutes, picked up by the next poll: never a failure.
+        let queued = [canned_job("E2E tests (MI300X)", "queued", WATCHDOG_LANE)];
+        let running = [canned_job(
+            "E2E tests (MI300X)",
+            "in_progress",
+            WATCHDOG_LANE,
+        )];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&queued), Call::Jobs(&running)], 10, &[]);
+        assert_eq!(rc, 0, "{log}");
+        assert!(!log.contains("::error::"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_fails_loudly_when_the_api_never_answers() {
+        let (rc, log) = run_watchdog(&[Call::ApiError], 600, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("::error::could not list this run's jobs"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_rides_out_a_transient_api_error() {
+        let jobs = [canned_job(
+            "E2E tests (MI300X)",
+            "in_progress",
+            WATCHDOG_LANE,
+        )];
+        let (rc, log) = run_watchdog(&[Call::ApiError, Call::Jobs(&jobs)], 600, &[]);
+        assert_eq!(rc, 0, "{log}");
+        assert!(
+            log.contains("::warning::could not list this run's jobs"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_tolerates_lanes_that_are_not_created_yet() {
+        let no_jobs: [String; 0] = [];
+        let running = [canned_job(
+            "E2E tests (MI300X)",
+            "in_progress",
+            WATCHDOG_LANE,
+        )];
+        // Absent at first, present at the second poll.
+        let (rc, log) = run_watchdog(&[Call::Jobs(&no_jobs), Call::Jobs(&running)], 0, &[]);
+        assert_eq!(rc, 0, "{log}");
+        // Absent for the whole grace: nothing to watch, which is not a failure.
+        let (rc, log) = run_watchdog(
+            &[Call::Jobs(&no_jobs)],
+            0,
+            &[("LANE_QUEUE_GRACE_MINUTES", "2")],
+        );
+        assert_eq!(rc, 0, "{log}");
+        assert!(
+            log.contains("::warning::no job with a watched runner label"),
+            "{log}"
+        );
+    }
 }

@@ -601,6 +601,30 @@ admin adding `build-and-test (ubuntu-26.04)`,
 `Test (affected crates) (ubuntu-26.04)` and `E2E tests (ubuntu-26.04)` to the
 required list.
 
+### Lanes no runner picks up
+
+GitHub cancels a job that no runner has been assigned after 24 hours. The job
+concludes `cancelled`, which merge gates treat as neutral, and
+`timeout-minutes` does not apply because it counts from the job start. A
+self-hosted lane whose runners are all offline therefore drops out of coverage
+without a single red check.
+
+`e2e-selfhosted.yml` (`lane-queue-watchdog`) and `nightly.yml`
+(`e2e-nightly-queue-watchdog`) each run `scripts/lane-queue-watchdog.sh` on a
+GitHub-hosted runner. It polls the run's job list and, once any job on a
+self-hosted runner has been `queued` for longer than the budget, fails with an
+annotation naming the job and how long it waited. Jobs that were skipped, are
+running or have finished never count. The watchdog is advisory for the same
+reason the lanes are: it is not a required check. It cannot make an offline
+runner appear; it makes the gap visible within hours instead of after a day.
+
+The jobs are matched on runner labels, not names: any job whose `runs-on`
+includes `self-hosted` is watched, so a new or renamed lane needs no change
+here. The budget is 300 minutes, set once per workflow in the watchdog job's
+`LANE_QUEUE_BUDGET_MINUTES`. Change that value to change the budget, and keep
+the job's `timeout-minutes` above it and at or below 360, the longest a
+GitHub-hosted job may run; the workflow contract tests check both.
+
 ## Fork safety
 
 Self-hosted runners are not used for untrusted fork pull requests: GitHub

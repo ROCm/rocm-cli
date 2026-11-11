@@ -1821,3 +1821,38 @@ jobs:
         with:
           name: e2e-consolidated-report-selfhosted
           path: consolidated/
+
+  # GitHub cancels a job no runner picked up after 24 hours, and a cancelled job
+  # is neutral to every merge gate, so a lane whose runners are all offline would
+  # otherwise vanish from coverage without one red check. `timeout-minutes` cannot
+  # catch this: it counts from the job START. This job polls the run's job list
+  # from a GitHub-hosted runner and fails once any job on a self-hosted runner has
+  # been queued past the budget. Advisory, like the lanes it watches: none of them
+  # are required checks. It watches runner LABELS, not lane names, so a new or
+  # renamed lane is covered as long as its `runs-on` carries `self-hosted`
+  # (pinned by xtask's workflow contract tests). The queue budget lives only in
+  # LANE_QUEUE_BUDGET_MINUTES; keep `timeout-minutes` above it and at or below
+  # the 360-minute GitHub-hosted job limit.
+  lane-queue-watchdog:
+    name: Self-hosted lane queue watchdog
+    runs-on: ubuntu-24.04 # one LTS: only polls the run's job list
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      actions: read
+    needs: [changes]
+    if: ${{ always() && needs.changes.result == 'success' }}
+    env:
+      LANE_QUEUE_BUDGET_MINUTES: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fail if a self-hosted lane sits unscheduled past the budget
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WATCH_LABELS: self-hosted
+        run: |
+          # shellcheck disable=SC2086 # WATCH_LABELS is a space-separated label list
+          scripts/lane-queue-watchdog.sh ${WATCH_LABELS}
