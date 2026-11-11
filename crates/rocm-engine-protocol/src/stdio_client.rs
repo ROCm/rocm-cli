@@ -108,6 +108,15 @@ pub struct EngineStdioOptions<'a> {
     /// its HTTP probe of a protected endpoint authenticates. The caller decides
     /// whether a file holds a usable key; this only carries it.
     pub endpoint_key_file: Option<&'a Path>,
+    /// With no `endpoint_key_file`, also CLEAR [`ENDPOINT_API_KEY_FILE_ENV`]
+    /// rather than leave whatever this process inherited to pass through.
+    ///
+    /// For a child that must not see a credential path at all — `rocm`'s
+    /// external engine plugins are third-party binaries. Off by default,
+    /// because "no key file for this request" and "this child may not have one"
+    /// are different statements: `rocmd` passes `None` for a loopback service
+    /// that simply needs no key, and its children are its own.
+    pub withhold_inherited_key_file: bool,
     /// Ask the engine for progress on stderr ([`ENGINE_PROGRESS_STDERR_ENV`]).
     pub request_progress: bool,
     /// Write the child's stderr to this process's stderr as it arrives, so a
@@ -155,13 +164,12 @@ where
     }
     if let Some(key_file) = options.endpoint_key_file {
         command.env(ENDPOINT_API_KEY_FILE_ENV, key_file);
-    } else {
-        // Cleared, not merely left unset. The caller said this child gets no
-        // endpoint key, and an engine plugin is a third-party binary: a value
-        // this process happens to have inherited must not reach it just
-        // because nothing overwrote it. `rocm`'s plugin calls pass `None`
-        // here, so this is what keeps a 0600 key-file path off their
-        // environment. See
+    } else if options.withhold_inherited_key_file {
+        // Cleared, not merely left unset: a value this process inherited must
+        // not reach a third-party plugin binary just because nothing
+        // overwrote it. Only for callers that ask — `rocmd` passes `None` for
+        // a loopback service that needs no key, and clearing there would
+        // change what its own children see. See
         // `an_external_plugin_child_is_not_handed_the_endpoint_key_file`.
         command.env_remove(ENDPOINT_API_KEY_FILE_ENV);
     }
@@ -706,6 +714,7 @@ mod tests {
                 app_paths: None,
                 env_root: None,
                 endpoint_key_file: None,
+                withhold_inherited_key_file: true,
                 request_progress: false,
                 forward_stderr: false,
                 note_failing_exit_after_answer: false,
@@ -721,6 +730,27 @@ mod tests {
             Some(None),
             "the key-file variable must be explicitly CLEARED when no key file \
              is passed, not merely left unset"
+        );
+
+        // The other direction, which is what keeps this scoped: a caller that
+        // did not ask (`rocmd`, for a loopback service that simply needs no
+        // key) must leave the child's inherited value alone.
+        let kept = engine_stdio_command(
+            Path::new("/an/engine"),
+            ["stdio"],
+            &EngineStdioOptions {
+                app_paths: None,
+                env_root: None,
+                endpoint_key_file: None,
+                withhold_inherited_key_file: false,
+                request_progress: false,
+                forward_stderr: false,
+                note_failing_exit_after_answer: false,
+            },
+        );
+        assert!(
+            kept.get_envs().all(|(key, _)| key != key_var),
+            "a caller that did not ask to withhold must not touch the variable"
         );
     }
 
@@ -738,6 +768,7 @@ mod tests {
                 app_paths: Some(&paths),
                 env_root: Some(Path::new("/envs")),
                 endpoint_key_file: Some(Path::new("/keys/svc.endpoint-key")),
+                withhold_inherited_key_file: false,
                 request_progress: true,
                 forward_stderr: true,
                 note_failing_exit_after_answer: false,
@@ -771,6 +802,7 @@ mod tests {
                 "ROCM_SERVE_API_KEY_FILE",
                 EngineStdioOptions {
                     endpoint_key_file: Some(Path::new("/keys/k")),
+                    withhold_inherited_key_file: false,
                     ..EngineStdioOptions::default()
                 },
             ),
@@ -1192,6 +1224,7 @@ mod tests {
                     app_paths: Some(&paths),
                     env_root: Some(Path::new("/envs")),
                     endpoint_key_file: Some(Path::new("/keys/k")),
+                    withhold_inherited_key_file: false,
                     request_progress: true,
                     forward_stderr: false,
                     note_failing_exit_after_answer: false,
