@@ -239,14 +239,22 @@ async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-/// TheRock package families this step may ask for, in preference order. Real
-/// published names, not placeholders: an unknown family is rejected during
+/// TheRock GPU targets this step may ask for, in preference order, each paired
+/// with the package family it resolves to. The install reads the newest layout,
+/// which picks its device payload by exact arch and refuses a grouped family
+/// name, so the request names the arch; the family is what the active runtime's
+/// `family=` column is compared against. Real published names, not placeholders:
+/// an unknown family is rejected during
 /// resolution, which would exit non-zero for a reason that has nothing to do
 /// with the consent gate and would still satisfy "the reinstall is refused".
 /// Each is published as a `therock-dist-linux-<family>-<version>.tar.gz` in the
 /// canonical release tarball catalog, for the same reason: an artifact the
 /// catalog does not carry fails resolution short of the gate.
-const OTHER_FAMILY_CANDIDATES: &[&str] = &["gfx110X-all", "gfx120X-all", "gfx94X-dcgpu"];
+const OTHER_FAMILY_CANDIDATES: &[(&str, &str)] = &[
+    ("gfx1100", "gfx110X-all"),
+    ("gfx1200", "gfx120X-all"),
+    ("gfx942", "gfx94X-dcgpu"),
+];
 
 #[when("the user installs a different GPU family without confirming")]
 async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
@@ -257,9 +265,9 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // case-preserving `family=` column — the runtime key alone would not do,
     // since it is lowercase-slugified and would never match `gfx110X-all`.
     let (runtimes, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
-    let family = OTHER_FAMILY_CANDIDATES
+    let (arch, _) = OTHER_FAMILY_CANDIDATES
         .iter()
-        .find(|candidate| !runtimes.contains(*candidate))
+        .find(|(_, family)| !runtimes.contains(*family))
         .copied()
         .unwrap_or_else(|| {
             panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
@@ -277,7 +285,7 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // `active_default_runtime_relation` shared by both formats — with a family
     // the host has genuinely never held. The refusal still costs only the
     // catalog listing: it bails before the multi-GiB archive is fetched.
-    let args = ["install", "sdk", "--format", "tarball", "--family", family];
+    let args = ["install", "sdk", "--format", "tarball", "--family", arch];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
