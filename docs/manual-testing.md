@@ -290,7 +290,10 @@ checks, which cannot be made anywhere else:
   `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
   detected but not supported by ROCm and that the Vulkan backend can still be
   used. A `<unknown>` target, or a missing `rocm_support` line, means detection
-  regressed.
+  regressed. That line is printed on **every** host, at one of three levels —
+  ROCm/HIP-supported, Vulkan-only (this case), or unknown — so on a supported
+  card or a machine with no GPU it must still be there, saying the level that
+  host's hardware implies rather than being absent.
 - A plain `rocm install sdk`, with no `--family`, gives the same refusal with
   the wording for a *detected* GPU rather than a requested one.
 - `rocm diagnose` reports `info-20-gpu-no-rocm-support`, naming `gfx90c` and
