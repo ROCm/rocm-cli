@@ -1126,9 +1126,20 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
 ///
 /// - a process that was signalled and that, or a process under it, outlived
 ///   the deadline (`timed_out`);
+/// - a process that is gone, with the separate kill of the processes under it
+///   not completed (`descendants_unconfirmed`, Windows): this stop saw the
+///   recorded process exit, so it does not say anything outlived a deadline, but
+///   one of the processes under it may still be running;
+/// - a recorded process that exited by itself before the processes under it
+///   could be taken down (`exited_before_tree_kill`, Windows), with no other
+///   recorded process confirmed gone to vouch for what was under it: nothing
+///   was signalled, and one of them may still be running;
 /// - a process that was not signalled because its identity could not be
-///   verified (`unverified`), with how to look at it. It may have exited
-///   meanwhile: the identity read can fail because the process is going away;
+///   verified (`unverified`), with how to look at it. There are two routes to
+///   it: a recorded start-time that can no longer be read back from a running
+///   process, and, on Windows, a PID that cannot be queried at all. It may have
+///   exited meanwhile: the identity read can fail because the process is going
+///   away;
 /// - the record changed while the stop ran, typically because a restart
 ///   recorded new processes, so the stop's verdict says nothing about what the
 ///   record names now.
@@ -1163,6 +1174,10 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
             .collect()
     };
     let timed_out = with_outcome(rocm_core::TerminationOutcome::TimedOut.as_str());
+    let descendants_unconfirmed =
+        with_outcome(rocm_core::TerminationOutcome::DescendantsUnconfirmed.as_str());
+    let exited_before_tree_kill =
+        with_outcome(rocm_core::TerminationOutcome::ExitedBeforeTreeKill.as_str());
     let unverified = with_outcome(rocm_core::TerminationOutcome::Unverified.as_str());
 
     let mut text = String::new();
@@ -1184,6 +1199,18 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
         let _ = writeln!(
             text,
             "  still running: process {pid} ({role}) or a process under it did not exit after it was signaled"
+        );
+    }
+    for (pid, role) in &descendants_unconfirmed {
+        let _ = writeln!(
+            text,
+            "  not confirmed: process {pid} ({role}) exited, but a process under it may still be running, because taking the processes under it down did not complete; rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"
+        );
+    }
+    for (pid, role) in &exited_before_tree_kill {
+        let _ = writeln!(
+            text,
+            "  not confirmed: process {pid} ({role}) was already gone when the processes under it were to be taken down, and nothing else the server recorded vouches for them, so one of them may still be running; rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"
         );
     }
     for (pid, role) in &unverified {
@@ -1248,11 +1275,24 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
 /// stop left alone because it could not verify it. Not a `rocm` command: the
 /// CLI deliberately does not act on that process, so the user decides.
 ///
-/// A Linux command because only Linux can produce that outcome: it needs a
-/// recorded start-time that can no longer be read back, and
-/// `rocm_core::process_start_ticks` records one only on Linux.
+/// Linux and Windows can both produce that outcome, by two routes. On both, a
+/// recorded start-time that can no longer be read back from a running process
+/// (`rocm_core::process_start_ticks` records one on both). On Windows also, a PID
+/// that cannot be queried at all, such as a live process this one may not open,
+/// which reads as unverifiable with or without a recorded token. So the command
+/// is the one the host has: `ps` on Linux, `tasklist` on Windows.
 pub(crate) fn process_check_command(pid: u64) -> String {
-    format!("ps -p {pid} -o pid,args")
+    process_check_command_for(cfg!(windows), pid)
+}
+
+/// [`process_check_command`] for a chosen platform, so a test reads both forms
+/// on every host.
+fn process_check_command_for(windows: bool, pid: u64) -> String {
+    if windows {
+        format!("tasklist /FI \"PID eq {pid}\"")
+    } else {
+        format!("ps -p {pid} -o pid,args")
+    }
 }
 
 /// A managed service's record exactly as it is on disk, without the engine-state
@@ -3423,5 +3463,25 @@ pub(crate) mod tests {
             "signaled_pids": [],
         }));
         assert_eq!(answer["status"], "stop_unconfirmed", "{answer}");
+    }
+
+    /// The check a stop that could not verify a process tells the user to run
+    /// is a command the host has: `ps` on Linux, `tasklist` on Windows, where a
+    /// Windows record now carries a creation time that can fail to read back.
+    /// The wording is pinned here; that the Windows form shows whether a PID is
+    /// running is what the `service-stop-07` steps rely on, which look a PID up
+    /// with the same `tasklist /FI "PID eq <pid>"` filter.
+    #[test]
+    fn the_process_check_command_is_the_one_the_host_has() {
+        assert_eq!(process_check_command_for(false, 42), "ps -p 42 -o pid,args");
+        assert_eq!(
+            process_check_command_for(true, 42),
+            "tasklist /FI \"PID eq 42\""
+        );
+        assert_eq!(
+            process_check_command(42),
+            process_check_command_for(cfg!(windows), 42),
+            "production picks by the host it runs on"
+        );
     }
 }

@@ -27,22 +27,7 @@ pub(crate) fn run_rocm_capture_for_paths(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    rocm_core::run_rocm_capture_with_env(
-        args,
-        &[
-            ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()),
-            ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
-            ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
-        ],
-        timeout,
-    )
-}
-
-pub(crate) fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
-    match value {
-        Some(value) => vec![flag.to_owned(), value.to_owned()],
-        None => Vec::new(),
-    }
+    rocm_core::run_rocm_capture_with_env(args, &paths.env_vars(), timeout)
 }
 
 pub(crate) fn payload_string(payload: &Value, key: &str) -> Option<String> {

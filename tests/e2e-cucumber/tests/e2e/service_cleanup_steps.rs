@@ -696,3 +696,201 @@ fn assert_succeeded(world: &E2eWorld) {
         combined_output(world)
     );
 }
+
+// ── A record held by a process `rocm` cannot query ─────────────────
+
+/// A PID no host is using, which the `e2e-test-hooks` build is told to read as
+/// "cannot be queried" (`ROCM_E2E_UNQUERYABLE_PIDS`).
+const UNQUERYABLE_PID: u32 = 2_000_000_001;
+
+/// Rewrite fields of the planted manifest.
+fn set_manifest_fields(world: &E2eWorld, fields: &[(&str, serde_json::Value)]) {
+    let manifest = services_dir(world).join(format!("{SERVICE_ID}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest).expect("failed to read the planted manifest"),
+    )
+    .expect("failed to parse the planted manifest");
+    for (key, value) in fields {
+        record[*key] = value.clone();
+    }
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to rewrite the planted manifest");
+}
+
+/// Make the next `rocm` invocation read [`UNQUERYABLE_PID`] as unqueryable.
+fn script_unqueryable(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_E2E_UNQUERYABLE_PIDS",
+        UNQUERYABLE_PID.to_string().into(),
+    ));
+}
+
+#[given("a local server record whose recorded process cannot be queried")]
+async fn record_with_unqueryable_process(world: &mut E2eWorld) {
+    plant_record(world, "ready");
+    set_manifest_fields(
+        world,
+        &[("supervisor_pid", serde_json::json!(UNQUERYABLE_PID))],
+    );
+}
+
+#[given("a local server record whose recorded process is running and whose stop was requested")]
+async fn record_with_running_process(world: &mut E2eWorld) {
+    plant_record(world, "ready");
+    // A real process the scenario owns, so the teardown (which stops every
+    // record left behind) ends it rather than the harness.
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start the recorded process");
+    set_manifest_fields(
+        world,
+        &[
+            ("supervisor_pid", serde_json::json!(child.id())),
+            ("stop_requested_unix_ms", serde_json::json!(1)),
+        ],
+    );
+    world.recorded_process = Some(child);
+}
+
+#[when("the user stops that local server while its process cannot be queried")]
+async fn stop_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "stop", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user removes that local server record while its process cannot be queried")]
+async fn remove_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "remove", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user force-removes that local server record while its process cannot be queried")]
+async fn force_remove_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["services", "remove", SERVICE_ID, "--force", "--yes"],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user prunes every record whatever its age while its process cannot be queried")]
+async fn prune_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "prune", "--any-age", "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI leaves the record alone and names the forced removal")]
+async fn prune_leaves_and_names_force(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&format!(
+            "{SERVICE_ID} is "
+        )) && combined.contains(&format!(
+            "process {UNQUERYABLE_PID} it recorded could not be queried - remove it with `rocm services remove {SERVICE_ID} --force --yes`"
+        )),
+        "{combined}"
+    );
+}
+
+#[when("the user force-removes that local server record")]
+async fn force_remove(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["services", "remove", SERVICE_ID, "--force", "--yes"],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI reports the stop as not confirmed because the process could not be queried")]
+async fn stop_not_confirmed_unverified(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(rc, 0, "an unverified stop must exit non-zero:\n{combined}");
+    assert!(
+        combined.contains("Local server stop not confirmed"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!("not signaled: process {UNQUERYABLE_PID}")),
+        "{combined}"
+    );
+    // The check the stop names is the host's own command, and names the PID.
+    assert!(
+        combined.contains(&format!("ps -p {UNQUERYABLE_PID} -o pid,args"))
+            || combined.contains(&format!("tasklist /FI \"PID eq {UNQUERYABLE_PID}\"")),
+        "{combined}"
+    );
+    // What the stop says it kept is what is on disk: the record names the
+    // process and the stop request is recorded.
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(services_dir(world).join(format!("{SERVICE_ID}.json")))
+            .expect("the record must still be there"),
+    )
+    .expect("the record must parse");
+    assert_eq!(manifest["supervisor_pid"], UNQUERYABLE_PID, "{manifest}");
+    assert!(manifest["stop_requested_unix_ms"].is_u64(), "{manifest}");
+}
+
+#[then("the CLI refuses the removal and names the forced removal")]
+async fn refuses_and_names_force(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(rc, 0, "{combined}");
+    assert!(
+        combined.contains(&format!(
+            "process {UNQUERYABLE_PID} it recorded could not be queried"
+        )),
+        "{combined}"
+    );
+    // The command the refusal names is the one the next step runs.
+    assert!(
+        combined.contains(&format!("rocm services remove {SERVICE_ID} --force --yes")),
+        "{combined}"
+    );
+}
+
+#[then("the CLI removes the record and says its process could not be queried")]
+async fn force_removed(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&format!(
+            "--force: process {UNQUERYABLE_PID} could not be queried"
+        )),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("Local server record removed"),
+        "{combined}"
+    );
+}
+
+#[then("the CLI refuses the forced removal because the record does not qualify")]
+async fn refuses_force(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(rc, 0, "{combined}");
+    assert!(
+        combined.contains("--force removes a record only when"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!("rocm services stop {SERVICE_ID} --yes")),
+        "{combined}"
+    );
+}

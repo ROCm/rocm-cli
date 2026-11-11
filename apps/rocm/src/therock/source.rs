@@ -399,6 +399,30 @@ mod tests {
         );
     }
 
+    /// A ROCm major newer than any this CLI has seen must resolve without a CLI
+    /// release: the layout is chosen by `major >= THEROCK_NEXT_MIN_MAJOR`, not by
+    /// a list of known majors. A stable pin of a later major takes the next
+    /// layout, and a pinned prerelease of one stays on the stream that serves it.
+    #[test]
+    fn a_future_rocm_major_selects_its_layout_without_a_cli_change() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+
+        for stable in ["11.0.0", "12.3.4", "99.0.0"] {
+            let pin = RuntimeVersionSelector::version(stable).unwrap();
+            assert_eq!(
+                select_source_layout(TheRockChannel::Release, &exact, Some(&pin)).unwrap(),
+                SourceLayout::Next,
+                "stable pin {stable}"
+            );
+        }
+
+        let alpha = RuntimeVersionSelector::version("11.0.0a20270101").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&alpha)).unwrap(),
+            SourceLayout::Canonical
+        );
+    }
+
     #[test]
     fn next_layout_resolves_its_own_bases() {
         let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
