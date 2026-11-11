@@ -902,7 +902,11 @@ mod tests {
                 let printed = advised_spans(&message, "rocm serve");
                 assert_eq!(printed.len(), 1, "{message}");
                 let script = format!("printf '%s\\n' {}", printed[0].replace("<model>", "qwen"));
-                let output = std::process::Command::new("sh")
+                // By absolute path, not by a `PATH` lookup: other tests replace `PATH`
+                // for a while (under `PROCESS_ENV_TEST_LOCK`, which this test does not
+                // take), and a lookup that lands in that window finds no `sh`. The
+                // script only uses the shell's builtin `printf`.
+                let output = std::process::Command::new("/bin/sh")
                     .arg("-c")
                     .arg(&script)
                     .current_dir(&root)
