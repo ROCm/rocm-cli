@@ -8407,7 +8407,7 @@ The following component(s) are licensed under Apache License 2.0:
   - serde_urlencoded 0.7.1 <https://github.com/nox/serde_urlencoded>
   - serial2 0.2.37 <https://github.com/de-vri-es/serial2-rs>
   - simdutf8 0.1.5 <https://github.com/rusticstuff/simdutf8>
-  - syn 2.0.118 <https://github.com/dtolnay/syn>
+  - syn 2.0.119 <https://github.com/dtolnay/syn>
   - syn 3.0.9 <https://github.com/dtolnay/syn>
   - sync_wrapper 1.0.2 <https://github.com/Actyx/sync_wrapper>
   - thiserror-impl 1.0.69 <https://github.com/dtolnay/thiserror>
