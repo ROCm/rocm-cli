@@ -134,11 +134,27 @@ impl Binaries {
 
     /// Fail naming the first binary that is not a file, as the gate is
     /// pointless against a partial build.
-    fn require_all_present(&self) -> Result<()> {
+    ///
+    /// Where the build was skipped, that is the usual cause, so the failure
+    /// says how to fix it: running without `--skip-build` builds into the
+    /// directory searched here, which
+    /// `the_build_lands_where_the_binaries_are_looked_for` proves.
+    fn require_all_present(&self, build_skipped: bool) -> Result<()> {
         for bin in Bin::ALL {
             let path = self.path(bin);
             if !path.is_file() {
-                bail!("missing smoke binary {}: {}", bin.key(), path.display());
+                let hint = if build_skipped {
+                    "\nnothing was built because of --skip-build: drop it to build them, or pass \
+                     the --profile and --target-dir of the build that produced them"
+                } else {
+                    ""
+                };
+                bail!(
+                    "missing smoke binary {}: {} (looked in {}){hint}",
+                    bin.key(),
+                    path.display(),
+                    self.dir.display()
+                );
             }
         }
         Ok(())
@@ -1009,7 +1025,8 @@ type Runner<'a> = dyn FnMut(&str, &Path, &[&str], bool) -> Result<String> + 'a;
 /// The gate: the version comparison, every table check in order, and the
 /// first-run assertions, against binaries the plan has located.
 fn execute(plan: &Plan, port: &str, run: &mut Runner<'_>) -> Result<()> {
-    plan.binaries.require_all_present()?;
+    plan.binaries.require_all_present(plan.build.is_none())?;
+    println!("{}", run_header(plan));
 
     if plan.env_root.exists() {
         std::fs::remove_dir_all(&plan.env_root)
@@ -1060,6 +1077,18 @@ fn execute(plan: &Plan, port: &str, run: &mut Runner<'_>) -> Result<()> {
         "first-run smoke runtime registry",
     )?;
     Ok(())
+}
+
+/// The line printed before the first check, naming the binaries and the
+/// state root the run uses:
+/// `--profile`, `--target-dir` and `CARGO_TARGET_DIR` all move the first, and
+/// nothing else in the output says which build was smoked.
+fn run_header(plan: &Plan) -> String {
+    format!(
+        "smoke: binaries from {}; throwaway state root {}",
+        plan.binaries.dir.display(),
+        plan.env_root.display()
+    )
 }
 
 /// The runner [`run`] hands to [`execute`]: every child gets the plan's isolated
@@ -1145,11 +1174,55 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let binaries = Binaries::new(dir.path().to_path_buf());
         let error = binaries
-            .require_all_present()
+            .require_all_present(false)
             .expect_err("an empty dir has no binaries");
         let message = format!("{error}");
         assert!(message.contains("missing smoke binary rocm"), "{message}");
         assert!(message.contains(&binary_name("rocm")), "{message}");
+        assert!(
+            message.contains(&format!("(looked in {})", dir.path().display())),
+            "{message}"
+        );
+        // A build ran and still produced nothing here: --skip-build is not
+        // the cause, so the failure must not offer it as the fix.
+        assert!(!message.contains("--skip-build"), "{message}");
+    }
+
+    /// With the build skipped, the failure names the fix as well as the gap.
+    /// That the fix works — a run without `--skip-build` builds into the
+    /// directory searched — is `the_build_lands_where_the_binaries_are_looked_for`.
+    #[test]
+    fn a_missing_binary_after_a_skipped_build_says_how_to_fix_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = Binaries::new(dir.path().to_path_buf())
+            .require_all_present(true)
+            .expect_err("an empty dir has no binaries");
+        let message = format!("{error}");
+        assert!(
+            message.contains(&format!("(looked in {})", dir.path().display())),
+            "{message}"
+        );
+        assert!(
+            message.contains("nothing was built because of --skip-build: drop it to build them"),
+            "{message}"
+        );
+    }
+
+    /// The run says which binaries and state root it used, since the flags and
+    /// `CARGO_TARGET_DIR` move them.
+    #[test]
+    fn the_run_header_names_the_binaries_and_the_state_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        assert_eq!(
+            run_header(&plan),
+            format!(
+                "smoke: binaries from {}; throwaway state root {}",
+                plan.binaries.dir.display(),
+                plan.env_root.display()
+            )
+        );
+        assert_ne!(plan.binaries.dir, plan.env_root);
     }
 
     #[test]
@@ -2460,10 +2533,10 @@ mod tests {
         let plan = fake_plan(dir.path());
         std::fs::remove_file(plan.binaries.path(Bin::Vllm)).expect("remove one binary");
         let (result, calls) = execute_with(&plan, &BTreeMap::new(), &mut |_| {});
-        assert!(
-            format!("{}", result.expect_err("a binary is missing"))
-                .contains("missing smoke binary vllm"),
-        );
+        let message = format!("{}", result.expect_err("a binary is missing"));
+        assert!(message.contains("missing smoke binary vllm"), "{message}");
+        // The fake plan skips the build, so the fix is named.
+        assert!(message.contains("because of --skip-build"), "{message}");
         assert!(calls.is_empty(), "nothing runs against a partial build");
     }
 

@@ -547,6 +547,10 @@ cargo xtask smoke --skip-build
 binaries the gate runs (`rocm`, `rocmd`, and the two engines), not the whole
 workspace. `--target-dir <dir>` builds into that directory and looks for the
 binaries there; without it, a configured `CARGO_TARGET_DIR` is honoured.
+Before its first check, a run names the binaries and the throwaway state root
+it uses. The build's output streams as it runs. Each smoked command must finish
+within three minutes; one that does not is killed, and the gate fails naming
+it.
 
 ### Property tests
 
