@@ -2617,13 +2617,22 @@ mod tests {
 
     #[test]
     fn a_free_port_is_released_and_outside_the_reserved_range() {
-        let port = free_tcp_port().expect("an ephemeral port");
-        assert!(port > 1023, "{port} is in the reserved range");
         // The serve rejections need the port free once it is handed to them:
         // a listener still held here would make them fail on the port rather
-        // than on the refusal they exist to check.
-        TcpListener::bind(("127.0.0.1", port))
-            .unwrap_or_else(|error| panic!("port {port} is still held: {error}"));
+        // than on the refusal they exist to check. Another test running in
+        // parallel can take a released port before it is bound again, so one
+        // successful re-bind out of a few attempts is the pass; a port that is
+        // never released fails every attempt.
+        let mut failures = Vec::new();
+        for _ in 0..5 {
+            let port = free_tcp_port().expect("an ephemeral port");
+            assert!(port > 1023, "{port} is in the reserved range");
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(_) => return,
+                Err(error) => failures.push(format!("{port}: {error}")),
+            }
+        }
+        panic!("no returned port could be bound again: {failures:?}");
     }
 
     #[test]
