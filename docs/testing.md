@@ -3103,6 +3103,34 @@ catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 ([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
+fix-4 has one verify line, not two: the catalog recipe and the `Fix` that
+`rocm diagnose` builds both read `RENDER_GROUP_VERIFY` in
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs), so the two cannot
+drift apart again. `the_render_group_fix_verify_matches_the_catalog_copy` in
+[linux.rs](../crates/rocm-core/src/diagnose/linux.rs) keeps either side from
+going back to its own copy, and `diagnose-65` asserts the line that
+`rocm fix fix-4-render-group --dry-run` prints. The line passes when the user
+is in the group that owns `/dev/kfd` (read with `stat -c %G`), or in `render`
+or `video`, and `/dev/kfd` exists; the diagnosis tells the user to join the
+owning group, which need not be `render`. It checks membership, not the
+device's mode, and not `rocminfo`, whose status `head` hides.
+`the_render_group_verify_accepts_the_group_that_owns_kfd` in the same file runs
+it in `/bin/sh` with stand-in tools on Unix hosts: a member of a third owning
+group passes, and a user in none of the groups fails, also when `stat` fails or
+names no group. `diagnose-66` asserts that fix-8's title names the
+`X.Y` release, which is what `check_8_wheel_rocm_mismatch` compares
+(`the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). Both run on every lane,
+because the plan prints before the platform gate. `diagnose-67` asserts the
+other copy, the fix-8 cause `rocm diagnose` prints: its title and plan name the
+`X.Y` release and neither says "major". The scenario carries no platform tag:
+its symptom scores 75 from keywords alone (`libamdhip64.so` 50, the loader
+failure 25), above the match threshold of 50, and `check_8_wheel_rocm_mismatch`
+is registered for Linux, Windows and WSL and only adds to that score.
+`a_library_load_error_alone_raises_the_wheel_mismatch_on_every_family` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs) holds that for all three
+families.
+
 Provider audit focused test:
 
 ```bash
