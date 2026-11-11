@@ -812,9 +812,8 @@ mod tests {
         // `hooks.py` is what keeps the recorded `rocm` from running anything but a
         // replay, so its tests (replay, refusal, PATH and temp-dir cleanup) run
         // with the rest of this crate. Python is on every lane that runs `cargo
-        // test` in CI (the acceptance-harness self-tests need it), so on CI a
-        // missing Python is a failure; on a machine without one the test says so
-        // and stops.
+        // test` in CI, so on CI a missing Python is a failure; on a machine
+        // without one the test says so and stops.
         let Some(python) = python() else {
             assert!(
                 std::env::var_os("CI").is_none(),
