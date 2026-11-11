@@ -754,10 +754,12 @@ mod tests {
         assert!(err.to_string().contains("protected system location"));
     }
 
-    /// `rocm runtimes uninstall` and `rocm storage remove-old-installs` share
-    /// the protected-location predicate with `rocm uninstall`, so a runtime
-    /// whose `install_root` is the home folder itself (`--prefix ~`) is refused
-    /// too — and the refusal says it is the home folder, not a system location.
+    /// `rocm runtimes uninstall` and `rocm storage remove-old-installs` judge a
+    /// runtime folder by the runtime-folder rule (`runtime_protected_location`),
+    /// which refuses the home folder as `rocm uninstall`'s own rule does, so a
+    /// runtime whose `install_root` is the home folder itself (`--prefix ~`) is
+    /// refused — and the refusal says it is the home folder, not a system
+    /// location.
     #[test]
     fn ensure_runtime_install_root_refuses_the_home_folder_by_name() {
         // A fixed home, so the check cannot fall back to some other refusal

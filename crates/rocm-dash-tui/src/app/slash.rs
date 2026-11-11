@@ -226,10 +226,33 @@ impl AppState {
                 // SAFE default: bare `/uninstall` is a dry-run (read-only). A real
                 // uninstall needs `/uninstall --apply` and is approval-gated (the
                 // bin auto-adds --yes on approval).
+                const PASSED_THROUGH: [&str; 5] = [
+                    "--keep-binaries",
+                    "--keep-config",
+                    "--keep-data",
+                    "--keep-cache",
+                    "--force-dev-binaries",
+                ];
                 let flags: Vec<&str> = rest.split_whitespace().skip(1).collect();
                 let saw_apply = flags.contains(&"--apply");
                 let saw_dry_run = flags.contains(&"--dry-run");
-                if saw_apply && saw_dry_run {
+                // A flag that is not one of these is refused, not dropped: a
+                // typo such as `--keep-dat` would otherwise turn an intended
+                // keep into a full removal request.
+                let unknown: Vec<&str> = flags
+                    .iter()
+                    .copied()
+                    .filter(|flag| {
+                        !PASSED_THROUGH.contains(flag) && !matches!(*flag, "--apply" | "--dry-run")
+                    })
+                    .collect();
+                if !unknown.is_empty() {
+                    self.chat.push(ChatTurn::error(format!(
+                        "unknown /uninstall flag {}: use --dry-run, --apply, {}",
+                        unknown.join(" "),
+                        PASSED_THROUGH.join(", ")
+                    )));
+                } else if saw_apply && saw_dry_run {
                     self.chat.push(ChatTurn::error(
                         "conflicting /uninstall flags: choose either --dry-run (safe) or --apply (real uninstall)"
                             .to_string(),
@@ -241,16 +264,12 @@ impl AppState {
                     // through, in both modes: a
                     // refused uninstall's advice is to re-run with one, and a
                     // dashboard that dropped it could never follow that advice.
-                    argv.extend(flags.iter().copied().filter(|flag| {
-                        matches!(
-                            *flag,
-                            "--keep-binaries"
-                                | "--keep-config"
-                                | "--keep-data"
-                                | "--keep-cache"
-                                | "--force-dev-binaries"
-                        )
-                    }));
+                    for flag in flags.iter().copied().filter(|f| PASSED_THROUGH.contains(f)) {
+                        // Each once, however often it was typed.
+                        if !argv.contains(&flag) {
+                            argv.push(flag);
+                        }
+                    }
                     if !real {
                         argv.push("--dry-run");
                     }
@@ -1200,6 +1219,28 @@ mod tests {
                 "uninstall", "--keep-binaries", "--keep-config", "--keep-data",
                 "--keep-cache", "--dry-run"
             ] })
+        );
+
+        // A typo is refused with the flags it takes, not dropped into a full
+        // removal; a repeated flag is passed once.
+        let before = s.chat.len();
+        assert_eq!(
+            s.handle_slash_command("/uninstall --apply --keep-dat"),
+            SlashOutcome::Handled
+        );
+        assert!(s.slash_tool.is_none(), "a typo must not raise a request");
+        let turn = s.chat.last().expect("an error turn");
+        assert!(s.chat.len() > before && turn.role == ChatRole::Error);
+        assert!(turn.content.contains("--keep-dat"), "{}", turn.content);
+        assert!(turn.content.contains("--keep-data"), "{}", turn.content);
+        assert_eq!(
+            s.handle_slash_command("/uninstall --keep-data --keep-data"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.take().expect("a dry-run request");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["uninstall", "--keep-data", "--dry-run"] })
         );
 
         // `--force-dev-binaries` is passed on too, not silently dropped.

@@ -827,15 +827,22 @@ pub fn runtime_protected_location_for_home(
     protected_location_on(path, home, RuntimePlatform::current())
 }
 
-const fn system_roots(platform: RuntimePlatform) -> &'static [&'static str] {
+/// The system locations a runtime folder may not be in. On Windows these are
+/// `rocm uninstall`'s own, on the system drive; on Unix the list differs from
+/// [`uninstall_system_roots`] on purpose: `/opt` and `/var` are refused here
+/// (a runtime prefix there is the system's), while `rocm uninstall` refuses
+/// only their top level and lets a marked folder below them go.
+fn system_roots(platform: RuntimePlatform) -> Vec<PathBuf> {
     if platform.is_windows() {
-        &["C:/Windows", "C:/Program Files", "C:/Program Files (x86)"]
-    } else {
-        &[
-            "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin",
-            "/sys", "/usr", "/var",
-        ]
+        return uninstall_system_roots_on(platform, &windows_system_drive());
     }
+    [
+        "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin",
+        "/sys", "/usr", "/var",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 /// What the user's own home folder says about a path, when it says anything.
@@ -881,7 +888,6 @@ fn protected_location_on(
     }
     system_roots(platform)
         .iter()
-        .map(Path::new)
         .any(|root| runtime_path_is_same_or_inside_on(path, root, platform))
         .then_some(ProtectedLocation::System)
 }
@@ -982,11 +988,14 @@ fn homes_parents_on(
 
 /// What `rocm uninstall` may do with the root `path`, judged against `home`.
 ///
-/// In order: `/` (or a drive root) is refused; the user's own home is refused,
-/// as is any folder containing it, while anything inside it is allowed; the
-/// [`uninstall_system_roots`] and anything inside them are refused, as are
-/// `extra_system_roots` (the caller passes their resolved spellings, so
-/// `/lib -> usr/lib` and `/usr/lib` are judged alike); another user's home or
+/// In order: `/` (or a drive root) is refused; the [`uninstall_system_roots`]
+/// and anything inside them are refused, as are `extra_system_roots` (the
+/// caller passes their resolved spellings, so `/lib -> usr/lib` and `/usr/lib`
+/// are judged alike) — before the home allowance, so an odd home inside a
+/// system location does not open it up; the user's own home is refused, as is
+/// any folder containing it, while anything inside it is allowed; off Windows,
+/// a folder other programs share (anything directly under `/`,
+/// `/var/{lib,cache,log,tmp}`, `/mnt/<x>`) is refused; another user's home or
 /// anything inside one is refused; anything else needs the marker.
 pub fn uninstall_root_verdict(
     path: &Path,
@@ -2020,19 +2029,6 @@ mod tests {
         assert!(accepted.is_empty(), "accepted as removable: {accepted:?}");
     }
 
-    // ── Properties: the recursive-delete guard ─────────────────────
-    //
-    // `runtime_protected_location` is the runtime-folder rule for
-    // "may ROCm CLI `remove_dir_all` this folder?". Everything below states a
-    // contract it must satisfy for EVERY spelling of a path, because the whole
-    // point of the guard is that it is handed a path somebody (or something)
-    // else wrote down — a registry entry, an `--prefix` argument, a tool call
-    // from the local assistant. Such a path is text, and text has many
-    // spellings for one folder.
-    //
-    // Unix-only: the protected-root list the guard consults is the Unix one,
-    // and `runtime_is_windows()` is decided at compile time, so the Windows
-    // branch cannot be exercised from here. All pure and in-process.
     /// A folder that already exists when ROCm CLI asks for it — even one
     /// created a moment earlier by someone else — is not marked; one this call
     /// creates is. A marker that cannot be written is a warning, not an error.
@@ -2139,6 +2135,44 @@ mod tests {
         }
     }
 
+    /// The runtime-folder rule refuses the same Windows system folders as
+    /// `rocm uninstall`, `ProgramData` included, on the system drive.
+    #[test]
+    fn the_runtime_rule_refuses_the_windows_system_folders_on_the_system_drive() {
+        let _guard = SYSTEM_DRIVE_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drive = windows_system_drive();
+        let windows = RuntimePlatform::Windows;
+        for folder in [
+            "Windows",
+            "Program Files",
+            "Program Files (x86)",
+            "ProgramData",
+        ] {
+            let path = PathBuf::from(format!("{drive}/{folder}/rocm"));
+            assert_eq!(
+                protected_location_on(&path, None, windows),
+                Some(ProtectedLocation::System),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    // ── Properties: the recursive-delete guard ─────────────────────
+    //
+    // `runtime_protected_location` is the runtime-folder rule for
+    // "may ROCm CLI `remove_dir_all` this folder?". Everything below states a
+    // contract it must satisfy for EVERY spelling of a path, because the whole
+    // point of the guard is that it is handed a path somebody (or something)
+    // else wrote down — a registry entry, an `--prefix` argument, a tool call
+    // from the local assistant. Such a path is text, and text has many
+    // spellings for one folder.
+    //
+    // Unix-only: the protected-root list the guard consults is the Unix one,
+    // and `runtime_is_windows()` is decided at compile time, so the Windows
+    // branch cannot be exercised from here. All pure and in-process.
     #[cfg(unix)]
     mod delete_guard_properties {
         use super::*;

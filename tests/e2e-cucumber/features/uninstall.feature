@@ -145,11 +145,11 @@ Feature: Uninstall
 
   # The assistant's uninstall preview (the `rocm_command` tool of the chat
   # assistant and the dashboard, called here without a model through the hidden
-  # `rocm mcp-call`) renders the same plan as a dry run, but it has no flag to
-  # offer, so it says that removal needs approval. It is the one run here that
-  # cannot pass --keep-binaries: the preview takes no flags and removes nothing,
-  # and it is made without --allow-mutation, so a call that would remove
-  # something is refused.
+  # `rocm mcp-call`) renders the same plan as a dry run, but it has no command
+  # line to offer, so it says that removal needs approval. It is the one run here
+  # made without --keep-binaries: the preview reads the --keep-* flags but
+  # removes nothing, and it is made without --allow-mutation, so a call that
+  # would remove something is refused.
   @id:uninstall-assistant-preview-says-removal-needs-approval
   Scenario: uninstall-12 - The assistant's uninstall preview lists what it would remove, says removal needs approval, and removes nothing
     Given the config folder holds the user's files
@@ -222,6 +222,12 @@ Feature: Uninstall
     When the user previews an uninstall
     Then the review warns that the uv and model caches will be deleted with the cache folder
     And the uv cache is still there after the preview
+    When the user uninstalls keeping the cache
+    Then the uninstall succeeds
+    And the uv cache is still there
+    When the user uninstalls
+    Then the uninstall succeeds
+    And the uv cache is gone
 
   # The text of `.` is not the home folder, but the folder it names is. Linux-
   # only like uninstall-01/-02 in what it claims: the resolution goes through
@@ -257,3 +263,4 @@ Feature: Uninstall
     When the dashboard runs an approved uninstall
     Then the refusal names setup.therock_venv and advises --keep-data, not a variable the user never set
     And the user's files in the home folder are still there
+    And the config folder is still there

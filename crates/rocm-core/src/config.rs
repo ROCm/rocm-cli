@@ -1454,16 +1454,6 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
-    /// The temp-file cleanup when the publish step fails (in
-    /// `atomic_write::publish_staged_file_with`), which the happy-path test above
-    /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
-    /// behind, so deleting the cleanup would go unnoticed until a user with a
-    /// failing disk accumulated one `config.json.tmp-<pid>-<ts>-<attempt>` per attempt.
-    ///
-    /// A directory at the destination is what makes the publish fail on both
-    /// supported platforms without needing permissions a root CI lane ignores —
-    /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
-    /// uses in `rocm_core::atomic_write`.
     /// Saving the config often creates the config folder; when it does, the
     /// folder is marked as ROCm CLI's own, so `rocm uninstall` can later remove
     /// it outside the home folder. A config folder that already existed is not
@@ -1493,6 +1483,16 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
+    /// The temp-file cleanup when the publish step fails (in
+    /// `atomic_write::publish_staged_file_with`), which the happy-path test above
+    /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
+    /// behind, so deleting the cleanup would go unnoticed until a user with a
+    /// failing disk accumulated one `config.json.tmp-<pid>-<ts>-<attempt>` per attempt.
+    ///
+    /// A directory at the destination is what makes the publish fail on both
+    /// supported platforms without needing permissions a root CI lane ignores —
+    /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
+    /// uses in `rocm_core::atomic_write`.
     #[test]
     fn a_config_save_that_cannot_publish_cleans_up_its_temp_file() -> Result<()> {
         let (root, paths) = temp_app_paths("config-save-rename-fails");

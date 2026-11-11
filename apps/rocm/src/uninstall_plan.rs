@@ -12,9 +12,10 @@
 //! are called directly from `dispatch()`.
 //!
 //! This is deliberately a separate file from `uninstall.rs`, not folded into
-//! it: `uninstall.rs` owns only what `rocm uninstall` itself does on top of
-//! removing files — undoing the installer's PATH change and deleting the
-//! running executable on Windows, which cannot unlink itself. `storage.rs`
+//! it: `uninstall.rs` owns what `rocm uninstall` itself does — carrying the
+//! plan out (`apply_uninstall_plan`, the one step that deletes), undoing the
+//! installer's PATH change and deleting the running executable on Windows,
+//! which cannot unlink itself. `storage.rs`
 //! builds and renders a removal plan of its own (`rocm storage
 //! remove-downloads`) and reuses this module's plan type and its
 //! file-removal helpers to do it, so keeping them in `uninstall.rs` would
@@ -343,15 +344,21 @@ pub(crate) fn judge_uninstall_root(
         &resolved_system_roots,
     ) {
         UninstallRootVerdict::Refused(why) => refuse(why),
-        UninstallRootVerdict::NeedsMarker
-            if !resolved.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file() =>
-        {
+        UninstallRootVerdict::NeedsMarker if !is_root_marker(&resolved) => {
             refuse(ProtectedLocation::NotMarked)
         }
         UninstallRootVerdict::Allowed | UninstallRootVerdict::NeedsMarker => RootJudgment::Remove {
             planned: PlannedAs::Dir(resolved),
         },
     }
+}
+
+/// Whether `dir` carries the marker as a regular file of its own. A link named
+/// like the marker is not one: anything that can plant a link there could
+/// point it at any file, and ROCm CLI only ever writes a plain file.
+fn is_root_marker(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(rocm_core::ROCM_CLI_ROOT_MARKER))
+        .is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// Whether the real directory `path` really is the user's home or inside it,
@@ -740,7 +747,10 @@ pub(crate) fn render_uninstall_plan(
     uninstall::render_extra_plan(&mut output, plan);
     if !plan.refused.is_empty() {
         let _ = writeln!(output);
-        let _ = writeln!(output, "Refused (ROCm CLI never removes these folders):");
+        let _ = writeln!(
+            output,
+            "Refused (nothing is removed while any of these is listed):"
+        );
     }
     for root in &plan.refused {
         let _ = writeln!(output, "  - {}: {}", root.kind, root.describe());
@@ -2112,6 +2122,44 @@ mod tests {
         let resolve: Canonicalize<'_> = &rocm_core::canonicalize_for_compare;
         assert!(!super::resolves_inside_own_home(&root, Some(top), resolve));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link named like the marker does not mark a folder: only the plain
+    /// file ROCm CLI writes does.
+    #[test]
+    #[cfg(unix)]
+    fn a_linked_marker_does_not_mark_a_folder() {
+        let root = sandbox("linked-marker");
+        let home = root.join("users").join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let data = root.join("srv").join("rocm");
+        std::fs::create_dir_all(&data).unwrap();
+        let elsewhere = root.join("any-file");
+        std::fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, data.join(rocm_core::ROCM_CLI_ROOT_MARKER)).unwrap();
+        let linked = super::build_uninstall_plan_for_home(
+            &data_only(data.clone(), &root),
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        std::fs::remove_file(data.join(rocm_core::ROCM_CLI_ROOT_MARKER)).unwrap();
+        std::fs::write(data.join(rocm_core::ROCM_CLI_ROOT_MARKER), b"").unwrap();
+        let marked = super::build_uninstall_plan_for_home(
+            &data_only(data, &root),
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(linked.refused.len(), 1, "{linked:?}");
+        assert_eq!(
+            linked.refused[0].why,
+            rocm_core::ProtectedLocation::NotMarked
+        );
+        assert!(marked.refused.is_empty(), "{marked:?}");
     }
 
     /// Check, then act, for a root that was a symbolic link at review time:

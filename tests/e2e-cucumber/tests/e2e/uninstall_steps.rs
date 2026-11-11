@@ -747,8 +747,10 @@ async fn config_intact(world: &mut E2eWorld) {
 #[then("the config folder is gone")]
 async fn config_gone(world: &mut E2eWorld) {
     let config = config_dir(world);
+    // `symlink_metadata`, not `exists`: a folder left behind as a dangling
+    // link is not gone.
     assert!(
-        !config.exists(),
+        std::fs::symlink_metadata(&config).is_err(),
         "the uninstall did not remove {}:\n{}",
         config.display(),
         output(world)
@@ -791,6 +793,33 @@ async fn warns_shared_caches_deleted(world: &mut E2eWorld) {
     assert!(
         stdout.contains("Re-run with --keep-cache to keep"),
         "the warning must say how to keep the caches:\n{stdout}"
+    );
+}
+
+#[when("the user uninstalls keeping the cache")]
+async fn uninstall_keeping_cache(world: &mut E2eWorld) {
+    run_uninstall(world, &["--yes", "--keep-cache"]);
+}
+
+#[then("the uv cache is still there")]
+async fn uv_cache_kept(world: &mut E2eWorld) {
+    let blob = home(world).join(".cache").join("uv").join("blob");
+    assert!(
+        blob.is_file(),
+        "--keep-cache did not keep {}:\n{}",
+        blob.display(),
+        output(world)
+    );
+}
+
+#[then("the uv cache is gone")]
+async fn uv_cache_gone(world: &mut E2eWorld) {
+    let cache = home(world).join(".cache");
+    assert!(
+        std::fs::symlink_metadata(&cache).is_err(),
+        "the review said the uv cache WILL BE DELETED, but {} is still there:\n{}",
+        cache.display(),
+        output(world)
     );
 }
 
@@ -1158,9 +1187,9 @@ async fn dry_run_offers_no_step(world: &mut E2eWorld) {
 /// The assistant's uninstall preview, called without a model through the hidden
 /// `rocm mcp-call` entry point the dashboard and chat use for their tools.
 ///
-/// The one run here that cannot pass `--keep-binaries`: the preview takes no
-/// flags, plans every folder and the binary under test, and renders the plan. It
-/// removes nothing, and it is made without `--allow-mutation`, so the tool
+/// The one run here made without `--keep-binaries`: called with no flags, the
+/// preview plans every folder and the binary under test, and renders the plan.
+/// It removes nothing, and it is made without `--allow-mutation`, so the tool
 /// refuses a call that would remove something instead of running it.
 #[when("the assistant previews an uninstall")]
 async fn assistant_previews_uninstall(world: &mut E2eWorld) {
@@ -1218,7 +1247,7 @@ async fn preview_says_removal_needs_approval(world: &mut E2eWorld) {
         text.contains("Nothing was removed. Removal needs your approval."),
         "the preview must say removal needs approval:\n{text}"
     );
-    // The preview has no flag to offer, so it must not point at one.
+    // The preview has no command line to offer, so it must not point at one.
     for phrase in ["run it again", "--dry-run.", "Review uninstall"] {
         assert!(
             !text.contains(phrase),
