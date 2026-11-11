@@ -11,7 +11,11 @@ so its artifact is untrusted input to a job holding a write token. This
 accepts only what an update may legitimately change:
 
 - exactly the expected files (``summary.md``, ``mise.toml``, ``mise.lock``,
-  ``locks/pylock.<name>.toml``), as regular files of bounded size;
+  ``locks/pylock.<name>.toml``, and, when mise moved, both bootstrap launchers
+  ``bin/mise`` and ``bin/mise.cmd``), as regular files of bounded size;
+- launchers in the form git stores them (LF line endings): the commit goes
+  through GitHub's API, which converts nothing, so a checked-out CRLF
+  ``mise.cmd`` would be committed as a change to every line;
 - a ``mise.toml`` identical to the base one except for the version of each
   ``[tools]`` entry. It is configuration maintainers run (``mise run``), so a
   new task, environment entry, asset pattern or setting — the cooldown
@@ -26,7 +30,10 @@ job runs this commit's ``cargo xtask deps check`` against the artifact before
 ``open-pr`` runs, and the pull request's CI runs it again. Among other things it
 requires every binary (``url`` and ``url_api``) to be a release download of its
 own GitHub repository at the locked version, and every Python artifact to come
-from PyPI or AMD's indexes.
+from PyPI or AMD's indexes. The same job runs ``cargo xtask deps
+verify-launchers``, which requires the launchers to be exactly what the base
+commit's mise generates for the version they pin, at a release past the
+cooldown.
 
 Usage::
 
@@ -47,8 +54,11 @@ MAX_BYTES = 5 * 1024 * 1024
 # the body less a few lines of text.
 MAX_SUMMARY_CHARS = 60_000
 ALLOWED = re.compile(
-    r"^(summary\.md|mise\.toml|mise\.lock|locks/pylock\.[a-z0-9-]+\.toml)$"
+    r"^(summary\.md|mise\.toml|mise\.lock|locks/pylock\.[a-z0-9-]+\.toml|bin/mise|bin/mise\.cmd)$"
 )
+LAUNCHERS = ("bin/mise", "bin/mise.cmd")
+# The directories an update may produce.
+DIRECTORIES = ("locks", "bin")
 REQUIRED = ("summary.md", "mise.toml", "mise.lock")
 # A version cell starts with a digit (or is `—` for added/removed), so it can
 # hold nothing GitHub would turn into a link, such as `www.example.com`.
@@ -111,9 +121,10 @@ def validate(artifact: Path, base_config: Path) -> None:
         if path.is_symlink():
             raise Invalid(f"symlink in artifact: {rel}")
         if path.is_dir():
-            # `locks/` is the only directory an update produces; anything
-            # else, a directory named like a lock included, is refused.
-            if rel != "locks":
+            # `locks/` and `bin/` are the only directories an update
+            # produces; anything else, a directory named like a lock
+            # included, is refused.
+            if rel not in DIRECTORIES:
                 raise Invalid(f"unexpected artifact entry: {rel}/")
             continue
         if not path.is_file() or not ALLOWED.fullmatch(rel):
@@ -123,6 +134,12 @@ def validate(artifact: Path, base_config: Path) -> None:
     for required in REQUIRED:
         if not (artifact / required).is_file():
             raise Invalid(f"artifact is missing {required}")
+    present = [name for name in LAUNCHERS if (artifact / name).is_file()]
+    if present and len(present) != len(LAUNCHERS):
+        raise Invalid(f"artifact has {present[0]} without the other launcher")
+    for name in present:
+        if b"\r" in (artifact / name).read_bytes():
+            raise Invalid(f"{name} has CR line endings; the artifact carries git's LF form")
     # The commit step deletes every committed lock the artifact lacks, so an
     # update that produced none would empty the lock directory.
     if not any(path.is_file() for path in (artifact / "locks").glob("pylock.*.toml")):
@@ -186,7 +203,8 @@ def self_test() -> None:
         (artifact / "summary.md").write_text(summary, encoding="utf-8")
         (artifact / "locks" / "pylock.p-linux.toml").write_text("", encoding="utf-8")
         for name, body in (extra or {}).items():
-            (artifact / name).write_text(body, encoding="utf-8")
+            (artifact / name).parent.mkdir(parents=True, exist_ok=True)
+            (artifact / name).write_bytes(body.encode("utf-8"))
         if tamper:
             tamper(artifact)
         (root / "base.toml").write_text(BASE, encoding="utf-8")
@@ -270,6 +288,41 @@ def self_test() -> None:
             "mise.toml changed",
         ),
         ("unexpected file", BASE, TABLE, {"run.sh": "x"}, "unexpected artifact entry"),
+        (
+            "both launchers, LF",
+            BASE,
+            TABLE,
+            {"bin/mise": "#!/bin/sh\n", "bin/mise.cmd": "@echo off\n"},
+            None,
+        ),
+        (
+            "one launcher without the other",
+            BASE,
+            TABLE,
+            {"bin/mise": "#!/bin/sh\n"},
+            "without the other launcher",
+        ),
+        (
+            "the other launcher alone",
+            BASE,
+            TABLE,
+            {"bin/mise.cmd": "@echo off\n"},
+            "without the other launcher",
+        ),
+        (
+            "a checked-out CRLF launcher",
+            BASE,
+            TABLE,
+            {"bin/mise": "#!/bin/sh\n", "bin/mise.cmd": "@echo off\r\n"},
+            "CR line endings",
+        ),
+        (
+            "file in bin/ that is not a launcher",
+            BASE,
+            TABLE,
+            {"bin/mise": "#!/bin/sh\n", "bin/mise.cmd": "@echo off\n", "bin/uv": "x"},
+            "unexpected artifact entry",
+        ),
         (
             "file in locks/ that is not a lock",
             BASE,

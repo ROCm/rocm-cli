@@ -22,7 +22,7 @@ Everything lives under [`runtimes/`](../runtimes/):
 | [`profiles.toml`](../runtimes/profiles.toml) | Python runtime profiles and the policy their locks must meet | People |
 | [`uv.toml`](../runtimes/uv.toml) | Which indexes uv resolves from | People |
 | `locks/pylock.<profile>-<os>.toml` | One PEP 751 lock per profile and OS: every package, exact URL, SHA-256 | `cargo xtask deps lock` |
-| [`bin/mise`](../runtimes/bin/mise), [`bin/mise.cmd`](../runtimes/bin/mise.cmd) | Wrappers (POSIX, Windows) that download a pinned, checksum-verified mise | `mise generate install-script` (see [MANIFEST.md](../MANIFEST.md)) |
+| [`bin/mise`](../runtimes/bin/mise), [`bin/mise.cmd`](../runtimes/bin/mise.cmd) | Wrappers (POSIX, Windows) that download a pinned, checksum-verified mise | `cargo xtask deps launchers` (see [MANIFEST.md](../MANIFEST.md)) |
 
 No hand-written non-test source spells Lemonade's version or archive
 digests outside `runtimes/`; their build-time constants are generated from
@@ -45,9 +45,11 @@ with `--cd runtimes`.
 | Command | Does |
 |---|---|
 | `runtimes/bin/mise run --cd runtimes lock` | Re-lock binaries at the current pins and every Python profile at the cutoff its lock records (network; see below) |
-| `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown (AMD-only Python packages are not held back; see *Cooldown*), then re-lock |
+| `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown (AMD-only Python packages are not held back; see *Cooldown*), then re-lock and move the mise launchers in `runtimes/bin/`. Linux only (the weekly workflow runs it): on Windows the task would rewrite `mise.cmd` while cmd is reading it |
 | `cargo xtask deps check` | Verify every lock, offline (also run by `cargo test -p xtask`) |
 | `cargo xtask deps verify-downloads` | Download every binary `mise.lock` records and check its SHA-256 against the lock (network) |
+| `cargo xtask deps launchers --mise <bin> --cooldown-days <n>` | Regenerate the mise launchers in `runtimes/bin/` for the newest mise at least `<n>` days old, if newer (network; the `update` task's last step) |
+| `cargo xtask deps verify-launchers --base <dir> --cooldown-days <n>` | Check the launchers are exactly what the launchers in `<dir>` generate for the version they pin, and that a moved version is newer and at least `<n>` days old (network; the weekly update's check job) |
 | `cargo xtask deps diff --base <rev>` | Markdown table of versions changed since `<rev>`. Every row carries a short digest after the version (of the asset for a binary, of all its artifacts' hashes for a Python package), so an artifact re-uploaded at the same version shows up too |
 
 The mise tasks install the pinned tools first, Lemonade included, so even
@@ -118,8 +120,8 @@ for one release do not declare the same dependencies everywhere: the Linux
 and `triton` ships no Windows wheel. A single cross-platform lock (uv's
 `uv.lock`) records `triton` unconditionally and cannot be installed on Windows.
 
-mise's own `pypi` backend was evaluated for these stacks and cannot lock them
-(mise 2026.10.25):
+mise's own `pypi` backend was evaluated for these stacks, with the mise of
+October 2026, and cannot lock them:
 
 - it locks one cross-platform graph per tool — the `triton` problem above;
 - it always resolves and installs with `--no-build`, and AMD publishes `rocm`
@@ -229,11 +231,27 @@ or refreshes one pull request on `runtime-deps/update` with a table from
 `deps diff`. Resolving runs upstream code (uv builds the `rocm` sdist for its
 metadata), so that job holds a read-only token. A second read-only job runs
 the base commit's validator and `cargo xtask deps check` against the
-artifact, and recomputes the pull request's table with `deps diff`, refusing
+artifact, checks the mise launchers (below), and recomputes the pull request's
+table with `deps diff`, refusing
 an artifact whose summary differs; only then does a third, holding the write token, validate it again
 and commit through `createCommitOnBranch`, which GitHub signs, as the
 `commit-signatures` gate requires. A pull request opened with
 `GITHUB_TOKEN` does not trigger CI: close and reopen it to run the checks.
+
+mise itself moves the same way. The `update` task's last step,
+`cargo xtask deps launchers`, regenerates the bootstrap launchers in
+`runtimes/bin/` for the newest mise release past the same cooldown
+(`mise latest --minimum-release-age`), with the command MANIFEST.md records;
+each launcher embeds the version it starts and that release's checksums, so a
+move shows in the table as one row per launcher. The read-only check job then
+runs `cargo xtask deps verify-launchers`, which regenerates the launchers with
+the base commit's own launcher for the version the update pins and refuses any
+byte that differs, a version that is not newer, or a release inside the
+cooldown. The artifact carries the launchers in the form git stores them (the
+Windows one with LF line endings; `.gitattributes` checks it out with CRLF),
+and they are committed over the existing files, so the POSIX launcher keeps
+its executable mode. Nothing else spells the mise version: the Windows CI step
+reads it from `mise.cmd`.
 
 The update branch is rebuilt from the base commit on every run, but never
 over someone else's work: while it holds a commit the workflow did not make, a

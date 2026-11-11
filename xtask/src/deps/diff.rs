@@ -12,6 +12,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 
+use super::launchers;
 use super::mise_lock::{self, MISE_LOCK};
 use super::profiles::{LOCK_DIR, Profiles, normalize_name, slash_path};
 use super::pylock::{self, PyLock};
@@ -36,7 +37,11 @@ fn summary(root: &Path, base: &str) -> Result<String> {
     let base = resolve_commit(root, base)?;
     // The locks the profiles produce now, plus any the base had: a profile
     // or OS the change removes must show up as removed, not drop out.
-    let mut lock_files = std::collections::BTreeSet::from([MISE_LOCK.to_owned()]);
+    let mut lock_files = std::collections::BTreeSet::from([
+        MISE_LOCK.to_owned(),
+        launchers::POSIX.to_owned(),
+        launchers::WINDOWS.to_owned(),
+    ]);
     lock_files.extend(
         profiles
             .targets()
@@ -139,7 +144,24 @@ fn file_now(root: &Path, file: &str) -> Result<Option<String>> {
 /// Read one lock's versions. A lock that does not parse is an error: reading
 /// it as empty would report every package in it as added or removed.
 fn collect(file: &str, text: &str, into: &mut Versions) -> Result<()> {
-    if file == MISE_LOCK {
+    if file == launchers::POSIX || file == launchers::WINDOWS {
+        // One row per launcher: the mise it starts, and a digest of the file
+        // in the form git stores it (LF), so a regenerated launcher at an
+        // unchanged version shows up too and a CRLF checkout does not.
+        use sha2::Digest as _;
+        let version =
+            launchers::version_in(file, text).with_context(|| format!("invalid {file}"))?;
+        let digest = sha2::Sha256::digest(text.replace("\r\n", "\n").as_bytes());
+        let digest = digest.iter().take(6).fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        into.insert(
+            (file.to_owned(), "mise".to_owned()),
+            format!("{version}-{digest}"),
+        );
+    } else if file == MISE_LOCK {
         // One row per platform, with the digest's first characters after the
         // version, so a digest swapped at an unchanged version still shows up
         // in the table the update pull request is opened with. A URL changed
@@ -640,6 +662,32 @@ mod tests {
             let err = collect(file, &text, &mut Versions::new()).unwrap_err();
             assert_eq!(format!("{err:#}"), format!("{file}: {expected}"));
         }
+    }
+
+    /// A launcher's row is the mise it starts plus a digest of the file as
+    /// git stores it: a regenerated launcher shows up even at the same
+    /// version, and a CRLF checkout of `mise.cmd` does not.
+    #[test]
+    fn a_launcher_row_is_its_version_and_a_digest_of_its_stored_form() {
+        let row = |file: &str, text: &str| {
+            let mut into = Versions::new();
+            collect(file, text, &mut into).unwrap();
+            into.remove(&(file.to_owned(), "mise".to_owned())).unwrap()
+        };
+        let windows = "@echo off\nset \"pinned_version=2026.10.25\"\n";
+        let cell = row(launchers::WINDOWS, windows);
+        assert!(cell.starts_with("2026.10.25-"), "{cell}");
+        assert_eq!(
+            row(launchers::WINDOWS, &windows.replace('\n', "\r\n")),
+            cell
+        );
+        assert_ne!(
+            row(launchers::WINDOWS, &format!("{windows}rem regenerated\n")),
+            cell
+        );
+        let posix = "mise_version=\"${MISE_VERSION:-2026.11.1}\"\n";
+        assert!(row(launchers::POSIX, posix).starts_with("2026.11.1-"));
+        assert!(collect(launchers::POSIX, "no version", &mut Versions::new()).is_err());
     }
 
     /// The table does not rely on `deps check` having run: a name or version

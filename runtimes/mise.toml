@@ -64,5 +64,8 @@ run = [
   "\"{{mise_bin}}\" upgrade --bump",
   "\"{{mise_bin}}\" lock",
   "\"{{mise_bin}}\" exec -- cargo xtask deps lock --upgrade --cooldown-days 7",
+  # mise itself: regenerate the bootstrap launchers in bin/ for the newest
+  # release past the cooldown (MANIFEST.md has the command it runs).
+  "cargo xtask deps launchers --mise \"{{mise_bin}}\" --cooldown-days 7",
   "cargo xtask deps check",
 ]

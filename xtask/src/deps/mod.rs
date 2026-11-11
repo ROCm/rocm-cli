@@ -9,6 +9,7 @@
 
 mod check;
 mod diff;
+mod launchers;
 mod lock;
 mod mise_lock;
 /// The generator `crates/rocm-deps/build.rs` runs, compiled in so `deps check`
@@ -61,6 +62,30 @@ pub(crate) enum DepsCommand {
     /// Download every binary `runtimes/mise.lock` records and check its
     /// SHA-256 against the lock (network).
     VerifyDownloads,
+    /// Regenerate the mise bootstrap launchers in `runtimes/bin/` for the
+    /// newest mise release at least `--cooldown-days` old, if that is newer
+    /// than the one they pin (network).
+    Launchers {
+        /// The mise binary that looks up releases and generates the launchers.
+        #[arg(long)]
+        mise: std::path::PathBuf,
+        /// How many days old a release must be.
+        #[arg(long)]
+        cooldown_days: u32,
+    },
+    /// Check that `runtimes/bin/`'s launchers are exactly what the launchers
+    /// in `--base` (from before an update) generate for the version they pin,
+    /// and that a changed version is newer and at least `--cooldown-days` old
+    /// (network).
+    VerifyLaunchers {
+        /// A directory holding the launchers from before the update, as
+        /// `mise` and `mise.cmd`; its `mise` is run.
+        #[arg(long)]
+        base: std::path::PathBuf,
+        /// How many days old a release must be.
+        #[arg(long)]
+        cooldown_days: u32,
+    },
     /// Print a Markdown table of versions changed since a git revision.
     Diff {
         /// Revision to compare against.
@@ -83,6 +108,14 @@ pub(crate) fn run(command: DepsCommand) -> Result<()> {
         DepsCommand::Check => check::run(),
         DepsCommand::Diff { base } => diff::run(&base),
         DepsCommand::VerifyDownloads => verify::run(),
+        DepsCommand::Launchers {
+            mise,
+            cooldown_days,
+        } => launchers::run_upgrade(mise, cooldown_days),
+        DepsCommand::VerifyLaunchers {
+            base,
+            cooldown_days,
+        } => launchers::run_verify(&base, cooldown_days),
     }
 }
 
@@ -122,31 +155,19 @@ mod tests {
         }
     }
 
-    /// Both bootstrap launchers start the same mise, and the Windows CI step
-    /// that runs `mise.cmd` expects that version. Bumping mise means
-    /// regenerating both launchers (MANIFEST.md) and this step together.
+    /// Both bootstrap launchers start the same mise, with the checksums
+    /// embedded for that version. Nothing else spells the version: the weekly
+    /// update moves the launchers alone (`deps launchers`), and the Windows
+    /// CI step reads the version from `mise.cmd`.
     #[test]
     fn the_launchers_pin_the_same_mise() {
         let root = crate::paths::workspace_root().unwrap();
         let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
-        let between = |text: &str, start: &str, end: &str| -> String {
-            let from = text.find(start).unwrap_or_else(|| panic!("no {start:?}")) + start.len();
-            text[from..from + text[from..].find(end).unwrap()].to_owned()
-        };
-        let windows = between(
-            &read("runtimes/bin/mise.cmd"),
-            "set \"pinned_version=",
-            "\"",
-        );
-        let posix = between(&read("runtimes/bin/mise"), "${MISE_VERSION:-", "}");
-        assert_eq!(
-            windows, posix,
-            "the two launchers pin different mise versions"
-        );
+        let version = super::launchers::pinned(&root).unwrap();
         // The POSIX launcher's embedded checksums apply only while its
         // `current_version` is the default; otherwise it falls back to fetching
         // SHASUMS256.txt.
-        let posix_text = read("runtimes/bin/mise");
+        let posix_text = read(super::launchers::POSIX);
         let current: Vec<&str> = posix_text
             .lines()
             .filter_map(|l| l.trim().strip_prefix("current_version=\"v"))
@@ -155,32 +176,25 @@ mod tests {
             !current.is_empty(),
             "the POSIX launcher embeds a current_version"
         );
-        for version in current {
+        for embedded in current {
             assert_eq!(
-                version,
-                format!("{posix}\""),
+                embedded,
+                format!("{version}\""),
                 "current_version drifted from the default"
             );
         }
-        // The regeneration command and the doc that cite the version.
+        // MANIFEST.md records the command, not a version that would go stale
+        // on the next weekly update.
+        let manifest = read("MANIFEST.md");
         assert!(
-            read("MANIFEST.md").contains(&format!("install-script --version {windows} ")),
-            "MANIFEST.md must record the command for mise {windows}"
+            manifest
+                .contains("install-script --version <version> --write runtimes/bin/mise --windows"),
+            "MANIFEST.md must record the command that generates the launchers"
         );
         assert!(
-            read("docs/runtime-dependencies.md").contains(&format!("(mise {windows})")),
-            "docs/runtime-dependencies.md must name mise {windows}"
-        );
-        // A whole line, `|| exit /b 1` included: without it a version
-        // mismatch would print and still pass the step.
-        let check = format!(
-            "findstr /b /c:\"{windows} \" \"%RUNNER_TEMP%\\mise-version.txt\" || exit /b 1"
-        );
-        assert!(
-            read(".github/workflows/ci.yml")
-                .lines()
-                .any(|line| line.trim() == check),
-            "the Windows CI step must fail unless mise reports {windows}: `{check}`"
+            !manifest.contains(&version)
+                && !read("docs/runtime-dependencies.md").contains(&format!("mise {version}")),
+            "the mise version is spelled only in the launchers"
         );
     }
 
@@ -211,8 +225,16 @@ mod tests {
         let flag = format!("--cooldown-days {days}\"");
         assert_eq!(
             mise.matches(&flag).count(),
-            2,
-            "both `lock` and `update` must pass `--cooldown-days {days}`"
+            3,
+            "`lock`, and `update`'s re-lock and launcher steps, must pass `--cooldown-days {days}`"
+        );
+        // The weekly update's `check` job holds the launchers to the same wait.
+        assert!(
+            read(".github/workflows/runtime-deps-update.yml").lines().any(|l| l.trim()
+                == format!(
+                    "cargo xtask deps verify-launchers --base \"$RUNNER_TEMP/base-launchers\" --cooldown-days {days}"
+                )),
+            "the update's check job must verify the launchers with --cooldown-days {days}"
         );
     }
 }
