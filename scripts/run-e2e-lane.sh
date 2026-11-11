@@ -144,6 +144,9 @@ export ROCM_CLI_ROCMD_BINARY="${CARGO_TARGET_DIR}/release/rocmd"
 # the build. A failure is returned, not fatal, so the next channel still runs.
 run_channel() {
   local channel="$1"
+  # The suite writes here, and a channel must not report the last one's files,
+  # even when its own preflight fails below. Returned, not ignored: the caller's `||` turns `set -e` off in here.
+  rm -rf tests/e2e-cucumber/results || return $?
   # The first channel's preflight ran before the build. A later one runs after
   # the previous suite, which may have left a model server on the GPU, as each
   # channel's job in nightly.yml starts with its own.
@@ -153,9 +156,6 @@ run_channel() {
   preflight_done=1
   local prewarm="${work}/prewarm-${channel}"
   export E2E_SHARED_RUNTIMES_DIR="${prewarm}/data/runtimes"
-  # The suite writes here, and a channel must not report the last one's files.
-  # Returned, not ignored: the caller's `||` turns `set -e` off in here.
-  rm -rf tests/e2e-cucumber/results || return $?
   HF_HOME="${E2E_SHARED_CACHE_DIR}/huggingface" \
     UV_CACHE_DIR="${E2E_SHARED_UV_CACHE_DIR}" \
     cargo xtask e2e-prewarm --channel "${channel}" --prewarm-dir "${prewarm}" ||

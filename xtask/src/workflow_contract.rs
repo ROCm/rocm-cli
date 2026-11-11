@@ -9316,6 +9316,8 @@ permissions:
         checksum_ok: bool,
         cargo_installed: bool,
         out_blocked: bool,
+        /// The preflight call (1-based) that fails, if any.
+        preflight_fails_on: Option<u32>,
     }
 
     #[cfg(unix)]
@@ -9330,6 +9332,7 @@ permissions:
                 checksum_ok: true,
                 cargo_installed: true,
                 out_blocked: false,
+                preflight_fails_on: None,
             }
         }
     }
@@ -9369,7 +9372,14 @@ permissions:
         .expect("copy the lane script");
         std::fs::write(
             root.join(".github/scripts/gpu-preflight.sh"),
-            "echo \"preflight ran\"\n",
+            format!(
+                "echo \"preflight ran\"\n\
+                 n=0; [ -f \"{counter}\" ] && read -r n < \"{counter}\"\n\
+                 n=$((n + 1)); echo \"$n\" > \"{counter}\"\n\
+                 [ \"$n\" -ne {fails_on} ]\n",
+                counter = dir.path().join("preflight-calls").display(),
+                fails_on = case.preflight_fails_on.unwrap_or(0),
+            ),
         )
         .expect("stub the preflight");
         if case.out_blocked {
@@ -9591,6 +9601,27 @@ permissions:
         assert_eq!(rc, 1, "{log}");
         assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
         assert!(log.contains("channel release failed (status 1)"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_channel_whose_preflight_fails_does_not_report_the_last_ones_results() {
+        // The second preflight call is the second channel's. It fails, so that
+        // channel never ran its suite: it must report nothing, not a copy of
+        // the first channel's results, and the lane is red.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(2),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+        assert!(!out.join("nightly/results/junit.xml").exists(), "{log}");
+        assert!(log.contains("channel nightly failed"), "{log}");
     }
 
     #[cfg(unix)]
