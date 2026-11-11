@@ -534,14 +534,25 @@ cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ig
 Run the cross-platform smoke test:
 
 ```bash
-python scripts/smoke_local.py
+cargo xtask smoke
 ```
 
 If the workspace is already built:
 
 ```bash
-python scripts/smoke_local.py --skip-build
+cargo xtask smoke --skip-build
 ```
+
+`--profile release` builds and smokes release binaries; it builds only the four
+binaries the gate runs (`rocm`, `rocmd`, `rocm-engine-lemonade` and
+`rocm-engine-vllm`), not the whole workspace. `--target-dir <dir>` builds into
+that directory and looks for the binaries there; without it, a configured
+`CARGO_TARGET_DIR` is honoured, and otherwise `target`. The build is always
+given that directory, so a `build.target-dir` in cargo config does not move it.
+Before its first check, a run names the binaries' directory and the throwaway
+state root it uses. The build's output streams as it runs. Each smoked command
+must finish within three minutes; one that does not is killed and the gate
+fails naming it, though a process that command started can outlive it.
 
 ### Property tests
 
@@ -4559,7 +4570,7 @@ rule the report applies before publishing, so a release version is never
 published as `unknown`; `release_tag_grammar_is_the_same_everywhere` in
 [build.rs](../apps/rocm/build.rs) holds that rule equal in build.rs,
 [release.yml](../.github/workflows/release.yml) and
-[smoke_local.py](../scripts/smoke_local.py). Scenario
+[smoke.rs](../xtask/src/smoke.rs) (`cargo xtask smoke`). Scenario
 `diagnose-58` in
 [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
 the field equals that leading version and that the version is the one the ref
