@@ -469,6 +469,26 @@ where
 /// applies equally to the chat `services` tool, which renders through the same
 /// [`crate::services_text::render_services_text`].
 ///
+/// # The decision, recorded (review on #678)
+///
+/// This is accepted rather than merely observed. `rocm services list` and the
+/// chat `services` tool can both block ~18s on a host whose engines are slow to
+/// answer, and for the duration the built-in probe holds the process-wide
+/// engine env lock [`with_scoped_builtin_engine_env`] takes, so a concurrent
+/// caller waits behind it.
+///
+/// Two cheaper options were considered and not taken. Moving the probe off the
+/// render path means the row stops reflecting the host at the moment it is
+/// printed, which is the whole reason ROCMAI-550 added it — the `device:` row
+/// exists to answer "what is this actually running on *now*". Probing once and
+/// printing nothing for the rest makes the output depend on service ordering,
+/// which reads as a bug to anyone who lists twice and sees different rows.
+///
+/// Both remain reasonable calls and this one is reversible: it is a constant and
+/// a start gate, not a structural choice. If a maintainer prefers a 10s hard
+/// cap, the change is a per-probe deadline, which needs a cancellable probe
+/// (see below) rather than a smaller number here.
+///
 /// Why not a per-probe deadline that would hold the total at 10s: the probe is
 /// `engine_request`, which for a built-in engine is a synchronous in-process
 /// call and for an external plugin is a `wait()` on a spawned child. Neither
