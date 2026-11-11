@@ -4424,7 +4424,8 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   Hugging Face token variable set, and checks that the listing, `HEAD` and
   range requests carry no `Authorization` or `Cookie` header.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
-  host-memory states (dedicated, none, unknown, APU), what is attached to a
+  host-memory states (dedicated, none, unknown, an APU's measured shared pool,
+  an APU whose pool could not be read), what is attached to a
   curated or non-GGUF answer (nothing beyond a note on a flag that did not
   apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
   reference quoted for a shell), the plan a sized estimate keeps when it
@@ -4439,6 +4440,25 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   and the note for a mask on a host whose GPUs differ in memory. Both are unit
   tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
   lane has GPUs of different sizes.
+- The APU memory pool (ROCMAI-912). An APU has no private VRAM: every adapter
+  query reports the fixed BIOS carve-out while the engine allocates from system
+  memory, so the pool a recipe minimum is compared against is read separately by
+  `detect_host_unified_memory_gib` in
+  [unified_memory.rs](../crates/rocm-core/src/host_gpu/unified_memory.rs).
+  Scenarios `diagnose-59`, `diagnose-60` and `diagnose-61` plant a simulated host
+  (`ROCM_CLI_TEST_HOST_ROOT`) carrying a KFD node and a DRM card with both
+  counters, so they run on the ungated lane and describe the same machine
+  whatever GPU the runner has: an APU judged on its aperture and reported
+  `degraded` because the pool is shared, an APU whose aperture is absent told so
+  rather than handed a fabricated figure, and a discrete card judged on its own
+  VRAM with the aperture beside it ignored. The Linux reader has its own planted
+  tree in [linux.rs](../crates/rocm-core/src/host_gpu/linux.rs). **The Windows
+  source has unit coverage only**: it reads
+  `DXGI_ADAPTER_DESC1::SharedSystemMemory` through COM, the host-simulation seam
+  re-roots Linux paths only, and no Windows lane runs on an APU whose pool
+  differs from its carve-out. The adapter choice and the implausible-reading rule
+  are pure functions tested on every platform; the FFI around them is not
+  exercised by any test.
 
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes

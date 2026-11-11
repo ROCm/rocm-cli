@@ -1767,11 +1767,13 @@ const OVERSIZED_MODEL_REF: &str = "glm5";
 /// The smallest curated recipe (2 GiB minimum). Any machine that measured
 /// dedicated GPU memory can serve it, so the "ready" half of diagnose-22 holds
 /// on every discrete-GPU lane rather than only the Instinct one. An APU lane
-/// does not qualify for that half even though `amd-smi` telemetry exists
-/// there too: it names the BIOS carve-out, not the pool the engine allocates
-/// from, so those hosts report no measured figure and land in the
-/// "could not measure" half instead, alongside hosts with no GPU at all and
-/// hosts with no telemetry whatsoever.
+/// reaches that half too, on the `degraded` branch it allows: its measured
+/// figure is the shared pool read by `rocm_core::detect_host_unified_memory_gib`
+/// (`amd-smi`'s own reading there is the BIOS carve-out, not the pool the
+/// engine allocates from), and a ceiling on memory shared with the operating
+/// system can never promise `ready`. Only an APU whose pool could not be read
+/// at all lands in the "could not measure" half, alongside hosts with no GPU
+/// and hosts with no telemetry whatsoever.
 const SMALLEST_MODEL_REF: &str = "qwen-smoke";
 
 /// A recipe index path that cannot exist, used to make the catalog source
@@ -1950,12 +1952,15 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
     // here, and reporting a memory verdict instead would be true and useless.
     // A third has a GPU whose memory it could not read at all, which is a gap
     // in what the CLI can see and must not be dressed up as a verdict about
-    // the model. The fourth is an APU: `amd-smi` telemetry exists, but it
-    // names the BIOS carve-out rather than the pool the engine allocates
-    // from, and there is no command that makes the right pool readable today
-    // -- so that gap earns its own reason, distinct from the no-telemetry-at-
-    // all case, and no dead-end remediation. None of the four may be reported
-    // as "this model is too big for you".
+    // the model. The fourth is an APU whose shared pool could not be read on
+    // this particular host (an older kernel with no `mem_info_gtt_total`, a
+    // container with no DRM device passed through): `amd-smi` telemetry
+    // exists, but it names the BIOS carve-out rather than the pool the engine
+    // allocates from, and running it again would answer identically forever --
+    // so that gap earns its own reason, distinct from the no-telemetry-at-all
+    // case, and no dead-end remediation. An APU whose pool IS readable never
+    // reaches this step: it reports a figure, and diagnose-59 covers it.
+    // None of the four may be reported as "this model is too big for you".
     let evidence = model_field(&model, "evidence").to_string();
     match model_verdict(&model) {
         "blocked" => {
@@ -2037,8 +2042,9 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
                 );
                 assert!(
                     model_field(&model, "fix").is_null(),
-                    "there is no command that makes the APU's pool readable today; offering one \
-                     would be a dead end: {model:#}"
+                    "nothing this host can run makes its pool readable -- `amd-smi` already ran \
+                     and named the carve-out, and would answer identically forever; offering a \
+                     command would be a dead end: {model:#}"
                 );
             }
             other => panic!(
@@ -2124,9 +2130,12 @@ async fn assert_fitting_model_is_ready(world: &mut E2eWorld) {
     if available < required {
         return;
     }
-    // `degraded` is allowed alongside `ready`: a machine whose system RAM is
-    // below the recipe's recommendation still runs it, and calling that a
-    // failure would make the scenario a test of the runner's RAM.
+    // `degraded` is allowed alongside `ready` for two reasons, and both are
+    // properties of the lane rather than of the model: a machine whose system
+    // RAM is below the recipe's recommendation still runs it, and an APU's
+    // measured figure is a ceiling on memory shared with the operating system,
+    // which never promises `ready` (ROCMAI-912). Calling either a failure would
+    // make this scenario a test of the runner's hardware.
     assert!(
         matches!(model_verdict(&model), "ready" | "degraded"),
         "this machine measured {available} GiB against a {required} GiB recipe, so the model runs \
@@ -4101,5 +4110,230 @@ async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
         reported,
         super::examine_steps::expected_leading_version(reference),
         "the report's cli_version does not follow from the ref ({first_line})"
+    );
+}
+
+// ── An integrated GPU's shared memory pool (ROCMAI-912) ────────────
+
+/// `gfx_target_version` for gfx1151 (Strix Halo), in the kernel's decimal
+/// encoding: major 11, minor 5, step 1.
+const GFX1151_TARGET_VERSION: u32 = 110_501;
+
+/// `gfx_target_version` for gfx1100 (Radeon RX 7900 / PRO W7900), a discrete
+/// part that `gfx_is_apu_family` does not match.
+const GFX1100_TARGET_VERSION: u32 = 110_000;
+
+/// A 4 GiB BIOS carve-out, in bytes: what every adapter query reports as an
+/// APU's memory, and what a fit check must NOT be reached against.
+const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// A 60 GiB aperture, in bytes: a Strix-Halo-shaped `mem_info_gtt_total`. Far
+/// enough from the carve-out that a verdict reached against the wrong one is
+/// unmistakable in the report.
+const APERTURE_BYTES: u64 = 60 * 1024 * 1024 * 1024;
+
+/// Plant a single-GPU machine under the simulated host root
+/// (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by `e2e-test-hooks` builds), as
+/// one KFD compute node plus one amdgpu DRM card.
+///
+/// The DRM card is what carries the memory counters, and planting it is what
+/// makes the scenario describe the same machine on every lane: with no
+/// `/dev/kfd` under the root, the `amd-smi` pre-flight declines, so the CLI
+/// falls back to these sysfs counters instead of the runner's real telemetry.
+/// `mem_info_vram_used` is planted too, because the fallback drops a card whose
+/// occupancy it cannot read rather than guessing it is empty.
+///
+/// `gtt_total` is `None` for the host whose aperture is unreadable.
+fn plant_single_gpu_with_memory(
+    world: &mut E2eWorld,
+    gfx_target_version: u32,
+    vram_total_bytes: u64,
+    gtt_total_bytes: Option<u64>,
+) {
+    let host = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+
+    // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
+    // GPU rather than a CPU node.
+    let node = host.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        format!("cpu_cores_count 0\nsimd_count 256\ngfx_target_version {gfx_target_version}\n"),
+    )
+    .expect("failed to write the planted KFD node properties");
+
+    let device = host.join("sys/class/drm/card0/device");
+    std::fs::create_dir_all(&device).expect("failed to create the planted DRM card");
+    // The AMD PCI vendor id, which is what marks this as an amdgpu card.
+    std::fs::write(device.join("vendor"), "0x1002\n").expect("failed to plant the vendor id");
+    std::fs::write(
+        device.join("mem_info_vram_total"),
+        format!("{vram_total_bytes}\n"),
+    )
+    .expect("failed to plant the VRAM total");
+    std::fs::write(device.join("mem_info_vram_used"), "0\n").expect("failed to plant the VRAM use");
+    if let Some(gtt) = gtt_total_bytes {
+        std::fs::write(device.join("mem_info_gtt_total"), format!("{gtt}\n"))
+            .expect("failed to plant the GTT aperture");
+    }
+
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+
+    // An `lspci` listing an empty bus, ahead of any real one, so the PCI probe
+    // succeeds on every runner without describing the runner's own cards -- the
+    // same reason `machine_with_an_unsupported_gpu` plants one.
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("shared-pool-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+/// Bytes as the GiB figure the report carries.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+#[given("a machine whose only GPU shares system memory, with the pool it may use readable")]
+async fn machine_with_a_readable_shared_pool(world: &mut E2eWorld) {
+    plant_single_gpu_with_memory(
+        world,
+        GFX1151_TARGET_VERSION,
+        CARVE_OUT_BYTES,
+        Some(APERTURE_BYTES),
+    );
+}
+
+#[given("a machine whose only GPU shares system memory, with the pool it may use unreadable")]
+async fn machine_with_an_unreadable_shared_pool(world: &mut E2eWorld) {
+    // Same machine, minus `mem_info_gtt_total`: the shape an older kernel or a
+    // container with no DRM device passed through presents.
+    plant_single_gpu_with_memory(world, GFX1151_TARGET_VERSION, CARVE_OUT_BYTES, None);
+}
+
+#[given("a machine whose only GPU is a discrete card that also reports a system-memory aperture")]
+async fn machine_with_a_discrete_card_and_an_aperture(world: &mut E2eWorld) {
+    // 8 GiB of real VRAM beside the same 60 GiB aperture the APU above has.
+    // The driver reports `mem_info_gtt_total` for a discrete card too; the
+    // point is that it must not reach the verdict.
+    plant_single_gpu_with_memory(
+        world,
+        GFX1100_TARGET_VERSION,
+        8 * 1024 * 1024 * 1024,
+        Some(APERTURE_BYTES),
+    );
+}
+
+#[then("the memory the answer was reached against is the shared pool, not the carve-out")]
+async fn assert_the_verdict_used_the_shared_pool(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    let measured = measured_gpu_gib(&model).unwrap_or_else(|| {
+        panic!(
+            "an APU whose aperture is readable must report a measured figure, not nothing: \
+             {model:#}"
+        )
+    });
+    assert!(
+        (measured - gib(APERTURE_BYTES)).abs() < 0.01,
+        "the verdict must be reached against the {} GiB aperture; {} GiB is the {} GiB \
+         carve-out or something else entirely: {model:#}",
+        gib(APERTURE_BYTES),
+        measured,
+        gib(CARVE_OUT_BYTES)
+    );
+}
+
+#[then("the model is reported as degraded, because the pool is shared rather than set aside")]
+async fn assert_shared_pool_is_degraded_with_its_reason(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "degraded",
+        "a ceiling on memory shared with the operating system is not an allocation, so it \
+         cannot promise READY -- and the model clears it, so it is not BLOCKED either: {model:#}"
+    );
+    // The verdict word alone would also be produced by the system-RAM
+    // softening, which has nothing to do with the shared pool, so the reason is
+    // asserted too (AGENTS.md section 3: the message and the state together).
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        evidence.contains("shares with the operating system"),
+        "the report has to say why it will not call this ready, or `degraded` reads as a \
+         property of the model: {evidence}"
+    );
+}
+
+#[then(
+    "the reason given is that the shared pool could not be read, and no memory figure is claimed"
+)]
+async fn assert_unreadable_shared_pool_claims_no_figure(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "unified_memory_unreadable",
+        "this host is an APU whose pool could not be read -- not a host with no telemetry at \
+         all, whose remedy is to run `amd-smi` again: {model:#}"
+    );
+    assert_eq!(
+        measured_gpu_gib(&model),
+        None,
+        "nothing measured the pool, so no figure may be claimed for it -- installed system RAM \
+         least of all, which over-estimates in the one direction that produces a wrong \
+         \"it fits\": {model:#}"
+    );
+    // And the carve-out must not have been smuggled in as the answer either.
+    assert!(
+        !model_field(&model, "evidence")
+            .as_array()
+            .expect("evidence is not an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|line| line.contains("offers 4.0 GiB")),
+        "the BIOS carve-out is not this host's pool and must not be reported as one: {model:#}"
+    );
+}
+
+#[then("the memory the answer was reached against is the card's own VRAM alone")]
+async fn assert_a_discrete_card_is_judged_on_its_vram(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    let measured = measured_gpu_gib(&model)
+        .unwrap_or_else(|| panic!("a discrete card's VRAM is measured: {model:#}"));
+    assert!(
+        (measured - 8.0).abs() < 0.01,
+        "a discrete card is judged on its 8 GiB of VRAM: 68 GiB would mean the aperture was \
+         added to it (and every model would then fit), {} GiB that it replaced it: {model:#}",
+        gib(APERTURE_BYTES)
+    );
+    assert_eq!(
+        model_verdict(&model),
+        "ready",
+        "8 GiB of dedicated VRAM clears this recipe, and a dedicated card is not a shared \
+         pool, so it stays READY: {model:#}"
     );
 }

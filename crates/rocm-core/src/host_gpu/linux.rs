@@ -220,6 +220,69 @@ pub(super) fn linux_drm_amdgpu_card_count() -> Option<usize> {
     Some(count)
 }
 
+/// The amdgpu GTT aperture cap, in bytes, for the one AMD DRM card this host
+/// has. `None` when there is no such figure to read.
+///
+/// `mem_info_gtt_total` is the kernel's own ceiling on how much system memory
+/// the amdgpu allocator may hand out as GPU-addressable GTT. That is the pool an
+/// engine serves a model from on an APU, where `mem_info_vram_total` reports only
+/// the fixed BIOS carve-out. It is a *measurement*, not the "half of installed
+/// RAM" rule of thumb that happens to be the driver's default: `amdgpu.gttsize`
+/// and the BIOS both move it, and the point of reading the file is that whatever
+/// moved it is already accounted for.
+///
+/// Reads through [`host_path`], so the E2E suite can plant one.
+#[cfg(target_os = "linux")]
+pub(super) fn linux_drm_amdgpu_gtt_total_bytes() -> Option<u64> {
+    linux_drm_amdgpu_gtt_total_bytes_in(&host_path("/sys/class/drm"))
+}
+
+/// [`linux_drm_amdgpu_gtt_total_bytes`] against a caller-supplied DRM class
+/// directory, so it can be driven from a planted tree rather than only on a
+/// machine that has the file. Same seam as [`linux_kfd_gpu_node_count_in`].
+///
+/// Enumerates primary `card<N>` nodes the same way
+/// [`linux_drm_amdgpu_card_count`] does (connector sub-nodes like `card0-DP-1`
+/// skipped, [`is_amdgpu_device`] deciding what is an AMD card) and answers only
+/// when **exactly one** AMD card is found. More than one card is ambiguous: this
+/// figure is attributed to a particular device by the caller, and the GTT
+/// aperture is per-device, so handing back one card's figure for a host that has
+/// two would name the wrong pool. Zero AMD cards is `None`, the same "nothing to
+/// report" the caller gets from an unreadable file.
+#[cfg(any(target_os = "linux", test))]
+fn linux_drm_amdgpu_gtt_total_bytes_in(drm_dir: &Path) -> Option<u64> {
+    let mut found: Option<u64> = None;
+    let mut cards = 0usize;
+    for entry in fs::read_dir(drm_dir).ok()?.flatten() {
+        let card_path = entry.path();
+        let Some(name) = card_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device_dir = card_path.join("device");
+        if !is_amdgpu_device(&device_dir) {
+            continue;
+        }
+        cards += 1;
+        if let Some(bytes) = read_sysfs_u64(&device_dir.join("mem_info_gtt_total")) {
+            found = Some(bytes);
+        }
+    }
+    // A single AMD card only: see the doc comment.
+    if cards == 1 { found } else { None }
+}
+
+/// A sysfs file whose whole contents are one unsigned integer. `None` when the
+/// file is absent, unreadable, or holds something else -- which is the
+/// "unparseable" half of what keeps
+/// [`crate::model_readiness::AcceleratorMemory::UnifiedMemoryUnreadable`] alive.
+#[cfg(any(target_os = "linux", test))]
+fn read_sysfs_u64(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+}
+
 /// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
 /// GPU" (topology readable with no GPU node, or no KFD device at all); `None`
 /// means the topology could not be read even though `/dev/kfd` exists, so
@@ -474,6 +537,104 @@ mod tests {
         fs::write(root.join("uevent"), "DRIVER=i915\n")?;
         assert!(!is_amdgpu_device(&root));
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// Plant one DRM card under `drm_dir`, with whatever of the two memory
+    /// counters the caller names.
+    fn plant_drm_card(
+        drm_dir: &Path,
+        name: &str,
+        vendor: &str,
+        gtt_total: Option<&str>,
+        vram_total: Option<&str>,
+    ) -> Result<()> {
+        let device = drm_dir.join(name).join("device");
+        fs::create_dir_all(&device)?;
+        fs::write(device.join("vendor"), format!("{vendor}\n"))?;
+        if let Some(gtt) = gtt_total {
+            fs::write(device.join("mem_info_gtt_total"), format!("{gtt}\n"))?;
+        }
+        if let Some(vram) = vram_total {
+            fs::write(device.join("mem_info_vram_total"), format!("{vram}\n"))?;
+        }
+        Ok(())
+    }
+
+    /// The whole point of the file: on an APU the VRAM counter beside it is the
+    /// BIOS carve-out and the GTT counter is the pool the engine allocates
+    /// from. They are read from the same directory and must not be confused,
+    /// so both are planted and only one is expected back.
+    #[test]
+    fn the_gtt_aperture_is_read_and_not_the_vram_carve_out() -> Result<()> {
+        let (root, _) = temp_app_paths("drm-gtt-aperture");
+        let drm = root.join("drm");
+        // A Strix-Halo-shaped reading: a ~4 GiB carve-out beside a 60 GiB
+        // aperture.
+        let gtt = 64_424_509_440_u64; // 60 GiB
+        plant_drm_card(
+            &drm,
+            "card0",
+            "0x1002",
+            Some(&gtt.to_string()),
+            Some("4294967296"),
+        )?;
+        // A connector sub-node must not be mistaken for a second card.
+        fs::create_dir_all(drm.join("card0-DP-1"))?;
+
+        let found = linux_drm_amdgpu_gtt_total_bytes_in(&drm);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(found, Some(gtt));
+        Ok(())
+    }
+
+    /// Absent, unparseable, non-AMD and absent-directory all read as "no figure
+    /// to report" -- which is what keeps `UnifiedMemoryUnreadable` alive rather
+    /// than letting a failed read become a number.
+    #[test]
+    fn an_unreadable_gtt_aperture_reports_nothing_rather_than_a_number() -> Result<()> {
+        let (root, _) = temp_app_paths("drm-gtt-unreadable");
+
+        // An AMD card with no `mem_info_gtt_total` (an older kernel).
+        let absent = root.join("absent");
+        plant_drm_card(&absent, "card0", "0x1002", None, Some("4294967296"))?;
+        assert_eq!(linux_drm_amdgpu_gtt_total_bytes_in(&absent), None);
+
+        // A file holding something that is not a count.
+        let garbage = root.join("garbage");
+        plant_drm_card(&garbage, "card0", "0x1002", Some("not-a-number"), None)?;
+        assert_eq!(linux_drm_amdgpu_gtt_total_bytes_in(&garbage), None);
+
+        // A card that is not AMD's: `i915` exposes no such file, and even if a
+        // directory carried one it is not an AMD part's aperture.
+        let intel = root.join("intel");
+        plant_drm_card(&intel, "card0", "0x8086", Some("64424509440"), None)?;
+        assert_eq!(linux_drm_amdgpu_gtt_total_bytes_in(&intel), None);
+
+        // No DRM class directory at all.
+        assert_eq!(
+            linux_drm_amdgpu_gtt_total_bytes_in(&root.join("nowhere")),
+            None
+        );
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    /// Two AMD cards: the aperture is per-device and the caller attributes the
+    /// answer to one GPU, so handing back whichever card `read_dir` happened to
+    /// reach last would name the wrong pool. Answer only when there is one card
+    /// to mean.
+    #[test]
+    fn two_amd_cards_leave_the_gtt_aperture_unattributable() -> Result<()> {
+        let (root, _) = temp_app_paths("drm-gtt-two-cards");
+        let drm = root.join("drm");
+        plant_drm_card(&drm, "card0", "0x1002", Some("64424509440"), None)?;
+        plant_drm_card(&drm, "card1", "0x1002", Some("8589934592"), None)?;
+
+        let found = linux_drm_amdgpu_gtt_total_bytes_in(&drm);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(found, None);
         Ok(())
     }
 

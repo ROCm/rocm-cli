@@ -139,9 +139,9 @@ pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
     WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
     detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
-    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
-    is_wsl_host, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
-    windows_amd_gpu_listing,
+    detect_host_gpu_summary, detect_host_unified_memory_gib, detect_system_ram_gib,
+    has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, preferred_serve_engine_for_host_gpu_summary,
+    usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
