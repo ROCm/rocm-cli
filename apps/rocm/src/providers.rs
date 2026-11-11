@@ -1751,6 +1751,16 @@ mod tests {
     fn ready_service_that_dies_mid_chunked_stream(
         name: &str,
     ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
+        ready_service_streaming_one_chunk_then_closing(
+            name,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n",
+        )
+    }
+
+    fn ready_service_streaming_one_chunk_then_closing(
+        name: &str,
+        chunk: &'static str,
+    ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
         let (root, paths) = temp_app_paths(name);
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -1763,7 +1773,6 @@ mod tests {
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                 )?;
-                let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
                 write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
                 stream.flush()?;
                 // Returning drops the stream: the client sees EOF on a chunk boundary.
@@ -1902,15 +1911,20 @@ mod tests {
         let (outcome, served) = client_then_server(&receiver, server);
         fs::remove_dir_all(root).ok();
 
-        let metrics = outcome.map_err(|_| {
+        let smoke = outcome.map_err(|_| {
             anyhow::anyhow!(
                 "the serve smoke test never returned after the engine closed the connection"
             )
         })?;
-        // Empty metrics are also what a smoke test that never reached the
+        // A failed outcome is also what a smoke test that never reached the
         // engine returns, so this is what makes the assertion below mean
         // "the engine died mid-answer" rather than "nothing happened".
         served.transpose()?;
+        let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke.clone() else {
+            anyhow::bail!("a stream that died mid-answer was reported as measured: {smoke:?}");
+        };
+        assert!(!reason.is_empty() && !reason.contains('\n'), "{reason:?}");
+        let (metrics, smoke_failure) = smoke.into_parts();
         assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
         let rendered =
             crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {
@@ -1923,11 +1937,47 @@ mod tests {
                 status: "ready".to_owned(),
                 already_running: false,
                 metrics,
+                smoke_failure,
                 api_key: None,
                 notes: Vec::new(),
             });
+        assert!(
+            rendered.starts_with("Deployment summary (smoke test failed)\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("started, smoke test failed"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("  ready\n"), "{rendered}");
         assert!(rendered.contains("time to first token  n/a"));
         assert!(rendered.contains("throughput (approx)  n/a"));
+        assert!(rendered.contains(&reason), "{rendered}");
+        assert!(rendered.contains("`rocm logs --service svc-ready`"));
+        Ok(())
+    }
+
+    /// A 200 stream that ends without ever carrying content (an engine that
+    /// accepts the request and answers with nothing) is a failed smoke test, not
+    /// a ready deployment with empty metrics.
+    #[test]
+    fn serve_smoke_test_fails_when_the_stream_carries_no_content() -> Result<()> {
+        let (root, paths, server) = ready_service_streaming_one_chunk_then_closing(
+            "serve-smoke-no-content",
+            "data: [DONE]\n\n",
+        )?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
+        });
+        let (outcome, served) = client_then_server(&receiver, server);
+        fs::remove_dir_all(root).ok();
+        let smoke = outcome.map_err(|_| anyhow::anyhow!("the smoke test never returned"))?;
+        served.transpose()?;
+        assert!(
+            matches!(&smoke, crate::serve_summary::SmokeOutcome::Failed(reason) if !reason.is_empty()),
+            "an empty stream was not reported as a failure: {smoke:?}"
+        );
         Ok(())
     }
 

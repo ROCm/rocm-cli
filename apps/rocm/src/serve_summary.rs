@@ -62,12 +62,56 @@ pub(crate) struct DeploymentSummary {
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,
     pub metrics: SmokeMetrics,
+    /// Why the post-launch smoke test failed, as one sanitised line. `None` when
+    /// the test passed or was not run; `Some` keeps the summary from presenting
+    /// the service as ready.
+    pub smoke_failure: Option<String>,
     /// The endpoint API key for a freshly launched *public* server, shown once as
     /// secure client configuration. `None` for loopback binds (no auth) and for an
     /// already-running service (whose key was delivered at its own launch).
     pub api_key: Option<String>,
     /// GPU/device warnings folded in from the serve plan.
     pub notes: Vec<String>,
+}
+
+/// Result of the post-launch smoke test.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SmokeOutcome {
+    /// The server streamed a first token; the metrics are what was measured.
+    Measured(SmokeMetrics),
+    /// The request errored or produced no content; carries a one-line reason.
+    Failed(String),
+}
+
+impl SmokeOutcome {
+    /// Splits the outcome into the summary's `metrics` and `smoke_failure` fields.
+    pub(crate) fn into_parts(self) -> (SmokeMetrics, Option<String>) {
+        match self {
+            Self::Measured(metrics) => (metrics, None),
+            Self::Failed(reason) => (SmokeMetrics::default(), Some(reason)),
+        }
+    }
+}
+
+/// Longest failure reason kept for display.
+const SMOKE_FAILURE_MAX_CHARS: usize = 200;
+
+/// Reduces an error message (which may embed an engine's HTTP error body
+/// verbatim) to one printable line: control characters and runs of whitespace
+/// become a single space, and the result is length-capped.
+fn one_line_reason(raw: &str) -> String {
+    let collapsed = raw
+        .split(|ch: char| ch.is_whitespace() || ch.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() > SMOKE_FAILURE_MAX_CHARS {
+        let mut cut: String = collapsed.chars().take(SMOKE_FAILURE_MAX_CHARS).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        collapsed
+    }
 }
 
 /// Render `Some(ttft)` as a human duration, or `n/a` when the probe did not
@@ -102,8 +146,11 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     // note must make that visibly different from a healthy deployment so the
     // summary is never mistaken for success.
     let ready = summary.status == "ready";
+    let smoke_failed = summary.smoke_failure.is_some() && !summary.already_running;
     let heading = if summary.already_running {
         "Deployment summary (already running)"
+    } else if smoke_failed {
+        "Deployment summary (smoke test failed)"
     } else if ready {
         "Deployment summary"
     } else {
@@ -132,7 +179,14 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         .collect();
     let rows: Vec<(&str, String)> = [
         vec![
-            ("status", summary.status.clone()),
+            (
+                "status",
+                if smoke_failed {
+                    "started, smoke test failed".to_owned()
+                } else {
+                    summary.status.clone()
+                },
+            ),
             ("engine", summary.engine.clone()),
         ],
         model_rows,
@@ -187,6 +241,15 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             out,
             "  note: {explanation} - follow `rocm logs --service {} --follow` or check `rocm services list`",
             summary.service_id
+        );
+    }
+    if let (true, Some(reason)) = (smoke_failed, summary.smoke_failure.as_deref()) {
+        // The server answered its health check, but the first request failed, so
+        // it is not known to serve. Say why the metrics rows are empty.
+        let _ = writeln!(
+            out,
+            "  note: the smoke test request failed, so no metrics were measured and the server may not be able to serve requests: {reason} - check `rocm logs --service {id}` and `rocm services list`",
+            id = summary.service_id
         );
     }
     for note in &summary.notes {
@@ -281,9 +344,10 @@ pub(crate) fn oom_memory_note(
 
 /// Run a single small chat completion against the just-started local server and
 /// measure time-to-first-token and generation throughput. Best-effort: any error
-/// (server not OpenAI-compatible, refused, timed out) yields empty metrics rather
-/// than failing the launch.
-pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeMetrics {
+/// (server not OpenAI-compatible, refused, timed out, died mid-answer) or a
+/// response with no content yields [`SmokeOutcome::Failed`] with the reason,
+/// rather than failing the launch.
+pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeOutcome {
     let request = ChatRequest {
         model: Some(api_model.to_owned()),
         messages: vec![ChatMessage {
@@ -316,11 +380,19 @@ pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeMetrics 
         },
     );
 
-    if result.is_err() {
-        return SmokeMetrics::default();
+    if let Err(err) = result {
+        return SmokeOutcome::Failed(one_line_reason(&format!("{err:#}")));
+    }
+    if first_token.is_none() {
+        return SmokeOutcome::Failed("the server returned no content".to_owned());
     }
 
-    compute_metrics(start, first_token, last_token, token_chunks)
+    SmokeOutcome::Measured(compute_metrics(
+        start,
+        first_token,
+        last_token,
+        token_chunks,
+    ))
 }
 
 /// Pure metric math, split out so it can be unit-tested without a live server.
@@ -466,6 +538,7 @@ mod tests {
                 ttft: Some(Duration::from_millis(180)),
                 gen_tps: Some(42.15),
             },
+            smoke_failure: None,
             api_key: None,
             notes: Vec::new(),
         }
@@ -1159,5 +1232,94 @@ mod tests {
             notes.is_empty(),
             "an OOM line beyond the shared tail budget must not surface the note: {notes:?}"
         );
+    }
+
+    fn failed_summary(reason: &str) -> DeploymentSummary {
+        let mut summary = base_summary();
+        summary.metrics = SmokeMetrics::default();
+        summary.smoke_failure = Some(reason.to_owned());
+        summary
+    }
+
+    #[test]
+    fn a_failed_smoke_test_is_not_presented_as_ready_and_says_why() {
+        let rendered = render_summary(&failed_summary("connection closed mid-response"));
+        assert!(
+            rendered.starts_with("Deployment summary (smoke test failed)\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("status               started, smoke test failed"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("status               ready"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("time to first token  n/a"), "{rendered}");
+        assert!(rendered.contains("throughput (approx)  n/a"), "{rendered}");
+        assert!(
+            rendered.contains("connection closed mid-response"),
+            "{rendered}"
+        );
+        // The remediation names commands that exist and take these arguments.
+        assert!(
+            rendered
+                .contains("`rocm logs --service vllm-qwen-1720000000` and `rocm services list`"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_passing_or_skipped_smoke_test_adds_no_failure_note() {
+        let passed = render_summary(&base_summary());
+        assert!(passed.starts_with("Deployment summary\n"), "{passed}");
+        assert!(!passed.contains("smoke test"), "{passed}");
+        // `--no-smoke-test`: default metrics, no failure recorded.
+        let mut skipped = base_summary();
+        skipped.metrics = SmokeMetrics::default();
+        let skipped = render_summary(&skipped);
+        assert!(skipped.starts_with("Deployment summary\n"), "{skipped}");
+        assert!(!skipped.contains("smoke test"), "{skipped}");
+        assert!(skipped.contains("status               ready"), "{skipped}");
+    }
+
+    #[test]
+    fn an_already_running_summary_ignores_a_smoke_failure() {
+        let mut summary = failed_summary("boom");
+        summary.already_running = true;
+        let rendered = render_summary(&summary);
+        assert!(
+            rendered.starts_with("Deployment summary (already running)\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("smoke test"), "{rendered}");
+    }
+
+    #[test]
+    fn smoke_outcome_splits_into_summary_fields() {
+        let metrics = SmokeMetrics {
+            ttft: Some(Duration::from_millis(5)),
+            gen_tps: None,
+        };
+        assert_eq!(
+            SmokeOutcome::Measured(metrics.clone()).into_parts(),
+            (metrics, None)
+        );
+        assert_eq!(
+            SmokeOutcome::Failed("x".to_owned()).into_parts(),
+            (SmokeMetrics::default(), Some("x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn failure_reason_is_one_line_without_control_characters_and_capped() {
+        let reason = one_line_reason("HTTP 500\r\n{\"error\":\t\"boom\"}\u{1b}[31m red\u{7}\n\n");
+        assert!(!reason.chars().any(char::is_control), "{reason:?}");
+        assert_eq!(reason, "HTTP 500 {\"error\": \"boom\"} [31m red");
+        let long = one_line_reason(&"x".repeat(5000));
+        assert_eq!(long.chars().count(), SMOKE_FAILURE_MAX_CHARS + 3);
+        assert!(long.ends_with("..."));
+        assert_eq!(one_line_reason("short"), "short");
     }
 }
