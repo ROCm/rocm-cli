@@ -1253,6 +1253,68 @@ async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
 }
 
+// ── Two dashboards at once (dash-52) ───────────────────────────────
+
+/// Wait until `tui`'s header says it is connected to a telemetry daemon.
+///
+/// The header carries the socket path and is cut off before "rocm daemon" at
+/// the default 80-column pty, so the terminal is widened first. Match
+/// "· rocm daemon" rather than "connected", which "disconnected" contains.
+async fn wait_until_connected(tui: &mut TuiSession, which: &str) {
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge {which}: {e}"));
+    tui.wait_for_screen_where(
+        "the connected header",
+        |screen| screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{which} is not connected to a telemetry daemon: {e}"));
+}
+
+fn second_session(world: &mut E2eWorld) -> &mut TuiSession {
+    world
+        .second_tui
+        .as_mut()
+        .expect("no second dashboard is open for this scenario")
+}
+
+#[then("the dashboard is connected to its telemetry daemon")]
+async fn dashboard_connected(world: &mut E2eWorld) {
+    wait_until_connected(session(world), "the dashboard").await;
+}
+
+/// Same isolated environment as the first, so the same socket path: the
+/// second dashboard finds the first one's daemon there.
+#[when("the user opens a second dashboard")]
+async fn open_second_dashboard(world: &mut E2eWorld) {
+    let tui = TuiSession::spawn(world, &["dash"])
+        .unwrap_or_else(|e| panic!("failed to open a second dashboard: {e}"));
+    world.second_tui = Some(tui);
+}
+
+#[then("the second dashboard is connected to its telemetry daemon")]
+async fn second_dashboard_connected(world: &mut E2eWorld) {
+    wait_until_connected(second_session(world), "the second dashboard").await;
+}
+
+#[when("the user quits the first dashboard")]
+async fn quit_first_dashboard(world: &mut E2eWorld) {
+    quit_tui(world, "the first dashboard").await;
+}
+
+/// The first dashboard ran the daemon, so its exit drops the second one's
+/// connection. The header the second one showed before that still reads
+/// connected, so a check made straight away could pass on that frame; the
+/// pause gives the client time to see the connection close and redraw as
+/// disconnected (it does so at once), after which only a daemon that is
+/// serving again brings the connected header back.
+#[then("the second dashboard is connected to its telemetry daemon again")]
+async fn second_dashboard_connected_again(world: &mut E2eWorld) {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_until_connected(second_session(world), "the second dashboard").await;
+}
+
 /// Send the plain quit gesture and nothing else — unlike `quit_dashboard`,
 /// this does not wait for (or resolve) the quit-confirm prompt that may open
 /// (issue #145), since the point of this step is to observe that prompt.
@@ -2605,6 +2667,11 @@ fn assert_tui_opened(world: &E2eWorld) {
 
 #[then("the dashboard exits successfully")]
 async fn dashboard_exited(world: &mut E2eWorld) {
+    assert_tui_opened(world);
+}
+
+#[then("the first dashboard exits successfully")]
+async fn first_dashboard_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 

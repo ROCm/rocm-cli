@@ -8,8 +8,9 @@
 //! telemetry daemon's [`RunnerOptions`] — wiring `services_dir =
 //! AppPaths::services_dir()` so the managed services that `rocm serve --managed`
 //! writes there surface live in the dashboard (the D7 registry→scrape→`gen_tps`
-//! seam) — auto-starts an embedded daemon when none is already listening, and
-//! runs the ratatui dashboard TUI.
+//! seam) — keeps the embedded telemetry daemon available through
+//! [`crate::dash_daemon`] (served by whichever open dashboard owns the socket),
+//! and runs the ratatui dashboard TUI.
 //!
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
@@ -129,12 +130,12 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
 /// been deleted — leaves the directive frozen at its last value, pinning the
 /// logical clock rather than restoring wall time. The warning goes to `tracing`, not
 /// stdout/stderr. It is reached through [`runner_options`], which runtime code
-/// calls only from [`maybe_spawn_embedded_daemon`]; `run_async` calls that only
+/// calls only from [`crate::dash_daemon::spawn_keeper`]; `run_async` calls that only
 /// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for an
 /// interactive `rocm chat` (including the launcher's routes into them; a
 /// non-interactive `rocm chat` renders text and never enters `run_async`), not
 /// for a focused overlay or `rocm dash --replay`/`--demo`. All of this is
-/// unix-only: on Windows [`maybe_spawn_embedded_daemon`] never calls
+/// unix-only: on Windows [`crate::dash_daemon::spawn_keeper`] never calls
 /// [`runner_options`], so no entry point reaches the warning. On the paths that
 /// do reach it, the process is about to hand the terminal to the TUI, and the
 /// client log is file-only (see `logging.rs`), so a stray stdout/stderr write
@@ -995,8 +996,8 @@ async fn run_async(
     // A live daemon is only needed for a connected full dashboard; replay/demo
     // feeds events straight into the TUI, and a focused host draws no telemetry
     // and streams its own job via the job-bridge — both skip the embedded daemon.
-    let embedded = if should_spawn_daemon(&args) {
-        maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await
+    let keeper = if should_spawn_daemon(&args) {
+        crate::dash_daemon::spawn_keeper(&args.connect, &config, &paths).await
     } else {
         None
     };
@@ -1005,12 +1006,11 @@ async fn run_async(
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()));
 
-    // Tidy up the embedded daemon on exit (best-effort).
-    if let Some((handle, socket)) = embedded {
-        handle.abort();
-        if let Some(path) = socket {
-            let _ = std::fs::remove_file(path);
-        }
+    // Stop this dashboard's keeper before the runtime goes. If it owned the
+    // daemon, that removes the daemon's socket so another open dashboard can
+    // take over; if it did not, the owner's socket is left alone.
+    if let Some(handle) = keeper {
+        crate::dash_daemon::stop_keeper(handle).await;
     }
     result
 }
@@ -1023,57 +1023,6 @@ async fn run_async(
 /// Pure predicate → unit-testable. Call after `args.replay` is set in `run_async`.
 const fn should_spawn_daemon(args: &ResolvedArgs) -> bool {
     args.replay.is_none() && args.focus.is_none()
-}
-
-/// Auto-start an embedded telemetry daemon when no local one is already
-/// listening, so `rocm dash` works without a separate `rocm daemon` terminal.
-/// Returns the task handle + socket to clean up on exit, or `None` when an
-/// existing daemon was found (we connect to it instead).
-// One function with `#[cfg]` blocks inside, not a cfg-split pair: the unix
-// body awaits, the Windows body does not. Callers `.await` this either way,
-// so dropping `async` off unix would not compile.
-#[allow(clippy::unused_async)]
-async fn maybe_spawn_embedded_daemon(
-    connect: &str,
-    config: &RocmCliConfig,
-    paths: &AppPaths,
-) -> Option<(tokio::task::JoinHandle<()>, Option<PathBuf>)> {
-    #[cfg(unix)]
-    {
-        // Only auto-manage a LOCAL unix-socket daemon.
-        let target = connect.strip_prefix("unix:")?;
-        if tokio::net::UnixStream::connect(target).await.is_ok() {
-            return None; // a daemon already answers here
-        }
-
-        let opts = runner_options(config, paths, false);
-        let listen = connect.to_string();
-        let socket = Some(PathBuf::from(target));
-
-        let handle = tokio::spawn(async move {
-            if let Err(e) = rocm_dash_daemon::server::run(&listen, opts).await {
-                eprintln!("rocm: embedded telemetry daemon exited: {e:#}");
-            }
-        });
-        // Poll until the daemon has bound and is accepting connections.
-        // A fixed sleep is race-prone on slow or loaded systems.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if tokio::net::UnixStream::connect(target).await.is_ok() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break; // Proceed anyway; the TUI client will retry with backoff.
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        Some((handle, socket))
-    }
-    #[cfg(windows)]
-    {
-        let _ = (connect, config, paths);
-        None
-    }
 }
 
 #[cfg(test)]
@@ -1627,7 +1576,7 @@ mod tests {
         assert!(!opts.enable_docker);
     }
 
-    /// EAI-7359 regression: the embedded daemon (`maybe_spawn_embedded_daemon`)
+    /// EAI-7359 regression: the embedded daemon (`dash_daemon::spawn_keeper`)
     /// always calls `runner_options(.., enable_docker=false)`, so the vLLM
     /// Prometheus scraper must NOT be gated on `enable_docker` — otherwise it
     /// is permanently dead in the common no-Docker / managed-vLLM case even

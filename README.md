@@ -236,7 +236,10 @@ the legacy full-screen setup assistant has been retired.
 ### The dashboard (`rocm dash`)
 
 The full-screen telemetry dashboard shows every instrument and action on one screen.
-It auto-starts an embedded `rocmd` daemon when none is running, then presents
+On Linux it runs its telemetry daemon inside the dashboard itself, with no
+separate service to start. Several dashboards open at once share one daemon,
+and when the dashboard running it closes, one that is still open takes it
+over, so the others reconnect. It presents
 five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 
 | Tab | What it shows |

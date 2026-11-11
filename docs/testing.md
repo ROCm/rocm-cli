@@ -3857,6 +3857,35 @@ the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
 
+## Two Dashboards Share One Telemetry Daemon
+
+Every live `rocm dash` of a user points at one unix socket, and the telemetry
+daemon behind it runs inside a dashboard process. Which dashboard serves it,
+and what a daemon may do to a path it finds occupied, is covered at two levels.
+
+The daemon's socket claim, in the `mod tests` of
+[server.rs](../crates/rocm-dash-daemon/src/server.rs), one test per state the
+path can be in: a live owner (`a_second_daemon_refuses_a_live_socket_instead_of_replacing_it`),
+a live daemon from a build without the lock (`an_answering_socket_without_a_lock_holder_is_left_in_place`),
+a lock holder whose socket does not answer (`a_lock_holder_keeps_the_path_even_when_its_socket_looks_stale`),
+a stale socket from a dead daemon (`a_stale_socket_from_a_dead_daemon_is_replaced`),
+a path that is not a socket (`a_path_that_is_not_a_socket_is_never_removed`),
+a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`)
+and several daemons racing (`exactly_one_of_several_concurrent_daemons_binds`).
+The dashboard's keeper, in [dash_daemon.rs](../apps/rocm/src/dash_daemon.rs):
+a surviving dashboard takes over when the owner leaves, and closing one that
+never owned the daemon leaves it alone. All of these are unix only.
+
+End to end, `dash-52` in
+[dash.feature](../tests/e2e-cucumber/features/dash.feature) opens two
+dashboards in one pseudo-terminal environment, quits the first and requires the
+second to show the connected header again. It runs on the Linux no-GPU lane
+with a simulated GPU-less host, like `dash-37`:
+
+```bash
+cargo xtask e2e -- -n "dash-52"
+```
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global

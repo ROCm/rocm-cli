@@ -1044,6 +1044,30 @@ Expected result:
   nothing to compare. Start around 30 rows, confirm both are present, then
   shrink past the drop and confirm both go at once.
 
+### 4d. Two Dashboards At Once
+
+**Linux or WSL only.** There is no daemon socket on Windows.
+
+Open two terminals and run `rocm dash` in each, the first one first. Then quit
+the first dashboard with `q`.
+
+Expected result:
+
+- Both headers read `connected · <host> · rocm daemon <version>` while both
+  are open (widen the terminal if the header is cut off before it).
+- After the first dashboard quits, the second one's header may read
+  `disconnected` for a moment, then reads `connected · ... · rocm daemon` again
+  within a few seconds, and its figures keep updating. A second dashboard that
+  stays `disconnected` is the bug this checks for.
+- The same holds when the first dashboard is killed instead of quit
+  (`kill -9 <pid>` from a third terminal).
+- Quitting the second dashboard as well leaves no `rocmdashd.sock` in the
+  socket directory (`$XDG_RUNTIME_DIR` when it is set); the
+  `rocmdashd.sock.lock` file beside it is expected to stay.
+- Opening a dashboard while a regular file sits at the socket path leaves the
+  file in place; the header reads `disconnected` and the client log names the
+  path and says it is not a socket.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are

@@ -174,6 +174,10 @@ pub struct E2eWorld {
     /// mock server and isolated directory so the child process never outlives
     /// the scenario. `None` for the non-interactive (piped `Command`) scenarios.
     pub tui: Option<e2e::tui_driver::TuiSession>,
+    /// A second dashboard open at the same time as `tui`, sharing its isolated
+    /// environment and so its telemetry socket (dash-52). Torn down in `Drop`
+    /// right after `tui`, for the same reasons.
+    pub second_tui: Option<e2e::tui_driver::TuiSession>,
     /// Set by the "interactive chat uses an offline assistant" step so the chat
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
@@ -385,6 +389,7 @@ impl Default for E2eWorld {
             command_env: Vec::new(),
             command_dir: None,
             tui: None,
+            second_tui: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
             comfyui_baseline_distributions: None,
@@ -719,6 +724,9 @@ impl Drop for E2eWorld {
         // may be talking to stops and before the isolated dir it reads is
         // removed — so it never outlives the scenario or races teardown.
         if let Some(tui) = self.tui.take() {
+            drop(tui);
+        }
+        if let Some(tui) = self.second_tui.take() {
             drop(tui);
         }
         // Stop the automation daemon before the isolated directory it writes its
