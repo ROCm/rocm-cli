@@ -357,19 +357,19 @@ required for merging and so is skipped in the merge queue rather than left
 queued on limited runner capacity after its PR has merged) when the workflow's
 own `changes` job's `serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
-group of their own, so none is cancelled or replaced by another. Merging or
-closing a pull request also starts a run (`closed` is a listed `pull_request`
-activity type) that joins that PR's group and runs only a no-op job, so it
-supersedes the PR's earlier run and frees runners where the cancel completes.
-A run whose job is still queued for a runner may not finish cancelling, so it
-can keep its place in the queue until the runner picks the job up. The heavy
+group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
 lane: they run only on the other lanes, and the only vLLM serve before a change
 lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
 matches. `push` fires on `main` and on any `release/**` branch, so pushing to
 a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
-branch.
+branch. Merging or closing a pull request also starts a run (`closed` is a
+listed `pull_request` activity type) that joins that PR's group and runs only a
+no-op job, so it supersedes the PR's earlier run and frees runners where the
+cancel completes. A run whose job is still queued for a runner may not finish
+cancelling, so it can keep its place in the queue until the runner picks the
+job up.
 
 On a release-branch push, every self-hosted GPU job additionally expands into
 a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three

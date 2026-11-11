@@ -7492,54 +7492,73 @@ jobs:
             );
         }
 
-        // Every other job must skip when `changes` skips: either its own `if`
-        // requires `changes` to have succeeded (the lanes) or it keys off a
-        // `changes` output, which is empty for a skipped job (`e2e-report`).
-        let jobs = top_level_block(&sh, "jobs");
-        let ids: Vec<&str> = jobs
-            .lines()
-            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
-            .filter_map(|l| l.trim().strip_suffix(':'))
-            .filter(|id| {
-                !id.is_empty()
-                    && id
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            })
-            .collect();
-        assert!(
-            ids.contains(&"e2e-report"),
-            "extractor sanity check: {ids:?}"
-        );
+        // Every other job must skip when `changes` skips. Each `if` is pinned in
+        // full, not by prefix: an `||` arm appended to a lane's condition (as
+        // `&&` binds tighter than `||`) would make it true whatever `changes`
+        // did, while a prefix check still passed. A new job has no entry here
+        // and fails until it is added, which is the point: someone must decide
+        // how it behaves on `closed`.
+        let lane_if = |extra: &str, platform: &str| {
+            format!(
+                "always() && needs.changes.result == 'success' && {extra}\
+                 ( (github.event_name != 'workflow_dispatch' \
+                 && needs.changes.outputs.serve == 'true') \
+                 || (github.event_name == 'workflow_dispatch' \
+                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+            )
+        };
+        let expected: Vec<(&str, String)> = vec![
+            (
+                "e2e-gpu",
+                lane_if("github.event_name != 'merge_group' && ", "app-dev-gpu"),
+            ),
+            ("e2e-gpu-strix-ubuntu", lane_if("", "strix-ubuntu")),
+            ("e2e-gpu-strix-windows", lane_if("", "strix-windows")),
+            ("e2e-wsl", lane_if("", "strix-wsl")),
+            ("e2e-gpu-w7900", lane_if("", "w7900")),
+            // Skips because the `serve` output of a skipped `changes` is empty.
+            (
+                "e2e-report",
+                "always() && (needs.changes.outputs.serve == 'true' \
+                 || github.event_name == 'workflow_dispatch')"
+                    .to_owned(),
+            ),
+        ];
+        let ids = job_ids(&sh);
         for id in ids
             .iter()
-            .filter(|id| !["changes", "pr-closed"].contains(id))
+            .filter(|id| !["changes", "pr-closed"].contains(&id.as_str()))
         {
+            let (_, want) = expected
+                .iter()
+                .find(|(name, _)| name == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "job `{id}` has no pinned `if`: add it, deciding how it behaves on `closed`"
+                    )
+                });
             let block = uncommented_job_block(&sh, id);
-            let condition = job_level_if(&block);
-            if *id == "e2e-report" {
-                // Skips because the `serve` output of a skipped `changes` is empty.
-                assert!(
-                    condition.starts_with("always() && (needs.changes.outputs.serve == 'true'"),
-                    "`e2e-report` must open with `always() && (needs.changes.outputs.serve == \
-                     'true'`, so it skips on `closed`; its `if` is `{condition}`"
-                );
-                continue;
-            }
-            // A lane's `if` must START with the `changes` gate: an `||` arm or a
-            // reordered operand would make it run when `changes` is skipped.
-            assert!(
-                condition.starts_with("always() && needs.changes.result == 'success'"),
-                "lane `{id}` must open with `always() && needs.changes.result == 'success'`, \
-                 so it skips on `closed`; its `if` is `{condition}`"
+            assert_eq!(
+                &job_level_if(&block),
+                want,
+                "job `{id}` must skip when `changes` is skipped (a closed PR)"
             );
-            // `changes` is skipped on `closed`, so its matrix output is empty;
-            // the fallback keeps the strategy evaluable.
+            if *id != "e2e-report" {
+                // `changes` is skipped on `closed`, so its matrix output is empty;
+                // the fallback keeps the strategy evaluable.
+                assert!(
+                    block.contains(
+                        "fromJSON(needs.changes.outputs.sdk_version_matrix || '[\"current\"]')"
+                    ),
+                    "lane `{id}` must fall back to `[\"current\"]` when the matrix output is \
+                     empty:\n{block}"
+                );
+            }
+        }
+        for (name, _) in &expected {
             assert!(
-                block.contains(
-                    "fromJSON(needs.changes.outputs.sdk_version_matrix || '[\"current\"]')"
-                ),
-                "lane `{id}` must fall back to `[\"current\"]` when the matrix output is empty:\n{block}"
+                ids.iter().any(|id| id == name),
+                "pinned job `{name}` is gone"
             );
         }
     }
