@@ -37,3 +37,22 @@ Feature: Model catalog listing
     Given a recipe catalog whose AIM entry was last verified long ago
     When the user asks for the model catalog in verbose detail
     Then the catalog warns that the AIM entry may no longer be current
+
+  # The catalog is also read by tool-using clients — the dashboard's Chat tab
+  # and any MCP client — and what they were handed was the verbose listing, not
+  # the recommendation list a person sees. On a developer host that is 189 KB
+  # against under 1 KB, which is more than a locally served model's whole
+  # context, so asking the assistant what this machine can run ended with the
+  # model's provider refusing the request instead of an answer.
+  @id:model-catalog-tool-client-gets-the-recommendations
+  Scenario: model-catalog-04 - A tool-using client asking about models gets the recommendations
+    When a tool-using client asks for the model catalog
+    Then the client is given the recommended models without the per-recipe diagnostics
+    And what the client is given is small enough for a locally served model to read
+
+  # The diagnostics are not gone, they are opt-in: a client that wants them
+  # asks for them, the same way a person types `rocm model --verbose`.
+  @id:model-catalog-tool-client-can-ask-for-diagnostics
+  Scenario: model-catalog-05 - A tool-using client can still ask for the full diagnostics
+    When a tool-using client asks for the model catalog in verbose detail
+    Then the client is given the per-recipe diagnostics
