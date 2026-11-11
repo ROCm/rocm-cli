@@ -1142,6 +1142,7 @@ mod tests {
             ],
         );
         assert!(has_line(&check_job, "    needs: propose"));
+        assert!(has_line(&check_job, "    timeout-minutes: 30"));
         assert!(has_line(
             &check_job,
             "    if: needs.propose.outputs.changed == 'true'"

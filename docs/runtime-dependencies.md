@@ -33,8 +33,13 @@ adapter checks its download against that digest, so a version and its digests
 can only move together. uv is pinned only as lock tooling, so no constants are
 generated for it. The Python stacks are locked here but not yet read by an
 installer: until they are, the versions vLLM installs are still also spelled
-in [`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs) (see the last
-section).
+in [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) and
+[`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs) (the older
+`wheels.vllm.ai` route); see the last section. A test ties the versions in
+`discover_builds.rs`'s ROCm 10.1 row to the vLLM profile, but not its index:
+that row installs from AMD's staging host
+(`rocm.frameworks-prereleases.amd.com`), while the lock resolves from
+`rocm.frameworks.amd.com`.
 
 ## Commands
 
@@ -280,6 +285,7 @@ follow-ups, each its own change with its own scenarios:
 1. `rocm install sdk` (release channel) installs from the SDK lock for the
    host's arch instead of resolving at install time.
 2. vLLM installs from its lock, replacing the tables in
+   [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) and
    [`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs). The vLLM 0.29.1
    and flash-attn 2.8.3 builds that lock holds have known HIGH CVEs and are
    the newest AMD publishes for ROCm 10.1, so the pull-request security scan
