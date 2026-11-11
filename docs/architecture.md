@@ -627,9 +627,9 @@ HTML and markdown reporting for the cucumber E2E suite, consumed only by `xtask`
 | [`components.rs`](../crates/e2e-report/src/components.rs) | Shared maud HTML fragments plus the CSS and timestamp helpers both report generators use. | flat |
 | [`consolidated/mod.rs`](../crates/e2e-report/src/consolidated/mod.rs) | The `PlatformReport` model, the reconciled scenario by platform `Grid`, the `PlatformReports` bundle and `load_platform_reports`, plus the report text both renderers share. | domain |
 | [`consolidated/descriptor.rs`](../crates/e2e-report/src/consolidated/descriptor.rs) | Artifact-name identity: parses an artifact or directory name into platform, OS and channel, and owns the platform-label rule. | domain |
-| [`consolidated/html.rs`](../crates/e2e-report/src/consolidated/html.rs) | The HTML renderer for the consolidated report. | domain |
+| [`consolidated/html.rs`](../crates/e2e-report/src/consolidated/html.rs) | The HTML renderer for the consolidated report. It does not render `PlatformVersions::provenance()`: the GFX target and package source appear only in the Markdown output (the wiki page and the step summary that shares its renderer). | domain |
 | [`consolidated/markdown.rs`](../crates/e2e-report/src/consolidated/markdown.rs) | The markdown renderer, including the table piped into `$GITHUB_STEP_SUMMARY`. | domain |
-| [`consolidated/sidecars.rs`](../crates/e2e-report/src/consolidated/sidecars.rs) | Schema and parsing for the `platform.json` manifest and the `commands.jsonl` record. | domain |
+| [`consolidated/sidecars.rs`](../crates/e2e-report/src/consolidated/sidecars.rs) | Schema and parsing for the `platform.json` manifest (including the per-lane `gfx_target` and package `source` shown as provenance) and the `commands.jsonl` record. | domain |
 | [`consolidated/test_support.rs`](../crates/e2e-report/src/consolidated/test_support.rs) | Test-only fixtures shared by the `consolidated/` tests. | flat |
 | [`parse.rs`](../crates/e2e-report/src/parse.rs) | The cucumber `report.json` data model, its parsing, and `@expected-failure` evaluation. | flat |
 | [`single_report.rs`](../crates/e2e-report/src/single_report.rs) | Single-platform HTML report generation. | flat |
