@@ -509,6 +509,12 @@ family is substituted for it. `rocm examine` reports the same conclusion on a
 
 These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
 
+`rocm examine` prints that `rocm_support` line on **every** host, not only this
+case, at one of three levels: ROCm/HIP-supported, Vulkan-only (the case above),
+or unknown. Unknown covers both a GPU nothing detected and a target this build's
+catalog does not recognise — detection gaps rather than a verdict about the
+hardware, so neither is reported as "no ROCm build".
+
 #### Compiler toolchain (--devel)
 
 Pass `--devel` to also install the compiler and headers needed to build GPU
