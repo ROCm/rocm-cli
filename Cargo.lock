@@ -6132,6 +6132,7 @@ dependencies = [
  "e2e-report",
  "flate2",
  "proc-macro2",
+ "regex",
  "rocm-core",
  "semver",
  "serde",

@@ -17,6 +17,7 @@ chrono.workspace = true
 clap.workspace = true
 e2e-report = { path = "../crates/e2e-report" }
 proc-macro2.workspace = true
+regex = "1"
 rocm-core = { path = "../crates/rocm-core" }
 semver = { workspace = true }
 serde = { workspace = true }

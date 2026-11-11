@@ -131,7 +131,7 @@ fn displayed_version(version_ref: &str, cargo_pkg_version: &str) -> String {
 /// The release-tag grammar, as an anchored regular expression: `vX.Y.Z`
 /// with an optional non-empty `-pre` or `+build` suffix of ASCII letters,
 /// digits, `.`, `-` and `+`. `release_version` is its implementation, and
-/// release.yml's "Determine version" step and `scripts/smoke_local.py` carry
+/// release.yml's "Determine version" step and `cargo xtask smoke` carry
 /// it verbatim; `release_tag_grammar_is_the_same_everywhere` holds all three
 /// together. The suffix characters are the ones a problem report publishes
 /// (`cli_version` in `crates/rocm-core/src/report.rs`), so a release never
@@ -614,7 +614,7 @@ mod tests {
 
     /// The release-tag grammar lives in three places: `release_version` here,
     /// the "Determine version" check in release.yml and `is_release_tag` in
-    /// scripts/smoke_local.py. The two copies must carry
+    /// `xtask/src/smoke.rs` (`cargo xtask smoke`). The two copies must carry
     /// [`RELEASE_TAG_PATTERN`] and the [`RELEASE_VERSION_MAX_LEN`] bound
     /// verbatim, and the pattern must accept exactly what `release_version`
     /// accepts.
@@ -636,12 +636,15 @@ mod tests {
             workflow.contains(&check),
             "release.yml's tag check is not `{check}`"
         );
-        let smoke = read("scripts/smoke_local.py");
+        let smoke = read("xtask/src/smoke.rs");
         for needle in [
-            format!(r#"RELEASE_TAG = re.compile(r"{RELEASE_TAG_PATTERN}")"#),
-            format!("RELEASE_TAG_MAX_LEN = {tag_max}"),
+            format!(r#"const RELEASE_TAG_PATTERN: &str = r"{RELEASE_TAG_PATTERN}";"#),
+            format!("const RELEASE_TAG_MAX_LEN: usize = {tag_max};"),
         ] {
-            assert!(smoke.contains(&needle), "smoke_local.py lacks `{needle}`");
+            assert!(
+                smoke.contains(&needle),
+                "xtask/src/smoke.rs lacks `{needle}`"
+            );
         }
 
         let pattern = regex::Regex::new(RELEASE_TAG_PATTERN).expect("pattern compiles");
