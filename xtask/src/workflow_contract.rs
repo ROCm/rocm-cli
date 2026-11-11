@@ -7448,6 +7448,11 @@ jobs:
             .to_owned()
     }
 
+    /// How every matrix lane must read its matrix: the placeholder only when
+    /// `changes` was skipped (a closed PR), the real output otherwise.
+    const MATRIX_EXPR: &str = "fromJSON(needs.changes.result == 'skipped' && '[\"current\"]' \
+                                || needs.changes.outputs.sdk_version_matrix)";
+
     #[test]
     fn closing_a_pr_supersedes_its_self_hosted_runs() {
         // A merged or closed PR's queued GPU run is dead work that still takes a
@@ -7498,8 +7503,6 @@ jobs:
         // did, while a prefix check still passed. A new job has no entry here
         // and fails until it is added, which is the point: someone must decide
         // how it behaves on `closed`.
-        const MATRIX_EXPR: &str = "fromJSON(needs.changes.result == 'skipped' && '[\"current\"]' \
-                                    || needs.changes.outputs.sdk_version_matrix)";
         let lane_if = |extra: &str, platform: &str| {
             format!(
                 "always() && needs.changes.result == 'success' && {extra}\
