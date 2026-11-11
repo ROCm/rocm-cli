@@ -583,9 +583,20 @@ regression shows red instead of always green; `e2e-gpu-w7900` runs with
 be flipped to `false` once it has a track record. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
-job, naming the lane, rather than silently dropping out of the grid; on a
+job, naming the lane, rather than silently dropping out of the grid; on the
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
+
+The nightly lanes in [`nightly.yml`](../.github/workflows/nightly.yml) set no
+`continue-on-error` at all, `e2e-gpu-nightly-w7900` and
+`e2e-gpu-nightly-mi350p` included, so a leg that fails turns its lane and the
+whole Nightly run red. Job-level `continue-on-error: true` would instead make
+the failed lane read `success`, both in `needs.<lane>.result` and in the run's
+conclusion. Nightly gates no merge or tag either way, and the consolidated
+report, wiki and release-readiness jobs still run on a red night.
+`e2e_lanes_do_not_mask_failures_with_continue_on_error` in
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs) pins both
+workflows' masked set: empty for nightly, only `e2e-gpu-w7900` per PR.
 
 ### Timeouts on the Strix lanes
 

@@ -3076,9 +3076,8 @@ jobs:
     /// cucumber measures scenario durations by subtracting `SystemTime` stamps, so
     /// a guest whose clock steps backwards mid-run kills the suite (#455 makes that
     /// survivable; this keeps the durations real). The hazard is invisible: the
-    /// step's absence breaks nothing that any other test here observes, and on the
-    /// nightly lane job-level `continue-on-error: true` means a regression would
-    /// not even turn the run red.
+    /// step's absence breaks nothing that any other test here observes: a clock
+    /// that never steps backwards on a given night passes the lane either way.
     ///
     /// Steps are matched as WHOLE LINES, not found as substrings of the job: the
     /// surrounding comments discuss the clock at length, and a comment line that
@@ -4820,9 +4819,11 @@ fi
 
     /// `release-readiness-nightly` must gate E2E lane coverage through
     /// `e2e-report-nightly`'s own result, not through each lane job's own
-    /// `continue-on-error: true`-masked result (which is always `success`
-    /// regardless of what actually happened). Ties the gate to the one place
-    /// that already fails correctly when a lane silently drops out — see
+    /// result. A lane's failing scenarios already reach the gate through the
+    /// consolidated report's failure total, so what is left to catch is a lane
+    /// that uploaded no report, and the report job's own result does that.
+    /// Ties the gate to the one place that fails correctly when a lane
+    /// silently drops out — see
     /// `every_lane_that_runs_is_checked_for_its_report_artifact`, which pins
     /// that `e2e-report-nightly` itself is driven by `LANE_REPORTS` and so
     /// covers every lane, including ones added later, without this job
@@ -4862,8 +4863,8 @@ fi
             assert!(
                 !needs.contains(&lane.to_string()),
                 "release-readiness-nightly must not depend on individual E2E lane job `{lane}` \
-                 directly: continue-on-error on that job means its own `result` is always \
-                 `success`, so gating on it can never fire"
+                 directly: it gates on e2e-report-nightly, whose result also covers a lane \
+                 that uploaded no report, so one copy of the lane list is enough"
             );
         }
 
@@ -4883,6 +4884,72 @@ fi
             "release-readiness-nightly must read --windows-result from \
              needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
              result) -- otherwise a failed Windows nightly build never fails the gate"
+        );
+    }
+
+    /// The lanes whose job-level `continue-on-error` may be `true`, per workflow.
+    ///
+    /// A job-level `continue-on-error: true` does more than keep the run going:
+    /// a failed leg then reads `success` in `needs.<lane>.result` downstream and
+    /// in the run's conclusion, so a broken lane is indistinguishable from a
+    /// passing one everywhere but its own log. The nightly lanes run in separate
+    /// jobs with `fail-fast: false` and the report job runs on `always()`, so
+    /// masking them bought nothing. `e2e-gpu-w7900` in e2e-selfhosted.yml is the
+    /// one deliberate exception, documented in that workflow's header comment
+    /// while the hardware is proven out.
+    fn masked_e2e_lanes(workflow: &str) -> &'static [&'static str] {
+        match workflow {
+            "e2e-selfhosted.yml" => &["e2e-gpu-w7900"],
+            "nightly.yml" => &[],
+            other => panic!("no masked-lane policy known for {other}"),
+        }
+    }
+
+    #[test]
+    fn e2e_lanes_do_not_mask_failures_with_continue_on_error() {
+        for (workflow, text) in self_hosted_workflows() {
+            let lanes = self_hosted_e2e_jobs(&text);
+            // Guards against a vacuous pass: a parsing change that found no
+            // lanes would otherwise check nothing.
+            let expected_lane = match workflow {
+                "e2e-selfhosted.yml" => "e2e-gpu",
+                "nightly.yml" => "e2e-gpu-nightly",
+                other => panic!("no known lane for {other}"),
+            };
+            assert!(
+                lanes.iter().any(|(job, _)| job == expected_lane),
+                "{workflow}: found no `{expected_lane}` among its self-hosted lanes {lanes:?}, \
+                 so nothing below would be checked"
+            );
+            let masked: Vec<&str> = lanes
+                .iter()
+                .filter(|(job, _)| {
+                    yaml_value_at(job_block(&text, job), 4, "continue-on-error")
+                        .is_some_and(|value| value != "false")
+                })
+                .map(|(job, _)| job.as_str())
+                .collect();
+            assert_eq!(
+                masked,
+                masked_e2e_lanes(workflow),
+                "{workflow}: these self-hosted E2E lanes set a job-level \
+                 `continue-on-error` other than `false`. That makes a failed lane read \
+                 `success` in `needs.<lane>.result` and in the run's conclusion, so the \
+                 run goes green while the lane is red. Remove it; if a lane really must \
+                 be non-blocking while its hardware is proven out, document why in the \
+                 workflow and add it to `masked_e2e_lanes`"
+            );
+        }
+
+        // With the lanes unmasked, a failed lane fails its job, and the default
+        // `success()` condition would then skip the consolidated report on the
+        // very night it is worth reading.
+        let nightly = read_workflow("nightly.yml");
+        let condition = job_scalar(job_block(&nightly, "e2e-report-nightly"), "if");
+        assert!(
+            ["always()", "${{ always() }}"].contains(&condition),
+            "e2e-report-nightly must run on `always()` so a failed lane is still \
+             reported; found `if: {condition}`"
         );
     }
 
@@ -5208,7 +5275,7 @@ fi
         );
         let nightly_ids: Vec<String> = nightly_lanes.iter().map(|(job, _)| job.clone()).collect();
         assert_eq!(
-            backticked_list_between(&readme_flat, "as non-blocking lanes (", ") with"),
+            backticked_list_between(&readme_flat, "above, in its own lanes (", ") with"),
             nightly_ids,
             "the E2E README must name every nightly self-hosted lane, in workflow order"
         );

@@ -196,11 +196,11 @@ exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
 The nightly workflow covers a strict superset of the hardware in the table
-above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+above, in its own lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
 `e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-w7900`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
+grid. They gate no merge, but a failing lane turns the Nightly run red. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
 counterpart — both were demoted from per-PR to nightly-only per ROCMAI-125 —
 so nightly is where their regression coverage now lives. The shared
 large-model scenario follows each lane's serve engine: it serves

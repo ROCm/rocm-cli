@@ -136,18 +136,19 @@ fn assemble_facts(
         Some(_) => {}
     }
     // The Total row above only counts platforms whose `report.json` actually
-    // got uploaded — a GPU lane that dies before uploading (preflight
-    // failure, timeout, runner loss) just drops out of it, silently reading
-    // as zero failures. Every lane is `continue-on-error`, so the lane job's
-    // own `needs.<job>.result` reads `success` even when it failed; gating on
-    // that (as an earlier version of this code did) can never fire. Gate on
-    // `e2e-report-nightly`'s result instead: its "every lane that ran
-    // uploaded its report" check (`nightly.yml`, `LANE_REPORTS`) already
-    // fails that job when a lane is silently missing, covering every lane in
-    // `LANE_REPORTS` — including ones added later — for free (a re-run can
-    // pass on an earlier attempt's artifact, so it can still miss a lane). Unlike the
-    // build gates, this job is `if: always()` and has no legitimate
-    // no-op-night skip, so `skipped` isn't accepted here.
+    // got uploaded — a GPU lane that dies before uploading (preflight failure,
+    // timeout, runner loss) just drops out of it, silently reading as zero
+    // failures. Gate on `e2e-report-nightly`'s result rather than each lane
+    // job's own `needs.<job>.result`: the lanes were once `continue-on-error`,
+    // which made those read `success` even when a lane failed, and a lane's
+    // failing scenarios already reach the Total row above, so the one thing
+    // left to catch is a missing report. Its "every lane that ran uploaded its
+    // report" check (`nightly.yml`, `LANE_REPORTS`) already fails that job when
+    // a lane is silently missing, covering every lane in `LANE_REPORTS` —
+    // including ones added later — for free (a re-run can pass on an earlier
+    // attempt's artifact, so it can still miss a lane). Unlike the build gates,
+    // this job is `if: always()` and has no legitimate no-op-night skip, so
+    // `skipped` isn't accepted here.
     if e2e_report_job_result != "success" {
         failing_gates.push(format!("E2E (lane report check: {e2e_report_job_result})"));
     }

@@ -371,8 +371,9 @@ pub(crate) enum Command {
         /// `report.json` (preflight failure, timeout, runner loss), which would
         /// otherwise just vanish from the consolidated E2E report's totals,
         /// reading as zero failures. Gating on this job's result (rather than
-        /// each lane job's own `continue-on-error`-masked result, which is
-        /// always `success`) covers every lane, present and future, for free.
+        /// each lane job's own result) covers every lane, present and future,
+        /// with no second copy of the lane list; a lane's failing scenarios
+        /// already reach the gate through the report's failure total.
         /// Caveat: a re-run can pass on an earlier attempt's artifact, so this
         /// can miss a lane.
         #[arg(long)]
