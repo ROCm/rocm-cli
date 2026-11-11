@@ -13,7 +13,7 @@ use super::scoring::{
     KEYWORDS_COMGR_CONFLICT, KEYWORDS_SHM_TOO_SMALL, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT,
     KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, zero,
 };
-use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH};
+use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH, SymptomEngine};
 use crate::examine::Examination;
 use regex::Regex;
 
@@ -34,6 +34,9 @@ use regex::Regex;
 /// `matched` but can never carry a verdict, and it can no longer lend its anchor
 /// to an OOM elsewhere in the paste. It stays an anchor because the flag is
 /// vLLM-specific, and because a real vLLM OOM often names it on the failing line.
+/// None of this applies when the user names vLLM with `rocm diagnose --engine`:
+/// every non-blank line is then vLLM's by their account, and the anchor plays
+/// no part.
 const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 
 /// A canonical vLLM-OOM `--symptom` string guaranteed to clear
@@ -52,7 +55,8 @@ const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
 
 /// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
-/// `gpu_memory_utilization`), joined by newlines — the only text
+/// `gpu_memory_utilization`), joined by newlines — or every non-blank line when
+/// the user named vLLM as the engine (`engine`, below). That is the only text
 /// [`check_16_vllm_oom`] is allowed to score.
 ///
 /// Co-occurrence anywhere in a pasted log is too loose -- a stray `vllm` mention
@@ -114,13 +118,29 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// silently stops diagnosing it (measured: 95 → 0).
 ///
 /// `\r\n` yields an empty segment, which carries no anchor and is dropped.
-fn vllm_anchored_lines(symptom: &str) -> String {
+///
+/// `engine` is the engine the user said the paste came from. With
+/// [`SymptomEngine::Vllm`] the whole paste is vLLM's by the user's own
+/// account, so every non-blank rendered line counts as anchored, as if the
+/// user had written `vllm` at the start of each of those lines, without
+/// editing their text. Blank lines are dropped, where a prefix would keep them;
+/// a blank line scores nothing either way, so the verdict is the same.
+/// The split still applies then, so a pattern cannot straddle two rendered
+/// lines either way.
+fn vllm_anchored_lines(symptom: &str, engine: Option<SymptomEngine>) -> String {
     let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
         return String::new();
     };
+    let stated_vllm = engine == Some(SymptomEngine::Vllm);
     crate::terminal::rendered_lines(symptom)
         .into_iter()
-        .filter(|line| anchor.is_match(&line.to_lowercase()))
+        .filter(|line| {
+            if stated_vllm {
+                !line.trim().is_empty()
+            } else {
+                anchor.is_match(&line.to_lowercase())
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -129,15 +149,27 @@ fn vllm_anchored_lines(symptom: &str) -> String {
 /// per-GPU VRAM or tenancy fields, so nothing structural can corroborate this —
 /// the user must pass the error via `--symptom`, or arrive from the serve
 /// failure note that points here. `e` is therefore unused.
-pub(super) fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
-    // Score the anchored lines only, never the whole paste. The anchor is the
-    // *only* thing separating this failure mode from any other framework's
-    // PyTorch/HIP OOM, so a boolean gate over the whole symptom is not enough:
-    // keyword hits from unanchored lines would still count at full weight. Any
-    // future change here must keep the scored text restricted to anchored lines.
-    let anchored = vllm_anchored_lines(symptom);
+///
+/// `engine` is the engine the user named with `rocm diagnose --engine`. Naming
+/// vLLM stands in for the anchor on every non-blank line (see
+/// [`vllm_anchored_lines`]).
+pub(super) fn check_16_vllm_oom(
+    _e: &Examination,
+    symptom: &str,
+    engine: Option<SymptomEngine>,
+) -> Diagnosis {
+    // Score the anchored lines only, never the whole paste -- unless the user
+    // named vLLM with `--engine`, when every non-blank line is vLLM's by their
+    // account and all of them are scored. Otherwise the anchor is the *only* thing
+    // separating this failure mode from any other framework's PyTorch/HIP OOM,
+    // so a boolean gate over the whole symptom is not enough: keyword hits from
+    // unanchored lines would still count at full weight. Any future change here
+    // must keep the scored text restricted to anchored lines whenever the user
+    // did not name the engine.
+    let anchored = vllm_anchored_lines(symptom, engine);
     if anchored.is_empty() {
-        // No vLLM anchor anywhere: don't attribute a bare framework OOM to vLLM.
+        // No vLLM anchor anywhere, and the user did not say the paste was
+        // vLLM's: don't attribute a bare framework OOM to vLLM.
         return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
     }
     let (score, evidence) = keyword_score_collapsing_overlaps(&anchored, KEYWORDS_VLLM_OOM);
@@ -535,7 +567,9 @@ pub(super) fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosi
 mod tests {
     use super::*;
     use crate::diagnose::test_support::{linux_base, wsl_base};
-    use crate::diagnose::{DiagnoseReport, HIGH_CONFIDENCE, diagnose};
+    use crate::diagnose::{
+        DiagnoseReport, HIGH_CONFIDENCE, diagnose, diagnose_with_engine, render_report_text,
+    };
 
     fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
         report
@@ -1210,6 +1244,301 @@ mod tests {
             report.matched
         );
         assert!(!report.has_match());
+    }
+
+    /// The scored part of a report: which entries matched, how strongly, and on
+    /// what evidence. Everything a caller acts on, without the provenance.
+    fn verdict(report: &DiagnoseReport) -> Vec<(String, i32, Vec<String>)> {
+        report
+            .matched
+            .iter()
+            .map(|d| (d.id.clone(), d.score, d.evidence.clone()))
+            .collect()
+    }
+
+    /// ROCMAI-955: naming the engine is the replacement for the `vllm: ` prefix
+    /// the rocm-doctor skill tells an agent to write into the user's paste (the
+    /// skill moves to `--engine` in a later change). It has to match exactly as
+    /// the prefixed text does, on both families vLLM runs on, while the
+    /// unprefixed paste on its own still does not match.
+    #[test]
+    fn naming_vllm_matches_the_paste_as_the_vllm_prefix_did() {
+        let paste = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB";
+        for host in [linux_base(), wsl_base()] {
+            let named = diagnose_with_engine(&host, paste, Some(SymptomEngine::Vllm));
+            let prefixed = diagnose(&host, &format!("vllm: {paste}"));
+            assert_eq!(verdict(&named), verdict(&prefixed));
+            assert_eq!(named.has_match, prefixed.has_match);
+            let oom = named
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-16-vllm-oom")
+                .expect("naming vLLM must reach the vLLM OOM entry");
+            assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+            assert!(
+                diagnose(&host, paste)
+                    .matched
+                    .iter()
+                    .all(|d| d.id != "fix-16-vllm-oom"),
+                "without the engine the bare paste must still not be attributed to vLLM"
+            );
+        }
+    }
+
+    /// A pasted log, not one line: with vLLM named, every non-blank line is
+    /// vLLM's, so the result is that of `vllm` written on each of them -- not
+    /// only on the first, which is all a prefix on the paste ever anchored.
+    #[test]
+    fn naming_vllm_anchors_every_line_of_a_multi_line_paste() {
+        let lines = [
+            "INFO 11-11 10:00:00 Loading model weights took 14.9 GiB",
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        ];
+        let named =
+            diagnose_with_engine(&linux_base(), &lines.join("\n"), Some(SymptomEngine::Vllm));
+        let every_line_prefixed = diagnose(
+            &linux_base(),
+            &lines
+                .iter()
+                .map(|line| format!("vllm: {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert_eq!(verdict(&named), verdict(&every_line_prefixed));
+        assert!(
+            named
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-16-vllm-oom" && d.score >= HIGH_CONFIDENCE)
+        );
+    }
+
+    /// Naming the engine is provenance for the vLLM entry only: an unrelated
+    /// failure is diagnosed exactly as without it, and on native Windows, where
+    /// the vLLM engine does not run, it still produces no vLLM verdict.
+    #[test]
+    fn naming_vllm_changes_nothing_but_the_vllm_entry() {
+        let isa = "HSA_STATUS_ERROR_INVALID_ISA";
+        assert_eq!(
+            verdict(&diagnose_with_engine(
+                &linux_base(),
+                isa,
+                Some(SymptomEngine::Vllm)
+            )),
+            verdict(&diagnose(&linux_base(), isa))
+        );
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let oom = "torch.OutOfMemoryError: HIP out of memory";
+        let named = diagnose_with_engine(&windows, oom, Some(SymptomEngine::Vllm));
+        assert!(named.matched.iter().all(|d| d.id != "fix-16-vllm-oom"));
+        assert_eq!(verdict(&named), verdict(&diagnose(&windows, oom)));
+    }
+
+    /// The report says which engine the user named and carries the symptom
+    /// byte for byte -- control bytes and all -- and says nothing of either
+    /// when no engine was named, so a report without one gains no field.
+    #[test]
+    fn the_report_records_the_named_engine_and_the_symptom_verbatim() {
+        let paste = "  torch.OutOfMemoryError: HIP out of memory\r\n\u{1b}[31mTried\u{1b}[0m  ";
+        let named = diagnose_with_engine(&linux_base(), paste, Some(SymptomEngine::Vllm));
+        let json = serde_json::to_value(&named).expect("a report serializes");
+        assert_eq!(json["provenance"]["engine"], "vllm");
+        assert_eq!(json["provenance"]["symptom"], paste);
+
+        let unnamed = serde_json::to_value(diagnose(&linux_base(), paste)).unwrap();
+        assert!(
+            unnamed.get("provenance").is_none(),
+            "a report with no engine named must not grow the field: {unnamed}"
+        );
+    }
+
+    /// ROCMAI-955 review: the `--json` the CLI prints is ASCII on the wire, yet
+    /// the paste in it is the paste, exactly. A JSON parser reading the escaped
+    /// document back gets the original bytes; nothing was stripped or
+    /// transliterated. And a document with nothing to escape is byte-for-byte
+    /// what plain pretty `serde_json` would have printed.
+    #[test]
+    fn a_non_ascii_paste_round_trips_through_the_json_exactly() {
+        use crate::diagnose::render_report_json;
+        use crate::diagnose::test_support::NON_ASCII_PASTE;
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        for host in [linux_base(), wsl_base(), windows] {
+            let report = diagnose_with_engine(&host, NON_ASCII_PASTE, Some(SymptomEngine::Vllm));
+            let json = render_report_json(&report).expect("the report renders");
+            assert!(json.is_ascii(), "{json}");
+            // The emoji is beyond the Basic Multilingual Plane, so it travels
+            // as a UTF-16 surrogate pair, the form every JSON parser accepts.
+            let backslash = char::from(92_u8);
+            let surrogate_pair = format!("{backslash}ud83d{backslash}udd25");
+            assert!(json.contains(&surrogate_pair), "{json}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("the escaped document is valid JSON");
+            assert_eq!(
+                parsed["provenance"]["symptom"].as_str().map(str::as_bytes),
+                Some(NON_ASCII_PASTE.as_bytes()),
+                "the paste must come back byte for byte"
+            );
+            assert_eq!(
+                serde_json::from_str::<DiagnoseReport>(&json)
+                    .expect("it reads back as a report")
+                    .provenance
+                    .map(|p| p.symptom),
+                Some(NON_ASCII_PASTE.to_owned())
+            );
+        }
+
+        let ascii_only = diagnose(&linux_base(), "torch.OutOfMemoryError");
+        assert_eq!(
+            render_report_json(&ascii_only).expect("the report renders"),
+            serde_json::to_string_pretty(&ascii_only).unwrap(),
+            "escaping must not change a document that has nothing to escape"
+        );
+    }
+
+    /// `SymptomEngine::name()` (what the text report prints) and the serde name
+    /// (what `provenance.engine` holds) are one contract, for every variant.
+    /// `every_engine` is checked against the enum by an exhaustive `match`, so
+    /// a new variant fails to compile until it is listed there.
+    #[test]
+    fn every_engine_name_is_its_serialized_name() {
+        for engine in crate::diagnose::test_support::every_engine() {
+            assert_eq!(
+                serde_json::to_value(engine).expect("an engine serializes"),
+                serde_json::Value::from(engine.name()),
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// The text report opens with the engine `--engine` named, and on a
+    /// platform where no entry reads it (native Windows, and a platform the
+    /// catalog does not cover) says the flag changed nothing. The line is
+    /// checked against the behaviour it describes: where it says nothing
+    /// changed, the diagnosis equals the one without the flag, and where it
+    /// says the symptom was read as vLLM's, a vLLM paste does differ. Read as,
+    /// not matched as: an unrelated or empty paste is read the same way and
+    /// matches nothing for vLLM, which the last rows pin.
+    #[test]
+    fn the_text_report_says_which_engine_was_named_and_whether_it_counted() {
+        let oom = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB";
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let uncovered = Examination {
+            os_family: "freebsd".to_owned(),
+            ..Examination::default()
+        };
+        let nothing_changed = "no entry for vllm exists on this OS, so the flag changed nothing";
+        for (label, host, read) in [
+            ("linux", linux_base(), true),
+            ("wsl", wsl_base(), true),
+            ("windows", windows, false),
+            ("uncovered", uncovered, false),
+        ] {
+            let named = diagnose_with_engine(&host, oom, Some(SymptomEngine::Vllm));
+            let text = render_report_text(&named, 5);
+            let first = text.lines().next().unwrap_or_default();
+            assert!(
+                first.starts_with("Engine: vllm (named with --engine;"),
+                "{label}: the text report must open with the named engine:\n{text}"
+            );
+            assert_eq!(
+                first.contains(nothing_changed),
+                !read,
+                "{label}: wrong claim about whether the flag counted: {first}"
+            );
+            assert_eq!(
+                verdict(&named) == verdict(&diagnose(&host, oom)),
+                !read,
+                "{label}: the line must agree with what the flag did to the diagnosis"
+            );
+            // The line is added above the report and takes nothing from it:
+            // the per-cause `source:` notes and everything else render as they
+            // would for the same diagnosis with no engine line.
+            let without_line = DiagnoseReport {
+                provenance: None,
+                ..named.clone()
+            };
+            assert_eq!(
+                text.strip_prefix(first)
+                    .and_then(|rest| rest.strip_prefix("\n\n")),
+                Some(render_report_text(&without_line, 5).as_str()),
+                "{label}: the engine line must sit above the report and change nothing in it"
+            );
+        }
+        // A Linux host with a host-state finding (both GPU groups missing) that
+        // the paste does not touch: the `source:` note marks that cause, and
+        // sits in the same report as the engine line.
+        let mut groups_missing = linux_base();
+        groups_missing.in_render_group = Some(false);
+        groups_missing.in_video_group = Some(false);
+        let linux_text = render_report_text(
+            &diagnose_with_engine(&groups_missing, oom, Some(SymptomEngine::Vllm)),
+            50,
+        );
+        assert!(
+            linux_text.starts_with("Engine: vllm")
+                && linux_text.contains(crate::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+            "the engine line and the per-cause source note must both appear:\n{linux_text}"
+        );
+
+        assert!(
+            !render_report_text(&diagnose(&linux_base(), oom), 5).contains("Engine:"),
+            "no engine named, no line"
+        );
+
+        // The missing row of the matrix: the engine is named on a host whose
+        // catalog reads it, but nothing for vLLM is in the paste. The line says
+        // how the symptom was read, which is still true, and claims no match --
+        // and the report holds no vLLM cause beside it.
+        let read_line = "Engine: vllm (named with --engine; every non-blank line of the symptom \
+                         was read as vllm's).";
+        for (label, paste) in [
+            (
+                "unrelated paste",
+                "Traceback (most recent call last):\n  File \"train.py\", line 3, in <module>\n\
+                 ZeroDivisionError: division by zero",
+            ),
+            ("empty paste", ""),
+        ] {
+            let named = diagnose_with_engine(&linux_base(), paste, Some(SymptomEngine::Vllm));
+            let text = render_report_text(&named, 50);
+            assert_eq!(text.lines().next(), Some(read_line), "{label}:\n{text}");
+            assert!(
+                named.matched.iter().all(|d| d.id != "fix-16-vllm-oom")
+                    && !text.contains("fix-16-vllm-oom"),
+                "{label}: nothing for vLLM is in the paste, so no vLLM cause may be reported \
+                 beside the line:\n{text}"
+            );
+        }
+
+        // The line adds nothing to the JSON report: `provenance` holds exactly the
+        // engine and the symptom, and a report read back from it does not know
+        // whether the engine was read, so it claims neither.
+        let json = serde_json::to_value(diagnose_with_engine(
+            &linux_base(),
+            oom,
+            Some(SymptomEngine::Vllm),
+        ))
+        .expect("a report serializes");
+        let keys: Vec<&String> = json["provenance"]
+            .as_object()
+            .expect("provenance is an object")
+            .keys()
+            .collect();
+        assert_eq!(keys, ["engine", "symptom"]);
+        let read_back: DiagnoseReport = serde_json::from_value(json).expect("it reads back");
+        assert_eq!(
+            render_report_text(&read_back, 5).lines().next(),
+            Some("Engine: vllm (named with --engine).")
+        );
     }
 
     #[test]

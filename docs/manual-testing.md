@@ -1538,6 +1538,68 @@ On some GPU families `rocm install sdk` installs vLLM itself
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
 
+### 6d. Naming the engine instead of editing the error
+
+Take the failing line from 6a without any `vllm` in it (the
+`torch.OutOfMemoryError: HIP out of memory ...` line from
+`rocm services logs <service-id>`), and diagnose it as is, then with the engine
+named:
+
+```bash
+rocm diagnose --symptom '<the line, unedited>' --json
+rocm diagnose --symptom '<the line, unedited>' --engine vllm --json
+```
+
+Expected result:
+
+- The first reports no vLLM out-of-memory cause: the line alone could be any
+  PyTorch program's.
+- The second reports `fix-16-vllm-oom`, with the same score and evidence as
+  `rocm diagnose --symptom 'vllm: <the line>' --json`, and its `provenance`
+  holds `"engine": "vllm"` and your line exactly as you passed it once the
+  JSON is decoded. A line with non-ASCII text in it (an accented path, a
+  box-drawing character) prints as `\uXXXX` escapes, and every byte of the
+  output is ASCII; `python -c "import json,sys;
+  print(json.load(sys.stdin)['provenance']['symptom'])"` prints it back as
+  you pasted it.
+- `--engine lemonade` (or any other value) is refused with a usage error that
+  lists `vllm`, and nothing is diagnosed. `--engine` with neither `--symptom`
+  nor `--symptom-file` is refused too.
+- In bash, `rocm diagnose --symptom-file - --engine vllm --json <<'EOF'`, then
+  the line and `EOF`, gives the same result as the second command, and its
+  `provenance.symptom` is your line without the heredoc's final line break.
+
+Then ask what a report would carry, with a line that names something of yours
+(a home-directory path or the host name) appended to the paste:
+
+```bash
+rocm diagnose --engine vllm --report \
+  --symptom '<the line> at /home/<you>/serve.py on <host>'
+```
+
+Expected result: the report (or, on hardware not on the compatibility matrix,
+the refusal) and the mail link under it carry no part of your paste and no
+`provenance`. On bare-metal Linux with a GPU on the matrix, its `entry` is
+`fix-16-vllm-oom`, which is the only thing the paste contributes (WSL is not
+inspected for a report yet, and native Windows has no vLLM entry). It says
+nothing has been sent. Do not add `--send` for this check unless you mean to
+open a mail.
+
+Last, the text report, with no `--json`:
+
+```bash
+rocm diagnose --symptom '<the line, unedited>' --engine vllm
+```
+
+Expected result: the first line names the engine. On Linux and WSL it reads
+`Engine: vllm (named with --engine; every non-blank line of the symptom was
+read as vllm's).` and the vLLM out-of-memory cause follows. The line says how
+the symptom was read, not that anything matched: with an unrelated paste (a
+plain Python traceback) it is the same line and no vLLM cause follows. On native
+Windows it reads `Engine: vllm (named with --engine; no entry for vllm exists
+on this OS, so the flag changed nothing).`, and the rest of the report is the
+same as without `--engine`.
+
 ## 7. vLLM Endpoint Key Coverage
 
 Needs a Linux or WSL host where the vLLM engine can start. Check that an

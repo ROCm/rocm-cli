@@ -4871,6 +4871,121 @@ others assert on the outcome the smoke test returns.
 cargo xtask e2e -- -n "serve-60"
 ```
 
+## Diagnose Engine Provenance
+
+`rocm diagnose --engine vllm` (ROCMAI-955) says which engine a symptom came
+from, whether it was passed with `--symptom` or read with `--symptom-file`, so
+a vLLM error that does not itself name vLLM is matched as vLLM's without anyone
+writing `vllm: ` into the user's text. The vLLM out-of-memory
+entry (`fix-16-vllm-oom`) only scores lines that name vLLM; with the engine
+named, every non-blank line of the symptom counts as vLLM's, as if `vllm` were
+written on each of them (a blank line is dropped, where a prefix would keep it;
+it scores nothing either way). No other entry reads the engine. The JSON
+diagnosis records the engine and the symptom, verbatim once decoded, under
+`provenance`; without `--engine` the field is absent. The output is otherwise
+unchanged, except that non-ASCII text in `--json` is now written as `\uXXXX`
+escapes on every run, host-derived evidence included (see below); the skill
+eval replays (`cargo xtask eval-fixtures --check`) are ASCII and stay as they
+are.
+`--engine` requires a symptom from either flag (a clap group over the two), and
+`--engine` alone is a usage error. With `--symptom-file` the recorded symptom
+is the text as read, with the one trailing line break that flag removes.
+
+`--engine` is accepted with `--report` and `--distro`, as plain `--symptom` is.
+`--distro` prints the diagnosis on the user's own screen, `provenance`
+included. The `--report` document, the one printed for mailing, is built from
+the examination, the entry the diagnosis established and whether a fix was
+offered, and from nothing the user typed, so neither the paste nor
+`provenance` reaches it or the mail link `--send` offers.
+
+`rocm diagnose --json` is ASCII on the wire (ROCMAI-543): the paste in
+`provenance.symptom`, and any host path an evidence line quotes, can hold
+non-ASCII text, so `render_report_json` in
+[report.rs](../crates/rocm-core/src/diagnose/report.rs) writes every non-ASCII
+character as a `\uXXXX` escape (a surrogate pair beyond the Basic Multilingual
+Plane). A JSON parser reads back the identical string. The ROCMAI-543 corpus
+test runs `diagnose_with_engine` with an accented path, a box-drawing
+character and an emoji, and fails if the escaping is dropped.
+
+The text report (not `--json`) opens with a line naming the engine. Where an
+entry on the examined platform reads it, the line says every non-blank line of
+the symptom was read as that engine's; that is how it was read, not a claim
+that anything matched, so an unrelated or empty paste gets the same line and no
+vLLM cause. Where no entry on the examined platform reads that engine, the line
+says the flag
+changed nothing; that is native Windows today, and a platform the catalog does
+not cover. The answer comes from `reads_engine_here` in
+[catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs), which reads the same
+`CHECKERS` table and platform family the checks run from, so the line follows
+the catalog rather than a list of operating systems. The answer is not
+serialized, so it adds nothing to the JSON report.
+
+Unit coverage — the match equals the prefixed form on Linux and WSL2, a
+multi-line paste is anchored on every non-blank line, nothing else changes
+(native Windows included), the diagnosis keeps the symptom byte for byte, the
+shared report and its mail link carry none of it, the text line agrees with
+what the flag did on Linux, WSL2, native Windows and an uncovered platform, and
+the flag takes only `vllm`:
+
+```bash
+cargo test -p rocm-core naming_vllm_
+cargo test -p rocm-core the_report_records_the_named_engine_and_the_symptom_verbatim
+cargo test -p rocm-core the_text_report_says_which_engine_was_named_and_whether_it_counted
+cargo test -p rocm-core a_non_ascii_paste_round_trips_through_the_json_exactly
+cargo test -p rocm-core every_message_the_diagnose_catalog_can_emit_is_ascii
+cargo test -p rocm-core every_engine_name_is_its_serialized_name
+cargo test -p rocm --bin rocm a_failing_render_json_hook_is_an_error_and_writes_nothing
+cargo test -p rocm --bin rocm diagnose_json_is_the_ascii_rendering_of_the_report
+cargo test -p rocm --bin rocm a_shared_report_never_carries_the_pasted_symptom_or_its_provenance
+cargo test -p rocm --bin rocm diagnose_engine_takes_the_engines_the_catalog_tells_apart
+```
+
+Scenarios in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature):
+`diagnose-71` (`@requires-os:linux`, as `diagnose-36`, because the vLLM entry is
+not in the native Windows catalog) diagnoses an unprefixed two-line vLLM OOM
+with the engine named and checks the match and the verbatim symptom;
+`diagnose-72` checks the recorded engine and symptom on every lane;
+`diagnose-73` checks that an engine `rocm serve` knows but the catalog does not
+tell apart (`lemonade`) is a usage error that diagnoses nothing;
+`diagnose-74` (`@requires-os:linux`) simulates a Linux machine whose only GPU
+is on the compatibility matrix, as `diagnose-58` does, so a real report is
+prepared on every Linux lane, WSL2 and GPU-less ones included; it asks for that
+`--report` with the engine named and a paste naming a user, host and token, and
+checks that a report was printed and that none of them, and no `provenance`,
+appears in it or in the mail link, and that nothing was sent (native Windows
+cannot be simulated this way; the payload unit test above covers it there);
+`diagnose-75` pipes the paste in with `--symptom-file -` and a final line
+break, names vLLM, and checks the recorded engine and that the recorded
+symptom is the paste without that line break; `diagnose-76`
+(`@requires-os:linux`, so Linux and WSL2) asks for the text report with the
+engine named and checks that it opens by saying the symptom was read as vLLM's
+and that the vLLM cause is there, and was not there without the flag;
+`diagnose-77` (`@requires-os:windows`) checks that the line says no entry for
+vLLM exists on this OS and that the rest of the report is the one without the
+flag; and `diagnose-78`, on every lane, saves a paste with an accented path, a
+box-drawing character and an emoji to a file, diagnoses it with
+`--symptom-file` and `--engine vllm --json`, and checks that every byte printed
+is ASCII and that the decoded symptom is the paste byte for byte; and
+`diagnose-79` (`@requires-os:linux`) names vLLM for a plain Python traceback
+and checks that the text report still says the symptom was read as vLLM's and
+reports no vLLM cause: the line says how the symptom was read, never that it
+matched. (`diagnose-59` to `diagnose-70` belong to other changes; see their own
+sections.)
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(7[1-689]) '
+```
+
+A name filter bypasses the suite's host filter, so on native Windows select
+`diagnose-72`, `diagnose-73`, `diagnose-75`, `diagnose-77` and `diagnose-78`
+instead (Linux and WSL2 run `diagnose-71` to `diagnose-76`, `diagnose-78` and
+`diagnose-79`):
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(7[23578]) '
+```
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global
