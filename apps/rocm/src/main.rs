@@ -1081,18 +1081,25 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         rocm_core::GpuSupportLevel::RocmHip => {
             "default embedded Lemonade server with ROCm llama.cpp backend"
         }
-        // Only `rocm examine` reaches this level — the cheap probe behind
-        // `host_gpu_support_level` passes `VulkanStatus::Unknown` and so lands
-        // on `VulkanOnly` — but the arm is spelled out rather than folded into
-        // `Unknown`, because what it means is the opposite: `Unknown` promises
-        // that a command can still answer, and here the question is already
-        // answered and the answer is no.
         // Looked at and inconclusive. Says the same "no ROCm/HIP" fact as the
         // arm below, but stops short of its claim about Vulkan, because
         // nothing here established it either way.
+        //
+        // Reached by every caller that passes a real `VulkanStatus`, which is
+        // `rocm examine` *and* `build_codex_bridge_snapshot` (the
+        // `InternalBridgeSnapshot` command and the MCP `bridge_snapshot`/
+        // `engines` tools), which builds the level from `examine.vulkan_status()`
+        // rather than the cheap `host_gpu_support_level`. So the advice cannot
+        // be "run `rocm examine`": this very note is rendered *inside* that
+        // command's own output, through `examine_human_report` ->
+        // `append_examine_engine_inventory`, and told its reader to run the
+        // command they were already reading. It names the thing that would
+        // actually settle the question instead.
         rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
-             Vulkan driver is present could not be determined - run `rocm examine`"
+             Vulkan driver is present could not be determined - install `vulkaninfo` to check, \
+             or a Vulkan driver (Mesa RADV on Linux, the AMD display driver on Windows) to run \
+             models on this GPU"
         }
         rocm_core::GpuSupportLevel::NoGpuBackend => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"

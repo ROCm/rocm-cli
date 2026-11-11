@@ -158,8 +158,17 @@ impl VulkanSupport {
             .find(|device| device.is_amd() && device.is_hardware())
             .and_then(|device| device.driver_name.clone())
             .or_else(|| {
+                // Filtered the same way `classify_vulkan_support` filters its
+                // own driver naming. Without this, an `Available` host whose AMD
+                // device omitted the optional `driverName`, on a machine that
+                // also has lavapipe installed, would be told the software
+                // rasteriser is the driver behind the GPU path it was just
+                // promised — contradicting this module's "a software rasteriser
+                // never counts as a GPU path" invariant in the one place the
+                // user actually reads a driver name.
                 self.icds
                     .iter()
+                    .filter(|icd| icd_is_gpu_driver(icd))
                     .find_map(|icd| icd_driver_label(icd))
                     .map(str::to_owned)
             })
@@ -456,11 +465,19 @@ pub fn classify_vulkan_support(
             || "a Vulkan driver is installed".to_owned(),
             |label| format!("{label} is installed"),
         );
+    // Two different hosts reach this status and they are not owed the same
+    // sentence. An empty `devices` really is "nothing answered". A non-empty one
+    // means `vulkaninfo` answered and the hardware it listed simply was not AMD
+    // — saying no device was enumerated there is false, and it is the shape an
+    // NVIDIA box with an AMD iGPU disabled lands in.
+    let detail = if devices.is_empty() {
+        format!("{named}, but no device was enumerated (install `vulkaninfo` to confirm)")
+    } else {
+        format!("{named}, but none of the devices it enumerated is an AMD GPU")
+    };
     VulkanSupport {
         status: VulkanStatus::DriverPresentDevicesUnverified,
-        detail: Some(format!(
-            "{named}, but no device was enumerated (install `vulkaninfo` to confirm)"
-        )),
+        detail: Some(detail),
         icds,
         devices,
     }

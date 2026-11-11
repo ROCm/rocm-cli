@@ -563,6 +563,49 @@ mod tests {
         );
     }
 
+    /// The motivating case, and the one nothing rendered: a host that **was**
+    /// probed and showed nothing either way — no ICD, no enumerated device, and
+    /// no `vulkaninfo` to ask. On Windows the Khronos `Drivers` key is legacy
+    /// and `vulkaninfo` is rarely on PATH, so a working Adrenalin laptop (the
+    /// machine ROCMAI-550 was reported from) lands here.
+    ///
+    /// `gfx_target.rs` pins that the classifier turns this into
+    /// `VulkanUnconfirmed`; this pins what the user actually reads, which is the
+    /// half that can go wrong on its own. Both directions are asserted: it must
+    /// not promise a backend, and it must not declare one absent either.
+    #[test]
+    fn examine_render_hedges_a_host_that_was_probed_and_showed_nothing() {
+        // Built directly rather than through `vulkan_support`, which plants an
+        // AMD device: an enumerated device is the one thing this state cannot
+        // have, and a fixture that contradicts its own status proves nothing.
+        let summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+            status: VulkanStatus::Inconclusive,
+            detail: Some(
+                "no Vulkan driver was found, but `vulkaninfo` is not installed either, so \
+                 nothing here confirms one is absent"
+                    .to_owned(),
+            ),
+            ..VulkanSupport::default()
+        }));
+
+        let rendered = summary.render_text();
+
+        assert!(
+            rendered.contains("`vulkaninfo` is not installed"),
+            "it must name the gap that stopped it confirming: {rendered}"
+        );
+        assert!(
+            !rendered.contains("the Vulkan backend can be used"),
+            "nothing here established a Vulkan path: {rendered}"
+        );
+        assert!(
+            !rendered.contains("and no Vulkan GPU driver was found - install one"),
+            "and nothing established its absence either, so the confirmed-absence \
+             sentence must not be used: {rendered}"
+        );
+        assert!(rendered.contains("vulkan: inconclusive"), "{rendered}");
+    }
+
     /// An unmapped target must not be *claimed* unsupported, even though every
     /// host now gets a `rocm_support` line.
     ///
