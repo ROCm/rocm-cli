@@ -13,6 +13,7 @@ mod consent;
 mod family;
 mod fetch;
 mod io;
+mod kept_torch;
 mod probe;
 mod process;
 mod python;
@@ -489,6 +490,14 @@ fn install_wheel_runtime(
         resolution.newest_repo_version.as_deref(),
         &resolution.latest_version,
     );
+    // Under the alignment opt-out an environment that already holds torch keeps it:
+    // the install then asks `uv` for the ROCm packages alone. Decided here, from the
+    // environment the install will run in, so the preview and the install name the
+    // same requirements.
+    let planned_env_python = venv_python_path(&install_root);
+    let planned_kept = kept_torch::kept_torch_stack(rocm_core::torch_alignment_disabled(), || {
+        kept_torch::installed_torch_stack(&planned_env_python)
+    });
     let plan = WheelPlan {
         channel,
         version_selector,
@@ -509,6 +518,7 @@ fn install_wheel_runtime(
             install_root: &install_root,
             runtime_key: &runtime_key,
             package_specs: &wheel_composition.package_specs,
+            kept_torch: planned_kept.as_ref(),
             manifest_path: &manifest_path,
         }),
     };
@@ -626,10 +636,29 @@ fn install_wheel_runtime(
     ));
     ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
+    // `ensure_uv_venv` recreates an environment built for another interpreter, and
+    // the recreated one holds no torch. Asked again, so that case installs the
+    // full stack instead of leaving the runtime without torch.
+    let kept = planned_kept.clone().filter(|_| {
+        kept_torch::kept_torch_stack(true, || kept_torch::installed_torch_stack(&env_python))
+            .is_some()
+    });
+    if let Some(kept) = &kept {
+        progress_line(format!(
+            "ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set: keeping the torch this runtime already holds ({}).",
+            kept.describe()
+        ));
+    } else if planned_kept.is_some() {
+        let _ = writeln!(
+            output,
+            "  torch_kept: not applied; the Python environment was recreated, so it held no torch to keep"
+        );
+    }
+    let install_specs = kept_torch::install_specs(&wheel_composition.package_specs, kept.as_ref());
 
     progress_line(format!(
         "Installing {} from {}",
-        wheel_composition.package_specs.join(" "),
+        install_specs.join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -637,7 +666,7 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(wheel_composition.package_specs.iter().cloned());
+    install_args.extend(install_specs.iter().cloned());
     run_uv_progress_command(
         paths,
         &uv,

@@ -15,6 +15,7 @@
 //! `command`). [`PlanStack::NeedsUv`] says those are not resolved, and why,
 //! where [`PlanStack::Resolved`] carries their values.
 
+use super::kept_torch::{self, KeptTorch};
 use super::python::{PlannedPython, WheelCompatibility};
 use super::resolve::{AggregateDeviceTarget, TorchaudioPin, UnresolvedPipRuntime};
 use super::source::{RuntimeVersionSelector, TheRockChannel};
@@ -72,6 +73,11 @@ pub(super) struct ResolvedStack<'a> {
     pub(super) install_root: &'a Path,
     pub(super) runtime_key: &'a str,
     pub(super) package_specs: &'a [String],
+    /// The torch stack the install leaves alone, when the opt-out asked for that and
+    /// the environment has one. The specs above stay the runtime's composition, as
+    /// recorded in its manifest; what `uv` is handed is [`kept_torch::install_specs`]
+    /// of them.
+    pub(super) kept_torch: Option<&'a KeptTorch>,
     pub(super) manifest_path: &'a Path,
 }
 
@@ -196,6 +202,13 @@ pub(super) fn write_wheel_plan(output: &mut String, plan: &WheelPlan<'_>) {
         output,
         "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
     );
+    if let PlanStack::Resolved(ResolvedStack {
+        kept_torch: Some(kept),
+        ..
+    }) = &plan.stack
+    {
+        let _ = writeln!(output, "{}", kept_torch::plan_line(kept));
+    }
     if let Some(warning) = plan.no_wheel_warning {
         let _ = writeln!(output, "  warning: {warning}");
     }
@@ -223,7 +236,10 @@ pub(super) fn write_dry_run_tail(output: &mut String, plan: &WheelPlan<'_>) {
             if matches!(plan.channel, TheRockChannel::Nightly) {
                 install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
             }
-            install_args.extend(stack.package_specs.iter().cloned());
+            install_args.extend(kept_torch::install_specs(
+                stack.package_specs,
+                stack.kept_torch,
+            ));
             let venv_args = uv_venv_args(&plan.python.venv_python_arg(), stack.install_root);
             // This line is offered as the command to run, so it has to be one a
             // shell reads back as the argv it previews. The install root in it

@@ -431,6 +431,56 @@ async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
     }
 }
 
+/// The SDK install did not write over the torch the runtime held.
+///
+/// Two things have to agree, because either alone can be satisfied without the
+/// other. The install says what it kept (`torch_kept:`, naming the torch version
+/// it found before running `uv`), and the runtime's own interpreter, asked after
+/// the install, reports that same version. The message by itself would certify the
+/// string, and the version by itself would pass on a runtime whose torch was
+/// rewritten to the same build.
+#[then("the SDK install leaves the torch the runtime held as it was")]
+async fn assert_sdk_install_kept_torch(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let kept_line = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("torch_kept: "))
+        .unwrap_or_else(|| {
+            panic!("the install did not say it kept the runtime's torch:\n{output}")
+        });
+    let Some((_, after_torch)) = kept_line.split_once(" already holds torch ") else {
+        panic!("`torch_kept:` names no torch version: {kept_line}");
+    };
+    let kept_version = after_torch
+        .split([',', ';'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    assert!(
+        !kept_version.is_empty(),
+        "`torch_kept:` names no torch version: {kept_line}"
+    );
+    let python = super::examine_steps::field_value(output, "python_executable")
+        .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
+    let probe = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; print(m.version('torch'))",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to ask {python} for its torch: {error}"));
+    assert!(
+        probe.status.success(),
+        "asking {python} for its torch failed: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let installed_version = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+    assert_eq!(
+        installed_version, kept_version,
+        "the SDK install replaced the torch it said it kept:\n{output}"
+    );
+}
+
 /// The kept torch is not sold to the user as a runtime to repair.
 ///
 /// Two surfaces print a repair for the same divergence and both have to be quiet
