@@ -146,18 +146,26 @@ impl WindowsExamineInventory {
     /// vendor, so the rows also hold devices like "AMD Bluetooth Capture Audio
     /// Device" and "Intel(R) UHD Graphics". A row counts only with an AMD PCI
     /// device id (`PCI\VEN_1002`) or a marketing name `rocm examine` recognizes.
+    /// The listed rows that are AMD GPUs, by the test
+    /// [`Self::amd_display_count`] describes.
+    ///
+    /// The count is defined as the length of this, rather than the two sharing
+    /// a copied predicate, because the WSL adapter list is built from here too:
+    /// a row the list reported but the count did not would let `rocm serve
+    /// --gpu N` refuse an index `rocm examine` had just shown.
+    pub(super) fn amd_displays(&self) -> impl Iterator<Item = &WindowsDisplayAdapter> {
+        self.displays.iter().filter(|display| {
+            display
+                .pnp_device_id
+                .as_deref()
+                .is_some_and(|id| id.to_ascii_uppercase().starts_with("PCI\\VEN_1002"))
+                || gfx_target_from_amd_marketing_name(&display.name).is_some()
+        })
+    }
+
     #[cfg(any(windows, test))]
     fn amd_display_count(&self) -> usize {
-        self.displays
-            .iter()
-            .filter(|display| {
-                display
-                    .pnp_device_id
-                    .as_deref()
-                    .is_some_and(|id| id.to_ascii_uppercase().starts_with("PCI\\VEN_1002"))
-                    || gfx_target_from_amd_marketing_name(&display.name).is_some()
-            })
-            .count()
+        self.amd_displays().count()
     }
 
     pub(super) fn amd_display_driver_detail(&self) -> Option<String> {

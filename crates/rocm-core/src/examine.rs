@@ -660,9 +660,10 @@ impl Examination {
     /// healthy machine. The caller already holds the detection (it is the
     /// `summary` of `rocm examine --json`), so this takes it rather than probing
     /// again: the Windows query is a PowerShell call with its own timeout. Does
-    /// nothing off WSL, where the probes own the field, and leaves `gpus` empty
-    /// (there is no PCI listing to build entries from) and `status` alone
-    /// (`compute_status` answers `wsl` before it asks about a GPU).
+    /// nothing off WSL, where the probes own the field, and leaves `gpus` and
+    /// `status` alone — the WSL probe fills the GPU list from the host adapter
+    /// inventory (`record_host_adapters`), and `compute_status` answers `wsl`
+    /// before it asks about a GPU.
     pub const fn adopt_wsl_host_gpu(&mut self, host_has_amd_gpu: bool) {
         if self.is_wsl {
             self.has_amd_gpu = host_has_amd_gpu;
@@ -924,7 +925,7 @@ mod tests {
         assert!(e.has_amd_gpu, "a detected gfx target means a GPU is there");
         assert!(
             e.gpus.is_empty(),
-            "there is no PCI listing on WSL to build gpu entries from"
+            "adopting the host verdict must not invent gpu entries of its own; the WSL probe fills the list from the host adapter inventory"
         );
         assert!(
             !e.has_apu && !e.has_discrete_amd,
