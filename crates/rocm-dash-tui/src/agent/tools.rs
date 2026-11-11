@@ -10,6 +10,12 @@
 //! seam types (`StateSnapshot`, `AgentError`, `AgentClient`) stay in
 //! `agent/mod.rs`; the JSON summarization these tools call lives in
 //! `agent::snapshot`.
+//!
+//! This is also where a read-only tool result is shaped for the model:
+//! [`model_facing_tool_result`] drops the command output the bin's MCP
+//! envelope carries twice and bounds what is left to
+//! [`TOOL_RESULT_CHAR_BUDGET`], so one large result cannot exhaust a locally
+//! served model's context. See `docs/llm-tool-use.md`.
 
 use std::sync::{Arc, Mutex};
 
@@ -230,6 +236,178 @@ pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
 // `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
 
+/// How many characters of one tool result may reach the model.
+///
+/// A tool result is not free: it is sent back as a message and counts against
+/// the model's context on that request and on every later turn of the same
+/// conversation. A locally served model is typically configured with a 32k
+/// context (llama.cpp's default `n_ctx`), of which the system prompt and the
+/// tool schemas already take a few thousand tokens, so the remaining room has
+/// to cover several turns. 16 KiB is roughly 4.5k tokens — one large result
+/// still fits alongside the prompt and a handful of turns, where an uncapped
+/// one (`rocm_command` with `["model"]` measured 204,470 characters, about
+/// 58k tokens) cannot fit in such a context at all and the provider rejects
+/// the whole request.
+pub(crate) const TOOL_RESULT_CHAR_BUDGET: usize = 16 * 1024;
+
+/// Shape one executor result for the model: drop the command output the
+/// envelope carries twice, then bound what is left to `budget`.
+///
+/// Both halves exist because the result is JSON the dash hands to the model
+/// verbatim, unlike the CLI chat path (`apps/rocm/src/chat/turn.rs`), which
+/// reads only the envelope's text.
+fn model_facing_tool_result(value: Value, budget: usize) -> Value {
+    cap_tool_result(drop_duplicated_command_output(value), budget)
+}
+
+/// Drop `structuredContent.stdout` / `.stderr` when the envelope's own text
+/// already carries them.
+///
+/// The bin's `internal_mcp_tool_result_from_command` puts a command's captured
+/// output in `content[0].text` *and* again in `structuredContent.stdout` (and
+/// `.stderr`). The MCP envelope keeps both — `rocm mcp-call` and the approval
+/// replay path read the structured fields — but the model only needs one copy,
+/// and charging it twice for the same bytes is what makes a big read-only
+/// result twice as expensive as it has to be. Only the duplicated keys go; a
+/// tool whose data lives *only* in `structuredContent` (`engines`,
+/// `bridge_snapshot`, `automations`, `gpu_snapshot`) is untouched.
+fn drop_duplicated_command_output(mut value: Value) -> Value {
+    let text = tool_result_content_text(&value);
+    if text.is_empty() {
+        return value;
+    }
+    let Some(structured) = value
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    else {
+        return value;
+    };
+    for key in ["stdout", "stderr"] {
+        let duplicated = structured
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| {
+                let trimmed = s.trim();
+                trimmed.is_empty() || text.contains(trimmed)
+            });
+        if duplicated {
+            structured.remove(key);
+        }
+    }
+    value
+}
+
+/// The text items of an MCP tool-result envelope, joined. Empty when the value
+/// is not such an envelope (a bare `{"error": …}`, say).
+fn tool_result_content_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Everything the envelope carries, rendered as plain text.
+///
+/// Used only when a result has to be truncated, so the model reads prose
+/// rather than a JSON document cut off mid-escape. Nothing is dropped
+/// silently: the text items come first, then whatever `structuredContent`
+/// still holds after [`drop_duplicated_command_output`].
+fn tool_result_plain_text(value: &Value) -> String {
+    let mut parts = Vec::new();
+    let text = tool_result_content_text(value);
+    if !text.is_empty() {
+        parts.push(text);
+    }
+    match value.get("structuredContent") {
+        Some(structured) if !structured.is_null() => {
+            parts.push(
+                serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string()),
+            );
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// The line appended to a truncated result.
+///
+/// Explicit about being a partial result and about how much is missing, so
+/// neither the model nor the user reading the model's answer can take a cut
+/// list for a complete one.
+fn truncation_marker(shown_chars: usize, total_chars: usize) -> String {
+    format!(
+        "\n[output truncated: {shown_chars} of {total_chars} characters shown, \
+         {omitted} omitted. This is NOT the whole result — say so when you use it, \
+         and run the matching `rocm` command in a terminal for the full output.]",
+        omitted = total_chars.saturating_sub(shown_chars)
+    )
+}
+
+/// Bound a tool result to `budget` characters of serialized JSON.
+///
+/// A result that already fits is returned untouched, so the common case keeps
+/// its exact shape. One that does not is replaced by the plain-text rendering
+/// cut on a line boundary plus [`truncation_marker`]; `budget` is measured
+/// against the *serialized* value, which is what actually reaches the model,
+/// so JSON escaping cannot push it back over.
+fn cap_tool_result(value: Value, budget: usize) -> Value {
+    if value.to_string().len() <= budget {
+        return value;
+    }
+    let full = tool_result_plain_text(&value);
+    let total_chars = full.chars().count();
+    // Candidate cuts: the start, then the end of every line, so a cut never
+    // lands inside a line (and never inside a UTF-8 character).
+    let mut cuts = vec![0usize];
+    cuts.extend(full.match_indices('\n').map(|(index, _)| index + 1));
+    if !full.is_empty() && !full.ends_with('\n') {
+        cuts.push(full.len());
+    }
+    // Largest cut that still fits. `best` is only ever set to a cut that was
+    // measured as fitting, so the returned value is within budget even where
+    // the length is not perfectly monotonic in the cut (the marker's digit
+    // count shifts by one across a power of ten).
+    let (mut low, mut high, mut best) = (0usize, cuts.len() - 1, 0usize);
+    while low <= high {
+        let mid = low.midpoint(high);
+        if truncated_tool_result(&full, cuts[mid], total_chars)
+            .to_string()
+            .len()
+            <= budget
+        {
+            best = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    truncated_tool_result(&full, cuts[best], total_chars)
+}
+
+/// The truncated form of `full` kept up to the byte offset `cut`.
+fn truncated_tool_result(full: &str, cut: usize, total_chars: usize) -> Value {
+    let kept = &full[..cut];
+    let shown_chars = kept.chars().count();
+    json!({
+        "truncated": true,
+        "tool_output": format!("{kept}{}", truncation_marker(shown_chars, total_chars)),
+    })
+}
+
 /// Shared body for every read-only ROCm tool: forward the intent to the injected
 /// executor (None ⇒ a clear "not available in this mode" message; ApprovalRequired
 /// ⇒ a "needs approval" error and nothing runs — `rocm_command` lands here for
@@ -255,7 +433,7 @@ async fn run_rocm_read_tool(
         return json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." });
     };
     match tokio::task::spawn_blocking(move || exec.execute(name, &args)).await {
-        Ok(RocmToolOutcome::Result(v)) => v,
+        Ok(RocmToolOutcome::Result(v)) => model_facing_tool_result(v, TOOL_RESULT_CHAR_BUDGET),
         Ok(RocmToolOutcome::Error(s)) => json!({ "error": s }),
         Ok(RocmToolOutcome::ApprovalRequired(_)) => {
             json!({ "error": "this action requires approval (interactive chat only)" })
@@ -418,17 +596,24 @@ rocm_read_tool!(
 rocm_read_tool!(
     RocmCommandRocmTool,
     "rocm_command",
+    // The examples are deliberately the cheap commands. A small local model
+    // copies the example in a tool description literally, and the example used
+    // to be `["model"]` — the single largest read-only result there is, which
+    // on a 32k-context model used to end the turn with a provider
+    // context-overflow error instead of an answer.
     "Run a READ-ONLY rocm CLI subcommand and return its output. Allowed: \
-     model/models, config show, runtimes (list), logs, daemon status. Pass the \
-     argv as `args`, e.g. [\"model\"] or [\"config\",\"show\"]. Mutating \
-     subcommands are rejected.",
+     config show, runtimes (list), logs, daemon status, model/models. Pass the \
+     argv as `args`, e.g. [\"config\",\"show\"] or [\"runtimes\",\"list\"]. \
+     [\"model\"] lists the recommended models and [\"model\",\"--verbose\"] \
+     adds the per-recipe diagnostics, which are long. Mutating subcommands are \
+     rejected.",
     {
         "type": "object",
         "properties": {
             "args": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Argv for the rocm subcommand, e.g. [\"model\"]."
+                "description": "Argv for the rocm subcommand, e.g. [\"config\",\"show\"]."
             }
         },
         "required": ["args"]
@@ -917,6 +1102,153 @@ mod tests {
         assert_eq!(
             tool.fired.lock().unwrap().as_slice(),
             &["doctor".to_string()]
+        );
+    }
+
+    /// A command-backed MCP envelope of roughly `text_chars` characters,
+    /// shaped exactly as the bin's `internal_mcp_tool_result_from_command`
+    /// builds one: the command output in `content[0].text` and again in
+    /// `structuredContent.stdout`.
+    fn command_envelope(text_chars: usize) -> (String, serde_json::Value) {
+        let line = "Qwen/Qwen3.5-4B  Q4_K_M  fits this GPU\n";
+        let stdout = line.repeat(text_chars.div_ceil(line.len()));
+        let envelope = json!({
+            "content": [{ "type": "text", "text": format!("Ran `rocm` command.\n\n{stdout}") }],
+            "structuredContent": {
+                "argv": ["rocm", "model"],
+                "exit_status": 0,
+                "stdout": stdout,
+                "stderr": "",
+            },
+            "isError": false,
+        });
+        (stdout, envelope)
+    }
+
+    /// The `[output truncated: A of B characters shown, C omitted` figures.
+    fn truncation_figures(text: &str) -> (usize, usize, usize) {
+        let marker = text
+            .split_once("[output truncated: ")
+            .unwrap_or_else(|| panic!("no truncation marker in:\n{text}"))
+            .1;
+        let numbers = marker
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .take(3)
+            .map(|part| part.parse::<usize>().expect("marker figure"))
+            .collect::<Vec<_>>();
+        (numbers[0], numbers[1], numbers[2])
+    }
+
+    #[tokio::test]
+    async fn an_oversized_read_only_tool_result_is_capped_before_the_model_sees_it() {
+        // A ~200 KB result is what `rocm_command` with `["model"]` used to
+        // return (204,470 characters measured on a developer host). Sent whole
+        // to a locally served model it exceeds the entire context and the
+        // provider refuses the request, so the user gets an HTTP 400 instead
+        // of an answer.
+        let (_, envelope) = command_envelope(200 * 1024);
+        assert!(
+            envelope.to_string().len() > 200 * 1024,
+            "the fixture must be bigger than the budget or it proves nothing"
+        );
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool.call(json!({ "args": ["model"] })).await.expect("ok");
+
+        // What the model is handed is the serialized value, so that is what
+        // the budget is measured against.
+        let rendered = out.to_string();
+        assert!(
+            rendered.len() <= TOOL_RESULT_CHAR_BUDGET,
+            "a tool result of {} characters reached the model; the budget is {TOOL_RESULT_CHAR_BUDGET}",
+            rendered.len()
+        );
+        // It says it is partial, rather than reading as a complete answer.
+        assert_eq!(out["truncated"], json!(true), "{out}");
+        let text = out["tool_output"].as_str().expect("tool_output text");
+        assert!(
+            text.contains("[output truncated:") && text.trim_end().ends_with(']'),
+            "the marker must close the result so the model cannot miss it: {text}"
+        );
+        // …and says how much is missing, consistently.
+        let (shown, total, omitted) = truncation_figures(text);
+        assert_eq!(shown + omitted, total, "the marker's figures must add up");
+        assert!(
+            omitted > total / 2,
+            "a 200 KB result cut to {TOOL_RESULT_CHAR_BUDGET} characters must report most of it omitted, got {omitted} of {total}"
+        );
+        // The part that is shown is real output, cut on a line boundary.
+        assert!(text.contains("Qwen/Qwen3.5-4B"), "{text}");
+        assert!(
+            text.split_once("\n[output truncated:")
+                .is_some_and(|(kept, _)| kept.is_empty() || kept.ends_with('\n')),
+            "the cut must land on a line boundary: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_backed_result_reaches_the_model_once_not_twice() {
+        // The bin's envelope carries the command output twice — once as the
+        // text a reader sees, once as `structuredContent.stdout` — because
+        // `rocm mcp-call` consumers read the structured field. The dash hands
+        // the whole value to the model, so without this the model pays for
+        // every byte twice.
+        let (stdout, envelope) = command_envelope(2 * 1024);
+        let before = envelope.to_string().len();
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool
+            .call(json!({ "args": ["config", "show"] }))
+            .await
+            .expect("ok");
+
+        // One copy survives, and it is the readable one.
+        let text = out["content"][0]["text"].as_str().expect("content text");
+        assert!(text.contains(stdout.trim()), "{out}");
+        assert!(
+            out["structuredContent"].get("stdout").is_none(),
+            "the duplicated copy must not reach the model: {out}"
+        );
+        assert!(
+            out["structuredContent"].get("stderr").is_none(),
+            "an empty stderr is pure overhead for the model: {out}"
+        );
+        // The fields that are not duplicates stay, so the model can still see
+        // what ran and whether it worked.
+        assert_eq!(out["structuredContent"]["exit_status"], json!(0), "{out}");
+        assert_eq!(out["structuredContent"]["argv"][1], json!("model"), "{out}");
+        assert!(
+            out.to_string().len() < before / 2 + 512,
+            "dropping the duplicate should roughly halve the result: {} vs {before}",
+            out.to_string().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_within_the_budget_keeps_its_exact_shape() {
+        // The cap must not reshape ordinary results: a tool whose data lives
+        // only in `structuredContent` (engines, bridge_snapshot, automations)
+        // would lose it if every result were flattened to text.
+        let value = json!({
+            "content": [{ "type": "text", "text": "Found 3 engine entries." }],
+            "structuredContent": { "engines": [{ "id": "lemonade", "available": true }] },
+            "isError": false,
+        });
+        let tool = EnginesRocmTool {
+            executor: Some(Arc::new(FakeExec(value.clone())) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({})).await.expect("ok");
+        assert_eq!(
+            out, value,
+            "an in-budget result must pass through unchanged"
         );
     }
 

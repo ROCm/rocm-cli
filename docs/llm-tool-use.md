@@ -55,6 +55,43 @@ rocm-cli local assistants use structured tools, not shell commands.
   where vLLM is the supported path. The assistant should answer platform
   questions from the injected facts and must never suggest CPU fallback.
 
+## Tool Result Shape And Size
+
+A tool result is an MCP envelope: a `content` array of text items, an optional
+`structuredContent` object, and `isError`. For a command-backed tool the
+envelope carries the command's output twice — as the `content` text and again
+as `structuredContent.stdout` — because `rocm mcp-call` consumers read the
+structured field. That full envelope is what `rocm mcp-call` prints and what
+the approval replay path stores.
+
+What reaches the *model* is narrower, because a tool result is not free: it is
+sent back as a message and counts against the model's context on that request
+and on every later turn of the same conversation. A locally served model is
+commonly configured with a 32k-token context (llama.cpp's default `n_ctx`),
+and the system prompt plus the tool schemas already take a few thousand of
+those. So the dash shapes each result before the model sees it
+(`run_rocm_read_tool` in
+[tools.rs](../crates/rocm-dash-tui/src/agent/tools.rs)):
+
+- **One copy.** `structuredContent.stdout` and `.stderr` are dropped when the
+  envelope's own text already carries them. Fields that are not duplicates —
+  `argv`, `exit_status`, and the data of tools whose payload lives only in
+  `structuredContent` — are kept.
+- **A size cap.** A result is bounded to `TOOL_RESULT_CHAR_BUDGET` characters
+  of serialized JSON (16 KiB, roughly 4.5k tokens). A result within it passes
+  through unchanged. One that is not is replaced by its plain-text rendering,
+  cut on a line boundary, ending in
+  `[output truncated: A of B characters shown, C omitted ...]`. The marker is
+  part of the contract: the assistant skill tells the model to report a
+  truncated result as partial rather than as a complete answer.
+
+The CLI chat path (`rocm chat --prompt --tools`) reads only the envelope's
+text, so it never sent the duplicate copy; it does not apply the cap.
+
+Read-only commands are rendered so that the cheap form is the default:
+`rocm_command` with `["model"]` returns the curated list `rocm model` prints,
+and the per-recipe diagnostics need an explicit `["model", "--verbose"]`.
+
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the
 tool, and the result is returned to the model for the next response. MCP tool

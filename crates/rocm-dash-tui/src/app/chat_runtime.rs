@@ -11,6 +11,10 @@
 //! one `drain_*` method per one-shot edge on `AppState` (`provider_switch`,
 //! `chat_endpoint_rebuild`, `chat_dispatch`) consumes that edge. The detect and
 //! persist edges do not touch the backend and stay in `event_loop`.
+//!
+//! [`chat_error_message`] sits on the dispatch edge: it turns a failed round
+//! trip into the line the transcript shows, rewriting a provider context
+//! overflow into plain language and leaving every other error as it is.
 
 use tokio::sync::mpsc;
 
@@ -26,6 +30,82 @@ use super::types::{ChatProvider, ChatTurn, NO_CHAT_BACKEND_MSG, ResolvedArgs};
 use super::{AppState, ProviderSwitch};
 
 type SharedAgent = std::sync::Arc<dyn AgentClient>;
+
+/// Turn a backend error into the line the Chat tab shows.
+///
+/// Most errors are already readable and pass through unchanged. The one that
+/// is not is a context overflow: the provider answers HTTP 400 with its own
+/// JSON body, and the transcript used to show the whole thing — status line,
+/// error type, token counts and all — which tells a user nothing about what
+/// happened or what to do next. That one case is rewritten into a sentence
+/// that names the cause and a way forward, and the raw body is logged so the
+/// detail is still available in `rocm-cli.log`.
+fn chat_error_message(raw: &str) -> String {
+    let Some(message) = context_overflow_message(raw) else {
+        return raw.to_owned();
+    };
+    // Only on the rewritten path: an error shown verbatim is already logged
+    // by the backend, and this is the one case where what the user sees no
+    // longer contains what a maintainer would need.
+    tracing::warn!(error = %raw, "chat request exceeded the model's context");
+    message
+}
+
+/// The plain-language form of a provider context-overflow error, or `None`
+/// when `raw` is some other failure.
+///
+/// Matches on the provider's own error type rather than on the HTTP status:
+/// a 400 covers many unrelated mistakes, and only this one has a cause the
+/// user can act on. The token counts come out of the same body; a body that
+/// omits them still gets the sentence, without the numbers.
+fn context_overflow_message(raw: &str) -> Option<String> {
+    if !raw.contains("exceed_context_size_error") {
+        return None;
+    }
+    let counts = json_number_field(raw, "n_prompt_tokens")
+        .zip(json_number_field(raw, "n_ctx"))
+        .map(|(used, available)| {
+            format!(
+                " ({} of {} tokens)",
+                group_thousands(used),
+                group_thousands(available)
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "A ROCm check returned more text than this model can read{counts}. \
+         Try a more specific question, or a model with a larger context."
+    ))
+}
+
+/// Read `"<field>": <integer>` out of a JSON fragment embedded in a longer
+/// message. Deliberately not a full parse: the body arrives wrapped in the
+/// backend's own error prose, so there is no single value to deserialize.
+fn json_number_field(raw: &str, field: &str) -> Option<u64> {
+    let needle = format!("\"{field}\"");
+    let after = raw.split_once(&needle)?.1;
+    let after = after.trim_start().strip_prefix(':')?.trim_start();
+    let digits = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .filter(|digits| !digits.is_empty())?;
+    digits.parse().ok()
+}
+
+/// `53820` → `53,820`. The counts are the point of the message, and an
+/// ungrouped five-digit number next to another one is hard to compare at a
+/// glance.
+fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
 
 pub(super) struct ChatRuntime {
     /// The backend the next submit is routed to; `None` when none could be
@@ -345,7 +425,7 @@ impl ChatRuntime {
                         let msg = match agent.complete(&history, snapshot).await {
                             Ok(text) => ClientMsg::ChatReply { text },
                             Err(e) => ClientMsg::ChatError {
-                                message: e.to_string(),
+                                message: chat_error_message(&e.to_string()),
                             },
                         };
                         let _ = reply_tx.send(msg);
@@ -707,6 +787,98 @@ mod tests {
                 assert!(message.contains("mock failure"), "got: {message}");
             }
             _ => panic!("expected an error message"),
+        }
+    }
+
+    // --- error messages ------------------------------------------------------
+
+    /// The body a local llama.cpp-style server answers a too-large request
+    /// with, wrapped in the backend prose the Chat tab used to show verbatim.
+    const CONTEXT_OVERFLOW_ERROR: &str = "chat request failed: CompletionError: HttpError: \
+         Invalid status code 400 Bad Request with message: \
+         {\"error\":{\"code\":400,\"message\":\"request (53820 tokens) exceeds the available \
+         context size (32768 tokens), try increasing it\",\
+         \"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":53820,\"n_ctx\":32768}}";
+
+    /// In-memory `tracing` writer so a test can read back what was logged.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn a_context_overflow_reads_as_plain_language_and_keeps_the_raw_body_in_the_log() {
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let message = chat_error_message(CONTEXT_OVERFLOW_ERROR);
+        drop(guard);
+
+        // What the user reads says what happened and what to do about it…
+        assert_eq!(
+            message,
+            "A ROCm check returned more text than this model can read \
+             (53,820 of 32,768 tokens). Try a more specific question, or a model \
+             with a larger context."
+        );
+        // …and none of the provider's wire detail.
+        for noise in ["HttpError", "400", "exceed_context_size_error", "n_ctx"] {
+            assert!(
+                !message.contains(noise),
+                "`{noise}` leaked into the chat message: {message}"
+            );
+        }
+        // The detail is not lost: it is in the log a maintainer reads.
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).expect("utf-8 log");
+        assert!(
+            logged.contains("exceed_context_size_error") && logged.contains("n_prompt_tokens"),
+            "the raw provider body must still reach rocm-cli.log, got: {logged}"
+        );
+    }
+
+    #[test]
+    fn a_context_overflow_without_token_counts_still_reads_as_plain_language() {
+        let message = chat_error_message(
+            "chat request failed: HttpError: 400 {\"error\":{\"type\":\"exceed_context_size_error\"}}",
+        );
+        assert!(
+            message.starts_with("A ROCm check returned more text"),
+            "{message}"
+        );
+        assert!(
+            !message.contains('('),
+            "with no counts in the body the sentence carries no numbers: {message}"
+        );
+    }
+
+    #[test]
+    fn every_other_backend_error_is_left_alone() {
+        // Only the one error with an actionable cause is rewritten; rewriting
+        // the rest would hide detail the user needs to report a real fault.
+        for raw in [
+            "chat request failed: connection refused",
+            "request timed out after 120s",
+            "failed to build chat client: no endpoint configured",
+            // A 400 that is not a context overflow keeps its own text.
+            "chat request failed: HttpError: Invalid status code 400 Bad Request",
+        ] {
+            assert_eq!(chat_error_message(raw), raw);
         }
     }
 
