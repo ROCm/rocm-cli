@@ -7498,6 +7498,8 @@ jobs:
         // did, while a prefix check still passed. A new job has no entry here
         // and fails until it is added, which is the point: someone must decide
         // how it behaves on `closed`.
+        const MATRIX_EXPR: &str = "fromJSON(needs.changes.result == 'skipped' && '[\"current\"]' \
+                                    || needs.changes.outputs.sdk_version_matrix)";
         let lane_if = |extra: &str, platform: &str| {
             format!(
                 "always() && needs.changes.result == 'success' && {extra}\
@@ -7507,21 +7509,23 @@ jobs:
                  && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
             )
         };
-        let expected: Vec<(&str, String)> = vec![
+        let expected: Vec<(&str, String, bool)> = vec![
             (
                 "e2e-gpu",
                 lane_if("github.event_name != 'merge_group' && ", "app-dev-gpu"),
+                true,
             ),
-            ("e2e-gpu-strix-ubuntu", lane_if("", "strix-ubuntu")),
-            ("e2e-gpu-strix-windows", lane_if("", "strix-windows")),
-            ("e2e-wsl", lane_if("", "strix-wsl")),
-            ("e2e-gpu-w7900", lane_if("", "w7900")),
+            ("e2e-gpu-strix-ubuntu", lane_if("", "strix-ubuntu"), true),
+            ("e2e-gpu-strix-windows", lane_if("", "strix-windows"), true),
+            ("e2e-wsl", lane_if("", "strix-wsl"), true),
+            ("e2e-gpu-w7900", lane_if("", "w7900"), true),
             // Skips because the `serve` output of a skipped `changes` is empty.
             (
                 "e2e-report",
                 "always() && (needs.changes.outputs.serve == 'true' \
                  || github.event_name == 'workflow_dispatch')"
                     .to_owned(),
+                false,
             ),
         ];
         let ids = job_ids(&sh);
@@ -7529,9 +7533,9 @@ jobs:
             .iter()
             .filter(|id| !["changes", "pr-closed"].contains(&id.as_str()))
         {
-            let (_, want) = expected
+            let (_, want, matrix) = expected
                 .iter()
-                .find(|(name, _)| name == id)
+                .find(|(name, _, _)| name == id)
                 .unwrap_or_else(|| {
                     panic!(
                         "job `{id}` has no pinned `if`: add it, deciding how it behaves on `closed`"
@@ -7543,19 +7547,27 @@ jobs:
                 want,
                 "job `{id}` must skip when `changes` is skipped (a closed PR)"
             );
-            if *id != "e2e-report" {
-                // `changes` is skipped on `closed`, so its matrix output is empty;
-                // the fallback keeps the strategy evaluable.
+            // Only a job pinned as a matrix lane reads the matrix, so a future
+            // non-matrix helper is not forced to carry it.
+            if *matrix {
+                // `changes` is skipped on `closed`, so its matrix output is empty.
+                // The placeholder applies only then (`&&` yields the string when
+                // the result is `skipped`, else `false`, so `||` falls through to
+                // the output): a missing output after `changes` succeeded still
+                // makes `fromJSON('')` fail instead of quietly running `current`.
                 assert!(
-                    block.contains(
-                        "fromJSON(needs.changes.outputs.sdk_version_matrix || '[\"current\"]')"
-                    ),
-                    "lane `{id}` must fall back to `[\"current\"]` when the matrix output is \
-                     empty:\n{block}"
+                    block.contains(MATRIX_EXPR),
+                    "lane `{id}` must read its matrix as `{MATRIX_EXPR}`:\n{block}"
+                );
+                assert_eq!(
+                    block.matches("sdk_version_matrix").count(),
+                    1,
+                    "lane `{id}` must read `sdk_version_matrix` only through that guarded \
+                     expression:\n{block}"
                 );
             }
         }
-        for (name, _) in &expected {
+        for (name, _, _) in &expected {
             assert!(
                 ids.iter().any(|id| id == name),
                 "pinned job `{name}` is gone"
