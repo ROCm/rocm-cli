@@ -3042,6 +3042,7 @@ sdk install
                 install_root: &install_root,
                 runtime_key: &runtime_key,
                 package_specs: &composition.package_specs,
+                kept_torch: None,
                 manifest_path: &manifest_path,
             }),
         };
@@ -3065,6 +3066,92 @@ sdk install
         );
         assert!(!resolved.contains("not resolved"), "{resolved}");
         assert!(!resolved.contains("resolution_note"), "{resolved}");
+    }
+
+    /// A kept torch changes what `uv` is handed and nothing the runtime is recorded as.
+    /// The preview's `command:` is the line a user is invited to run, so it has to
+    /// leave the torch stack out exactly as the install does, while `package_specs:`
+    /// stays the composition the manifest and the runtime key are made from.
+    #[test]
+    fn a_kept_torch_is_left_out_of_the_command_but_not_out_of_the_composition() {
+        use super::super::super::kept_torch::{KeptTorch, kept_torch_stack};
+        use super::super::super::wheel_plan::{
+            PlanStack, ResolvedStack, WheelPlan, write_dry_run_tail, write_wheel_plan,
+        };
+
+        let resolution = resolved_runtime();
+        let composition = wheel_runtime_composition(&resolution, &resolution.device_target, false);
+        let install_root = PathBuf::from("/runtimes/kept");
+        let manifest_path = PathBuf::from("/manifests/kept");
+        let (python, compatibility) = clean_host_python();
+        let kept = kept_torch_stack(true, || {
+            Ok(vec![("torch".to_owned(), "2.9.0+gitd0c8b1f".to_owned())])
+        });
+        let render = |kept: Option<&KeptTorch>| {
+            let plan = WheelPlan {
+                channel: TheRockChannel::Release,
+                version_selector: None,
+                index_url: &resolution.index_url,
+                layout_generation: resolution.layout.generation(),
+                latest_version: &resolution.latest_version,
+                family: &resolution.family,
+                family_source: &resolution.family_source,
+                device_target: &resolution.device_target,
+                host_version_newer: None,
+                python: &python,
+                wheel_compatibility: &compatibility,
+                version_resolution_specs: resolution.version_resolution_specs.as_deref(),
+                torchaudio_pin: resolution.torchaudio_pin.as_ref(),
+                no_wheel_warning: None,
+                stack: PlanStack::Resolved(ResolvedStack {
+                    compatibility_key: &resolution.package_versions.compatibility_key,
+                    install_root: &install_root,
+                    runtime_key: "kept",
+                    package_specs: &composition.package_specs,
+                    kept_torch: kept,
+                    manifest_path: &manifest_path,
+                }),
+            };
+            let mut text = String::new();
+            write_wheel_plan(&mut text, &plan);
+            write_dry_run_tail(&mut text, &plan);
+            text
+        };
+        let line = |text: &str, key: &str| {
+            text.lines()
+                .find(|line| line.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("no `{key}` line in:\n{text}"))
+                .to_owned()
+        };
+
+        let plain = render(None);
+        assert!(!plain.contains("torch_kept:"), "{plain}");
+        assert!(
+            line(&plain, "command:").contains("torch[device-gfx1200]==2.10.0+rocm10.0.0"),
+            "without a kept torch the command installs it: {plain}"
+        );
+
+        let kept_plan = render(kept.as_ref());
+        assert!(
+            line(&kept_plan, "torch_kept:").contains("torch 2.9.0+gitd0c8b1f"),
+            "{kept_plan}"
+        );
+        let command = line(&kept_plan, "command:");
+        assert!(
+            command.contains("rocm["),
+            "the SDK is still installed: {command}"
+        );
+        for left_out in ["torch[", "torchvision", "torchaudio"] {
+            assert!(
+                !command.contains(left_out),
+                "the command still installs `{left_out}`: {command}"
+            );
+        }
+        assert_eq!(
+            line(&kept_plan, "package_specs:"),
+            line(&plain, "package_specs:"),
+            "the composition the manifest records does not change"
+        );
     }
 
     // ---- the recorded device target ------------------------------------------

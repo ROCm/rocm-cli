@@ -732,9 +732,9 @@ contributors and is part of the public source distribution.
 
 ### `scripts/` Directory
 
-The `scripts/` directory contains Python and shell scripts for local smoke
-testing, GPU integration tests, release packaging, and CI support. These are
-development tools, not shipped to end users.
+The `scripts/` directory contains Python and shell scripts for GPU integration
+tests, release packaging, and CI support. These are development tools, not
+shipped to end users. The local smoke test is `cargo xtask smoke`.
 
 ## Media Assets
 
