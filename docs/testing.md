@@ -3892,21 +3892,21 @@ row is the backend and ordinal with no name — correct and unspecific, rather
 than specific and wrong. No CI lane has two AMD GPUs, so that branch is covered
 by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
 
-**`rocm examine` prints a `rocm_support` line on every host**, at one of four
-levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, no GPU backend,
-or unknown. Unknown covers both "nothing detected" and "a target this build's
-catalog does not recognise" — conflating the latter with "confirmed to have no
-ROCm build" would turn a detection gap into a claim about the hardware, which
-is why it is distinct from the `NoGpuBackend` level that *is* a confirmed
-answer. `examine-49` holds the line against the `detected_gfx_target` and
-`compatible_therock_family` the same report prints, so every lane checks the
-level its own hardware implies; `examine-50`, `examine-51` and `examine-52`
-cover the Vulkan tiers (a driver present, none present, and a software
-renderer that must not count as a GPU path) and are `@requires-os:linux`:
+**`rocm examine` prints a `rocm_support` line on every host**, at one of three
+levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, or unknown.
+Unknown covers both "nothing detected" and "a target this build's catalog does
+not recognise" — conflating the latter with "confirmed to have no ROCm build"
+would turn a detection gap into a claim about the hardware. `examine-49` holds
+the line against the `detected_gfx_target` and `compatible_therock_family` the
+same report prints, so every lane checks the level its own hardware implies:
 
 ```bash
-cargo xtask e2e -- -n '(examine-49|examine-5[012])'
+cargo xtask e2e -- -n '(examine-49)'
 ```
+
+A fourth level, `NoGpuBackend`, and the scenarios covering the Vulkan tiers
+live in the Vulkan-probe change (#1036), which is what makes that level
+knowable.
 
 ## Windows Tool Notes
 

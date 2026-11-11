@@ -3331,15 +3331,6 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
         (_, Some(_), Some(_)) => ("rocm serve <model>", &["rocm install sdk"]),
         // ROCm-capable with no managed SDK yet: that install is the next step.
         (_, Some(_), None) => ("rocm install sdk", &[]),
-        // A GPU no package family covers, and the Vulkan probe found no GPU
-        // driver either: there is no backend to serve on, so the line owes a
-        // way to GET one rather than a serve command that would be refused.
-        // Branched on the rendered tier the way the renderer itself is — a
-        // flat expectation here failed on exactly this hardware, since this
-        // scenario is untagged and runs on every lane.
-        (Some(_), None, _) if line.contains("no Vulkan GPU driver was found") => {
-            ("install one", &["rocm serve", "rocm install sdk"])
-        }
         // A GPU no package family covers — confirmed Vulkan-only (gfx90c) or
         // merely unrecognized. Either way the SDK has nothing for it and
         // Lemonade's Vulkan backend is what can serve on it.
