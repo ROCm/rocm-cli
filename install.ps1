@@ -168,14 +168,17 @@ function Convert-FileUriToPath {
     return $null
 }
 
-# Pinned production release signing public keys (trust roots). These stay empty
-# until the repository owner publishes production keys (see docs/release-trust.md,
-# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior:
-# a signature is verified only when a key is supplied via the parameters/env vars
-# or ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
-# signatures by default with these keys as trust roots. Two slots support
-# zero-downtime key rotation: a release signed with either the current or the
-# pre-staged next key verifies, so the next key is trusted before its first use.
+# Pinned production release signing public keys (trust roots). The Current slot
+# holds the published release key, whose canonical copy is
+# docs/keys/rocm-cli-release-current-public.pem; the Next slot stays "" until a
+# rotation key is published. Resolve-SigningPublicKey falls back to these keys
+# whenever no key is passed with -SigningPublicKeyPath/-SigningPublicKeyPem (or
+# ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/ROCM_CLI_SIGNING_PUBLIC_KEY_PEM), so every
+# install on any channel verifies the detached signature and a missing .sig
+# sidecar fails it. A key supplied that way replaces these keys rather than
+# adding to them. Two slots support zero-downtime key rotation: a release signed
+# with either the current or the pre-staged next key verifies, so the next key is
+# trusted before its first use.
 $PinnedReleasePublicKeyCurrent = @"
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxuyScR/BzV+kuXqWAHtE

@@ -10,8 +10,9 @@ AIM entries live in [model_catalog.json](../crates/rocm-core/src/model_catalog.j
 alongside every other model recipe (`"loader": "aim"`). They are hand-maintained
 and ship on the normal CLI release cadence, through the same PR review as any
 other recipe. There is no network fetch of the catalog: a hosted, signed
-recipe index is blocked on production signing keys (see
-[release-trust.md](release-trust.md)) and is out of scope here.
+recipe index is blocked on the unpublished recipe index signing key (see
+[release-trust.md](release-trust.md#remaining-owner-step)) and is out of scope
+here.
 
 ## Freshness
 

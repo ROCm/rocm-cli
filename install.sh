@@ -103,14 +103,16 @@ fetch() {
   fi
 }
 
-# Pinned production release signing public keys (trust roots). These stay empty
-# until the repository owner publishes production keys (see docs/release-trust.md,
-# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior
-# below: a signature is verified only when a key is supplied via the env vars or
-# ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
-# signatures by default with these keys as trust roots. Two slots support
-# zero-downtime key rotation: a release signed with either the current or the
-# pre-staged next key verifies, so the next key is trusted before its first use.
+# Pinned production release signing public keys (trust roots). The CURRENT slot
+# holds the published release key, whose canonical copy is
+# docs/keys/rocm-cli-release-current-public.pem; the NEXT slot stays "" until a
+# rotation key is published. resolve_public_keys falls back to these keys
+# whenever ROCM_CLI_SIGNING_PUBLIC_KEY_PATH and ROCM_CLI_SIGNING_PUBLIC_KEY_PEM
+# are unset, so every install on any channel verifies the detached signature and
+# a missing .sig sidecar fails it. A key supplied through those env vars replaces
+# these keys rather than adding to them. Two slots support zero-downtime key
+# rotation: a release signed with either the current or the pre-staged next key
+# verifies, so the next key is trusted before its first use.
 PINNED_RELEASE_PUBLIC_KEY_CURRENT="-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxuyScR/BzV+kuXqWAHtE
 +9xiPCWURUYnsio9MOrf2Xe01mBngP7qPcF13+5nrfT3EnuxOn5rSCYwjOndlS+c
