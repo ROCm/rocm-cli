@@ -38,7 +38,7 @@ differs is when each runs and what hardware it covers.
 |---|---|---|---|---|
 | Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below, except `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` (see below) | No — absent from the required-status-check list |
 | Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same self-hosted platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
-| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The same per-PR lanes | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
+| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The full self-hosted matrix: every platform in the table below, including `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which only skip `pull_request` | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
 
 R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
@@ -148,22 +148,15 @@ cloning the checkout into the guest's native filesystem to avoid building
 against the slow DrvFs mount. The distro is deliberately left without ROCm's
 WSL driver bridge — see "What the WSL distro needs" below.
 
-This migration is scoped to the per-PR lanes in this table, plus the nightly
-WSL and Windows Strix lanes below — not every nightly lane. `nightly.yml`'s
-Ubuntu Strix lane (`e2e-gpu-nightly-strix`) still pins the `native` label and
-runs on the same static, always-on host these per-PR lanes moved off of —
-that label still means what it always did there: `native` disambiguates this
-host from any runner that might carry a bare `wsl` label alongside
-`strix-halo` (the static WSL runner this repo used before the WSL lanes below
-moved to the ephemeral pool). Whether that runner remains registered is not
-something this migration changes either way, since nothing here targets a
-`wsl`-labeled runner anymore. `nightly.yml`'s `e2e-wsl-nightly` and
-`e2e-gpu-nightly-strix-windows`, however, both moved onto the same DevLab
-Dispatch pool as the per-PR `e2e-wsl`/`e2e-gpu-strix-windows` lanes above, for
-the same reason: neither needs a dedicated `native`- or `wsl`-labeled runner,
-so there is nothing pool-incompatible about either. Moving the remaining
-`native` Ubuntu nightly lane onto the pool as well is a separate, not-yet-made
-decision.
+The Strix Halo lanes in this table run on the DevLab Dispatch pool, and so do
+their nightly counterparts: `nightly.yml`'s `e2e-gpu-nightly-strix` (Ubuntu),
+`e2e-gpu-nightly-strix-windows` and `e2e-wsl-nightly` all use the same
+`runs-on` labels as `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows` and
+`e2e-wsl` (pinned by `nightly_devlab_dispatch_lanes_share_the_per_pr_pool_labels`
+in `xtask/src/workflow_contract.rs`). The Ubuntu nightly lane used to pin the
+static `native` label; that host is offline, so the lane sat queued until the
+run cap and never ran. Whether a `native`- or `wsl`-labeled runner remains
+registered no longer matters: nothing targets one.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
