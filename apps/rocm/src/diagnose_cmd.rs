@@ -36,8 +36,16 @@ use crate::cli_report::{JsonOrText, print_json_or_text};
 use crate::diagnose_model;
 use crate::model_fit::assess_model_on_this_host;
 
+/// What `--symptom` and `--engine` asked for: the error text, exactly as the
+/// user gave it, and the engine they said it came from. One value because
+/// `--engine` cannot be given without `--symptom`.
+pub(crate) struct SymptomQuery {
+    pub(crate) text: String,
+    pub(crate) engine: Option<rocm_core::SymptomEngine>,
+}
+
 pub(crate) fn diagnose(
-    symptom: Option<String>,
+    symptom: Option<SymptomQuery>,
     top: usize,
     json: bool,
     distro: Option<String>,
@@ -97,7 +105,9 @@ pub(crate) fn diagnose(
         .wsl
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
-    let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    let (symptom, engine) =
+        symptom.map_or((String::new(), None), |query| (query.text, query.engine));
+    let mut report = rocm_core::run_diagnose_with_engine(&examination, &symptom, engine);
     // A prepared report carries no model verdict, and a GGUF estimate may read
     // the model's header from the network -- which `--report` promises it never
     // does -- so under `--report` the model is not assessed at all.
@@ -545,6 +555,7 @@ mod tests {
             },
             out_of_scope: None,
             model: None,
+            provenance: None,
         }
     }
 

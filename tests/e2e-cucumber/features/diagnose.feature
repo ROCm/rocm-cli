@@ -867,3 +867,37 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine whose only GPU is a released one
     When the user asks the CLI what that machine's report would carry in machine-readable form
     Then the report names the CLI version that `rocm version` leads with
+
+  # ROCMAI-955. A vLLM error is often an ordinary PyTorch line that does not say
+  # vLLM, and the vLLM entry will not claim a line that does not, so the
+  # rocm-doctor skill tells an agent to write `vllm: ` in front of the user's
+  # paste (it moves to naming the engine in a later change). The user can now
+  # say where the paste came from instead, and the paste is used, and reported,
+  # exactly as given. @requires-os:linux for the reason given on
+  # diagnose-36: the vLLM entry is not in the native Windows catalog. Writing
+  # `vllm` into the paste still matches as before; diagnose-36 covers that form.
+  @id:diagnose-named-engine-matches-the-paste-unedited @requires-os:linux
+  Scenario: diagnose-59 - A pasted vLLM error is matched as vLLM's when the user names the engine, and not edited
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from
+    Then the diagnosis identifies the vLLM startup OOM
+    And the symptom in the report is exactly what the user pasted
+
+  # The record of where the paste came from does not depend on whether this
+  # machine's catalog has an entry for that engine, so it holds on every lane,
+  # native Windows included.
+  @id:diagnose-named-engine-is-recorded-in-the-report
+  Scenario: diagnose-60 - The report says which engine the user named and keeps the paste as given
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from
+    Then the report says the user named vLLM as the source of the symptom
+    And the symptom in the report is exactly what the user pasted
+
+  # Only the engines the catalog tells apart are accepted. An engine `rocm
+  # serve` knows but the catalog does not would change nothing, so it is
+  # refused rather than accepted and silently ignored.
+  @id:diagnose-unknown-engine-is-refused
+  Scenario: diagnose-61 - Naming an engine the diagnosis cannot tell apart is refused
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming an engine the diagnosis does not know
+    Then the CLI refuses the engine, names the ones it accepts, and diagnoses nothing

@@ -306,6 +306,18 @@ async fn user_pasted_a_capture_with_a_foreign_oom(world: &mut E2eWorld) {
     );
 }
 
+/// A vLLM startup OOM as a user pastes it from the engine log: two lines, and
+/// neither names vLLM, which is what made the old prefix necessary. The leading
+/// line and the trailing spaces are there so "exactly as pasted" has something
+/// to lose: a paste trimmed, split or re-joined would no longer compare equal.
+const UNNAMED_VLLM_OOM_PASTE: &str = "INFO Loading model weights took 14.9 GiB\n\
+     torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB  ";
+
+#[given("a user who pasted a vLLM out-of-memory error that does not name vLLM")]
+async fn user_pasted_unnamed_vllm_oom(world: &mut E2eWorld) {
+    world.model_name = Some(UNNAMED_VLLM_OOM_PASTE.to_string());
+}
+
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
@@ -619,6 +631,41 @@ async fn user_diagnoses_json(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Diagnose the scenario's symptom, naming `engine` as where it came from.
+/// Keeps stdout, stderr and the exit code apart: a refusal is judged on all
+/// three.
+fn diagnose_naming_engine(world: &mut E2eWorld, engine: &str) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            &symptom,
+            "--engine",
+            engine,
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from")]
+async fn user_diagnoses_naming_vllm(world: &mut E2eWorld) {
+    diagnose_naming_engine(world, "vllm");
+}
+
+/// `lemonade` because it is an engine `rocm serve --engine` accepts: the
+/// refusal is about what the diagnosis tells apart, not about a typo.
+#[when(
+    "the user asks the CLI to diagnose that symptom, naming an engine the diagnosis does not know"
+)]
+async fn user_diagnoses_naming_unknown_engine(world: &mut E2eWorld) {
+    diagnose_naming_engine(world, "lemonade");
+}
+
 #[when("the user asks the CLI which fixes it offers")]
 async fn user_lists_fixes(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["fix"]);
@@ -915,6 +962,56 @@ async fn assert_no_vllm_oom_reported(world: &mut E2eWorld) {
             diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
         }),
         "another engine's OOM must not be attributed to vLLM:\n{output}"
+    );
+}
+
+#[then("the symptom in the report is exactly what the user pasted")]
+async fn assert_report_keeps_the_paste_verbatim(world: &mut E2eWorld) {
+    let pasted = world.model_name.clone().expect("no symptom set");
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/symptom")
+            .and_then(serde_json::Value::as_str),
+        Some(pasted.as_str()),
+        "the report must carry the paste byte for byte, with nothing added:\n{output}"
+    );
+}
+
+#[then("the report says the user named vLLM as the source of the symptom")]
+async fn assert_report_names_vllm_as_source(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/engine")
+            .and_then(serde_json::Value::as_str),
+        Some("vllm"),
+        "the report must record the engine the user named:\n{output}"
+    );
+}
+
+#[then("the CLI refuses the engine, names the ones it accepts, and diagnoses nothing")]
+async fn assert_unknown_engine_refused(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    // clap's usage-error exit code.
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "an unknown engine is a usage error:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lemonade") && stderr.contains("vllm"),
+        "the refusal must name the rejected value and the accepted one:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "nothing may be diagnosed when the engine is refused:\n{stdout}"
     );
 }
 

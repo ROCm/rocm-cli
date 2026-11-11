@@ -356,7 +356,7 @@ Windows. The Vulkan driver version is not shown.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
+rocm diagnose [--symptom TEXT [--engine vllm]] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
@@ -374,6 +374,13 @@ position.
 `rocm diagnose` takes these flags:
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
+- `--engine` names the engine the `--symptom` text came from (only `vllm` is
+  accepted; it needs `--symptom`). An engine's own error is often a line any
+  program could print, such as a PyTorch out-of-memory error, and the vLLM entry
+  claims only lines that name vLLM. With `--engine vllm`, every line of the
+  symptom is taken as vLLM's, so the error is matched without editing it; the
+  `--json` report records the engine and the symptom, exactly as given, under
+  `provenance`. Writing `vllm` into the symptom text still works too.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such

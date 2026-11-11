@@ -3857,6 +3857,45 @@ the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
 
+## Diagnose Engine Provenance
+
+`rocm diagnose --engine vllm` (ROCMAI-955) says which engine a `--symptom` came
+from, so a vLLM error that does not itself name vLLM is matched as vLLM's
+without anyone writing `vllm: ` into the user's text. The vLLM out-of-memory
+entry (`fix-16-vllm-oom`) only scores lines that name vLLM; with the engine
+named, every line of the symptom counts as vLLM's, which is exactly the result
+of `vllm` written on each line. No other entry reads the engine. The JSON report
+records the engine and the symptom, verbatim, under `provenance`; without
+`--engine` the field is absent and the report is unchanged, so the skill eval
+replays (`cargo xtask eval-fixtures --check`) stay as they are.
+
+Unit coverage — the match equals the prefixed form on Linux and WSL2, a
+multi-line paste is anchored on every line, nothing else changes (native
+Windows included), the report keeps the symptom byte for byte, and the flag
+takes only `vllm`:
+
+```bash
+cargo test -p rocm-core naming_vllm_
+cargo test -p rocm-core the_report_records_the_named_engine_and_the_symptom_verbatim
+cargo test -p rocm --bin rocm diagnose_engine_takes_the_engines_the_catalog_tells_apart
+```
+
+Scenarios in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature):
+`diagnose-59` (`@requires-os:linux`, as `diagnose-36`, because the vLLM entry is
+not in the native Windows catalog) diagnoses an unprefixed two-line vLLM OOM
+with the engine named and checks the match and the verbatim symptom;
+`diagnose-60` checks the recorded engine and symptom on every lane; and
+`diagnose-61` checks that an engine `rocm serve` knows but the catalog does not
+tell apart (`lemonade`) is a usage error that diagnoses nothing:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-59|diagnose-60|diagnose-61)'
+```
+
+A name filter bypasses the suite's host filter, so on native Windows select
+`diagnose-60` and `diagnose-61` only.
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global

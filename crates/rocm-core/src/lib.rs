@@ -102,10 +102,10 @@ pub use crypto::{
     verify_rsa_pkcs1_sha256_signature,
 };
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, Route, VLLM_IMPORT_CANONICAL_SYMPTOM,
-    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
-    render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
-    vllm_oom_symptom_is_diagnosable,
+    DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
+    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    diagnose_with_engine as run_diagnose_with_engine, render_report_text as render_diagnose_text,
+    vllm_import_symptom_is_diagnosable, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,

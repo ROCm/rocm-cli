@@ -659,6 +659,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose {
             symptom,
+            engine,
             top,
             json,
             distro,
@@ -670,6 +671,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         }) => {
             let model = model.map(|model_ref| {
                 diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            let symptom = symptom.map(|text| diagnose_cmd::SymptomQuery {
+                text,
+                engine: engine.map(Into::into),
             });
             diagnose(symptom, top, json, distro, model, report, send)
         }
