@@ -465,6 +465,9 @@ pub(super) fn finalize(
         score: score.min(100),
         evidence,
         fix: Some(fix),
+        // Not a checker's call: `diagnose` sets it by comparing against a run
+        // with no symptom.
+        symptom_matched: false,
     }
 }
 

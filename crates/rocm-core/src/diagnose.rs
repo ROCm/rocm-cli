@@ -43,7 +43,7 @@ mod wsl;
 
 pub use engine::{VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM};
 pub use linux::{AMDGPU_MISSING_EVIDENCE, dkms_driver_plan_is_supported};
-pub use report::{render_report_text, upstream_route};
+pub use report::{SYMPTOM_DID_NOT_CONTRIBUTE_NOTE, render_report_text, upstream_route};
 
 /// At/above this score a diagnosis is treated as a real match.
 pub const MIN_SCORE_FOR_MATCH: i32 = 50;
@@ -91,6 +91,25 @@ pub struct Diagnosis {
     pub score: i32,
     pub evidence: Vec<String>,
     pub fix: Option<Fix>,
+    /// Whether the symptom text the user supplied contributed to this entry.
+    ///
+    /// `true` when, without the symptom, this entry would have a different score
+    /// or different evidence, or would not be listed at all; `false` when it
+    /// comes from the examined host's state alone. A host-state finding can
+    /// outrank the entry the symptom added to, so a reader asking "did the text
+    /// I pasted contribute to this entry?" reads this rather than the ranking.
+    ///
+    /// It records a contribution, not a verdict that the entry explains the
+    /// error: any keyword hit counts, however weak. Read `score` and `evidence`
+    /// for how much the text added.
+    ///
+    /// Always serialized, and `false` when no symptom was given: nothing was
+    /// pasted, so nothing in it contributed. Omitting it in that case would make
+    /// "no symptom" indistinguishable from "a CLI too old to report this field".
+    /// `#[serde(default)]` so a payload written before the field existed still
+    /// deserializes. Set by [`diagnose`], never by a checker.
+    #[serde(default)]
+    pub symptom_matched: bool,
 }
 
 /// Where to send a report when no catalog entry matches.
@@ -200,6 +219,43 @@ pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
     scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", run_all_checks)
 }
 
+/// Set [`Diagnosis::symptom_matched`] on every entry in `matched`.
+///
+/// Decided by running the same catalog again on the same machine with no
+/// symptom and comparing, rather than by each checker reporting what it read.
+/// Checkers fold the symptom in several ways (keyword tables, single patterns,
+/// a keyword whose own weight is replaced by a fixed one, a symptom that lifts a
+/// negative host score above zero), and a flag each of them had to set by hand
+/// is one a new checker can forget. The comparison asks the question itself:
+/// would this entry look the same without the text? Evidence is compared as
+/// well as the score because a score is capped at 100, so a keyword hit on an
+/// entry already at the cap changes its evidence and not its number.
+///
+/// The checkers are pure functions of the examination and the symptom, so the
+/// second run reads no more of the machine than the first.
+fn mark_symptom_contribution(matched: &mut [Diagnosis], e: &Examination, symptom: &str) {
+    if symptom.is_empty() {
+        return;
+    }
+    let host_only = run_all_checks(e, "");
+    for d in matched {
+        d.symptom_matched = contributed(d, &host_only);
+    }
+}
+
+/// Whether the symptom contributed to `d`, given `host_only`, the same catalog
+/// run on the same host with no symptom.
+///
+/// It did when `d` is absent from that run, or present with a different score
+/// or different evidence. Either difference alone is enough: a keyword hit on
+/// an entry already at the 100 cap changes only its evidence.
+fn contributed(d: &Diagnosis, host_only: &[Diagnosis]) -> bool {
+    host_only
+        .iter()
+        .find(|h| h.id == d.id)
+        .is_none_or(|h| h.score != d.score || h.evidence != d.evidence)
+}
+
 /// Diagnose an examination against the closed catalog.
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
@@ -221,6 +277,7 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     } else {
         run_all_checks(e, symptom)
     };
+    mark_symptom_contribution(&mut matched, e, symptom);
     take_applicability_from_the_catalog(&mut matched, platform_family(e));
     DiagnoseReport {
         has_match: any_cleared_threshold(&matched),
@@ -506,5 +563,168 @@ mod tests {
         assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
         // And a bare framework mention the engine would reject is not diagnosable.
         assert!(!vllm_oom_symptom_is_diagnosable("vllm: out of memory"));
+    }
+
+    /// The entry with `id` in `report`, or a panic naming what was listed.
+    fn entry<'a>(report: &'a DiagnoseReport, id: &str) -> &'a Diagnosis {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{id} was not listed: {:?}",
+                    report
+                        .matched
+                        .iter()
+                        .map(|d| (&d.id, d.score))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn with_gpu_override() -> Examination {
+        let mut e = linux_base();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        e
+    }
+
+    const ISA_PASTE: &str = "hipErrorNoBinaryForGpu: HSA_STATUS_ERROR_INVALID_ISA";
+
+    /// The case the field exists for: a finding about the machine sits beside
+    /// the entry the paste scores, and the paste contributed to only one of them.
+    #[test]
+    fn a_host_state_finding_is_not_credited_to_a_paste_about_something_else() {
+        let report = diagnose(&with_gpu_override(), ISA_PASTE);
+
+        let host = entry(&report, "fix-2-unset-override");
+        assert!(
+            !host.symptom_matched,
+            "the override finding comes from the environment alone: {host:?}"
+        );
+        let pasted = entry(&report, "fix-1-arch");
+        assert!(
+            pasted.symptom_matched,
+            "the ISA entry is scored from the paste: {pasted:?}"
+        );
+
+        // And both answers reach the document a consumer reads.
+        let json = serde_json::to_value(&report).unwrap();
+        let field = |id: &str| {
+            json["matched"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == id)
+                .map(|d| d["symptom_matched"].clone())
+        };
+        assert_eq!(field("fix-2-unset-override"), Some(false.into()));
+        assert_eq!(field("fix-1-arch"), Some(true.into()));
+    }
+
+    #[test]
+    fn a_paste_that_raises_a_host_finding_is_credited() {
+        // The override alone scores 30; a page fault in the paste adds to it.
+        let report = diagnose(&with_gpu_override(), "memory access page fault");
+        let raised = entry(&report, "fix-2-unset-override");
+        assert!(
+            raised.score > 30,
+            "the paste must have raised it: {raised:?}"
+        );
+        assert!(raised.symptom_matched, "{raised:?}");
+    }
+
+    #[test]
+    fn a_paste_that_lifts_an_entry_the_host_alone_ruled_out_is_credited() {
+        // The framework already carries this GPU's target, which pulls the
+        // arch entry below zero on its own, so it is not listed without the
+        // paste at all. With it, the entry is listed, and only because of it.
+        let mut e = linux_base();
+        e.gpus = vec![crate::examine::Gpu {
+            gfx_target: "gfx1100".to_owned(),
+            is_amd: true,
+            ..crate::examine::Gpu::default()
+        }];
+        e.framework_arch_list = vec!["gfx1100".to_owned()];
+        assert!(
+            diagnose(&e, "")
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-1-arch"),
+            "the premise: without the paste this entry is not listed"
+        );
+        let report = diagnose(&e, ISA_PASTE);
+        assert!(entry(&report, "fix-1-arch").symptom_matched);
+    }
+
+    #[test]
+    fn with_no_symptom_every_entry_says_so_and_the_field_is_still_written() {
+        for symptom in ["", "   "] {
+            let report = diagnose(&with_gpu_override(), symptom);
+            assert!(
+                !report.matched.is_empty(),
+                "this test is pointless unless something was listed"
+            );
+            assert!(
+                report.matched.iter().all(|d| !d.symptom_matched),
+                "nothing was pasted for {symptom:?}, so nothing in it contributed: {:?}",
+                report.matched
+            );
+            let json = serde_json::to_value(&report).unwrap();
+            for d in json["matched"].as_array().unwrap() {
+                assert_eq!(
+                    d.get("symptom_matched"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "the field is written, not omitted, when no symptom was given: {d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_payload_written_before_the_field_existed_still_reads() {
+        let old =
+            r#"{"id":"fix-2-unset-override","title":"t","score":30,"evidence":[],"fix":null}"#;
+        let d: Diagnosis = serde_json::from_str(old).expect("an older payload deserializes");
+        assert!(!d.symptom_matched);
+    }
+
+    fn finding(id: &str, score: i32, evidence: &[&str]) -> Diagnosis {
+        Diagnosis {
+            id: id.to_owned(),
+            score,
+            evidence: evidence.iter().map(|&e| e.to_owned()).collect(),
+            ..Diagnosis::default()
+        }
+    }
+
+    /// The three ways the symptom can show in an entry, one at a time, so each
+    /// half of the comparison has a case that only it decides.
+    #[test]
+    fn contribution_is_any_difference_from_the_run_without_the_symptom() {
+        let host_only = [finding("fix-a", 30, &["host fact"])];
+
+        // Same entry, same evidence, higher score: the score alone differs.
+        assert!(contributed(
+            &finding("fix-a", 55, &["host fact"]),
+            &host_only
+        ));
+        // Same score, extra evidence: what a keyword hit does to an entry
+        // already at the 100 cap. The evidence alone differs.
+        assert!(contributed(
+            &finding("fix-a", 30, &["host fact", "error mentions X"]),
+            &host_only
+        ));
+        // Not listed at all without the symptom.
+        assert!(contributed(
+            &finding("fix-b", 50, &["error mentions Y"]),
+            &host_only
+        ));
+        // Identical to the run without it: nothing contributed.
+        assert!(!contributed(
+            &finding("fix-a", 30, &["host fact"]),
+            &host_only
+        ));
     }
 }
