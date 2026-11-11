@@ -236,7 +236,11 @@ pub fn ensure_public_service_has_endpoint_key(
         // same engine and model and discards the key it generated for that
         // attempt, so launching again over it would leave the service as keyless
         // as it was and this refusal would come back at the next start. The stop
-        // is what clears the condition, and is harmless for one that has stopped.
+        // is what clears the condition, and is harmless for one that has stopped,
+        // which is the usual way to this refusal: `rocm` tests that the stop exits 0
+        // and leaves the record stopped with nothing pending
+        // (`the_stop_a_refusal_names_is_harmless_on_a_service_that_has_already_stopped`,
+        // scenario `service-stop-11`).
         let stop = format!(
             "rocm services stop {} --yes",
             crate::posix_shell_quote(service_id)

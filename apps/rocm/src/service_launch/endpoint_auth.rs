@@ -557,6 +557,27 @@ mod tests {
         Ok(())
     }
 
+    /// The model a launch of `qwen-canonical` resolves to, as the spawn is given it.
+    #[cfg(not(windows))]
+    fn resolved_qwen() -> rocm_engine_protocol::ResolveModelResponse {
+        rocm_engine_protocol::ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: rocm_engine_protocol::DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        }
+    }
+
     /// A recorded service whose key file is gone while the service still runs.
     /// `rocm serve` of the same engine and model reuses it and drops the key it
     /// generated for that attempt, so following only the `rocm serve` command
@@ -569,24 +590,7 @@ mod tests {
     -> Result<()> {
         use super::super::spawn::{ManagedSpawn, TEST_SPAWN_HOOK};
         use rocm_core::ServiceStart;
-        use rocm_engine_protocol::{DevicePolicy, ResolveModelResponse};
-
-        let resolve = ResolveModelResponse {
-            canonical_model_id: "qwen-canonical".to_owned(),
-            served_model_id: None,
-            task: "chat".to_owned(),
-            source: "hf".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llama.cpp".to_owned(),
-            trust_remote_code: false,
-            chat_template_mode: "auto".to_owned(),
-            dtype: "auto".to_owned(),
-            device_policy: DevicePolicy::GpuPreferred,
-            estimated_memory: "unknown".to_owned(),
-            launch_defaults: serde_json::json!({}),
-            engine_recipe: None,
-            warnings: Vec::new(),
-        };
+        let resolve = resolved_qwen();
         for start in [ServiceStart::Restart, ServiceStart::Respawn] {
             for (host, requires_api_key) in [
                 ("127.0.0.1", true),
@@ -733,6 +737,129 @@ mod tests {
                 assert!(
                     reached_spawn.get(),
                     "{case}: after the stop the launch reaches the spawn with its key"
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+        Ok(())
+    }
+
+    /// The common way to the refusal: a service that has already stopped, whose
+    /// key the stop dropped, restarted by id. The refusal still names the stop,
+    /// and there is nothing for it to stop, so it must do no harm: succeed, leave
+    /// the record stopped with no process and no pending stop request, and leave
+    /// the launch that follows it free to go through to the spawn with its key.
+    /// This follows the advice as printed through the real stop and the real
+    /// spawn, for a recorded service that is not running.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_stop_a_refusal_names_is_harmless_on_a_service_that_has_already_stopped() -> Result<()> {
+        use super::super::spawn::TEST_SPAWN_HOOK;
+        use rocm_core::ServiceStart;
+
+        let resolve = resolved_qwen();
+        for start in [ServiceStart::Restart, ServiceStart::Respawn] {
+            for (host, requires_api_key) in [
+                ("127.0.0.1", true),
+                ("0.0.0.0", true),
+                ("0.0.0.0", false),
+                ("gpu-box.example", false),
+            ] {
+                let (root, paths) = test_paths("stopped-service-advice");
+                paths.ensure()?;
+                fs::create_dir_all(paths.services_dir())?;
+                let service_id = "vllm-qwen-1000";
+                let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+                    .local_addr()?
+                    .port();
+                // What a stop leaves: stopped, no process, no key file.
+                let mut existing = rocm_core::ManagedServiceRecord::new(
+                    &paths,
+                    service_id,
+                    "vllm",
+                    "qwen",
+                    "qwen-canonical",
+                    host,
+                    port,
+                    "managed",
+                    0,
+                    None,
+                    None,
+                    None,
+                );
+                existing.status = "stopped".to_owned();
+                existing.supervisor_pid = 0;
+                existing.requires_api_key = requires_api_key;
+                existing.write()?;
+                let case = format!("{host} requires={requires_api_key} {start:?}");
+                let message = rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    requires_api_key,
+                    start,
+                    service_id,
+                    port,
+                )
+                .expect_err("a keyless service is refused")
+                .to_string();
+                let stop = advised_stop_command(&message);
+                assert_eq!(
+                    stop.join(" "),
+                    crate::service_hints::service_stop_hint(service_id),
+                    "{case}"
+                );
+
+                // The advised stop, on a service with nothing left to stop.
+                let report = crate::service_control::stop_internal_managed_service_with(
+                    &paths,
+                    service_id,
+                    |_| Vec::new(),
+                )?;
+                assert_eq!(report["stopped"], true, "{case}: {report}");
+                assert_eq!(report["status"], "stopped", "{case}: {report}");
+                // As written to disk: a listing's liveness refresh would tidy a
+                // stale stop request away and hide it.
+                let (after, _) =
+                    crate::services_text::read_managed_service_manifest(&paths, service_id)?;
+                assert_eq!(after.status, "stopped", "{case}");
+                assert_eq!(after.supervisor_pid, 0, "{case}");
+                assert!(after.engine_pid.is_none(), "{case}: {after:?}");
+                assert!(
+                    after.stop_requested_unix_ms.is_none(),
+                    "{case}: a confirmed stop leaves no stop pending: {after:?}"
+                );
+                assert_eq!(after.requires_api_key, requires_api_key, "{case}");
+
+                // The launch that follows finds nothing running to reuse and
+                // reaches the spawn with the key `serve` stored for it.
+                let runnable: Vec<String> = advised_serve_command(&message)
+                    .iter()
+                    .map(|word| match word.as_str() {
+                        "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
+                        _ => word.clone(),
+                    })
+                    .collect();
+                let reached_spawn = std::rc::Rc::new(std::cell::Cell::new(false));
+                let observed = reached_spawn.clone();
+                TEST_SPAWN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(std::rc::Rc::new(move |_command| {
+                        observed.set(true);
+                        Err(std::io::Error::other("spawn intercepted by test"))
+                    }));
+                });
+                let (spawned, _) =
+                    follow_serve_through_the_spawn(&runnable, &paths, "vllm-qwen-2000", &resolve);
+                TEST_SPAWN_HOOK.with(|hook| *hook.borrow_mut() = None);
+                let error = spawned
+                    .err()
+                    .unwrap_or_else(|| panic!("{case}: the intercepted spawn fails"));
+                assert!(
+                    format!("{error:#}").contains("spawn intercepted by test"),
+                    "{case}: {error:#}"
+                );
+                assert!(
+                    reached_spawn.get(),
+                    "{case}: after the stop the launch reaches the spawn"
                 );
                 let _ = fs::remove_dir_all(root);
             }

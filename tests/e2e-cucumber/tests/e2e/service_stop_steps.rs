@@ -186,6 +186,19 @@ async fn loopback_server_that_required_a_key_without_it(world: &mut E2eWorld) {
     .expect("failed to rewrite service record");
 }
 
+/// What a stop leaves behind, planted directly: a publicly bound server that is
+/// already stopped, so it names no process and no pending stop, with the key the
+/// stop dropped. Nothing is running for the scenario to own or reap.
+#[given("a public managed server that is already stopped and whose endpoint key is gone")]
+async fn public_managed_server_already_stopped(world: &mut E2eWorld) {
+    write_server_record(world, "0.0.0.0", "stopped", 0, None);
+    let listed = crate::run_rocm_ok(world, &["services", "list"]);
+    assert!(
+        !lists_live_server_row(&listed),
+        "premise: a stopped record must not read as running:\n{listed}"
+    );
+}
+
 fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key: bool) {
     let process = Command::new("sleep")
         .arg("300")
@@ -347,19 +360,9 @@ fn windows_process_is_running(pid: u32) -> bool {
     .unwrap_or_else(|message| panic!("{message}"))
 }
 
-/// Write the record for a ready server whose supervisor is `process`, with
-/// `ticks` as its start-time token when there is one, and take `process` into
-/// the World so the scenario (and its teardown) can check and reap it.
-fn plant_server_record(
-    world: &mut E2eWorld,
-    host: &str,
-    with_key: bool,
-    process: std::process::Child,
-    ticks: Option<u64>,
-) {
-    let pid = process.id();
-    world.recorded_process = Some(process);
-
+/// Write the record of a managed server on `host` whose recorded supervisor is
+/// `pid` (`0` for none), with `ticks` as its start-time token when there is one.
+fn write_server_record(world: &E2eWorld, host: &str, status: &str, pid: u32, ticks: Option<u64>) {
     let services = services_dir(world);
     std::fs::create_dir_all(&services).expect("failed to create services dir");
     let manifest = manifest_path(world);
@@ -375,7 +378,7 @@ fn plant_server_record(
         "port": SERVER_PORT,
         "endpoint_url": format!("http://{host}:{SERVER_PORT}/v1"),
         "mode": "managed",
-        "status": "ready",
+        "status": status,
         "supervisor_pid": pid,
         "supervisor_start_ticks": ticks,
         "engine_pid": null,
@@ -389,6 +392,21 @@ fn plant_server_record(
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");
+}
+
+/// Write the record for a ready server whose supervisor is `process`, with
+/// `ticks` as its start-time token when there is one, and take `process` into
+/// the World so the scenario (and its teardown) can check and reap it.
+fn plant_server_record(
+    world: &mut E2eWorld,
+    host: &str,
+    with_key: bool,
+    process: std::process::Child,
+    ticks: Option<u64>,
+) {
+    let pid = process.id();
+    world.recorded_process = Some(process);
+    write_server_record(world, host, "ready", pid, ticks);
     if with_key {
         std::fs::write(endpoint_key_path(world), "e2e-endpoint-key")
             .expect("failed to write endpoint key");
@@ -499,6 +517,24 @@ async fn stop_with_yes(world: &mut E2eWorld) {
 async fn restart_with_yes(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
         crate::run_rocm_with_scenario_env(world, &["services", "restart", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+/// Run the stop the refusal printed, as printed. The refusal is the output of
+/// the restart that came before, so this reads it back before the stop replaces
+/// it.
+#[when("the user runs the stop the refusal named")]
+async fn run_the_stop_the_refusal_named(world: &mut E2eWorld) {
+    let refusal = combined_output(world);
+    let stop = refusal
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .find(|span| span.starts_with("rocm services stop"))
+        .unwrap_or_else(|| panic!("the refusal names no stop command:\n{refusal}"))
+        .to_owned();
+    let words: Vec<&str> = stop.split_whitespace().skip(1).collect();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &words);
     record(world, stdout, stderr, rc);
 }
 
@@ -975,6 +1011,15 @@ async fn record_reads_stopped(world: &mut E2eWorld) {
     assert!(
         record["stop_requested_unix_ms"].is_null(),
         "a confirmed stop leaves no stop pending: {record}"
+    );
+}
+
+#[then("the server is not listed as running")]
+async fn server_not_listed_as_running(world: &mut E2eWorld) {
+    let listed = crate::run_rocm_ok(world, &["services", "list"]);
+    assert!(
+        !lists_live_server_row(&listed),
+        "a stopped server must not be listed as running:\n{listed}"
     );
 }
 

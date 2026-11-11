@@ -1991,6 +1991,7 @@ cargo test -p rocm-engine-protocol endpoint_api_key
 cargo test -p rocm-core is_public_bind_host
 cargo test -p rocm-core endpoint_key
 cargo test -p rocm --bin rocm the_command_a_respawn_refusal_names_clears_the_refusal
+cargo test -p rocm --bin rocm the_stop_a_refusal_names_is_harmless
 cargo test -p rocmd server_recover_passes_
 cargo test -p rocmd supervising_a_
 cargo test -p rocmd server_recover_refuses_a_keyless_public_service
@@ -2074,7 +2075,9 @@ running record on the mock lane and the record being persisted as stopped, and
 confirms a stop. `service-stop-09` covers a `services restart` of a public server whose key is
 gone being refused, naming a `rocm serve` command that `rocm` accepts, with the
 running server left running, and `service-stop-10` covers the same restart of a
-loopback server that was launched with `--require-api-key`; a restart that goes
+loopback server that was launched with `--require-api-key`, and `service-stop-11`
+covers the stop that refusal names, run as printed on a server that has
+already stopped, which is the usual way to the refusal; a restart that goes
 ahead remains unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
 upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
@@ -2644,7 +2647,7 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop-(0[1-689]|10)"`. Not `-n "service-stop"`: a name filter bypasses the
+"service-stop-(0[1-689]|1[01])"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
@@ -2667,6 +2670,17 @@ no `--host` or `--allow-public-bind` and parses, that the stop named before it
 is this server's exact stop command and parses, and, in the same scenario, that
 the recorded process is still running, the record is not marked stopped, still
 says it required a key and names no stop request, and no key file was created.
+
+`service-stop-11` (mock lane, no process recorded) plants the server a stop
+leaves behind, publicly bound, `stopped`, naming no process and with no key file,
+and restarts it: the refusal names a stop, and the scenario runs that stop as
+printed. It checks that the stop exits 0 and says the server stopped, that the
+record still reads stopped, names no process and no pending stop, that there is
+still no key file, and that the server is not listed as running. That the launch
+after it goes through is the unit test
+`the_stop_a_refusal_names_is_harmless_on_a_service_that_has_already_stopped`,
+which follows the advice through the real stop and the real spawn for a stopped
+record (a real `rocm serve` needs a GPU).
 
 `features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same
