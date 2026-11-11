@@ -90,6 +90,17 @@ fn lists_live_server_row(listed: &str) -> bool {
         .any(|line| line.trim_end().strip_prefix("- ") == Some(SERVICE_ID))
 }
 
+/// The backtick spans of `output` that start with `prefix`: the commands a
+/// refusal tells the user to run.
+fn advised_spans<'a>(output: &'a str, prefix: &str) -> Vec<&'a str> {
+    output
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.starts_with(prefix))
+        .collect()
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 /// Plant a record with `supervisor_pid: 0` — the documented placeholder for
@@ -526,14 +537,13 @@ async fn restart_with_yes(world: &mut E2eWorld) {
 #[when("the user runs the stop the refusal named")]
 async fn run_the_stop_the_refusal_named(world: &mut E2eWorld) {
     let refusal = combined_output(world);
-    let stop = refusal
-        .split('`')
-        .skip(1)
-        .step_by(2)
-        .find(|span| span.starts_with("rocm services stop"))
-        .unwrap_or_else(|| panic!("the refusal names no stop command:\n{refusal}"))
-        .to_owned();
-    let words: Vec<&str> = stop.split_whitespace().skip(1).collect();
+    let stops = advised_spans(&refusal, "rocm services stop");
+    assert_eq!(
+        stops.len(),
+        1,
+        "the refusal must name exactly one stop command:\n{refusal}"
+    );
+    let words: Vec<&str> = stops[0].split_whitespace().skip(1).collect();
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &words);
     record(world, stdout, stderr, rc);
 }
@@ -681,12 +691,7 @@ async fn refusal_names_an_accepted_serve_command_with_the_key_flag(world: &mut E
 /// it was.
 fn check_advised_serve_command(world: &mut E2eWorld, expected: &str) -> String {
     let combined = combined_output(world);
-    let advised: Vec<&str> = combined
-        .split('`')
-        .skip(1)
-        .step_by(2)
-        .filter(|span| span.starts_with("rocm serve <model>"))
-        .collect();
+    let advised = advised_spans(&combined, "rocm serve <model>");
     assert_eq!(
         advised.len(),
         1,
@@ -727,12 +732,7 @@ fn check_advised_serve_command(world: &mut E2eWorld, expected: &str) -> String {
 #[then("the refusal names the stop that has to come first")]
 async fn refusal_names_the_stop_first(world: &mut E2eWorld) {
     let combined = combined_output(world);
-    let stops: Vec<&str> = combined
-        .split('`')
-        .skip(1)
-        .step_by(2)
-        .filter(|span| span.starts_with("rocm services stop"))
-        .collect();
+    let stops = advised_spans(&combined, "rocm services stop");
     assert_eq!(
         stops.len(),
         1,

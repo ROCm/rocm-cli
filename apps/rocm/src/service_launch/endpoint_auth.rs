@@ -249,19 +249,25 @@ mod tests {
         ensure_public_bind_engine_supported("lemonade", false, true).unwrap(); // loopback needs no key
     }
 
-    /// The `rocm serve …` command a refusal tells the user to run: the backtick
-    /// span that starts with `rocm serve`, split into words.
-    fn advised_serve_command(message: &str) -> Vec<String> {
-        let spans: Vec<&str> = message
+    /// The backtick spans of a refusal that start with `prefix`: the commands it
+    /// tells the user to run.
+    fn advised_spans<'a>(message: &'a str, prefix: &str) -> Vec<&'a str> {
+        message
             .split('`')
             .skip(1)
             .step_by(2)
-            .filter(|span| span.starts_with("rocm serve"))
-            .collect();
+            .filter(|span| span.starts_with(prefix))
+            .collect()
+    }
+
+    /// The one command a refusal names that starts with `prefix` (`rocm serve`,
+    /// `rocm services stop`), split into words.
+    fn advised_command(message: &str, prefix: &str) -> Vec<String> {
+        let spans = advised_spans(message, prefix);
         assert_eq!(
             spans.len(),
             1,
-            "the refusal must name exactly one `rocm serve` command: {message}"
+            "the refusal must name exactly one `{prefix}` command: {message}"
         );
         crate::advised_commands::split_words(spans[0])
     }
@@ -310,24 +316,6 @@ mod tests {
             require_api_key,
             api_key,
         }
-    }
-
-    /// The `rocm services stop …` command a refusal tells the user to run: the
-    /// backtick span that starts with it, split into words.
-    #[cfg(not(windows))]
-    fn advised_stop_command(message: &str) -> Vec<String> {
-        let spans: Vec<&str> = message
-            .split('`')
-            .skip(1)
-            .step_by(2)
-            .filter(|span| span.starts_with("rocm services stop"))
-            .collect();
-        assert_eq!(
-            spans.len(),
-            1,
-            "the refusal must name exactly one `rocm services stop` command: {message}"
-        );
-        crate::advised_commands::split_words(spans[0])
     }
 
     /// Run what `rocm serve` does with `advised` before it spawns anything — the
@@ -498,7 +486,7 @@ mod tests {
                 )
                 .expect_err("a keyless service in this state is refused")
                 .to_string();
-                let advised = advised_serve_command(&message);
+                let advised = advised_command(&message, "rocm serve");
 
                 // `rocm serve` takes a required <MODEL>: the command names it as
                 // a placeholder, and parses as printed.
@@ -636,7 +624,7 @@ mod tests {
                 )
                 .expect_err("a keyless service is refused")
                 .to_string();
-                let serve = advised_serve_command(&message);
+                let serve = advised_command(&message, "rocm serve");
                 assert!(
                     serve
                         .windows(2)
@@ -650,7 +638,7 @@ mod tests {
                         _ => word.clone(),
                     })
                     .collect();
-                let stop = advised_stop_command(&message);
+                let stop = advised_command(&message, "rocm services stop");
                 let case = format!("{host} requires={requires_api_key} {start:?}");
 
                 // The stop is the CLI's own hint, and a command `rocm` accepts.
@@ -802,7 +790,7 @@ mod tests {
                 )
                 .expect_err("a keyless service is refused")
                 .to_string();
-                let stop = advised_stop_command(&message);
+                let stop = advised_command(&message, "rocm services stop");
                 assert_eq!(
                     stop.join(" "),
                     crate::service_hints::service_stop_hint(service_id),
@@ -832,7 +820,7 @@ mod tests {
 
                 // The launch that follows finds nothing running to reuse and
                 // reaches the spawn with the key `serve` stored for it.
-                let runnable: Vec<String> = advised_serve_command(&message)
+                let runnable: Vec<String> = advised_command(&message, "rocm serve")
                     .iter()
                     .map(|word| match word.as_str() {
                         "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
@@ -911,12 +899,7 @@ mod tests {
                 )
                 .expect_err("a keyless service is refused")
                 .to_string();
-                let printed: Vec<&str> = message
-                    .split('`')
-                    .skip(1)
-                    .step_by(2)
-                    .filter(|span| span.starts_with("rocm serve"))
-                    .collect();
+                let printed = advised_spans(&message, "rocm serve");
                 assert_eq!(printed.len(), 1, "{message}");
                 let script = format!("printf '%s\\n' {}", printed[0].replace("<model>", "qwen"));
                 let output = std::process::Command::new("sh")
