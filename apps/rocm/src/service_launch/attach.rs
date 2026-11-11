@@ -117,7 +117,7 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {}", report.service_id);
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
-            println!("  logs: rocm logs {}", report.service_id);
+            println!("  logs: rocm services logs {}", report.service_id);
             println!(
                 "  stop: {}",
                 service_hints::service_stop_hint(&report.service_id)

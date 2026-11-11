@@ -610,6 +610,57 @@ mod tests {
     use super::*;
     use crate::tests::test_paths;
 
+    /// `run_builtin_engine_serve_http` itself, which no test reached: it has one
+    /// production call site (`main.rs`), and the e2e scenarios arm
+    /// `ROCM_E2E_SCRIPTED_ENGINE`, which takes the early-return hook above and
+    /// never runs the wrapper's own error wiring. So the tests "covering" the
+    /// backstop all called `record_engine_serve_http_failure` directly, and
+    /// unwiring it from this function would have stayed green.
+    ///
+    /// Driven through the unparseable-device-policy arm, which is the one error
+    /// this function can be made to take in-process: the `match engine` arm
+    /// below it is only reachable *after* `spawn_alongside_engine` starts the
+    /// Anthropic proxy thread, which a unit test must not do. That arm's own
+    /// wiring is therefore still uncovered — see the PR body.
+    #[test]
+    fn the_serve_http_wrapper_stamps_a_failure_it_returns_rather_than_only_returning_it() {
+        let (root, _paths) = test_paths("engine-ipc-wrapper");
+        let state_path = root.join("engine-state.json");
+        let log_path = root.join("service.log");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&state_path, br#"{"status":"starting"}"#).unwrap();
+
+        let error = run_builtin_engine_serve_http(
+            "lemonade",
+            "svc-wrapper".to_owned(),
+            "model/one".to_owned(),
+            "127.0.0.1".to_owned(),
+            0,
+            "not-a-device-policy",
+            Vec::new(),
+            None,
+            None,
+            state_path.clone(),
+            Some(log_path.clone()),
+            None,
+        )
+        .expect_err("an unparseable device policy is an engine failure");
+
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            state["status"], "failed",
+            "the service must not be left reading `starting` forever: {error:#}"
+        );
+        assert!(
+            log.contains("svc-wrapper") && log.contains("failed:"),
+            "and the reason must reach the service log: {log}"
+        );
+    }
+
     /// The backstop itself, which nothing covered directly: on Linux the same
     /// text also arrives through the stderr attach, so deleting the file write
     /// would have stayed green on every lane that runs.

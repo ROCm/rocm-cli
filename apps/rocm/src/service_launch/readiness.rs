@@ -96,12 +96,18 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
     record_still_live(&latest, pid_alive)
 }
 
-/// Record a server that died mid-start as stopped, leaving a manifest that a
+/// Record how a server that died mid-start died, leaving a manifest that a
 /// `services stop` already settled untouched. A `failed` state the engine
 /// reported is persisted rather than overwritten, so the reason survives.
-fn settle_exited_service(paths: &AppPaths, service_id: &str) {
+///
+/// Returns whether the death was **asked for**, so the caller can say so. The
+/// `--wait` message used to read "the server exited before it became ready"
+/// even for a `rocm services stop` issued from another shell, which is a true
+/// sentence told in a way that reads as a failure.
+fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
+    let deliberate = managed_service_stop_was_requested(paths, service_id);
     let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
-        return;
+        return deliberate;
     };
     let on_disk = latest.status.clone();
     let _ = latest.refresh_from_engine_state();
@@ -118,7 +124,7 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) {
         // An engine that *did* stamp `failed` itself is not reached: that record
         // no longer reads live, so it takes the branch below and keeps its own
         // reason.
-        if managed_service_stop_was_requested(paths, service_id) {
+        if deliberate {
             latest.status = "stopped".to_owned();
         } else {
             latest.status = "failed".to_owned();
@@ -132,9 +138,10 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) {
             );
         }
     } else if latest.status == on_disk {
-        return;
+        return deliberate;
     }
     let _ = latest.write();
+    deliberate
 }
 
 /// The failure a `--wait` ends with when the server died before it became
@@ -153,7 +160,16 @@ pub(super) fn died_during_wait(
     {
         return None;
     }
-    settle_exited_service(paths, service_id);
+    if settle_exited_service(paths, service_id) {
+        // A `rocm services stop` from another shell ends the wait too, and it is
+        // not a launch that failed. The wait still ends non-zero, because the
+        // thing the caller asked to wait for did not happen — but it says which
+        // of the two it was instead of reporting an operator's own stop as the
+        // server failing to come up.
+        return Some(anyhow!(
+            "the server for service `{service_id}` was stopped before it became ready"
+        ));
+    }
     let mut message = format!(
         "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
     );
@@ -1187,6 +1203,10 @@ mod tests {
             after.status, "stopped",
             "a stop that asked for this death must not be reported as a crash"
         );
+        assert!(
+            settle_exited_service(&paths, &record.service_id),
+            "and it must report the death as deliberate, so `--wait` can say so"
+        );
 
         // Same service, same death, with nothing having asked for it.
         record.stop_requested_unix_ms = None;
@@ -1301,6 +1321,26 @@ mod tests {
         // the ROCMAI-541 defect surviving at the `--wait` exit point — see
         // `a_wait_death_is_a_crash_unless_a_stop_asked_for_it`.
         assert_eq!(status(), "failed");
+
+        // And a stop issued from another shell during the wait gets its own
+        // sentence, rather than being reported as the launch failing to come
+        // up. Re-plant the record live with a stop marker on it.
+        let mut stopped = ManagedServiceRecord::read_manifest(&paths, &id).expect("read");
+        stopped.status = "starting".to_owned();
+        stopped.supervisor_pid = std::process::id();
+        stopped.stop_requested_unix_ms = Some(1);
+        stopped.write().expect("write");
+        let error =
+            died_during_wait(&paths, &id, true, pending, |_| false).expect("the wait still ends");
+        let message = error.to_string();
+        assert!(
+            message.contains("was stopped before it became ready"),
+            "an operator's own stop must not read as the server failing to start: {message}"
+        );
+        assert!(
+            !message.contains("exited before it became ready"),
+            "{message}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

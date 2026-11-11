@@ -1172,7 +1172,10 @@ can:
 If the server dies on its own while you are attached, `rocm serve` exits
 **non-zero** and prints why, quoting the end of the service log, and the service
 is left marked `failed`. Stopping it deliberately — Ctrl-C here, or `rocm
-services stop` from another shell — still exits 0.
+services stop` from another shell — is not a crash: the service is never marked
+`failed`, and the command exits 0 once the stop is confirmed. The one exception
+is the unconfirmed-stop case described above, which still exits with an error —
+that is a stop whose outcome is unknown, not a stop reported as a failure.
 
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its

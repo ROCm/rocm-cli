@@ -12,7 +12,7 @@
 // Only the Windows arm calls it; the Unix arm reaps through the retained
 // `Child`. Gated to match, or the Unix `-D warnings` build rejects it unused.
 #[cfg(windows)]
-use crate::process::process_is_running;
+use crate::process::probe_process;
 
 /// Confirms whether a managed-service child is still running, using a
 /// platform-appropriate check that can tell a truly running process apart from
@@ -65,12 +65,25 @@ impl ManagedChildLiveness {
     /// reaped by something else) is treated as "not running": a failure report
     /// must never be blocked on being unable to positively confirm the child
     /// is gone.
+    ///
+    /// The Windows arm asks [`probe_process`] rather than `process_is_running`,
+    /// whose own doc comment says a decision that must not take a process for
+    /// gone has to keep [`ProcessProbe::Unqueryable`] apart. This is such a
+    /// decision: callers turn a `false` here into a crash verdict that stamps
+    /// the record `failed`. `process_is_running` collapses `Unqueryable` into
+    /// "not running", so a transient `OpenProcess` failure — an
+    /// `ERROR_ACCESS_DENIED` on a live process this one may not open — would
+    /// report a healthy engine as crashed. Unqueryable therefore reads as "may
+    /// still be running", which errs toward waiting rather than toward a false
+    /// crash report.
+    ///
+    /// [`ProcessProbe::Unqueryable`]: crate::ProcessProbe::Unqueryable
     pub fn is_running(&mut self) -> bool {
         match self {
             #[cfg(not(windows))]
             Self::Unix(child) => matches!(child.try_wait(), Ok(None)),
             #[cfg(windows)]
-            Self::Windows(pid) => process_is_running(*pid),
+            Self::Windows(pid) => probe_process(*pid).may_be_running(),
         }
     }
 }
@@ -85,10 +98,13 @@ mod tests {
     /// rather than panicking or erroring (this type's whole reason to exist
     /// is that a bare `process_is_running` pid probe gets this wrong for a
     /// Unix zombie; see the type's doc comment). The Windows arm
-    /// (`ManagedChildLiveness::Windows`, backed by `process_is_running` over
-    /// `OpenProcess`/`GetExitCodeProcess`) is not exercised here: it cannot be
-    /// built on a non-Windows test target, and this repo's test environment
-    /// has no Windows runner to exercise it on.
+    /// (`ManagedChildLiveness::Windows`, backed by `probe_process` over
+    /// `OpenProcess`/`GetExitCodeProcess`) is not exercised *by this test*
+    /// only because the variant cannot be built on a non-Windows target. It is
+    /// not unexercised: `ci.yml`'s `windows-debug` job runs
+    /// `cargo test --workspace --all-targets` on `windows-latest` for any `.rs`
+    /// change, so the `#[cfg(windows)]` test below it is this repo's coverage
+    /// of that arm.
     #[cfg(not(windows))]
     #[test]
     fn managed_child_liveness_unix_reports_dead_after_exit_and_does_not_double_reap() {
