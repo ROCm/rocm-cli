@@ -26,9 +26,7 @@ use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{
-    gpu_stats_line, instances_on_gpu, node_efficiency, power_style, temperature_style, trunc,
-};
+use crate::ui::widgets::{gpu_stats_line, instances_on_gpu, power_style, temperature_style, trunc};
 
 /// Height of the GPU-section summary header (partition + efficiency).
 const GPU_HEADER_H: u16 = 1;
@@ -281,6 +279,24 @@ fn gpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )];
+    let eff = rocm_dash_core::efficiency::node_efficiency(snap);
+    // Spelled out rather than the `*` the tabs with a footer use: this header
+    // has no room for the legend, and a marker with nothing to define it is
+    // worse than none. It sits right after the GPU count, ahead of the
+    // partition and VRAM text, so a narrow terminal clips those and never the
+    // marker that says the figure is not live.
+    let held = if eff.is_some_and(|n| n.held()) {
+        " (held)"
+    } else {
+        ""
+    };
+    spans.push(Span::styled(
+        format!(
+            "  ·  eff {}{held}",
+            format::tokens_per_watt(eff.map(|n| n.tokens_per_watt))
+        ),
+        Style::default().fg(if eff.is_some() { theme.ok } else { theme.muted }),
+    ));
     if let Some(si) = snap.gpu_system_info.as_ref() {
         spans.push(Span::styled(
             format!(
@@ -300,11 +316,6 @@ fn gpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
     spans.push(Span::styled(
         format!("  ·  {:.1} kW", total_power / 1000.0),
         Style::default().fg(theme.fg),
-    ));
-    let eff = node_efficiency(snap);
-    spans.push(Span::styled(
-        format!("  ·  eff {}", format::tokens_per_watt(eff)),
-        Style::default().fg(if eff.is_some() { theme.ok } else { theme.muted }),
     ));
     Line::from(spans)
 }
@@ -601,7 +612,9 @@ mod tests {
     use crate::app::{ActiveTab, AppState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rocm_dash_core::metrics::{GpuSystemInfo, SystemMetrics};
+    use rocm_dash_core::metrics::{
+        GpuSystemInfo, ObservationFreshness, ObservationMetadata, SystemMetrics,
+    };
     use rocm_dash_core::partition::{ComputePartitionMode, MemoryPartitionMode};
 
     /// Render `draw` to a TestBackend and return the buffer as a flat string.
@@ -850,6 +863,73 @@ mod tests {
         assert!(text.contains("kW"), "missing total power");
         // 250 tok / 500 W = 0.50 tok/W
         assert!(text.contains("0.50 tok/W"), "missing efficiency: {text}");
+    }
+
+    fn header_text_with_freshness(freshness: Option<ObservationFreshness>) -> String {
+        let theme = Theme::default_dark();
+        let mut inst = mk_instance("a", &["0"], Some(250.0));
+        inst.gen_tps_observation = freshness.map(|freshness| ObservationMetadata {
+            observed_at: chrono::Utc::now(),
+            freshness,
+        });
+        let snap = Snapshot {
+            gpus: vec![mk_gpu("gpu-0", 50.0, 65.0, 500.0)],
+            instances: vec![inst],
+            ..Default::default()
+        };
+        gpu_section_header(&snap, &theme)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn gpu_section_header_marks_a_held_efficiency_and_only_then() {
+        // 250 tok/s over 500 W = 0.50 tok/W in every case.
+        let held = header_text_with_freshness(Some(ObservationFreshness::Held));
+        assert!(
+            held.contains("0.50 tok/W (held)"),
+            "held must be marked: {held}"
+        );
+        let fresh = header_text_with_freshness(Some(ObservationFreshness::Fresh));
+        assert!(fresh.contains("0.50 tok/W"), "missing efficiency: {fresh}");
+        assert!(!fresh.contains("held"), "fresh must not be marked: {fresh}");
+        // Unknown freshness (a legacy snapshot) is never presented as held.
+        let legacy = header_text_with_freshness(None);
+        assert!(
+            legacy.contains("0.50 tok/W") && !legacy.contains("held"),
+            "{legacy}"
+        );
+    }
+
+    #[test]
+    fn a_held_efficiency_survives_an_80_column_terminal() {
+        // The full header with a partitioned system is wider than 80 columns, and
+        // a `Paragraph` clips its line at the right edge. The marker must not be
+        // the part that goes, or a held figure reads as live.
+        let theme = Theme::default_dark();
+        let mut inst = mk_instance("a", &["0"], Some(250.0));
+        inst.gen_tps_observation = Some(ObservationMetadata {
+            observed_at: chrono::Utc::now(),
+            freshness: ObservationFreshness::Held,
+        });
+        let snap = Snapshot {
+            gpus: vec![mk_gpu("gpu-0", 50.0, 65.0, 500.0)],
+            gpu_system_info: Some(sysinfo_partitioned()),
+            instances: vec![inst],
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        term.draw(|f| f.render_widget(Paragraph::new(gpu_section_header(&snap, &theme)), f.area()))
+            .unwrap();
+        let row: String = (0..80)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("0.50 tok/W (held)"),
+            "marker clipped at 80 columns: {row:?}"
+        );
     }
 
     #[test]

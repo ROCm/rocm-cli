@@ -416,24 +416,204 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
     terminate_process(pid)
 }
 
+/// What one look at a PID could establish.
+///
+/// [`process_is_running`] answers a plain yes or no, so a process that is alive
+/// but cannot be queried reads the same as one that is gone. A stop that is about
+/// to report a process as exited must not make that mistake, so this keeps the
+/// third answer apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessProbe {
+    /// The PID names a process that has not exited.
+    Running,
+    /// The PID names no process, or one that has exited.
+    Gone,
+    /// The PID could not be queried, so it can be neither confirmed running nor
+    /// confirmed gone. On Windows that includes a live process the caller may not
+    /// open (`ERROR_ACCESS_DENIED`).
+    ///
+    /// The cost of reading this as "may be running" is that a stopped service's
+    /// recorded PID, taken since by a process the caller cannot open, keeps its
+    /// record live: the record never reconciles to `stopped`, `services remove`
+    /// and `prune` refuse it, and a stop reports it unverified. That is the safe
+    /// direction (the alternative deletes the key and record under a process that
+    /// may be serving), and there is no better evidence to be had: the creation
+    /// time that would tell the two processes apart is read with the same access
+    /// right, so a process that cannot be opened has no readable token to
+    /// compare. `rocm services remove <id> --force --yes` clears such a record
+    /// (see `docs/manual-testing.md`, "A record that stays unverified"); it
+    /// applies only when no recorded process is confirmed running, one could not
+    /// be queried, and a stop was requested.
+    Unqueryable,
+}
+
+impl ProcessProbe {
+    /// Whether the process may still be running: everything but a confirmed
+    /// exit. The answer for a decision that must not treat a process it could
+    /// not look at as gone, such as dropping a service's endpoint key, marking
+    /// its record stopped or deleting it.
+    #[must_use]
+    pub const fn may_be_running(self) -> bool {
+        !matches!(self, Self::Gone)
+    }
+}
+
+/// Windows `ERROR_INVALID_PARAMETER`: what `OpenProcess` sets for a PID that
+/// names no process.
+#[cfg(any(windows, test))]
+const ERROR_INVALID_PARAMETER: i32 = 87;
+
+/// Windows `STILL_ACTIVE`: the exit code `GetExitCodeProcess` reports for a
+/// process that has not exited.
+#[cfg(any(windows, test))]
+const STILL_ACTIVE: u32 = 259;
+
+/// What `GetExitCodeProcess` on a handle that opened says about the process:
+/// still active is running, any other exit code is gone, and a failed query is
+/// neither. Split out of the FFI, with the open-failure mapping above, so a test
+/// runs the whole decision on every host.
+#[cfg(any(windows, test))]
+pub(crate) const fn classify_exit_query(queried: bool, exit_code: u32) -> ProcessProbe {
+    match (queried, exit_code) {
+        (false, _) => ProcessProbe::Unqueryable,
+        (true, STILL_ACTIVE) => ProcessProbe::Running,
+        (true, _) => ProcessProbe::Gone,
+    }
+}
+
+/// What a failed `OpenProcess` says about the PID, from its `GetLastError` code.
+///
+/// Only the code for "no such process" counts as gone. `ERROR_ACCESS_DENIED`
+/// (5), which a live process the caller may not open sets, and any other or
+/// missing code are [`ProcessProbe::Unqueryable`]: a failure to look is not an
+/// exit. Split out of the FFI so a test runs it on every host.
+#[cfg(any(windows, test))]
+pub(crate) const fn classify_open_failure(code: Option<i32>) -> ProcessProbe {
+    match code {
+        Some(ERROR_INVALID_PARAMETER) => ProcessProbe::Gone,
+        _ => ProcessProbe::Unqueryable,
+    }
+}
+
+/// The path of a Windows system tool in the system directory (`System32`).
+///
+/// The directory comes from `GetSystemDirectoryW`, not from the environment, so
+/// neither a directory earlier on `PATH` nor a `SystemRoot` the caller controls
+/// can stand in for it; the bare name when the directory cannot be read (and off
+/// Windows). `name` includes the extension (`taskkill.exe`).
+#[must_use]
+pub fn windows_system_tool(name: &str) -> PathBuf {
+    system_tool_path(windows_system_directory(), name)
+}
+
+/// [`windows_system_tool`] for a given system directory, so a test builds the
+/// path on every host.
+fn system_tool_path(system_dir: Option<PathBuf>, name: &str) -> PathBuf {
+    match system_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// The Windows system directory, read with `GetSystemDirectoryW`.
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
-pub fn process_is_running(pid: u32) -> bool {
+fn windows_system_directory() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    const MAX_PATH: u32 = 260;
+    let mut buffer = [0_u16; MAX_PATH as usize];
+    // SAFETY: `buffer` is a live local valid for `MAX_PATH` wide characters, and
+    // that is the size passed, so the call cannot write past it.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), MAX_PATH) } as usize;
+    // Zero is a failure; a length that does not fit means the path was too long
+    // for the buffer, which is not a directory to trust either.
+    (length > 0 && length < buffer.len())
+        .then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])))
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::missing_const_for_fn)] // keeps the signature of the Windows arm
+fn windows_system_directory() -> Option<PathBuf> {
+    None
+}
+
+/// E2E hook: `ROCM_E2E_UNQUERYABLE_PIDS`, a comma-separated list of PIDs, makes
+/// [`probe_process`] answer [`ProcessProbe::Unqueryable`] for each of them.
+///
+/// A live process this account may not open cannot be staged from outside the
+/// binary, and without it the stop, the liveness refresh and `services remove`
+/// have no live coverage for that case off Windows. Compiled only into the
+/// `e2e-test-hooks` build; production builds never read the variable.
+#[cfg(feature = "e2e-test-hooks")]
+fn scripted_probe(pid: u32) -> Option<ProcessProbe> {
+    let listed = std::env::var("ROCM_E2E_UNQUERYABLE_PIDS").ok()?;
+    listed
+        .split(',')
+        .filter_map(|entry| entry.trim().parse::<u32>().ok())
+        .any(|listed| listed == pid)
+        .then_some(ProcessProbe::Unqueryable)
+}
+
+/// Look at `pid`, keeping a process that cannot be queried apart from one that
+/// is gone. See [`ProcessProbe`].
+#[cfg(windows)]
+#[must_use]
+#[allow(unsafe_code)] // Win32 FFI
+pub fn probe_process(pid: u32) -> ProcessProbe {
     use windows_sys::Win32::Foundation::CloseHandle;
 
-    if pid == 0 {
-        return false;
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(scripted) = scripted_probe(pid) {
+        return scripted;
     }
+    if pid == 0 {
+        return ProcessProbe::Gone;
+    }
+    // SAFETY: `OpenProcess` takes only plain values and returns a handle or null.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
-        return false;
+        return classify_open_failure(std::io::Error::last_os_error().raw_os_error());
     }
     let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
+    // SAFETY: `handle` is the non-null handle opened above, still open, and
+    // `exit_code` is a live local that is valid for this one call to write to.
+    let queried = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
+    // SAFETY: `handle` is the handle opened above, closed here exactly once and
+    // not used afterwards.
     unsafe {
         CloseHandle(handle);
     }
-    ok && exit_code == 259
+    classify_exit_query(queried, exit_code)
+}
+
+/// Look at `pid`. `kill(pid, 0)` already tells a live process the caller may
+/// not signal (`EPERM`, which counts as running) from one that is gone, so there
+/// is no third answer to keep apart here.
+#[cfg(not(windows))]
+#[must_use]
+pub fn probe_process(pid: u32) -> ProcessProbe {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(scripted) = scripted_probe(pid) {
+        return scripted;
+    }
+    if process_is_running(pid) {
+        ProcessProbe::Running
+    } else {
+        ProcessProbe::Gone
+    }
+}
+
+/// Whether `pid` names a running process.
+///
+/// On Windows a live process this one may not open reads as not running here; a
+/// decision that must not take it for gone (dropping a key, marking a record
+/// stopped, deleting it) asks [`probe_process`] instead and keeps
+/// [`ProcessProbe::Unqueryable`] apart.
+#[cfg(windows)]
+pub fn process_is_running(pid: u32) -> bool {
+    probe_process(pid) == ProcessProbe::Running
 }
 
 #[cfg(not(windows))]
@@ -450,67 +630,6 @@ pub fn process_is_running(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Confirms whether a managed-service child is still running, using a
-/// platform-appropriate check that can tell a truly running process apart from
-/// one whose exit has not yet been reaped (ROCMAI-541).
-///
-/// On Unix, [`process_is_running`]'s `kill(pid, 0)` succeeds for a zombie — a
-/// process that already exited but whose parent has not yet called `wait()` —
-/// because the kernel keeps its entry around until reaped. The managed engine
-/// is spawned as a *direct* child of the `rocm` process: [`detach_command_session`]
-/// only calls `setsid()` in `pre_exec`, there is no second fork to orphan it to
-/// init. So while `rocm` is still watching it (the launch readiness wait, or the
-/// attached `--verbose` log-streaming loop), a child that dies becomes a zombie
-/// that a signal probe alone would misreport as alive — exactly the original
-/// ROCMAI-541 symptom, on the platform the first round of this fix claimed to
-/// have covered. Retaining the spawned [`std::process::Child`] and calling
-/// `try_wait()` instead reaps it (so the zombie entry is released) and reads
-/// its *real* wait status rather than merely probing whether the pid still
-/// exists.
-///
-/// On Windows there is no equivalent gap: [`process_is_running`] there opens a
-/// fresh handle with `OpenProcess` and reads the actual exit code via
-/// `GetExitCodeProcess`, which needs no parent-side reaping — so the bare pid
-/// is enough, and this variant just defers to it.
-pub enum ManagedChildLiveness {
-    #[cfg(not(windows))]
-    Unix(std::process::Child),
-    #[cfg(windows)]
-    Windows(u32),
-}
-
-impl ManagedChildLiveness {
-    /// Build from the just-spawned child on Unix, where a real `Child` handle
-    /// is available to reap later.
-    #[cfg(not(windows))]
-    pub const fn from_child(child: std::process::Child) -> Self {
-        Self::Unix(child)
-    }
-
-    /// Build from a bare pid on Windows, where [`process_is_running`] already
-    /// reads the real exit code without needing a retained handle.
-    #[cfg(windows)]
-    pub const fn from_pid(pid: u32) -> Self {
-        Self::Windows(pid)
-    }
-
-    /// True while the child is confirmed still running. Reaps it on Unix if it
-    /// has just exited — see the type's doc comment for why that reap (rather
-    /// than a signal probe) is the point of this type. An error from
-    /// `try_wait` (in practice only reachable if the pid had already been
-    /// reaped by something else) is treated as "not running": a failure report
-    /// must never be blocked on being unable to positively confirm the child
-    /// is gone.
-    pub fn is_running(&mut self) -> bool {
-        match self {
-            #[cfg(not(windows))]
-            Self::Unix(child) => matches!(child.try_wait(), Ok(None)),
-            #[cfg(windows)]
-            Self::Windows(pid) => process_is_running(*pid),
-        }
-    }
 }
 
 /// An advisory, cross-process exclusive lock backed by a lock file.
@@ -1375,6 +1494,72 @@ mod tests {
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
 
+    /// A system tool is started from the system directory, never by a bare name
+    /// that `PATH` could resolve to something else; with no directory it falls
+    /// back to the bare name.
+    #[test]
+    fn a_system_tool_is_resolved_under_the_system_directory() {
+        let dir = PathBuf::from("C:\\Windows").join("System32");
+        let path = system_tool_path(Some(dir.clone()), "taskkill.exe");
+        assert_eq!(path, dir.join("taskkill.exe"));
+        assert!(path.ends_with(Path::new("System32").join("taskkill.exe")));
+        assert!(!path.parent().unwrap().as_os_str().is_empty());
+
+        assert_eq!(
+            system_tool_path(None, "tasklist.exe"),
+            PathBuf::from("tasklist.exe")
+        );
+        assert_eq!(
+            system_tool_path(Some(PathBuf::new()), "tasklist.exe"),
+            PathBuf::from("tasklist.exe"),
+            "an empty directory is no directory"
+        );
+    }
+
+    /// A failed `OpenProcess` is a gone process only for the code that means
+    /// "no such process". Access denied, which a live process the caller may not
+    /// open sets, and any code that is not known are not an exit.
+    #[test]
+    fn a_failed_open_is_gone_only_for_no_such_process() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        assert_eq!(classify_open_failure(Some(87)), ProcessProbe::Gone);
+        assert_eq!(
+            classify_open_failure(Some(ERROR_ACCESS_DENIED)),
+            ProcessProbe::Unqueryable
+        );
+        // The codes around the two that matter, and no code at all.
+        for code in [Some(0), Some(6), Some(31), Some(299), Some(-1), None] {
+            assert_eq!(
+                classify_open_failure(code),
+                ProcessProbe::Unqueryable,
+                "{code:?}"
+            );
+        }
+    }
+
+    /// An opened handle's exit code: still active is running, any other code is
+    /// gone, and a failed query (whatever the code it left behind) is neither.
+    #[test]
+    fn an_exit_code_query_is_running_gone_or_unqueryable() {
+        assert_eq!(classify_exit_query(true, 259), ProcessProbe::Running);
+        assert_eq!(classify_exit_query(true, 0), ProcessProbe::Gone);
+        assert_eq!(classify_exit_query(true, 1), ProcessProbe::Gone);
+        assert_eq!(classify_exit_query(false, 0), ProcessProbe::Unqueryable);
+        assert_eq!(classify_exit_query(false, 259), ProcessProbe::Unqueryable);
+    }
+
+    /// Off Windows, a PID that is running (including one the caller may not
+    /// signal) probes as running and an absent one as gone, matching
+    /// [`process_is_running`].
+    #[cfg(not(windows))]
+    #[test]
+    fn the_probe_agrees_with_process_is_running_off_windows() {
+        let own = std::process::id();
+        assert_eq!(probe_process(own), ProcessProbe::Running);
+        assert_eq!(probe_process(0), ProcessProbe::Gone);
+        assert_eq!(probe_process(999_999_998), ProcessProbe::Gone);
+    }
+
     const LOCK_CHILD_PATH_ENV: &str = "ROCM_CORE_TEST_LOCK_PATH";
     const LOCK_CHILD_READY_ENV: &str = "ROCM_CORE_TEST_LOCK_READY";
     const HANDOFF_PORT_ENV: &str = "ROCM_CORE_TEST_HANDOFF_PORT";
@@ -1652,101 +1837,6 @@ mod tests {
         drop(b);
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// ROCMAI-541: pins the core contract `ManagedChildLiveness` exists
-    /// for — a child that has exited must read as not-running, and a second
-    /// call after it has already been reaped must keep reading that way
-    /// rather than panicking or erroring (this type's whole reason to exist
-    /// is that a bare `process_is_running` pid probe gets this wrong for a
-    /// Unix zombie; see the type's doc comment). The Windows arm
-    /// (`ManagedChildLiveness::Windows`, backed by `process_is_running` over
-    /// `OpenProcess`/`GetExitCodeProcess`) is not exercised here: it cannot be
-    /// built on a non-Windows test target, and this repo's test environment
-    /// has no Windows runner to exercise it on.
-    #[cfg(not(windows))]
-    #[test]
-    fn managed_child_liveness_unix_reports_dead_after_exit_and_does_not_double_reap() {
-        use std::process::Command;
-        use std::time::{Duration, Instant};
-
-        let child = Command::new("true")
-            .spawn()
-            .expect("spawn a trivial, immediately-exiting child");
-        let mut liveness = ManagedChildLiveness::from_child(child);
-
-        // Poll rather than assume a fixed sleep always outraces the scheduler:
-        // `true` exits almost immediately, but the test only needs it to be
-        // gone by the time it checks, not instantly.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while liveness.is_running() {
-            assert!(
-                Instant::now() < deadline,
-                "child did not report dead within the timeout"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // The second call is the point of this test: reaping must not leave
-        // the type unable to answer again, or answering "running" once it no
-        // longer can reap a real exit status.
-        assert!(
-            !liveness.is_running(),
-            "a second call after reaping must still report dead, not panic or flip to `true`"
-        );
-    }
-
-    /// The Windows counterpart, covering the arm that is the actual
-    /// crash-detection primitive on that platform (ROCMAI-541 review).
-    ///
-    /// The Unix case above cannot reach it — `ManagedChildLiveness::Windows`
-    /// cannot even be constructed off Windows — and the scripted-engine e2e
-    /// scenarios run on the Linux no-GPU lane, where the Unix arm does the
-    /// work. So without this, the half of the liveness check that decides
-    /// crash-vs-starting on the reported platform had nothing exercising it,
-    /// while its sibling (`spawn_detached_with_log`) did.
-    ///
-    /// No reaping is involved here: the Windows arm reads the real exit code
-    /// through `OpenProcess`/`GetExitCodeProcess`, so the contract is simply
-    /// "alive while running, dead once terminated, and still dead when asked
-    /// again".
-    #[cfg(windows)]
-    #[test]
-    fn managed_child_liveness_windows_tracks_a_real_child_through_termination() {
-        use std::time::{Duration, Instant};
-
-        // A child that outlives the assertions below without finishing on its
-        // own, so "still running" is a real observation rather than a race.
-        let comspec = std::env::var_os("COMSPEC")
-            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
-        let mut child = Command::new(&comspec)
-            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
-            .spawn()
-            .expect("spawn a long-running child");
-        let pid = child.id();
-        let mut liveness = ManagedChildLiveness::from_pid(pid);
-
-        assert!(
-            liveness.is_running(),
-            "a child that has not been terminated must read as running"
-        );
-
-        terminate_process(pid).expect("terminate the fixture child");
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while liveness.is_running() {
-            assert!(
-                Instant::now() < deadline,
-                "a terminated child must stop reading as running"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            !liveness.is_running(),
-            "a second call must keep reporting dead"
-        );
-
-        let _ = child.wait();
     }
 
     /// The shells every grandchild case below is run against.

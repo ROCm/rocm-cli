@@ -251,7 +251,7 @@ profile_path_for_shell() {
   case "$(shell_name)" in
     bash) printf '%s\n' "${HOME}/.bashrc" ;;
     zsh) printf '%s\n' "${HOME}/.zshrc" ;;
-    fish) printf '%s\n' "${HOME}/.config/fish/config.fish" ;;
+    fish) fish_config_path ;;
     ksh) printf '%s\n' "${HOME}/.kshrc" ;;
     *) printf '%s\n' "${HOME}/.profile" ;;
   esac
@@ -294,11 +294,14 @@ append_path_snippet() {
   path_expr="$3"
   escaped_path_expr="$(escape_for_double_quotes "${path_expr}")"
 
+  # A profile that cannot be created leaves nothing for the `cat >>` below to
+  # append to, and that write returns non-zero before "updated" is printed, so
+  # the caller reports that the folder is not saved instead of claiming it is.
   profile_dir="${profile%/*}"
   if [ "${profile_dir}" != "${profile}" ]; then
-    mkdir -p "${profile_dir}"
+    mkdir -p "${profile_dir}" 2>/dev/null || true
   fi
-  [ -f "${profile}" ] || : > "${profile}"
+  [ -f "${profile}" ] || { : > "${profile}"; } 2>/dev/null || true
 
   if profile_has_path_entry "${profile}" "${path_expr}"; then
     printf '%s\n' "unchanged:${profile}"
@@ -307,7 +310,7 @@ append_path_snippet() {
 
   case "${shell_kind}" in
     fish)
-      cat >> "${profile}" <<EOF
+      cat >> "${profile}" <<EOF || return 1
 
 # >>> rocm-cli path >>>
 if not contains -- "${escaped_path_expr}" \$PATH
@@ -317,7 +320,7 @@ end
 EOF
       ;;
     *)
-      cat >> "${profile}" <<EOF
+      cat >> "${profile}" <<EOF || return 1
 
 # >>> rocm-cli path >>>
 case ":\$PATH:" in
@@ -357,6 +360,112 @@ record_path_edit() {
     return 0
   fi
   printf '%s\n' "$1" >> "${record}"
+}
+
+# The folder fish reads its config from: $XDG_CONFIG_HOME/fish when that is
+# set to an absolute path, else ~/.config/fish. fish would also take a relative
+# XDG_CONFIG_HOME, but against its own working directory, so it names a
+# different folder from each directory; the installer does not follow that.
+fish_config_dir() {
+  case "${XDG_CONFIG_HOME:-}" in
+    /*) printf '%s\n' "${XDG_CONFIG_HOME}/fish" ;;
+    *) printf '%s\n' "${HOME}/.config/fish" ;;
+  esac
+}
+
+fish_config_path() {
+  printf '%s\n' "$(fish_config_dir)/config.fish"
+}
+
+# Whether fish is set up on this machine, whatever the login shell is: the
+# binary is on PATH, or the user already has a fish config directory. A bash
+# login shell is common even for people who run fish interactively.
+fish_is_installed() {
+  command -v fish >/dev/null 2>&1 && return 0
+  [ -d "$(fish_config_dir)" ] && return 0
+  return 1
+}
+
+# Append the fish PATH block to fish's config.fish and record it so
+# `rocm uninstall` can take it out again. The caller skips this when that file
+# is the profile the login-shell step just wrote.
+configure_fish_path() {
+  fish_profile="$(fish_config_path)"
+  fish_expr="$1"
+  fish_result="$(append_path_snippet "${fish_profile}" fish "${fish_expr}")" || true
+  if profile_has_own_block "${fish_profile}" "${fish_expr}"; then
+    record_path_edit "profile ${fish_profile}"
+    record_path_edit "path-expr ${fish_expr}"
+  fi
+  case "${fish_result}" in
+    updated:*)
+      ok "fish shell profile updated:"
+      info "profile: ${fish_result#updated:}"
+      ;;
+    unchanged:*)
+      info "fish shell profile already configured:"
+      info "profile: ${fish_result#unchanged:}"
+      ;;
+    *)
+      info "note: ${INSTALL_DIR} is not saved in your fish config"
+      ;;
+  esac
+}
+
+# The first line of the fish completion script this installer writes, followed
+# by the install folder. `rocm uninstall` removes the script only when it still
+# starts with this line naming its own folder, so a script the user wrote, or
+# one another install folder wrote over this one, stays. Keep it in step with
+# FISH_COMPLETIONS_MARKER in apps/rocm/src/uninstall.rs.
+FISH_COMPLETIONS_MARKER='# rocm-cli fish completions for '
+
+# Whether file $1 is a regular file this installer (any install folder) wrote:
+# not a link, and starting with the marker line.
+is_installer_completions() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  first_line=""
+  IFS= read -r first_line < "$1" || [ -n "${first_line}" ] || return 1
+  case "${first_line}" in
+    "${FISH_COMPLETIONS_MARKER}"?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Install fish completions from the binary that was just placed, so they match
+# it, and record the file so `rocm uninstall` removes it with the binary. Best
+# effort: a binary that cannot print them leaves the install intact. The binary
+# reads nothing from stdin, which under `curl | sh` is the rest of this script.
+#
+# rocm.fish is one fixed path, so a file or link that is already there and did
+# not come from this installer is the user's: it is left alone, never written
+# through, and not recorded, so `rocm uninstall` leaves it too.
+install_fish_completions() {
+  completions_dir="$(fish_config_dir)/completions"
+  completions_path="${completions_dir}/rocm.fish"
+  completions_tmp="${tmp_dir}/rocm.fish"
+  completions_marked="${tmp_dir}/rocm.fish.marked"
+  if { [ -e "${completions_path}" ] || [ -L "${completions_path}" ]; } \
+    && ! is_installer_completions "${completions_path}"; then
+    info "note: fish completions not installed: ${completions_path} already exists and was not written by this installer"
+    info "it is left as it is; remove it and run the installer again to replace it"
+    return 0
+  fi
+  if "${INSTALL_DIR}/rocm" completions fish < /dev/null > "${completions_tmp}" \
+    && [ -s "${completions_tmp}" ] \
+    && { printf '%s%s\n' "${FISH_COMPLETIONS_MARKER}" "${INSTALL_DIR}" \
+      && cat "${completions_tmp}"; } > "${completions_marked}" \
+    && mkdir -p "${completions_dir}" \
+    && install -m 0644 "${completions_marked}" "${completions_path}"; then
+    record_path_edit "completions ${completions_path}"
+    ok "fish completions installed:"
+    info "${completions_path}"
+  else
+    info "note: could not install fish completions"
+    info "to try again, run the installer again, or run:"
+    info "mkdir -p '${completions_dir}'"
+    info "'${INSTALL_DIR}/rocm' completions fish > '${completions_path}'"
+    info "(a file written that way has no installer marker, so rocm uninstall leaves it)"
+  fi
 }
 
 ensure_installer_process_path() {
@@ -633,6 +742,15 @@ case ":${PATH}:" in
           info "rocm is installed here: ${INSTALL_DIR}/rocm"
           ;;
       esac
+      # Fish gets its own snippet when it is installed, including when the
+      # login shell is bash, zsh, or ksh. Skip the second write when that
+      # login shell already targeted config.fish.
+      if fish_is_installed; then
+        if [ "${profile_path}" != "$(fish_config_path)" ]; then
+          configure_fish_path "${path_expr}"
+        fi
+        install_fish_completions
+      fi
     else
       info "shell profile update skipped"
       info "rocm is installed here: ${INSTALL_DIR}/rocm"

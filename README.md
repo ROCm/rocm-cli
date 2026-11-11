@@ -81,9 +81,20 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
-removes the binaries, and undoes the `PATH` change too when no other program
-lives in that directory.
+directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
+`PATH`, or fish's config folder already exists), the installer also adds that
+directory to `PATH` in fish's `config.fish` and installs fish completions,
+including when the login shell is bash, zsh, or ksh. Fish's config folder is
+`$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
+`~/.config/fish`. A `completions/rocm.fish` that is already there and that the
+installer did not write (your own file, or a link) is left as it is: the
+installer prints a note that completions were not installed, and
+`rocm uninstall` leaves it too.
+Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
+its completions included. Rerun the installer any time to upgrade.
+`rocm uninstall` removes the binaries and the fish completions the installer
+wrote for them, and undoes the `PATH` change too when no other program lives
+in that directory.
 
 ### Linux and WSL2 (x86_64)
 
@@ -121,10 +132,12 @@ rocm version
 ```
 
 The output shows the ROCm CLI version with its release tag or branch and commit
-hash, the ROCm SDK that ROCm CLI would use on this computer, and the GPU driver
-version. A successful install prints the CLI version line. The SDK and driver
-lines read `not detected` when none is found, which is expected on a computer
-where you haven't installed ROCm or a driver yet.
+hash (a release build leads with its release version, such as
+`0.2.1 (v0.2.1, 1cde824)`; a build from `main` leads with `0.0.0-dev`), the ROCm
+SDK that ROCm CLI would use on this computer, and the GPU driver version. A
+successful install prints the CLI version line. The SDK and driver lines read
+`not detected` when none is found, which is expected on a computer where you
+haven't installed ROCm or a driver yet.
 
 If the shell reports `rocm: command not found`, confirm that the install
 directory is on your `PATH`. That is `~/.local/bin` on Linux,
@@ -294,7 +307,7 @@ form works depends on the engine your GPU selects.
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
+| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash (a release `vX.Y.Z` reports `X.Y.Z`; a branch, including `main`, reports `0.0.0-dev`), plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
@@ -396,6 +409,14 @@ The ROCm release and the inference engine's release are each cut
 back to a release, so a build number that would narrow toward one machine
 never appears there; the CLI's own version is the exception, since it names
 the tool that wrote the report instead of something read off the machine.
+That value is the version `rocm version` leads with (`X.Y.Z` for a release
+tag `vX.Y.Z`, `0.0.0-dev` for any other resolved ref), without the ref and
+commit hash that follow it there, since a local branch name is text from the
+machine. A release tag's suffix may only use letters, digits, `.`, `-` and
+`+`, and the version is at most 64 characters, so a release always reports
+its version here; a tag outside that is not treated as a release, and the
+release workflow refuses it. Anything else that reaches the report outside
+those rules is reported as `unknown`.
 The distribution is checked against a list of known names instead of
 being repeated from the machine.
 
@@ -1331,7 +1352,7 @@ rocm services list [--all] [--json]
 rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
-rocm services remove <service-id> --yes
+rocm services remove <service-id> --yes [--force]
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
 
@@ -1340,10 +1361,15 @@ gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
 processes, and any endpoint key, which the server may still be enforcing. It
 names each process that, or a process under it, did not exit after it was
-signaled; for a process it could not verify as the server's, it signals nothing
-and names an operating-system command to check on it. It does not suggest
-running the stop again: when only a process under the recorded one survived, a
-second stop can report the server stopped while that process still runs.
+signaled. On Windows it also names a process that did exit (or was already gone)
+when taking the processes under it down did not complete, or found nothing and
+no other recorded process is confirmed gone, because one of them may still be
+running. For a process it could not verify as the server's (its recorded
+start-time can no longer be read back, or, on Windows, `rocm` cannot query it at
+all), it signals nothing and names an operating-system command to check on it.
+It does not suggest running the stop again: when only a process under the
+recorded one survived, a second stop can report the server stopped while that
+process still runs.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
@@ -1352,15 +1378,25 @@ nothing, and leaves the stop request recorded.
 After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
 and re-checks the port before it respawns: if another live managed service is
 now recorded on that port, or (on the default `127.0.0.1` host only) the port is
-bound by another process, it refuses and the service stays stopped (`rocm services list` shows it). The lock wait is
-bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
+bound by another process, it refuses and the service stays stopped
+(`rocm services list` shows it). The lock wait is bounded (5 seconds), unlike
+`rocm serve`'s: if a launch still holds the lock,
 `restart` fails saying the server was stopped but not restarted and names
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
-alone, and additionally clears leftover files whose record is already gone.
+alone, and additionally clears leftover files whose record is already gone. A
+server counts as running while any process it recorded may be running, which on
+Windows includes one `rocm` cannot query (a live process the account may not
+open): `remove` and `prune` refuse such a record until that process is gone.
+`remove <service-id> --force --yes` is the way out for exactly that case: it
+removes the record when a stop was requested, no recorded process is confirmed
+running, and at least one could not be queried, says which one, and never
+removes a record whose process `rocm` can see running. `prune` has no
+`--force`, but when it leaves such a record alone it lists it with the exact
+`remove --force --yes` command. `docs/manual-testing.md` walks through it.
 
 Removal destroys both the log and the `restart` option for the records it
 takes, so `prune` only considers records untouched for 24 hours. Age is
@@ -1621,6 +1657,27 @@ rocm config set-provider-key <provider>
 rocm config clear-provider-key <provider>
 ```
 
+Settings live in `config.json` in the config directory and are replaced in one
+step, so an interrupted save leaves the previous file rather than a truncated
+one. On Windows, a replace that fails part-way can instead leave the new
+settings in a `config.json.tmp-*` file beside it, which the error names: rename
+it back to `config.json` before running another command. If the file exists
+but cannot be read — a bad hand edit, for example —
+rocm-cli reports it and does not save over it, so the settings in it are never
+replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
+where runtimes are kept; when it is too damaged to read even that, commands stop
+and say how to recover (`rocm diagnose` still runs). Repairing the file
+restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
+when the file still shows it) points commands back at your runtimes' folder
+meanwhile; until the file is repaired, any command that changes settings still
+stops on it, and other commands either stop too or run on default settings.
+To start over instead, rename the file yourself: the error names the exact
+file it read (under `ROCM_CLI_CONFIG_DIR` when that is set) and a name to give
+it, `config.json.broken` beside it, and rocm-cli does not rename or move it for
+you. That resets every setting to its default, and runtimes in a custom folder
+then need `ROCM_CLI_DATA_DIR`, which the error names when the file recorded
+that folder.
+
 ### Setup
 
 ```
@@ -1698,6 +1755,16 @@ be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
 Each step is reported as it finishes, so if a later step fails, the output
 still shows what was already removed.
 
+On Linux it also removes the fish completion script (`completions/rocm.fish`
+in fish's config folder) that the installer recorded writing, even when the
+`PATH` change stays for other programs, and keeps it with `--keep-binaries`.
+The installer starts that file with a line naming the folder it installed into,
+and uninstall removes the file only when that line names its own folder. A
+`rocm.fish` you wrote yourself, a link, or one another install folder wrote
+since is left in place, and the review says so under `Left alone:`. If the
+file cannot be removed, uninstall prints a warning naming it and carries on,
+since the completions are only a convenience; delete it yourself then.
+
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.
@@ -1748,6 +1815,10 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 #   autoload -Uz compinit && compinit
 
 # fish
+# The Linux installer writes this file when fish is installed (under
+# $XDG_CONFIG_HOME/fish when that is an absolute path). To refresh it, run the
+# installer again. A file you write with the command below carries no
+# installer marker line, so `rocm uninstall` leaves it in place:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 

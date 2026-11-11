@@ -34,6 +34,7 @@ pub mod hardware_root;
 pub mod host_gpu;
 mod jsonl_store;
 pub mod log_tail;
+pub mod managed_child;
 pub mod managed_runtime;
 pub mod model_catalog;
 pub mod model_readiness;
@@ -55,6 +56,7 @@ pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
 pub mod service_record;
+mod sigpipe;
 pub mod terminal;
 pub mod user_path;
 
@@ -154,6 +156,7 @@ pub use log_tail::{
     service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
     tail_log_decoded,
 };
+pub use managed_child::ManagedChildLiveness;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
@@ -179,16 +182,20 @@ pub use net::{
     http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
-pub use paths::{AppPaths, engine_plugin_dirs};
+pub use paths::{
+    AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV, DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs,
+};
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
+    RecordedPidStop, TerminationOutcome, identity_state, process_start_ticks,
+    terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
+    terminate_verified,
 };
 pub use process::{
-    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ManagedChildLiveness,
-    detach_command_session, is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
-    lease_loopback_port_or_bind_error, process_is_running, terminate_process,
-    terminate_process_tree,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
+    is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
+    lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
+    terminate_process_tree, windows_system_tool,
 };
 #[cfg(windows)]
 pub use process::{
@@ -234,6 +241,7 @@ pub use service_record::{
     INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
     engine_stop_decides_confirmation,
 };
+pub use sigpipe::with_sigpipe_ignored;
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,

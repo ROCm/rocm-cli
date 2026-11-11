@@ -12,13 +12,14 @@
 //! the completion builder, and re-imports these types so every other module
 //! keeps reaching them as `crate::Command`, `crate::Provider` and so on.
 
+pub(crate) use crate::cli_args::{
+    DevicePolicyArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider, SandboxToolArg,
+    TelemetryModeArg, WatcherModeArg,
+};
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::{bootstrap, chat, comfyui, remote, storage};
-use clap::{Parser, Subcommand, ValueEnum};
-use rocm_core::{
-    DEFAULT_LOCAL_HOST, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode,
-};
+use clap::{Parser, Subcommand};
+use rocm_core::DEFAULT_LOCAL_HOST;
 use std::path::PathBuf;
 
 /// User-selectable serving engines, in the order shown in `--help` and shell
@@ -233,6 +234,9 @@ pub(crate) enum Command {
     },
     /// Print the rocm-cli version, release tag or branch, and commit hash,
     /// plus the ROCm SDK and GPU driver this machine would use.
+    ///
+    /// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A build
+    /// from `main` is shown as `0.0.0-dev (main, <hash>)`.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -689,10 +693,12 @@ rocm logs --search error timeout")]
     /// Remove ROCm CLI-managed files from this computer.
     ///
     /// Removes the config, data, and cache directories and the installed
-    /// binaries, including the running rocm.exe on Windows. It also undoes the
-    /// PATH change the installer made (its marked shell-profile block, or the
-    /// user PATH entry it recorded adding on Windows), unless other programs
-    /// share the install folder.
+    /// binaries, including the running rocm.exe on Windows, and the fish
+    /// completion script the Linux installer wrote for them (a rocm.fish it
+    /// did not write is left in place, and one it cannot remove is only a
+    /// warning). It also undoes the PATH change the installer made (its marked
+    /// shell-profile block, or the user PATH entry it recorded adding on
+    /// Windows), unless other programs share the install folder.
     #[command(after_help = "EXAMPLES:\n  \
 rocm uninstall --dry-run\n  \
 rocm uninstall\n  \
@@ -707,7 +713,8 @@ rocm uninstall --keep-data --yes")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries, and the installer's PATH change.
+        /// Keep installed rocm-cli binaries, the installer's PATH change, and the
+        /// fish completions it wrote.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -1153,9 +1160,10 @@ pub(crate) enum ServicesCommand {
     /// confirmed gone. Otherwise it reports on stderr that the stop was not
     /// confirmed and exits with an error, keeping the record, which still names
     /// the processes, and any endpoint key, which the server may still be
-    /// enforcing. It names each process that did not exit, and for one it could
-    /// not verify it signals nothing and names an operating-system command to
-    /// check on it. It does not suggest running the stop again.
+    /// enforcing. It names each process that did not exit (on Windows, also one
+    /// whose child processes may still be running), and for one it could not
+    /// verify it signals nothing and names an operating-system command to check
+    /// on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
@@ -1177,9 +1185,10 @@ pub(crate) enum ServicesCommand {
     },
     /// Delete one local server record and its files.
     ///
-    /// Only works on a record that is not running: stop the server first. The
-    /// record's details file, log, engine state file, and endpoint key file are
-    /// all deleted, so its log can no longer be read and it can no longer be
+    /// Only works on a record that is not running: stop the server first (on
+    /// Windows a process `rocm` cannot query counts as running). The record's
+    /// details file, log, engine state file, and endpoint key file are all
+    /// deleted, so its log can no longer be read and it can no longer be
     /// restarted.
     Remove {
         /// Service id from `rocm services list --all`.
@@ -1187,11 +1196,21 @@ pub(crate) enum ServicesCommand {
         /// Required; remove refuses without it.
         #[arg(long)]
         yes: bool,
+        /// Remove a record whose recorded process `rocm` cannot query.
+        ///
+        /// Only when a stop was requested, no recorded process is confirmed
+        /// running, and at least one could not be queried (on Windows, a live
+        /// process the account may not open). Deletes the record, log, engine
+        /// state and endpoint key, and says which process; if it is still
+        /// running it keeps running. Refused for a process confirmed running.
+        #[arg(long)]
+        force: bool,
     },
     /// Delete local server records that are no longer running.
     ///
-    /// Running servers are always left alone. Leftover files whose record is
-    /// already gone are cleaned up too.
+    /// Running servers are always left alone; a record held only by a process
+    /// `rocm` cannot query (Windows) is listed with the `remove --force` command.
+    /// Leftover files whose record is already gone are cleaned up too.
     ///
     /// Waits for a managed launch already under way to publish its record
     /// before reading the directory, and waits as long as that launch takes.
@@ -1329,164 +1348,6 @@ pub(crate) enum SetupCommand {
     },
 }
 
-/// Which framework `rocm examine` should probe.
-///
-/// The CLI-facing mirror of [`rocm_core::FrameworkProbe`], which cannot derive
-/// `ValueEnum` itself without pulling clap into `rocm-core`. Every variant of
-/// that enum existed and was reachable in the library, but no caller ever passed
-/// anything but the default, so the choice could not be made from the command
-/// line at all.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum FrameworkArg {
-    /// Try PyTorch first, then llama.cpp (the default).
-    Auto,
-    /// Probe PyTorch only.
-    Pytorch,
-    /// Probe llama.cpp only.
-    #[value(name = "llama-cpp", alias = "llamacpp")]
-    LlamaCpp,
-    /// Probe no framework at all - fastest, and enough for GPU and driver questions.
-    Skip,
-}
-
-impl From<FrameworkArg> for rocm_core::FrameworkProbe {
-    fn from(value: FrameworkArg) -> Self {
-        match value {
-            FrameworkArg::Auto => Self::Auto,
-            FrameworkArg::Pytorch => Self::PyTorch,
-            FrameworkArg::LlamaCpp => Self::LlamaCpp,
-            FrameworkArg::Skip => Self::Skip,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum InstallFormat {
-    /// Python wheel packages (recommended; smaller, pip-installable).
-    Wheel,
-    /// Self-contained tarball archive of the ROCm SDK.
-    Tarball,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum Provider {
-    /// A local OpenAI-compatible server started via `rocm serve` (no API key).
-    Local,
-    /// Anthropic Claude API (requires an API key).
-    Anthropic,
-    /// OpenAI API or OpenAI-compatible endpoint (requires an API key).
-    Openai,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum WatcherModeArg {
-    /// Only report findings; never take action.
-    Observe,
-    /// Report findings and propose changes for you to approve.
-    Propose,
-    /// Apply changes automatically within a contained, reversible scope.
-    Contained,
-}
-
-impl From<WatcherModeArg> for WatcherMode {
-    fn from(value: WatcherModeArg) -> Self {
-        match value {
-            WatcherModeArg::Observe => Self::Observe,
-            WatcherModeArg::Propose => Self::Propose,
-            WatcherModeArg::Contained => Self::Contained,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum TelemetryModeArg {
-    /// Collect GPU telemetry on this machine only; nothing leaves the device.
-    Local,
-    /// Disable telemetry collection entirely.
-    Off,
-}
-
-/// User-facing `rocm serve --device` policy.
-///
-/// Modeled as a clap `ValueEnum` so invalid input is rejected by clap's usage
-/// validation (exit code 2, with the valid choices listed) rather than a generic
-/// application error (exit code 1) — matching how every other enum-style CLI
-/// argument behaves. The historical aliases (`auto`/`gpu` for `gpu_required`,
-/// `cpu` for `cpu_only`) stay accepted for backward compatibility but are hidden
-/// from the advertised list.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub(crate) enum DevicePolicyArg {
-    /// Require a ROCm GPU; fail if none is usable (the default).
-    #[value(alias = "auto", alias = "gpu")]
-    GpuRequired,
-    /// Accepted for compatibility; behaves identically to `gpu_required`
-    /// (rocm serve has no CPU fallback path).
-    GpuPreferred,
-    /// Accepted but always rejected: rocm serve has no CPU fallback path, so
-    /// this exits with an error. Hidden from `--help`, shell completions and the
-    /// invalid-value suggestion list so it is never advertised as usable, while
-    /// still parsing so the deliberate rejection message is preserved.
-    #[value(alias = "cpu", hide = true)]
-    CpuOnly,
-}
-
-impl DevicePolicyArg {
-    /// Canonical policy string understood by [`crate::gpu_policy::parse_device_policy`]. Routing the
-    /// parsed variant back through the string keeps `parse_device_policy` the
-    /// single choke point that enforces the `cpu_only` rejection across every
-    /// caller, rather than adding a second conversion path that could bypass it.
-    pub(crate) const fn as_policy_str(self) -> &'static str {
-        match self {
-            Self::GpuRequired => "gpu_required",
-            Self::GpuPreferred => "gpu_preferred",
-            Self::CpuOnly => "cpu_only",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub(crate) enum SandboxToolArg {
-    ListServers,
-    RestartServer,
-    StopServer,
-}
-
-impl SandboxToolArg {
-    pub(crate) const fn as_cli_value(self) -> &'static str {
-        match self {
-            Self::ListServers => "list_servers",
-            Self::RestartServer => "restart_server",
-            Self::StopServer => "stop_server",
-        }
-    }
-}
-
-impl TelemetryModeArg {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => TELEMETRY_MODE_LOCAL,
-            Self::Off => TELEMETRY_MODE_OFF,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum PermissionsModeArg {
-    FullAccess,
-    Ask,
-}
-
-impl PermissionsModeArg {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::FullAccess => PERMISSIONS_MODE_FULL_ACCESS,
-            Self::Ask => PERMISSIONS_MODE_ASK,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1497,6 +1358,39 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `cli_version_string` is `ROCM_CLI_VERSION`, the one string
+    /// `format_cli_version` in `build.rs` embeds, clap's `-V`/`--version` is
+    /// that same string, and `cli_version_number` leads it. This does not run
+    /// the binary: `@id:examine-version` compares the printed `rocm version`
+    /// and `-V`/`--version` lines. Tag, `main`, and unknown shapes are the
+    /// `format_cli_version_*` tests in `build.rs`; this checks only the shape
+    /// of the ref this checkout resolved, which is never a release tag in CI.
+    #[test]
+    fn version_surfaces_share_one_build_script_string() {
+        let full = crate::cli_version_string();
+        let number = crate::cli_version_number();
+        let reference = env!("ROCM_CLI_VERSION_REF");
+        let hash = env!("ROCM_CLI_GIT_HASH");
+        assert_eq!(full, env!("ROCM_CLI_VERSION"));
+        assert_eq!(
+            cli_command().get_version(),
+            Some(full.as_str()),
+            "-V/--version must print the same string as `rocm version`"
+        );
+        assert_eq!(full, format!("{number} ({reference}, {hash})"));
+        // A resolved ref whose text is not `v` plus the leading version is not
+        // a release tag. `main`, a feature branch, and a name such as `vllm`
+        // all land here, and none of them may report the workspace package
+        // version.
+        if reference != "unknown" && reference.strip_prefix('v') != Some(number.as_str()) {
+            assert_eq!(number, "0.0.0-dev", "{full}");
+            assert_ne!(number, env!("CARGO_PKG_VERSION"));
+        }
+        if reference == "unknown" {
+            assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,
