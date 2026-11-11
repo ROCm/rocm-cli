@@ -7,12 +7,12 @@
 //! to (`EngineSelection`, `resolve_engine_selection`,
 //! `validate_engine_selection_runtime`, `single_ready_runtime_key`,
 //! `resolve_runtime_selector_to_exact_key`), small argv-building helpers used
-//! when relaunching a managed engine (`optional_arg`,
-//! `engine_recipe_json_arg`, `parse_engine_recipe_json_arg`,
+//! when relaunching a managed engine (`engine_recipe_json_arg`,
+//! `parse_engine_recipe_json_arg`,
 //! `daemon_run_argv`, `managed_service_launcher_path`), the `ROCM_CLI_*`
 //! environment variables every managed child inherits
-//! (`app_path_env_vars`/`app_path_env_var_values`/`app_path_env_var_refs`/
-//! `apply_app_path_env`), and polling a freshly launched service until it can
+//! (`app_path_env_var_values`/`app_path_env_var_refs`, over
+//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`), and polling a freshly launched service until it can
 //! actually answer inference requests (`wait_for_service_http_ready`,
 //! `wait_for_service_http_ready_with_progress`,
 //! `service_http_readiness_paths`, `http_get_local_service`,
@@ -61,16 +61,10 @@
 //! it does not decide which runtime counts as "the one ready runtime" itself,
 //! it asks `runtime_adopt::select_single_ready_runtime`, the rule
 //! `rocm comfyui install` shares.
-//! `optional_arg` and
-//! `engine_recipe_json_arg` are `pub(crate)`, read from `engine_ipc.rs`'s
+//! `engine_recipe_json_arg` is `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
-//! `app_path_env_vars`/`apply_app_path_env` are `pub(crate)`, read from
-//! `engine_ipc.rs`, `app_path_env_vars` is also read from
-//! `chat/mcp_bridge.rs`, and `apply_app_path_env` is also read from
-//! `engines_cmd.rs`,
-//! `service_launch.rs`, and `service_control.rs`'s
-//! `restart_internal_managed_service_with`; `app_path_env_var_values`/
+//! `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
 //! and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
@@ -96,7 +90,6 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
 
@@ -246,13 +239,6 @@ pub(crate) fn resolve_runtime_selector_to_exact_key(
     }
 }
 
-pub(crate) fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
-    match value {
-        Some(value) => vec![flag.to_owned(), value.to_owned()],
-        None => Vec::new(),
-    }
-}
-
 pub(crate) fn engine_recipe_json_arg(
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<Vec<String>> {
@@ -275,20 +261,13 @@ pub(crate) fn parse_engine_recipe_json_arg(
         .transpose()
 }
 
-pub(crate) fn app_path_env_vars(paths: &AppPaths) -> [(&'static str, &Path); 3] {
-    [
-        ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()),
-        ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
-        ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
-    ]
-}
-
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn app_path_env_var_values(
     paths: &AppPaths,
     env_root: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
-    let mut vars = app_path_env_vars(paths)
+    let mut vars = paths
+        .env_vars()
         .into_iter()
         .map(|(key, value)| (key, value.to_path_buf()))
         .collect::<Vec<_>>();
@@ -323,12 +302,6 @@ pub(crate) fn managed_service_launcher_path() -> Result<PathBuf> {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)
-}
-
-pub(crate) fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths) {
-    for (key, value) in app_path_env_vars(paths) {
-        command.env(key, value);
-    }
 }
 
 pub(crate) fn wait_for_service_http_ready(
@@ -921,16 +894,6 @@ mod tests {
         // it rather than joining, and the thread dies with the test process.
         drop(server);
         Ok(())
-    }
-
-    #[test]
-    fn app_path_env_vars_include_config_data_and_cache() {
-        let paths = test_app_paths();
-        let vars = app_path_env_vars(&paths);
-
-        assert_eq!(vars[0], ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()));
-        assert_eq!(vars[1], ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()));
-        assert_eq!(vars[2], ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()));
     }
 
     #[test]

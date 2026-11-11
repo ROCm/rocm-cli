@@ -104,6 +104,30 @@ pub(super) fn resolve_managed_port_in_transaction(
 /// be published. Short: the child is milliseconds old and has nothing to flush.
 const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 
+/// Whether this host records a start token for a process: Linux (the kernel
+/// start-time) and Windows (the creation time). Anywhere else
+/// `rocm_core::process_start_ticks` has nothing to read.
+const fn host_records_start_tokens() -> bool {
+    cfg!(any(target_os = "linux", windows))
+}
+
+/// The verdict that ends a failed launch's cleanup before anything is signalled:
+/// `Some(Unverified)` for a child whose token was not captured on a host that
+/// records tokens, because that child was gone before it could be captured and
+/// its pid may now belong to another process. `None` otherwise: a captured token
+/// is verified by the termination, and on a host with no tokens there is nothing
+/// to verify, so the kill proceeds as it always did there.
+const fn launch_cleanup_refusal(
+    engine_start_ticks: Option<u64>,
+    host_records_tokens: bool,
+) -> Option<rocm_core::TerminationOutcome> {
+    if engine_start_ticks.is_none() && host_records_tokens {
+        Some(rocm_core::TerminationOutcome::Unverified)
+    } else {
+        None
+    }
+}
+
 /// Undo a failed managed launch attempt before the launch lock is released,
 /// so no failed transaction leaves a live reservation or a stray endpoint key.
 ///
@@ -120,23 +144,54 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// Every step is best-effort and idempotent; cleanup must never mask the
 /// original failure with a second one.
 pub(super) fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
+    // The shared routine `rocm services stop` and `rocmd` use, not
+    // `terminate_verified` alone: on Windows only the routine takes the
+    // processes under the child down, so a failed launch cannot leave the engine
+    // one level below the supervisor running.
+    abandon_failed_managed_launch_with(paths, record, |identity| {
+        rocm_core::terminate_recorded_pid_within(identity, MANAGED_LAUNCH_CLEANUP_GRACE)
+    });
+}
+
+/// [`abandon_failed_managed_launch`] with the termination of the child supplied
+/// by the caller, so a test sees what the cleanup asks it to terminate, and
+/// whether it asks at all.
+fn abandon_failed_managed_launch_with(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    terminate: impl Fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
+) {
     if let Some(pid) = record.engine_pid.filter(|pid| *pid != 0) {
         // The token captured at spawn, not a fresh `capture`: when the child
         // already exited, a fresh one would describe a recycled pid's new owner
         // and the forced tree kill would hit it. Where start tokens exist
-        // (Linux), a missing one means the child was gone before it could be
-        // captured, so the pid is unverifiable and nothing is signalled
-        // (`terminate_verified` alone would "best-effort proceed"). Windows
-        // records no token at all, so there the kill proceeds as before.
-        let outcome = if record.engine_start_ticks.is_none() && cfg!(target_os = "linux") {
-            rocm_core::TerminationOutcome::Unverified
+        // (Linux, and Windows, which records the process creation time), a
+        // missing one means the child was gone before it could be captured, so
+        // the pid is unverifiable and nothing is signalled (`terminate_verified`
+        // alone would "best-effort proceed"). A token that was captured is
+        // verified by the termination on both.
+        //
+        // The tradeoff on Windows, chosen deliberately: a child whose creation
+        // time could not be read at capture is not killed, so if `OpenProcess`
+        // failed for a child that is in fact alive (it is this account's own
+        // fresh child, so that is not expected), a failed launch leaves its
+        // engine running and the audit event says `unverified`. The alternative
+        // is a forced tree kill of a pid that may by now belong to another
+        // process, which cannot be undone. The spawn primitive returns only the
+        // pid and closes its handle, so a handle-based identity would mean
+        // changing it; that is not done here. The refusal decision
+        // (`launch_cleanup_refusal`) and what the cleanup asks the termination to
+        // do are under tests that run on Windows; the cleanup of a real Windows
+        // child is run by no test.
+        let outcome = if let Some(refusal) =
+            launch_cleanup_refusal(record.engine_start_ticks, host_records_start_tokens())
+        {
+            refusal
         } else {
-            rocm_core::terminate_verified(
-                &rocm_core::ProcessIdentity::new(pid, record.engine_start_ticks),
-                rocm_core::KillScope::Tree,
-                MANAGED_LAUNCH_CLEANUP_GRACE,
-                true,
-            )
+            terminate(&rocm_core::ProcessIdentity::new(
+                pid,
+                record.engine_start_ticks,
+            ))
         };
         record_cli_audit_event(
             paths,
@@ -703,7 +758,7 @@ mod tests {
         // confirms every recorded process gone without touching the test
         // process itself.
         crate::service_control::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| {
-            crate::service_control::RecordedStopTermination::confirmed_stopped()
+            Vec::new()
         })?;
 
         let decision = resolve_managed_port_in_transaction(
@@ -898,6 +953,55 @@ mod tests {
         Ok(())
     }
 
+    /// What the cleanup asks of the termination, through the seam and so on every
+    /// host: the child's PID with the token captured at spawn, and nothing at all
+    /// for a child with no token where tokens are recorded. The record is marked
+    /// stopped either way and the audit event carries the verdict the termination
+    /// gave.
+    #[test]
+    fn abandoned_launch_asks_the_termination_for_the_spawned_child_with_its_token() -> Result<()> {
+        use std::cell::RefCell;
+        let cases = [
+            // (token captured, whether the cleanup is expected to ask)
+            (Some(77_u64), true),
+            (None, !host_records_start_tokens()),
+        ];
+        for (token, expect_call) in cases {
+            let (root, paths) = test_paths("abandon-launch-asks-termination");
+            paths.ensure()?;
+            let mut record = write_live_service_record(
+                &paths,
+                "lemonade-abandon-seam",
+                "abandon-seam-model",
+                11_494,
+                "running",
+            )?;
+            record.engine_pid = Some(4242);
+            record.engine_start_ticks = token;
+            let asked = RefCell::new(Vec::new());
+
+            abandon_failed_managed_launch_with(&paths, &record, |identity| {
+                asked.borrow_mut().push(*identity);
+                rocm_core::TerminationOutcome::Forced
+            });
+
+            let asked = asked.into_inner();
+            let persisted = load_managed_services(&paths)?
+                .into_iter()
+                .find(|candidate| candidate.service_id == record.service_id)
+                .expect("a launch that spawned a child keeps its record");
+            let _ = fs::remove_dir_all(root);
+            let expected = if expect_call {
+                vec![rocm_core::ProcessIdentity::new(4242, token)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(asked, expected, "token {token:?}");
+            assert_eq!(persisted.status, "stopped", "token {token:?}");
+        }
+        Ok(())
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn abandoned_launch_never_signals_a_pid_that_no_longer_matches_the_spawn_token() -> Result<()> {
@@ -998,5 +1102,36 @@ mod tests {
             "a spawned child's record must be kept, but in a status recovery ignores"
         );
         Ok(())
+    }
+
+    /// A failed launch's cleanup refuses to signal a child whose token was not
+    /// captured on any host that records tokens. Windows is one of them, since
+    /// it records the creation time: a missing token there means the child was
+    /// gone before it could be captured, and its pid may now be another
+    /// process's, so the kill must not proceed as it did when Windows had none.
+    #[test]
+    fn launch_cleanup_refuses_a_child_without_a_token_only_where_tokens_exist() {
+        use rocm_core::TerminationOutcome::Unverified;
+
+        // A host that records tokens: a missing one is unverifiable, a captured
+        // one goes on to be verified by the termination.
+        assert_eq!(launch_cleanup_refusal(None, true), Some(Unverified));
+        assert_eq!(launch_cleanup_refusal(Some(7), true), None);
+        // A host with no tokens has nothing to verify and proceeds as before.
+        assert_eq!(launch_cleanup_refusal(None, false), None);
+        assert_eq!(launch_cleanup_refusal(Some(7), false), None);
+    }
+
+    /// Ties the cleanup's idea of "this host records tokens" to what
+    /// `process_start_ticks` really does, on the host the test runs on: Linux and
+    /// Windows read a token for a live process (this one), anywhere else there
+    /// is none. If a platform gains or loses tokens without the cleanup being
+    /// told, this fails there.
+    #[test]
+    fn the_cleanup_guard_agrees_with_whether_this_host_reads_tokens() {
+        assert_eq!(
+            host_records_start_tokens(),
+            rocm_core::process_start_ticks(std::process::id()).is_some()
+        );
     }
 }

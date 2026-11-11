@@ -113,6 +113,7 @@ impl Tool for ListInstancesTool {
             name: Self::NAME.to_string(),
             description: "List discovered serving instances: name, model, status, \
                           KV-cache usage %, running/waiting request counts, \
+                          the whole-node `node` figure (see tokens_per_watt), \
                           generation tok/s, TTFT/TPOT (each with a fresh/held \
                           flag; held means the last value, not a live reading), \
                           and attributed_power_w (this instance's share of its \
@@ -171,7 +172,14 @@ impl Tool for TokensPerWattTool {
             name: Self::NAME.to_string(),
             description: "Per-instance efficiency: generation tokens/sec divided by \
                           the instance's attributed share of its GPUs' power (W). \
-                          GPUs shared by several instances are split between them."
+                          GPUs shared by several instances are split between them. \
+                          Also returns `node`: whole-node tokens/sec over total \
+                          board power (whole-board, so it is not the sum of the \
+                          per-instance values), with freshness `fresh`, `held` \
+                          (carried from a prior scrape, expires within about \
+                          30 s) or null when unknown. `node` is null, meaning \
+                          no figure and not zero, when there is no traffic or \
+                          no power telemetry."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }

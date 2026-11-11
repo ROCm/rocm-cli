@@ -17,6 +17,7 @@ mod chat;
 mod chat_cmd;
 mod chat_host_facts;
 mod cli;
+mod cli_args;
 mod cli_audit;
 mod cli_progress;
 mod cli_report;
@@ -191,10 +192,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(all(test, not(windows)))]
-use std::process::Stdio;
-#[cfg(all(test, not(windows)))]
-use std::process::{Command as ProcessCommand, ExitStatus};
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -222,33 +219,6 @@ fn reset_sigpipe() {
 // `missing_const_for_fn` onto every caller in turn.
 #[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
-
-/// Run `f` with SIGPIPE temporarily ignored, restoring the previous
-/// disposition afterwards.
-///
-/// [`reset_sigpipe`] sets `SIG_DFL` process-wide so stdout/stderr pipe writes
-/// terminate the process conventionally. But a write to a spawned child's stdin
-/// whose reader has already exited would then kill `rocm` with SIGPIPE before
-/// the caller can turn the resulting `EPIPE` into a diagnostic. Wrap such writes
-/// in this helper so the failure surfaces as an `io::Error` (`BrokenPipe`)
-/// instead of a signal.
-#[cfg(unix)]
-#[allow(unsafe_code)] // libc FFI
-fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: reading/installing a signal disposition is always safe.
-    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    let result = f();
-    // SAFETY: restoring the disposition captured above is always safe.
-    unsafe {
-        libc::signal(libc::SIGPIPE, previous);
-    }
-    result
-}
-
-#[cfg(not(unix))]
-fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    f()
-}
 
 /// Marker error carrying `rocm fix`'s exit code back through `main()`'s
 /// ordinary return path, instead of calling `std::process::exit` mid-stack
@@ -415,17 +385,24 @@ fn parse_cli() -> Result<Cli> {
 }
 
 /// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
-/// the MCP in-process handler) prints: the semantic version Cargo built, plus
-/// the git ref and commit hash [`build.rs`] embedded, additively — never a
-/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
-/// still reports a real version number rather than none at all.
+/// the MCP in-process handler) prints. `format_cli_version` in `build.rs`
+/// computes this once from the ref and commit hash it already resolves and
+/// exports it as `ROCM_CLI_VERSION`, so these surfaces cannot disagree.
+///
+/// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A branch,
+/// including `main`, is shown as `0.0.0-dev (<ref>, <hash>)`. Only an
+/// unresolved ref falls back to the workspace package version, which is not
+/// bumped per release (see the module docs in `build.rs`).
 fn cli_version_string() -> String {
-    format!(
-        "{} ({}, {})",
-        env!("CARGO_PKG_VERSION"),
-        env!("ROCM_CLI_VERSION_REF"),
-        env!("ROCM_CLI_GIT_HASH")
-    )
+    env!("ROCM_CLI_VERSION").to_owned()
+}
+
+/// The leading version of [`cli_version_string`], without the parenthetical
+/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`
+/// and a problem report's `cli_version`. `build.rs` exports it beside the full
+/// string, from the same function, so nothing here parses that string.
+fn cli_version_number() -> String {
+    env!("ROCM_CLI_VERSION_NUMBER").to_owned()
 }
 
 /// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
@@ -1536,164 +1513,6 @@ pub(crate) mod tests {
                 "the update path must name itself as the approval source: {line}"
             );
         }
-    }
-
-    /// Regression test for the engine child-stdin write under the process-wide
-    /// `SIG_DFL` that `main` installs via [`reset_sigpipe`]. If an engine child
-    /// exits before reading its stdin, the parent's write to that pipe must
-    /// surface as a `BrokenPipe` error — handled by the caller's diagnostics —
-    /// rather than killing `rocm` with SIGPIPE before those diagnostics run.
-    ///
-    /// The bug only reproduces under `SIG_DFL`; the test harness leaves SIGPIPE
-    /// at Rust's default `SIG_IGN`, and flipping it process-wide would race
-    /// sibling tests. So this re-execs itself in fresh processes that install
-    /// `SIG_DFL` first, and checks BOTH directions:
-    /// - unguarded write to a dead child's stdin is fatal (killed by SIGPIPE) —
-    ///   this is the regression the plain `SIG_DFL` reset introduced;
-    /// - the same write wrapped in [`with_sigpipe_ignored`] survives and returns
-    ///   an error instead — this is the fix.
-    ///
-    /// Each child reaps its short-lived grandchild before writing, so the read
-    /// end is closed deterministically and the outcome does not race.
-    #[cfg(unix)]
-    #[test]
-    fn engine_stdin_write_under_sig_dfl_is_guarded_not_fatal() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        // Grandchild helper: reproduce main()'s SIG_DFL, spawn a process that
-        // exits immediately, reap it, then write to its now-closed stdin. The
-        // "guarded" arm wraps the write; the "unguarded" arm does not.
-        if let Some(mode) = std::env::var_os("ROCM_TEST_SIGPIPE_ARM") {
-            reset_sigpipe();
-            let mut grandchild = ProcessCommand::new("true")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn a process that exits immediately");
-            let mut stdin = grandchild.stdin.take().expect("grandchild stdin");
-            grandchild.wait().expect("reap grandchild");
-            // Heap-allocated so the buffer doesn't trip clippy::large-stack-arrays;
-            // it must exceed the pipe buffer so the write actually reaches the
-            // closed read end rather than being swallowed by kernel buffering.
-            let payload = vec![b'x'; 64 * 1024];
-            if mode == "guarded" {
-                let result = with_sigpipe_ignored(|| stdin.write_all(&payload));
-                assert!(
-                    result.is_err(),
-                    "guarded write to a dead pipe should return BrokenPipe, not succeed"
-                );
-            } else {
-                // Unguarded: under SIG_DFL this write delivers SIGPIPE and never
-                // returns. If the process somehow survives, exit 0 so the parent's
-                // "should have been signalled" assertion fails loudly.
-                let _ = stdin.write_all(&payload);
-            }
-            return;
-        }
-
-        let exe = std::env::current_exe().expect("current test executable");
-        let run_arm = |mode: &str| -> ExitStatus {
-            ProcessCommand::new(&exe)
-                .args([
-                    "tests::engine_stdin_write_under_sig_dfl_is_guarded_not_fatal",
-                    "--exact",
-                    "--nocapture",
-                ])
-                .env("ROCM_TEST_SIGPIPE_ARM", mode)
-                .status()
-                .expect("re-exec the test arm in a child process")
-        };
-
-        let unguarded = run_arm("unguarded");
-        assert_eq!(
-            unguarded.signal(),
-            Some(libc::SIGPIPE),
-            "sanity check: an unguarded stdin write under SIG_DFL must be killed by \
-             SIGPIPE (got {unguarded:?}); if not, the test no longer proves the guard matters"
-        );
-
-        let guarded = run_arm("guarded");
-        assert!(
-            guarded.success(),
-            "guarded child-stdin write was fatal under SIG_DFL ({guarded:?}) — \
-             SIGPIPE reached the process instead of surfacing as an error"
-        );
-    }
-
-    /// The codex bridge renders `summary` to the operator just as the two CLI
-    /// surfaces render their note, so the same correction has to reach it.
-    #[test]
-    fn codex_bridge_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
-        let engines = builtin_codex_bridge_engine_inventory(rocm_core::GpuSupportLevel::VulkanOnly);
-
-        let lemonade = engines
-            .iter()
-            .find(|engine| engine.id == "lemonade")
-            .expect("the bridge inventory must still carry lemonade");
-        assert!(
-            lemonade.summary.contains("no ROCm/HIP support")
-                && lemonade.summary.contains("Vulkan llama.cpp backend"),
-            "bridge clients must be told the real backend: {}",
-            lemonade.summary
-        );
-        assert!(
-            !lemonade.summary.contains("with ROCm llama.cpp backend"),
-            "the stale ROCm claim must not survive in the bridge: {}",
-            lemonade.summary
-        );
-        // Only `summary` is support-level aware; the bridge's JSON shape and
-        // every other engine's row are untouched by the substitution.
-        assert!(lemonade.installed_binary);
-        let vllm = engines
-            .iter()
-            .find(|engine| engine.id == "vllm")
-            .expect("the bridge inventory must still carry vllm");
-        assert_eq!(
-            vllm.summary,
-            "Linux/WSL ROCm GPU serving engine through external vLLM"
-        );
-    }
-
-    #[test]
-    fn codex_bridge_engine_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
-        let engines = builtin_codex_bridge_engine_inventory(rocm_core::GpuSupportLevel::RocmHip);
-
-        let lemonade = engines
-            .iter()
-            .find(|engine| engine.id == "lemonade")
-            .expect("the bridge inventory must still carry lemonade");
-        assert_eq!(
-            lemonade.summary,
-            "default embedded Lemonade server with ROCm llama.cpp backend"
-        );
-    }
-
-    #[test]
-    fn codex_bridge_engine_inventory_does_not_claim_vulkan_for_an_unrecognized_gpu() {
-        let engines = builtin_codex_bridge_engine_inventory(rocm_core::GpuSupportLevel::Unknown);
-
-        let lemonade = engines
-            .iter()
-            .find(|engine| engine.id == "lemonade")
-            .expect("the bridge inventory must still carry lemonade");
-        assert!(
-            !lemonade.summary.contains("no ROCm/HIP support"),
-            "an unrecognized GPU must not be reported as confirmed ROCm-less: {}",
-            lemonade.summary
-        );
-        assert!(
-            !lemonade.summary.contains("with ROCm llama.cpp backend"),
-            "nor told it has ROCm support - that is the claim this PR removes, \
-             surviving on the hosts the CLI knows least about: {}",
-            lemonade.summary
-        );
-        assert!(
-            lemonade.summary.contains("rocm examine"),
-            "claiming no backend still has to leave the operator a way to find \
-             out: {}",
-            lemonade.summary
-        );
     }
 
     #[test]

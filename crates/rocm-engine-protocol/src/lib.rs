@@ -2,6 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod fake_engine;
+
+mod stdio_client;
+pub use stdio_client::{
+    ENGINE_PROGRESS_STDERR_ENV, EngineStdioOptions, decode_engine_response,
+    engine_request_envelope, run_engine_stdio,
+};
+
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -277,6 +286,17 @@ impl GpuSelection {
             format!("invalid --gpu value `{value}`: `{trimmed}` is not a GPU index")
         })?;
         Ok(Self::Index(index))
+    }
+}
+
+/// The two arguments `flag value` when `value` is set, none when it is not, for
+/// building the command line of an engine or supervisor child. Shared so `rocm`
+/// and `rocmd` spell optional flags the same way.
+#[must_use]
+pub fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
+    match value {
+        Some(value) => vec![flag.to_owned(), value.to_owned()],
+        None => Vec::new(),
     }
 }
 
@@ -984,6 +1004,15 @@ mod tests {
         // Multiple GPUs are no longer supported.
         assert!(GpuSelection::parse_cli_value("0,1").is_err());
         assert!(GpuSelection::parse_cli_value("0,2,3").is_err());
+    }
+
+    #[test]
+    fn optional_arg_is_the_flag_and_value_or_nothing() {
+        assert_eq!(
+            optional_arg("--runtime-id", Some("therock-release:gfx120X-all")),
+            ["--runtime-id", "therock-release:gfx120X-all"]
+        );
+        assert!(optional_arg("--runtime-id", None).is_empty());
     }
 
     #[test]

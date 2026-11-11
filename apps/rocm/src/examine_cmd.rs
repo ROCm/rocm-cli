@@ -82,13 +82,13 @@ pub(crate) fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Resul
         // torch lives only in its site-packages, so probing PATH would report
         // `unknown` for a host that has one.
         let interpreter = rocm_core::active_managed_framework_interpreter(&paths, &config);
-        let mut examination =
-            rocm_core::Examination::probe_with_interpreter(framework, interpreter.as_ref());
-        // `gather` rather than `examine_human_report`: the latter first runs
-        // `recover_setup_runtime_registration`, which writes. Asking a machine a
-        // question should not change it, and `--json` is the form tooling calls
-        // in a loop.
-        let host = ExamineSummary::gather()?;
+        // `probe_with_summary` rather than `examine_human_report`, whose recovery
+        // step writes: asking a machine a question should not change it, and
+        // `--json` is the form tooling calls in a loop. It gathers the summary
+        // from the examination it probes, so the kernel release is read once for
+        // both documents and the two fields cannot disagree.
+        let (mut examination, host) =
+            rocm_core::Examination::probe_with_summary(framework, interpreter.as_ref())?;
         // The human report's "AMD GPU detected" line reads this same
         // `detected_gfx_target`; WSL skips the probes that would set
         // `has_amd_gpu`, so take it from here rather than leave the two forms

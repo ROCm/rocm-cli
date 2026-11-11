@@ -22,7 +22,6 @@
 
 use super::summaries::managed_service_running_state;
 use crate::automations::{render_automations_text, render_daemon_text};
-use crate::engine_runtime_select::app_path_env_vars;
 use crate::freeform_planner::{format_structured_tool_call, plan_freeform_request_with_context};
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
 use crate::rocm_argv::{chat_cli_arg_value, chat_cli_has_flag};
@@ -473,7 +472,7 @@ fn run_rocm_capture_for_paths(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    rocm_core::run_rocm_capture_with_env(args, &app_path_env_vars(paths), timeout)
+    rocm_core::run_rocm_capture_with_env(args, &paths.env_vars(), timeout)
 }
 
 fn run_rocm_command_for_paths(
@@ -1176,7 +1175,21 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("rocm")
         );
-        assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+        // The MCP summary prefixes the command output. The expected line is
+        // assembled from the build script's separate exports rather than from
+        // `cli_version_string()`, the function the handler itself calls, so a
+        // regression in that function's content fails here too. Which leading
+        // version a tag, `main`, or an unknown ref produces is the
+        // `format_cli_version_*` tests in `build.rs` (run via
+        // `tests/build_metadata.rs`).
+        let text = mcp_tool_result_text(&result);
+        let version_line = format!(
+            "rocm-cli {} ({}, {})",
+            env!("ROCM_CLI_VERSION_NUMBER"),
+            env!("ROCM_CLI_VERSION_REF"),
+            env!("ROCM_CLI_GIT_HASH")
+        );
+        assert!(text.lines().any(|line| line == version_line), "{text}");
     }
 
     /// The bridge's `engines` tool carries the same claim `rocm engines` and

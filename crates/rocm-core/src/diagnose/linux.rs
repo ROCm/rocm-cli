@@ -13,6 +13,27 @@ use super::scoring::{
 use super::{Diagnosis, Fix};
 use crate::examine::Examination;
 
+/// The phrase `check_3_rocm_kernel_unsupported` puts in its evidence when
+/// `amdgpu_loaded` is `Some(false)` and ROCm is installed.
+const AMDGPU_KERNEL_MODULE_NOT_LOADED: &str = "the amdgpu kernel module is not loaded";
+/// The evidence line `check_5_amdgpu_blacklisted` adds when `amdgpu_loaded` is
+/// `Some(false)`.
+const AMDGPU_MODULE_NOT_LOADED: &str = "amdgpu module is not loaded";
+/// The start of the evidence line `check_5_amdgpu_blacklisted` adds when Secure
+/// Boot is enabled and `amdgpu_loaded` is `Some(false)`.
+const SECURE_BOOT_BLOCKED_AMDGPU: &str = "Secure Boot is enabled and amdgpu didn't load";
+
+/// One phrase per evidence line that only `amdgpu_loaded == Some(false)` produces.
+///
+/// The checks build their lines from these same constants, so a test that asserts
+/// a diagnosis cites none of them (the e2e scenario for a built-in `amdgpu`)
+/// cannot drift from the wording and pass vacuously.
+pub const AMDGPU_MISSING_EVIDENCE: [&str; 3] = [
+    AMDGPU_KERNEL_MODULE_NOT_LOADED,
+    AMDGPU_MODULE_NOT_LOADED,
+    SECURE_BOOT_BLOCKED_AMDGPU,
+];
+
 pub(super) fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
@@ -24,7 +45,7 @@ pub(super) fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) ->
     if !rocm_version.is_empty() && e.amdgpu_loaded == Some(false) {
         score += 30;
         evidence.push(format!(
-            "ROCm {rocm_version} is installed but the amdgpu kernel module is not loaded; this is typical when DKMS failed against an unsupported kernel."
+            "ROCm {rocm_version} is installed but {AMDGPU_KERNEL_MODULE_NOT_LOADED}; this is typical when DKMS failed against an unsupported kernel."
         ));
     }
 
@@ -140,7 +161,7 @@ pub(super) fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diag
     }
     if e.amdgpu_loaded == Some(false) {
         score += 35;
-        evidence.push("amdgpu module is not loaded".to_owned());
+        evidence.push(AMDGPU_MODULE_NOT_LOADED.to_owned());
     }
     if e.rocminfo_status == "not-loaded" {
         score += 25;
@@ -148,7 +169,7 @@ pub(super) fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diag
     }
     if e.secure_boot == "enabled" && e.amdgpu_loaded == Some(false) {
         score += 10;
-        evidence.push("Secure Boot is enabled and amdgpu didn't load -- DKMS modules are often blocked until you sign them or disable Secure Boot.".to_owned());
+        evidence.push(format!("{SECURE_BOOT_BLOCKED_AMDGPU} -- DKMS modules are often blocked until you sign them or disable Secure Boot."));
     }
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_MODULE_NOT_LOADED);
     score += kw_score;
@@ -648,6 +669,46 @@ mod tests {
     use crate::diagnose::test_support::linux_base;
     use crate::diagnose::{HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH, diagnose, render_report_text};
     use crate::examine::{Device, Gpu};
+
+    #[test]
+    fn every_amdgpu_missing_phrase_is_in_the_evidence_the_checks_produce() {
+        let mut e = linux_base();
+        e.rocm_version = "7.1.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        e.secure_boot = "enabled".to_owned();
+        let lines: Vec<String> = [
+            check_3_rocm_kernel_unsupported(&e, ""),
+            check_5_amdgpu_blacklisted(&e, ""),
+        ]
+        .into_iter()
+        .flat_map(|d| d.evidence)
+        .collect();
+        for phrase in AMDGPU_MISSING_EVIDENCE {
+            assert!(
+                lines.iter().any(|l| l.contains(phrase)),
+                "no evidence line contains {phrase:?}: {lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_amdgpu_produces_none_of_the_amdgpu_missing_phrases() {
+        let mut e = linux_base();
+        e.rocm_version = "7.1.0".to_owned();
+        e.amdgpu_loaded = Some(true);
+        e.secure_boot = "enabled".to_owned();
+        for d in [
+            check_3_rocm_kernel_unsupported(&e, ""),
+            check_5_amdgpu_blacklisted(&e, ""),
+        ] {
+            for line in &d.evidence {
+                assert!(
+                    !AMDGPU_MISSING_EVIDENCE.iter().any(|p| line.contains(p)),
+                    "{line}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn render_group_missing_is_diagnosed() {
