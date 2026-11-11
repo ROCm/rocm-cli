@@ -32,8 +32,11 @@ on:
   # the GPU lanes. Affected-crate/heavy selection diffs against github.base_ref.
   pull_request:
     # `closed` (merge OR close) joins the PR's concurrency group below, so it
-    # supersedes that PR's queued/running GPU runs. It runs only the no-op
-    # `pr-closed` job; every GPU lane skips because `changes` skips.
+    # supersedes that PR's earlier run. It runs only the no-op `pr-closed` job;
+    # every GPU lane skips because `changes` skips. This frees runners only where
+    # the cancel completes: a job queued for a runner that is not picking it up
+    # (W7900 while its one runner is busy) may not finish cancelling, so this
+    # does NOT clear such queued runs.
     types: [opened, synchronize, reopened, closed]
   merge_group:
     branches: [main]
@@ -190,8 +193,9 @@ jobs:
           fi
 
   # Exists only to start a run in the PR's concurrency group when the PR is
-  # merged or closed: that run cancels the PR's older run, and with it any GPU
-  # job still queued for a head nobody will look at again.
+  # merged or closed: that run cancels the PR's older run. A GPU job of that run
+  # which is queued for a runner that is not picking it up may not finish
+  # cancelling (observed on W7900-queued runs).
   pr-closed:
     name: Supersede runs of a closed PR
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
