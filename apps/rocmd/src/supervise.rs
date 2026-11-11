@@ -149,7 +149,9 @@ fn supervise_service_on(
     // at `None` would quietly withdraw that stop and hand the service straight
     // back to the daemon's recovery.
     record.stop_requested_unix_ms = existing.and_then(|existing| existing.stop_requested_unix_ms);
-    // Refuse a keyless public respawn before the manifest write, so a refused
+    // Refuse a keyless respawn that would reopen the service without
+    // authentication (a public bind, or a service launched with
+    // `--require-api-key`) before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
     // site below re-checks against the key actually threaded onto the command.

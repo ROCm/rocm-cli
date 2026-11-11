@@ -156,7 +156,7 @@ fn engine_request_via<R>(
 where
     R: DeserializeOwned,
 {
-    // A protected public endpoint enforces its key on every request, including
+    // A protected endpoint enforces its key on every request, including
     // this stdio-transported healthcheck — without the carrier the engine
     // adapter's HTTP probe is unauthenticated and the endpoint looks
     // unreachable, which would misclassify a healthy protected service as
@@ -274,7 +274,7 @@ mod tests {
 
         // An empty (or otherwise unusable) key file is not a key: the engine
         // adapters would enforce nothing, so reporting `true` here would let the
-        // respawn guard pass and still open an anonymous public listener.
+        // respawn guard pass and still open an anonymous listener.
         fs::write(&key_path, "   \n").unwrap();
         let mut command = ProcessCommand::new("true");
         assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));

@@ -398,9 +398,9 @@ pub(crate) fn restart_stale_runtime_services(
 /// The service's record if it is still running, having failed to restart.
 ///
 /// A failed restart does NOT imply a stopped server:
-/// `restart_internal_managed_service` refuses a public bind with no endpoint key
-/// before it stops anything, and `restart_service_onto_runtime` can fail earlier
-/// still while rewriting the record. `load_managed_service` refreshes the record
+/// `restart_internal_managed_service` refuses a service that needs an endpoint
+/// key and has none before it stops anything, and `restart_service_onto_runtime`
+/// can fail earlier still while rewriting the record. `load_managed_service` refreshes the record
 /// against the real processes, so this is read from the world rather than
 /// inferred from how far the code got. A record that cannot be read back
 /// returns `None` here, and the report is a bi-state rather than a tri-state:
