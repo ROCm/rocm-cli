@@ -269,22 +269,29 @@ active runtime was installed from. Both are read from that runtime's own
 registry record by the harness (`collect_versions` in
 [`capability.rs`](../tests/e2e-cucumber/src/capability.rs)), never from a
 workflow label, so a lane running on a legacy or different source shows that
-source instead of the one the workflow meant. A row omits the target or the
+source instead of the one the workflow meant. The harness reads the record with its own copy of the CLI's lookup (`wheel_composition_device_target` and the source-layout fallback), tied to it only by a comment, so a change to the record shape needs the harness updated by hand. A row omits the target or the
 source when it has no managed runtime, when its runtime's record predates the
 field, when the record carries none (a tarball runtime has no index URL, and a
 wheel runtime whose device target was not resolved exactly has no target), or,
 for the source, when a legacy record has no index URL. What
 a lane skips on a given platform follows from the `@requires-*` tags above.
 
-To reproduce a lane's result locally, install a runtime from the same target
-and source the Platform cell names (`rocm install sdk --channel release|nightly`;
+To reproduce a lane's result locally, pre-warm a runtimes tree from the same
+target and source the Platform cell names and export `E2E_SHARED_RUNTIMES_DIR`
+to it (see [the shared pre-warmed runtime](#the-shared-pre-warmed-runtime)).
+Without that variable each scenario runs in its own isolated data directory,
+sees no runtime, and installs one itself at the default channel (a multi-GiB
+download that also occupies the GPU), so the run does not use the runtime you
+installed. Install with `rocm install sdk --channel release|nightly`;
 `--family` takes a family label such as `gfx110X-all`, not the exact target, and
 no flag selects the package source, so treat the cell as what to compare
-against, not what to pass), then run a scenario that exercises it, for example
-`cargo xtask e2e -- -n "serve-05"` (`-n` is a regex over the scenario name, not
-a prefix, and not the `@id:` slug the report anchors show). `-n` skips the
-host capability checks, so pick a scenario whose `@requires-*` tags your host
-meets; see [testing.md](testing.md) for how to select a scenario.
+against, not what to pass. Then run a scenario that exercises the runtime, for
+example `cargo xtask e2e -- -n "serve-05"` on a vLLM lane or `-n "serve-07"` on
+a lemonade lane (the Strix Halo, R9700 and W7900 rows serve on lemonade). `-n` is a regex
+over the scenario name, not a prefix, and not the `@id:` slug the report
+anchors show. It skips the host capability checks, so pick a scenario whose
+`@requires-*` tags (such as `@requires-engine:vllm`) your host meets; see
+[testing.md](testing.md) for how to select a scenario.
 
 `nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
 via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows

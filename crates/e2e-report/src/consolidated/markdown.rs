@@ -814,7 +814,7 @@ mod tests {
             consolidated_summary_markdown(&load_platform_reports(&[("mi300x".to_string(), path)]));
         assert!(
             md.contains(
-                "target gfx942 · source https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)"
+                "GFX gfx942 · source https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)"
             ),
             "target and source missing from the Platform cell:\n{md}"
         );
@@ -829,7 +829,7 @@ mod tests {
         let md =
             consolidated_summary_markdown(&load_platform_reports(&[("mi300x".to_string(), path)]));
         assert!(
-            !md.contains("target gfx") && !md.contains("source http"),
+            !md.contains("GFX gfx") && !md.contains("source http"),
             "{md}"
         );
     }

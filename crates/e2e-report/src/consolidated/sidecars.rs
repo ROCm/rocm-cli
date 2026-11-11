@@ -97,11 +97,11 @@ fn join_parts<const N: usize>(parts: [Option<String>; N]) -> String {
 }
 
 impl PlatformVersions {
-    /// "target gfx1100 · source <url> (<generation>)" for the summary-matrix
+    /// "GFX gfx1100 · source <url> (<generation>)" for the summary-matrix
     /// Platform cell, skipping what is unknown. Empty when neither is known.
     pub(super) fn provenance(&self) -> String {
         join_parts([
-            self.gfx_target.as_deref().map(|v| format!("target {v}")),
+            self.gfx_target.as_deref().map(|v| format!("GFX {v}")),
             self.source.as_deref().map(|v| format!("source {v}")),
         ])
     }
