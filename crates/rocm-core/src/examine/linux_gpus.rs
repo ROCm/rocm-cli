@@ -217,8 +217,10 @@ fn extract_lspci_name(line: &str) -> String {
 /// A placeholder, not a name: it says "AMD GPU, source known, model unknown".
 /// Both probes that can produce a GPU without a marketing name use it, and
 /// [`gpu_name_is_unknown`] reads it back, so it has to be one string rather
-/// than three copies that could drift apart.
-const KERNEL_TOPOLOGY_GPU_NAME: &str = "AMD GPU (from kernel topology)";
+/// than three copies that could drift apart. Public so the e2e scenario that
+/// asserts a GPU has no model name (`examine-49`) reads this string rather
+/// than a copy of it.
+pub const KERNEL_TOPOLOGY_GPU_NAME: &str = "AMD GPU (from kernel topology)";
 
 /// Whether this GPU still has no real model name.
 ///
@@ -257,6 +259,103 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
     apply_rocminfo_gpu_agents(e, &out);
 }
 
+/// One GPU agent `rocminfo` listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RocminfoGpuAgent {
+    /// The agent's `Name:`, which for a GPU is its gfx target.
+    gfx_target: String,
+    /// The agent's `Marketing Name:`, empty when it printed none.
+    marketing_name: String,
+    /// The `bus:device.function` its `BDFID:` decodes to, `None` when the line
+    /// is absent or zero. `rocminfo` prints no PCI domain.
+    bus_address: Option<String>,
+}
+
+/// The GPU agents in a `rocminfo` listing, in the order it printed them.
+fn parse_rocminfo_gpu_agents(out: &str) -> Vec<RocminfoGpuAgent> {
+    let mut agents = Vec::new();
+    let mut current = RocminfoGpuAgent::default();
+    let mut is_gpu = false;
+    let mut finish = |agent: RocminfoGpuAgent, is_gpu: bool| {
+        if is_gpu && agent.gfx_target.starts_with("gfx") {
+            agents.push(agent);
+        }
+    };
+    for line in out.lines() {
+        let s = line.trim();
+        if s.starts_with("Agent ") {
+            finish(std::mem::take(&mut current), std::mem::take(&mut is_gpu));
+        } else if let Some(rest) = s.strip_prefix("Name:") {
+            current.gfx_target = rest.trim().to_owned();
+        } else if let Some(rest) = s.strip_prefix("Marketing Name:") {
+            current.marketing_name = rest.trim().to_owned();
+        } else if let Some(rest) = s.strip_prefix("Device Type:") {
+            is_gpu = rest.contains("GPU");
+        } else if let Some(rest) = s.strip_prefix("BDFID:") {
+            current.bus_address = parse_rocminfo_bdfid(rest);
+        }
+    }
+    finish(current, is_gpu);
+    agents
+}
+
+/// The `bus:device.function` a `rocminfo` `BDFID:` value names.
+///
+/// `BDFID` is decimal and uses the kernel's `pci_dev_id()` encoding, the same
+/// as the KFD topology's `location_id`, so both decode through
+/// [`crate::host_gpu::pci_bus_device_function`] and cannot disagree about a
+/// card. Zero, which `rocminfo` prints for a CPU agent, is no address.
+fn parse_rocminfo_bdfid(value: &str) -> Option<String> {
+    crate::host_gpu::pci_bus_device_function(value.trim().parse::<u32>().ok()?)
+}
+
+/// Split a listed GPU's `domain:bus:device.function` address into its domain
+/// and the `bus:device.function` that `rocminfo` can be compared with. An
+/// address with no domain (`lspci` without `-D`) is in domain 0. `None` for
+/// an entry with no address.
+fn split_pci_domain(pci_id: &str) -> Option<(&str, &str)> {
+    if pci_id.is_empty() {
+        return None;
+    }
+    match pci_id.split_once(':') {
+        Some((domain, rest)) if rest.contains(':') => Some((domain, rest)),
+        _ => Some(("0000", pci_id)),
+    }
+}
+
+/// Why a `rocminfo` agent could not be attributed to a listed GPU.
+fn unattributed_agent_label(agent: &RocminfoGpuAgent, why: &str) -> String {
+    match &agent.bus_address {
+        Some(address) => format!("{} at bus address {address} ({why})", agent.gfx_target),
+        None => format!("{} ({why})", agent.gfx_target),
+    }
+}
+
+/// Write one `rocminfo` agent's reading onto the listed GPU it describes.
+fn apply_agent_to_gpu(gpu: &mut Gpu, agent: RocminfoGpuAgent) {
+    gpu.is_apu = Some(gfx_is_apu_family(&agent.gfx_target));
+    gpu.gfx_target = agent.gfx_target;
+    if !agent.marketing_name.is_empty() && gpu_name_is_unknown(&gpu.name) {
+        gpu.name = agent.marketing_name;
+    }
+}
+
+/// List a `rocminfo` agent as a GPU of its own, for an agent no listed entry
+/// can be.
+fn gpu_from_agent(agent: RocminfoGpuAgent) -> Gpu {
+    Gpu {
+        name: if agent.marketing_name.is_empty() {
+            "AMD GPU".to_owned()
+        } else {
+            agent.marketing_name
+        },
+        is_apu: Some(gfx_is_apu_family(&agent.gfx_target)),
+        gfx_target: agent.gfx_target,
+        is_amd: true,
+        ..Gpu::default()
+    }
+}
+
 /// Fold a `rocminfo` reading into the GPU list, against caller-supplied output.
 ///
 /// Split from the process launch the same way [`apply_kernel_gpu_membership`] is
@@ -264,35 +363,31 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 /// behaviour here is how an agent is matched onto an existing entry, and a test
 /// that had to run the real `rocminfo` could only assert it on a host with a
 /// GPU. See `a_rocminfo_marketing_name_outranks_the_kernel_topology_placeholder`.
+///
+/// Matched by PCI address, not by position: `rocminfo` lists the agents the
+/// ROCm runtime exposes, which a visibility mask such as `ROCR_VISIBLE_DEVICES`
+/// makes a subset of the cards listed here, in an order of its own. Pairing by
+/// position wrote one card's model name, target and APU verdict onto another.
+///
+/// - An agent's `BDFID` is matched against each AMD entry's bus, device and
+///   function. `rocminfo` prints no domain, so a match that two entries in
+///   different domains share is refused. Several entries at one address are the
+///   partitions of one card, and are paired with that address's agents in order.
+/// - An agent no entry matches is listed as a GPU of its own when every AMD
+///   entry has an address, since it then cannot be any of them; when some
+///   entry has none, it could be that one, so nothing is written and a note
+///   says so.
+/// - Only when no agent states an address at all, and the agents and the AMD
+///   entries are equal in number, are they paired by position: the last
+///   resort, for a `rocminfo` too old to print `BDFID`. Unequal counts write
+///   nothing onto any entry, and a note says so.
+/// - An entry no agent matches is left as it was: its own target and no model
+///   name, rather than another card's.
 fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
-    let mut gfx_targets: Vec<(String, String)> = Vec::new();
-    let mut cur_name = String::new();
-    let mut cur_marketing = String::new();
-    let mut cur_is_gpu = false;
-    for line in out.lines() {
-        let s = line.trim();
-        if s.starts_with("Agent ") {
-            if cur_is_gpu && cur_name.starts_with("gfx") {
-                gfx_targets.push((cur_name.clone(), cur_marketing.clone()));
-            }
-            cur_name.clear();
-            cur_marketing.clear();
-            cur_is_gpu = false;
-        } else if let Some(rest) = s.strip_prefix("Name:") {
-            cur_name = rest.trim().to_owned();
-        } else if let Some(rest) = s.strip_prefix("Marketing Name:") {
-            cur_marketing = rest.trim().to_owned();
-        } else if let Some(rest) = s.strip_prefix("Device Type:") {
-            cur_is_gpu = rest.contains("GPU");
-        }
-    }
-    if cur_is_gpu && cur_name.starts_with("gfx") {
-        gfx_targets.push((cur_name, cur_marketing));
-    }
-    if gfx_targets.is_empty() {
+    let agents = parse_rocminfo_gpu_agents(out);
+    if agents.is_empty() {
         return;
     }
-
     let amd_indices: Vec<usize> = e
         .gpus
         .iter()
@@ -300,28 +395,87 @@ fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
         .filter(|(_, g)| g.is_amd)
         .map(|(idx, _)| idx)
         .collect();
-    for (idx, (gfx, marketing)) in gfx_targets.into_iter().enumerate() {
-        if let Some(&gpu_idx) = amd_indices.get(idx) {
-            let gpu = &mut e.gpus[gpu_idx];
-            gpu.gfx_target = gfx.clone();
-            if !marketing.is_empty() && gpu_name_is_unknown(&gpu.name) {
-                gpu.name = marketing;
+    if amd_indices.is_empty() {
+        // Nothing listed for an agent to be confused with.
+        e.gpus.extend(agents.into_iter().map(gpu_from_agent));
+        return;
+    }
+
+    let mut unattributed: Vec<String> = Vec::new();
+    if agents.iter().all(|agent| agent.bus_address.is_none()) {
+        if agents.len() == amd_indices.len() {
+            for (agent, &gpu_idx) in agents.into_iter().zip(&amd_indices) {
+                apply_agent_to_gpu(&mut e.gpus[gpu_idx], agent);
             }
-            gpu.is_apu = Some(gfx_is_apu_family(&gfx));
         } else {
-            let is_apu = gfx_is_apu_family(&gfx);
-            e.gpus.push(Gpu {
-                name: if marketing.is_empty() {
-                    "AMD GPU".to_owned()
-                } else {
-                    marketing
-                },
-                gfx_target: gfx,
-                is_amd: true,
-                is_apu: Some(is_apu),
-                ..Gpu::default()
-            });
+            unattributed.extend(agents.iter().map(|agent| {
+                unattributed_agent_label(agent, "no bus address, and the GPU counts differ")
+            }));
         }
+    } else {
+        let some_entry_has_no_address =
+            amd_indices.iter().any(|&idx| e.gpus[idx].pci_id.is_empty());
+        let mut claimed = vec![false; amd_indices.len()];
+        let mut appended = Vec::new();
+        for agent in agents {
+            let Some(address) = agent.bus_address.clone() else {
+                unattributed.push(unattributed_agent_label(&agent, "no bus address"));
+                continue;
+            };
+            let candidates: Vec<(usize, &str)> = amd_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &idx)| {
+                    let (domain, bdf) = split_pci_domain(&e.gpus[idx].pci_id)?;
+                    bdf.eq_ignore_ascii_case(&address).then_some((slot, domain))
+                })
+                .collect();
+            if candidates.is_empty() {
+                if some_entry_has_no_address {
+                    unattributed.push(unattributed_agent_label(
+                        &agent,
+                        "no listed GPU has that address, and one has no address at all",
+                    ));
+                } else {
+                    appended.push(gpu_from_agent(agent));
+                }
+                continue;
+            }
+            let first_domain = candidates[0].1;
+            if candidates
+                .iter()
+                .any(|(_, domain)| !domain.eq_ignore_ascii_case(first_domain))
+            {
+                unattributed.push(unattributed_agent_label(
+                    &agent,
+                    "GPUs in more than one PCI domain have that address",
+                ));
+                continue;
+            }
+            let Some(slot) = candidates
+                .iter()
+                .map(|(slot, _)| *slot)
+                .find(|&slot| !claimed[slot])
+            else {
+                unattributed.push(unattributed_agent_label(
+                    &agent,
+                    "more agents than listed GPUs at that address",
+                ));
+                continue;
+            };
+            claimed[slot] = true;
+            apply_agent_to_gpu(&mut e.gpus[amd_indices[slot]], agent);
+        }
+        e.gpus.extend(appended);
+    }
+
+    if !unattributed.is_empty() {
+        e.notes.push(format!(
+            "{} GPU reading(s) from rocminfo could not be matched to a listed GPU, so their \
+             model name and gfx target are not reported for any GPU: {}.",
+            unattributed.len(),
+            unattributed.join("; ")
+        ));
     }
 }
 
@@ -427,8 +581,11 @@ impl<'a> GpuProbeSources<'a> {
 ///
 /// - The membership pass decides *which* AMD GPUs exist, so it runs before
 ///   `rocminfo`: the PCI scan over-reports in a container, and `rocminfo` maps
-///   its agents onto the surviving entries by position, so it has to see the
-///   reconciled list rather than the whole bus.
+///   its agents onto the surviving entries (by PCI address, and by position
+///   only as a count-checked last resort; see [`apply_rocminfo_gpu_agents`]),
+///   so it has to see the reconciled list rather than the whole bus. The
+///   membership pass is also what gives a kernel-only entry the address that
+///   match needs.
 /// - [`note_unnamed_kernel_topology_gpus`] runs after `rocminfo`, which is the
 ///   probe most likely to name a card the PCI scan missed, and before the sysfs
 ///   fallback, which plants the same placeholder with a note of its own.
@@ -1492,6 +1649,440 @@ mod tests {
         assert_eq!(
             classify_amd_marketing_name("Ryzen AI Max+ 395"),
             ("gfx1151".to_owned(), true)
+        );
+    }
+
+    // -- `rocminfo` agents matched onto the listed GPUs (ROCMAI-40) ---------
+    //
+    // One test per row of the state matrix in `apply_rocminfo_gpu_agents`'s
+    // doc comment, plus the shapes that cross rows: a subset, a reordering,
+    // an APU beside a dGPU, a domain clash and a partitioned card.
+
+    /// A `rocminfo` listing in the shape the real tool prints: a CPU agent with
+    /// `BDFID: 0`, then one GPU agent per `(gfx, marketing name, BDFID)`, each
+    /// value space-padded to the tool's column. `None` omits the `BDFID` line,
+    /// as a `rocminfo` too old to print it would.
+    fn rocminfo_listing(gpus: &[(&str, &str, Option<u32>)]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::from(
+            "*******\nAgent 1\n*******\n  Name:                    AMD Ryzen 9 7950X\n  \
+             Marketing Name:          AMD Ryzen 9 7950X\n  Device Type:             CPU\n  \
+             BDFID:                   0\n",
+        );
+        for (index, (gfx, marketing, bdfid)) in gpus.iter().enumerate() {
+            write!(
+                out,
+                "*******\nAgent {}\n*******\n  Name:                    {gfx}\n  \
+                 Marketing Name:          {marketing}\n  Device Type:             GPU\n",
+                index + 2
+            )
+            .expect("writing to a String cannot fail");
+            if let Some(bdfid) = bdfid {
+                writeln!(out, "  BDFID:                   {bdfid}")
+                    .expect("writing to a String cannot fail");
+            }
+        }
+        out
+    }
+
+    /// Run the GPU passes after the PCI scan over a planted kernel topology
+    /// (one GPU node per `(location_id, gfx_target_version)`) and a `rocminfo`
+    /// listing, with an empty PCI scan in front: the ordinary ROCm container.
+    fn examine_planted_host(tag: &str, nodes: &[(u32, u32)], rocminfo: &str) -> Examination {
+        let (root, nodes) = plant_kfd_topology(tag, nodes);
+        let mut e = Examination::default();
+        probe_gpus_after_lspci(
+            &mut e,
+            GpuProbeSources {
+                kfd_nodes: &nodes,
+                rocminfo: Some(rocminfo),
+                sysfs_gfx_target: || None,
+            },
+        );
+        std::fs::remove_dir_all(&root).ok();
+        summarise_gpu_categories(&mut e);
+        e
+    }
+
+    fn gpu_at<'a>(e: &'a Examination, pci_id: &str) -> &'a Gpu {
+        e.gpus
+            .iter()
+            .find(|gpu| gpu.pci_id == pci_id)
+            .unwrap_or_else(|| panic!("no GPU listed at {pci_id}: {:#?}", e.gpus))
+    }
+
+    /// The note `apply_rocminfo_gpu_agents` takes for readings it could not
+    /// attribute, and only that one.
+    fn unattributed_notes(e: &Examination) -> Vec<&String> {
+        e.notes
+            .iter()
+            .filter(|note| note.contains("from rocminfo could not be matched"))
+            .collect()
+    }
+
+    // `location_id` / `BDFID` 768 is 03:00.0, 1024 is 04:00.0, 50176 is c4:00.0.
+    const AT_03: u32 = 768;
+    const AT_04: u32 = 1024;
+    const AT_C4: u32 = 50176;
+
+    #[test]
+    fn a_rocminfo_bdfid_line_in_the_real_shape_decodes_to_its_bus_address() {
+        // Real `rocminfo` pads the value to a column and prints `BDFID: 0` for
+        // a CPU agent. 49_920 is the GPU at c3:00.0 on a ROCm 7.14 host.
+        let agents = parse_rocminfo_gpu_agents(&rocminfo_listing(&[(
+            "gfx1100",
+            "AMD Radeon RX 7900 XTX",
+            Some(49_920),
+        )]));
+        assert_eq!(
+            agents,
+            vec![RocminfoGpuAgent {
+                gfx_target: "gfx1100".to_owned(),
+                marketing_name: "AMD Radeon RX 7900 XTX".to_owned(),
+                bus_address: Some("c3:00.0".to_owned()),
+            }],
+            "the CPU agent is not a GPU, and the GPU's BDFID is its address"
+        );
+        assert_eq!(parse_rocminfo_bdfid("                   0"), None);
+        assert_eq!(parse_rocminfo_bdfid(" not-a-number"), None);
+        // A missing line is no address, not a zero one.
+        let without = parse_rocminfo_gpu_agents(&rocminfo_listing(&[("gfx1100", "X", None)]));
+        assert_eq!(without[0].bus_address, None);
+    }
+
+    #[test]
+    fn a_kfd_location_id_and_a_rocminfo_bdfid_name_the_same_card_alike() {
+        // The producer and the consumer of the match: the kernel topology
+        // gives each listed GPU its address from `location_id`, `rocminfo`
+        // gives each agent one from `BDFID`, and the match is only right if
+        // one number decodes to one address on both sides. Includes a
+        // non-zero device and function, which a zero-only decode would miss.
+        for dev_id in [AT_03, AT_04, AT_C4, 0x8ffa, 23808] {
+            let (root, nodes) = plant_kfd_topology("bdf-tie", &[(dev_id, 110_000)]);
+            let read = crate::kfd_gpu_nodes_in(&nodes).expect("planted topology must be readable");
+            std::fs::remove_dir_all(&root).ok();
+            let bdf = parse_rocminfo_bdfid(&format!("  {dev_id}"))
+                .unwrap_or_else(|| panic!("BDFID {dev_id} must decode"));
+            let (domain, kfd_bdf) =
+                split_pci_domain(&read[0].pci_id).expect("the node must carry an address");
+            assert_eq!(domain, "0000");
+            assert_eq!(
+                kfd_bdf, bdf,
+                "location_id and BDFID {dev_id} must decode alike"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gpu_the_rocm_runtime_cannot_see_does_not_borrow_another_gpus_reading() {
+        // Rows (a) and (f), and the reported defect: two GPUs in the kernel
+        // topology, and a `rocminfo` that sees only the second (a visibility
+        // mask). Pairing by position wrote the second card's model name,
+        // target and APU verdict onto the first.
+        let e = examine_planted_host(
+            "rocminfo-subset",
+            &[(AT_03, 110_000), (AT_04, 110_001)],
+            &rocminfo_listing(&[("gfx1101", "AMD Radeon RX 7800 XT", Some(AT_04))]),
+        );
+        assert_eq!(e.gpus.len(), 2, "{:#?}", e.gpus);
+        let seen = gpu_at(&e, "0000:04:00.0");
+        assert_eq!(seen.name, "AMD Radeon RX 7800 XT");
+        assert_eq!(seen.gfx_target, "gfx1101");
+        assert_eq!(seen.is_apu, Some(false));
+        let unseen = gpu_at(&e, "0000:03:00.0");
+        assert_eq!(
+            unseen.name, KERNEL_TOPOLOGY_GPU_NAME,
+            "the card rocminfo did not describe keeps no model name"
+        );
+        assert_eq!(unseen.gfx_target, "gfx1100", "and keeps its own target");
+        assert_eq!(
+            unseen.is_apu, None,
+            "and claims no packaging it was never given"
+        );
+        assert_eq!(unattributed_notes(&e), Vec::<&String>::new());
+        // The unknown-name note now counts the right card: one is unnamed.
+        assert_eq!(unknown_name_notes(&e).len(), 1, "{:#?}", e.notes);
+    }
+
+    #[test]
+    fn rocminfo_agents_listed_in_another_order_each_reach_their_own_card() {
+        // Row (a) with the two lists in opposite orders: every agent matched,
+        // each by its own address.
+        let e = examine_planted_host(
+            "rocminfo-reordered",
+            &[(AT_03, 110_000), (AT_04, 110_001)],
+            &rocminfo_listing(&[
+                ("gfx1101", "AMD Radeon RX 7800 XT", Some(AT_04)),
+                ("gfx1100", "AMD Radeon RX 7900 XTX", Some(AT_03)),
+            ]),
+        );
+        assert_eq!(e.gpus.len(), 2, "{:#?}", e.gpus);
+        assert_eq!(gpu_at(&e, "0000:03:00.0").name, "AMD Radeon RX 7900 XTX");
+        assert_eq!(gpu_at(&e, "0000:03:00.0").gfx_target, "gfx1100");
+        assert_eq!(gpu_at(&e, "0000:04:00.0").name, "AMD Radeon RX 7800 XT");
+        assert_eq!(gpu_at(&e, "0000:04:00.0").gfx_target, "gfx1101");
+        assert!(e.notes.is_empty(), "{:#?}", e.notes);
+    }
+
+    #[test]
+    fn an_apu_the_runtime_hides_is_still_reported_as_an_apu() {
+        // The APU+dGPU host with the iGPU masked out of the runtime: the
+        // dGPU's "discrete" verdict landed on the APU, so `has_apu` read
+        // false, which `rocm diagnose`'s iGPU/dGPU check reads.
+        let mut e = examine_planted_host(
+            "rocminfo-apu-hidden",
+            &[(AT_C4, 110_003), (AT_03, 110_000)],
+            &rocminfo_listing(&[("gfx1100", "AMD Radeon RX 7900 XTX", Some(AT_03))]),
+        );
+        let apu = gpu_at(&e, "0000:c4:00.0");
+        assert_eq!(apu.gfx_target, "gfx1103");
+        assert_eq!(apu.name, KERNEL_TOPOLOGY_GPU_NAME);
+        let dgpu = gpu_at(&e, "0000:03:00.0");
+        assert_eq!(dgpu.gfx_target, "gfx1100");
+        assert_eq!(dgpu.is_apu, Some(false));
+        assert!(e.has_discrete_amd);
+        // The APU's verdict is not invented either way: KFD gives the target,
+        // not the packaging, so `has_apu` stays unclaimed rather than wrong.
+        assert_eq!(apu.is_apu, None);
+        assert!(!e.has_apu);
+
+        // With `lspci` naming both (which carries the packaging), the hidden
+        // APU keeps the verdict the scan gave it.
+        e = Examination {
+            gpus: vec![
+                Gpu {
+                    name: "AMD Phoenix".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                    pci_id: "0000:c4:00.0".to_owned(),
+                    is_apu: Some(true),
+                    is_amd: true,
+                },
+                Gpu {
+                    name: "Navi 31 [Radeon RX 7900 XT/7900 XTX]".to_owned(),
+                    gfx_target: String::new(),
+                    pci_id: "0000:03:00.0".to_owned(),
+                    is_apu: Some(false),
+                    is_amd: true,
+                },
+            ],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            &rocminfo_listing(&[("gfx1100", "AMD Radeon RX 7900 XTX", Some(AT_03))]),
+        );
+        summarise_gpu_categories(&mut e);
+        assert_eq!(gpu_at(&e, "0000:c4:00.0").gfx_target, "gfx1103");
+        assert_eq!(gpu_at(&e, "0000:c4:00.0").is_apu, Some(true));
+        assert_eq!(gpu_at(&e, "0000:03:00.0").gfx_target, "gfx1100");
+        assert!(e.has_apu, "the hidden APU must still be reported as one");
+        assert!(e.has_discrete_amd);
+    }
+
+    #[test]
+    fn an_agent_at_an_address_no_listed_gpu_has_is_listed_as_its_own_gpu() {
+        // Row (b): every listed AMD GPU has an address and none is the
+        // agent's, so the agent cannot be any of them and is added, as before.
+        let e = examine_planted_host(
+            "rocminfo-unmatched-addressed",
+            &[(AT_03, 110_000)],
+            &rocminfo_listing(&[
+                ("gfx1100", "AMD Radeon RX 7900 XTX", Some(AT_03)),
+                ("gfx1101", "AMD Radeon RX 7800 XT", Some(AT_04)),
+            ]),
+        );
+        assert_eq!(e.gpus.len(), 2, "{:#?}", e.gpus);
+        assert_eq!(gpu_at(&e, "0000:03:00.0").name, "AMD Radeon RX 7900 XTX");
+        let added = e
+            .gpus
+            .iter()
+            .find(|gpu| gpu.name == "AMD Radeon RX 7800 XT")
+            .expect("the unmatched agent must be listed");
+        assert_eq!(added.gfx_target, "gfx1101");
+        assert!(
+            added.pci_id.is_empty(),
+            "rocminfo gives no domain to build one from"
+        );
+        assert!(unattributed_notes(&e).is_empty(), "{:#?}", e.notes);
+    }
+
+    #[test]
+    fn an_agent_that_could_be_the_gpu_with_no_address_is_noted_not_added() {
+        // Row (c): a listed GPU has no address (a KFD node with no
+        // `location_id`), so an agent that matches no address could be that
+        // very card. Adding it would list one card twice; writing onto it
+        // would be a guess. Neither: the entry stays as it was, with a note.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name: KERNEL_TOPOLOGY_GPU_NAME.to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+                pci_id: String::new(),
+                is_apu: None,
+                is_amd: true,
+            }],
+            ..Examination::default()
+        };
+        let before = e.gpus.clone();
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            &rocminfo_listing(&[("gfx1101", "AMD Radeon RX 7800 XT", Some(AT_04))]),
+        );
+        assert_eq!(e.gpus, before, "nothing added and nothing written");
+        let notes = unattributed_notes(&e);
+        assert_eq!(notes.len(), 1, "{:#?}", e.notes);
+        assert!(
+            notes[0].starts_with("1 GPU reading(s)")
+                && notes[0].contains("gfx1101 at bus address 04:00.0"),
+            "the note must name the reading it set aside: {notes:?}"
+        );
+        assert!(
+            notes[0].is_ascii(),
+            "examine notes must be ASCII-only: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn agents_without_an_address_pair_by_position_only_when_the_counts_agree() {
+        // Row (d): a `rocminfo` that prints no `BDFID` and as many GPU agents
+        // as there are listed AMD GPUs -- the documented last resort.
+        let e = examine_planted_host(
+            "rocminfo-no-bdfid-equal",
+            &[(AT_03, 110_000), (AT_04, 110_001)],
+            &rocminfo_listing(&[
+                ("gfx1100", "AMD Radeon RX 7900 XTX", None),
+                ("gfx1101", "AMD Radeon RX 7800 XT", None),
+            ]),
+        );
+        assert_eq!(gpu_at(&e, "0000:03:00.0").name, "AMD Radeon RX 7900 XTX");
+        assert_eq!(gpu_at(&e, "0000:04:00.0").name, "AMD Radeon RX 7800 XT");
+        assert!(e.notes.is_empty(), "{:#?}", e.notes);
+    }
+
+    #[test]
+    fn agents_without_an_address_write_nothing_when_the_counts_differ() {
+        // Row (e): no address and one agent for two cards. Which card it
+        // describes is unknowable, so neither gets its reading; both keep
+        // their own target and no model name, and a note says why.
+        let e = examine_planted_host(
+            "rocminfo-no-bdfid-unequal",
+            &[(AT_03, 110_000), (AT_04, 110_001)],
+            &rocminfo_listing(&[("gfx1101", "AMD Radeon RX 7800 XT", None)]),
+        );
+        assert_eq!(e.gpus.len(), 2, "{:#?}", e.gpus);
+        for (pci_id, own_target) in [("0000:03:00.0", "gfx1100"), ("0000:04:00.0", "gfx1101")] {
+            let gpu = gpu_at(&e, pci_id);
+            assert_eq!(gpu.name, KERNEL_TOPOLOGY_GPU_NAME, "{pci_id}");
+            assert_eq!(gpu.gfx_target, own_target, "{pci_id}");
+            assert_eq!(gpu.is_apu, None, "{pci_id}");
+        }
+        let notes = unattributed_notes(&e);
+        assert_eq!(notes.len(), 1, "{:#?}", e.notes);
+        assert!(
+            notes[0].contains("gfx1101 (no bus address, and the GPU counts differ)"),
+            "{notes:?}"
+        );
+
+        // Row (e)'s exception: with no AMD GPU listed at all there is nothing
+        // to confuse the agent with, so it is listed, as before.
+        let mut empty = Examination::default();
+        apply_rocminfo_gpu_agents(
+            &mut empty,
+            &rocminfo_listing(&[("gfx1101", "AMD Radeon RX 7800 XT", None)]),
+        );
+        assert_eq!(empty.gpus.len(), 1, "{:#?}", empty.gpus);
+        assert_eq!(empty.gpus[0].name, "AMD Radeon RX 7800 XT");
+        assert_eq!(empty.gpus[0].gfx_target, "gfx1101");
+        assert!(empty.notes.is_empty());
+    }
+
+    #[test]
+    fn an_address_shared_across_pci_domains_is_refused() {
+        // `rocminfo` prints no domain, so 03:00.0 in domain 0 and in domain 1
+        // are indistinguishable to it. Picking either would be a guess.
+        let mut e = Examination {
+            gpus: ["0000:03:00.0", "0001:03:00.0"]
+                .into_iter()
+                .map(|pci_id| Gpu {
+                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+                    gfx_target: String::new(),
+                    pci_id: pci_id.to_owned(),
+                    is_apu: Some(false),
+                    is_amd: true,
+                })
+                .collect(),
+            ..Examination::default()
+        };
+        let before = e.gpus.clone();
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            &rocminfo_listing(&[("gfx942", "AMD Instinct MI300X", Some(AT_03))]),
+        );
+        assert_eq!(e.gpus, before, "neither card may take the reading");
+        let notes = unattributed_notes(&e);
+        assert_eq!(notes.len(), 1, "{:#?}", e.notes);
+        assert!(notes[0].contains("more than one PCI domain"), "{notes:?}");
+    }
+
+    #[test]
+    fn an_agent_with_no_address_beside_agents_with_one_is_set_aside() {
+        // Once any agent states an address, matching is by address, and an
+        // agent that states none cannot be placed: it is not paired by
+        // position with whatever entry is left over.
+        let e = examine_planted_host(
+            "rocminfo-mixed-bdfid",
+            &[(AT_03, 110_000), (AT_04, 110_001)],
+            &rocminfo_listing(&[
+                ("gfx1101", "AMD Radeon RX 7800 XT", Some(AT_04)),
+                ("gfx1100", "AMD Radeon RX 7900 XTX", None),
+            ]),
+        );
+        assert_eq!(e.gpus.len(), 2, "{:#?}", e.gpus);
+        assert_eq!(gpu_at(&e, "0000:04:00.0").name, "AMD Radeon RX 7800 XT");
+        assert_eq!(gpu_at(&e, "0000:03:00.0").name, KERNEL_TOPOLOGY_GPU_NAME);
+        let notes = unattributed_notes(&e);
+        assert_eq!(notes.len(), 1, "{:#?}", e.notes);
+        assert!(notes[0].contains("gfx1100 (no bus address)"), "{notes:?}");
+    }
+
+    #[test]
+    fn the_partitions_of_one_card_pair_within_that_card() {
+        // A partitioned Instinct: KFD lists one node per partition, all at the
+        // card's address, and `rocminfo` one agent per partition. Each pairs
+        // within its card, in order; a second card's agent goes to it alone.
+        let e = examine_planted_host(
+            "rocminfo-partitions",
+            &[(AT_03, 90402), (AT_03, 90402), (AT_04, 90402)],
+            &rocminfo_listing(&[
+                ("gfx942", "AMD Instinct MI300X", Some(AT_04)),
+                ("gfx942", "AMD Instinct MI300X", Some(AT_03)),
+                ("gfx942", "AMD Instinct MI300X", Some(AT_03)),
+            ]),
+        );
+        assert_eq!(e.gpus.len(), 3, "{:#?}", e.gpus);
+        assert!(
+            e.gpus.iter().all(|gpu| gpu.name == "AMD Instinct MI300X"),
+            "every partition is named: {:#?}",
+            e.gpus
+        );
+        assert!(e.notes.is_empty(), "{:#?}", e.notes);
+
+        // One agent too many at an address: the card is already listed once
+        // per partition the kernel exposes, so the extra is noted, not added.
+        let extra = examine_planted_host(
+            "rocminfo-partitions-extra",
+            &[(AT_03, 90402)],
+            &rocminfo_listing(&[
+                ("gfx942", "AMD Instinct MI300X", Some(AT_03)),
+                ("gfx942", "AMD Instinct MI300X", Some(AT_03)),
+            ]),
+        );
+        assert_eq!(extra.gpus.len(), 1, "{:#?}", extra.gpus);
+        assert_eq!(extra.gpus[0].name, "AMD Instinct MI300X");
+        let notes = unattributed_notes(&extra);
+        assert_eq!(notes.len(), 1, "{:#?}", extra.notes);
+        assert!(
+            notes[0].contains("more agents than listed GPUs at that address"),
+            "{notes:?}"
         );
     }
 }

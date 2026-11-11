@@ -42,10 +42,10 @@ pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
 use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};
-pub use linux_gpus::gfx_is_apu_family;
 use linux_gpus::{
     GpuProbeSources, probe_gpus_after_lspci, probe_gpus_lspci, summarise_gpu_categories,
 };
+pub use linux_gpus::{KERNEL_TOPOLOGY_GPU_NAME, gfx_is_apu_family};
 use rocm_install_probe::probe_rocm_install;
 pub(crate) use windows::parse_dotted_version;
 use windows::{

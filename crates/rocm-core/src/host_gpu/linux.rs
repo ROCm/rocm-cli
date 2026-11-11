@@ -141,16 +141,36 @@ fn kfd_node_pci_id(properties: &str) -> Option<String> {
     let location = kfd_property_value(properties, "location_id")?
         .parse::<u32>()
         .ok()?;
-    if location == 0 {
-        return None;
-    }
     let domain = kfd_property_value(properties, "domain")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
-    let bus = (location >> 8) & 0xff;
-    let device = (location >> 3) & 0x1f;
-    let function = location & 0x7;
-    Some(format!("{domain:04x}:{bus:02x}:{device:02x}.{function}"))
+    let bdf = pci_bus_device_function(location)?;
+    Some(format!("{domain:04x}:{bdf}"))
+}
+
+/// The `bus:device.function` part of a PCI address, spelled as `lspci` spells
+/// it, from the kernel's `pci_dev_id()` encoding: `(bus << 8) | devfn`, with
+/// `devfn` packing the device number in bits 3..8 and the function in bits
+/// 0..3. So `4352` (`0x1100`) is `11:00.0`.
+///
+/// Two readings carry an address in this encoding, and both decode through
+/// here so they cannot disagree about a card: the KFD topology's `location_id`
+/// (`kfd_node_pci_id`, which adds the `domain` property in front) and
+/// `rocminfo`'s per-agent `BDFID`, which has no domain at all
+/// (`examine::linux_gpus`, which matches each `rocminfo` agent onto the GPU
+/// with this address).
+///
+/// `None` for zero, for the reason `kfd_node_pci_id` gives: `00:00.0` is the
+/// host bridge, and `rocminfo` prints `BDFID: 0` for its CPU agents, so a zero
+/// is "no address" rather than an address that could match an unrelated entry.
+pub(crate) fn pci_bus_device_function(dev_id: u32) -> Option<String> {
+    if dev_id == 0 {
+        return None;
+    }
+    let bus = (dev_id >> 8) & 0xff;
+    let device = (dev_id >> 3) & 0x1f;
+    let function = dev_id & 0x7;
+    Some(format!("{bus:02x}:{device:02x}.{function}"))
 }
 
 /// The KFD-topology read, against a caller-supplied nodes directory.

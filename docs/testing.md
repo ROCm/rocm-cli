@@ -4121,6 +4121,13 @@ RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-48 '
 ```
 
+`examine-49` plants a native Linux machine whose kernel topology has two GPUs, at `0000:03:00.0` (gfx1100) and `0000:04:00.0` (gfx1101), with an `lspci` stand-in that lists an empty bus and a `rocminfo` stand-in that lists only the second, as "AMD Radeon RX 7800 XT" with its `BDFID`: the ROCm runtime with the first GPU hidden from it. `rocm examine --json` must report the second GPU with that model name, gfx1101 and `is_apu: false`, and the first with gfx1100, no model name (the kernel-topology placeholder, explained by one "marketing name is unknown" note) and no `is_apu`. Before the fix the runtime's GPUs were paired with the listed ones by position, so the first GPU took the second's name, target and verdict. It runs on the Linux lanes and needs no GPU. The other rows of the match (no `BDFID`, with equal and with unequal counts, an address no listed GPU has, an address shared across PCI domains, a partitioned card) are unit tests in [linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs), next to `apply_rocminfo_gpu_agents`:
+
+```bash
+cargo test -p rocm-core --lib -- examine::linux_gpus
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-49 '
+```
+
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 
 ```bash
