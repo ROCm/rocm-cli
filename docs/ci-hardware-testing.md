@@ -360,9 +360,9 @@ cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. Merging or
 closing a pull request also starts a run (`closed` is a listed `pull_request`
 activity type) that joins that PR's group and runs only a no-op job, so it
-supersedes the PR's earlier run and frees runners where the cancel completes. A run whose
-job is still queued for a runner may not finish cancelling, so it can keep
-its place in the queue until the runner picks the job up. The heavy
+supersedes the PR's earlier run and frees runners where the cancel completes.
+A run whose job is still queued for a runner may not finish cancelling, so it
+can keep its place in the queue until the runner picks the job up. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
 lane: they run only on the other lanes, and the only vLLM serve before a change
 lands is the per-PR canary (`serve-05`), which runs when the `serve` filter

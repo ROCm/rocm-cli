@@ -7416,13 +7416,17 @@ jobs:
         );
     }
 
-    /// A job's block with comments removed, so a match cannot come from prose.
-    fn uncommented_job_block(text: &str, job: &str) -> String {
-        job_block(text, job)
-            .lines()
+    /// `text` with every comment removed, so a match cannot come from prose.
+    fn yaml_without_comments(text: &str) -> String {
+        text.lines()
             .map(strip_comment)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A job's block with comments removed.
+    fn uncommented_job_block(text: &str, job: &str) -> String {
+        yaml_without_comments(job_block(text, job))
     }
 
     /// The job-level `if:` of an already uncommented job block, with a folded
@@ -7454,13 +7458,7 @@ jobs:
         // Every assertion reads one job's comment-free block, so prose or another
         // job cannot satisfy it.
         let sh = read_workflow("e2e-selfhosted.yml");
-        let on = normalized_whitespace(
-            &top_level_block(&sh, "on")
-                .lines()
-                .map(strip_comment)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        let on = normalized_whitespace(&yaml_without_comments(&top_level_block(&sh, "on")));
         assert!(
             on.contains("types: [opened, synchronize, reopened, closed]"),
             "pull_request must list `closed` next to the default types, got `{on}`"
@@ -7517,12 +7515,31 @@ jobs:
             .iter()
             .filter(|id| !["changes", "pr-closed"].contains(id))
         {
-            let condition = job_level_if(&uncommented_job_block(&sh, id));
+            let block = uncommented_job_block(&sh, id);
+            let condition = job_level_if(&block);
+            if *id == "e2e-report" {
+                // Skips because the `serve` output of a skipped `changes` is empty.
+                assert!(
+                    condition.starts_with("always() && (needs.changes.outputs.serve == 'true'"),
+                    "`e2e-report` must open with `always() && (needs.changes.outputs.serve == \
+                     'true'`, so it skips on `closed`; its `if` is `{condition}`"
+                );
+                continue;
+            }
+            // A lane's `if` must START with the `changes` gate: an `||` arm or a
+            // reordered operand would make it run when `changes` is skipped.
             assert!(
-                condition.contains("needs.changes.result == 'success'")
-                    || condition.contains("needs.changes.outputs.serve == 'true'"),
-                "job `{id}` must skip when `changes` is skipped (a closed PR); its `if` is \
-                 `{condition}`"
+                condition.starts_with("always() && needs.changes.result == 'success'"),
+                "lane `{id}` must open with `always() && needs.changes.result == 'success'`, \
+                 so it skips on `closed`; its `if` is `{condition}`"
+            );
+            // `changes` is skipped on `closed`, so its matrix output is empty;
+            // the fallback keeps the strategy evaluable.
+            assert!(
+                block.contains(
+                    "fromJSON(needs.changes.outputs.sdk_version_matrix || '[\"current\"]')"
+                ),
+                "lane `{id}` must fall back to `[\"current\"]` when the matrix output is empty:\n{block}"
             );
         }
     }

@@ -221,7 +221,7 @@ jobs:
       # single-element `["current"]` matrix, so the ordinary PR/merge-queue path
       # runs exactly one job, unchanged from before this matrix existed.
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix || '["current"]') }}
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself, and this check isn't in the required list (see the
     # file header), so a broken build here still can't block a merge; ci.yml's
@@ -485,7 +485,7 @@ jobs:
         # See `e2e-gpu` (ROCMAI-430): layered alongside the pre-existing
         # `channel` dimension above, not replacing it — this lane is the only
         # per-PR job with two independent matrix axes.
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix || '["current"]') }}
         # The nightly channel only carries the latest (pre-)release builds, so
         # it cannot resolve the n-1/n-2 released versions the matrix pins
         # (`rocm install sdk` fails with "no mutually compatible TheRock ...
@@ -640,7 +640,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix || '["current"]') }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-windows.
     if: >-
       always()
@@ -988,7 +988,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix || '["current"]') }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
     # `serve` like the sibling lanes rather than the broader `heavy`: the
     # consolidated report gates on `serve` too, so a heavy-but-not-serve change
@@ -1596,7 +1596,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix || '["current"]') }}
     if: >-
       always()
       && needs.changes.result == 'success'
