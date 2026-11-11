@@ -15,8 +15,9 @@ use rocm_core::{
     AppPaths, AutomationRuntimeState, ManagedServiceRecord, WatcherMode, WatcherRuntimeSnapshot,
     unix_time_millis,
 };
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
@@ -313,4 +314,85 @@ pub(crate) fn write_executable_script(
     file.set_permissions(fs::Permissions::from_mode(0o755))?;
     file.sync_all()?;
     Ok(())
+}
+
+const RECIPE_INDEX_PATH_ENV: &str = "ROCM_CLI_MODEL_RECIPE_INDEX_PATH";
+const RECIPE_INDEX_SIGNATURE_ENV: &str = "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH";
+const RECIPE_INDEX_PUBLIC_KEY_ENV: &str = "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH";
+const REQUIRE_SIGNED_RECIPE_INDEX_ENV: &str = "ROCM_CLI_REQUIRE_MODEL_RECIPE_SIGNATURE";
+
+static RECIPE_INDEX_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds the process-wide model recipe registry configuration for one test.
+///
+/// `rocm_core::resolve_model_recipe_artifact` (reached through
+/// `run_sandbox_tool`'s `prefetch_artifact` arm) reads the recipe-index
+/// environment variables on every call, and the environment is shared by every
+/// test thread. A test that resolves a recipe reference, or sets those
+/// variables, therefore takes this guard first: it serialises them against each
+/// other, so a resolver never sees the index path set without its public key,
+/// or the variables mid-restore. The previous values come back on drop.
+pub(crate) struct RecipeIndexEnv {
+    previous: Vec<(&'static str, Option<OsString>)>,
+    _serialised: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RecipeIndexEnv {
+    /// The built-in catalog: no index configured and no signature required, whatever
+    /// the developer's shell exports.
+    pub(crate) fn builtin_catalog() -> Self {
+        Self::apply(&[
+            (RECIPE_INDEX_PATH_ENV, None),
+            (RECIPE_INDEX_SIGNATURE_ENV, None),
+            (RECIPE_INDEX_PUBLIC_KEY_ENV, None),
+            (REQUIRE_SIGNED_RECIPE_INDEX_ENV, None),
+        ])
+    }
+
+    /// A signed recipe index, set as the registry for as long as the guard lives.
+    pub(crate) fn signed_index(index: &Path, signature: &Path, public_key: &Path) -> Self {
+        Self::apply(&[
+            (RECIPE_INDEX_PATH_ENV, Some(index)),
+            (RECIPE_INDEX_SIGNATURE_ENV, Some(signature)),
+            (RECIPE_INDEX_PUBLIC_KEY_ENV, Some(public_key)),
+            (REQUIRE_SIGNED_RECIPE_INDEX_ENV, None),
+        ])
+    }
+
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+    fn apply(vars: &[(&'static str, Option<&Path>)]) -> Self {
+        let serialised = RECIPE_INDEX_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self {
+            previous,
+            _serialised: serialised,
+        }
+    }
+}
+
+impl Drop for RecipeIndexEnv {
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 }
