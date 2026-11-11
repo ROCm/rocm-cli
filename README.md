@@ -81,9 +81,20 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
-removes the binaries, and undoes the `PATH` change too when no other program
-lives in that directory.
+directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
+`PATH`, or fish's config folder already exists), the installer also adds that
+directory to `PATH` in fish's `config.fish` and installs fish completions,
+including when the login shell is bash, zsh, or ksh. Fish's config folder is
+`$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
+`~/.config/fish`. A `completions/rocm.fish` that is already there and that the
+installer did not write (your own file, or a link) is left as it is: the
+installer prints a note that completions were not installed, and
+`rocm uninstall` leaves it too.
+Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
+its completions included. Rerun the installer any time to upgrade.
+`rocm uninstall` removes the binaries and the fish completions the installer
+wrote for them, and undoes the `PATH` change too when no other program lives
+in that directory.
 
 ### Linux and WSL2 (x86_64)
 
@@ -97,6 +108,10 @@ This tracks the default `release` channel. For nightly builds, pass the
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- nightly
 ```
+
+The channel here is the one the `rocm` binary comes from. It is separate from
+the ROCm SDK channel: `rocm install sdk --channel release|nightly` picks which
+TheRock stream the SDK comes from, whichever channel installed the binary.
 
 ### Windows (x86_64, PowerShell)
 
@@ -112,6 +127,9 @@ $env:ROCM_CLI_CHANNEL = "nightly"
 irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
 
+As on Linux, this is the binary's channel only. The ROCm SDK channel is chosen
+separately with `rocm install sdk --channel`.
+
 ### Verify the installation
 
 Open a new terminal so the updated `PATH` takes effect, then run:
@@ -121,10 +139,12 @@ rocm version
 ```
 
 The output shows the ROCm CLI version with its release tag or branch and commit
-hash, the ROCm SDK that ROCm CLI would use on this computer, and the GPU driver
-version. A successful install prints the CLI version line. The SDK and driver
-lines read `not detected` when none is found, which is expected on a computer
-where you haven't installed ROCm or a driver yet.
+hash (a release build leads with its release version, such as
+`0.2.1 (v0.2.1, 1cde824)`; a build from `main` leads with `0.0.0-dev`), the ROCm
+SDK that ROCm CLI would use on this computer, and the GPU driver version. A
+successful install prints the CLI version line. The SDK and driver lines read
+`not detected` when none is found, which is expected on a computer where you
+haven't installed ROCm or a driver yet.
 
 If the shell reports `rocm: command not found`, confirm that the install
 directory is on your `PATH`. That is `~/.local/bin` on Linux,
@@ -289,12 +309,12 @@ form works depends on the engine your GPU selects.
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
-| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus a text-only Anthropic `/v1/messages` endpoint) |
+| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus an Anthropic `/v1/messages` endpoint, streaming or not) |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
+| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash (a release `vX.Y.Z` reports `X.Y.Z`; a branch, including `main`, reports `0.0.0-dev`), plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
@@ -396,6 +416,14 @@ The ROCm release and the inference engine's release are each cut
 back to a release, so a build number that would narrow toward one machine
 never appears there; the CLI's own version is the exception, since it names
 the tool that wrote the report instead of something read off the machine.
+That value is the version `rocm version` leads with (`X.Y.Z` for a release
+tag `vX.Y.Z`, `0.0.0-dev` for any other resolved ref), without the ref and
+commit hash that follow it there, since a local branch name is text from the
+machine. A release tag's suffix may only use letters, digits, `.`, `-` and
+`+`, and the version is at most 64 characters, so a release always reports
+its version here; a tag outside that is not treated as a release, and the
+release workflow refuses it. Anything else that reaches the report outside
+those rules is reported as `unknown`.
 The distribution is checked against a list of known names instead of
 being repeated from the machine.
 
@@ -450,6 +478,7 @@ hardware, not something an install or a setting can put right.
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
+                    [--python-version X.Y]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -533,10 +562,40 @@ already there no longer runs its own Python, it is removed outright and rebuilt.
 The approval prompt doesn't cover this, because it asks only about changing the
 active default runtime, not about what a named prefix loses.
 
+#### Which Python `install sdk` uses
+
+ROCm CLI picks the Python from the ROCm version it installs. ROCm 7.14 installs
+use Python 3.12. ROCm 10 and newer use Python 3.14 by default, because vLLM,
+flash-attn and amd-aiter for ROCm 10 are published for 3.14 only. The ROCm 10
+SDK and PyTorch wheels are also published for 3.10 to 3.14, so an install that
+doesn't need vLLM can choose one:
+
+```
+rocm install sdk --version 10.1.0 --family gfx1200 --python-version 3.12
+```
+
+With a Python other than 3.14, the SDK and PyTorch install and run, but vLLM
+doesn't: the engine install that normally follows an SDK install on a vLLM GPU
+is skipped with a note, and `rocm engines install vllm` refuses that runtime.
+Re-run the install without `--python-version` to move it to 3.14. An update
+keeps the Python the runtime was installed with.
+
+`--python-version` applies to ROCm 10 and newer wheel installs only. A ROCm 7
+install is built for Python 3.12 and refuses any other. A Python that doesn't
+match the install is refused rather than used, so `ROCM_CLI_PYTHON` (an
+interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the version
+ROCm CLI prepares itself) must name a Python the install accepts.
+
+If you see Python 3.14 without asking for it, the install resolved to ROCm 10
+or newer. That happens with `--version 10.x.y`, and also when the channel's
+newest build is ROCm 10, as the nightly channel's is today. The install prints
+which Python it chose, and `--dry-run` shows it without changing anything.
+
 #### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version`. These versions select their device payload by exact
+version with `--version` (an unpinned nightly install also gets ROCm 10 while
+that channel's newest build is one, from the nightly sources as before). These versions select their device payload by exact
 GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
 a family of GPUs, or none), or you want to target a different GPU, also pass
 `--family` with the raw `gfx` code instead of a family label:
@@ -577,8 +636,9 @@ dependency metadata alongside the pinned torchaudio. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
+Nothing about this happens on its own on the release channel. Without a
+`--version` of 10 or newer, `install sdk` resolves the same release and nightly
+sources as before. It doesn't
 quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
 you what it couldn't find instead.
 
@@ -997,7 +1057,7 @@ Alongside the OpenAI-compatible endpoint, a served model gets an
 Anthropic-compatible `/v1/messages` endpoint, shown as `anthropic endpoint:` in
 `rocm services list` and in the interactive `rocm serve` summary (a fresh launch
 waits briefly for it; if it is not there yet, check `rocm services list`). It is
-a text-only, non-streaming endpoint. It is a base URL: point an
+a text-and-tools endpoint that answers both plain and `stream: true` requests. It is a base URL: point an
 Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
 if the service has one, as `x-api-key` (the translation front also accepts a
 bearer token). `rocm` runs a
@@ -1005,9 +1065,15 @@ translation front on its own port, inside the serving process, so it starts and
 stops with the service; it fronts the engine even when the engine has its own
 `/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
 answers, and the reply names it. The translation covers text turns, system
-prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`;
-streaming, tool use (`tools`, `tool_choice`), extended thinking and image or
-other non-text content blocks are refused with
+prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`,
+and tool use: `tools` and `tool_choice` (including `disable_parallel_tool_use`),
+`tool_use` and `tool_result` blocks in the conversation, and `tool_use` blocks
+with the `tool_use` stop reason in the reply. Whether the model calls a tool
+depends on the engine: vLLM needs `--tool-call-parser <name>` (and auto tool choice) for any
+`tool_choice` (`any` and a named tool included), and answers a request that names a
+tool with a 400 without one. A streaming request is answered with Anthropic server-sent events built from the
+engine's streamed chunks, but streaming a request that defines `tools` is refused. Extended thinking, server tools (web search and
+the like) and image or other non-text content blocks are refused with
 an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
 marks the endpoint `(not responding)` when a ready service's endpoint does not
 answer.
@@ -1288,7 +1354,7 @@ rocm services list [--all] [--json]
 rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
-rocm services remove <service-id> --yes
+rocm services remove <service-id> --yes [--force]
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
 
@@ -1297,10 +1363,15 @@ gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
 processes, and any endpoint key, which the server may still be enforcing. It
 names each process that, or a process under it, did not exit after it was
-signaled; for a process it could not verify as the server's, it signals nothing
-and names an operating-system command to check on it. It does not suggest
-running the stop again: when only a process under the recorded one survived, a
-second stop can report the server stopped while that process still runs.
+signaled. On Windows it also names a process that did exit (or was already gone)
+when taking the processes under it down did not complete, or found nothing and
+no other recorded process is confirmed gone, because one of them may still be
+running. For a process it could not verify as the server's (its recorded
+start-time can no longer be read back, or, on Windows, `rocm` cannot query it at
+all), it signals nothing and names an operating-system command to check on it.
+It does not suggest running the stop again: when only a process under the
+recorded one survived, a second stop can report the server stopped while that
+process still runs.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
@@ -1309,15 +1380,25 @@ nothing, and leaves the stop request recorded.
 After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
 and re-checks the port before it respawns: if another live managed service is
 now recorded on that port, or (on the default `127.0.0.1` host only) the port is
-bound by another process, it refuses and the service stays stopped (`rocm services list` shows it). The lock wait is
-bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
+bound by another process, it refuses and the service stays stopped
+(`rocm services list` shows it). The lock wait is bounded (5 seconds), unlike
+`rocm serve`'s: if a launch still holds the lock,
 `restart` fails saying the server was stopped but not restarted and names
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
-alone, and additionally clears leftover files whose record is already gone.
+alone, and additionally clears leftover files whose record is already gone. A
+server counts as running while any process it recorded may be running, which on
+Windows includes one `rocm` cannot query (a live process the account may not
+open): `remove` and `prune` refuse such a record until that process is gone.
+`remove <service-id> --force --yes` is the way out for exactly that case: it
+removes the record when a stop was requested, no recorded process is confirmed
+running, and at least one could not be queried, says which one, and never
+removes a record whose process `rocm` can see running. `prune` has no
+`--force`, but when it leaves such a record alone it lists it with the exact
+`remove --force --yes` command. `docs/manual-testing.md` walks through it.
 
 Removal destroys both the log and the `restart` option for the records it
 takes, so `prune` only considers records untouched for 24 hours. Age is
@@ -1578,6 +1659,27 @@ rocm config set-provider-key <provider>
 rocm config clear-provider-key <provider>
 ```
 
+Settings live in `config.json` in the config directory and are replaced in one
+step, so an interrupted save leaves the previous file rather than a truncated
+one. On Windows, a replace that fails part-way can instead leave the new
+settings in a `config.json.tmp-*` file beside it, which the error names: rename
+it back to `config.json` before running another command. If the file exists
+but cannot be read — a bad hand edit, for example —
+rocm-cli reports it and does not save over it, so the settings in it are never
+replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
+where runtimes are kept; when it is too damaged to read even that, commands stop
+and say how to recover (`rocm diagnose` still runs). Repairing the file
+restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
+when the file still shows it) points commands back at your runtimes' folder
+meanwhile; until the file is repaired, any command that changes settings still
+stops on it, and other commands either stop too or run on default settings.
+To start over instead, rename the file yourself: the error names the exact
+file it read (under `ROCM_CLI_CONFIG_DIR` when that is set) and a name to give
+it, `config.json.broken` beside it, and rocm-cli does not rename or move it for
+you. That resets every setting to its default, and runtimes in a custom folder
+then need `ROCM_CLI_DATA_DIR`, which the error names when the file recorded
+that folder.
+
 ### Setup
 
 ```
@@ -1655,6 +1757,16 @@ be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
 Each step is reported as it finishes, so if a later step fails, the output
 still shows what was already removed.
 
+On Linux it also removes the fish completion script (`completions/rocm.fish`
+in fish's config folder) that the installer recorded writing, even when the
+`PATH` change stays for other programs, and keeps it with `--keep-binaries`.
+The installer starts that file with a line naming the folder it installed into,
+and uninstall removes the file only when that line names its own folder. A
+`rocm.fish` you wrote yourself, a link, or one another install folder wrote
+since is left in place, and the review says so under `Left alone:`. If the
+file cannot be removed, uninstall prints a warning naming it and carries on,
+since the completions are only a convenience; delete it yourself then.
+
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.
@@ -1705,6 +1817,10 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 #   autoload -Uz compinit && compinit
 
 # fish
+# The Linux installer writes this file when fish is installed (under
+# $XDG_CONFIG_HOME/fish when that is an absolute path). To refresh it, run the
+# installer again. A file you write with the command below carries no
+# installer marker line, so `rocm uninstall` leaves it in place:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 

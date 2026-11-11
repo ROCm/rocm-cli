@@ -111,6 +111,20 @@ Expected result:
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
+Optional: an unreadable settings file. Copy `config.json` from the config
+directory aside, cut the original off part-way through, and run `rocm version`
+without `ROCM_CLI_DATA_DIR` set. Expected result:
+
+- The command fails and names `config.json`, saying it cannot be read, and
+  explains the three ways out: repair it; set `ROCM_CLI_DATA_DIR` (it names the
+  folder if the damaged file still shows it), after which commands that change
+  settings still stop and others either stop or run on default settings; or
+  rename it to the `config.json.broken` path it names, which resets every
+  setting and leaves runtimes in a custom folder reachable only through
+  `ROCM_CLI_DATA_DIR`.
+- `config.json` is byte-for-byte what you left; nothing was saved over it.
+- Restoring the copy makes `rocm runtimes list` show the same runtimes as before.
+
 ## 2. TheRock SDK Command-Line Install
 
 This tests the command-line install path without using the TUI:
@@ -194,6 +208,19 @@ Expected result:
   with the install's own message. Its output before the failure states only
   what was found (for example that the `PATH` Python is not usable) and never
   says a real install would prepare or use a managed Python.
+- `rocm install sdk --version 10.0.0 --family gfx1200 --python-version 3.12
+  --dry-run` plans Python 3.12 (`python_wheel_tag: cp312`, and a managed Python
+  3.12 in the note on a host with none), and nothing in the plan says 3.14.
+  `--python-version 3.13` on an unpinned ROCm 7 install is refused, naming
+  Python 3.12 as the one that install uses, and `--python-version 3.9` on a
+  ROCm 10 install is refused naming 3.10 to 3.14. A real ROCm 10 install on a
+  vLLM GPU family with `--python-version 3.12` skips the engine auto-install
+  with a note, while a real ROCm 7 install on that family with `--python-version
+  3.12` (the redundant, accepted value) still auto-installs vLLM.
+- On the ROCm 10 runtime installed on Python 3.12 (including an unpinned
+  nightly install that resolved to ROCm 10), `rocm engines install vllm` names
+  the wheel tag it needs, and `rocm update` of that runtime builds the new one
+  on Python 3.12 again.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
@@ -323,7 +350,7 @@ Expected result:
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
-- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. A request with `"stream":true` or `tools` is refused with an `invalid_request_error`.
+- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.
 
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
@@ -579,12 +606,77 @@ rocm services restart <service-id> --yes
 `stop` prints `Local server stopped` only once every recorded process is
 confirmed gone; otherwise it prints `Local server stop not confirmed` on stderr,
 keeps the record and any endpoint key, and exits non-zero. It names each
-process that, or a process under it, did not exit, and for one it could not
-verify, an operating-system command to check on it. It never prints a `retry:`
-line.
+process that, or a process under it, did not exit. On Windows it also names one
+that did exit while taking the processes under it down did not complete
+(`not confirmed: process <pid> (<role>) exited, but a process under it may still
+be running`), and one that was already gone when that step ran with no other
+recorded process confirmed gone (`not confirmed: process <pid> (<role>) was
+already gone when the processes under it were to be taken down`). For one it
+could not verify, it names an operating-system command to check on it. It never
+prints a `retry:` line.
 
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
+
+On Windows the stop takes the engine's process tree down with the recorded
+process (`taskkill /T /F`, which has to finish within the stop's grace period of
+10 seconds, or the stop is not confirmed), and it checks the recorded process
+against the creation time written when the server started, so a process that has
+since taken the same PID is left alone and reported as `identity_mismatch`. A
+process it cannot verify, on either platform, is not signalled and is named with
+the check the host has: `ps -p <pid> -o pid,args` on Linux and WSL, and
+`tasklist /FI "PID eq <pid>"` on Windows. There are two ways to be unverifiable:
+the recorded start-time can no longer be read back from a running process, or
+(Windows only) the PID cannot be queried at all, as for a live process the
+account may not open. The text of `rocm services stop` does not list a per-process
+outcome for the stopping process itself; the JSON answer of the sandbox
+`stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
+as stopped).
+
+#### Windows host check
+
+The Windows build-and-test job runs the workspace unit tests, which include two
+`#[cfg(windows)]` tests in `proc_lifecycle.rs` that stop a real `ping` process
+through the PID hold, the creation-time read and the System32 `taskkill`. It does
+not run any scenario, and nothing there stages the unrun parts: the end-to-end
+tree kill of a parent with a child (`service-stop-07`), a real unopenable
+process (the `OpenProcess` failure codes), and `taskkill` exiting 128 or failing
+or stalling. None of these has been run on a Windows host, and no Windows result
+is claimed. On a Windows host with a `--features rocm/e2e-test-hooks` debug
+build and `ROCM_CLI_BINARY` set, run the scenarios that apply to Windows:
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-0[178]"` (`-01`
+plants PID 0, `-07` is Windows-only, `-08` runs on every OS) and
+`cargo test -p e2e-cucumber --test e2e -- -n "service-unqueryable-01"`, and
+record the result. Do not select `service-stop-02` to `-06` or
+`service-unqueryable-02`: they are Linux-only (they need `sleep` or `/proc`),
+and `-n` bypasses the harness's OS filter, so they would fail for want of the
+platform rather than for any defect.
+
+#### A record that stays unverified
+
+If the server is gone but its recorded PID has been taken by a process this
+account cannot open, `rocm` cannot tell the two apart, and it treats that as
+possibly running, which is the safe direction: the record never reconciles to
+`stopped`, `rocm services remove` and `rocm services prune` refuse it, and
+`rocm services stop` keeps reporting `unverified`. To clear it:
+
+1. Run the check command the stop printed. If the process is this server's, end it
+   yourself (from an elevated prompt if the account may not), then run
+   `rocm services`; the record reconciles and its endpoint key is dropped.
+2. If it is an unrelated process, run `rocm services remove <service-id> --force
+   --yes`. The refusal of a plain `remove` names exactly this command. `--force`
+   applies only when a stop was requested (the stop that reported `unverified`
+   did that), no recorded process is confirmed running, and at least one could
+   not be queried; a process `rocm` can see running is never forced past. The
+   command says which process could not be queried and that, if it is still
+   running, it keeps running, and it deletes the record, its log, its engine
+   state and its endpoint key. The server can no longer be restarted afterwards.
+   `rocm services prune` has no `--force`: it leaves such a record alone and lists it
+   under `Left alone` with this exact command.
+   If the record still reads `ready` and nobody has run `rocm services stop` on it,
+   `--force` is refused and the refusal names that stop first; run it (it reports
+   the process unverified and records the request), then the forced removal. This is
+   the intended order, not a gap: `--force` never removes a record nobody tried to stop.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
@@ -941,6 +1033,10 @@ Expected result:
   and disappear **together** as the terminal is resized. A `*` on a reading
   with no legend anywhere on screen is a bug; so is the legend with nothing
   marked.
+- The Hardware tab's GPU header has no room for a legend, so it spells the
+  same condition out: `eff 0.50 tok/W (held)`. It sits right after the GPU
+  count, so on an 80-column terminal the partition and VRAM text clips before
+  it does. A held figure that shows no `(held)` there is a bug.
 
   Check this one by **starting tall and shrinking**, not at the 22-to-24 rows
   above. The legend is the first row the hero drops, and the marker is gated on
@@ -1239,21 +1335,39 @@ rocm uninstall
 Expected result:
 
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
-  as the command exits) and, under
-  `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing, and at a
+  as the command exits), on Linux the `shell completions` file
+  `completions/rocm.fish` in fish's config folder (`$XDG_CONFIG_HOME/fish`
+  when that is an absolute path, else `~/.config/fish`) when the installer
+  wrote one, and, under `PATH changes from the installer that would be
+  undone:`, each shell profile the installer wrote (Linux, including fish's
+  `config.fish` when fish was installed) or the user `PATH` entry (Windows).
+  It removes nothing, and at a
   terminal ends with `Nothing was removed. To remove these items, run it again
   without --dry-run.` Running the same command again without `--dry-run` asks
   `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
   its output piped to a file or another command, or its input redirected, it
   lists the same items and omits that last line (scenario `uninstall-08`).
-- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+- After confirming, the install folder holds no `rocm`/`rocmd` files, the
+  fish completion script is gone (its `completions` folder stays), and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
 - If another program lives in the install folder, the review instead says
-  `PATH change left in place` and names it, and the `PATH` change stays.
-- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
-  stays too, and it does.
+  `PATH change left in place` and names it, and the `PATH` change stays; the
+  fish completion script still goes.
+- If you already have your own `completions/rocm.fish` (or a link there) when
+  you run the installer, it prints `note: fish completions not installed: …
+  already exists and was not written by this installer`, changes nothing, and
+  a later uninstall leaves the file (scenario `lifecycle-35`).
+- If you replace `rocm.fish` with your own file before uninstalling (for
+  example `rocm completions fish > <that path>`, which writes no installer
+  marker line), the review lists it under `Left alone:` as not written by the
+  installer, and the file stays (scenario `lifecycle-33`).
+- If the `completions` folder cannot be written to (`chmod 0555` it), the
+  uninstall prints `warning: could not remove shell completions <path>`,
+  still removes everything else, and ends with `uninstall complete`
+  (scenario `lifecycle-34`).
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change and
+  fish completions stay too, and they do (scenario `lifecycle-25`).
 - On a home folder ROCm CLI never touched, the dry run says
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run

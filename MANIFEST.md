@@ -103,7 +103,7 @@ mise's copyright and MIT licence text travel with them in
 | bytes | 1.12.0 | MIT |
 | castaway | 0.2.4 | MIT |
 | cbc | 0.1.2 | MIT OR Apache-2.0 |
-| cc | 1.10.0 | MIT OR Apache-2.0 |
+| cc | 1.11.0 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
 | cfg_aliases | 0.1.1 | MIT |
 | cfg_aliases | 0.2.1 | MIT |
@@ -366,7 +366,7 @@ mise's copyright and MIT licence text travel with them in
 | powerfmt | 0.2.0 | MIT OR Apache-2.0 |
 | ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
-| proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
+| proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
 | proptest | 1.12.0 | MIT OR Apache-2.0 |
 | quick-xml | 0.39.4 | MIT |
@@ -439,7 +439,7 @@ mise's copyright and MIT licence text travel with them in
 | serde_json | 1.0.154 | MIT OR Apache-2.0 |
 | serde_path_to_error | 0.1.20 | MIT OR Apache-2.0 |
 | serde_repr | 0.1.20 | MIT OR Apache-2.0 |
-| serde_spanned | 1.1.1 | MIT OR Apache-2.0 |
+| serde_spanned | 1.1.3 | MIT OR Apache-2.0 |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 |
 | serde_with | 3.21.0 | MIT OR Apache-2.0 |
 | serde_with_macros | 3.21.0 | MIT OR Apache-2.0 |
@@ -507,11 +507,11 @@ mise's copyright and MIT licence text travel with them in
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-tungstenite | 0.28.0 | MIT |
 | tokio-util | 0.7.20 | MIT |
-| toml | 1.1.6+spec-1.1.0 | MIT OR Apache-2.0 |
-| toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_datetime | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 |
-| toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
-| toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_writer | 1.2.0+spec-1.1.0 | MIT OR Apache-2.0 |
 | tower | 0.5.3 | MIT |
 | tower-http | 0.6.11 | MIT |
 | tower-http | 0.7.1 | MIT |
@@ -540,7 +540,7 @@ mise's copyright and MIT licence text travel with them in
 | unicode-linebreak | 0.1.5 | Apache-2.0 |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
 | unicode-truncate | 2.0.1 | MIT OR Apache-2.0 |
-| unicode-width | 0.2.2 | MIT OR Apache-2.0 |
+| unicode-width | 0.2.3 | MIT OR Apache-2.0 |
 | unicode-xid | 0.2.6 | MIT OR Apache-2.0 |
 | untrusted | 0.9.0 | ISC |
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
@@ -634,7 +634,7 @@ mise's copyright and MIT licence text travel with them in
 | zerotrie | 0.2.4 | Unicode-3.0 |
 | zerovec | 0.11.6 | Unicode-3.0 |
 | zerovec-derive | 0.11.3 | Unicode-3.0 |
-| zip | 9.1.2 | MIT |
+| zip | 9.3.0 | MIT |
 | zlib-rs | 0.6.7 | Zlib |
 | zmij | 1.0.21 | MIT |
 | zopfli | 0.8.3 | Apache-2.0 |

@@ -109,6 +109,33 @@ pub struct ManagedServiceRecord {
     /// existed, which is the safe default (keep the key).
     #[serde(default)]
     pub stop_requested_unix_ms: Option<u128>,
+    /// The stop marker a liveness refresh cleared off a record that named no
+    /// process, kept as the evidence that it was cleared and not by a relaunch.
+    ///
+    /// A record naming no process has nothing for a pending stop to wait on, so
+    /// the refresh drops the marker (and the key) at once. A `starting` or
+    /// `failed` record is left at that status, and a stop that began on such a
+    /// record would then find it with no marker and nothing recorded, which is
+    /// also what a relaunch that has not recorded its supervisor yet looks like.
+    /// This holds the marker's value (the stop's own request stamp), so the stop
+    /// can tell its own marker having been consumed from a relaunch having
+    /// cleared it ([`Self::is_covered_by_stop_of`]). Cleared by a restart
+    /// ([`Self::reset_for_restart`]); absent from records that never had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_stop_unix_ms: Option<u128>,
+    /// The generation of a relaunch that has begun but not yet published its
+    /// processes: stamped by `rocm services restart` once its own stop has
+    /// confirmed and before it restores the endpoint key or spawns, and cleared
+    /// when the restart publishes ([`Self::reset_for_restart`]).
+    ///
+    /// Until then the record is an empty `stopped` manifest, which is also what a
+    /// stop's own completion looks like, so a stop that read the record earlier
+    /// would claim it and delete the key the restart restored for its child. A
+    /// stop covers the record only while the record carries the generation the
+    /// stop read ([`Self::is_covered_by_stop_of`]). Absent from records that are
+    /// not between a restart's stop and its publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunch_started_unix_ms: Option<u128>,
     /// When the last inference probe was attempted. Throttles re-probing of a
     /// service that is listed but still loading — see
     /// [`crate::INFERENCE_PROBE_RETRY_INTERVAL`]. Absent on records written before
@@ -254,6 +281,8 @@ impl ManagedServiceRecord {
             restart_count: 0,
             last_restart_unix_ms: None,
             stop_requested_unix_ms: None,
+            settled_stop_unix_ms: None,
+            relaunch_started_unix_ms: None,
             startup_phase: None,
             inference_verified_at_unix_ms: None,
             inference_probe_attempted_at_unix_ms: None,
@@ -298,6 +327,10 @@ impl ManagedServiceRecord {
         // died with the previous run.
         self.anthropic_endpoint_url = None;
         self.anthropic_endpoint_mode = None;
+        // A relaunch is no longer the stop that was settled under it, and it is
+        // published now, so it is no longer waiting to be.
+        self.settled_stop_unix_ms = None;
+        self.relaunch_started_unix_ms = None;
         self.restart_count = self.restart_count.saturating_add(1);
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
@@ -330,11 +363,98 @@ impl ManagedServiceRecord {
             && self.engine_start_ticks == other.engine_start_ticks
     }
 
+    /// Whether `self`, the record as it is now, is still the record of the
+    /// service that `stopping`, the copy the stop read before it signalled
+    /// anything, was stopping: the stop's verdict covers what it names.
+    ///
+    /// True when the two name the same processes
+    /// ([`Self::names_same_processes`]), and also when `self` names none because
+    /// the same stop was completed under it: a liveness refresh that saw every
+    /// recorded process gone, with the stop requested, clears the processes and
+    /// reads the record as `stopped` (the deferred cleanup). A record reading
+    /// `stopped` that names no process has nothing left that the stop did not
+    /// handle, so the stop's own confirmation is still true of it.
+    ///
+    /// False for a restart that recorded new processes, and equally for one that
+    /// is mid-launch with none recorded yet: that record reads `starting` (or
+    /// another live status) with the stop marker cleared, not `stopped`, and
+    /// claiming it stopped, or dropping the key it will serve with, would be
+    /// false. That holds when the stopping snapshot itself names no process too:
+    /// an empty record is covered only while it still carries the stop's marker,
+    /// once it reads `stopped`, or once a liveness refresh consumed that very
+    /// marker ([`Self::settled_stop_unix_ms`]), which leaves a `starting` or
+    /// `failed` record at its status with the marker gone.
+    ///
+    /// Never true for a record in another relaunch generation than the stop read
+    /// ([`Self::relaunch_started_unix_ms`]): a restart that has stopped the
+    /// service and not yet published its child leaves an empty `stopped` record
+    /// that an older stop would otherwise take for its own completion.
+    #[must_use]
+    pub fn is_covered_by_stop_of(&self, stopping: &Self) -> bool {
+        if self.relaunch_started_unix_ms != stopping.relaunch_started_unix_ms {
+            return false;
+        }
+        if self.status == "stopped" && self.names_no_process() {
+            return true;
+        }
+        // The same processes. When they are none, that equality is also what a
+        // relaunch that has not recorded its supervisor yet looks like, so it
+        // proves nothing: the stop's own marker is what tells the two apart, since
+        // a restart clears it and a stop that is still finalizing has it on disk.
+        // A marker that is gone is the stop's own only when the refresh that
+        // consumed it left its stamp behind; a restart wipes that stamp.
+        self.names_same_processes(stopping)
+            && (!stopping.names_no_process()
+                || self.stop_requested_unix_ms.is_some()
+                || (stopping.stop_requested_unix_ms.is_some()
+                    && self.settled_stop_unix_ms == stopping.stop_requested_unix_ms))
+    }
+
+    /// Stamp the record as a relaunch that has begun and not yet published its
+    /// processes, as a generation no earlier stop or relaunch carried. See
+    /// [`Self::relaunch_started_unix_ms`].
+    pub fn begin_relaunch(&mut self) {
+        let now = unix_time_millis();
+        self.relaunch_started_unix_ms = Some(
+            now.max(
+                self.relaunch_started_unix_ms
+                    .map_or(0, |earlier| earlier + 1),
+            ),
+        );
+    }
+
+    /// Whether the record names neither a supervisor nor an engine process.
+    const fn names_no_process(&self) -> bool {
+        self.supervisor_pid == 0
+            && self.supervisor_start_ticks.is_none()
+            && self.engine_pid.is_none()
+            && self.engine_start_ticks.is_none()
+    }
+
     /// Record `pid` as the engine, together with its start-time token. See
     /// [`Self::record_supervisor_identity`].
     pub fn record_engine_identity(&mut self, pid: u32) {
         self.engine_pid = Some(pid);
         self.engine_start_ticks = crate::process_start_ticks(pid);
+    }
+
+    /// Forget the processes this record names: the supervisor and the engine,
+    /// each with its start-time token.
+    ///
+    /// For a stop that has confirmed every one of them gone, and for nothing
+    /// else. A recorded PID goes stale the instant its process exits, and a
+    /// later stop of the same record would signal whatever the OS has since
+    /// handed that number to; a PID recorded without a token cannot be
+    /// refuted, and on Windows none can, so the tree kill would take that
+    /// process and everything under it. `rocm services stop` and `rocmd`'s stop
+    /// both call this on the confirmed path, so the two leave the same record
+    /// behind. An unconfirmed stop keeps the PIDs: the record is the only thing
+    /// that names a survivor.
+    pub const fn clear_recorded_processes(&mut self) {
+        self.supervisor_pid = 0;
+        self.supervisor_start_ticks = None;
+        self.engine_pid = None;
+        self.engine_start_ticks = None;
     }
 
     pub fn normalize_paths_for_host(&mut self) {
@@ -778,7 +898,8 @@ mod tests {
     /// been recycled. One live process stands in for both roles, as it does for
     /// a `rocm serve --background` launch.
     ///
-    /// Linux-only: `process_start_ticks` reads `/proc`, and is `None` elsewhere.
+    /// Linux-only here, because it spawns `sleep`: `process_start_ticks` gives a
+    /// token on Linux and on Windows (the creation time) and is `None` elsewhere.
     #[cfg(target_os = "linux")]
     #[test]
     fn recording_a_process_identity_writes_the_pid_with_its_own_token() {
@@ -800,6 +921,230 @@ mod tests {
         assert_eq!(record.supervisor_start_ticks, expected);
         assert_eq!(record.engine_pid, Some(pid));
         assert_eq!(record.engine_start_ticks, expected);
+    }
+
+    /// What a stop that confirmed its processes gone leaves behind: no PID and
+    /// no token for either role, and nothing else touched.
+    #[test]
+    fn clearing_the_recorded_processes_clears_each_pid_and_its_token_and_nothing_else() {
+        let mut record = probe_test_record(11437);
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = Some(5);
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
+        record.status = "ready".to_owned();
+        record.restart_count = 3;
+        let before = record.clone();
+
+        record.clear_recorded_processes();
+
+        assert_eq!(record.supervisor_pid, 0);
+        assert_eq!(record.supervisor_start_ticks, None);
+        assert_eq!(record.engine_pid, None);
+        assert_eq!(record.engine_start_ticks, None);
+        assert_eq!(record.service_id, before.service_id);
+        assert_eq!(record.status, "ready");
+        assert_eq!(record.restart_count, 3);
+        assert_eq!(record.port, before.port);
+        // A cleared record no longer names what it named, so a stop that read it
+        // before and finds this after does not claim the same processes.
+        assert!(!before.names_same_processes(&record));
+        assert!(record.names_same_processes(&record.clone()));
+    }
+
+    /// What a stop's verdict still covers, record by record: the same processes,
+    /// or none because the same stop was completed under it (`stopped`, nothing
+    /// recorded). A restart's record is never covered: new processes recorded, or
+    /// still starting with none recorded yet.
+    #[test]
+    fn a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch() {
+        let mut stopping = probe_test_record(11438);
+        stopping.supervisor_pid = 4242;
+        stopping.supervisor_start_ticks = None;
+        stopping.engine_pid = Some(4243);
+        stopping.engine_start_ticks = Some(77);
+        stopping.status = "ready".to_owned();
+        let record_with = |status: &str, pid: u32, engine: Option<u32>| {
+            let mut record = stopping.clone();
+            status.clone_into(&mut record.status);
+            record.supervisor_pid = pid;
+            record.supervisor_start_ticks = None;
+            record.engine_pid = engine;
+            record.engine_start_ticks = None;
+            record
+        };
+        // (what the record on disk is now, whether the stop still covers it)
+        let rows = [
+            ("unchanged", stopping.clone(), true),
+            // The deferred cleanup of this very stop: every process gone, so the
+            // record is stopped and names none.
+            (
+                "completed under the stop",
+                record_with("stopped", 0, None),
+                true,
+            ),
+            // A restart that recorded new processes.
+            (
+                "relaunched, ready",
+                record_with("ready", 5555, Some(5556)),
+                false,
+            ),
+            (
+                "relaunched, starting",
+                record_with("starting", 5555, None),
+                false,
+            ),
+            // A restart mid-launch that has not recorded anything yet: not a stop.
+            (
+                "restarting, nothing recorded",
+                record_with("starting", 0, None),
+                false,
+            ),
+            (
+                "recovering, nothing recorded",
+                record_with("recovering", 0, None),
+                false,
+            ),
+            (
+                "ready, nothing recorded",
+                record_with("ready", 0, None),
+                false,
+            ),
+            // Stopped, but naming a process the stop did not handle.
+            (
+                "stopped, other process",
+                record_with("stopped", 5555, None),
+                false,
+            ),
+        ];
+        for (name, record, covered) in rows {
+            assert_eq!(record.is_covered_by_stop_of(&stopping), covered, "{name}");
+        }
+
+        // The same table from a stopping snapshot that names no process: an
+        // untouched record (the stop's own marker still on it, or completed to
+        // `stopped`) is that stop; an empty relaunch that has cleared the marker is
+        // not, and neither is one that has recorded processes.
+        let mut empty = stopping.clone();
+        empty.clear_recorded_processes();
+        empty.stop_requested_unix_ms = Some(1);
+        let with_marker = |status: &str, marker: Option<u128>, pid: u32| {
+            let mut record = empty.clone();
+            status.clone_into(&mut record.status);
+            record.stop_requested_unix_ms = marker;
+            record.supervisor_pid = pid;
+            record
+        };
+        // What a liveness refresh leaves when it consumes the stop's marker off an
+        // empty record: the marker gone, the status as it was, the marker's value
+        // kept as `settled_stop_unix_ms`.
+        let settled = |status: &str, stamp: Option<u128>| {
+            let mut record = with_marker(status, None, 0);
+            record.settled_stop_unix_ms = stamp;
+            record
+        };
+        let rows = [
+            ("empty, untouched", with_marker("ready", Some(1), 0), true),
+            ("empty, stopped", with_marker("stopped", None, 0), true),
+            // The stop's own marker consumed by a listing: not a relaunch.
+            (
+                "empty, starting, marker consumed by a listing",
+                settled("starting", Some(1)),
+                true,
+            ),
+            (
+                "empty, failed, marker consumed by a listing",
+                settled("failed", Some(1)),
+                true,
+            ),
+            // A stamp that is not this stop's (an earlier stop's), or none at all,
+            // is no evidence about this one.
+            (
+                "empty, starting, another stop's marker consumed",
+                settled("starting", Some(2)),
+                false,
+            ),
+            (
+                "empty, starting relaunch",
+                with_marker("starting", None, 0),
+                false,
+            ),
+            (
+                "empty, recovering relaunch",
+                with_marker("recovering", None, 0),
+                false,
+            ),
+            (
+                "empty, ready relaunch",
+                with_marker("ready", None, 0),
+                false,
+            ),
+            (
+                "relaunched with a process",
+                with_marker("starting", None, 5555),
+                false,
+            ),
+        ];
+        for (name, record, covered) in rows {
+            assert_eq!(record.is_covered_by_stop_of(&empty), covered, "{name}");
+        }
+
+        // Nothing is learned from two absent stamps: a snapshot without a marker
+        // of its own is not matched by a record that never consumed one.
+        let mut unmarked = empty.clone();
+        unmarked.stop_requested_unix_ms = None;
+        assert!(
+            !settled("starting", None).is_covered_by_stop_of(&unmarked),
+            "None must not equal None as evidence"
+        );
+    }
+
+    /// A restart between its own confirmed stop and the publication of its child
+    /// leaves an empty `stopped` record. A stop that read the record before that
+    /// (another generation) must not cover it, however the rest of the record
+    /// reads, while a stop that read the same generation still does.
+    #[test]
+    fn a_stop_does_not_cover_a_record_in_another_relaunch_generation() {
+        let mut stopping = probe_test_record(11440);
+        stopping.supervisor_pid = 4242;
+        stopping.status = "ready".to_owned();
+        let mut relaunching = stopping.clone();
+        relaunching.clear_recorded_processes();
+        "stopped".clone_into(&mut relaunching.status);
+        assert!(
+            relaunching.is_covered_by_stop_of(&stopping),
+            "premise: without a relaunch the completed stop covers it"
+        );
+        relaunching.begin_relaunch();
+        assert!(
+            !relaunching.is_covered_by_stop_of(&stopping),
+            "an older stop does not cover a record whose relaunch has begun"
+        );
+        // A stop that read the record during the relaunch, and an empty snapshot
+        // of the same generation, are the same stop as before.
+        let mut during = relaunching.clone();
+        during.stop_requested_unix_ms = Some(9);
+        assert!(relaunching.is_covered_by_stop_of(&during));
+        // The generation is never reused, even within one millisecond.
+        let first = relaunching.relaunch_started_unix_ms;
+        relaunching.begin_relaunch();
+        assert!(relaunching.relaunch_started_unix_ms > first);
+    }
+
+    /// A restart supersedes the stop that was settled under it: the stamp a
+    /// listing left behind does not outlive the relaunch, or a stop that began
+    /// before it would read the relaunch's empty record as its own completion.
+    #[test]
+    fn restarting_forgets_a_settled_stop() {
+        let mut record = probe_test_record(11439);
+        record.settled_stop_unix_ms = Some(7);
+        record.begin_relaunch();
+        record.reset_for_restart();
+        assert_eq!(record.settled_stop_unix_ms, None);
+        assert_eq!(
+            record.relaunch_started_unix_ms, None,
+            "publishing ends the relaunch generation"
+        );
     }
 
     /// Writing a service manifest never writes through a file another writer

@@ -252,20 +252,23 @@ repos:
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
       - id: cargo-module-size
-        name: Source files are within the module-size limit (advisory)
-        # Check-only: it never rewrites or restages anything. Advisory for now, so
-        # it prints the offenders and lets the commit through, because a blocking
-        # hook would fail the very commits that split an over-limit file. The
-        # advisory behaviour lives in the `-advisory` subcommand, not a flag on the
-        # check; making the limit blocking means pointing this entry at
-        # `cargo xtask check-module-size` and deleting the wrapper. Advisory only
-        # once xtask has built: a WIP commit that leaves xtask or rocm-core not
-        # compiling still fails here, as it does the other xtask hooks.
-        entry: cargo xtask check-module-size-advisory
+        name: Source files are within the module-size limit
+        # Check-only: it never rewrites or restages anything. Blocking, the local
+        # mirror of the module-size step in the `clippy` CI job: a source file over
+        # the limit fails the hook and stops the commit, and the output names the
+        # file and how to split it. It measures the working tree, so a Rust file under
+        # a crate's src/ that no `mod` declares fails it too, even an untracked scratch
+        # file, and the error says to declare or delete it. Only a commit that stages
+        # Rust source runs it, and only for someone who installed the hooks; CI stays
+        # the authority. Stage: pre-commit, like the other local checks, not pre-push.
+        # The consequence is that it also refuses the intermediate commits when an
+        # over-limit file is split across several commits (CI only sees the final
+        # state). Do the split in one commit, or commit the intermediate steps with
+        # `SKIP=cargo-module-size git commit ...`.
+        entry: cargo xtask check-module-size
         language: system
         types: [rust]
         pass_filenames: false
-        verbose: true # a passing hook is silent otherwise, and this one passes while it warns
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
       - id: cargo-tpn

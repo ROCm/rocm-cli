@@ -15,6 +15,7 @@ e2e-test-hooks = ["rocm-core/e2e-test-hooks"]
 
 [dependencies]
 anyhow.workspace = true
+async-stream.workspace = true
 axum.workspace = true
 clap.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
@@ -24,3 +25,11 @@ serde_json.workspace = true
 sha2 = "0.10"
 tokio.workspace = true
 ureq = { version = "2.12", features = ["native-certs"] }
+
+[dev-dependencies]
+# The fake engine child both engine IPC callers are tested against.
+rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The SIGPIPE disposition a test restores in a re-executed child.
+libc.workspace = true

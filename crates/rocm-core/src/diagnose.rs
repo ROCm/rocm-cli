@@ -42,7 +42,7 @@ mod windows;
 mod wsl;
 
 pub use engine::{VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM};
-pub use linux::dkms_driver_plan_is_supported;
+pub use linux::{AMDGPU_MISSING_EVIDENCE, dkms_driver_plan_is_supported};
 pub use report::{render_report_text, upstream_route};
 
 /// At/above this score a diagnosis is treated as a real match.

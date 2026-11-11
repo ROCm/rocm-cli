@@ -451,6 +451,26 @@ pub(super) const fn deliberately_diverged_package(
     }
 }
 
+/// Every package the dependency check should expect to diverge, given the one the
+/// install settled on (`diverged`, from [`deliberately_diverged_package`] or
+/// [`retained_diverged_package`]).
+///
+/// Opted out, the torch the runtime holds is the user's, and so is the rest of the
+/// stack the SDK wrote with it: vLLM pins an exact build of each, so reading
+/// torchvision, torchaudio or triton as violations would answer the opt-out with a
+/// remedy the engine's repair no longer offers. With nothing settled, nothing is
+/// expected.
+pub(super) fn diverged_packages(
+    diverged: Option<&'static str>,
+    alignment_disabled: bool,
+) -> Vec<&'static str> {
+    match diverged {
+        Some(_) if alignment_disabled => rocm_core::SDK_TORCH_STACK_PACKAGES.to_vec(),
+        Some(package) => vec![package],
+        None => Vec::new(),
+    }
+}
+
 /// The build identifier of the torch that belongs to this runtime's SDK.
 ///
 /// Taken from the manifest, never from whatever torch happens to be installed.
@@ -1248,7 +1268,7 @@ mod tests {
             vec![
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.9.0+cpu` is installed".to_owned(),
             ],
-            deliberately_diverged_package(&outcome),
+            &diverged_packages(deliberately_diverged_package(&outcome), false),
         );
         assert!(matches!(
             dependencies,
@@ -1258,6 +1278,65 @@ mod tests {
         assert!(
             !rendered.contains("--reinstall"),
             "the remedy would undo the opt-out, got {rendered:?}"
+        );
+    }
+
+    /// What the CI GPU lanes print after the SDK is installed over an engine runtime
+    /// with the opt-out set: the SDK wrote torchvision, torchaudio and triton as well
+    /// as torch, and each one misses vLLM's pin. Judged one package at a time, the
+    /// three siblings were violations carrying a "repair" remedy the engine no longer
+    /// performs, and the install reported `dependency_check: violated`.
+    #[test]
+    fn an_opted_out_runtime_expects_the_whole_sdk_torch_stack_to_diverge() {
+        let details = vec![
+            "The package `vllm` requires `triton==3.6.0`, but `3.8.0+git4cff872c.rocm7.14.1` is installed".to_owned(),
+            "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.26.0+rocm7.14.1` is installed".to_owned(),
+            "The package `vllm` requires `torchaudio==2.9.0+eaa9e4e`, but `2.11.0+rocm7.14.1` is installed".to_owned(),
+            "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.14.1` is installed".to_owned(),
+        ];
+        let kept = TorchRetention::SdkBuild {
+            version: "2.11.0+rocm7.14.1".to_owned(),
+        };
+
+        let opted_out = classify_dependency_details(
+            details.clone(),
+            &diverged_packages(retained_diverged_package(&kept), true),
+        );
+        assert!(
+            matches!(&opted_out, EngineDependencyCheck::ExpectedDivergence(expected) if expected.len() == 4),
+            "opted out, all four are the user's: {opted_out:?}"
+        );
+
+        // Not opted out, only torch is ever an intended divergence: the siblings
+        // are real violations, because rocm-cli realigns torch and nothing else.
+        let aligned = classify_dependency_details(
+            details,
+            &diverged_packages(retained_diverged_package(&kept), false),
+        );
+        assert!(
+            matches!(&aligned, EngineDependencyCheck::Violated { violations, expected }
+                if violations.len() == 3 && expected.len() == 1),
+            "aligned, the siblings stay violations: {aligned:?}"
+        );
+    }
+
+    /// The opt-out spares the torch stack and nothing else, and a runtime with no
+    /// settled divergence expects none.
+    #[test]
+    fn the_opt_out_widens_the_divergence_to_the_torch_stack_only() {
+        assert!(diverged_packages(None, true).is_empty());
+        assert_eq!(diverged_packages(Some("torch"), false), vec!["torch"]);
+        let widened = diverged_packages(Some("torch"), true);
+        assert_eq!(widened, rocm_core::SDK_TORCH_STACK_PACKAGES.to_vec());
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `numpy==1.26.4`, but `2.0.0` is installed".to_owned(),
+            ],
+            &widened,
+        );
+        assert!(
+            matches!(outcome, EngineDependencyCheck::Violated { .. }),
+            "an unrelated pin is still a violation under the opt-out"
         );
     }
 }

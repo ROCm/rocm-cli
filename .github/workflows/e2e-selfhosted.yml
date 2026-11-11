@@ -272,7 +272,7 @@ jobs:
       # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
       # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
       # the local target.
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -1634,7 +1634,7 @@ jobs:
 
       # cache: false for the same reason as e2e-gpu — the build cache is kept in
       # CARGO_TARGET_DIR on the work volume, not in GitHub's cache service.
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -1739,7 +1739,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # No rust-cache restore/save: builds start from a clean tree, so a
           # poisoned cache entry cannot reach this job (zizmor cache-poisoning).

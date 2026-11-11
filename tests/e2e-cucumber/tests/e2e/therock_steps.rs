@@ -1016,6 +1016,82 @@ async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
 }
 
 #[when(
+    "the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 on Python 3.12"
+)]
+async fn preview_pinned_wheel_install_on_python_312(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--python-version",
+            "3.12",
+            "--dry-run",
+        ],
+    );
+}
+
+#[when(
+    "the user tries to preview a wheel SDK install for arch gfx1200 with no version pin on Python 3.13"
+)]
+async fn try_preview_unpinned_wheel_install_on_python_313(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--python-version",
+            "3.13",
+            "--dry-run",
+        ],
+    );
+}
+
+/// The plan names the requested interpreter and its tag. The default's tag is
+/// checked absent too: a plan that printed both would pass the first two checks.
+#[then("the preview plans Python 3.12 and its cp312 wheel tag and not the default")]
+async fn preview_plans_requested_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "would use uv to install managed Python 3.12",
+        "python note",
+    );
+    assert_contains(world, "python_wheel_tag: cp312", "python wheel tag");
+    let out = stdout(world);
+    assert!(
+        !out.contains("cp314") && !out.contains("Python 3.14"),
+        "the default Python must not appear in the plan:\n{out}"
+    );
+}
+
+#[then(
+    "the preview is refused because the layout has no wheels for that Python, and prepared none"
+)]
+async fn preview_refused_for_unpublished_python(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("--python-version applies only to ROCm 10 and newer installs")
+            && stderr.contains("this install uses Python 3.12"),
+        "expected the refusal to name the Python that is allowed:\n{stderr}"
+    );
+    assert_no_python_prepared(world);
+}
+
+#[when(
     "the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain"
 )]
 async fn preview_pinned_wheel_install_with_devel(world: &mut E2eWorld) {
