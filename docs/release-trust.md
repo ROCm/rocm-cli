@@ -157,8 +157,12 @@ happen before activation. Run the current host's set with
 The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to
 `apt-get install`, which runs its maintainer scripts as root. rocm-cli therefore
 carries a SHA-256 digest for each published ROCDXG release and checks the
-download against it before the install step; on a mismatch the plan stops before
-anything runs as root. Verification is on by default and needs nothing set.
+package against it before the install step; on a mismatch the plan stops before
+the package's maintainer scripts run. The check is made on a copy root has
+placed in `/var/cache/rocm-cli/rocdxg/`, which only root can write, and that
+same file is what `apt-get install` reads, so no other local user can change
+the package between the check and the install. Verification is on by default
+and needs nothing set.
 
 `ROCM_CLI_ROCDXG_SHA256` supplies a digest for a release rocm-cli has none for,
 and overrides the pinned digest for one it does:

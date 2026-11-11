@@ -176,7 +176,7 @@ pub(super) fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diag
         fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
-            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. `rocm install driver` shows the full plan, and checks the download against a digest pinned for that ROCDXG release.".to_owned(),
+            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. `rocm install driver` shows the full plan, and checks the package against a digest pinned for that ROCDXG release after root has placed it where only root can write, so the file checked is the file installed.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -531,10 +531,21 @@ mod tests {
         // Verification is no longer something the user has to remember to turn
         // on: `rocm install driver` pins a digest per release. The note has to
         // say so, because a print-only recipe is all the user sees here.
+        //
+        // This pins the wording only. That the plan really checks the copy
+        // root installs, from a directory only root can write, is proved by
+        // `wsl_rocdxg_generated_steps_install_exactly_the_verified_file` in
+        // `apps/rocm/src/driver_plan/rocdxg.rs`, which executes the generated
+        // steps.
+        let note = fix
+            .notes
+            .iter()
+            .find(|n| n.contains("digest"))
+            .unwrap_or_else(|| panic!("must state that the package is verified: {:?}", fix.notes));
         assert!(
-            fix.notes.iter().any(|n| n.contains("digest")),
-            "must state that the download is verified: {:?}",
-            fix.notes
+            note.contains("only root can write")
+                && note.contains("the file checked is the file installed"),
+            "must state that the checked file is the root-placed copy that is installed: {note}"
         );
         assert!(
             fix.commands
