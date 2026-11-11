@@ -28,16 +28,16 @@
 //! `parse_device_policy`, `parse_gpu_selection`,
 //! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
 //! and `validate_pinned_gpu_index` moved out of `main.rs` into
-//! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); `resolve_engine_selection` and
+//! `gpu_policy.rs`; `resolve_engine_selection` and
 //! `validate_engine_selection_runtime` moved out of `main.rs` into
-//! `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this file's `use`
+//! `engine_runtime_select.rs`; this file's `use`
 //! list below points to both now instead of at the crate root. The
 //! managed-service-spawning tail this file calls into — `start_managed_service`,
 //! `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,
 //! `drop_orphaned_endpoint_key_on_already_running`, `print_managed_launch_plain`,
 //! `validate_bind_host`, `ensure_background_helper_running_quiet` — was relocated
-//! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
+//! to `service_launch.rs`, along with its test module;
 //! this file's `use` list below points there now instead of at the crate root.
 
 use anyhow::{Context as _, Result, bail};

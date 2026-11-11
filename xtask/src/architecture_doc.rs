@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Require every production source file to appear in `docs/architecture.md`.
+//! Require every production source file, and every file of the repository's own
+//! tooling and end-to-end harness, to appear in `docs/architecture.md`.
 //!
 //! `docs/architecture.md` is the contributor-facing module map and is meant to
 //! be "updated in the same PR as the code it documents". Nothing enforced that
@@ -19,8 +20,18 @@
 //! neither does a link missing its `[` or `)`, one with an escaped bracket, an
 //! image, or the outer brackets of a link that contains another link),
 //! or be a test-only helper (see [`is_test_helper`]). Out of scope: `build.rs`
-//! files at a crate's root and the `tests/` and `examples/` trees, which sit
-//! outside `<crate>/src`.
+//! files at a crate's root and the `tests/` and `examples/` trees of those
+//! crates, which sit outside `<crate>/src`.
+//!
+//! The same applies, without the helper exemption, to every tracked `.rs` file
+//! under `xtask/src`, `tests/e2e-cucumber/src` and `tests/e2e-cucumber/tests`
+//! (see [`HAND_KEPT_TREES`]): the tooling and the harness are not part of a
+//! release, but their tables in the doc used to be kept current by hand, and
+//! nothing noticed a file added without a row. The `tests/` tree of that
+//! harness is its step definitions and its drift guards, so it is covered as
+//! well as its `src/`. Every file in those trees needs a link, including a
+//! file named like a helper, because a file added there is not shared test
+//! support of a production crate.
 //!
 //! It reads the git index and the working tree, never a git diff, so the answer
 //! does not depend on a base ref. That is the same answer in CI and in the
@@ -53,15 +64,38 @@ const DOC_DIR: &str = "docs";
 /// Source roots whose `<crate>/src` trees are in scope.
 const SOURCE_ROOTS: [&str; 3] = ["apps", "crates", "engines"];
 
-/// Whether `path` is a tracked-file path this check covers: a `.rs` file under
-/// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
+/// The repository's own tooling and end-to-end harness: directory prefixes
+/// whose `.rs` files are in scope with no helper exemption.
+const HAND_KEPT_TREES: [&str; 3] = [
+    "xtask/src/",
+    "tests/e2e-cucumber/src/",
+    "tests/e2e-cucumber/tests/",
+];
+
+/// Everything `git ls-files` is asked for: the [`SOURCE_ROOTS`] and the roots
+/// the [`HAND_KEPT_TREES`] sit under.
+const TRACKED_ROOTS: [&str; 5] = ["apps", "crates", "engines", "xtask", "tests/e2e-cucumber"];
+
+/// Whether `path` is a `.rs` file under `<root>/<crate>/src/` for one of the
+/// [`SOURCE_ROOTS`].
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // Rust sources are always lowercase `.rs`
-fn in_scope(path: &str) -> bool {
+fn in_product_scope(path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').collect();
     parts.len() >= 4
         && SOURCE_ROOTS.contains(&parts[0])
         && parts[2] == "src"
         && path.ends_with(".rs")
+}
+
+/// Whether `path` is a `.rs` file under one of the [`HAND_KEPT_TREES`].
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Rust sources are always lowercase `.rs`
+fn in_hand_kept_scope(path: &str) -> bool {
+    path.ends_with(".rs") && HAND_KEPT_TREES.iter().any(|tree| path.starts_with(tree))
+}
+
+/// Whether `path` is a tracked-file path this check covers.
+fn in_scope(path: &str) -> bool {
+    in_product_scope(path) || in_hand_kept_scope(path)
 }
 
 /// Whether `path` is a test-only helper that does not need an architecture
@@ -389,7 +423,10 @@ fn check(tracked: &[String], cited: &BTreeSet<String>) -> Vec<String> {
     let mut violations = Vec::new();
 
     for path in &in_tree {
-        if !cited.contains(*path) && !is_test_helper(path) {
+        // The helper exemption is for a production crate's shared test support;
+        // a file in the tooling or harness trees needs its row like any other.
+        let exempt = in_product_scope(path) && is_test_helper(path);
+        if !cited.contains(*path) && !exempt {
             violations.push(format!(
                 "`{path}` is not cited in {DOC}: add an entry for it to the module map, as an \
                  inline `[text](path)` markdown link relative to docs/ (reference-style links, \
@@ -401,13 +438,13 @@ fn check(tracked: &[String], cited: &BTreeSet<String>) -> Vec<String> {
     violations
 }
 
-/// Tracked files under the [`SOURCE_ROOTS`], as the index lists them.
+/// Tracked files under the [`TRACKED_ROOTS`], as the index lists them.
 fn tracked_files(root: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["ls-files", "-z", "--"])
-        .args(SOURCE_ROOTS)
+        .args(TRACKED_ROOTS)
         .output()
         .context("failed to run `git ls-files`")?;
     if !output.status.success() {
@@ -430,7 +467,7 @@ fn violations_in(root: &Path) -> Result<Vec<String>> {
     Ok(check(&tracked_files(root)?, &cited_paths(&doc)))
 }
 
-/// Fail if a production source file has no entry in `docs/architecture.md`.
+/// Fail if a file in scope has no entry in `docs/architecture.md`.
 pub fn run() -> Result<()> {
     let root = paths::workspace_root()?;
     let violations = violations_in(&root)?;
@@ -485,11 +522,64 @@ mod tests {
             "apps/rocm/tests/broken_pipe.rs",
             "apps/rocm/build.rs",
             "crates/rocm-dash-tui/examples/gen_cast.rs",
-            "xtask/src/anything.rs",
             "apps/rocm/src/data.json",
-            "tests/e2e-cucumber/src/lib.rs",
+            "xtask/build.rs",
+            "xtask/Cargo.toml",
+            "xtask/tests/anything.rs",
+            "tests/e2e-cucumber/build.rs",
+            "tests/e2e-cucumber/features/chat.feature",
+            "tests/e2e-cucumber/examples/anything.rs",
+            "tests/other-suite/src/lib.rs",
+            "tests/e2e-cucumber/srcs/anything.rs",
         ]);
         assert!(check(&tracked, &cites(&[])).is_empty());
+    }
+
+    #[test]
+    fn a_tooling_or_harness_file_with_no_entry_fails_and_is_named() {
+        for path in [
+            "xtask/src/brand_new.rs",
+            "xtask/src/nested/brand_new.rs",
+            "tests/e2e-cucumber/src/brand_new.rs",
+            "tests/e2e-cucumber/src/bin/brand-new.rs",
+            "tests/e2e-cucumber/tests/e2e.rs",
+            "tests/e2e-cucumber/tests/e2e/brand_new_steps.rs",
+        ] {
+            let violations = check(&files(&[path]), &cites(&[]));
+            assert_eq!(violations.len(), 1, "{path} must need an entry");
+            assert!(violations[0].contains(path));
+            assert!(violations[0].contains("is not cited"));
+        }
+    }
+
+    #[test]
+    fn a_tooling_or_harness_file_with_an_entry_passes() {
+        let paths = [
+            "xtask/src/main.rs",
+            "tests/e2e-cucumber/src/lib.rs",
+            "tests/e2e-cucumber/tests/e2e/chat_steps.rs",
+        ];
+        assert!(check(&files(&paths), &cites(&paths)).is_empty());
+    }
+
+    #[test]
+    fn a_citation_does_not_cover_the_same_name_in_the_other_tree() {
+        let violations = check(
+            &files(&["xtask/src/paths.rs", "tests/e2e-cucumber/src/paths.rs"]),
+            &cites(&["xtask/src/paths.rs"]),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("tests/e2e-cucumber/src/paths.rs"));
+    }
+
+    #[test]
+    fn a_file_named_like_a_helper_needs_an_entry_in_the_tooling_and_harness_trees() {
+        let tracked = files(&[
+            "xtask/src/test_support.rs",
+            "tests/e2e-cucumber/src/world_props.rs",
+            "tests/e2e-cucumber/tests/chat_proptests.rs",
+        ]);
+        assert_eq!(check(&tracked, &cites(&[])).len(), 3);
     }
 
     #[test]
@@ -781,6 +871,26 @@ mod tests {
                 "apps/rocm/src/c.rs"
             ])
         );
+    }
+
+    #[test]
+    fn the_git_listing_includes_the_tooling_and_harness_trees() {
+        // `check` only sees what `tracked_files` lists, so a listing that stopped
+        // at the product roots would leave the new scope silently empty.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask crate has a parent directory");
+        let listed = tracked_files(root).expect("git is readable in a checkout");
+        for expected in [
+            "xtask/src/architecture_doc.rs",
+            "tests/e2e-cucumber/src/lib.rs",
+            "tests/e2e-cucumber/tests/e2e.rs",
+        ] {
+            assert!(
+                listed.iter().any(|path| path == expected),
+                "{expected} is missing from the tracked-file listing"
+            );
+        }
     }
 
     #[test]

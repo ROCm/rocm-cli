@@ -8,13 +8,13 @@
 //! Relocated from `main.rs`, since extended with the port-allocation and
 //! launch-lock transaction. This module
 //! is the managed-service-spawning tail that was deliberately deferred out of
-//! the Phase 6a (ROCMAI-82) split: `start_managed_service`,
+//! the earlier relocation of the service-record code: `start_managed_service`,
 //! `run_attached_service`, `spawn_managed_engine_child`, `stream_attached_logs`,
 //! and the rest of what was then a single file. It was entangled with crate-root launch helpers
 //! — `record_cli_audit_event`, `existing_live_managed_service_in`, and the stop
 //! action of the service-record-management cluster (this module reaches only
 //! stop, via `AttachOutcome::Stop`; restart/remove/prune are not called here)
-//! — and this later pass (ROCMAI-91, Phase 6b) separates the spawning tail out
+//! — and this later pass separates the spawning tail out
 //! from them; see below for where they live now.
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
