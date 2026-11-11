@@ -3478,9 +3478,17 @@ async fn unsupported_gpu_without_vulkan(world: &mut E2eWorld) {
 }
 
 /// The *common* no-driver shape, and the one examine-51 does not cover: a host
-/// with no ICD and no `vulkaninfo` to ask. `plant_unsupported_gpu` always writes
-/// a `vulkaninfo`, so this removes it again — the probe must then report that it
+/// with no ICD and no `vulkaninfo` to ask. The probe must then report that it
 /// could not confirm, rather than either promising Vulkan or declaring it absent.
+///
+/// Deleting the planted stub is not enough on its own, and doing only that would
+/// contradict `plant_unsupported_gpu`'s own "planted in both directions" reason:
+/// that function leaves the runner's `PATH` on the end, so a CI host with a real
+/// `vulkaninfo` installed would answer for the fixture and this scenario would
+/// describe the runner rather than the planted machine. So `PATH` is narrowed to
+/// the fake directory as well. `lspci` stays in it, and the fake executables are
+/// `#!/bin/sh` scripts reached by absolute path, so nothing else the probe needs
+/// is lost — only the ability to find a `vulkaninfo` anywhere.
 #[given("a machine whose GPU has no official support and no way to check Vulkan")]
 async fn unsupported_gpu_without_vulkaninfo(world: &mut E2eWorld) {
     plant_unsupported_gpu(world, None, None);
@@ -3491,6 +3499,11 @@ async fn unsupported_gpu_without_vulkaninfo(world: &mut E2eWorld) {
         .path()
         .join("fake-bin");
     std::fs::remove_file(bin.join("vulkaninfo")).expect("failed to remove the planted vulkaninfo");
+    // Pushed after `plant_unsupported_gpu`'s own entry: `command_env` is applied
+    // in order, so this is the `PATH` the child sees.
+    let path =
+        std::env::join_paths(std::iter::once(bin)).expect("fake-bin cannot hold a separator");
+    world.command_env.push(("PATH", path));
 }
 
 #[then("the inspection says it could not confirm whether a Vulkan driver is there")]

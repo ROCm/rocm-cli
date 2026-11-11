@@ -100,18 +100,18 @@ impl ExamineSummary {
                         "Vulkan was not probed on this platform, so the Vulkan backend is \
                          unconfirmed"
                             .to_owned(),
-                    VulkanStatus::Inconclusive =>
-                        "no Vulkan driver was found, and `vulkaninfo` is not installed to \
-                         confirm it"
-                            .to_owned(),
-                    VulkanStatus::Absent => "no Vulkan GPU driver was found".to_owned(),
+                    // Unreachable: `gpu_support_level` routes `Inconclusive` to
+                    // `VulkanUnconfirmed` and `Absent` to `NoGpuBackend`, so
+                    // neither can arrive under `VulkanOnly`. Kept spelled out
+                    // rather than folded into a `_` so that adding a
+                    // `VulkanStatus` stays a compile error here, and worded
+                    // hedged rather than promising so that a future routing
+                    // change cannot silently resurrect the claim this level
+                    // exists to stop making.
+                    VulkanStatus::Inconclusive | VulkanStatus::Absent =>
+                        "the Vulkan backend is unconfirmed".to_owned(),
                 }
             ),
-            // Both halves are established facts: the catalog confirmed there is
-            // no ROCm build, and the probe looked for a Vulkan driver and found
-            // none. Unlike `Unknown` below, there is nothing left to go and find
-            // out on this host, so the advice is to install a driver rather than
-            // to serve a model and read back what happened.
             // Looked at, nothing found, and nothing that could have found it.
             // Says what was searched and how to settle it, rather than either
             // promising a backend or declaring one absent — neither of which
@@ -123,26 +123,18 @@ impl ExamineSummary {
                  driver on Windows) to run models on this GPU\n",
                 detected.unwrap_or_default()
             ),
+            // Both halves are established facts: the catalog confirmed there is
+            // no ROCm build, and the probe looked for a Vulkan driver and found
+            // none. Unlike `VulkanUnconfirmed` above, there is nothing left to
+            // go and find out on this host, so "install a driver" is the whole
+            // story. Only `Absent` reaches this level — `gpu_support_level`
+            // routes the probed-but-inconclusive host to `VulkanUnconfirmed`
+            // precisely so that this sentence is never said to one.
             GpuSupportLevel::NoGpuBackend => format!(
-                "  rocm_support: GPU detected ({}) but not supported by ROCm, and {}\n",
-                detected.unwrap_or_default(),
-                // Two different evidentiary states reach this level, and they
-                // owe the user different sentences. `Absent` is a confirmed
-                // negative — the probe found something and ruled it out, so
-                // "install a driver" is the whole story. `Inconclusive` was
-                // looked at and showed nothing either way; claiming a
-                // confirmed absence there would tell a host that already has a
-                // working driver to install one, so it names the gap and the
-                // way to close it.
-                match vulkan {
-                    VulkanStatus::Inconclusive =>
-                        "no Vulkan GPU driver was found either - `vulkaninfo` is not installed, \
-                         so install it to check, or install a driver (Mesa RADV on Linux, the \
-                         AMD display driver on Windows) to run models on this GPU",
-                    _ =>
-                        "no Vulkan GPU driver was found - install one (Mesa RADV on Linux, the \
-                         AMD display driver on Windows) to run models on this GPU",
-                }
+                "  rocm_support: GPU detected ({}) but not supported by ROCm, and no Vulkan GPU \
+                 driver was found - install one (Mesa RADV on Linux, the AMD display driver on \
+                 Windows) to run models on this GPU\n",
+                detected.unwrap_or_default()
             ),
             // The covering family is the fact; it is already printed on its own
             // line above, so this one says what it means rather than repeating

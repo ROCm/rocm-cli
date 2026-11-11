@@ -614,8 +614,9 @@ pub enum GpuSupportLevel {
 /// the detected gfx target and whichever TheRock family (if any) covers it —
 /// plus what the Vulkan probe found.
 ///
-/// `vulkan` only ever decides between [`GpuSupportLevel::VulkanOnly`] and
-/// [`GpuSupportLevel::NoGpuBackend`], and is consulted only once the catalog has
+/// `vulkan` only ever decides between [`GpuSupportLevel::VulkanOnly`],
+/// [`GpuSupportLevel::VulkanUnconfirmed`] and [`GpuSupportLevel::NoGpuBackend`],
+/// and is consulted only once the catalog has
 /// confirmed there is no ROCm build. A host with a covering family is `RocmHip`
 /// whatever Vulkan reports, and an unrecognized target stays `Unknown`: finding
 /// a Vulkan driver says nothing about whether ROCm would also work there, so it
@@ -1154,10 +1155,6 @@ mod tests {
         );
     }
 
-    /// The defect this guards against: `VulkanOnly` used to be inferred from the
-    /// gfx table alone, so a Renoir laptop with no Vulkan driver installed — or
-    /// with only a CPU rasteriser — was told to go and serve a model on a
-    /// backend that cannot start.
     /// The common no-driver host: no ICD, no device, and no `vulkaninfo` to
     /// ask. It must not be promised a Vulkan path — that is the symptom this
     /// change exists to remove, and it is the usual shape, since a host with no

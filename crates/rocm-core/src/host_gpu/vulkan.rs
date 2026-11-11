@@ -429,7 +429,14 @@ pub fn classify_vulkan_support(
                 devices,
             };
         }
-        let detail = if icds.is_empty() {
+        // A device that enumerated is proof a driver answered, so "no Vulkan
+        // driver found" would be false here even though no ICD manifest was
+        // read: the ICD search is not exhaustive, and `vulkaninfo` can see a
+        // driver it misses. Say what was actually established — hardware
+        // answered, none of it AMD — rather than denying the driver.
+        let detail = if !devices.is_empty() {
+            "Vulkan devices were enumerated, but none of them is an AMD GPU".to_owned()
+        } else if icds.is_empty() {
             "no Vulkan driver found".to_owned()
         } else {
             "only a software (CPU) Vulkan driver is installed; that is not a GPU path".to_owned()
@@ -702,8 +709,16 @@ GPU1:
         );
     }
 
+    /// Pins a **known limitation**, not a desired behavior: an enumeration that
+    /// returned only non-AMD hardware is not treated as evidence against an AMD
+    /// Vulkan path, so such a host is still routed to `VulkanOnly` and told to
+    /// serve a model. An earlier name for this test claimed the opposite ("does
+    /// not make Vulkan an AMD path") while asserting exactly this, which hid the
+    /// limitation behind a reassuring name. Asserting the routing too, rather
+    /// than only the status, is what keeps that from happening again: if this is
+    /// ever tightened, this test fails and has to be rewritten deliberately.
     #[test]
-    fn a_non_amd_gpu_does_not_make_vulkan_an_amd_path() {
+    fn a_non_amd_only_enumeration_is_still_routed_to_vulkan_today() {
         let nvidia = "\
 GPU0:
 \tvendorID     = 0x10de
@@ -718,9 +733,44 @@ GPU0:
             true,
         );
 
-        // The driver is installed and is not software, so the honest answer is
-        // "unverified for AMD", not "available".
+        // The driver is installed and is not software, so the status stops short
+        // of "available" — but it is still `is_usable()`.
         assert_eq!(support.status, VulkanStatus::DriverPresentDevicesUnverified);
+        assert_eq!(
+            crate::gfx_target::gpu_support_level(Some("gfx90c"), None, support.status),
+            crate::gfx_target::GpuSupportLevel::VulkanOnly,
+            "today a non-AMD-only enumeration still promises this host a Vulkan path; \
+             this is the documented limitation, and changing it must break this test"
+        );
+    }
+
+    /// A device that enumerated is proof a driver answered, so the report must
+    /// not deny one just because no ICD manifest was read: the ICD search is a
+    /// fixed directory list that `vulkaninfo` can see past. The earlier wording
+    /// said "no Vulkan driver found" on exactly this host, which is false.
+    #[test]
+    fn an_enumerated_non_amd_device_is_not_reported_as_a_missing_driver() {
+        let nvidia = "\
+GPU0:
+\tvendorID     = 0x10de
+\tdeviceType   = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+\tdeviceName   = NVIDIA GeForce GTX 1050 Ti
+\tdriverName   = NVIDIA
+";
+        // No ICD manifest at all, so the pre-fix code fell to "no Vulkan driver
+        // found" despite the enumeration above.
+        let support =
+            classify_vulkan_support(Vec::new(), parse_vulkaninfo_summary(nvidia), true, true);
+
+        let detail = support.detail.as_deref().unwrap_or_default();
+        assert!(
+            !detail.contains("no Vulkan driver found"),
+            "a driver answered with a device, so it cannot be reported missing: {support:?}"
+        );
+        assert!(
+            detail.contains("none of them is an AMD GPU"),
+            "the report should say what was established: {support:?}"
+        );
     }
 
     #[test]
