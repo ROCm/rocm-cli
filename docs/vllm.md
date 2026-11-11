@@ -69,6 +69,17 @@ torch back. The trade-off: under the opt-out a genuinely broken torchvision,
 torchaudio or triton (including one that is not installed at all) is neither
 reported as a violation nor repaired.
 
+The opt-out also applies to `rocm install sdk` run over a runtime that already
+holds torch. That command normally hands `uv` the SDK's `torch`, `torchvision`
+and `torchaudio` along with `rocm`, which replaces the stack the engine or you
+installed (and `triton` with it). With the variable set it asks for the ROCm
+packages alone and leaves the torch stack where it is: the plan prints a
+`torch_kept:` line naming the torch it found, and `rocm install sdk --dry-run`
+shows the same reduced `command:`. A runtime with no torch yet, or an
+environment recreated for another Python, still gets the full stack, since
+there is nothing to keep. The runtime's recorded composition (and so its
+runtime key and `rocm update` comparison) is unchanged.
+
 Use it when you are deliberately running a torch that the alignment would
 replace, such as a locally built wheel, a version under test, or a stack pinned
 for a reproduction. It is an escape hatch, not a supported configuration: the

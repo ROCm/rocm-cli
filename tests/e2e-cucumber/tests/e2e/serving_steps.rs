@@ -3221,10 +3221,15 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
     // that scenario in model_serving.feature). What remains asserted is the
     // half that is a real invariant: the two surfaces read one engine over one
     // RPC, so where both speak they must say the same thing.
-    let summary = world
-        .serve_summary
-        .as_deref()
-        .expect("the Given step must have recorded the serve summary");
+    // And only when a summary was recorded at all. The backend assertion above
+    // is this step's real invariant and has already run; the cross-surface
+    // comparison is an extra that needs a Given which captured `rocm serve`'s
+    // own output. serve-05 and serve-07 both have one today, but panicking here
+    // would fail any future scenario reusing this Then for the backend check
+    // alone — a failure about the fixture rather than about the product.
+    let Some(summary) = world.serve_summary.as_deref() else {
+        return;
+    };
     if let Some(summary_device) = device_row_value(summary) {
         assert_eq!(
             summary_device, device,

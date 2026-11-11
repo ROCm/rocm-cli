@@ -222,6 +222,9 @@ const fn stdio_options<'a>(
         app_paths: paths,
         env_root,
         endpoint_key_file: None,
+        // An external plugin is a third-party binary: never hand it a path to
+        // a live endpoint credential, including one we inherited ourselves.
+        withhold_inherited_key_file: true,
         request_progress: stream_progress,
         forward_stderr: true,
         note_failing_exit_after_answer: false,
@@ -469,6 +472,26 @@ where
 /// applies equally to the chat `services` tool, which renders through the same
 /// [`crate::services_text::render_services_text`].
 ///
+/// # The decision, recorded (review on #678)
+///
+/// This is accepted rather than merely observed. `rocm services list` and the
+/// chat `services` tool can both block ~18s on a host whose engines are slow to
+/// answer, and for the duration the built-in probe holds the process-wide
+/// engine env lock [`with_scoped_builtin_engine_env`] takes, so a concurrent
+/// caller waits behind it.
+///
+/// Two cheaper options were considered and not taken. Moving the probe off the
+/// render path means the row stops reflecting the host at the moment it is
+/// printed, which is the whole reason ROCMAI-550 added it — the `device:` row
+/// exists to answer "what is this actually running on *now*". Probing once and
+/// printing nothing for the rest makes the output depend on service ordering,
+/// which reads as a bug to anyone who lists twice and sees different rows.
+///
+/// Both remain reasonable calls and this one is reversible: it is a constant and
+/// a start gate, not a structural choice. If a maintainer prefers a 10s hard
+/// cap, the change is a per-probe deadline, which needs a cancellable probe
+/// (see below) rather than a smaller number here.
+///
 /// Why not a per-probe deadline that would hold the total at 10s: the probe is
 /// `engine_request`, which for a built-in engine is a synchronous in-process
 /// call and for an external plugin is a `wait()` on a spawned child. Neither
@@ -687,6 +710,30 @@ mod tests {
             assert_eq!(
                 device_worth_reporting(device.to_owned()),
                 Some(device.to_owned())
+            );
+        }
+    }
+
+    /// `rocm` must actually ASK for the withholding, not merely be able to.
+    ///
+    /// The protocol crate's own test proves the flag causes the clearing; this
+    /// is the other half of the chain, and without it flipping the value here
+    /// to `false` would re-open the leak with every test still green. Asserted
+    /// on `stdio_options` rather than on a built `Command` because
+    /// `engine_stdio_command` is private to the protocol crate.
+    #[test]
+    fn every_external_plugin_spawn_asks_to_withhold_the_endpoint_key_file() {
+        for stream_progress in [false, true] {
+            let options = stdio_options(None, None, stream_progress);
+            assert!(
+                options.withhold_inherited_key_file,
+                "an engine plugin is a third-party binary: `rocm` must withhold \
+                 an inherited key-file path from it, whatever else this request \
+                 asks for"
+            );
+            assert!(
+                options.endpoint_key_file.is_none(),
+                "and it must never hand one over either"
             );
         }
     }

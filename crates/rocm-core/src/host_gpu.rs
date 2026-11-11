@@ -517,6 +517,16 @@ pub fn pinned_gpu_name(gpu_indices: &[u32]) -> Option<String> {
     // launch path. The read is eager rather than lazy only on the platform that
     // uses it: off Windows nothing is probed here at all, and on Windows the
     // count already needed it before any of the decisions below could run.
+    //
+    // The cost, stated rather than implied (raised in review on #678): this
+    // deduplicates *within* a call and is **not** cached across calls. Each
+    // engine's `write_running_state` calls it, and that runs more than once per
+    // launch (`starting`, then `running`), so a Windows launch pays that many
+    // PowerShell/CIM probes. It is on the launch path only — no request path
+    // reaches it — which is why the cost is accepted rather than cached: a
+    // cache would have to be invalidated on GPU hotplug to stay correct, and no
+    // caller is hot enough to earn that. Unverified on Windows; nothing
+    // available to this change can build the MSVC target.
     let windows_inventory = runtime_is_windows()
         .then(detect_windows_examine_inventory)
         .flatten();

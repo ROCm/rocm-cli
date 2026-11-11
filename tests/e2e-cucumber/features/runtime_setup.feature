@@ -70,14 +70,16 @@ Feature: Runtime configuration
   # see. This is the same reinstall as scenario 4 with the opt-out set, so what
   # differs between them is exactly the variable.
   #
-  # Four claims across three Thens, because the opt-out is only coherent if all
-  # four hold: torch was not rewritten; the skip is reported as its own verdict
-  # rather than folded into the generic `not_applicable`, which would leave the
-  # user unable to tell whether the variable did anything; the divergence the
-  # opt-out deliberately leaves behind is not then sold back to that user as a
-  # runtime to repair by reinstalling the engine — an instruction that would undo
-  # what they asked for; and the checks the opt-out does not suppress still run,
-  # because it suppresses the correction, not the diagnosis.
+  # Four claims, because the opt-out is only coherent if all four hold: torch
+  # was not rewritten by the alignment; the SDK install itself did not rewrite
+  # it either — it hands `uv` the torch requirements too, so
+  # before it honoured the opt-out the engine's torch was replaced by the SDK's
+  # build in the same command that reported the opt-out, and a GPU on which that
+  # build opens no device failed the install; the divergence the opt-out
+  # deliberately leaves behind is not then sold back to that user as a runtime to
+  # repair by reinstalling the engine — an instruction that would undo what they
+  # asked for; and the checks the opt-out does not suppress still run, because it
+  # suppresses the correction, not the diagnosis.
   #
   # Same lane as scenario 4 and for the same reasons: a real SDK install and a
   # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
@@ -88,6 +90,7 @@ Feature: Runtime configuration
     And the user has opted out of realigning torch
     When the user installs the SDK again
     Then the torch alignment reports the opt-out instead of rewriting torch
+    And the SDK install leaves the torch the runtime held as it was
     And the install does not offer to reinstall the engine over the kept torch
     And the runtime's device health is still reported
 
