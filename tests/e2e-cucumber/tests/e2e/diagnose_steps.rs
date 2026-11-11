@@ -331,6 +331,16 @@ async fn user_chose_path_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-6-path".to_string());
 }
 
+#[given("a user who has chosen the fix for a missing render group")]
+async fn user_chose_render_group_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen the fix for a framework wheel built for another ROCm release")]
+async fn user_chose_wheel_mismatch_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-8-wheel-rocm".to_string());
+}
+
 #[then(
     "the printed commands and verify line avoid the constructs known to break in Windows PowerShell"
 )]
@@ -448,6 +458,40 @@ async fn assert_notes_name_the_runtime_only_case(world: &mut E2eWorld) {
                     && note.contains("Verify (Linux, WSL)")
             })),
         "no note names the runtime-only case:\n{output}"
+    );
+}
+
+#[then(
+    "the printed verify line checks the user's groups and shows who owns the GPU compute device"
+)]
+async fn assert_render_group_verify_shows_the_kfd_owner(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // The cause also fires when `/dev/kfd` belongs to a group other than
+    // `render`, so the check has to show which group that is. Text only: the
+    // line needs a Linux GPU host to run. That `rocm diagnose` prints this same
+    // line is held by `the_render_group_fix_verify_matches_the_catalog_copy` in
+    // crates/rocm-core/src/diagnose/linux.rs; both read one constant.
+    assert!(
+        verify.starts_with("groups ") && verify.contains("ls -l /dev/kfd"),
+        "the verify line must check the groups and list /dev/kfd: {verify}"
+    );
+}
+
+#[then("the printed title names the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_title_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let title = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Fix:"))
+        .unwrap_or_else(|| panic!("the preview printed no Fix: line:\n{output}"))
+        .trim();
+    // Text only. The comparison the title describes, `X.Y` and not the bare
+    // major, is held by `the_wheel_mismatch_compares_the_x_y_release_and_says_so`
+    // in crates/rocm-core/src/diagnose/host.rs.
+    assert!(
+        title.contains("X.Y") && !title.contains("major"),
+        "the title must name the X.Y release it compares: {title}"
     );
 }
 
@@ -2993,6 +3037,60 @@ fn diagnose_verify_line(output: &str, fix_id: &str) -> String {
         })
         .trim()
         .to_owned()
+}
+
+#[when("the user diagnoses this machine with a ROCm runtime library load failure")]
+async fn user_diagnoses_runtime_library_load_failure(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "libamdhip64.so.6: cannot open shared object file",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the wheel mismatch cause and its plan name the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_cause_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // The symptom alone raises this cause on every OS it is scoped to, whatever
+    // the host's own ROCm, so every lane sees the block. Text only: the
+    // comparison it describes is held by
+    // `the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+    // crates/rocm-core/src/diagnose/host.rs.
+    let block = cause_block(output, "fix-8-wheel-rocm");
+    assert!(
+        !block.is_empty(),
+        "no `fix-8-wheel-rocm` cause was reported:\n{output}"
+    );
+    let header = block[0];
+    assert!(
+        header.contains("X.Y release"),
+        "the cause's title must name the X.Y release: {header}"
+    );
+    let plan = block
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("plan:"))
+        .unwrap_or_else(|| panic!("the cause printed no plan:\n{}", block.join("\n")));
+    assert!(
+        plan.contains("X.Y release"),
+        "the plan must name the X.Y release: {plan}"
+    );
+    let says_major: Vec<&str> = block
+        .iter()
+        .copied()
+        .filter(|line| line.contains("major"))
+        .collect();
+    assert!(
+        says_major.is_empty(),
+        "the cause still calls the X.Y release a major: {says_major:?}"
+    );
 }
 
 #[given("a Linux machine whose shell has a GPU override set")]

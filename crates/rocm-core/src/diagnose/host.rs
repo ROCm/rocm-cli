@@ -60,8 +60,8 @@ pub(super) fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagn
         summary: "Reinstall the framework from a wheel index that includes this GPU's gfx target. Use HSA_OVERRIDE_GFX_VERSION ONLY as a temporary workaround when no native wheel exists.".to_owned(),
         commands: vec![
             "# Recommended: a PyTorch ROCm nightly, which often carries kernels a".to_owned(),
-            "# release has not shipped yet. Pick the nightly for the ROCm major you".to_owned(),
-            "# have, not an older one.".to_owned(),
+            "# release has not shipped yet. Pick the nightly for the ROCm X.Y release".to_owned(),
+            "# you have, not an older one.".to_owned(),
             "pip uninstall -y torch torchvision torchaudio".to_owned(),
             "pip install --pre torch torchvision torchaudio \\\n  --index-url https://download.pytorch.org/whl/nightly/rocm7.14".to_owned(),
             "# llama.cpp: rebuild with AMDGPU_TARGETS set to this GPU's gfx.".to_owned(),
@@ -299,14 +299,14 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
         &e.rocm_version
     };
 
-    let fw_major = major_version(fw_rocm);
-    let sys_major = major_version(sys_rocm);
+    let fw_release = major_minor(fw_rocm);
+    let sys_release = major_minor(sys_rocm);
     // Only meaningful when the framework resolves its HIP from the system. A
     // managed runtime's torch loads it from a sibling `_rocm_sdk_core` package
-    // inside the runtime, so its HIP major is free to differ from the system's
+    // inside the runtime, so its HIP release is free to differ from the system's
     // on a completely healthy host — and "reinstall torch" would be wrong there.
     let framework_uses_system_rocm = e.framework_source != "managed-runtime";
-    if let (Some(fw), Some(sys)) = (&fw_major, &sys_major)
+    if let (Some(fw), Some(sys)) = (&fw_release, &sys_release)
         && fw != sys
         && framework_uses_system_rocm
     {
@@ -326,12 +326,12 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
     }
     let fix = if windows {
         Fix {
-            summary: "Reinstall the framework against the HIP SDK major you have installed (or install the HIP SDK major the wheel needs).".to_owned(),
+            summary: "Reinstall the framework against the HIP SDK X.Y release you have installed (or install the HIP SDK X.Y release the wheel needs).".to_owned(),
             commands: vec![
                 "pip uninstall -y torch torchvision torchaudio".to_owned(),
                 "# TheRock publishes Windows ROCm wheels per HIP SDK release:".to_owned(),
                 "#   https://github.com/ROCm/TheRock".to_owned(),
-                "# Match the wheel index to the HIP SDK major you have on disk.".to_owned(),
+                "# Match the wheel index to the HIP SDK X.Y release you have on disk.".to_owned(),
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
@@ -340,10 +340,10 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
         }
     } else {
         Fix {
-            summary: "Reinstall the framework from the wheel index that matches the system ROCm major (or upgrade the system ROCm to match the wheel).".to_owned(),
+            summary: "Reinstall the framework from the wheel index that matches the system ROCm X.Y release (or upgrade the system ROCm to match the wheel).".to_owned(),
             commands: vec![
                 "pip uninstall -y torch torchvision torchaudio".to_owned(),
-                "# Install the index for the ROCm major `rocm examine` reports:".to_owned(),
+                "# Install the index for the ROCm X.Y release `rocm examine` reports:".to_owned(),
                 "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14".to_owned(),
                 "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:".to_owned(),
                 "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0".to_owned(),
@@ -357,15 +357,21 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
     };
     finalize(
         "fix-8-wheel-rocm",
-        "Framework wheel built for a different ROCm major than the system",
+        "Framework wheel built for a different ROCm X.Y release than the system",
         score,
         evidence,
         fix,
     )
 }
 
-/// Extract `X.Y` from a version-ish string.
-fn major_version(s: &str) -> Option<String> {
+/// Extract the `X.Y` release line from a version-ish string: `6.4` from
+/// `hip=6.4.43482` or `6.4.1`.
+///
+/// `check_8` compares this, not the bare major, on purpose: ROCm PyTorch wheels
+/// are built and indexed per `X.Y` (`whl/rocm6.4`), so a torch built for 6.3
+/// beside a system 6.4 is a mismatch even though both are ROCm 6. The patch
+/// level is dropped because the wheel index does not carry it.
+fn major_minor(s: &str) -> Option<String> {
     let re = Regex::new(r"(\d+)\.(\d+)").ok()?;
     let caps = re.captures(s)?;
     Some(format!("{}.{}", &caps[1], &caps[2]))
@@ -553,9 +559,9 @@ mod tests {
     use crate::fix::{OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, torch_rocm_indexes_named_in};
     use crate::rocm_install::discover_rocm_installs_in;
 
-    /// A host whose framework HIP major differs from its system ROCm: torch on
-    /// HIP 7, a system ROCm 6 beside it.
-    fn hip_major_differs_from_system_rocm(framework_source: &str) -> Examination {
+    /// A host whose framework HIP release differs from its system ROCm: torch on
+    /// HIP 7.14, a system ROCm 6.4 beside it.
+    fn hip_release_differs_from_system_rocm(framework_source: &str) -> Examination {
         Examination {
             framework: "pytorch".to_owned(),
             framework_rocm_version: "hip=7.14.60850".to_owned(),
@@ -567,8 +573,8 @@ mod tests {
 
     /// A remedy has to be able to resolve the mismatch that produced it.
     ///
-    /// `check_8` fires when the framework's HIP major differs from the system
-    /// ROCm major, and tells the user to pick the wheel index matching their
+    /// `check_8` fires when the framework's HIP `X.Y` release differs from the
+    /// system ROCm's, and tells the user to pick the wheel index matching their
     /// system. If every index it names is older than any ROCm this CLI installs,
     /// there is nothing to pick: following the instruction installs a torch for
     /// a major the machine does not have, and this same check fires again on the
@@ -619,12 +625,12 @@ mod tests {
     fn a_managed_runtimes_hip_is_not_measured_against_the_system_rocm() {
         // A managed runtime's torch loads HIP from a sibling `_rocm_sdk_core`
         // package inside the runtime, never from the system install, so the two
-        // majors are free to differ on a perfectly healthy host. Before
+        // releases are free to differ on a perfectly healthy host. Before
         // `examine` probed the runtime this could not fire, because the field it
         // reads was always empty; now that it is populated, the comparison has
         // to be told when it is meaningless -- or fixing the probe would hand
         // every such host a spurious "reinstall torch".
-        let managed = diagnose(&hip_major_differs_from_system_rocm("managed-runtime"), "");
+        let managed = diagnose(&hip_release_differs_from_system_rocm("managed-runtime"), "");
         assert!(
             !managed.matched.iter().any(|d| d.id == "fix-8-wheel-rocm"),
             "a managed runtime must not be told to reinstall torch: {:?}",
@@ -638,17 +644,58 @@ mod tests {
         // The same host, same versions, with torch coming from the ambient
         // interpreter: there the comparison is exactly right, and the checker
         // must keep its full strength.
-        let ambient = diagnose(&hip_major_differs_from_system_rocm("path"), "");
+        let ambient = diagnose(&hip_release_differs_from_system_rocm("path"), "");
         let finding = ambient
             .matched
             .iter()
             .find(|d| d.id == "fix-8-wheel-rocm")
-            .expect("an ambient torch built against a different ROCm major is a real mismatch");
+            .expect("an ambient torch built against a different ROCm release is a real mismatch");
         assert!(
             finding.score >= MIN_SCORE_FOR_MATCH,
             "the version evidence alone has to establish it: {}",
             finding.score
         );
+    }
+
+    /// `check_8` compares the `X.Y` release line, because that is how ROCm
+    /// PyTorch wheels are indexed (`whl/rocm6.4`). Its title once said "ROCm
+    /// major" over this same comparison, so this pins both the comparison and
+    /// that neither title names the major again.
+    #[test]
+    fn the_wheel_mismatch_compares_the_x_y_release_and_says_so() {
+        let host = |framework_rocm_version: &str| Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: framework_rocm_version.to_owned(),
+            framework_source: "path".to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            ..linux_base()
+        };
+
+        // Same major, different minor: a mismatch.
+        let minor = check_8_wheel_rocm_mismatch(&host("hip=6.3.42131"), "");
+        assert_eq!(
+            minor.evidence,
+            vec!["Framework links HIP 6.3 but system ROCm is 6.4".to_owned()],
+            "a 6.3 torch beside a 6.4 system is built for another wheel index"
+        );
+        assert!(minor.score >= MIN_SCORE_FOR_MATCH, "{}", minor.score);
+
+        // Same X.Y, different patch: the same wheel index, so no mismatch.
+        let patch = check_8_wheel_rocm_mismatch(&host("hip=6.4.43482"), "");
+        assert_eq!(patch.score, 0, "{:?}", patch.evidence);
+
+        let catalog_title = crate::fix::catalog_manifest()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "fix-8-wheel-rocm")
+            .map(|entry| entry.title)
+            .expect("fix-8-wheel-rocm is in the recipe catalog");
+        for title in [minor.title.as_str(), catalog_title.as_str()] {
+            assert!(
+                title.contains("X.Y") && !title.contains("major"),
+                "the title must name what is compared: {title}"
+            );
+        }
     }
 
     #[test]

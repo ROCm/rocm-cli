@@ -136,7 +136,7 @@ pub(super) fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis 
         needs_sudo: true,
         needs_relogin: true,
         fix_id: "fix-4-render-group".to_owned(),
-        verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && ls -l /dev/kfd && rocminfo | head -n 5".to_owned(),
+        verify: crate::fix::RENDER_GROUP_VERIFY.to_owned(),
         notes: vec![
             "Group membership only takes effect after a full re-login (or reboot). `newgrp render` will give the current shell access but not other terminals or services.".to_owned(),
         ],
@@ -749,6 +749,36 @@ mod tests {
         let top = &report.matched[0];
         assert_eq!(top.id, "fix-4-render-group");
         assert_eq!(top.score, 60); // 35 render + 25 kfd
+    }
+
+    /// fix-4's verify line is printed by `rocm diagnose` (from this check's
+    /// `Fix`) and by `rocm fix fix-4-render-group` (from the recipe). The two
+    /// copies drifted once, with only this one listing `/dev/kfd`. Both now read
+    /// `crate::fix::RENDER_GROUP_VERIFY`, and this keeps either side from going
+    /// back to a literal of its own. The check builds its verify line without
+    /// looking at the host, so one host that fires it is enough.
+    #[test]
+    fn the_render_group_fix_verify_matches_the_catalog_copy() {
+        let (catalog_verify, _, _) =
+            crate::fix::recipe_verify_notes_and_run_commands("fix-4-render-group")
+                .expect("fix-4-render-group is in the recipe catalog");
+        let not_in_render = Examination {
+            in_render_group: Some(false),
+            ..linux_base()
+        };
+        let fix = check_4_render_group(&not_in_render, "")
+            .fix
+            .expect("check 4 builds a Fix when the user is not in render");
+        assert_eq!(
+            fix.verify, catalog_verify,
+            "the verify line for fix-4-render-group diverged between `diagnose` and `rocm fix`"
+        );
+        // Printed for the user to read which group owns `/dev/kfd`; the line's
+        // exit status does not depend on it.
+        assert!(
+            catalog_verify.contains("ls -l /dev/kfd"),
+            "{catalog_verify}"
+        );
     }
 
     #[test]
