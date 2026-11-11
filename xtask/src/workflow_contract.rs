@@ -7416,6 +7416,34 @@ jobs:
         );
     }
 
+    /// A job's block with comments removed, so a match cannot come from prose.
+    fn uncommented_job_block(text: &str, job: &str) -> String {
+        job_block(text, job)
+            .lines()
+            .map(strip_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The job-level `if:` of an already uncommented job block, with a folded
+    /// (`>-`) condition joined onto one line. Empty when the job has none.
+    fn job_level_if(block: &str) -> String {
+        let mut lines = block.lines();
+        let Some(first) = lines.find(|l| l.starts_with("    if:")) else {
+            return String::new();
+        };
+        let mut parts = vec![first.trim_start_matches("    if:").trim().to_owned()];
+        // Continuation lines are indented deeper than the 4-space job keys.
+        parts.extend(
+            lines
+                .take_while(|l| l.starts_with("      "))
+                .map(|l| l.trim().to_owned()),
+        );
+        normalized_whitespace(&parts.join(" "))
+            .trim_start_matches(">- ")
+            .to_owned()
+    }
+
     #[test]
     fn closing_a_pr_supersedes_its_self_hosted_runs() {
         // A merged or closed PR's queued GPU run is dead work that still takes a
@@ -7423,6 +7451,8 @@ jobs:
         // must be listed; the run it starts joins the PR's group (same key as the
         // opened/synchronize runs) and so cancels the earlier one. It must run
         // nothing but the no-op job: `changes` skips, and with it every lane.
+        // Every assertion reads one job's comment-free block, so prose or another
+        // job cannot satisfy it.
         let sh = read_workflow("e2e-selfhosted.yml");
         let on = normalized_whitespace(
             &top_level_block(&sh, "on")
@@ -7435,19 +7465,66 @@ jobs:
             on.contains("types: [opened, synchronize, reopened, closed]"),
             "pull_request must list `closed` next to the default types, got `{on}`"
         );
-        assert!(
-            sh.contains(
-                "if: github.event_name != 'pull_request' || github.event.action != 'closed'"
-            ),
+
+        let changes = uncommented_job_block(&sh, "changes");
+        assert_eq!(
+            job_level_if(&changes),
+            "github.event_name != 'pull_request' || github.event.action != 'closed'",
             "the `changes` job must skip on `closed`, or every GPU lane would run for a closed PR"
         );
-        assert!(
-            sh.contains("  pr-closed:\n")
-                && sh.contains(
-                    "github.event_name == 'pull_request' && github.event.action == 'closed'"
-                ),
-            "a no-op `pr-closed` job must exist so the closed run has something to run"
+
+        let closed = uncommented_job_block(&sh, "pr-closed");
+        assert_eq!(
+            job_level_if(&closed),
+            "github.event_name == 'pull_request' && github.event.action == 'closed'",
+            "`pr-closed` must run on `closed` and on nothing else"
         );
+        assert!(
+            closed.contains("    runs-on: ubuntu-24.04\n"),
+            "`pr-closed` must run on a GitHub-hosted runner, never queue for a GPU:\n{closed}"
+        );
+        assert!(
+            closed.contains("    permissions: {}\n"),
+            "`pr-closed` must hold no token permissions:\n{closed}"
+        );
+        for forbidden in ["uses:", "needs:", "secrets", "checkout"] {
+            assert!(
+                !closed.contains(forbidden),
+                "`pr-closed` is a no-op and must not contain `{forbidden}`:\n{closed}"
+            );
+        }
+
+        // Every other job must skip when `changes` skips: either its own `if`
+        // requires `changes` to have succeeded (the lanes) or it keys off a
+        // `changes` output, which is empty for a skipped job (`e2e-report`).
+        let jobs = top_level_block(&sh, "jobs");
+        let ids: Vec<&str> = jobs
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+            .filter_map(|l| l.trim().strip_suffix(':'))
+            .filter(|id| {
+                !id.is_empty()
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .collect();
+        assert!(
+            ids.contains(&"e2e-report"),
+            "extractor sanity check: {ids:?}"
+        );
+        for id in ids
+            .iter()
+            .filter(|id| !["changes", "pr-closed"].contains(id))
+        {
+            let condition = job_level_if(&uncommented_job_block(&sh, id));
+            assert!(
+                condition.contains("needs.changes.result == 'success'")
+                    || condition.contains("needs.changes.outputs.serve == 'true'"),
+                "job `{id}` must skip when `changes` is skipped (a closed PR); its `if` is \
+                 `{condition}`"
+            );
+        }
     }
 
     #[test]
