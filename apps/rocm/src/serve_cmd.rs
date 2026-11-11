@@ -1236,16 +1236,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Best-effort inference smoke test, on by default (opt out with
             // `--no-smoke-test`). Only meaningful for a freshly-ready server we
             // just launched; skipped when metrics could not be shown anyway.
-            let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
-                spinner.set_label("Running smoke test…");
-                // The local provider resolves the endpoint key from the per-service
-                // 0600 key file by service id, so the smoke test authenticates
-                // against a protected public endpoint without threading the secret
-                // through here.
-                serve_summary::run_smoke_test(&paths, resolve.served_model_name())
-            } else {
-                serve_summary::SmokeMetrics::default()
-            };
+            let (metrics, smoke_failure) =
+                if !no_smoke_test && !report.already_running && report.status == "ready" {
+                    spinner.set_label("Running smoke test…");
+                    // The local provider resolves the endpoint key from the per-service
+                    // 0600 key file by service id, so the smoke test authenticates
+                    // against a protected public endpoint without threading the secret
+                    // through here.
+                    serve_summary::run_smoke_test(&paths, resolve.served_model_name()).into_parts()
+                } else {
+                    (serve_summary::SmokeMetrics::default(), None)
+                };
             spinner.clear();
 
             let mut notes = collect_serve_notes(
@@ -1314,6 +1315,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 status: report.status.clone(),
                 already_running: report.already_running,
                 metrics,
+                smoke_failure,
                 api_key: launched_key,
                 notes,
             };
