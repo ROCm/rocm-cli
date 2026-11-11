@@ -2646,10 +2646,24 @@ async fn preview_warns_newest_nightly_has_no_wheels(world: &mut E2eWorld) {
 async fn preview_resolves_earlier_nightly_index(world: &mut E2eWorld) {
     let base = format!("{}/nightly-earlier", server_base(world));
     assert_nightly_preview(world, &base, EARLIER_NIGHTLY_ROCM_VERSION, "multi-arch-v2");
+    // Both fixtures are served; the pin must not reach the newest layout's.
+    let next = format!("{}/nightly-next", server_base(world));
+    assert!(
+        !stdout(world).contains(&next) && !stdout(world).contains("next-v1"),
+        "a pin to the earlier stream's last build date reached the newest layout:\n{}",
+        stdout(world)
+    );
 }
 
 #[then("the preview resolves the newest layout's nightly pip index for that build date")]
 async fn preview_resolves_next_nightly_index_for_the_build_date(world: &mut E2eWorld) {
     let base = format!("{}/nightly-next", server_base(world));
     assert_nightly_preview(world, &base, NEXT_NIGHTLY_ROCM_VERSION, "next-v1");
+    // Both fixtures are served; the pin must not fall back to the earlier one.
+    let earlier = format!("{}/nightly-earlier", server_base(world));
+    assert!(
+        !stdout(world).contains(&earlier) && !stdout(world).contains("multi-arch-v2"),
+        "a pin to a newest-layout build date reached the earlier stream:\n{}",
+        stdout(world)
+    );
 }

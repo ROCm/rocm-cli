@@ -63,7 +63,7 @@ probe an Instinct target) it runs
 `rocm install sdk --channel nightly --family <family> --dry-run` and checks the
 plan with [`nightly_canary.py`](../scripts/nightly_canary.py):
 
-- the channel, source URL and source layout generation are the canonical
+- the channel, source URL and source layout generation are the
   current (next-layout) nightly ones, which an unpinned nightly install
   resolves to, read from [`source.rs`](../apps/rocm/src/therock/source.rs)
   rather than copied, so the earlier multi-arch endpoint, the stable stream or

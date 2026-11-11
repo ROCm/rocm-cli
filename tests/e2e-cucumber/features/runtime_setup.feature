@@ -129,6 +129,7 @@ Feature: Runtime configuration
   @id:runtime-install-records-the-real-folder @nightly
   Scenario: runtime-06 - Previewing an install through a linked runtimes folder names the real folder
     Given a machine whose runtimes folder is a link to somewhere else
+    And a uv is already installed
     When the user previews an SDK install
     Then the planned runtime folder is inside the folder the link points at
     And the planned runtime folder is not expressed through the link

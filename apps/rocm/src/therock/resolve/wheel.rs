@@ -14,7 +14,9 @@
 //! `select_matching_pip_package_versions` takes the newest `rocm` whose
 //! `torch`, `torchvision` and `torchaudio` listings agree; on the next layout
 //! `torchaudio::torchaudio_pin` pins a torchaudio first (the hardware-verified
-//! release when it is published) and `resolve_published_pip_package_versions` has
+//! release when it is published), `rocm_versions_with_full_stack` first drops
+//! any `rocm` build that `torch`, `torchvision` or `torchaudio` do not all
+//! publish yet, and `resolve_published_pip_package_versions` has
 //! `uv pip compile` choose the rest. That compile is the one step that may fetch
 //! `uv`: a real install and an update acquire it; a preview
 //! (`preview_pip_runtime`) runs a present one or stops with an
