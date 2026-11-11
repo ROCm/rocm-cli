@@ -95,7 +95,8 @@ pub(crate) enum Command {
     /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
     /// takes the id, not the position.
     Diagnose {
-        /// Raw error text from the user; sharpens keyword scoring.
+        /// Raw error text from the user; sharpens keyword scoring. Each match then
+        /// says whether this text contributed to it (`symptom_matched` in --json).
         #[arg(long)]
         symptom: Option<String>,
         /// Show at most this many matches (default 5).

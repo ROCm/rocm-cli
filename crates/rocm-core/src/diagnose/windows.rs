@@ -1200,6 +1200,7 @@ mod tests {
                     score,
                     evidence: vec!["synthetic".to_owned()],
                     fix: None,
+                    ..Diagnosis::default()
                 },
             );
             assert!(score < HIGH_CONFIDENCE);

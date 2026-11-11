@@ -70,6 +70,17 @@ fn is_advice_only(fix_id: &str) -> bool {
     fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID
 }
 
+/// The note under a cause the symptom text did not contribute to.
+///
+/// Printed when the symptom contributed to some other cause in the same
+/// report: the text form of [`super::Diagnosis::symptom_matched`] being
+/// `false`.
+///
+/// "The examined host", not "this machine": `rocm remote doctor` renders the
+/// same report for a machine it reached over the network.
+pub const SYMPTOM_DID_NOT_CONTRIBUTE_NOTE: &str =
+    "source: the examined host's state alone; the symptom text did not contribute to it";
+
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
 #[must_use]
 pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
@@ -100,6 +111,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             "\nAdvice about this host follows. It does not explain the symptom, and nothing in it is applied automatically.\n\n",
         );
     }
+    let symptom_matched_any = report.matched.iter().any(|d| d.symptom_matched);
     for (i, d) in report.matched.iter().take(top).enumerate() {
         let tier = if d.score >= HIGH_CONFIDENCE {
             "HIGH"
@@ -123,6 +135,19 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         let _ = writeln!(out, "   id: {}", d.id);
         for ev in &d.evidence {
             let _ = writeln!(out, "   - {ev}");
+        }
+        // Said only once the symptom contributed to something in this report:
+        // a finding about the host can outrank the one the symptom added to,
+        // and the ranking alone reads as if the symptom lay behind it. With no
+        // symptom, or one that contributed to nothing, every row would carry it
+        // and it would say nothing.
+        //
+        // `symptom_matched_any` reads the whole report, not only the rows
+        // `--top` shows. When the only entry the symptom contributed to is cut
+        // off, every row shown carries the note, which is still true of each,
+        // and the "Showing N of M" line below says more were found.
+        if symptom_matched_any && !d.symptom_matched {
+            let _ = writeln!(out, "   {SYMPTOM_DID_NOT_CONTRIBUTE_NOTE}");
         }
         if let Some(fix) = &d.fix {
             let _ = writeln!(out, "   plan: {}", fix.summary);
@@ -216,6 +241,7 @@ mod tests {
                         class: crate::fix::FixClass::DiagnoseOnly,
                         ..Fix::default()
                     }),
+                    ..Diagnosis::default()
                 },
                 Diagnosis {
                     id: "fix-9-igpu-dgpu".to_owned(),
@@ -227,6 +253,7 @@ mod tests {
                         summary: "Pin HIP_VISIBLE_DEVICES.".to_owned(),
                         ..Fix::default()
                     }),
+                    ..Diagnosis::default()
                 },
             ],
             has_match: true,
@@ -386,6 +413,97 @@ mod tests {
             "the reachable routing targets changed; update the docs in \
              skills/rocm-doctor/reference.md (and the amd/skills copy) to match"
         );
+    }
+
+    /// The cause block for `id` in rendered `out`: its header line and every
+    /// line under it up to the blank line that ends it.
+    fn block(out: &str, id: &str) -> String {
+        let marker = format!("({id})");
+        out.lines()
+            .skip_while(|l| !l.contains(&marker))
+            .take_while(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The note and the field it renders are asserted together: the text
+    /// claims the symptom did not contribute, and the report's own field is
+    /// what says so.
+    #[test]
+    fn a_cause_the_symptom_did_not_contribute_to_says_so_in_the_text() {
+        let mut e = linux_base();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        let report = diagnose(&e, "hipErrorNoBinaryForGpu: HSA_STATUS_ERROR_INVALID_ISA");
+        let out = render_report_text(&report, 20);
+        for d in &report.matched {
+            let shown = block(&out, &d.id);
+            assert!(!shown.is_empty(), "{} was not rendered:\n{out}", d.id);
+            assert_eq!(
+                shown.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+                !d.symptom_matched,
+                "the note must appear exactly where the symptom did not contribute ({}):\n{out}",
+                d.id
+            );
+        }
+        let host = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-2-unset-override")
+            .expect("the override is listed");
+        assert!(!host.symptom_matched);
+        assert!(
+            block(&out, &host.id).contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn without_a_symptom_no_cause_carries_the_note() {
+        let mut e = linux_base();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        let report = diagnose(&e, "");
+        assert!(!report.matched.is_empty(), "something must be listed");
+        let out = render_report_text(&report, 20);
+        assert!(
+            !out.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+            "with nothing pasted the note would sit on every cause and say nothing:\n{out}"
+        );
+    }
+
+    /// The rule for `--top`: the note is decided per row from the whole
+    /// report, so when the only entry the symptom contributed to is cut off,
+    /// the row shown still carries it, which is true of that row, and the
+    /// truncation line says there is more.
+    #[test]
+    fn a_contributed_entry_past_top_still_marks_the_rows_shown() {
+        let row = |id: &str, score: i32, symptom_matched: bool| Diagnosis {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            score,
+            symptom_matched,
+            ..Diagnosis::default()
+        };
+        let report = DiagnoseReport {
+            matched: vec![
+                row("fix-host-only", 60, false),
+                row("fix-from-the-paste", 40, true),
+            ],
+            has_match: true,
+            min_score_for_match: MIN_SCORE_FOR_MATCH,
+            high_confidence_threshold: HIGH_CONFIDENCE,
+            route_when_no_match: upstream_route("rocm-core"),
+            out_of_scope: None,
+            model: None,
+        };
+        let out = render_report_text(&report, 1);
+        assert!(
+            block(&out, "fix-host-only").contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+            "{out}"
+        );
+        assert!(!out.contains("(fix-from-the-paste)"), "{out}");
+        assert!(out.contains("Showing 1 of 2"), "{out}");
     }
 
     #[test]

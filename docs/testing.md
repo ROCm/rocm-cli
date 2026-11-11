@@ -4364,6 +4364,40 @@ Windows:
 cargo xtask e2e -- -n '(diagnose-48)'
 ```
 
+### Which causes the pasted error contributed to
+
+Every entry in `rocm diagnose --json`'s `matched` carries `symptom_matched`:
+`true` when the `--symptom` text contributed to its score or evidence, `false`
+when it came from the examined host's state alone, and `false` on every entry
+when no `--symptom` was given. Any keyword hit counts, however weak, so the
+field records a contribution, not that the entry explains the error.
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs) decides it by running the
+catalog a second time with no symptom and comparing each entry with its
+counterpart (`contributed`: absent, a different score, or different evidence),
+so no checker sets it by hand. The text report prints a `source: the examined
+host's state alone` line under each shown entry the text did not contribute to,
+once the text contributed to any entry in the report, including one cut off by
+`--top`. The rules are pinned by unit tests in diagnose.rs,
+[report.rs](../crates/rocm-core/src/diagnose/report.rs) and, for the same line
+under `rocm remote doctor`, [doctor.rs](../apps/rocm/src/remote/doctor.rs):
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/credited|contribution_is_any|symptom|carries_the_note|says_so_in_the_text|past_top|before_the_field/)'
+cargo nextest run -p rocm -E 'test(the_symptom_note_is_true_of_a_remote_host)'
+```
+
+`diagnose-59` (JSON), `diagnose-60` (text) and `diagnose-61` (no symptom, both
+forms) in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+cover it on every lane. They set an unneeded `HSA_OVERRIDE_GFX_VERSION` on the
+CLI. The first two also paste an ISA error, so the override entry must read
+`false` and the ISA entry `true` whatever the runner's own state; the third
+pastes nothing, so every entry must read `false` and no line is printed. To run
+only those three without bypassing the harness's gates:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
+```
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a model will run on this host
