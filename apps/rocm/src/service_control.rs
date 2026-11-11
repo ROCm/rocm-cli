@@ -273,7 +273,7 @@ fn stop_internal_managed_service_confirmed_with(
         record.stop_requested_unix_ms = Some(requested_at);
     }
     record.write()?;
-    // Drop the endpoint key with the service by deleting its 0600 key file.
+    // Drop the endpoint key with the service by deleting its owner-only key file.
     // Best-effort — a stopped service must not fail to stop just because key
     // cleanup did.
     //
@@ -612,7 +612,7 @@ fn restart_internal_managed_service_inner(
     if let Some(lease) = port_lease {
         lease.release();
     }
-    // A restarted public service comes back authenticated: its 0600 key file
+    // A restarted public service comes back authenticated: its owner-only key file
     // persists across restarts (removed only on stop), so hand the child the same
     // file and reuse the key for the readiness probe.
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, &record.service_id);
