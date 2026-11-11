@@ -716,6 +716,22 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor
 
+  # The host probes' subprocess helpers used to read a tool's output until every
+  # holder of the pipe had closed it, so a tool that left a background process
+  # behind (a helper the tool starts and does not wait for) held the whole
+  # inspection until that process exited, however quickly the tool itself did.
+  # They now stop reading shortly after the tool exits, and the inspection keeps
+  # what the tool printed before that. The stand-in `lspci` prints one AMD GPU,
+  # exits 0 and leaves a `sleep` holding its output for 30 seconds; the
+  # inspection must finish well inside that and still list the GPU, so what the
+  # tool printed before it exited is still collected. It does not pin the length
+  # of the grace: that is the unit tests' (`subprocess_runners_pair`).
+  @id:examine-lspci-leaving-a-background-process-does-not-hold-up-the-inspection @requires-os:linux
+  Scenario: examine-48 - A PCI listing tool that leaves a background process behind does not hold up the inspection
+    Given a machine whose lspci prints a GPU and leaves a background process holding its output open
+    When the user inspects that machine in machine-readable form and the time it takes is measured
+    Then the inspection finishes long before the background process does
+    And the inspection lists the GPU that lspci printed
   # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
   # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
   # mock lane included, not only the Vulkan-only hosts the ticket started from.
@@ -731,7 +747,7 @@ Feature: GPU detection and system inspection
   # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
   # fails here.
   @id:examine-reports-this-hosts-rocm-support-level
-  Scenario: examine-48 - System inspection says whether this machine's GPU is supported by ROCm
+  Scenario: examine-49 - System inspection says whether this machine's GPU is supported by ROCm
     When the user inspects the system
     Then the inspection states this host's ROCm support level
     And the support level agrees with the GPU the inspection detected
@@ -748,7 +764,7 @@ Feature: GPU detection and system inspection
   # was taken to mean "Vulkan then", on a machine nobody had looked at. Each
   # scenario pins one of the three answers that inference could not tell apart.
   @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
-  Scenario: examine-49 - A GPU the official stack rejects is told which way it can still run models
+  Scenario: examine-50 - A GPU the official stack rejects is told which way it can still run models
     Given a machine whose GPU has no official support but has a working Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -756,7 +772,7 @@ Feature: GPU detection and system inspection
     And the inspection names the Vulkan driver it found
 
   @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
-  Scenario: examine-50 - A machine with no way to run models is not told it has one
+  Scenario: examine-51 - A machine with no way to run models is not told it has one
     Given a machine whose GPU has no official support and no Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -768,7 +784,7 @@ Feature: GPU detection and system inspection
   # reporting a GPU path - the one outcome the no-fallback rule exists to
   # prevent, reached through a backend rather than a policy change.
   @id:examine-does-not-count-a-software-renderer-as-a-gpu-path @requires-os:linux
-  Scenario: examine-51 - A software renderer does not count as a way to run on the GPU
+  Scenario: examine-52 - A software renderer does not count as a way to run on the GPU
     Given a machine whose GPU has no official support and only a software renderer
     When the user inspects that machine
     Then the inspection does not claim models can run through Vulkan

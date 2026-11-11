@@ -5,6 +5,7 @@
 #![allow(clippy::items_after_test_module)]
 
 pub mod anthropic_proxy;
+mod artifact_prefetch;
 mod cli;
 mod common;
 mod daemon;

@@ -42,11 +42,18 @@ every file: no flag, baseline or exemption. The `clippy` CI job runs
 `cargo xtask check-module-size` and fails when any file is over the limit; `clippy` is a
 required check and also runs on merge-queue runs. The failure text names each file and
 points at the split rule in [architecture.md](architecture.md). The `cargo-module-size`
-pre-commit hook still only reports: it runs `cargo xtask check-module-size-advisory`, the
-same check, but it exits successfully even when the check itself cannot run. That holds
-once xtask has built: a commit that leaves xtask or `rocm-core` not compiling still fails
-the hook.
-The counting rules are unit-tested in `xtask/src/module_size.rs`:
+pre-commit hook is the local mirror of that step: it runs the same
+`cargo xtask check-module-size`, so a commit that stages Rust source while a file is over the
+limit is refused, and the output names the file and its count. It only checks and never
+rewrites or restages anything. The check measures the working tree, so the hook also
+fails when a Rust file under a crate's `src/` is not declared by any `mod`, even an
+untracked scratch file; the error says to declare or delete it, where CI only sees the
+files that are committed. It runs only for contributors who installed the hooks, so the
+CI step stays the authority.
+The counting rules are unit-tested in `xtask/src/module_size.rs`, and
+[workflow_contract.rs](../xtask/src/workflow_contract.rs) pins that the hook runs the
+strict check in `module_size_hook_runs_the_strict_check_at_pre_commit`; the `module_size`
+filter below selects both:
 
 ```bash
 cargo test -p xtask module_size
@@ -4157,6 +4164,12 @@ is what the verdict turns on.
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
+```
+
+`examine-48` plants a native Linux machine (a simulated host root that is not WSL, because the PCI probe is skipped on WSL) whose `lspci` is a stand-in on `PATH` that prints one AMD GPU, exits 0 and leaves a `sleep` holding its output pipes for 30 seconds. The host probes now stop reading a tool's output shortly after the tool exits, so `rocm examine --json` must finish in under 15 seconds, well inside the background process's life, and must still list the GPU the stand-in printed at `0000:fe:00.0`, so what the tool printed before it exited is still collected (the length of the grace is not pinned here). It runs on the Linux lanes and needs no GPU; the unit tests behind it (`subprocess_runners_pair` in `host_gpu/capture.rs`) pin the same bound for each of the three runners.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-48 '
 ```
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.

@@ -109,6 +109,10 @@ This tracks the default `release` channel. For nightly builds, pass the
 curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- nightly
 ```
 
+The channel here is the one the `rocm` binary comes from. It is separate from
+the ROCm SDK channel: `rocm install sdk --channel release|nightly` picks which
+TheRock stream the SDK comes from, whichever channel installed the binary.
+
 ### Windows (x86_64, PowerShell)
 
 ```powershell
@@ -122,6 +126,9 @@ This tracks the default `release` channel. For nightly builds, set
 $env:ROCM_CLI_CHANNEL = "nightly"
 irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
+
+As on Linux, this is the binary's channel only. The ROCm SDK channel is chosen
+separately with `rocm install sdk --channel`.
 
 ### Verify the installation
 

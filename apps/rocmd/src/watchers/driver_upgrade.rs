@@ -231,18 +231,18 @@ mod tests {
             &event,
             |_paths| {
                 Ok(crate::sandbox::sandbox_driver_plan_value(
-                    rocm_core::CommandCapture {
-                        argv: vec![
+                    rocm_core::CommandCapture::from_text(
+                        vec![
                             "rocm".to_owned(),
                             "install".to_owned(),
                             "driver".to_owned(),
                             "--dkms".to_owned(),
                             "--dry-run".to_owned(),
                         ],
-                        exit_status: 0,
-                        stdout: "driver install plan\n  supported: true\n".to_owned(),
-                        stderr: String::new(),
-                    },
+                        0,
+                        "driver install plan\n  supported: true\n".to_owned(),
+                        String::new(),
+                    ),
                 ))
             },
         )?;

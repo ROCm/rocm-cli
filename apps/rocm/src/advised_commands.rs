@@ -1276,6 +1276,11 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "debug log line",
     ),
     (
+        "crates/rocm-core/src/host_gpu/capture.rs",
+        "rocm debug: command capture output from {} may be incomplete: {note}",
+        "debug log line",
+    ),
+    (
         "crates/rocm-dash-tui/src/ui/command_screen.rs",
         "rocm {}",
         "echo of whatever the user typed into the command runner",

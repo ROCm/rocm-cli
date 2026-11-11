@@ -14,6 +14,8 @@ use super::windows_inventory::{
     parse_windows_examine_inventory, parse_windows_pnputil_display_inventory,
 };
 use super::wsl::{detect_wsl_windows_display_probe_text, is_wsl_host};
+#[cfg(any(windows, test))]
+use crate::command_capture::{CommandCapture, CommandOutcome};
 #[cfg(windows)]
 use crate::gfx_target::{
     amd_pci_device_id_from_pnp_id, gfx_target_from_amd_marketing_name,
@@ -21,17 +23,15 @@ use crate::gfx_target::{
 };
 #[cfg(windows)]
 use crate::probe_exec::tool_path_candidates;
+#[cfg(windows)]
+use crate::process::run_bounded;
 use crate::{runtime_is_linux, runtime_is_windows, runtime_os_name};
+#[cfg(any(windows, test))]
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::io::Read;
+use std::process::Command;
 #[cfg(windows)]
-use std::path::PathBuf;
-#[cfg(windows)]
-use std::process::{Command, Stdio};
-#[cfg(windows)]
-use std::thread;
-#[cfg(windows)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub fn detect_host_gpu_diagnostics() -> String {
     use std::fmt::Write as _;
@@ -186,7 +186,7 @@ fn append_windows_probe_diagnostics(
 }
 
 #[derive(Debug)]
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 struct DiagnosticCommandResult {
     program: Option<PathBuf>,
     status: Option<String>,
@@ -196,96 +196,79 @@ struct DiagnosticCommandResult {
     timed_out: bool,
 }
 
+/// Run `program` under every spelling [`tool_path_candidates`] gives, through the
+/// executor the other host probes share ([`run_bounded`]), and describe the
+/// first run that started.
 #[cfg(windows)]
 fn capture_diagnostic_command(
     program: &str,
     args: &[&str],
     timeout: Duration,
 ) -> DiagnosticCommandResult {
-    let candidates = tool_path_candidates(program);
+    capture_diagnostic_with(program, &tool_path_candidates(program), |path| {
+        let mut command = Command::new(path);
+        command.args(args);
+        run_bounded(command, timeout, "process")
+    })
+}
+
+/// [`capture_diagnostic_command`] with the candidates and the runner passed in,
+/// so a test on any host can say how each run ends.
+///
+/// The next spelling is tried only when a program could not be started. Any run
+/// that started is final: an exit (non-zero included) reports its status and
+/// both streams, a timeout reports the output that arrived and says so, and a
+/// failure to wait reports that, with no output.
+#[cfg(any(windows, test))]
+fn capture_diagnostic_with(
+    program: &str,
+    candidates: &[String],
+    mut run: impl FnMut(&Path) -> CommandCapture,
+) -> DiagnosticCommandResult {
     let mut last_error = None;
     for candidate in candidates {
-        let path = PathBuf::from(&candidate);
-        let mut child = match Command::new(&path)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                last_error = Some(format!("failed to launch {}: {error}", path.display()));
-                continue;
+        let path = PathBuf::from(candidate);
+        let capture = run(&path);
+        match capture.outcome {
+            CommandOutcome::NotFound | CommandOutcome::SpawnFailed(_) => {
+                last_error = Some(format!(
+                    "failed to launch {}: {}",
+                    path.display(),
+                    capture.detail.as_deref().unwrap_or("unknown error")
+                ));
             }
-        };
-        let stdout_reader = child.stdout.take().map(|mut stdout| {
-            thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = stdout.read_to_end(&mut bytes);
-                bytes
-            })
-        });
-        let stderr_reader = child.stderr.take().map(|mut stderr| {
-            thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = stderr.read_to_end(&mut bytes);
-                bytes
-            })
-        });
-
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let stdout = stdout_reader
-                        .map(|reader| reader.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let stderr = stderr_reader
-                        .map(|reader| reader.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    return DiagnosticCommandResult {
-                        program: Some(path),
-                        status: Some(status.to_string()),
-                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                        error: None,
-                        timed_out: false,
-                    };
-                }
-                Ok(None) if start.elapsed() < timeout => {
-                    thread::sleep(Duration::from_millis(25));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let stdout = stdout_reader
-                        .map(|reader| reader.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let stderr = stderr_reader
-                        .map(|reader| reader.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    return DiagnosticCommandResult {
-                        program: Some(path),
-                        status: None,
-                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                        error: None,
-                        timed_out: true,
-                    };
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return DiagnosticCommandResult {
-                        program: Some(path),
-                        status: None,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        error: Some(format!("failed to wait: {error}")),
-                        timed_out: false,
-                    };
-                }
+            CommandOutcome::Exited(_) | CommandOutcome::Signaled(_) => {
+                return DiagnosticCommandResult {
+                    program: Some(path),
+                    status: capture.status.map(|status| status.to_string()),
+                    stdout: capture.stdout,
+                    stderr: capture.stderr,
+                    error: None,
+                    timed_out: false,
+                };
+            }
+            CommandOutcome::TimedOut => {
+                return DiagnosticCommandResult {
+                    program: Some(path),
+                    status: None,
+                    stdout: capture.stdout,
+                    stderr: capture.stderr,
+                    error: None,
+                    timed_out: true,
+                };
+            }
+            CommandOutcome::WaitFailed => {
+                return DiagnosticCommandResult {
+                    program: Some(path),
+                    status: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(format!(
+                        "failed to wait: {}",
+                        capture.detail.as_deref().unwrap_or("unknown error")
+                    )),
+                    timed_out: false,
+                };
             }
         }
     }
@@ -328,5 +311,189 @@ fn truncate_diagnostic_line(line: &str, max_chars: usize) -> String {
         format!("{truncated}...")
     } else {
         truncated
+    }
+}
+
+/// The Windows-only diagnostic capture's choice of candidate and its report of
+/// each way a run can end, driven through an injected runner so it runs on every
+/// host, the Windows job included.
+#[cfg(test)]
+mod capture_diagnostic_tests {
+    use super::{CommandCapture, CommandOutcome, capture_diagnostic_with};
+    use std::path::Path;
+    use std::process::ExitStatus;
+
+    fn status(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+        #[cfg(unix)]
+        let raw = code << 8;
+        #[cfg(windows)]
+        let raw = code.unsigned_abs();
+        ExitStatus::from_raw(raw)
+    }
+
+    fn candidates(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn finished(
+        outcome: CommandOutcome,
+        code: Option<i32>,
+        detail: Option<&str>,
+    ) -> CommandCapture {
+        CommandCapture::from_run(
+            vec!["tool".to_owned()],
+            outcome,
+            code.map(status),
+            b"out\n".to_vec(),
+            b"err\n".to_vec(),
+            detail.map(str::to_owned),
+        )
+    }
+
+    /// A runner that gives each candidate the next scripted capture, and records
+    /// which candidates it was asked to start.
+    fn scripted(
+        mut script: Vec<CommandCapture>,
+        asked: &mut Vec<String>,
+    ) -> impl FnMut(&Path) -> CommandCapture + '_ {
+        script.reverse();
+        move |path| {
+            asked.push(path.display().to_string());
+            script
+                .pop()
+                .expect("more candidates were started than scripted")
+        }
+    }
+
+    #[test]
+    fn the_next_spelling_is_tried_only_when_a_program_could_not_be_started() {
+        let mut asked = Vec::new();
+        let result = capture_diagnostic_with(
+            "tool",
+            &candidates(&["a", "b", "c"]),
+            scripted(
+                vec![
+                    finished(CommandOutcome::NotFound, None, Some("no a")),
+                    finished(
+                        CommandOutcome::SpawnFailed(std::io::ErrorKind::PermissionDenied),
+                        None,
+                        Some("no b"),
+                    ),
+                    finished(CommandOutcome::Exited(0), Some(0), None),
+                ],
+                &mut asked,
+            ),
+        );
+
+        assert_eq!(asked, ["a", "b", "c"]);
+        assert_eq!(result.program.as_deref(), Some(Path::new("c")));
+        assert_eq!(result.status, Some(status(0).to_string()));
+        assert_eq!(
+            (result.stdout.as_str(), result.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+        assert!(result.error.is_none() && !result.timed_out);
+    }
+
+    #[test]
+    fn a_program_that_never_starts_reports_the_last_launch_error() {
+        let mut asked = Vec::new();
+        let result = capture_diagnostic_with(
+            "tool",
+            &candidates(&["a", "b"]),
+            scripted(
+                vec![
+                    finished(CommandOutcome::NotFound, None, Some("no a")),
+                    finished(CommandOutcome::NotFound, None, Some("no b")),
+                ],
+                &mut asked,
+            ),
+        );
+
+        assert!(result.program.is_none() && result.status.is_none());
+        assert_eq!(result.error.as_deref(), Some("failed to launch b: no b"));
+        assert!(result.stdout.is_empty() && !result.timed_out);
+
+        let none = capture_diagnostic_with("tool", &[], |_| unreachable!("no candidate"));
+        assert_eq!(none.error.as_deref(), Some("tool was not found"));
+    }
+
+    #[test]
+    fn a_non_zero_exit_is_final_and_reports_its_status_and_both_streams() {
+        let mut asked = Vec::new();
+        let result = capture_diagnostic_with(
+            "tool",
+            &candidates(&["a", "b"]),
+            scripted(
+                vec![finished(CommandOutcome::Exited(3), Some(3), None)],
+                &mut asked,
+            ),
+        );
+
+        assert_eq!(asked, ["a"], "a run that started must not be retried");
+        assert_eq!(result.program.as_deref(), Some(Path::new("a")));
+        assert_eq!(result.status, Some(status(3).to_string()));
+        #[cfg(windows)]
+        assert_eq!(result.status.as_deref(), Some("exit code: 3"));
+        assert_eq!(
+            (result.stdout.as_str(), result.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+        assert!(result.error.is_none() && !result.timed_out);
+    }
+
+    #[test]
+    fn a_timeout_is_final_keeps_the_output_that_arrived_and_says_so() {
+        let mut asked = Vec::new();
+        let result = capture_diagnostic_with(
+            "tool",
+            &candidates(&["a", "b"]),
+            scripted(
+                vec![finished(CommandOutcome::TimedOut, Some(1), None)],
+                &mut asked,
+            ),
+        );
+
+        assert_eq!(asked, ["a"], "a hung program must not be started again");
+        assert!(result.timed_out);
+        assert!(
+            result.status.is_none(),
+            "a killed child has no status to report"
+        );
+        assert_eq!(
+            (result.stdout.as_str(), result.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn a_failure_to_wait_is_final_and_reports_no_output() {
+        let mut asked = Vec::new();
+        let result = capture_diagnostic_with(
+            "tool",
+            &candidates(&["a", "b"]),
+            scripted(
+                vec![finished(
+                    CommandOutcome::WaitFailed,
+                    None,
+                    Some("the os said no"),
+                )],
+                &mut asked,
+            ),
+        );
+
+        assert_eq!(asked, ["a"]);
+        assert_eq!(result.program.as_deref(), Some(Path::new("a")));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("failed to wait: the os said no")
+        );
+        assert!(result.stdout.is_empty() && result.stderr.is_empty());
+        assert!(!result.timed_out && result.status.is_none());
     }
 }
