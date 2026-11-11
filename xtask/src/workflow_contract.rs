@@ -6218,6 +6218,43 @@ fi
     /// its own. Putting `clippy` back in `needs:` would silently add its whole
     /// runtime to every run, so the list is pinned exactly. The `clippy` job must
     /// still exist, otherwise dropping it from `needs:` would have dropped the check.
+    /// The Linux lane runs the no-fallback smoke gate as a step that can fail
+    /// the job. `ci_windows_jobs_keep_every_gating_step_enabled` pins the
+    /// Windows lane's copy; without this, the Linux step could be dropped,
+    /// renamed, set to `continue-on-error`, or pointed back at a script, and
+    /// no test would notice.
+    #[test]
+    fn ci_build_and_test_keeps_the_smoke_gate_enabled() {
+        let ci = read_workflow("ci.yml");
+        let steps = job_steps(&ci_job(&ci, "build-and-test")).expect("build-and-test has steps");
+        let matching: Vec<&String> = steps
+            .iter()
+            .filter(|(name, _)| name == "Local no-fallback smoke")
+            .map(|(_, step)| step)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "build-and-test must have exactly one `Local no-fallback smoke` step"
+        );
+        let step = matching[0];
+        let code = code_only(step);
+        assert!(
+            code.contains("cargo xtask smoke --skip-build"),
+            "build-and-test's smoke step must run `cargo xtask smoke --skip-build`:\n{step}"
+        );
+        assert!(
+            !step_keys(step).iter().any(|key| key == "continue-on-error"),
+            "build-and-test's smoke step must not set continue-on-error:\n{step}"
+        );
+        let item_indent = indent_of(step.lines().next().expect("a step has a first line"));
+        assert_eq!(
+            yaml_value_at(step, item_indent + 2, "if").as_deref(),
+            Some("needs.changes.outputs.heavy == 'true'"),
+            "build-and-test's smoke step must keep its exact `if:`"
+        );
+    }
+
     #[test]
     fn ci_build_and_test_waits_for_prek_but_not_clippy() {
         let ci = read_workflow("ci.yml");
