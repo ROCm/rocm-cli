@@ -324,6 +324,24 @@ fn detect_vulkan_devices() -> Vec<VulkanDevice> {
         .unwrap_or_default()
 }
 
+/// Whether `vulkaninfo` is on this host at all, regardless of what it said.
+///
+/// The distinction the classification turns on is "could we ask" versus "we
+/// asked and nothing was there" — and an empty device list cannot tell those
+/// apart, because a missing binary and one that exits non-zero both yield it.
+/// A host that genuinely has no Vulkan driver is the second case: `vulkaninfo`
+/// is installed and fails. Only the first is a gap in the probe.
+fn vulkan_enumeration_available() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        crate::probe_exec::tool_path_candidates("vulkaninfo")
+            .iter()
+            .any(|name| dir.join(name).is_file())
+    })
+}
+
 /// Whether this platform's Vulkan surfaces can be read at all.
 const fn vulkan_is_probeable() -> bool {
     cfg!(any(target_os = "linux", windows))
@@ -336,6 +354,7 @@ pub fn detect_vulkan_support() -> VulkanSupport {
         detect_icds(),
         detect_vulkan_devices(),
         vulkan_is_probeable(),
+        vulkan_enumeration_available(),
     )
 }
 
@@ -346,6 +365,7 @@ pub fn classify_vulkan_support(
     icds: Vec<String>,
     devices: Vec<VulkanDevice>,
     probeable: bool,
+    enumerated: bool,
 ) -> VulkanSupport {
     if !probeable {
         return VulkanSupport {
@@ -383,33 +403,37 @@ pub fn classify_vulkan_support(
 
     let gpu_icds: Vec<&String> = icds.iter().filter(|icd| icd_is_gpu_driver(icd)).collect();
     if gpu_icds.is_empty() {
-        // No ICD *and* no enumerated device is an absence of evidence, not
-        // evidence of absence: neither source is exhaustive. The Linux ICD
-        // search is a fixed directory list that ignores `VK_ICD_FILENAMES` and
-        // `VK_DRIVER_FILES`; the Windows one reads only the legacy Khronos
-        // registry key, which current AMD drivers need not populate; and
-        // `vulkaninfo` is frequently not installed on either. A working driver
-        // can therefore leave both empty, and `Absent` is rendered to the user
-        // as a confirmed fact ("no Vulkan GPU driver was found - install one").
-        // Say we could not tell instead, and keep `Absent` for the cases below
-        // where something was actually found and ruled out.
-        if icds.is_empty() && devices.is_empty() {
+        // Nothing found at all, and nothing that could have found it: the ICD
+        // search is not exhaustive (a fixed directory list on Linux that
+        // ignores `VK_ICD_FILENAMES`/`VK_DRIVER_FILES`; only the legacy
+        // Khronos key on Windows), so without `vulkaninfo` to ask, an empty
+        // result is a gap in the probe rather than a fact about the host.
+        // `Absent` renders as "no Vulkan GPU driver was found - install one",
+        // which would then be told to a host that has one.
+        //
+        // `enumerated` is deliberately "the tool is installed", not "the tool
+        // returned devices": a host genuinely without a driver HAS
+        // `vulkaninfo` and gets nothing from it, and that is a real answer.
+        if icds.is_empty() && devices.is_empty() && !enumerated {
             return VulkanSupport {
                 status: VulkanStatus::Unknown,
                 detail: Some(
-                    "no Vulkan driver was found, but this host exposes nothing that confirms                      one is absent either (no ICD manifest, and `vulkaninfo` did not enumerate)"
+                    "no Vulkan driver was found, but `vulkaninfo` is not installed either, so \
+                     nothing here confirms one is absent"
                         .to_owned(),
                 ),
                 icds,
                 devices,
             };
         }
+        let detail = if icds.is_empty() {
+            "no Vulkan driver found".to_owned()
+        } else {
+            "only a software (CPU) Vulkan driver is installed; that is not a GPU path".to_owned()
+        };
         return VulkanSupport {
             status: VulkanStatus::Absent,
-            detail: Some(
-                "only a software (CPU) Vulkan driver is installed; that is not a GPU path"
-                    .to_owned(),
-            ),
+            detail: Some(detail),
             icds,
             devices,
         };
@@ -494,7 +518,7 @@ GPU0:
     fn a_real_renoir_host_reports_vulkan_available_and_names_its_driver() {
         let devices = parse_vulkaninfo_summary(RENOIR_WINDOWS_SUMMARY);
 
-        let support = classify_vulkan_support(Vec::new(), devices, true);
+        let support = classify_vulkan_support(Vec::new(), devices, true, true);
 
         assert_eq!(support.status, VulkanStatus::Available);
         assert!(support.status.is_usable());
@@ -525,7 +549,7 @@ GPU0:
         assert!(!devices[0].is_hardware());
 
         let support =
-            classify_vulkan_support(vec!["lvp_icd.x86_64.json".to_owned()], devices, true);
+            classify_vulkan_support(vec!["lvp_icd.x86_64.json".to_owned()], devices, true, true);
 
         assert_eq!(
             support.status,
@@ -544,8 +568,12 @@ GPU0:
 
     #[test]
     fn a_lavapipe_only_install_is_absent_even_before_any_device_is_enumerated() {
-        let support =
-            classify_vulkan_support(vec!["lvp_icd.x86_64.json".to_owned()], Vec::new(), true);
+        let support = classify_vulkan_support(
+            vec!["lvp_icd.x86_64.json".to_owned()],
+            Vec::new(),
+            true,
+            true,
+        );
 
         assert_eq!(support.status, VulkanStatus::Absent);
         assert!(!icd_is_gpu_driver("lvp_icd.x86_64.json"));
@@ -554,8 +582,12 @@ GPU0:
 
     #[test]
     fn an_installed_driver_with_no_enumerated_device_stays_unverified() {
-        let support =
-            classify_vulkan_support(vec!["radeon_icd.x86_64.json".to_owned()], Vec::new(), true);
+        let support = classify_vulkan_support(
+            vec!["radeon_icd.x86_64.json".to_owned()],
+            Vec::new(),
+            true,
+            true,
+        );
 
         assert_eq!(support.status, VulkanStatus::DriverPresentDevicesUnverified);
         assert!(
@@ -580,29 +612,44 @@ GPU0:
     /// a working driver would be told to install one it already has.
     #[test]
     fn no_evidence_either_way_is_not_reported_as_a_confirmed_absence() {
-        let nothing = classify_vulkan_support(Vec::new(), Vec::new(), true);
+        // `vulkaninfo` absent: nothing could have found a driver, so nothing
+        // may claim there is none.
+        let unasked = classify_vulkan_support(Vec::new(), Vec::new(), true, false);
         assert_eq!(
-            nothing.status,
+            unasked.status,
             VulkanStatus::Unknown,
-            "an empty probe must not claim the driver is absent"
+            "with no ICD and no way to enumerate, absence is unproven"
         );
         assert!(
-            nothing
+            unasked
                 .detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("confirms")),
-            "the detail must say the absence is unconfirmed: {nothing:?}"
+                .is_some_and(|detail| detail.contains("not installed")),
+            "the detail must name the missing tool: {unasked:?}"
+        );
+
+        // `vulkaninfo` present and it found nothing: that IS the answer, and
+        // it is the shape a host genuinely without a driver takes.
+        let nothing = classify_vulkan_support(Vec::new(), Vec::new(), true, true);
+        assert_eq!(
+            nothing.status,
+            VulkanStatus::Absent,
+            "a probe that could look and found nothing is a real absence"
         );
         assert!(nothing.driver_label().is_none());
 
         // What `Absent` is now reserved for: something WAS found and ruled out.
-        let software_only =
-            classify_vulkan_support(vec!["lvp_icd.x86_64.json".to_owned()], Vec::new(), true);
+        let software_only = classify_vulkan_support(
+            vec!["lvp_icd.x86_64.json".to_owned()],
+            Vec::new(),
+            true,
+            true,
+        );
         assert_eq!(software_only.status, VulkanStatus::Absent);
 
         // macOS and friends: no evidence either way, which must not read as
         // "no Vulkan" any more than it reads as "Vulkan works".
-        let unprobeable = classify_vulkan_support(Vec::new(), Vec::new(), false);
+        let unprobeable = classify_vulkan_support(Vec::new(), Vec::new(), false, false);
         assert_eq!(unprobeable.status, VulkanStatus::Unknown);
         assert!(!unprobeable.status.is_usable());
     }
@@ -617,6 +664,7 @@ GPU0:
         let support = classify_vulkan_support(
             vec!["some_new_vendor_icd.x86_64.json".to_owned()],
             Vec::new(),
+            true,
             true,
         );
         assert_eq!(support.status, VulkanStatus::DriverPresentDevicesUnverified);
@@ -636,7 +684,8 @@ GPU1:
 \tdeviceName   = AMD Radeon RX 7900 XTX
 \tdriverName   = radv
 ";
-        let support = classify_vulkan_support(Vec::new(), parse_vulkaninfo_summary(mixed), true);
+        let support =
+            classify_vulkan_support(Vec::new(), parse_vulkaninfo_summary(mixed), true, true);
 
         assert_eq!(support.status, VulkanStatus::Available);
         assert_eq!(support.driver_label().as_deref(), Some("radv"));
@@ -661,6 +710,7 @@ GPU0:
         let support = classify_vulkan_support(
             vec!["nvidia_icd.json".to_owned()],
             parse_vulkaninfo_summary(nvidia),
+            true,
             true,
         );
 
