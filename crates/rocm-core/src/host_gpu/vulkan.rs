@@ -383,14 +383,33 @@ pub fn classify_vulkan_support(
 
     let gpu_icds: Vec<&String> = icds.iter().filter(|icd| icd_is_gpu_driver(icd)).collect();
     if gpu_icds.is_empty() {
-        let detail = if icds.is_empty() {
-            "no Vulkan driver found".to_owned()
-        } else {
-            "only a software (CPU) Vulkan driver is installed; that is not a GPU path".to_owned()
-        };
+        // No ICD *and* no enumerated device is an absence of evidence, not
+        // evidence of absence: neither source is exhaustive. The Linux ICD
+        // search is a fixed directory list that ignores `VK_ICD_FILENAMES` and
+        // `VK_DRIVER_FILES`; the Windows one reads only the legacy Khronos
+        // registry key, which current AMD drivers need not populate; and
+        // `vulkaninfo` is frequently not installed on either. A working driver
+        // can therefore leave both empty, and `Absent` is rendered to the user
+        // as a confirmed fact ("no Vulkan GPU driver was found - install one").
+        // Say we could not tell instead, and keep `Absent` for the cases below
+        // where something was actually found and ruled out.
+        if icds.is_empty() && devices.is_empty() {
+            return VulkanSupport {
+                status: VulkanStatus::Unknown,
+                detail: Some(
+                    "no Vulkan driver was found, but this host exposes nothing that confirms                      one is absent either (no ICD manifest, and `vulkaninfo` did not enumerate)"
+                        .to_owned(),
+                ),
+                icds,
+                devices,
+            };
+        }
         return VulkanSupport {
             status: VulkanStatus::Absent,
-            detail: Some(detail),
+            detail: Some(
+                "only a software (CPU) Vulkan driver is installed; that is not a GPU path"
+                    .to_owned(),
+            ),
             icds,
             devices,
         };
@@ -553,12 +572,33 @@ GPU0:
         );
     }
 
+    /// No ICD and no enumerated device is an absence of evidence, not evidence
+    /// of absence — neither source is exhaustive (the Linux ICD search ignores
+    /// `VK_ICD_FILENAMES`, the Windows one reads only the legacy registry key,
+    /// and `vulkaninfo` is often not installed). `Absent` renders as a
+    /// confirmed "no Vulkan GPU driver was found - install one", so a host with
+    /// a working driver would be told to install one it already has.
     #[test]
-    fn a_host_with_nothing_installed_is_absent_and_a_platform_that_cannot_look_is_unknown() {
+    fn no_evidence_either_way_is_not_reported_as_a_confirmed_absence() {
         let nothing = classify_vulkan_support(Vec::new(), Vec::new(), true);
-        assert_eq!(nothing.status, VulkanStatus::Absent);
-        assert_eq!(nothing.detail.as_deref(), Some("no Vulkan driver found"));
+        assert_eq!(
+            nothing.status,
+            VulkanStatus::Unknown,
+            "an empty probe must not claim the driver is absent"
+        );
+        assert!(
+            nothing
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("confirms")),
+            "the detail must say the absence is unconfirmed: {nothing:?}"
+        );
         assert!(nothing.driver_label().is_none());
+
+        // What `Absent` is now reserved for: something WAS found and ruled out.
+        let software_only =
+            classify_vulkan_support(vec!["lvp_icd.x86_64.json".to_owned()], Vec::new(), true);
+        assert_eq!(software_only.status, VulkanStatus::Absent);
 
         // macOS and friends: no evidence either way, which must not read as
         // "no Vulkan" any more than it reads as "Vulkan works".

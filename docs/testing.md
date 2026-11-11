@@ -3895,14 +3895,14 @@ or unknown. Unknown covers both "nothing detected" and "a target this build's
 catalog does not recognise" — conflating the latter with "confirmed to have no
 ROCm build" would turn a detection gap into a claim about the hardware, which
 is why it is distinct from the `NoGpuBackend` level that *is* a confirmed
-answer. `examine-48` holds the line against the `detected_gfx_target` and
+answer. `examine-49` holds the line against the `detected_gfx_target` and
 `compatible_therock_family` the same report prints, so every lane checks the
-level its own hardware implies; `examine-49`, `examine-50` and `examine-51`
+level its own hardware implies; `examine-50`, `examine-51` and `examine-52`
 cover the Vulkan tiers (a driver present, none present, and a software
 renderer that must not count as a GPU path) and are `@requires-os:linux`:
 
 ```bash
-cargo xtask e2e -- -n '(examine-4[89]|examine-5[01])'
+cargo xtask e2e -- -n '(examine-49|examine-5[012])'
 ```
 
 ## Windows Tool Notes
