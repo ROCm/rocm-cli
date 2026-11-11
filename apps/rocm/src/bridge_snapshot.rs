@@ -40,7 +40,6 @@ pub(crate) fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridg
     let gpu_support_level = rocm_core::gpu_support_level(
         examine.detected_gfx_target.as_deref(),
         examine.compatible_therock_family.as_deref(),
-        examine.vulkan_status(),
     );
     Ok(CodexBridgeSnapshot {
         protocol: "rocmd-codex-bridge-v0".to_owned(),

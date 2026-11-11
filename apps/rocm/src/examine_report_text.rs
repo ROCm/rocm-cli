@@ -133,13 +133,9 @@ pub(crate) fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    // `summary` already carries the Vulkan probe result, so the support level
-    // here is the verified one: this is the surface other messages send people
-    // to when they want a real answer.
     let gpu_support_level = rocm_core::gpu_support_level(
         summary.detected_gfx_target.as_deref(),
         summary.compatible_therock_family.as_deref(),
-        summary.vulkan_status(),
     );
     append_examine_engine_inventory(
         &mut output,
@@ -208,10 +204,7 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
     render_engine_inventory_text_for_host(
         paths,
         rocm_core::default_engine_for_host(&host_gpu),
-        // No Vulkan probe on this listing path, for the reason given on
-        // `host_gpu_support_level`: `rocm engines` is cheap by design, and
-        // `rocm examine` is where the verified answer lives.
-        rocm_core::gpu_support_level_for_host_gpu(&host_gpu, rocm_core::VulkanStatus::Unknown),
+        rocm_core::gpu_support_level_for_host_gpu(&host_gpu),
     )
 }
 
@@ -641,7 +634,6 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
-            vulkan: None,
             driver: rocm_core::DriverSummary {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),

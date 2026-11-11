@@ -54,7 +54,6 @@ mod gpu_visibility;
 pub(crate) mod linux;
 mod os_facts;
 mod render;
-mod vulkan;
 mod windows_inventory;
 mod wsl;
 
@@ -74,11 +73,6 @@ pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
-pub use vulkan::{
-    VulkanDevice, VulkanStatus, VulkanSupport, classify_vulkan_support, detect_vulkan_support,
-    icd_driver_label, icd_is_gpu_driver, parse_vulkaninfo_summary,
-    parse_windows_vulkan_icd_listing,
-};
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
 use windows_inventory::parse_windows_examine_inventory;
@@ -139,15 +133,6 @@ pub struct ExamineSummary {
     pub compatible_therock_family: Option<String>,
     #[serde(default)]
     pub detected_therock_family: Option<String>,
-    /// What the Vulkan probe found, when it could run.
-    ///
-    /// `#[serde(default)]` is load-bearing in the *reverse* direction: `rocm
-    /// remote doctor` deserializes summaries produced by other hosts, which may
-    /// be running a build from before this field existed. `None` means "not
-    /// probed", which [`ExamineSummary::vulkan_status`] maps to
-    /// [`VulkanStatus::Unknown`] — never to "no Vulkan".
-    #[serde(default)]
-    pub vulkan: Option<VulkanSupport>,
     pub driver: DriverSummary,
     pub legacy_rocm: LegacyRocmSummary,
     #[serde(default)]
@@ -299,7 +284,6 @@ impl ExamineSummary {
             detected_gfx_target,
             compatible_therock_family,
             detected_therock_family,
-            vulkan: Some(detect_vulkan_support()),
             driver: detect_driver_summary_with_windows_inventory(
                 windows_inventory.as_ref(),
                 wsl.as_ref(),
@@ -746,7 +730,6 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
-            vulkan: None,
             driver: windows_driver_summary(
                 Some("AMD Radeon(TM) Graphics driver 30.0.13014.8".to_owned()),
                 info,

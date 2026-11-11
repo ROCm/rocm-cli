@@ -1081,15 +1081,6 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         rocm_core::GpuSupportLevel::RocmHip => {
             "default embedded Lemonade server with ROCm llama.cpp backend"
         }
-        // Only `rocm examine` reaches this level — the cheap probe behind
-        // `host_gpu_support_level` passes `VulkanStatus::Unknown` and so lands
-        // on `VulkanOnly` — but the arm is spelled out rather than folded into
-        // `Unknown`, because what it means is the opposite: `Unknown` promises
-        // that a command can still answer, and here the question is already
-        // answered and the answer is no.
-        rocm_core::GpuSupportLevel::NoGpuBackend => {
-            "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
-        }
         rocm_core::GpuSupportLevel::Unknown => {
             "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
         }
@@ -1102,21 +1093,8 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
 /// The same two inputs `rocm examine` derives it from, read through
 /// `detect_host_gpu_summary` rather than the full examine gather — exactly what
 /// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
-///
-/// **The Vulkan probe is deliberately not run here**, so this stays the cheap
-/// probe its callers chose it for: the probe spawns `vulkaninfo` on Linux and
-/// PowerShell on Windows, and `rocm engines` is a listing command that would
-/// pay that on every invocation. Passing [`VulkanStatus::Unknown`] keeps these
-/// surfaces answering exactly as they did before this probe existed — a
-/// Vulkan-capable-by-the-table host still reads `VulkanOnly` — while `rocm
-/// examine`, which already gathers the probe, is the surface that can tell a
-/// host with a Vulkan driver from one without. That split is why
-/// `lemonade_engine_note` sends the user to `rocm examine` for a real answer.
 pub(crate) fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
-    rocm_core::gpu_support_level_for_host_gpu(
-        &rocm_core::detect_host_gpu_summary(paths),
-        rocm_core::VulkanStatus::Unknown,
-    )
+    rocm_core::gpu_support_level_for_host_gpu(&rocm_core::detect_host_gpu_summary(paths))
 }
 
 fn refresh_startup_update_check_quietly() {
