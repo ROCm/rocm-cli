@@ -8,7 +8,9 @@ use rocm_dash_core::metrics::SystemMetrics;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub struct HostCollector {
-    sys: System,
+    // `None` when sysinfo could not initialise on this platform; `tick` then
+    // reports empty metrics instead of failing the whole dashboard.
+    sys: Option<System>,
 }
 
 impl Default for HostCollector {
@@ -22,30 +24,39 @@ impl HostCollector {
         let refresh = RefreshKind::nothing()
             .with_cpu(sysinfo::CpuRefreshKind::everything())
             .with_memory(MemoryRefreshKind::everything());
-        let mut sys = System::new_with_specifics(refresh);
-        // First refresh primes CPU deltas; the very first read is meaningless.
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
-        Self { sys }
+        Self::from_system(System::new_with_specifics(refresh))
+    }
+
+    fn from_system<E: std::fmt::Display>(sys: Result<System, E>) -> Self {
+        match sys {
+            Ok(mut sys) => {
+                // First refresh primes CPU deltas; the very first read is meaningless.
+                sys.refresh_cpu_all();
+                sys.refresh_memory();
+                Self { sys: Some(sys) }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "host metrics unavailable: sysinfo failed to initialise");
+                Self { sys: None }
+            }
+        }
     }
 
     pub fn tick(&mut self) -> SystemMetrics {
-        self.sys.refresh_cpu_all();
-        self.sys.refresh_memory();
+        let Some(sys) = self.sys.as_mut() else {
+            return SystemMetrics::default();
+        };
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
 
-        let cpu_overall_pct = self.sys.global_cpu_usage();
-        let cpu_per_core_pct: Vec<f32> = self
-            .sys
-            .cpus()
-            .iter()
-            .map(sysinfo::Cpu::cpu_usage)
-            .collect();
+        let cpu_overall_pct = sys.global_cpu_usage();
+        let cpu_per_core_pct: Vec<f32> = sys.cpus().iter().map(sysinfo::Cpu::usage).collect();
 
         // sysinfo reports memory in bytes.
-        let memory_used_mb = self.sys.used_memory() / 1024 / 1024;
-        let memory_total_mb = self.sys.total_memory() / 1024 / 1024;
-        let swap_used_mb = self.sys.used_swap() / 1024 / 1024;
-        let swap_total_mb = self.sys.total_swap() / 1024 / 1024;
+        let memory_used_mb = sys.used_memory() / 1024 / 1024;
+        let memory_total_mb = sys.total_memory() / 1024 / 1024;
+        let swap_used_mb = sys.used_swap() / 1024 / 1024;
+        let swap_total_mb = sys.total_swap() / 1024 / 1024;
 
         SystemMetrics {
             cpu_overall_pct,
@@ -73,5 +84,16 @@ mod tests {
         let m = c.tick();
         assert!(!m.cpu_per_core_pct.is_empty(), "expected at least one CPU");
         assert!(m.memory_total_mb > 0, "expected nonzero total memory");
+    }
+
+    #[test]
+    fn a_collector_whose_sysinfo_failed_to_initialise_reports_empty_metrics() {
+        // sysinfo 0.40 made `System` construction fallible. The dashboard must
+        // keep ticking, with nothing to show for the host, rather than panic.
+        let mut c = HostCollector::from_system::<&str>(Err("unsupported platform"));
+        let m = c.tick();
+        assert!(m.cpu_per_core_pct.is_empty(), "{m:?}");
+        assert_eq!(m.memory_total_mb, 0, "{m:?}");
+        assert_eq!(m.swap_total_mb, 0, "{m:?}");
     }
 }

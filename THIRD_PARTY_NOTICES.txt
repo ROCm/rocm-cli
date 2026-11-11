@@ -11167,7 +11167,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - sysinfo 0.39.6 <https://github.com/GuillaumeGomez/sysinfo>
+  - sysinfo 0.40.1 <https://github.com/GuillaumeGomez/sysinfo>
 
 The MIT License (MIT)
 

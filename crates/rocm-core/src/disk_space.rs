@@ -230,11 +230,20 @@ pub fn mount_for_path(path: &Path) -> Option<(PathBuf, u64)> {
 /// `/proc/diskstats` and `/sys/block/*/queue/rotational`, neither of which this
 /// module uses.
 fn listed_mounts() -> Vec<(PathBuf, u64)> {
-    let disks = sysinfo::Disks::new_with_refreshed_list_specifics(
+    mounts_of(sysinfo::Disks::new_with_refreshed_list_specifics(
         sysinfo::DiskRefreshKind::nothing().with_storage(),
-    );
+    ))
+}
+
+/// Flatten a disk listing into mount points, or an empty list when the
+/// platform could not enumerate disks at all. An empty list leaves
+/// `mount_for_path` with nothing to match, so callers get "unknown" and never
+/// block the operation.
+fn mounts_of<E>(disks: Result<sysinfo::Disks, E>) -> Vec<(PathBuf, u64)> {
+    let Ok(disks) = disks else {
+        return Vec::new();
+    };
     disks
-        .list()
         .iter()
         .map(|disk| (disk.mount_point().to_path_buf(), disk.available_space()))
         .collect()
@@ -890,6 +899,21 @@ mod tests {
             low_space_warning("extract the SDK", Path::new("/install"), u64::MAX, None),
             None
         );
+    }
+
+    #[test]
+    fn a_failed_disk_enumeration_reports_unknown_space_and_never_blocks() {
+        // sysinfo 0.40 made listing disks fallible. The failure must surface as
+        // "no mounts", which `select_mount` cannot match and `classify_space`
+        // reports as unknown, rather than as a panic or an invented figure.
+        let mounts = mounts_of::<&str>(Err("the platform could not list disks"));
+        assert!(mounts.is_empty(), "{mounts:?}");
+        let selected = select_mount(Path::new("/var/cache/rocm"), &mounts);
+        assert_eq!(selected, None);
+        assert!(matches!(
+            classify_space(u64::MAX, selected.map(|(_, available)| available)),
+            SpaceCheck::Unknown
+        ));
     }
 
     #[test]
