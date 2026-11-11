@@ -803,6 +803,42 @@ mod tests {
             .collect()
     }
 
+    /// Every action the runtime-lock workflows run is pinned to a full commit
+    /// SHA, never a tag: `open-pr` holds a write token, and a moved tag would
+    /// run new code with it.
+    #[test]
+    fn the_runtime_lock_workflows_pin_every_action_to_a_commit() {
+        let update = read_workflow("runtime-deps-update.yml");
+        let ci = read_workflow("ci.yml");
+        let locks = job_block(&ci, "runtime-locks");
+        // Each source is counted on its own, so an empty or wrong slice of one
+        // cannot hide behind the other's count. A line-based scan: it reads
+        // `uses:` as these files write it (one step key per line, unquoted,
+        // a `# vX.Y.Z` comment after it), not every YAML form.
+        for (label, text, expected) in [
+            ("runtime-deps-update.yml", update.as_str(), 7),
+            ("runtime-locks", locks, 3),
+        ] {
+            let mut seen = 0;
+            for line in without_comments(text).lines() {
+                let Some(value) = line.trim().trim_start_matches("- ").strip_prefix("uses:") else {
+                    continue;
+                };
+                // The reference itself, without the `# vX.Y.Z` comment after it.
+                let value = value.split_whitespace().next().unwrap_or_default();
+                seen += 1;
+                let pinned = value.split_once('@').is_some_and(|(_, sha)| {
+                    sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())
+                });
+                assert!(
+                    pinned,
+                    "{label}: `{value}` is not pinned to a full commit SHA"
+                );
+            }
+            assert_eq!(seen, expected, "{label}: `uses:` lines found");
+        }
+    }
+
     /// The update refuses to reset its branch over a commit it did not make.
     /// Its own commits are recognised by the bot's login, or, only when
     /// GitHub leaves the commit's user unresolved, by the bot's commit email;

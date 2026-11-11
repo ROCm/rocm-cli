@@ -160,6 +160,13 @@ impl MiseConfig {
 /// option set); they are merged here, and must agree on the version.
 pub(crate) fn parse_lock(text: &str) -> Result<BTreeMap<String, LockedTool>> {
     let doc: toml::Table = toml::from_str(text).context("not valid TOML")?;
+    // As at every other level: a key this check does not know is refused.
+    if let Some(key) = doc
+        .keys()
+        .find(|key| !matches!(key.as_str(), "lockfile_version" | "tools"))
+    {
+        bail!("unknown top-level field {key:?}");
+    }
     let tools = doc
         .get("tools")
         .and_then(toml::Value::as_table)
@@ -786,6 +793,11 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
     #[test]
     fn fields_this_check_does_not_understand_are_refused() {
         let base = lock(LINUX, Some(WINDOWS));
+        let root = format!("mirror = \"https://evil.example/\"\n{base}");
+        assert_eq!(
+            format!("{:#}", parse_lock(&root).unwrap_err()),
+            "unknown top-level field \"mirror\""
+        );
         for (what, text) in [
             (
                 "platform field",

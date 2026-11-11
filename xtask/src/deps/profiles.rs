@@ -317,11 +317,18 @@ impl Requirement {
         }
         public == self.version
             || public.strip_prefix(&self.version).is_some_and(|rest| {
-                // `0.29.*` admits `0.29.1.dev0` and `0.29rc1`, never `0.290`.
+                // `0.29.*` admits `0.29.1.dev0`, `0.29rc1` and `0.29rc1.dev0`,
+                // never `0.290` or `0.29adventure`: what follows the prefix
+                // starts with `.`, or is a pre-, post- or dev-release marker
+                // whose number (or none) ends the version or is followed by
+                // `.`. This tells a series apart; it is not a PEP 440 parser.
                 rest.starts_with('.')
-                    || ["a", "b", "rc", "dev", "post"]
-                        .iter()
-                        .any(|suffix| rest.starts_with(suffix))
+                    || ["a", "b", "rc", "dev", "post"].iter().any(|marker| {
+                        rest.strip_prefix(marker).is_some_and(|after| {
+                            let tail = after.trim_start_matches(|c: char| c.is_ascii_digit());
+                            tail.is_empty() || tail.starts_with('.')
+                        })
+                    })
             })
     }
 }
@@ -515,8 +522,26 @@ windows = "x86_64-pc-windows-msvc"
         for pre in ["0.29rc1", "0.29a1", "0.29b2", "0.29dev1", "0.29post1"] {
             assert!(series.matches(pre), "{pre}");
         }
+        assert!(series.matches("0.29rc"));
         assert!(!series.matches("0.290.0"));
         assert!(!series.matches("0.30.0"));
+        for combined in [
+            "0.29rc1.dev0",
+            "0.29post1.dev2",
+            "0.29rc1.post1",
+            "0.29a1.post2",
+        ] {
+            assert!(series.matches(combined), "{combined}");
+        }
+        for word in [
+            "0.29adventure",
+            "0.29beta",
+            "0.29devel",
+            "0.29postx1",
+            "0.29rc1x",
+        ] {
+            assert!(!series.matches(word), "{word}");
+        }
 
         let extras = Requirement::parse("Rocm_SDK[libraries,device-gfx1151]==10.1.0").unwrap();
         assert_eq!(extras.name, "rocm-sdk");
