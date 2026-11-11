@@ -405,33 +405,23 @@ fn format_anthropic_endpoint_line(url: &str, responding: bool) -> String {
 /// `rocm services list`, and the chat `services` tool, which renders the same
 /// text.
 ///
-/// **This is no longer a pure local read.** Since ROCMAI-550 it makes one live
-/// `Healthcheck` RPC per *ready* service to fill the `device:` row, capped in
-/// aggregate by `engine_ipc::SERVICE_DEVICE_PROBE_BUDGET`. Worst case is that
-/// budget plus one in-flight probe — about 18s with the built-in engines, not
-/// 10s, because the budget gates the *start* of each probe and never
-/// interrupts one. That doc comment carries the arithmetic and why a
-/// per-probe deadline was not taken.
-///
-/// The chat tool pays the same bound deliberately rather than rendering a
-/// device-less view: the two surfaces would then disagree about one service
-/// while claiming to show the same list, and "which GPU is this running on" is
-/// a question asked in chat at least as often as at the prompt. The cost is
-/// bounded and flat in the number of services, which is what makes it
-/// acceptable there.
+/// **No longer a pure local read.** Since ROCMAI-550 it makes one live
+/// `Healthcheck` RPC per *ready* service to fill the `device:` row, bounded in
+/// aggregate by `engine_ipc::SERVICE_DEVICE_PROBE_BUDGET` — see that constant
+/// for the arithmetic behind the ~18s worst case. The chat tool pays the same
+/// bound rather than render a device-less view, which would have the two
+/// surfaces disagree while claiming to show the same list.
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
     render_services_text_with_devices(paths, all, |ready| fetch_service_devices(paths, ready))
 }
 
 /// [`render_services_text`] with the live device probe injected.
 ///
-/// Split out because the probe is the one thing a unit test cannot have: it is
-/// a `Healthcheck` RPC to a running engine, so in default CI (no GPU, no
-/// servers) it answers nothing and the `device:` row is never rendered at all —
-/// deleting the row would stay green everywhere except the GPU lanes, which is
-/// exactly the gap this closes. The seam takes only the probe, not the row:
-/// which services are offered to it (`status == "ready"`) and where the row
-/// lands both stay in the shared body, so a test can pin them.
+/// Split out because the probe is the one thing a unit test cannot have: in
+/// default CI it answers nothing, so deleting the `device:` row would stay
+/// green outside the GPU lanes. The seam takes only the probe — which services
+/// are offered to it and where the row lands stay in the shared body, so a
+/// test can pin both.
 fn render_services_text_with_devices(
     paths: &AppPaths,
     all: bool,
@@ -465,11 +455,9 @@ fn render_services_text_with_devices(
         } else {
             writeln!(output, "No local servers are running.")
         };
-        // Gate the separator on the same condition as the hint, not just on
-        // `!all`: `write_past_attempts_hint` early-returns at zero, so a host
-        // that has never served would otherwise gain a blank line between "No
-        // local servers are running." and the next line - a visible change to
-        // the one output this PR is not meant to touch.
+        // Gated on the same condition as the hint, not just `!all`:
+        // `write_past_attempts_hint` early-returns at zero, so a host that has
+        // never served would otherwise gain a stray blank line here.
         if !all && counts.past_attempts > 0 {
             write_past_attempts_hint(
                 &mut output,
