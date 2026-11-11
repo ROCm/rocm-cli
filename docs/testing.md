@@ -3465,6 +3465,11 @@ cargo test -p rocmd restart_runs_supervise_on_the_rocmd_it_is_given
 cargo test -p rocmd restart_without_a_rocmd_to_run_changes_nothing
 cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
 cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
+cargo test -p rocmd supervise_terminates_the_engine_when_recording_its_pid_fails
+cargo test -p rocmd supervise_terminates_the_engine_when_recording_ready_fails
+cargo test -p rocmd an_engine_child_dropped_before_its_wait_is_terminated_and_reaped
+cargo test -p rocmd an_engine_child_that_was_waited_for_is_not_signalled_on_drop
+cargo test -p rocmd terminate_recovery_supervisor_kills_and_reaps_the_child
 cargo test -p rocmd engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd
 cargo test -p rocmd engine_request_without_a_rocm_beside_rocmd_names_it
 cargo test -p rocm-core sibling_binary_path_from
