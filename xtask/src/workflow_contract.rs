@@ -7694,14 +7694,55 @@ jobs:
         }
         // A pull request runs one Linux node (MI300X) and one Windows node (the
         // Strix Halo pool). These two lanes are off the pull_request path but must
-        // still run in the merge queue, so the gate may name `pull_request` and
-        // nothing else about the event.
-        for job in ["e2e-gpu-strix-ubuntu", "e2e-gpu-w7900"] {
-            let gate = normalized_whitespace(&gate(job));
+        // still run on push and in the merge queue. Pin the WHOLE gate, not a
+        // substring: the `pull_request` exclusion must sit in the non-dispatch
+        // branch (so a dispatch can still select the lane) and nothing else about
+        // the event may be named, so a gate that dropped push/merge_group some
+        // other way fails here too.
+        for (job, platform) in [
+            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
+            ("e2e-gpu-w7900", "w7900"),
+        ] {
+            let expected = format!(
+                "always() && needs.changes.result == 'success' && ( \
+                 (github.event_name != 'workflow_dispatch' \
+                 && github.event_name != 'pull_request' \
+                 && needs.changes.outputs.serve == 'true') \
+                 || (github.event_name == 'workflow_dispatch' \
+                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+            );
+            assert_eq!(
+                normalized_whitespace(&gate(job)),
+                normalized_whitespace(&expected),
+                "`{job}` must skip pull_request in its non-dispatch branch and keep running \
+                 on push, merge_group and dispatch"
+            );
+        }
+    }
+
+    /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
+    /// RUSTUP_HOME, TMPDIR and PIP_CACHE_DIR pointed at `/home/ubuntu/actions-runner`)
+    /// to the DevLab Dispatch pool. A pool host has none of those paths, so the job
+    /// must neither set them nor read one it does not set: an unset variable is
+    /// empty, not defaulted, and a step that built a path from it would write to `/`.
+    #[test]
+    fn nightly_strix_ubuntu_job_holds_no_static_host_paths() {
+        let nightly = read_workflow("nightly.yml");
+        let block = job_block(&nightly, "e2e-gpu-nightly-strix");
+        let env = job_mapping(block, "env");
+        let uncommented: String = block
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !uncommented.contains("actions-runner"),
+            "the pool host has no /home/ubuntu/actions-runner tree"
+        );
+        for var in ["CARGO_HOME", "RUSTUP_HOME", "TMPDIR", "PIP_CACHE_DIR"] {
             assert!(
-                gate.contains("github.event_name != 'pull_request'")
-                    && !gate.contains("merge_group"),
-                "`{job}` must skip pull_request but keep running in the merge queue (gate: `{gate}`)"
+                env.contains_key(var) || !uncommented.contains(var),
+                "e2e-gpu-nightly-strix reads {var} but no longer sets it"
             );
         }
     }

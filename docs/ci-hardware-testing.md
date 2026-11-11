@@ -128,12 +128,16 @@ separate tier flag or tag filter to maintain.
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` |
 
+On `pull_request`, `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900` are skipped; the
+other lanes above run (one Linux node, MI300X, and the Windows Strix Halo pool).
+Both still run on `push`, `merge_group`, dispatch and nightly.
+
 `e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
-nightly]` axis — two concurrent legs on the same job, channel-suffixed
-artifact names — so the per-PR smoke gate proves the nightly channel boots on
-at least one platform without adding the axis (and its wall-clock cost) to
-every per-PR lane. This mirrors `nightly.yml`'s channel matrix from
-ROCMAI-429, applied to a single per-PR lane rather than all of them.
+nightly]` axis: two concurrent legs on the same job, channel-suffixed artifact
+names, so that lane proves the nightly package channel boots. It no longer runs
+on `pull_request`, so on a PR no lane exercises the nightly channel; it runs on
+`push`, `merge_group`, dispatch and in `nightly.yml`'s channel matrix
+(ROCMAI-429).
 
 All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
 runner is registered per job and destroyed after, opt-in only via the
@@ -386,8 +390,8 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 ## Triggers
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
-`pull_request` (not `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and `merge_group` (every GPU lane except MI300X, which is not
-required for merging and so is skipped in the merge queue rather than left
+`pull_request` (all lanes but `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and
+`merge_group` (every GPU lane except MI300X, which is not required for merging and so is skipped in the merge queue rather than left
 queued on limited runner capacity after its PR has merged) when the workflow's
 own `changes` job's `serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a

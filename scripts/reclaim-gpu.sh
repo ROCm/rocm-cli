@@ -46,9 +46,10 @@ set -euo pipefail
 # The scenario root stays ABSOLUTE, and follows TMPDIR.
 #
 # Scenario dirs come from `TempDir::with_prefix("rocm-e2e-")`, which builds on
-# `std::env::temp_dir()` and so follows TMPDIR; the nightly Strix lane redirects
-# it to `$HOME/actions-runner/tmp`. A bare `/tmp/rocm-e2e` kept matching there
-# only by accident — that directory is itself named `tmp`, so the substring
+# `std::env::temp_dir()` and so follows TMPDIR; a lane on a host that redirects
+# it (the nightly Strix lane did, to `$HOME/actions-runner/tmp`, before it moved
+# to the pool) is the case this handles. A bare `/tmp/rocm-e2e` kept matching
+# there only by accident — that directory is itself named `tmp`, so the substring
 # still appeared — and would silently stop matching under any redirect not
 # named `tmp`. Deriving the redirected form fixes that for ANY target.
 #

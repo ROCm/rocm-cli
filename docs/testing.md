@@ -1473,8 +1473,8 @@ install.
 `serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
 restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
-per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
-the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
+Strix Ubuntu job when it still ran per PR (about 25 minutes without them, 45
+minute cap) used up the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
 and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
 is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
 dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
