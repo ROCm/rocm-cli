@@ -3401,12 +3401,19 @@ GPU0:
 /// `vulkaninfo_summary` what `vulkaninfo --summary` prints; `None` for either
 /// means that half of the evidence is absent.
 ///
-/// The `vulkaninfo` stub is planted in **both** directions. When a scenario
-/// wants the tool absent it is planted as a failing command rather than left
-/// out, because `PATH` still reaches the rest of the machine: a runner with a
-/// real `vulkaninfo` installed would otherwise answer for it, and a scenario
-/// about a host with no Vulkan driver has to be hermetic about the host and not
-/// only about the planted root.
+/// The `vulkaninfo` stub is planted in **both** directions, because `PATH`
+/// still reaches the rest of the machine: a runner with a real `vulkaninfo`
+/// installed would otherwise answer for the fixture, and a scenario about a
+/// host with no Vulkan driver has to be hermetic about the host and not only
+/// about the planted root.
+///
+/// `None` plants a stub that **succeeds and reports no devices**, not one that
+/// fails. That distinction is the whole point of the `enumerated` input to
+/// `classify_vulkan_support`: a tool that exits non-zero answered nothing, and
+/// must leave the host `Inconclusive`, while one that runs and lists nothing is
+/// the genuine "looked and found none" that earns a confirmed `Absent`. The
+/// earlier `exit 1` stub pinned exactly the conflation this probe exists to
+/// avoid, so examine-51 passed for the wrong reason.
 fn plant_unsupported_gpu(
     world: &mut E2eWorld,
     icd_manifest: Option<&str>,
@@ -3448,7 +3455,9 @@ fn plant_unsupported_gpu(
         .expect("failed to write the fake lspci");
     let vulkaninfo = match vulkaninfo_summary {
         Some(summary) => format!("#!/bin/sh\ncat <<'ROCM_E2E_EOF'\n{summary}ROCM_E2E_EOF\n"),
-        None => "#!/bin/sh\nexit 1\n".to_owned(),
+        // Exit 0 with an empty `Devices:` section: the tool answered, and the
+        // answer is "none". See this function's doc comment.
+        None => "#!/bin/sh\nprintf 'Devices:\\n=======\\n'\nexit 0\n".to_owned(),
     };
     rocm_core::fake_executable::write_fake_executable(&bin.join("vulkaninfo"), &vulkaninfo)
         .expect("failed to write the fake vulkaninfo");
@@ -3511,7 +3520,7 @@ async fn assert_vulkan_unconfirmed(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     let line = rocm_support_line(output).expect("no rocm_support line");
     assert!(
-        line.contains("`vulkaninfo` is not installed"),
+        line.contains("`vulkaninfo` did not answer"),
         "the support line must name the gap that stopped it confirming, not assert \
          a driver is absent: {line}\n{output}"
     );

@@ -570,6 +570,14 @@ pub enum GpuSupportLevel {
     /// was **found on this host**, so Vulkan-based engines (the default Lemonade
     /// backend) run on it.
     ///
+    /// One exception, and it is deliberate: [`VulkanStatus::Unknown`] — a
+    /// platform the probe cannot read at all, or a summary from before the probe
+    /// existed — also lands here, keeping the benefit of the doubt it had before
+    /// any probe existed rather than withholding the only path such a host has.
+    /// So this level means "a driver was found, **or** nobody could look"; it is
+    /// `render.rs` that tells the two apart in what the user reads, and it only
+    /// names a driver when one was actually found.
+    ///
     /// The second half of that sentence is evidence, not inference. This variant
     /// used to be returned from the gfx table alone — "no ROCm build" was taken
     /// to mean "Vulkan then", on a machine nobody had looked at. Every surface

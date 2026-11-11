@@ -520,7 +520,7 @@ case, at one of five levels:
 | Level | Meaning |
 | --- | --- |
 | ROCm/HIP-supported | A TheRock package family covers this GPU. |
-| Vulkan-only | No ROCm build, **and** a Vulkan GPU driver was found here. |
+| Vulkan-only | No ROCm build, **and** either a Vulkan GPU driver was found here, or the platform cannot be probed for one at all (anything other than Linux and Windows, or a summary from an older `rocm remote doctor` that predates the probe). The `rocm_support` line says which of the two it is, and only names a driver when one was actually found. |
 | Vulkan-unconfirmed | No ROCm build, and the probe could not reach an answer — no ICD, no enumerated device, and no `vulkaninfo` to ask. |
 | no GPU backend | No ROCm build, **and** the probe looked and found no Vulkan GPU driver. |
 | unknown | No GPU detected, or a target this build's catalog does not recognize. |

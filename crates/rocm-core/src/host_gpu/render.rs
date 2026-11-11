@@ -118,9 +118,10 @@ impl ExamineSummary {
             // the evidence supports. See `GpuSupportLevel::VulkanUnconfirmed`.
             GpuSupportLevel::VulkanUnconfirmed => format!(
                 "  rocm_support: GPU detected ({}) but not supported by ROCm; no Vulkan driver \
-                 was found either, and `vulkaninfo` is not installed to confirm that - install \
-                 `vulkaninfo` to check, or a Vulkan driver (Mesa RADV on Linux, the AMD display \
-                 driver on Windows) to run models on this GPU\n",
+                 was found, and `vulkaninfo` did not answer to confirm that - install \
+                 `vulkaninfo` (or find out why it fails) to check, or install a Vulkan driver \
+                 (Mesa RADV on Linux, the AMD display driver on Windows) to run models on this \
+                 GPU\n",
                 detected.unwrap_or_default()
             ),
             // Both halves are established facts: the catalog confirmed there is
@@ -581,8 +582,8 @@ mod tests {
         let summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
             status: VulkanStatus::Inconclusive,
             detail: Some(
-                "no Vulkan driver was found, but `vulkaninfo` is not installed either, so \
-                 nothing here confirms one is absent"
+                "no Vulkan driver was found, and `vulkaninfo` did not answer (it is not \
+                 installed, or it failed to run), so nothing here confirms one is absent"
                     .to_owned(),
             ),
             ..VulkanSupport::default()
@@ -591,7 +592,7 @@ mod tests {
         let rendered = summary.render_text();
 
         assert!(
-            rendered.contains("`vulkaninfo` is not installed"),
+            rendered.contains("`vulkaninfo` did not answer"),
             "it must name the gap that stopped it confirming: {rendered}"
         );
         assert!(

@@ -337,21 +337,30 @@ const fn detect_icds() -> Vec<String> {
 /// The devices `vulkaninfo --summary` reports, or an empty list when the tool
 /// is not installed. Absence of the tool is not absence of a driver, which is
 /// why this cannot decide [`VulkanStatus`] on its own.
-fn detect_vulkan_devices() -> Vec<VulkanDevice> {
-    capture_optional_command("vulkaninfo", &["--summary"])
-        .map(|output| parse_vulkaninfo_summary(&output))
-        .unwrap_or_default()
+fn detect_vulkan_devices() -> (Vec<VulkanDevice>, bool) {
+    vulkan_devices_from_capture(capture_optional_command("vulkaninfo", &["--summary"]))
 }
 
-/// Whether `vulkaninfo` is on this host at all, regardless of what it said.
+/// The pure half of [`detect_vulkan_devices`]: the devices the capture named,
+/// and whether `vulkaninfo` actually **answered**.
 ///
-/// The distinction the classification turns on is "could we ask" versus "we
-/// asked and nothing was there" — and an empty device list cannot tell those
-/// apart, because a missing binary and one that exits non-zero both yield it.
-/// A host that genuinely has no Vulkan driver is the second case: `vulkaninfo`
-/// is installed and fails. Only the first is a gap in the probe.
-fn vulkan_enumeration_available() -> bool {
-    crate::probe_exec::which("vulkaninfo")
+/// The classification turns on "could we ask" versus "we asked and nothing was
+/// there", and the second half of that is what this bool carries. It is
+/// deliberately *not* "the binary exists": `capture_optional_command` yields
+/// `Some` only for an exit-0 run, so a `vulkaninfo` that exits non-zero, times
+/// out, or is too old to know `--summary` is `None` here — none of which is a
+/// host that was looked at and found empty.
+///
+/// Using mere presence on `PATH` for this was wrong in the direction that
+/// matters: on a host whose ICD sits outside the fixed search directories, a
+/// failing `vulkaninfo` produced a *confirmed* `Absent` and told the user "no
+/// Vulkan GPU driver was found - install one", which is the unearned claim
+/// this probe exists to stop making.
+fn vulkan_devices_from_capture(captured: Option<String>) -> (Vec<VulkanDevice>, bool) {
+    captured.map_or_else(
+        || (Vec::new(), false),
+        |output| (parse_vulkaninfo_summary(&output), true),
+    )
 }
 
 /// Whether this platform's Vulkan surfaces can be read at all.
@@ -362,12 +371,8 @@ const fn vulkan_is_probeable() -> bool {
 /// What this host offers for Vulkan.
 #[must_use]
 pub fn detect_vulkan_support() -> VulkanSupport {
-    classify_vulkan_support(
-        detect_icds(),
-        detect_vulkan_devices(),
-        vulkan_is_probeable(),
-        vulkan_enumeration_available(),
-    )
+    let (devices, enumerated) = detect_vulkan_devices();
+    classify_vulkan_support(detect_icds(), devices, vulkan_is_probeable(), enumerated)
 }
 
 /// The pure decision behind [`detect_vulkan_support`], split out so every
@@ -423,15 +428,19 @@ pub fn classify_vulkan_support(
         // `Absent` renders as "no Vulkan GPU driver was found - install one",
         // which would then be told to a host that has one.
         //
-        // `enumerated` is deliberately "the tool is installed", not "the tool
-        // returned devices": a host genuinely without a driver HAS
-        // `vulkaninfo` and gets nothing from it, and that is a real answer.
+        // `enumerated` is "the tool answered", not "the tool returned devices"
+        // and not "the tool is installed": a host genuinely without a driver
+        // runs `vulkaninfo` successfully and gets an empty device list, and
+        // that is a real answer. A `vulkaninfo` that exits non-zero, times out,
+        // or is too old for `--summary` is not — it answered nothing, so it
+        // cannot be the evidence that turns an empty result into a confirmed
+        // absence.
         if icds.is_empty() && devices.is_empty() && !enumerated {
             return VulkanSupport {
                 status: VulkanStatus::Inconclusive,
                 detail: Some(
-                    "no Vulkan driver was found, but `vulkaninfo` is not installed either, so \
-                     nothing here confirms one is absent"
+                    "no Vulkan driver was found, and `vulkaninfo` did not answer (it is not \
+                     installed, or it failed to run), so nothing here confirms one is absent"
                         .to_owned(),
                 ),
                 icds,
@@ -758,6 +767,42 @@ GPU0:
             crate::gfx_target::GpuSupportLevel::VulkanOnly,
             "today a non-AMD-only enumeration still promises this host a Vulkan path; \
              this is the documented limitation, and changing it must break this test"
+        );
+    }
+
+    /// The distinction the whole classification rests on, at the seam where it
+    /// is actually decided.
+    ///
+    /// `capture_optional_command` collapses "not installed", "exited non-zero",
+    /// "timed out" and "too old for `--summary`" into one `None`, and **none**
+    /// of those is a host that was looked at. Reading presence on `PATH` as
+    /// "it answered" meant a failing `vulkaninfo`, on a host whose ICD sits
+    /// outside the fixed search directories, produced a confirmed `Absent` and
+    /// told the user to install a driver they already had.
+    #[test]
+    fn only_a_vulkaninfo_that_answered_counts_as_having_looked() {
+        let (devices, enumerated) = vulkan_devices_from_capture(None);
+        assert!(
+            !enumerated && devices.is_empty(),
+            "a run that produced no output did not look at this host"
+        );
+        assert_eq!(
+            classify_vulkan_support(Vec::new(), devices, true, enumerated).status,
+            VulkanStatus::Inconclusive,
+            "so it must not be reported as a confirmed absence"
+        );
+
+        // The genuine "looked and found none": exit 0, empty device list.
+        let (devices, enumerated) =
+            vulkan_devices_from_capture(Some("Devices:\n=======\n".to_owned()));
+        assert!(
+            enumerated && devices.is_empty(),
+            "an empty answer is still an answer"
+        );
+        assert_eq!(
+            classify_vulkan_support(Vec::new(), devices, true, enumerated).status,
+            VulkanStatus::Absent,
+            "and that one has earned the confirmed absence"
         );
     }
 
