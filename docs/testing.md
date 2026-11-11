@@ -3008,6 +3008,37 @@ tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
 blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
 same module; `serve-53` is the real-engine check.
 
+A recipe may publish a different build of the same model per engine, through the
+`model_id_override` on its `engine_recipes` entry: Lemonade serves GGUF with an
+explicit quantization variant, vLLM serves the safetensors repo. The resolution
+is pinned on every host by `serve_small_assistant_resolves_the_gguf_build_on_lemonade`
+and, catalog-wide, by `every_lemonade_catalog_recipe_resolves_to_a_servable_ref`
+in [serve_cmd.rs](../apps/rocm/src/serve_cmd.rs) — the second fails for any
+recipe that *lists* Lemonade whose resolved ref is a Hugging Face `owner/repo`
+with no `:variant`, which the engine refuses only after it has already been
+launched. A recipe that lists no Lemonade entry is still handed its canonical
+id when Lemonade is reached some other way (an explicit `--engine`, a
+configured default, the platform default), and that is deliberate: such a
+recipe has no GGUF build to substitute.
+
+```bash
+cargo test -p rocm --bin rocm every_lemonade_catalog_recipe_resolves_to_a_servable_ref
+```
+
+The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
+`rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
+It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
+engine is the CLI's to pick here — so the lane that exercises the Lemonade half
+is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
+the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
+([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
+path filter matches) but none of their check names is a required status check,
+so the two unit tests above are the blocking per-PR coverage. The scenario
+carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
+unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
+their known serve failure there has not been observed, and a row claiming a
+known bug before one is seen would say something untrue.
+
 Natural-language plan handoff tests:
 
 ```bash
