@@ -566,23 +566,63 @@ pub(crate) fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) 
 pub enum GpuSupportLevel {
     /// A TheRock package family covers this GPU: full ROCm/HIP support.
     RocmHip,
-    /// Recognized, confirmed to have no ROCm/HIP build, but Vulkan-based
-    /// engines (the default Lemonade backend) still work on it.
+    /// Recognized, confirmed to have no ROCm/HIP build, and a Vulkan GPU driver
+    /// was **found on this host**, so Vulkan-based engines (the default Lemonade
+    /// backend) run on it.
+    ///
+    /// The second half of that sentence is evidence, not inference. This variant
+    /// used to be returned from the gfx table alone — "no ROCm build" was taken
+    /// to mean "Vulkan then", on a machine nobody had looked at. Every surface
+    /// that renders this level tells the user to go and serve a model on it, so
+    /// a host with no Vulkan driver installed, or with only a software
+    /// rasteriser, was sent to a backend that cannot start.
     VulkanOnly,
+    /// Recognized, confirmed to have no ROCm/HIP build, **and** no Vulkan GPU
+    /// driver was found: this host has no GPU path at all.
+    ///
+    /// Deliberately not folded into [`Self::Unknown`]. Both halves here are
+    /// confirmed — the catalog establishes the missing ROCm build, and the
+    /// Vulkan probe looked and found nothing — whereas `Unknown` means the CLI
+    /// could not establish either. Collapsing them would commit, in the other
+    /// direction, the exact conflation this enum's `Unknown` exists to prevent:
+    /// a fact about the machine would be reported as a gap in what this build
+    /// knows, and the user would be sent to probe a question already answered.
+    NoGpuBackend,
     /// No GPU detected yet, or a gfx target this catalog doesn't recognize.
     Unknown,
 }
 
-/// Classify the host's GPU support level from the same two facts
-/// `ExamineSummary` and `resolve_family` already compute: the detected gfx
-/// target and whichever TheRock family (if any) covers it.
+/// Classify the host's GPU support level.
+///
+/// Reads the two facts `ExamineSummary` and `resolve_family` already compute —
+/// the detected gfx target and whichever TheRock family (if any) covers it —
+/// plus what the Vulkan probe found.
+///
+/// `vulkan` only ever decides between [`GpuSupportLevel::VulkanOnly`] and
+/// [`GpuSupportLevel::NoGpuBackend`], and is consulted only once the catalog has
+/// confirmed there is no ROCm build. A host with a covering family is `RocmHip`
+/// whatever Vulkan reports, and an unrecognized target stays `Unknown`: finding
+/// a Vulkan driver says nothing about whether ROCm would also work there, so it
+/// must not be allowed to turn a detection gap into a support claim.
+///
+/// [`VulkanStatus::Unknown`] — the platform could not be probed at all — keeps
+/// `VulkanOnly`, because withholding the one path such a host has on the
+/// strength of a probe that never ran would be worse than the old assumption,
+/// not better.
 pub fn gpu_support_level(
     detected_gfx_target: Option<&str>,
     compatible_therock_family: Option<&str>,
+    vulkan: crate::host_gpu::VulkanStatus,
 ) -> GpuSupportLevel {
     match (detected_gfx_target, compatible_therock_family) {
         (_, Some(_)) => GpuSupportLevel::RocmHip,
-        (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => GpuSupportLevel::VulkanOnly,
+        (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => {
+            if vulkan.is_usable() || vulkan == crate::host_gpu::VulkanStatus::Unknown {
+                GpuSupportLevel::VulkanOnly
+            } else {
+                GpuSupportLevel::NoGpuBackend
+            }
+        }
         _ => GpuSupportLevel::Unknown,
     }
 }
@@ -594,17 +634,27 @@ pub fn gpu_support_level(
 /// site that transposed them would classify a Vulkan-only host as `RocmHip`
 /// and still compile. `rocm engines` and the codex-bridge `engines` tool both
 /// derive the level from this struct, so both go through this.
+///
+/// `vulkan` is passed in rather than probed here so this stays a pure function
+/// of what the caller already holds: the probe runs a subprocess and reads the
+/// filesystem, and burying that in a helper this cheap would make every caller
+/// pay for it without saying so.
 #[must_use]
-pub fn gpu_support_level_for_host_gpu(host_gpu: &HostGpuSummary) -> GpuSupportLevel {
+pub fn gpu_support_level_for_host_gpu(
+    host_gpu: &HostGpuSummary,
+    vulkan: crate::host_gpu::VulkanStatus,
+) -> GpuSupportLevel {
     gpu_support_level(
         host_gpu.gfx_target.as_deref(),
         host_gpu.therock_family.as_deref(),
+        vulkan,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_gpu::VulkanStatus;
 
     #[test]
     fn normalize_therock_family_maps_gfx1101_to_gfx110x_all() {
@@ -997,7 +1047,7 @@ mod tests {
             therock_family: Some("gfx94X-dcgpu".to_owned()),
         };
         assert_eq!(
-            gpu_support_level_for_host_gpu(&host_gpu),
+            gpu_support_level_for_host_gpu(&host_gpu, VulkanStatus::Available),
             GpuSupportLevel::RocmHip
         );
     }
@@ -1010,7 +1060,7 @@ mod tests {
             therock_family: None,
         };
         assert_eq!(
-            gpu_support_level_for_host_gpu(&host_gpu),
+            gpu_support_level_for_host_gpu(&host_gpu, VulkanStatus::Available),
             GpuSupportLevel::VulkanOnly
         );
     }
@@ -1018,7 +1068,7 @@ mod tests {
     #[test]
     fn gpu_support_level_for_host_gpu_reads_an_undetected_summary_as_unknown() {
         assert_eq!(
-            gpu_support_level_for_host_gpu(&HostGpuSummary::default()),
+            gpu_support_level_for_host_gpu(&HostGpuSummary::default(), VulkanStatus::Available),
             GpuSupportLevel::Unknown
         );
     }
@@ -1026,24 +1076,76 @@ mod tests {
     #[test]
     fn gpu_support_level_is_rocm_hip_when_a_family_covers_it() {
         assert_eq!(
-            gpu_support_level(Some("gfx90a"), Some("gfx90a")),
+            gpu_support_level(Some("gfx90a"), Some("gfx90a"), VulkanStatus::Available),
+            GpuSupportLevel::RocmHip
+        );
+        // A covering family wins outright: a host whose Vulkan probe found
+        // nothing still has ROCm, and must not be downgraded for it.
+        assert_eq!(
+            gpu_support_level(Some("gfx90a"), Some("gfx90a"), VulkanStatus::Absent),
             GpuSupportLevel::RocmHip
         );
     }
 
     #[test]
     fn gpu_support_level_is_unknown_without_detection_or_for_an_unrecognized_target() {
-        assert_eq!(gpu_support_level(None, None), GpuSupportLevel::Unknown);
         assert_eq!(
-            gpu_support_level(Some("gfx_totally_unrecognized"), None),
+            gpu_support_level(None, None, VulkanStatus::Available),
+            GpuSupportLevel::Unknown
+        );
+        // Finding a Vulkan driver says nothing about whether ROCm would work on
+        // an unrecognized target, so it must not promote a detection gap into a
+        // support claim.
+        assert_eq!(
+            gpu_support_level(
+                Some("gfx_totally_unrecognized"),
+                None,
+                VulkanStatus::Available
+            ),
             GpuSupportLevel::Unknown
         );
     }
 
     #[test]
-    fn gpu_support_level_is_vulkan_only_for_gfx90c() {
+    fn gpu_support_level_is_vulkan_only_for_gfx90c_with_a_vulkan_driver() {
         assert_eq!(
-            gpu_support_level(Some("gfx90c"), None),
+            gpu_support_level(Some("gfx90c"), None, VulkanStatus::Available),
+            GpuSupportLevel::VulkanOnly
+        );
+        // An installed driver that enumerated no device is still worth routing
+        // to; the level says "Vulkan", and `examine`'s own line carries how sure
+        // the probe was.
+        assert_eq!(
+            gpu_support_level(
+                Some("gfx90c"),
+                None,
+                VulkanStatus::DriverPresentDevicesUnverified
+            ),
+            GpuSupportLevel::VulkanOnly
+        );
+    }
+
+    /// The defect this guards against: `VulkanOnly` used to be inferred from the
+    /// gfx table alone, so a Renoir laptop with no Vulkan driver installed — or
+    /// with only a CPU rasteriser — was told to go and serve a model on a
+    /// backend that cannot start.
+    #[test]
+    fn gpu_support_level_reports_no_gpu_backend_when_the_vulkan_probe_found_none() {
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None, VulkanStatus::Absent),
+            GpuSupportLevel::NoGpuBackend,
+            "a confirmed-absent Vulkan driver must not read as a usable Vulkan path"
+        );
+    }
+
+    /// A platform the probe cannot read is not a platform without Vulkan.
+    /// Withholding the only path such a host has, on the strength of a probe
+    /// that never ran, would be a worse answer than the assumption this change
+    /// replaces.
+    #[test]
+    fn gpu_support_level_keeps_vulkan_when_the_probe_could_not_run() {
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None, VulkanStatus::Unknown),
             GpuSupportLevel::VulkanOnly
         );
     }
