@@ -623,12 +623,14 @@ jobs:
 
       - name: Test rocm-core with e2e-test-hooks
         # The simulated-host-root tests (`hardware_root.rs`, and the planted-root
-        # probe tests in `examine.rs`) only exist with this feature, which no
-        # other unit-test, nextest or clippy invocation enables. Without this
-        # step they are not even compiled in CI, so a probe reverted to a raw
-        # path would pass everything automated. Runs only when rocm-core is in
-        # the affected selection (or the whole workspace is), since nothing
-        # outside the crate can change these results.
+        # probe tests in `examine.rs`) only exist with this feature, which the
+        # plain nextest step above does not enable. The `rocm` step below
+        # turns it on in rocm-core too but runs only rocm's own tests, and the
+        # feature-on clippy step compiles these tests without running them, so
+        # without this step a probe reverted to a raw path would pass
+        # everything automated. Runs only when rocm-core is in the affected
+        # selection (or the whole workspace is), since nothing outside the
+        # crate can change these results.
         #
         # This is a sample, not full coverage of the routed reads. The probe
         # tests assert only the KFD topology (GPU node count and gfx target),
@@ -657,6 +659,26 @@ jobs:
           && (steps.sel.outputs.sel == '--workspace'
               || contains(format('{0} ', steps.sel.outputs.sel), '-p rocm-core '))
         run: cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
+
+      - name: Test rocm with e2e-test-hooks
+        # Runs the whole rocm suite with the feature on, not only the tests
+        # that exist only with it (the low-VRAM hook in `gpu_policy.rs`, and
+        # the `system_packages.rs` tests that plant a simulated host root),
+        # which the feature-on clippy step compiles but only this step runs.
+        # Tests gated on the feature being off (`cfg(not(..))`, as in
+        # `dash.rs`) are not built here; the plain nextest step runs them.
+        # The selection gate is the rocm-core step's: the trailing space stops
+        # `-p rocm-core` from satisfying a check for `-p rocm `. The step uses
+        # nextest so that each test is its own process: the feature-only tests
+        # set process-wide variables the hooks read (`ROCM_E2E_FORCE_LOW_VRAM`,
+        # and the simulated host root) while holding `ScopedTestEnv`'s lock,
+        # but the hooks read them without it, so under a threaded `cargo test`
+        # another test reaching a hook in that window could see them.
+        if: >-
+          needs.changes.outputs.rust == 'true'
+          && (steps.sel.outputs.sel == '--workspace'
+              || contains(format('{0} ', steps.sel.outputs.sel), '-p rocm '))
+        run: cargo nextest run --locked -p rocm --features rocm/e2e-test-hooks
 
   # The Windows lane is two parallel jobs (`windows-debug`, `windows-release`)
   # joined by `windows-build-and-test` below. One serial job was the longest pole
@@ -777,9 +799,12 @@ jobs:
       # of every platform conditional and never sees the `cfg(windows)` side.
       # Windows-gated code was therefore outside the warnings-as-errors gate
       # entirely — not merely under-linted — so a lint could land there and no
-      # check in the set could fail. This mirrors the two invocations the Linux
-      # `clippy` job runs; the second is separate because the `e2e` target sets
-      # `test = false`, so `--all-targets` does not build it.
+      # check in the set could fail. This mirrors the Linux `clippy` job's
+      # plain workspace pass and its e2e-harness pass. The e2e-harness pass is
+      # separate because the `e2e` target sets `test = false`, so
+      # `--all-targets` does not build it. The `e2e-test-hooks` feature-on
+      # pass runs on Linux only, so the feature's code as compiled for Windows
+      # is not linted by any CI clippy step.
       #
       # Runs before the build so a lint failure costs seconds rather than the
       # full build and test cycle.
@@ -1446,6 +1471,17 @@ jobs:
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # A second pass, not a replacement: each `e2e-test-hooks` seam has a
+      # feature-off half (the `cfg(not(..))` fallbacks in, e.g., comfyui.rs,
+      # service_control.rs, amd_smi.rs and hardware_root.rs) that only the run
+      # above compiles, and a feature-on half, including the tests that exist
+      # only with the feature, that only this one does. Enabling it on `rocm`
+      # turns it on in rocm-core and the engine crates as well, so the
+      # rocm-core and Lemonade seams are linted here too.
+      - name: Clippy (e2e-test-hooks)
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy --locked --workspace --all-targets --features rocm/e2e-test-hooks -- -D warnings
 
       # The e2e-cucumber `e2e` target sets `test = false` (so nextest/`cargo test
       # --all-targets` skip the custom harness), which also excludes it from

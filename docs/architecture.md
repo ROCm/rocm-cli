@@ -764,7 +764,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 | [`tpn.rs`](../xtask/src/tpn.rs) | `cargo xtask tpn`: regenerates or checks [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt) through cargo-about with the committed config and template. | flat |
 | [`verify_commits.rs`](../xtask/src/verify_commits.rs) | `cargo xtask verify-commits`: checks that every commit in a range is signed and carries a DCO `Signed-off-by` trailer, or only that signing is configured. | flat |
 | [`verify_pinned_keys.rs`](../xtask/src/verify_pinned_keys.rs) | `cargo xtask verify-pinned-keys`: checks that the public keys pinned in the installers and the CLI match the canonical keys under `docs/keys/`. | flat |
-| [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) | Source-scan tests over the GitHub workflow files and CI scripts: lane placement and concurrency groups, runner labels, timeouts, permissions and other CI invariants. | flat |
+| [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) | Source-scan tests over the GitHub workflow files and CI scripts: lane placement and concurrency groups, runner labels, timeouts, permissions and other CI invariants, including that CI lints and runs every crate's `e2e-test-hooks`-only tests, found by walking the module tree `module_size.rs` walks. | flat |
 
 Boundaries:
 

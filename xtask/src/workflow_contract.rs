@@ -10532,4 +10532,608 @@ permissions:
             "{log}"
         );
     }
+
+    /// Test code that only an `e2e-test-hooks` build compiles, and the CI
+    /// steps that must therefore lint it and run it with the feature on.
+    ///
+    /// The feature is off in every CI build except the steps pinned here, so a
+    /// test behind it that no feature-on step builds is not compiled anywhere
+    /// in CI: it cannot fail, and the hook it covers can break unnoticed.
+    mod e2e_test_hooks_coverage {
+        use std::collections::BTreeSet;
+
+        use proc_macro2::{Delimiter, TokenStream, TokenTree};
+        use syn::spanned::Spanned;
+        use syn::{ImplItem, Item, TraitItem};
+
+        use super::{
+            ci_job, indent_of, job_steps, read_workflow, repo_root, step_keys, yaml_value_at,
+        };
+        use crate::module_size::{
+            ReachedPackage, attrs_are_test_gated, impl_item_attrs, item_attrs,
+            reached_source_files, trait_item_attrs,
+        };
+
+        const FEATURE: &str = "e2e-test-hooks";
+
+        /// The `if:` every feature-on test step carries: Rust changed, and the
+        /// crate is in the affected selection or the whole workspace is. The
+        /// trailing space stops `-p rocm-core` from satisfying a check for
+        /// `-p rocm `.
+        fn selection_gate(krate: &str) -> String {
+            format!(
+                "needs.changes.outputs.rust == 'true' && (steps.sel.outputs.sel == '--workspace' \
+                 || contains(format('{{0}} ', steps.sel.outputs.sel), '-p {krate} '))"
+            )
+        }
+
+        /// Whether `tokens` hold a `feature = "e2e-test-hooks"` term, in
+        /// either polarity.
+        fn names_feature(tokens: &TokenStream) -> bool {
+            let (positive, negative) = feature_terms(tokens, false);
+            positive || negative
+        }
+
+        /// The `feature = "e2e-test-hooks"` terms in `tokens`, a cfg predicate,
+        /// as `(positive, negative)`: positive when one sits under an even
+        /// number of `not(..)`s, so turning the feature on can make the
+        /// predicate hold, negative when one sits under an odd number.
+        /// `negated` says whether `tokens` are already under an odd number.
+        fn feature_terms(tokens: &TokenStream, negated: bool) -> (bool, bool) {
+            let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+            let (mut positive, mut negative) = (false, false);
+            for (at, tree) in trees.iter().enumerate() {
+                match tree {
+                    TokenTree::Ident(ident) if ident == "feature" => {
+                        let is_ours = matches!(
+                            (trees.get(at + 1), trees.get(at + 2)),
+                            (Some(TokenTree::Punct(eq)), Some(TokenTree::Literal(lit)))
+                                if eq.as_char() == '=' && lit.to_string() == format!("\"{FEATURE}\"")
+                        );
+                        if is_ours {
+                            if negated {
+                                negative = true;
+                            } else {
+                                positive = true;
+                            }
+                        }
+                    }
+                    TokenTree::Group(group) => {
+                        let flips = at > 0
+                            && matches!(&trees[at - 1], TokenTree::Ident(ident) if ident == "not");
+                        let (p, n) = feature_terms(&group.stream(), negated != flips);
+                        positive |= p;
+                        negative |= n;
+                    }
+                    _ => {}
+                }
+            }
+            (positive, negative)
+        }
+
+        /// Whether `tokens` hold a cfg that the feature turns on: a
+        /// `cfg(..)` attribute or `cfg!(..)` whose predicate has a positive
+        /// feature term (see [`feature_terms`]), or any `cfg_attr(..)` naming
+        /// the feature, since either polarity there changes which attributes
+        /// (an `ignore`, say) the feature-on build sees. A `cfg(not(feature =
+        /// ..))` alone does not count: what it gates is built with the feature
+        /// off, which the plain steps already cover.
+        fn feature_turns_on_code(tokens: &TokenStream) -> bool {
+            let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+            for (at, tree) in trees.iter().enumerate() {
+                let TokenTree::Group(group) = tree else {
+                    continue;
+                };
+                if group.delimiter() == Delimiter::Parenthesis && at > 0 {
+                    let head = if matches!(&trees[at - 1], TokenTree::Punct(bang) if bang.as_char() == '!')
+                        && at > 1
+                    {
+                        &trees[at - 2]
+                    } else {
+                        &trees[at - 1]
+                    };
+                    if let TokenTree::Ident(ident) = head {
+                        if ident == "cfg" && feature_terms(&group.stream(), false).0 {
+                            return true;
+                        }
+                        if ident == "cfg_attr" && names_feature(&group.stream()) {
+                            return true;
+                        }
+                    }
+                }
+                if feature_turns_on_code(&group.stream()) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// The source text of `node`, outer attributes included, as tokens.
+        fn tokens_of(source: &str, node: &impl Spanned) -> TokenStream {
+            source[node.span().byte_range()]
+                .parse()
+                .expect("a parsed item's own text tokenizes")
+        }
+
+        /// Whether `source` holds test code that only the feature-on build
+        /// compiles. `gated_file` is true when the file is reached through at
+        /// least one test gate (a `#[cfg(test)] mod x;` elsewhere), and then
+        /// everything in it is treated as test code: a feature-gated
+        /// production item in such a file is counted as hooks-only test code,
+        /// an over-report on the safe side.
+        ///
+        /// Test code is what `check-module-size` calls test-gated: an item
+        /// under `#[test]`, `#[tokio::test]` or a test-only `#[cfg(..)]`, and
+        /// everything inside one, macro bodies included. Inside it, any cfg the
+        /// feature turns on counts, down to a single statement. Test code
+        /// inside a non-test item that the feature turns on counts as well.
+        /// An external `mod x;` the feature turns on counts without its file
+        /// being read: the module walk records test gates only, so whether that
+        /// file holds tests is not known here, and it is assumed that it does.
+        fn has_hooks_only_test_code(source: &str, gated_file: bool) -> bool {
+            let file = syn::parse_file(source).expect("source parses");
+            let gated =
+                gated_file || attrs_are_test_gated(&file.attrs).expect("file attributes parse");
+            let in_feature = file
+                .attrs
+                .iter()
+                .any(|attr| feature_turns_on_code(&tokens_of(source, attr)));
+            items_have_hooks_only_test_code(source, &file.items, gated, in_feature)
+        }
+
+        fn items_have_hooks_only_test_code(
+            source: &str,
+            items: &[Item],
+            gated: bool,
+            in_feature: bool,
+        ) -> bool {
+            items.iter().any(|item| {
+                let attrs = item_attrs(item);
+                let test = gated || attrs_are_test_gated(attrs).expect("attributes parse");
+                if test {
+                    return in_feature || feature_turns_on_code(&tokens_of(source, item));
+                }
+                let in_feature = in_feature
+                    || attrs
+                        .iter()
+                        .any(|attr| feature_turns_on_code(&tokens_of(source, attr)));
+                match item {
+                    Item::Mod(module) => match &module.content {
+                        Some((_, inner)) => {
+                            items_have_hooks_only_test_code(source, inner, false, in_feature)
+                        }
+                        None => in_feature,
+                    },
+                    Item::Impl(imp) => imp.items.iter().any(|member: &ImplItem| {
+                        attrs_are_test_gated(impl_item_attrs(member)).expect("attributes parse")
+                            && (in_feature || feature_turns_on_code(&tokens_of(source, member)))
+                    }),
+                    Item::Trait(tr) => tr.items.iter().any(|member: &TraitItem| {
+                        attrs_are_test_gated(trait_item_attrs(member)).expect("attributes parse")
+                            && (in_feature || feature_turns_on_code(&tokens_of(source, member)))
+                    }),
+                    _ => false,
+                }
+            })
+        }
+
+        /// Every workspace package with test code only the feature-on build
+        /// compiles, found by walking each package's module tree the way
+        /// `check-module-size` does.
+        fn crates_with_hooks_only_tests(packages: &[ReachedPackage]) -> BTreeSet<String> {
+            packages
+                .iter()
+                .filter(|(_, files)| {
+                    files.iter().any(|(file, gated)| {
+                        let source = std::fs::read_to_string(file)
+                            .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
+                        has_hooks_only_test_code(&source, *gated)
+                    })
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        }
+
+        /// Every workspace package whose sources hold a cfg naming the feature
+        /// in either polarity: its feature-on and feature-off builds compile
+        /// different code, so both have to be linted.
+        fn crates_with_hooks_seams(packages: &[ReachedPackage]) -> BTreeSet<String> {
+            packages
+                .iter()
+                .filter(|(_, files)| {
+                    files.iter().any(|(file, _)| {
+                        let source = std::fs::read_to_string(file)
+                            .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
+                        names_feature_in_a_cfg(&source.parse().expect("source tokenizes"))
+                    })
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        }
+
+        /// Whether `tokens` hold a `cfg(..)`, `cfg!(..)` or `cfg_attr(..)`
+        /// naming the feature, in either polarity.
+        fn names_feature_in_a_cfg(tokens: &TokenStream) -> bool {
+            let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+            trees.iter().enumerate().any(|(at, tree)| {
+                let TokenTree::Group(group) = tree else {
+                    return false;
+                };
+                let head = trees[..at].iter().rev().find(
+                    |t| !matches!(t, TokenTree::Punct(bang) if bang.as_char() == '!'),
+                );
+                let is_cfg = group.delimiter() == Delimiter::Parenthesis
+                    && matches!(head, Some(TokenTree::Ident(ident)) if ident == "cfg" || ident == "cfg_attr");
+                (is_cfg && names_feature(&group.stream()))
+                    || names_feature_in_a_cfg(&group.stream())
+            })
+        }
+
+        /// The features `rocm`'s own `e2e-test-hooks` feature turns on in
+        /// other packages, as `package/feature` entries.
+        fn rocm_hooks_feature_entries() -> Vec<String> {
+            let manifest = std::fs::read_to_string(repo_root().join("apps/rocm/Cargo.toml"))
+                .expect("apps/rocm/Cargo.toml is readable");
+            let manifest: toml::Table = manifest.parse().expect("apps/rocm/Cargo.toml parses");
+            manifest["features"][FEATURE]
+                .as_array()
+                .expect("rocm defines an `e2e-test-hooks` feature list")
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .expect("a feature entry is a string")
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        /// The command that runs `krate`'s tests with the feature on, matched
+        /// whole against a step's `run:` value, so an appended `|| true`, a
+        /// `--no-run`, a filter that selects nothing or a narrower target
+        /// fails the match. rocm-core's step names its own feature
+        /// unqualified and passes `--lib`, so rocm-core's integration tests
+        /// under `tests/` do not run with the feature. #510 added that step to
+        /// run rocm-core's lib tests with the feature. Every other crate takes
+        /// the plain form.
+        fn hooks_test_command(krate: &str) -> String {
+            match krate {
+                "rocm-core" => {
+                    format!("cargo nextest run --locked -p rocm-core --lib --features {FEATURE}")
+                }
+                _ => format!("cargo nextest run --locked -p {krate} --features {krate}/{FEATURE}"),
+            }
+        }
+
+        /// The clippy command that lints the workspace with the feature on.
+        fn hooks_clippy_command() -> String {
+            format!(
+                "cargo clippy --locked --workspace --all-targets --features rocm/{FEATURE} \
+                 -- -D warnings"
+            )
+        }
+
+        /// Whether `step`'s own `run:` value, comments removed and folded onto
+        /// one line, is exactly `command`. Only the `run:` key is read, so a
+        /// step whose name or comment quotes the command does not match, and a
+        /// multi-line script folds into something longer than one command.
+        /// The value is read by `yaml_value_at`, which strips only a `|` or
+        /// `>-` block header: a command under `|-`, `>` or `|+` keeps a stray
+        /// `-`, `>` or `+` in front and does not match.
+        fn runs_exactly(step: &str, command: &str) -> bool {
+            let item_indent = indent_of(step.lines().next().expect("a step has a first line"));
+            yaml_value_at(step, item_indent + 2, "run").as_deref() == Some(command)
+        }
+
+        /// A step's own `if:`, folded onto one line.
+        fn step_if(step: &str) -> Option<String> {
+            let item_indent = indent_of(step.lines().next().expect("a step has a first line"));
+            yaml_value_at(step, item_indent + 2, "if")
+        }
+
+        /// Every crate with test code behind `e2e-test-hooks` has its tests
+        /// run with the feature on, and the clippy job lints the workspace
+        /// both with the feature off and with it on, reaching every crate that
+        /// has a seam.
+        ///
+        /// A test step's `run:` must be exactly [`hooks_test_command`] for the
+        /// crate, under exactly the selection gate the other affected-crate
+        /// steps use, and must not be made advisory. The two clippy commands
+        /// are matched whole against a step's `run:` the same way.
+        ///
+        /// The crates are found through each package's library, binary,
+        /// proc-macro and build-script module trees, the ones
+        /// `check-module-size` walks.
+        /// Integration tests under a crate's `tests/` directory are not read,
+        /// so a test there behind the feature is not checked.
+        #[test]
+        fn ci_lints_and_tests_every_crate_with_e2e_test_hooks_gated_tests() {
+            let packages = reached_source_files().expect("the workspace module tree can be walked");
+            let crates = crates_with_hooks_only_tests(&packages);
+            for expected in ["rocm", "rocm-core"] {
+                assert!(
+                    crates.contains(expected),
+                    "`{expected}` has tests behind `{FEATURE}` today, so the scan finding \
+                     {crates:?} has stopped seeing them; fix the scan before trusting it"
+                );
+            }
+
+            let ci = read_workflow("ci.yml");
+            let test_steps = job_steps(&ci_job(&ci, "test")).expect("the test job has steps");
+            for krate in &crates {
+                let command = hooks_test_command(krate);
+                let running: Vec<&(String, String)> = test_steps
+                    .iter()
+                    .filter(|(_, step)| runs_exactly(step, &command))
+                    .collect();
+                assert!(
+                    !running.is_empty(),
+                    "`{krate}` has tests that exist only with `{FEATURE}`, so the `test` job \
+                     needs a step whose `run:` is exactly `{command}`; without one they are \
+                     compiled by the feature-on clippy step but never run"
+                );
+                let gate = selection_gate(krate);
+                assert!(
+                    running.iter().any(|(_, step)| {
+                        step_if(step).as_deref() == Some(gate.as_str())
+                            && !step_keys(step).iter().any(|key| key == "continue-on-error")
+                    }),
+                    "a step running `{krate}`'s `{FEATURE}` tests must have exactly \
+                     `if: {gate}` (so it runs whenever `{krate}` is affected) and no \
+                     `continue-on-error`; found {:?}",
+                    running.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                );
+            }
+
+            let clippy_steps = job_steps(&ci_job(&ci, "clippy")).expect("the clippy job has steps");
+            for command in [
+                "cargo clippy --locked --workspace --all-targets -- -D warnings".to_owned(),
+                hooks_clippy_command(),
+            ] {
+                assert!(
+                    clippy_steps.iter().any(|(_, step)| {
+                        runs_exactly(step, &command)
+                            && step_if(step).as_deref()
+                                == Some("needs.changes.outputs.rust == 'true'")
+                            && !step_keys(step).iter().any(|key| key == "continue-on-error")
+                    }),
+                    "the clippy job must run `{command}` whenever Rust changed, with no \
+                     `continue-on-error`: the feature-off and feature-on runs each lint code the \
+                     other never compiles"
+                );
+            }
+
+            let enabled = rocm_hooks_feature_entries();
+            for krate in crates_with_hooks_seams(&packages) {
+                assert!(
+                    krate == "rocm" || enabled.contains(&format!("{krate}/{FEATURE}")),
+                    "`{krate}` has code behind `{FEATURE}`, but `rocm/{FEATURE}` does not turn \
+                     on `{krate}/{FEATURE}`, so the feature-on clippy step never lints it; add \
+                     `{krate}/{FEATURE}` to rocm's `{FEATURE}` feature list, or, if rocm does not \
+                     depend on `{krate}`, give the clippy job a feature-on run that reaches it and \
+                     teach this check to accept that run"
+                );
+            }
+        }
+
+        fn test_code(source: &str) -> bool {
+            has_hooks_only_test_code(source, false)
+        }
+
+        #[test]
+        fn a_feature_gated_test_is_found() {
+            assert!(test_code(
+                "#[cfg(test)]\nmod tests {\n    #[cfg(feature = \"e2e-test-hooks\")]\n    #[test]\n    fn t() {}\n}\n"
+            ));
+            assert!(test_code(
+                "#[cfg(all(feature = \"e2e-test-hooks\", target_os = \"linux\"))]\n#[tokio::test]\nasync fn t() {}\n"
+            ));
+        }
+
+        #[test]
+        fn a_test_gated_on_the_feature_being_off_is_not_found() {
+            assert!(!test_code(
+                "#[cfg(test)]\nmod tests {\n    #[cfg(not(feature = \"e2e-test-hooks\"))]\n    #[test]\n    fn t() {}\n}\n"
+            ));
+            assert!(!test_code(
+                "#[cfg(test)]\nmod tests {\n    #[cfg(not(any(unix, feature = \"e2e-test-hooks\")))]\n    #[test]\n    fn t() {}\n}\n"
+            ));
+        }
+
+        #[test]
+        fn a_doubly_negated_feature_counts_as_on() {
+            assert!(test_code(
+                "#[cfg(not(not(feature = \"e2e-test-hooks\")))]\n#[test]\nfn t() {}\n"
+            ));
+        }
+
+        /// A gated module, a gated statement inside an ungated test, a
+        /// `cfg_attr` in either polarity, a `cfg!` and a gated helper inside
+        /// the test module all change what the feature-on build tests.
+        #[test]
+        fn gating_below_or_around_the_test_fn_is_found() {
+            for source in [
+                "#[cfg(all(test, feature = \"e2e-test-hooks\"))]\nmod hooks {\n    #[test]\n    fn t() {}\n}\n",
+                "#[cfg(feature = \"e2e-test-hooks\")]\nmod hooks {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn t() {}\n    }\n}\n",
+                "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        #[cfg(feature = \"e2e-test-hooks\")]\n        {\n            assert!(true);\n        }\n    }\n}\n",
+                "#[cfg(test)]\nmod tests {\n    #[cfg_attr(not(feature = \"e2e-test-hooks\"), ignore)]\n    #[test]\n    fn t() {}\n}\n",
+                "#[test]\nfn t() {\n    if cfg!(feature = \"e2e-test-hooks\") {}\n}\n",
+                "#[cfg(test)]\nmod tests {\n    #[cfg(feature = \"e2e-test-hooks\")]\n    use std::env;\n}\n",
+                "#[cfg(feature = \"e2e-test-hooks\")]\nmod hooks;\n",
+            ] {
+                assert!(test_code(source), "not found in:\n{source}");
+            }
+        }
+
+        /// Each shape below reaches feature-on test code through one branch of
+        /// the scanner: a test-gated member of an impl or a trait that names
+        /// the feature itself, a plain test member of an impl or a trait the
+        /// feature gates, a file whose own `#![cfg(test)]` makes it test code,
+        /// and a file whose own `#![cfg(feature = ..)]` puts every test in it
+        /// behind the feature.
+        #[test]
+        fn impl_and_trait_members_and_inner_file_attributes_are_found() {
+            for (branch, source) in [
+                (
+                    "impl member",
+                    "struct S;\nimpl S {\n    #[cfg(all(test, feature = \"e2e-test-hooks\"))]\n    fn helper() {}\n}\n",
+                ),
+                (
+                    "trait member",
+                    "trait T {\n    #[cfg(all(test, feature = \"e2e-test-hooks\"))]\n    fn helper() {}\n}\n",
+                ),
+                (
+                    "test member of a feature-gated impl",
+                    "struct S;\n#[cfg(feature = \"e2e-test-hooks\")]\nimpl S {\n    #[cfg(test)]\n    fn helper() {}\n}\n",
+                ),
+                (
+                    "test member of a feature-gated trait",
+                    "#[cfg(feature = \"e2e-test-hooks\")]\ntrait T {\n    #[cfg(test)]\n    fn helper() {}\n}\n",
+                ),
+                (
+                    "inner #![cfg(test)]",
+                    "#![cfg(test)]\n#[cfg(feature = \"e2e-test-hooks\")]\npub fn plant() {}\n",
+                ),
+                (
+                    "inner feature attribute",
+                    "#![cfg(feature = \"e2e-test-hooks\")]\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+                ),
+            ] {
+                assert!(test_code(source), "{branch} not found in:\n{source}");
+            }
+        }
+
+        /// Everything in a file only test builds reach is test code.
+        #[test]
+        fn a_gated_helper_in_a_test_only_file_is_found() {
+            let source = "#[cfg(feature = \"e2e-test-hooks\")]\npub fn plant() {}\n";
+            assert!(has_hooks_only_test_code(source, true));
+            assert!(!has_hooks_only_test_code(source, false));
+        }
+
+        /// Production seams, the feature named in a string or a comment, and
+        /// a different feature are not test code behind this one.
+        #[test]
+        fn production_seams_strings_and_other_features_are_not_found() {
+            for source in [
+                "#[cfg(feature = \"e2e-test-hooks\")]\nfn seam() {}\n",
+                "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        let _ = \"#[cfg(feature = \\\"e2e-test-hooks\\\")]\";\n    }\n}\n",
+                "#[cfg(test)]\nmod tests {\n    // #[cfg(feature = \"e2e-test-hooks\")]\n    #[test]\n    fn t() {}\n}\n",
+                "#[cfg(test)]\nmod tests {\n    #[cfg(feature = \"other-hooks\")]\n    #[test]\n    fn t() {}\n}\n",
+            ] {
+                assert!(!test_code(source), "wrongly found in:\n{source}");
+            }
+        }
+
+        #[test]
+        fn the_seam_scan_sees_either_polarity_and_nothing_else() {
+            let seam = |source: &str| names_feature_in_a_cfg(&source.parse().expect("tokenizes"));
+            assert!(seam(
+                "#[cfg(not(feature = \"e2e-test-hooks\"))]\nfn f() {}\n"
+            ));
+            assert!(seam(
+                "fn f() -> bool { cfg!(feature = \"e2e-test-hooks\") }\n"
+            ));
+            assert!(seam(
+                "#[cfg_attr(feature = \"e2e-test-hooks\", allow(dead_code))]\nfn f() {}\n"
+            ));
+            assert!(!seam(
+                "fn f() -> &'static str { \"feature = e2e-test-hooks\" }\n"
+            ));
+            assert!(!seam(
+                "#[doc = \"cfg(feature = \\\"e2e-test-hooks\\\")\"]\nfn f() {}\n"
+            ));
+        }
+
+        /// A step named after `command`, with `run` as its `run:` line.
+        fn step_named_for(command: &str, run: &str) -> String {
+            format!(
+                "      - name: {command}\n        # {command}\n        if: x\n        run: {run}\n"
+            )
+        }
+
+        /// The test step matcher takes only the exact command as the whole
+        /// `run:` value, and rejects every row below for not being that one
+        /// command. Some rows would keep the step green while its tests do not
+        /// run or a failure does not fail it (`|| true`, `--no-run`, an
+        /// `echo`); a `-E` filter narrows which tests run, and `--lib` changes
+        /// which targets are selected; the `set +e` script would still fail
+        /// with the command, since a script's status is its last command's,
+        /// but the check does not reason about scripts, so it accepts only the
+        /// command on its own. The command is still accepted with a trailing
+        /// comment, or alone under a `|` or `>-` block header.
+        #[test]
+        fn the_test_step_matcher_takes_only_the_exact_command() {
+            let rocm = hooks_test_command("rocm");
+            assert_eq!(
+                rocm,
+                "cargo nextest run --locked -p rocm --features rocm/e2e-test-hooks"
+            );
+            for run in [
+                rocm.clone(),
+                format!("{rocm} # why"),
+                format!("|\n          {rocm}"),
+                format!(">-\n          {rocm}"),
+            ] {
+                assert!(
+                    runs_exactly(&step_named_for(&rocm, &run), &rocm),
+                    "rejected `run: {run}`"
+                );
+            }
+            for run in [
+                format!("{rocm} || true"),
+                rocm.replace("run --locked", "run --no-run --locked"),
+                format!("{rocm} -E 'not test(/./)'"),
+                rocm.replace("-p rocm ", "-p rocm --lib "),
+                "echo skipped".to_owned(),
+                format!("echo {rocm}"),
+                format!("|\n          set +e\n          {rocm}"),
+            ] {
+                assert!(
+                    !runs_exactly(&step_named_for(&rocm, &run), &rocm),
+                    "accepted `run: {run}`"
+                );
+            }
+            // The limit `runs_exactly` documents: `yaml_value_at` strips only a
+            // `|` or `>-` header, so the command under `|-`, `>` or `|+` is
+            // rejected.
+            for header in ["|-", ">", "|+"] {
+                let run = format!("{header}\n          {rocm}");
+                assert!(
+                    !runs_exactly(&step_named_for(&rocm, &run), &rocm),
+                    "accepted `run: {run}`"
+                );
+            }
+        }
+
+        /// The clippy commands go through the same matcher: an appended
+        /// `|| true`, an `echo` in place of the command, and a dropped
+        /// `--features` are each rejected.
+        #[test]
+        fn the_clippy_step_matcher_takes_only_the_exact_command() {
+            let clippy = hooks_clippy_command();
+            assert!(runs_exactly(&step_named_for(&clippy, &clippy), &clippy));
+            for run in [
+                format!("{clippy} || true"),
+                "echo skipped".to_owned(),
+                clippy.replace(&format!(" --features rocm/{FEATURE}"), ""),
+            ] {
+                assert!(
+                    !runs_exactly(&step_named_for(&clippy, &run), &clippy),
+                    "accepted `run: {run}`"
+                );
+            }
+        }
+
+        #[test]
+        fn the_selection_gate_is_the_rocm_core_steps() {
+            let ci = read_workflow("ci.yml");
+            let steps = job_steps(&ci_job(&ci, "test")).expect("the test job has steps");
+            let (_, step) = steps
+                .iter()
+                .find(|(name, _)| name == "Test rocm-core with e2e-test-hooks")
+                .expect("the rocm-core step exists");
+            assert_eq!(step_if(step), Some(selection_gate("rocm-core")));
+        }
+    }
 }

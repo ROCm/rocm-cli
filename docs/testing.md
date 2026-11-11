@@ -21,11 +21,18 @@ also what the `windows-debug` job of the required `windows-build-and-test` lane
 does. See [Tests that touch the environment](#tests-that-touch-the-environment)
 before writing a test that sets an environment variable.
 
-Run clippy with warnings as errors:
+Run clippy with warnings as errors, once with the `e2e-test-hooks` feature off
+and once with it on:
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features rocm/e2e-test-hooks -- -D warnings
 ```
+
+Each run compiles code the other never sees: a test hook's `cfg(not(..))`
+fallback only with the feature off, and the hook itself, with the tests that
+exist only alongside it, only with the feature on. The CI `clippy` job runs both.
+The Windows clippy steps in the `windows-debug` job lint with the feature off only.
 
 ### Source file size
 
@@ -974,6 +981,32 @@ and in the merge queue the full workspace always runs. For a full local verifica
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
 narrows the local pre-push hooks (next section).
 
+That `cargo nextest run` builds with the `e2e-test-hooks` feature off, so the
+tests that exist only with it are not among them. Two more steps of the `test`
+job run them, each when its crate is in the selection or the selection is the
+whole workspace. Each runs that crate's whole suite with the feature on (the
+rocm-core one its library tests), not only the tests behind the feature:
+
+```bash
+cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
+cargo nextest run --locked -p rocm --features rocm/e2e-test-hooks
+```
+
+Tests gated on the feature being off, such as
+`runner_options_points_the_kfd_preflight_at_the_real_device` in
+[dash.rs](../apps/rocm/src/dash.rs) and
+`a_build_without_the_hook_ignores_the_variable` in
+[hardware_root.rs](../crates/rocm-core/src/hardware_root.rs), are not built by
+these two steps; feature-off runs such as the plain `cargo nextest run` above
+run them.
+
+A contract test in [workflow_contract.rs](../xtask/src/workflow_contract.rs),
+`ci_lints_and_tests_every_crate_with_e2e_test_hooks_gated_tests`, finds every
+crate whose library, binary, proc-macro or build-script module tree has such
+tests, and fails while one has no step like these, so a crate that gains its
+first one needs a step of its own. It does not read integration tests under a
+crate's `tests/` directory, so a test there behind the feature is not checked.
+
 ### Pre-push hook scope
 
 The pre-push hooks `cargo-clippy`, `cargo-clippy-e2e` and `cargo-test` in
@@ -988,6 +1021,9 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
 - `test` runs `cargo test -p <crate> … --all-targets` for the affected crates, never including
   `e2e-cucumber` (its scenarios run through `cargo xtask e2e`), or
   `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
+
+The hooks build with `e2e-test-hooks` off, so the feature-on clippy and the two feature-on
+test steps run only in CI, or by hand with the commands above.
 
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
 so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
@@ -4337,8 +4373,8 @@ as itself rather than silently treated as an unknown distribution. The two
 host root and check that both `rocm examine` reads answer from it through the
 shared parser: the first at `/etc/os-release`, the second with only
 `/usr/lib/os-release` present, so the fallback is exercised through the real
-`host_path`-routed call sites, not just the helper in isolation; the feature
-they need is enabled only by its own CI step. The
+`host_path`-routed call sites, not just the helper in isolation; CI runs them
+in the `test` job's rocm-core `e2e-test-hooks` step. The
 `try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable`
 test runs the WSL remote probe's own shell fallback for real under `/bin/sh`
 against a primary that exists but cannot be sourced (a directory in its
@@ -4357,7 +4393,8 @@ and expects the real file back, and
 `system_packages::tests::the_install_hints_read_the_real_host_and_ignore_a_simulated_root`
 holds the three install hints to the same rule. Both live in that process
 rather than in `rocm-core`'s, so the environment variable they set cannot
-overlap a `rocm-core` test that reads host paths.
+overlap a `rocm-core` test that reads host paths. CI runs them in the `test`
+job's rocm `e2e-test-hooks` step.
 `system_packages::tests::no_caller_in_this_binary_reads_the_real_os_release_by_hand`
 fails when a source file of the `rocm` binary reads the file with its own
 resolver instead of calling it.

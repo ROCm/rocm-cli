@@ -246,6 +246,69 @@ impl From<&MetaPackage> for Package {
     }
 }
 
+/// A package name, and each source file its module tree reaches with whether it
+/// is reached through at least one test gate.
+#[cfg(test)]
+pub(crate) type ReachedPackage = (String, Vec<(PathBuf, bool)>);
+
+/// Every source file each workspace package's targets reach, by package name,
+/// with whether the file is reached through a test-gated `mod` declaration
+/// (`#[cfg(test)] mod x;`, or any file below one), or through a file whose own
+/// `#![cfg(test)]` gates it: the walk passes that gate on to the file's
+/// children. A file reached both through a gate and without one is listed as
+/// gated. The flag does not reflect a file's own `#![cfg(test)]` on that file
+/// itself: a caller that needs it reads the file's inner attributes. For the
+/// `e2e-test-hooks` contract in
+/// `workflow_contract.rs`, which must follow the module tree this check walks —
+/// including `#[path]` modules and files one package loads from another's
+/// directory — rather than guess a file's package and gating from where it sits.
+/// The walk starts only from library, binary, proc-macro and build-script
+/// targets, so integration tests under a package's `tests/` directory are not
+/// listed.
+#[cfg(test)]
+pub(crate) fn reached_source_files() -> Result<Vec<ReachedPackage>> {
+    reached_source_files_in(&paths::run_cargo_metadata(&["--no-deps"])?)
+}
+
+/// [`reached_source_files`] on one `cargo metadata --no-deps` document, so a
+/// test can feed it a workspace of its own.
+#[cfg(test)]
+fn reached_source_files_in(stdout: &[u8]) -> Result<Vec<ReachedPackage>> {
+    #[derive(Deserialize)]
+    struct NamedPackage {
+        name: String,
+        #[serde(flatten)]
+        package: MetaPackage,
+    }
+    #[derive(Deserialize)]
+    struct NamedMetadata {
+        workspace_root: PathBuf,
+        packages: Vec<NamedPackage>,
+    }
+    let metadata: NamedMetadata =
+        serde_json::from_slice(stdout).context("failed to parse `cargo metadata` output")?;
+    let mut reached = Vec::new();
+    for named in &metadata.packages {
+        let mut walk = Walk {
+            root: normalize(&metadata.workspace_root),
+            counted: Vec::new(),
+            counted_files: BTreeSet::new(),
+            reached_files: BTreeSet::new(),
+            seen: BTreeSet::new(),
+        };
+        for target_root in &Package::from(&named.package).roots {
+            walk.visit(target_root, true, false)?;
+        }
+        let mut files: std::collections::BTreeMap<PathBuf, bool> =
+            std::collections::BTreeMap::new();
+        for (file, _, gated) in walk.seen {
+            *files.entry(file).or_default() |= gated;
+        }
+        reached.push((named.name.clone(), files.into_iter().collect()));
+    }
+    Ok(reached)
+}
+
 /// Production line count of every source file in `packages`, keyed by its path
 /// relative to `root` with `/` separators.
 fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
@@ -599,7 +662,7 @@ fn path_attribute(attrs: &[Attribute]) -> Result<Option<String>> {
 }
 
 /// Whether any attribute makes an item exist only in test builds.
-fn attrs_are_test_gated(attrs: &[Attribute]) -> Result<bool> {
+pub(crate) fn attrs_are_test_gated(attrs: &[Attribute]) -> Result<bool> {
     for attr in attrs {
         let path = attr.path();
         if path.is_ident("cfg") {
@@ -670,7 +733,7 @@ fn cfg_is_test_only(predicate: &CfgTerm) -> Result<bool> {
     Ok(!terms.is_empty())
 }
 
-fn item_attrs(item: &Item) -> &[Attribute] {
+pub(crate) fn item_attrs(item: &Item) -> &[Attribute] {
     match item {
         Item::Const(i) => &i.attrs,
         Item::Enum(i) => &i.attrs,
@@ -691,7 +754,7 @@ fn item_attrs(item: &Item) -> &[Attribute] {
     }
 }
 
-fn impl_item_attrs(item: &ImplItem) -> &[Attribute] {
+pub(crate) fn impl_item_attrs(item: &ImplItem) -> &[Attribute] {
     match item {
         ImplItem::Const(i) => &i.attrs,
         ImplItem::Fn(i) => &i.attrs,
@@ -701,7 +764,7 @@ fn impl_item_attrs(item: &ImplItem) -> &[Attribute] {
     }
 }
 
-fn trait_item_attrs(item: &TraitItem) -> &[Attribute] {
+pub(crate) fn trait_item_attrs(item: &TraitItem) -> &[Attribute] {
     match item {
         TraitItem::Const(i) => &i.attrs,
         TraitItem::Fn(i) => &i.attrs,
@@ -1444,6 +1507,69 @@ trait T {
                 path: "big/src/lib.rs".to_string(),
                 lines: 1501,
             }]
+        );
+    }
+
+    /// The gated flag the `e2e-test-hooks` contract reads: true for a file
+    /// reached through a test-gated `mod` declaration and for the files below
+    /// it, false for an ordinary module, false for a file whose only gate is
+    /// its own `#![cfg(test)]`, which the flag does not reflect, true for a
+    /// file below that one, which inherits the gate, and true for a file
+    /// reached both through a gate and without one. `both_a.rs` and
+    /// `both_b.rs` differ in which declaration carries the gate: the plain
+    /// `mod` for one, the `#[path]` alias for the other. So a fold that keeps
+    /// either the first or the last set entry for a file gives `false` on one
+    /// of them.
+    #[test]
+    fn reached_source_files_flag_files_reached_through_a_test_gated_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"demo\"]\nresolver = \"2\"\n",
+        );
+        write(root, "demo/Cargo.toml", &manifest("demo"));
+        write(
+            root,
+            "demo/src/lib.rs",
+            "mod plain;\nmod own;\n#[cfg(test)]\nmod gated;\n\
+             #[cfg(test)]\nmod both_a;\n#[path = \"both_a.rs\"]\nmod both_a_alias;\n\
+             mod both_b;\n#[cfg(test)]\n#[path = \"both_b.rs\"]\nmod both_b_alias;\n",
+        );
+        write(root, "demo/src/both_a.rs", "fn a() {}\n");
+        write(root, "demo/src/both_b.rs", "fn b() {}\n");
+        write(root, "demo/src/plain.rs", "fn p() {}\n");
+        write(root, "demo/src/own.rs", "#![cfg(test)]\nmod child;\n");
+        write(root, "demo/src/own/child.rs", "fn c() {}\n");
+        write(root, "demo/src/gated.rs", "mod below;\n");
+        write(root, "demo/src/gated/below.rs", "fn b() {}\n");
+
+        let reached = reached_source_files_in(&real_metadata(root)).unwrap();
+        let [(name, files)] = reached.as_slice() else {
+            panic!("one package: {reached:?}");
+        };
+        assert_eq!(name, "demo");
+        let src = normalize(&root.join("demo/src"));
+        let flags: Vec<(String, bool)> = files
+            .iter()
+            .map(|(file, gated)| {
+                let relative = file.strip_prefix(&src).unwrap_or(file);
+                (relative.to_string_lossy().replace('\\', "/"), *gated)
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("both_a.rs".to_string(), true),
+                ("both_b.rs".to_string(), true),
+                ("gated/below.rs".to_string(), true),
+                ("gated.rs".to_string(), true),
+                ("lib.rs".to_string(), false),
+                ("own/child.rs".to_string(), true),
+                ("own.rs".to_string(), false),
+                ("plain.rs".to_string(), false),
+            ]
         );
     }
 

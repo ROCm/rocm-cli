@@ -399,6 +399,7 @@ Minimum quality gate before upstream-ready status:
 ```bash
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features rocm/e2e-test-hooks -- -D warnings
 cargo xtask smoke
 ```
 
