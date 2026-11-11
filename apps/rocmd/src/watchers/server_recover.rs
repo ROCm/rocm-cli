@@ -12,8 +12,8 @@ use crate::persistence::load_service_record;
 use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result};
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, AutomationTriggerEvent, ManagedServiceRecord, WatcherMode,
-    format_host_port, process_is_running, unix_time_millis,
+    AppPaths, AutomationRuntimeState, AutomationTriggerEvent, IdentityState, ManagedServiceRecord,
+    ProcessIdentity, WatcherMode, format_host_port, unix_time_millis,
 };
 #[cfg(test)]
 use serde_json::json;
@@ -96,10 +96,14 @@ fn service_record_matches_recovery_event(
         return false;
     }
     match event.kind.as_str() {
+        // The same guarded reasons as the scan, so a live startup the scan
+        // spared cannot be restarted by an event raised before it was spared.
         "service.manifest_recoverable" => {
-            manifest_service_recovery_reason(record, unix_time_millis()).is_some()
+            stale_manifest_recovery_reason(record, unix_time_millis()).is_some()
         }
-        "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
+        "service.endpoint_recoverable" => {
+            unreachable_endpoint_recovery_reason(record, unix_time_millis()).is_some()
+        }
         "service.healthcheck_recoverable" => crate::engine_ipc::engine_healthcheck_response(
             paths,
             &record.engine,
@@ -326,16 +330,12 @@ pub(crate) fn find_recoverable_service(
         {
             continue;
         }
-        if let Some(reason) = manifest_service_recovery_reason(&record, now) {
-            // `rocm services` persists an engine's own `starting` state into
-            // the record, so a live server still downloading under the
-            // interactive serve wait (or left by a Ctrl-C of it) can read
-            // `starting` past the stale-start window. It is not stale until
-            // the startup deadline.
-            if record.status == "starting" && live_startup_still_in_progress(&record, now) {
-                continue;
-            }
+        if let Some(reason) = stale_manifest_recovery_reason(&record, now) {
             return Ok(Some((record, reason)));
+        }
+        if manifest_service_recovery_reason(&record, now).is_some() {
+            // A live startup the guard above spared.
+            continue;
         }
         if matches!(record.status.as_str(), "ready" | "running") {
             let Ok(healthcheck) = crate::engine_ipc::engine_healthcheck_response(
@@ -367,8 +367,9 @@ pub(crate) fn find_recoverable_service(
 ///
 /// A live `running` process that has not opened its port is still the
 /// interactive serve wait's job: restarting it kills a download the CLI is
-/// reporting. A dead pid is not spared. One function for both places that
-/// fall back to the endpoint, so neither can drop the guard.
+/// reporting. A dead pid is not spared. One function for every place that
+/// falls back to the endpoint, scan and event re-check, so none can drop the
+/// guard.
 fn unreachable_endpoint_recovery_reason(
     record: &ManagedServiceRecord,
     now_unix_ms: u128,
@@ -407,10 +408,39 @@ fn live_startup_still_in_progress(record: &ManagedServiceRecord, now_unix_ms: u1
     if age_ms >= rocm_core::SERVE_STARTUP_DEADLINE.as_millis() {
         return false;
     }
-    [Some(record.supervisor_pid), record.engine_pid]
-        .into_iter()
-        .flatten()
-        .any(|pid| pid != 0 && process_is_running(pid))
+    // A recorded pid alone could have been recycled within the window, so the
+    // recorded start time must match too. A record with none is the
+    // best-effort `Matches` `identity_state` gives a legacy record.
+    [
+        Some((record.supervisor_pid, record.supervisor_start_ticks)),
+        record
+            .engine_pid
+            .map(|pid| (pid, record.engine_start_ticks)),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|(pid, start_ticks)| {
+        pid != 0
+            && rocm_core::identity_state(&ProcessIdentity { pid, start_ticks })
+                == IdentityState::Matches
+    })
+}
+
+/// Why a stale or failed manifest should be recovered, or `None`.
+///
+/// `rocm services` persists an engine's own `starting` state into the
+/// record, so a live server still downloading under the interactive serve
+/// wait (or left by a Ctrl-C of it) can read `starting` past the stale-start
+/// window. It is not stale until the startup deadline. Shared by the scan and
+/// the event re-check, so neither can drop the guard.
+fn stale_manifest_recovery_reason(
+    record: &ManagedServiceRecord,
+    now_unix_ms: u128,
+) -> Option<String> {
+    if record.status == "starting" && live_startup_still_in_progress(record, now_unix_ms) {
+        return None;
+    }
+    manifest_service_recovery_reason(record, now_unix_ms)
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
@@ -1168,6 +1198,18 @@ mod tests {
         Ok(())
     }
 
+    fn recovery_event(record: &ManagedServiceRecord, kind: &str) -> AutomationTriggerEvent {
+        AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: kind.to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: None,
+            payload: json!({}),
+        }
+    }
+
     /// A live process that has not opened its port yet is the interactive
     /// `rocm serve` wait, not a crash. Endpoint recovery must leave it alone
     /// until [`rocm_core::SERVE_STARTUP_DEADLINE`]. A dead pid at the same age
@@ -1200,6 +1242,18 @@ mod tests {
         live.write()?;
 
         let found_inside = find_recoverable_service(&paths)?;
+        let event_inside = service_record_matches_recovery_event(
+            &paths,
+            &live,
+            &recovery_event(&live, "service.endpoint_recoverable"),
+        );
+
+        // The pid is alive but the recorded start time is not its own: a
+        // recycled pid is not the startup, so it is recovered.
+        live.supervisor_start_ticks = Some(u64::MAX);
+        live.write()?;
+        let found_recycled = find_recoverable_service(&paths)?;
+        live.supervisor_start_ticks = None;
 
         live.supervisor_pid = u32::MAX;
         live.engine_pid = None;
@@ -1218,14 +1272,26 @@ mod tests {
             found_inside.is_none(),
             "a live process inside the startup deadline must not be restarted: {found_inside:?}"
         );
-        assert_eq!(
-            found_dead.map(|(record, reason)| (record.service_id, reason)),
-            Some((
-                "svc-live-startup".to_owned(),
-                "endpoint_status_unreachable".to_owned()
-            )),
-            "a dead pid is not a startup still in progress"
+        assert!(
+            !event_inside,
+            "an endpoint event raised earlier must not restart it either"
         );
+        for (found, why) in [
+            (
+                found_recycled,
+                "a recycled pid is not a startup still in progress",
+            ),
+            (found_dead, "a dead pid is not a startup still in progress"),
+        ] {
+            assert_eq!(
+                found.map(|(record, reason)| (record.service_id, reason)),
+                Some((
+                    "svc-live-startup".to_owned(),
+                    "endpoint_status_unreachable".to_owned()
+                )),
+                "{why}"
+            );
+        }
         assert_eq!(
             found_at_deadline.map(|(record, reason)| (record.service_id, reason)),
             Some((
@@ -1269,6 +1335,11 @@ mod tests {
         assert!(now.saturating_sub(live.created_at_unix_ms) >= SERVER_TRANSIENT_STALE_MS);
         live.write()?;
         let found_inside = find_recoverable_service(&paths)?;
+        let event_inside = service_record_matches_recovery_event(
+            &paths,
+            &live,
+            &recovery_event(&live, "service.manifest_recoverable"),
+        );
 
         live.supervisor_pid = u32::MAX;
         live.write()?;
@@ -1283,6 +1354,10 @@ mod tests {
         assert!(
             found_inside.is_none(),
             "a live starting process inside the startup deadline must not be restarted: {found_inside:?}"
+        );
+        assert!(
+            !event_inside,
+            "a manifest event raised earlier must not restart it either"
         );
         for (found, why) in [
             (found_dead, "a dead pid is a stale start"),

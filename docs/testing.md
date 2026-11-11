@@ -2002,7 +2002,8 @@ previous request returned (`InferenceProbeThrottle`, tested under a fake clock
 by `inference_probe_backs_off_to_the_retry_interval_after_listing`). `rocmd` does not
 restart a live `running` service whose endpoint does not answer, or a live
 `starting` one past the stale-start window, while it is younger than that
-deadline; a recoverable engine healthcheck is still restarted.
+deadline (a pid whose recorded start time does not match is not live); a
+recoverable engine healthcheck is still restarted.
 Piped output keeps the 45-second status budget. Like `--wait`, the
 interactive wait first prints the service id, `rocm logs --service
 <service-id> --follow` and a public bind's key (`announces_wait` in

@@ -534,7 +534,7 @@ pub(crate) fn decide_serve_startup(
         );
     }
     if view.phase == ServeStartupPhase::Unreachable
-        && timing.elapsed >= policy.bounds.silent_unreachable
+        && timing.since_progress >= policy.bounds.silent_unreachable
     {
         return stop_decision(
             model,
@@ -1279,7 +1279,10 @@ mod tests {
             "vllm",
             EndpointReadiness::Unreachable,
             &alive(),
-            at(SILENT_UNREACHABLE.as_millis() as u64, 0),
+            at(
+                SILENT_UNREACHABLE.as_millis() as u64,
+                SILENT_UNREACHABLE.as_millis() as u64,
+            ),
             &interactive(),
         ));
         assert!(stop.user_message("qwen", "vllm", "svc-1").contains(&hint));
@@ -1639,12 +1642,13 @@ mod tests {
         );
     }
 
-    /// The two silent limits read different clocks: the unreachable one
-    /// counts from the start of the wait, the load one from the last change
-    /// of the log line. Each row moves one clock past its limit and holds the
-    /// other below it, so swapping the fields in either check fails a row.
+    /// Both silent limits count the silence, from the last change of what
+    /// the wait observes, not the whole wait: a long startup that goes quiet
+    /// is judged on how long it has been quiet. Each row moves one clock past
+    /// the limit and holds the other below it, so a check reading `elapsed`
+    /// fails a row.
     #[test]
-    fn silent_limits_read_their_own_clocks() {
+    fn silent_limits_count_from_the_last_change() {
         let decide = |log_line: Option<&str>, elapsed: Duration, since: Duration| {
             let mut signals = alive();
             signals.log_line = log_line.map(str::to_owned);
@@ -1661,13 +1665,13 @@ mod tests {
             )
         };
         let short = Duration::from_secs(1);
-        // Unreachable, no log: the time since the start decides.
-        let stop = assert_stop(decide(None, SILENT_UNREACHABLE, short));
-        assert_eq!(stop.reason, ServeStartupStopReason::Silent);
+        // Unreachable, no log: only now silent, after a long startup.
         assert!(matches!(
-            decide(None, short, SILENT_UNREACHABLE),
+            decide(None, SILENT_UNREACHABLE * 3, short),
             ServeStartupDecision::Continue(_)
         ));
+        let stop = assert_stop(decide(None, SILENT_UNREACHABLE, SILENT_UNREACHABLE));
+        assert_eq!(stop.reason, ServeStartupStopReason::Silent);
         // Loading: the time since the line last changed decides, however long
         // the wait has run.
         let load = Some("Loading safetensors checkpoint shards: 40%");
