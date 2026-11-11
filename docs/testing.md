@@ -1067,9 +1067,10 @@ it; `therock-next-23` is the tarball refusal for a nightly pin before that
 boundary, run together with the wheel install it points to. `update-11` holds
 that an update installs from the layout its runtime recorded: a runtime of the
 earlier release stream recorded with only a family label still updates, instead
-of being refused for an exact arch. The live counterparts, which resolve the real indexes and so run on the
-`@nightly` lane, are `runtime-08` and `runtime-31` (nightly) and `runtime-09`
-and `runtime-32` (release, which needs a detected GPU target). The routing rule
+of being refused for an exact arch. The live counterparts, which resolve the real indexes and so run on
+gated lanes, are `runtime-08` and `runtime-31` (nightly, `@nightly` lane) and
+`runtime-09` and `runtime-32` (release, `@requires-gfx-target`: they need a
+detected GPU target). The routing rule
 itself, `layout_serving`, is a table of every request shape on both channels in
 [source.rs](../apps/rocm/src/therock/source.rs), including the boundary dates.
 The paced tarball download in `download-progress-01` reads the newest layout's

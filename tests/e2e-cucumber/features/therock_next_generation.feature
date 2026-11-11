@@ -11,7 +11,7 @@ Feature: TheRock "next" ROCm 10 install layout
   # nightly in the canonical stream. The newer layout picks its device payload
   # by exact arch, so a request that reads it also needs a raw GFX arch.
   #
-  # Scenarios 01-05 and 16-22 point source overrides at loopback fixtures
+  # Scenarios 01-05 and 16-23 point source overrides at loopback fixtures
   # through the explicit trust gate. Scenario 06 proves the same overrides are
   # inert when the trust gate is absent; scenario 07 supplies the live GPU
   # evidence.

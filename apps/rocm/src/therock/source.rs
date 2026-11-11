@@ -322,7 +322,7 @@ pub(super) fn select_source_layout(
         bail!(
             "this install reads the ROCm {THEROCK_NEXT_MIN_MAJOR} package layout, which requires an exact GPU arch, but the resolved target family `{}` names a group of them.\n\
              That layout selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --family gfx1200`.\n\
-             An earlier build, which still publishes grouped families, is installed by pinning it: `--version 7.14.1` on the release channel, or `--build-date` for a nightly.\n\n{}",
+             An earlier build, which still publishes grouped families, is installed by pinning it in a wheel install (`--format wheel`; a tarball install takes no pin): `--version 7.14.1` on the release channel, or `--build-date` for a nightly.\n\n{}",
             family_resolution.family,
             detect_host_gpu_diagnostics()
         );

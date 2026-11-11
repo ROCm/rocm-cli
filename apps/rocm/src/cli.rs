@@ -804,17 +804,19 @@ rocm install sdk --version 10.0.0 --python-version 3.12")]
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
         /// Exact TheRock package version to install; with none, the channel's
-        /// newest build. An earlier ROCm 7 release such as 7.14.1 is supported.
+        /// newest build. An earlier ROCm 7 release such as 7.14.1 is supported,
+        /// for a wheel install only.
         #[arg(long, conflicts_with = "build_date")]
         version: Option<String>,
         /// Pick the TheRock package built on this date; nightlies from before
-        /// 2026-08-23 are still installable.
+        /// 2026-08-23 are still installable, for a wheel install only.
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
-        /// TheRock GPU package family to install, such as gfx110X-all.
+        /// TheRock GPU package family to install, such as gfx1200.
         ///
         /// ROCm 10 and newer, which an install with no `--version` gets, need
-        /// an exact arch such as `gfx1200`; a label is for an earlier ROCm 7.
+        /// an exact arch such as `gfx1200`; a label such as gfx110X-all is for
+        /// an earlier ROCm 7 (wheel installs only).
         ///
         /// A GPU target ROCm publishes no build for is refused rather than
         /// mapped to a near neighbour: `--family gfx90c` - the Vega iGPU in
