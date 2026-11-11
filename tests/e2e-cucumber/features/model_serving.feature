@@ -359,10 +359,11 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
-  # image and a 9B checkpoint on a cold runner and may wait out the full
-  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. They run only when
+  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
+  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
+  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
   # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both

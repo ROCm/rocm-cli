@@ -394,7 +394,7 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request` (all lanes but `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and
-`merge_group` (the Windows Strix Halo lanes only: MI300X, Strix Ubuntu and
+`merge_group` (the Windows Strix Halo and WSL2 lanes only: MI300X, Strix Ubuntu and
 W7900 are not required for merging and so are skipped in the merge queue rather
 than left queued on limited runner capacity or hung at their cap after its PR
 has merged) when the workflow's own `changes` job's
