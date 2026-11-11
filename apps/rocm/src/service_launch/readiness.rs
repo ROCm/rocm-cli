@@ -467,32 +467,40 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// stop": that is itself anomalous, and silently treating it as a clean stop
 /// would risk masking a real crash.
 ///
-/// # Known residual race (ROCMAI-541 review)
+/// # Why neither term is the record's `status`
 ///
-/// The `status == "stopped"` term is **not** sound proof of an intentional
-/// stop. `managed_service_status::refresh_managed_service_runtime_liveness`
-/// reconciles *any* record whose tracked pids are all dead to `"stopped"` —
-/// `dash.rs` describes it as "demoting a crashed server's stale `running`
-/// record to `stopped`" — without writing a marker. So an ordinary concurrent
-/// `rocm services` / `rocm dash` / daemon read that lands between a crash and
-/// the check below can relabel that crash as a clean stop, and it would be
-/// reported as one.
+/// This used to read `status == "stopped"`, and that was never proof of an
+/// intentional stop. `managed_service_status::refresh_managed_service_runtime_liveness`
+/// reconciles *any* record whose tracked pids are all dead to `"stopped"`,
+/// saying so in its own comment ("dead pids alone do not distinguish a stopped
+/// service from a crashed one"), and writes no marker doing it. So an ordinary
+/// concurrent `rocm services` / `rocm dash` / `rocmd` read landing between a
+/// crash and this check relabelled the crash as a clean stop, and it was
+/// reported as one — exit 0, "server process exited", the original ROCMAI-541
+/// symptom reappearing inside its own fix.
 ///
-/// It cannot simply be dropped: a *confirmed* stop clears its own marker
-/// (`stop_internal_managed_service_confirmed_with`), so the status is the only
-/// trace such a stop leaves. Verified empirically — removing this term turns
-/// the external-stop scenario (`serve-scripted-external-stop-while-attached`)
-/// red, because the stop completes well inside one poll interval.
+/// The term could not simply be dropped, because a *confirmed* stop used to
+/// clear its own marker and the status was then the only trace it left:
+/// removing it turned `serve-scripted-external-stop-while-attached` (serve-56)
+/// red, which also meant that scenario was passing on the unsound term and so
+/// could not tell a stop from a crash at all.
 ///
-/// Closing it properly means making the two distinguishable on disk — either a
-/// distinct status for a bare dead-pid reconciliation, or a confirmed stop
-/// leaving a durable marker — which changes bookkeeping shared with `rocmd`
-/// and the dashboard, and is deliberately out of this change's scope.
-/// [`StopWatch`] narrows the window (it catches any stop visible while the
-/// child was still being watched) but cannot close it.
+/// Both halves are fixed by making the stop's own evidence durable instead:
+/// `stop_internal_managed_service_confirmed_with` now *moves* its marker into
+/// [`ManagedServiceRecord::settled_stop_unix_ms`] rather than dropping it. That
+/// field already existed for the sibling case (a pending marker consumed by the
+/// refresh), is written only by a stop, and is cleared by
+/// [`ManagedServiceRecord::reset_for_restart`] — so a stop settled before a
+/// relaunch cannot mask a crash after it. Nothing a crash can do sets either
+/// field.
+///
+/// [`StopWatch`] still narrows the live window for a stop that is requested and
+/// confirmed entirely between two polls.
 pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &str) -> bool {
     crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
-        |(record, _)| record.stop_requested_unix_ms.is_some() || record.status == "stopped",
+        |(record, _)| {
+            record.stop_requested_unix_ms.is_some() || record.settled_stop_unix_ms.is_some()
+        },
     )
 }
 
@@ -724,9 +732,13 @@ mod tests {
             "svc-stop-in-flight"
         ));
 
-        // A confirmed stop clears the marker but leaves `status: "stopped"`.
+        // A confirmed stop moves its marker into `settled_stop_unix_ms` rather
+        // than dropping it. This used to assert that `status: "stopped"` alone
+        // was enough, which is what let a reconciled crash pass as a stop — see
+        // `a_reconciled_crash_is_not_evidence_of_a_stop_but_a_settled_one_is`.
         let mut confirmed = make_record("svc-stop-confirmed");
         confirmed.status = "stopped".to_owned();
+        confirmed.settled_stop_unix_ms = Some(1);
         confirmed.write().expect("write confirmed-stop record");
         assert!(managed_service_stop_was_requested(
             &paths,
@@ -1172,6 +1184,58 @@ mod tests {
         record.write().expect("write");
         assert!(!service_still_live(&paths, &record.service_id, |_| true));
         assert!(!service_still_live(&paths, "no-such-service", |_| true));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The residual ROCMAI-541 race, closed.
+    ///
+    /// `refresh_managed_service_runtime_liveness` reconciles any record with
+    /// dead tracked pids to `"stopped"` without writing any marker, so when this
+    /// predicate also accepted `status == "stopped"`, a crash that any
+    /// concurrent `rocm services`/`rocm dash`/`rocmd` read happened to reconcile
+    /// became indistinguishable from a deliberate stop — and was reported as
+    /// one, exit 0.
+    ///
+    /// Both directions are pinned. The first arm is the regression itself; the
+    /// second is what stopped the term being removable before, and would fail
+    /// for a fix that simply deleted the status term without making the stop's
+    /// own evidence durable.
+    #[test]
+    fn a_reconciled_crash_is_not_evidence_of_a_stop_but_a_settled_one_is() {
+        let (root, paths) = test_paths("stop-evidence");
+        paths.ensure().expect("paths");
+
+        // What the liveness reconciliation leaves behind for a crash: status
+        // `stopped`, and no marker of any kind.
+        let mut crashed = record_tracking_pid(&paths, 0, "stopped");
+        crashed.stop_requested_unix_ms = None;
+        crashed.settled_stop_unix_ms = None;
+        crashed.write().expect("write");
+        assert!(
+            !managed_service_stop_was_requested(&paths, &crashed.service_id),
+            "a status nobody can vouch for must not pass as proof of a stop"
+        );
+
+        // What a confirmed stop leaves behind: the marker moved to the durable
+        // field. Same status, opposite verdict - which is the whole point.
+        let mut settled =
+            ManagedServiceRecord::read_manifest(&paths, &crashed.service_id).expect("read");
+        settled.settled_stop_unix_ms = Some(4_321);
+        settled.write().expect("write");
+        assert!(
+            managed_service_stop_was_requested(&paths, &settled.service_id),
+            "a stop that confirmed and cleared its own marker still has to be recognised"
+        );
+
+        // And a relaunch clears it, so an old stop cannot mask a later crash.
+        let mut relaunched =
+            ManagedServiceRecord::read_manifest(&paths, &crashed.service_id).expect("read");
+        relaunched.reset_for_restart();
+        relaunched.write().expect("write");
+        assert!(
+            !managed_service_stop_was_requested(&paths, &relaunched.service_id),
+            "the stop before a relaunch says nothing about the run after it"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

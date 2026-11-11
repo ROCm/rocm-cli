@@ -3665,8 +3665,16 @@ async fn assert_scripted_crash_fails(world: &mut E2eWorld) {
     // prints "exited unexpectedly" even when the log tail is EMPTY, so asserting
     // only it would stay green in exactly the failure ROCMAI-541 is about: the
     // engine's reason reaching neither the log nor the user. Pin the engine's
-    // OWN message in both places instead — the log, which is what the Windows
-    // stdio attach fixes, and the CLI output, which is what the user sees.
+    // OWN message in both places instead.
+    //
+    // What this does NOT pin, despite an earlier comment here claiming it: the
+    // Windows stdio attach. The in-child backstop
+    // (`record_engine_serve_http_failure`) appends the reason to this same log
+    // file directly, independent of stdout/stderr, so the assertion below stays
+    // green with the attach reverted — and on Linux the attach is not exercised
+    // at all. What it pins is that the reason reaches the log by *some* route,
+    // which is the user-visible guarantee; the attach itself is covered at the
+    // unit level by `a_detached_child_writes_both_streams_into_the_log`.
     let service_id = world
         .scripted_service_id
         .clone()

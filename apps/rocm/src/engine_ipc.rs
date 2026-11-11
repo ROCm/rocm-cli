@@ -292,10 +292,18 @@ pub(crate) fn builtin_engine_available(engine: &str) -> bool {
 /// same file `rocm services logs <service_id>` tails) — one line, because this process's
 /// stderr reaches that same file, so the full chain is already there whenever
 /// the attachment worked — and the full chain to this process's own
-/// structured log, and marks the engine state file `failed` — regardless of whether the
-/// engine already did either on this particular error path. A later success
-/// (this function only runs once per process, so there is no later state to
-/// race against) is unaffected; only the error path writes anything here.
+/// structured log, and marks the engine state file `failed` — regardless of
+/// whether the engine already did either on this particular error path.
+///
+/// With one exception, which the sentence above used to omit: a **deliberate
+/// stop** is not a failure. When the engine state file already says the stop was
+/// asked for, `record_engine_serve_http_failure` writes a `stopped:` line rather
+/// than a `failed:` one and stamps nothing, so an operator's own `rocm services
+/// stop` is not recorded as a crash.
+///
+/// A later success (this function only runs once per process, so there is no
+/// later state to race against) is unaffected; only the error path writes
+/// anything here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_builtin_engine_serve_http(
     engine: &str,

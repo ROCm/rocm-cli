@@ -254,7 +254,20 @@ fn stop_internal_managed_service_confirmed_with(
     let all_stopped = terminated_all && !record_changed && engine_stop_confirms;
     if all_stopped {
         record.status = "stopped".to_owned();
-        record.stop_requested_unix_ms = None;
+        // Moved, not dropped. Clearing the marker outright left `status ==
+        // "stopped"` as the only trace that this death was asked for, and that
+        // is not evidence: `refresh_managed_service_runtime_liveness` writes the
+        // same status for a record whose tracked PIDs are merely gone, saying so
+        // in its own comment ("dead pids alone do not distinguish a stopped
+        // service from a crashed one"). A crash reconciled by any concurrent
+        // `rocm services`/`rocm dash`/`rocmd` read therefore looked exactly like
+        // a deliberate stop, and `managed_service_stop_was_requested` believed
+        // it — the original ROCMAI-541 symptom, surviving inside its own fix.
+        //
+        // `settled_stop_unix_ms` already exists for the sibling case (a marker
+        // consumed by the refresh) and is already cleared by `reset_for_restart`,
+        // so a stop settled before a relaunch cannot mask a later crash.
+        record.settled_stop_unix_ms = record.stop_requested_unix_ms.take();
         // The processes this stop confirmed gone are not the service's any more,
         // and their PIDs are stale the instant they exited. Left in the record,
         // a later stop would signal them again: a PID recorded without a

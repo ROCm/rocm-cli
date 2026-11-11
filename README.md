@@ -1177,6 +1177,19 @@ services stop` from another shell — is not a crash: the service is never marke
 is the unconfirmed-stop case described above, which still exits with an error —
 that is a stop whose outcome is unknown, not a stop reported as a failure.
 
+The same rule now holds on **every** path a managed engine can die on, not only
+the attached one. A background `rocm serve` whose child dies during the readiness
+wait, a `rocm serve --wait` whose server dies before it answers, and a `rocm
+services restart` whose engine dies on start all fail loudly: non-zero exit, the
+reason quoted from the service log, and both the service record and the engine
+state file left `failed`. A death that was *asked for* — `rocm services stop`, or
+`rocm dash`'s stop action — is reported as a stop on all of them instead, and
+marks nothing `failed`.
+
+The distinction is made from the stop's own recorded evidence, not from the
+record's status: a reconciliation that merely notices the processes are gone
+writes `stopped` too, and that is not proof anyone asked for it.
+
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
