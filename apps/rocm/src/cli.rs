@@ -65,10 +65,10 @@ pub(crate) enum Command {
     ///
     /// A `rocm_support` line is printed on **every** host, at one of three
     /// levels: ROCm/HIP-supported, Vulkan-only, or unknown. Vulkan-only covers
-    /// a GPU that is recognized but has no ROCm build at all — `gfx90c`, the
-    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs — which still
+    /// a GPU that is recognized but has no ROCm build at all (`gfx90c`, the
+    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs), which still
     /// works through Lemonade's Vulkan backend. Unknown covers both a GPU
-    /// nothing detected and a target this build's catalog does not recognise:
+    /// nothing detected and a target this build's catalog does not recognize:
     /// those are detection gaps, not a verdict on the hardware, which is why
     /// an empty `compatible_therock_family` does not read as a failed probe.
     Examine {
