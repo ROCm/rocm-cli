@@ -31,6 +31,11 @@
 //!   reads a variable the isolation sets. The build uses the `cargo` this task
 //!   runs under (`$CARGO`, which `cargo xtask` always sets), where the script
 //!   searched `PATH` and then `~/.cargo/bin`.
+//! * Each smoked command has a deadline ([`CHILD_DEADLINE`]): one still running
+//!   is killed and the gate fails naming it. The script waited indefinitely, so
+//!   a refusal that regressed into starting a server held the gate until the CI
+//!   job timed out. The build has no deadline, and its output streams as it
+//!   runs instead of being printed when it ends.
 //! * The script merged each child's stderr into its stdout pipe, truly
 //!   interleaving them. `std::process` has no portable equivalent, so the two
 //!   streams are captured separately and concatenated (stdout first). No check
@@ -50,9 +55,13 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -483,13 +492,28 @@ fn free_tcp_port() -> Result<u16> {
         .port())
 }
 
+/// How long one smoked command may run. Every check is a first-run status
+/// read or a refusal, which take seconds; a refusal that regressed into
+/// starting a server would otherwise hold the gate until the CI job's own
+/// timeout, without naming the check.
+const CHILD_DEADLINE: Duration = Duration::from_mins(3);
+
+/// How often a running child is polled against its deadline.
+const CHILD_POLL: Duration = Duration::from_millis(20);
+
 /// Spawn one child and return its combined output, failing when the exit status
-/// does not match `expect_failure`.
+/// does not match `expect_failure`, or when the child or anything it leaves
+/// holding its output is still running at `deadline`.
 ///
 /// Every child is handed a null stdin rather than inheriting this process's:
 /// `rocm chat` without `--prompt` reads a piped stdin to EOF, so an inherited
 /// pipe that the harness keeps open would hang the gate depending only on how
 /// it was launched.
+///
+/// On the deadline the child is killed and the failure names the check and
+/// prints what it had written. A process the child started and left behind is
+/// not killed (the standard library can only kill the child itself), but the
+/// gate does not wait for it either.
 fn run_command(
     label: &str,
     program: &Path,
@@ -497,8 +521,10 @@ fn run_command(
     env: &BTreeMap<&'static str, OsString>,
     cwd: &Path,
     expect_failure: bool,
+    deadline: Duration,
 ) -> Result<String> {
     println!("smoke: {label}");
+    let started = Instant::now();
     let mut command = Command::new(program);
     command
         .args(args)
@@ -509,28 +535,119 @@ fn run_command(
     for (key, value) in env {
         command.env(key, value);
     }
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to run {}", program.display()))?;
+    let stdout = OutputPipe::read(child.stdout.take().expect("stdout is piped"));
+    let stderr = OutputPipe::read(child.stderr.take().expect("stderr is piped"));
+    let combined = |stdout: &OutputPipe, stderr: &OutputPipe| {
+        let mut text = stdout.text();
+        text.push_str(&stderr.text());
+        text.trim().to_string()
+    };
 
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    let combined = combined.trim().to_string();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to wait for {label}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            // Best effort: the child may have exited between the poll and here.
+            let _ = child.kill();
+            let _ = child.wait();
+            print_output(&combined(&stdout, &stderr));
+            bail!("{label} did not finish within {deadline:?} and was killed");
+        }
+        std::thread::sleep(CHILD_POLL);
+    };
+    // The child has exited, but a process it started can still hold the pipes
+    // open; wait for them only until the same deadline.
+    while !(stdout.closed() && stderr.closed()) {
+        if started.elapsed() >= deadline {
+            print_output(&combined(&stdout, &stderr));
+            bail!(
+                "{label} exited, but a process it started still held its output open after {deadline:?}"
+            );
+        }
+        std::thread::sleep(CHILD_POLL);
+    }
+    let combined = combined(&stdout, &stderr);
+    print_output(&combined);
+
+    if expect_failure {
+        if status.success() {
+            bail!("{label} unexpectedly succeeded");
+        }
+    } else if !status.success() {
+        bail!("{label} exited with status {}", exit_code_text(&status));
+    }
+    Ok(combined)
+}
+
+/// Run the build with its output streamed to this process's terminal as it
+/// happens, rather than captured and printed when it ends: a cold build takes
+/// minutes, and a captured one shows nothing until then. It has no deadline,
+/// for the same reason.
+fn run_build(label: &str, program: &Path, args: &[&str], cwd: &Path) -> Result<()> {
+    println!("smoke: {label}");
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run {}", program.display()))?;
+    if !status.success() {
+        bail!("{label} exited with status {}", exit_code_text(&status));
+    }
+    Ok(())
+}
+
+fn print_output(combined: &str) {
     if !combined.is_empty() {
         println!("{combined}");
     }
+}
 
-    if expect_failure {
-        if output.status.success() {
-            bail!("{label} unexpectedly succeeded");
-        }
-    } else if !output.status.success() {
-        bail!(
-            "{label} exited with status {}",
-            exit_code_text(&output.status)
-        );
+/// One of a child's output pipes, drained on its own thread so the child can
+/// never block on a full pipe, and readable at any moment, including after a
+/// deadline when the pipe may never close.
+struct OutputPipe {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl OutputPipe {
+    fn read(mut pipe: impl Read + Send + 'static) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (sink, done) = (Arc::clone(&bytes), Arc::clone(&closed));
+        // Detached on purpose: on a deadline the gate stops waiting for a pipe
+        // that may never close, and the thread ends with the process.
+        std::thread::spawn(move || {
+            let mut chunk = [0_u8; 8192];
+            while let Ok(read @ 1..) = pipe.read(&mut chunk) {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..read]);
+            }
+            done.store(true, Ordering::Release);
+        });
+        Self { bytes, closed }
     }
-    Ok(combined)
+
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn text(&self) -> String {
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// The script printed Python's `returncode`, which is the negated signal number
@@ -954,7 +1071,15 @@ fn execute(plan: &Plan, port: &str, run: &mut Runner<'_>) -> Result<()> {
 /// gate cannot catch that; only a test of this function can.
 fn child_runner(plan: &Plan) -> impl FnMut(&str, &Path, &[&str], bool) -> Result<String> + '_ {
     move |label, program, argv, expect_failure| {
-        run_command(label, program, argv, &plan.env, &plan.root, expect_failure)
+        run_command(
+            label,
+            program,
+            argv,
+            &plan.env,
+            &plan.root,
+            expect_failure,
+            CHILD_DEADLINE,
+        )
     }
 }
 
@@ -977,14 +1102,7 @@ pub fn run(profile: Profile, skip_build: bool, target_dir_override: Option<PathB
         // one. Isolation exists for the binaries under test; under it, a redirected
         // `HOME` hides cargo's registry and config from the build. No build
         // script reads the variables the isolation sets.
-        run_command(
-            build_label(profile),
-            &cargo,
-            &argv,
-            &BTreeMap::new(),
-            &root,
-            false,
-        )?;
+        run_build(build_label(profile), &cargo, &argv, &root)?;
     }
 
     let port = free_tcp_port()?.to_string();
@@ -1711,7 +1829,90 @@ mod tests {
             env,
             cwd,
             expect_failure,
+            TEST_DEADLINE,
         )
+    }
+
+    /// Long enough that no test child that is meant to finish gets near it.
+    const TEST_DEADLINE: Duration = Duration::from_mins(1);
+
+    /// A child that outlives its deadline is killed and the failure names the
+    /// check, rather than the gate waiting for it: the regression this guards
+    /// is a refusal check whose command started a server instead.
+    #[test]
+    fn run_command_kills_a_child_that_outlives_its_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("ping", &["-n", "60", "127.0.0.1"])
+        } else {
+            ("sleep", &["60"])
+        };
+        let started = Instant::now();
+        let error = run_command(
+            "demo",
+            Path::new(program),
+            args,
+            &BTreeMap::new(),
+            dir.path(),
+            true,
+            Duration::from_millis(500),
+        )
+        .expect_err("a child past its deadline fails the check");
+        assert!(
+            format!("{error}").contains("demo did not finish within 500ms and was killed"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the gate waited for the child instead of killing it"
+        );
+    }
+
+    /// A child that exits but leaves a process holding its output open must
+    /// not hold the gate either.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_does_not_wait_for_a_process_left_holding_the_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = Instant::now();
+        let error = run_command(
+            "demo",
+            Path::new("sh"),
+            &["-c", "sleep 60 & echo started"],
+            &BTreeMap::new(),
+            dir.path(),
+            false,
+            Duration::from_millis(500),
+        )
+        .expect_err("output still open at the deadline fails the check");
+        assert!(
+            format!("{error}")
+                .contains("demo exited, but a process it started still held its output open"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn run_build_names_the_build_and_its_status_when_it_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit 3"])
+        } else {
+            ("sh", &["-c", "exit 3"])
+        };
+        let error = run_build("build demo", Path::new(program), args, dir.path())
+            .expect_err("the build fails");
+        assert!(
+            format!("{error}").contains("build demo exited with status 3"),
+            "{error}"
+        );
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit 0"])
+        } else {
+            ("sh", &["-c", "exit 0"])
+        };
+        run_build("build demo", Path::new(program), args, dir.path()).expect("the build passes");
     }
 
     fn run_shell(label: &str, unix: &str, windows: &str, expect_failure: bool) -> Result<String> {
