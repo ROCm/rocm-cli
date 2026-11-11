@@ -198,15 +198,20 @@ pub(super) fn write_wheel_plan(output: &mut String, plan: &WheelPlan<'_>) {
             let _ = writeln!(output, "  package_specs: {NOT_RESOLVED}");
         }
     }
+    let kept = match &plan.stack {
+        PlanStack::Resolved(ResolvedStack { kept_torch, .. }) => *kept_torch,
+        PlanStack::NeedsUv { .. } => None,
+    };
     let _ = writeln!(
         output,
-        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
+        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction{}",
+        if kept.is_some() {
+            " (the torch, torchvision and torchaudio requirements are resolved but not installed; see torch_kept)"
+        } else {
+            ""
+        }
     );
-    if let PlanStack::Resolved(ResolvedStack {
-        kept_torch: Some(kept),
-        ..
-    }) = &plan.stack
-    {
+    if let Some(kept) = kept {
         let _ = writeln!(output, "{}", kept_torch::plan_line(kept));
     }
     if let Some(warning) = plan.no_wheel_warning {

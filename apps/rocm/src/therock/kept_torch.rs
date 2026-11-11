@@ -63,7 +63,15 @@ pub(super) fn kept_torch_stack(
     if !opted_out {
         return None;
     }
-    let installed = installed().ok()?;
+    let installed = match installed() {
+        Ok(installed) => installed,
+        Err(err) => {
+            eprintln!(
+                "warning: ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set but the installed torch could not be read ({err:#}); the install will replace torch with the SDK's. Unset the variable to make that the intended behaviour."
+            );
+            return None;
+        }
+    };
     installed
         .iter()
         .any(|(name, _)| name == "torch")
@@ -99,6 +107,23 @@ pub(super) fn plan_line(kept: &KeptTorch) -> String {
         "  torch_kept: ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set and this runtime already holds {}; the torch, torchvision and torchaudio requirements are left out of the install",
         kept.describe()
     )
+}
+
+/// The one `torch_kept:` line a real install prints, once the environment is
+/// prepared: the plan's line when the torch is kept, an explanation when the
+/// environment was recreated and the torch the plan counted on is gone.
+pub(super) fn install_line(
+    planned: Option<&KeptTorch>,
+    kept: Option<&KeptTorch>,
+) -> Option<String> {
+    match (planned, kept) {
+        (_, Some(kept)) => Some(plan_line(kept)),
+        (Some(planned), None) => Some(format!(
+            "  torch_kept: not applied; the Python environment was recreated for another interpreter, which discarded the torch it held ({}); the full torch stack is installed",
+            planned.describe()
+        )),
+        (None, None) => None,
+    }
 }
 
 /// Ask the environment's own interpreter which torch packages it holds.
@@ -209,6 +234,19 @@ mod tests {
     fn an_environment_that_cannot_be_read_keeps_nothing() {
         let kept = kept_torch_stack(true, || anyhow::bail!("the interpreter would not start"));
         assert_eq!(kept, None);
+    }
+
+    #[test]
+    fn a_recreated_environment_prints_one_line_that_matches_what_is_installed() {
+        let planned = kept_torch_stack(true, || held(&[("torch", "2.11.0")])).expect("kept");
+        assert_eq!(install_line(None, None), None);
+        assert_eq!(
+            install_line(Some(&planned), Some(&planned)),
+            Some(plan_line(&planned))
+        );
+        let line = install_line(Some(&planned), None).expect("a line");
+        assert!(line.starts_with("  torch_kept: not applied;"), "{line}");
+        assert!(line.contains("torch 2.11.0") && !line.contains("left out of the install"));
     }
 
     #[test]

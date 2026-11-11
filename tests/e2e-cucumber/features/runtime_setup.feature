@@ -70,9 +70,9 @@ Feature: Runtime configuration
   # see. This is the same reinstall as scenario 4 with the opt-out set, so what
   # differs between them is exactly the variable.
   #
-  # Five claims across four Thens, because the opt-out is only coherent if all
-  # five hold: torch was not rewritten by the alignment; the SDK install itself
-  # did not rewrite it either — it hands `uv` the torch requirements too, so
+  # Four claims, because the opt-out is only coherent if all four hold: torch
+  # was not rewritten by the alignment; the SDK install itself did not rewrite
+  # it either — it hands `uv` the torch requirements too, so
   # before it honoured the opt-out the engine's torch was replaced by the SDK's
   # build in the same command that reported the opt-out, and a GPU on which that
   # build opens no device failed the install; the divergence the opt-out

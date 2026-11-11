@@ -518,7 +518,10 @@ fn install_wheel_runtime(
             install_root: &install_root,
             runtime_key: &runtime_key,
             package_specs: &wheel_composition.package_specs,
-            kept_torch: planned_kept.as_ref(),
+            // A real install decides again once the environment is prepared (it may
+            // be recreated and lose its torch), and writes the one `torch_kept:` line
+            // then; a preview cannot know, so it prints the plan's.
+            kept_torch: if dry_run { planned_kept.as_ref() } else { None },
             manifest_path: &manifest_path,
         }),
     };
@@ -648,11 +651,9 @@ fn install_wheel_runtime(
             "ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set: keeping the torch this runtime already holds ({}).",
             kept.describe()
         ));
-    } else if planned_kept.is_some() {
-        let _ = writeln!(
-            output,
-            "  torch_kept: not applied; the Python environment was recreated, so it held no torch to keep"
-        );
+    }
+    if let Some(line) = kept_torch::install_line(planned_kept.as_ref(), kept.as_ref()) {
+        let _ = writeln!(output, "{line}");
     }
     let install_specs = kept_torch::install_specs(&wheel_composition.package_specs, kept.as_ref());
 
