@@ -875,6 +875,12 @@ const READ_CHUNK: usize = 16 * 1024;
 /// while neither reader thread has run a single instruction. So the grace covers
 /// reader start-up as well as the last buffer or two. 200ms absorbs both with
 /// room to spare, including on the no-GPU e2e lane's 64 concurrent scenarios.
+///
+/// The one value for every caller, and what it costs is output: a descendant
+/// that writes later than this after the child exited contributes nothing, and
+/// the capture's `detail` says only that output was still arriving. Whether a
+/// caller whose tool is known to do that should be able to ask for a longer
+/// grace is open, listed in `docs/host-probing.md`.
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 /// How much of a timed-out child's own output the timeout error quotes.
