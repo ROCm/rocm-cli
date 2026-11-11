@@ -262,3 +262,18 @@ Feature: Runtime lifecycle state machine
     And the server is still counted as left on the first runtime
     And the switch to the second runtime was kept
     And the server record still names the first runtime
+
+  # The install report names a runtime's channel, package source, source layout
+  # and exact GPU target; afterwards only its manifest still knows them. The
+  # listing reads them back and says when one was never recorded rather than
+  # inferring it — the older runtime's family is itself an exact target, so a
+  # guess would look like a recorded value. The planted manifests need no SDK
+  # download or GPU, so this runs on the mock lane.
+  @id:runtime-lifecycle-list-names-runtime-provenance
+  Scenario: runtime-lifecycle-19 - Listing runtimes says which stream, source and GPU each runtime was installed from
+    Given a registered nightly runtime installed for one exact GPU
+    And a registered runtime installed before its source layout and GPU target were recorded
+    When the user lists the registered runtimes
+    Then the nightly runtime's listing names its channel, package source, source layout and exact GPU target
+    And its version shows its build date
+    And the older runtime's listing says which of those facts were not recorded instead of guessing

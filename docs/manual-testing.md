@@ -108,7 +108,15 @@ rocm runtimes list
 Expected result:
 
 - `rocm examine` shows a managed runtime.
-- `rocm runtimes list` shows the runtime key for the installed TheRock venv.
+- `rocm runtimes list` shows the runtime key for the installed TheRock venv,
+  and under it a `provenance:` line naming the `channel`, the package `source`,
+  the `source_layout_generation` and the exact `device_target` the install
+  printed. A fact recorded nowhere, or recorded blank, reads `unrecorded`;
+  none is guessed (the target is never the family).
+- `rocm examine` reports the same four facts for the active runtime as its
+  `active_runtime_channel`, `active_runtime_source`,
+  `active_runtime_source_layout_generation` and `active_runtime_device_target`
+  lines.
 - The active runtime is ready, or the output gives one clear next command.
 
 Optional: an unreadable settings file. Copy `config.json` from the config

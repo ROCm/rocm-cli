@@ -29,9 +29,9 @@ use rocm_core::{
 };
 
 use crate::runtime_registry::{
-    ManifestOverwrite, paths_equivalent, runtime_manifest_path, runtime_registry_dir,
-    sort_manifests_newest_install_first, validate_runtime_manifest_for_activation,
-    write_runtime_manifest,
+    ADOPTED_RUNTIME_ARTIFACT_URL, ManifestOverwrite, paths_equivalent, runtime_manifest_path,
+    runtime_registry_dir, sort_manifests_newest_install_first,
+    validate_runtime_manifest_for_activation, write_runtime_manifest,
 };
 use crate::therock;
 
@@ -298,7 +298,7 @@ pub(crate) fn adopt_runtime_from_probe(
         family_source: "runtime_id".to_owned(),
         version,
         install_root: install_root.clone(),
-        selected_artifact_url: "adopted-read-only".to_owned(),
+        selected_artifact_url: ADOPTED_RUNTIME_ARTIFACT_URL.to_owned(),
         source_layout_generation: None,
         index_url: None,
         tarball_file_name: None,
@@ -644,12 +644,32 @@ mod tests {
         Ok(())
     }
 
-    /// The other half of the same derivation: an adopted environment that does
-    /// expose a CMake path has the toolchain, and the manifest must say so or
-    /// the next `rocm update` would quietly reinstall without it.
-    #[test]
-    fn runtime_adopt_records_devel_when_the_probe_finds_cmake() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt-devel");
+    /// Adopts a fake external TheRock venv under `root` whose probe reports a
+    /// CMake path, through the same `adopt_runtime_from_probe` that
+    /// `rocm runtimes adopt` runs, and returns the manifest it registered.
+    fn adopt_test_runtime(
+        root: &Path,
+        paths: &AppPaths,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        adopt_test_runtime_with(root, paths, TestAdoptRequest::HandBuilt)
+    }
+
+    /// How [`adopt_test_runtime_with`] builds its adoption request.
+    enum TestAdoptRequest {
+        /// A request with the runtime id and key spelled out.
+        HandBuilt,
+        /// The request `rocm runtimes adopt` builds with no `--runtime-id`,
+        /// through [`infer_adopt_runtime_request`]; `channel` is `--channel`.
+        Inferred { channel: Option<&'static str> },
+    }
+
+    /// Adopts a fake external environment, building the request as `request`
+    /// says.
+    fn adopt_test_runtime_with(
+        root: &Path,
+        paths: &AppPaths,
+        request: TestAdoptRequest,
+    ) -> Result<therock::InstalledRuntimeManifest> {
         let external_root = root.join("external-therock-venv");
         let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         let python_executable = scripts_dir.join(if cfg!(windows) {
@@ -680,38 +700,56 @@ mod tests {
         fs::write(&amdhip, "amdhip")?;
         fs::write(&hipblas, "hipblas")?;
 
-        let adopted = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
+        let probe = therock::RocmSdkPythonProbe {
+            import_ok: true,
+            rocm_sdk_version: Some("7.13.0".to_owned()),
+            root_path: Some(sdk_root.clone()),
+            bin_path: Some(sdk_bin.clone()),
+            cmake_path: Some(cmake_path),
+            runtime_roots: vec![sdk_root],
+            bin_paths: vec![sdk_bin.clone()],
+            library_paths: vec![sdk_bin],
+            resolved_libraries: vec![
+                therock::RocmSdkLibraryProbe {
+                    shortname: "amdhip64".to_owned(),
+                    paths: vec![amdhip],
+                },
+                therock::RocmSdkLibraryProbe {
+                    shortname: "hipblas".to_owned(),
+                    paths: vec![hipblas],
+                },
+            ],
+            resolved_target_family: Some("gfx120X-all".to_owned()),
+            ..therock::RocmSdkPythonProbe::default()
+        };
+        let request = match request {
+            TestAdoptRequest::HandBuilt => AdoptRuntimeRequest {
                 python_executable,
                 install_root: external_root,
                 runtime_id: "therock-release:gfx120X-all".to_owned(),
                 runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
                 replace: false,
             },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                cmake_path: Some(cmake_path),
-                runtime_roots: vec![sdk_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin],
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )?;
+            TestAdoptRequest::Inferred { channel } => infer_adopt_runtime_request(
+                python_executable,
+                Some(external_root),
+                None,
+                None,
+                channel.map(str::to_owned),
+                false,
+                &probe,
+            )?,
+        };
+        adopt_runtime_from_probe(paths, request, probe)
+    }
+
+    /// The other half of the same derivation: an adopted environment that does
+    /// expose a CMake path has the toolchain, and the manifest must say so or
+    /// the next `rocm update` would quietly reinstall without it.
+    #[test]
+    fn runtime_adopt_records_devel_when_the_probe_finds_cmake() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt-devel");
+        let adopted = adopt_test_runtime(&root, &paths)?;
 
         assert!(
             adopted.devel,
@@ -719,6 +757,71 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Adoption installs nothing, so there is no package source to name: the
+    /// manifest's artifact URL holds only the adoption marker. The listing must
+    /// say the source was not recorded rather than present that marker as one.
+    /// The request is the one `rocm runtimes adopt` builds with neither
+    /// `--channel` nor `--runtime-id`, so the channel is adoption's default,
+    /// `release`.
+    #[test]
+    fn adopted_runtime_lists_its_source_as_unrecorded() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt-provenance");
+        let adopted =
+            adopt_test_runtime_with(&root, &paths, TestAdoptRequest::Inferred { channel: None })?;
+        let rendered =
+            crate::runtimes_cmd::render_runtimes_text(&paths, &RocmCliConfig::default())?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(adopted.channel, "release");
+        let row = format!(" {} runtime_id=", adopted.runtime_key);
+        let provenance = rendered
+            .lines()
+            .skip_while(|line| !line.contains(&row))
+            .find(|line| line.trim_start().starts_with("provenance:"))
+            .unwrap_or_else(|| panic!("no provenance line for the adopted runtime:\n{rendered}"));
+        assert_eq!(
+            provenance,
+            "      provenance: channel=release source=unrecorded \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    /// An adopted runtime's channel is the one adoption recorded. With
+    /// `--channel nightly` and no `--runtime-id`, that is `nightly`, and the
+    /// listing shows it — not the `release` that adoption records when no
+    /// channel is named (`adopted_runtime_lists_its_source_as_unrecorded`).
+    #[test]
+    fn adopted_nightly_runtime_lists_its_channel_as_nightly() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt-provenance-nightly");
+        let adopted = adopt_test_runtime_with(
+            &root,
+            &paths,
+            TestAdoptRequest::Inferred {
+                channel: Some("nightly"),
+            },
+        )?;
+        let rendered =
+            crate::runtimes_cmd::render_runtimes_text(&paths, &RocmCliConfig::default())?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(adopted.channel, "nightly");
+        let row = format!(" {} runtime_id=", adopted.runtime_key);
+        let provenance = rendered
+            .lines()
+            .skip_while(|line| !line.contains(&row))
+            .find(|line| line.trim_start().starts_with("provenance:"))
+            .unwrap_or_else(|| panic!("no provenance line for the adopted runtime:\n{rendered}"));
+        assert_eq!(
+            provenance,
+            "      provenance: channel=nightly source=unrecorded \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "{rendered}"
+        );
         Ok(())
     }
 
