@@ -164,7 +164,7 @@ Feature: TheRock "next" ROCm 10 install layout
   #
   # The serve+inference tail matters because `serve-vllm-inference`
   # (model_serving.feature) does not cover this route: its runtime comes from
-  # a plain unpinned `rocm install sdk`, never the ROCm 10 preview source. A
+  # a plain unpinned `rocm install sdk`, which reads the newest layout. A
   # discovered wheel that installs cleanly but can't actually load or answer a
   # request (bad torch realignment, cp314 ABI mismatch, a `uv.toml` fallback
   # pulling an incompatible transitive dep) would pass every assertion above

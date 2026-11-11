@@ -274,7 +274,7 @@ Expected result:
 Developer-only deterministic override:
 
 ```powershell
-python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
+python scripts\therock_sdk_install_test.py --dry-run --family gfx1200
 ```
 
 Use `--family` only when a test needs a fixed package family. Do not use it for

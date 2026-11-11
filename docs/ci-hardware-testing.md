@@ -92,7 +92,7 @@ owner of this one.
 
 **Rerun.** Actions, "Nightly stream canary", "Run workflow". Locally, with a
 built `rocm`: `python scripts/nightly_canary.py --rocm target/release/rocm`
-(add `--family gfx110X-all` to probe one family; `--self-test` runs the rules
+(add `--family gfx1100` to probe one arch; `--self-test` runs the rules
 against fixtures without the network).
 
 

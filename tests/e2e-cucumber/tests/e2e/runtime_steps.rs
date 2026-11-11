@@ -60,7 +60,7 @@ async fn user_previews_sdk_install(world: &mut E2eWorld) {
     // this to a plan: no venv, no multi-GiB download.
     let stdout = crate::run_rocm_ok(
         world,
-        &["install", "sdk", "--family", "gfx110X-all", "--dry-run"],
+        &["install", "sdk", "--family", "gfx1100", "--dry-run"],
     );
     world.cli_output = Some(stdout);
 }
@@ -248,7 +248,7 @@ async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
 /// resolution, which would exit non-zero for a reason that has nothing to do
 /// with the consent gate and would still satisfy "the reinstall is refused".
 /// Each is published as a `therock-dist-linux-<family>-<version>.tar.gz` in the
-/// canonical release tarball catalog, for the same reason: an artifact the
+/// newest layout's release tarball catalog, for the same reason: an artifact the
 /// catalog does not carry fails resolution short of the gate.
 const OTHER_FAMILY_CANDIDATES: &[(&str, &str)] = &[
     ("gfx1100", "gfx110X-all"),

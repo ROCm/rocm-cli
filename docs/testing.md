@@ -1052,6 +1052,23 @@ preview runs it exactly once, for the compile, and prints the resolved plan. The
 is already installed`, which installs the managed `uv` into the scenario's data
 folder the way a real install would have.
 
+The decision is unit-tested on every platform, Windows included
+(`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
+[uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
+both layouts, a preview or an install, and a `uv` present or not), as are the
+plan's whole text and its key order against a resolved plan's
+(`the_plan_a_preview_without_uv_prints_is_exactly_this` and
+`a_resolved_and_an_unresolved_plan_print_the_same_keys` in
+[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs)). On Unix,
+`a_preview_never_acquires_uv_and_a_real_resolution_still_does` there runs the
+real resolution against a served index and a stand-in `uv`, counting what each
+row looked for, acquired and ran. What no test reaches without the network is the
+real download a real install makes when no `uv` is installed, and that the public
+entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
+first is a network call, and the second is held only by the types (those entry
+points return a resolved plan and refuse the unresolved one) and by the lanes
+that install a ROCm 10 runtime for real.
+
 Which source an install reads is covered by the `therock-next` scenarios against
 loopback fixtures served through the trust gate (the
 `ROCM_CLI_THEROCK_*_BASE` variables, see [release-trust.md](release-trust.md)).
@@ -1075,22 +1092,6 @@ itself, `layout_serving`, is a table of every request shape on both channels in
 [source.rs](../apps/rocm/src/therock/source.rs), including the boundary dates.
 The paced tarball download in `download-progress-01` reads the newest layout's
 catalog with an exact arch for the same reason.
-The decision is unit-tested on every platform, Windows included
-(`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
-[uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
-both layouts, a preview or an install, and a `uv` present or not), as are the
-plan's whole text and its key order against a resolved plan's
-(`the_plan_a_preview_without_uv_prints_is_exactly_this` and
-`a_resolved_and_an_unresolved_plan_print_the_same_keys` in
-[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs)). On Unix,
-`a_preview_never_acquires_uv_and_a_real_resolution_still_does` there runs the
-real resolution against a served index and a stand-in `uv`, counting what each
-row looked for, acquired and ran. What no test reaches without the network is the
-real download a real install makes when no `uv` is installed, and that the public
-entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
-first is a network call, and the second is held only by the types (those entry
-points return a resolved plan and refuse the unresolved one) and by the lanes
-that install a ROCm 10 runtime for real.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
@@ -1188,7 +1189,7 @@ Use a deterministic family only for developer tests that need fixed package
 selection:
 
 ```bash
-python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
+python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx1200
 ```
 
 ### GPU targets with no ROCm build
