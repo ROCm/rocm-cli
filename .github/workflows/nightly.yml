@@ -768,8 +768,9 @@ jobs:
     # it, so the "Report whether Docker is reachable" step logs the answer. If it
     # does not, no nightly lane runs AIM serve and a pool-based one is needed.
     timeout-minutes: 120
-    # The DevLab Dispatch pool, identical to the per-PR e2e-gpu-strix-ubuntu
-    # lane in e2e-selfhosted.yml (pinned by workflow_contract.rs). This lane used
+    # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
+    # e2e-selfhosted.yml, which runs on push, merge_group and dispatch but not on
+    # pull_request (pinned by workflow_contract.rs). This lane used
     # to target the static `native` host, which is offline: every nightly sat
     # queued until the 12h run cap and the lane never ran. Pool hosts are cold,
     # so there are no host-specific HOME or cache-dir overrides.

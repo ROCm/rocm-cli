@@ -7693,20 +7693,25 @@ jobs:
             );
         }
         // A pull request runs one Linux node (MI300X) and one Windows node (the
-        // Strix Halo pool). These two lanes are off the pull_request path but must
-        // still run on push and in the merge queue. Pin the WHOLE gate, not a
-        // substring: the `pull_request` exclusion must sit in the non-dispatch
-        // branch (so a dispatch can still select the lane) and nothing else about
-        // the event may be named, so a gate that dropped push/merge_group some
-        // other way fails here too.
-        for (job, platform) in [
-            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
-            ("e2e-gpu-w7900", "w7900"),
+        // Strix Halo pool). Strix Ubuntu is off the pull_request path but must
+        // still run on push and in the merge queue; W7900 is off pull_request AND
+        // merge_group (one runner on borrowed quota, the queue does not wait for
+        // it) but still runs on push and dispatch. Pin the WHOLE gate, not a
+        // substring: the event exclusions must sit in the non-dispatch branch (so
+        // a dispatch can still select the lane) and nothing else about the event
+        // may be named, so a gate that dropped push some other way fails too.
+        for (job, platform, excluded) in [
+            ("e2e-gpu-strix-ubuntu", "strix-ubuntu", ""),
+            (
+                "e2e-gpu-w7900",
+                "w7900",
+                "&& github.event_name != 'merge_group' ",
+            ),
         ] {
             let expected = format!(
                 "always() && needs.changes.result == 'success' && ( \
                  (github.event_name != 'workflow_dispatch' \
-                 && github.event_name != 'pull_request' \
+                 && github.event_name != 'pull_request' {excluded}\
                  && needs.changes.outputs.serve == 'true') \
                  || (github.event_name == 'workflow_dispatch' \
                  && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
@@ -7714,10 +7719,14 @@ jobs:
             assert_eq!(
                 normalized_whitespace(&gate(job)),
                 normalized_whitespace(&expected),
-                "`{job}` must skip pull_request in its non-dispatch branch and keep running \
-                 on push, merge_group and dispatch"
+                "`{job}` has the wrong event gate (pull_request, plus merge_group for W7900, \
+                 excluded in the non-dispatch branch only)"
             );
         }
+        assert!(
+            !job_block(&sh, "e2e-gpu-w7900").contains("E2E_MERGE_QUEUE"),
+            "e2e-gpu-w7900 never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
     }
 
     /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
@@ -7741,9 +7750,16 @@ jobs:
             !uncommented.contains("actions-runner"),
             "the pool host has no /home/ubuntu/actions-runner tree"
         );
+        // Whole-word match, so a future `HF_TMPDIR` is not read as `TMPDIR`.
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
         for var in ["CARGO_HOME", "RUSTUP_HOME", "TMPDIR", "PIP_CACHE_DIR"] {
+            let read = uncommented.match_indices(var).any(|(index, _)| {
+                let before = uncommented[..index].chars().next_back();
+                let after = uncommented[index + var.len()..].chars().next();
+                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            });
             assert!(
-                env.contains_key(var) || !uncommented.contains(var),
+                env.contains_key(var) || !read,
                 "e2e-gpu-nightly-strix reads {var} but no longer sets it"
             );
         }

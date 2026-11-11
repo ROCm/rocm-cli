@@ -1196,8 +1196,8 @@ serve_timeout_secs = 90
     #[test]
     fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
         // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
-        // may each wait out a 1200s readiness cap. Run per-PR on the Strix Ubuntu
-        // pool they pushed the job (~25 min otherwise) into its 45 min cap on every
+        // may each wait out a 1200s readiness cap. Run on every PR on the Strix
+        // Ubuntu pool (before that lane left the PR path) they pushed the job (~25 min otherwise) into its 45 min cap on every
         // run. They must resolve to Skip unless the nightly opt-in is set, and must
         // still be reachable (not Skip for the nightly reason) when it is.
         let m = Expectations::default();

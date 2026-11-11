@@ -36,9 +36,9 @@ differs is when each runs and what hardware it covers.
 
 | Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
 |---|---|---|---|---|
-| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below, except `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` (see below) | No — absent from the required-status-check list |
+| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below, except `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` (and W7900 also `merge_group`; see below) | No — absent from the required-status-check list |
 | Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same self-hosted platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
-| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The full self-hosted matrix: every platform in the table below, including `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which only skip `pull_request` | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
+| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The full self-hosted matrix: every platform in the table below, including `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`, which skip `pull_request` (W7900 also `merge_group`, but a `release/**` push runs both) | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
 
 R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
@@ -48,9 +48,10 @@ A pull request now runs on exactly one Linux GPU node and one Windows GPU
 node: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
 the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu (`e2e-gpu-strix-ubuntu`) and W7900 (`e2e-gpu-w7900`) lanes no longer
-start on `pull_request`; they keep their `push`/`merge_group`/dispatch
-triggers and run nightly (`e2e-gpu-nightly-strix` on the same DevLab Dispatch
-pool labels, `e2e-gpu-nightly-w7900`).
+start on `pull_request`; they keep their `push`/dispatch triggers (Strix
+Ubuntu also `merge_group`; W7900 does not run in the merge queue) and run
+nightly (`e2e-gpu-nightly-strix` on the same DevLab Dispatch pool labels,
+`e2e-gpu-nightly-w7900`).
 
 [`queue-run.yml`](../.github/workflows/queue-run.yml) runs GPU lanes on a
 shared GPU queue, one per GPU model, so no runner holds a GPU for the length
@@ -130,7 +131,8 @@ separate tier flag or tag filter to maintain.
 
 On `pull_request`, `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900` are skipped; the
 other lanes above run (one Linux node, MI300X, and the Windows Strix Halo pool).
-Both still run on `push`, `merge_group`, dispatch and nightly.
+Both still run on `push`, dispatch and nightly; Strix Ubuntu also on `merge_group`,
+W7900 does not (a single runner on borrowed quota would sit behind the queue).
 
 `e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
 nightly]` axis: two concurrent legs on the same job, channel-suffixed artifact
@@ -391,10 +393,10 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request` (all lanes but `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and
-`merge_group` (every GPU lane except MI300X, which is not required for merging
-and so is skipped in the merge queue rather than left queued on limited runner
-capacity after its PR has merged) when the workflow's
-own `changes` job's `serve` path filter is `true`. A new push to a pull request
+`merge_group` (every GPU lane except MI300X and W7900, which are not required for
+merging and so are skipped in the merge queue rather than left queued on limited runner
+capacity after its PR has merged) when the workflow's own `changes` job's
+`serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM

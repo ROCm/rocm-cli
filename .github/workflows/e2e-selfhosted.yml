@@ -12,8 +12,9 @@ name: E2E self-hosted
 # Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
 # MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
 # node (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
-# Ubuntu and W7900 lanes keep their push / merge_group / dispatch triggers and
-# run nightly (nightly.yml); they just no longer start on pull_request.
+# Ubuntu lane keeps its push / merge_group / dispatch triggers and the W7900
+# lane its push / dispatch triggers (no merge_group); both run nightly
+# (nightly.yml) and neither starts on pull_request.
 #
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
@@ -116,7 +117,7 @@ jobs:
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
       # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
-      # full matrix (every lane but MI300X, which skips merge_group) and its
+      # full matrix (every lane but MI300X and W7900, which skip merge_group) and its
       # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
       # ROCMAI-430: the three most recent rows of the official release list
@@ -1610,15 +1611,18 @@ jobs:
       fail-fast: false
       matrix:
         sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
-    # Not on pull_request: one runner on borrowed quota, 58-70% of its PR jobs
-    # never started before being superseded. Still runs on push/merge_group/
-    # dispatch and nightly (nightly.yml, e2e-gpu-nightly-w7900).
+    # Not on pull_request or merge_group: one runner on borrowed quota, 58-70% of
+    # its PR jobs never started before being superseded, and a merge_group run
+    # would queue behind it the same way (the queue does not wait for this
+    # check). Still runs on push (main, release/**), dispatch and nightly
+    # (nightly.yml, e2e-gpu-nightly-w7900).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
           && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'w7900'))
@@ -1631,8 +1635,6 @@ jobs:
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Full serve matrix at the merge-queue gate.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
