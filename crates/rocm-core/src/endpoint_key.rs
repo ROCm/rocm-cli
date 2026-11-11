@@ -257,6 +257,8 @@ pub fn ensure_public_service_has_endpoint_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proptest_cases;
+    use proptest::prelude::*;
 
     #[test]
     fn generate_endpoint_api_key_is_random_and_alphanumeric() {
@@ -311,6 +313,82 @@ mod tests {
             "[::1]",
         ] {
             assert!(is_public_bind_host(host), "{host} must be public");
+        }
+    }
+
+    /// The three spellings the CLI accepts as loopback, written out here rather
+    /// than shared with the code under test.
+    const LOOPBACK_SPELLINGS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+    /// Addresses that reach this host, or every interface, without being one of
+    /// the accepted spellings: all must be treated as public.
+    const OTHER_LOCAL_ADDRESSES: [&str; 9] = [
+        "0.0.0.0",
+        "::",
+        "[::1]",
+        "::ffff:127.0.0.1",
+        "127.0.0.2",
+        "127.000.0.1",
+        "0:0:0:0:0:0:0:1",
+        "localhost.localdomain",
+        "",
+    ];
+
+    /// One near miss of a loopback spelling; kind 0 is the spelling itself.
+    fn near_loopback(spelling: &str, kind: u8) -> String {
+        match kind {
+            0 => spelling.to_owned(),
+            1 => format!(" {spelling}"),
+            2 => format!("{spelling}\n"),
+            3 => spelling.to_ascii_uppercase(),
+            4 => {
+                let mut chars = spelling.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
+            }
+            5 => format!("[{spelling}]"),
+            6 => format!("{spelling}:8080"),
+            _ => format!("{spelling}."),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: proptest_cases(1024),
+            ..ProptestConfig::default()
+        })]
+
+        /// The loopback allowlist decides whether an endpoint gets an API key.
+        /// Anything that is not one of the three exact accepted spellings must
+        /// be classified public (key required) — misclassifying a public bind
+        /// as loopback opens an unauthenticated listener.
+        ///
+        /// A random host string essentially never lands near those spellings,
+        /// so most cases are drawn from the near-miss region: each loopback
+        /// spelling padded, re-cased, bracketed or extended, plus other
+        /// addresses that reach this host but are not on the list.
+        #[test]
+        fn only_exact_loopback_spellings_skip_the_api_key(
+            host in prop_oneof![
+                3 => (
+                    prop::sample::select(LOOPBACK_SPELLINGS.to_vec()),
+                    0u8..8,
+                )
+                    .prop_map(|(spelling, kind)| near_loopback(spelling, kind)),
+                1 => prop::sample::select(OTHER_LOCAL_ADDRESSES.to_vec()).prop_map(str::to_owned),
+                1 => "[ -~]{0,24}",
+            ],
+        ) {
+            let loopback = !is_public_bind_host(&host);
+            let allowlisted = LOOPBACK_SPELLINGS.contains(&host.as_str());
+            prop_assert!(
+                loopback == allowlisted,
+                "host {host:?} was classified {} but only the exact spellings \
+                 {LOOPBACK_SPELLINGS:?} may skip the key",
+                if loopback { "loopback" } else { "public" }
+            );
         }
     }
 

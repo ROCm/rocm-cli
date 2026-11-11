@@ -3187,6 +3187,7 @@ Artifact integrity and engine protocol property tests:
 ```bash
 cargo test -p rocm-core --test digest_gate_properties --test integrity_properties --test model_selector_properties
 cargo test -p rocm-engine-protocol --test protocol_properties
+cargo test -p rocm-core --lib endpoint_key
 cargo test -p rocm-engine-lemonade --lib archive_digest
 cargo test -p xtask verify_pinned_keys
 ```
@@ -3196,7 +3197,11 @@ pinned release key is authentic, and the code that decodes engine output. The
 generators aim at near misses — a digest one nibble off or sharing a correct
 prefix, a signature with one byte changed or leading zeros, a loopback spelling
 padded or re-cased, a model id with a variant suffix — because a uniformly
-random input is rejected by any implementation, correct or not. The pinned-key
+random input is rejected by any implementation, correct or not. The loopback
+property, `only_exact_loopback_spellings_skip_the_api_key`, runs next to the
+function it checks, `is_public_bind_host` in
+[`endpoint_key.rs`](../crates/rocm-core/src/endpoint_key.rs), so it is in the
+`rocm-core` lib tests rather than in `protocol_properties`. The pinned-key
 tests run the real check over a scratch repository root and walk every
 position of the committed key. `model_selector_properties` also pins, rather
 than asserts away, two shapes where readiness accepts an engine's reported name
