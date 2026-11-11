@@ -7448,6 +7448,14 @@ jobs:
             .to_owned()
     }
 
+    /// The `if` a job must carry so it skips on a closed PR, and whether the job
+    /// is a matrix lane (and so must also read its matrix through `MATRIX_EXPR`).
+    struct PinnedIf {
+        job: &'static str,
+        condition: String,
+        matrix_lane: bool,
+    }
+
     /// How every matrix lane must read its matrix: the placeholder only when
     /// `changes` was skipped (a closed PR), the real output otherwise.
     const MATRIX_EXPR: &str = "fromJSON(needs.changes.result == 'skipped' && '[\"current\"]' \
@@ -7512,33 +7520,38 @@ jobs:
                  && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
             )
         };
-        let expected: Vec<(&str, String, bool)> = vec![
-            (
+        let lane = |job, extra: &str, platform: &str| PinnedIf {
+            job,
+            condition: lane_if(extra, platform),
+            matrix_lane: true,
+        };
+        let expected = vec![
+            lane(
                 "e2e-gpu",
-                lane_if("github.event_name != 'merge_group' && ", "app-dev-gpu"),
-                true,
+                "github.event_name != 'merge_group' && ",
+                "app-dev-gpu",
             ),
-            ("e2e-gpu-strix-ubuntu", lane_if("", "strix-ubuntu"), true),
-            ("e2e-gpu-strix-windows", lane_if("", "strix-windows"), true),
-            ("e2e-wsl", lane_if("", "strix-wsl"), true),
-            ("e2e-gpu-w7900", lane_if("", "w7900"), true),
+            lane("e2e-gpu-strix-ubuntu", "", "strix-ubuntu"),
+            lane("e2e-gpu-strix-windows", "", "strix-windows"),
+            lane("e2e-wsl", "", "strix-wsl"),
+            lane("e2e-gpu-w7900", "", "w7900"),
             // Skips because the `serve` output of a skipped `changes` is empty.
-            (
-                "e2e-report",
-                "always() && (needs.changes.outputs.serve == 'true' \
-                 || github.event_name == 'workflow_dispatch')"
+            PinnedIf {
+                job: "e2e-report",
+                condition: "always() && (needs.changes.outputs.serve == 'true' \
+                            || github.event_name == 'workflow_dispatch')"
                     .to_owned(),
-                false,
-            ),
+                matrix_lane: false,
+            },
         ];
         let ids = job_ids(&sh);
         for id in ids
             .iter()
             .filter(|id| !["changes", "pr-closed"].contains(&id.as_str()))
         {
-            let (_, want, matrix) = expected
+            let pinned = expected
                 .iter()
-                .find(|(name, _, _)| name == id)
+                .find(|pinned| pinned.job == id)
                 .unwrap_or_else(|| {
                     panic!(
                         "job `{id}` has no pinned `if`: add it, deciding how it behaves on `closed`"
@@ -7546,13 +7559,13 @@ jobs:
                 });
             let block = uncommented_job_block(&sh, id);
             assert_eq!(
-                &job_level_if(&block),
-                want,
+                job_level_if(&block),
+                pinned.condition,
                 "job `{id}` must skip when `changes` is skipped (a closed PR)"
             );
             // Only a job pinned as a matrix lane reads the matrix, so a future
             // non-matrix helper is not forced to carry it.
-            if *matrix {
+            if pinned.matrix_lane {
                 // `changes` is skipped on `closed`, so its matrix output is empty.
                 // The placeholder applies only then (`&&` yields the string when
                 // the result is `skipped`, else `false`, so `||` falls through to
@@ -7570,10 +7583,11 @@ jobs:
                 );
             }
         }
-        for (name, _, _) in &expected {
+        for pinned in &expected {
             assert!(
-                ids.iter().any(|id| id == name),
-                "pinned job `{name}` is gone"
+                ids.iter().any(|id| id == pinned.job),
+                "pinned job `{}` is gone",
+                pinned.job
             );
         }
     }

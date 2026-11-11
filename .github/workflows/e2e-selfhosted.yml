@@ -100,7 +100,9 @@ jobs:
   # forced true, matching ci.yml.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
-    # Skipped on `closed`: every lane gates on `needs.changes.result == 'success'`.
+    # Skipped on `closed`, and with it every lane and `e2e-report`: the lanes gate
+    # on `needs.changes.result == 'success'`, the report on
+    # `needs.changes.outputs.serve`, which is empty for a skipped job.
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     permissions:
       contents: read
