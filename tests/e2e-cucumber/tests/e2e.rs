@@ -46,6 +46,7 @@ mod e2e {
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
+    pub mod symptom_file_steps;
     pub mod therock_steps;
     pub mod tui_driver;
     pub mod uninstall_steps;
@@ -201,6 +202,14 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The pasted error a diagnose-59 or diagnose-60 scenario hands to
+    /// `rocm diagnose --symptom-file`. Its own field for the reason
+    /// `skill_symptom` is.
+    pub symptom_paste: Option<String>,
+    /// The `rocm diagnose --symptom-file` runs a diagnose-59 to diagnose-61
+    /// scenario made: one per shell that piped a paste, or one per file the
+    /// CLI was pointed at.
+    pub symptom_file_runs: Vec<e2e::symptom_file_steps::SymptomFileRun>,
     /// The background helper (`rocm daemon`) a scenario saw running, captured
     /// while it was known live, so `Drop` can stop it by a verified identity if
     /// an earlier step failed before the scenario disabled the watcher.
@@ -391,6 +400,8 @@ impl Default for E2eWorld {
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            symptom_paste: None,
+            symptom_file_runs: Vec::new(),
             helper_identity: None,
             recorded_process: None,
             recorded_descendant: None,
