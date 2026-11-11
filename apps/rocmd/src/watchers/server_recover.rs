@@ -841,6 +841,59 @@ mod tests {
         Ok(())
     }
 
+    /// What ROCMAI-541's crash verdict actually leaves behind, pinned here
+    /// because it decides whether `rocmd` respawns a crashed engine.
+    ///
+    /// The launch and restart readiness paths, and the attached `ServerExited`
+    /// arm, stamp the manifest `failed` with no stop marker when the child died
+    /// — the ticket asks for exactly that, so a crash is visible rather than
+    /// silently `stopped`. The consequence is that such a record **is** a
+    /// recovery candidate: `mark_launch_abandoned()` is what takes a record out
+    /// of recovery, and a crash verdict deliberately does not call it.
+    ///
+    /// So a repeatedly-crashing engine is repeatedly restarted by the recovery
+    /// watcher, bounded by whatever `rocmd`'s automation mode allows. That is
+    /// the intended reading of "a crashed service should come back", but it is
+    /// a behaviour worth failing loudly on if it ever changes by accident,
+    /// which is what this test is for.
+    #[test]
+    fn a_crash_verdict_record_is_a_recovery_candidate() -> Result<()> {
+        let (root, paths) = temp_app_paths("recoverable-crash-verdict");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-crashed",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        // Exactly what `finalize_managed_launch_readiness` and
+        // `record_restart_readiness` leave: `failed`, and no stop marker,
+        // because a stop was ruled out before the stamp.
+        record.engine_pid = Some(UNCONFIRMED_STOP_PID);
+        record.status = "failed".to_owned();
+        record.stop_requested_unix_ms = None;
+        record.write()?;
+
+        let found = find_recoverable_service(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            found.map(|(record, _)| record.service_id).as_deref(),
+            Some("svc-crashed"),
+            "a crash verdict leaves a record recovery WILL pick up; if this ever \
+             changes, the crash-report path and rocmd recovery have diverged"
+        );
+        Ok(())
+    }
+
     #[test]
     fn find_recoverable_service_detects_stale_starting_manifest() -> Result<()> {
         let (root, paths) = temp_app_paths("recoverable-stale-starting");
