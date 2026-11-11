@@ -459,8 +459,8 @@ mod tests {
     use super::*;
     use crate::persistence::load_service_record;
     use crate::test_support::{
-        assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
-        temp_app_paths,
+        RecipeIndexEnv, assert_unconfirmed_stop_kept_the_service, seed_keyed_service,
+        stop_with_outcome, temp_app_paths,
     };
     use rocm_core::ManagedServiceRecord;
     #[cfg(target_os = "linux")]
@@ -933,6 +933,9 @@ mod tests {
     #[test]
     fn sandbox_prefetch_unknown_artifact_ref_errors() {
         let (root, paths) = temp_app_paths("sandbox-prefetch-unknown-ref");
+        // The registry is read from the process environment, which the dispatch
+        // test below sets, so resolve against the built-in catalog under the guard.
+        let _env = RecipeIndexEnv::builtin_catalog();
         let error = run_sandbox_tool(
             &paths,
             SandboxToolArg::PrefetchArtifact,
@@ -946,43 +949,6 @@ mod tests {
 
         assert!(error.to_string().contains("was not found"), "{error:#}");
     }
-
-    /// Sets the signed recipe-index environment for the lifetime of the guard.
-    /// The environment is process-wide, so callers hold `RECIPE_INDEX_ENV_LOCK`
-    /// for as long as the guard lives.
-    struct RecipeIndexEnv {
-        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl RecipeIndexEnv {
-        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
-        fn set(vars: &[(&'static str, &std::path::Path)]) -> Self {
-            let previous = vars
-                .iter()
-                .map(|(key, _)| (*key, std::env::var_os(key)))
-                .collect();
-            for (key, value) in vars {
-                unsafe { std::env::set_var(key, value) };
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for RecipeIndexEnv {
-        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
-        fn drop(&mut self) {
-            for (key, value) in &self.previous {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
-
-    static RECIPE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Drives `prefetch_artifact` through `run_sandbox_tool` with an artifact
     /// reference that the recipe registry resolves (the built-in catalog lists no
@@ -1042,20 +1008,7 @@ mod tests {
         fs::write(&public_key, public_pem)?;
 
         let run = |policy: SandboxToolPolicy| {
-            let _lock = RECIPE_INDEX_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _env = RecipeIndexEnv::set(&[
-                ("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.as_path()),
-                (
-                    "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH",
-                    signature.as_path(),
-                ),
-                (
-                    "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
-                    public_key.as_path(),
-                ),
-            ]);
+            let _env = RecipeIndexEnv::signed_index(&index, &signature, &public_key);
             run_sandbox_tool(
                 &paths,
                 SandboxToolArg::PrefetchArtifact,
