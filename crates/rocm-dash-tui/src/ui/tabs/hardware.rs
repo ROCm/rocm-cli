@@ -849,6 +849,16 @@ mod tests {
     }
 
     #[test]
+    fn a_half_narrower_than_the_minimum_graph_width_stacks() {
+        // The other boundary in the gate. Width 70 leaves exactly MIN_GRAPH_W
+        // a side, so it splits; one column less does not. Without this a
+        // `>=` -> `>` slip here would pass.
+        assert_eq!((70_u16 / 2).saturating_sub(PANEL_CHROME_W), MIN_GRAPH_W);
+        assert!(cpu_fits_side_by_side(Rect::new(0, 0, 70, 10), 4));
+        assert!(!cpu_fits_side_by_side(Rect::new(0, 0, 69, 10), 4));
+    }
+
+    #[test]
     fn side_by_side_needs_two_columns_per_core_not_one() {
         // 48 cores in 170 columns: each half has 80 inner columns, enough for
         // one column per core but not for the gutters between them, so the

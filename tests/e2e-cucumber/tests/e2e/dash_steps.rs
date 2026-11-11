@@ -247,9 +247,18 @@ async fn cpu_graph_is_continuous(world: &mut E2eWorld) {
 async fn cpu_box_reports_core_count(world: &mut E2eWorld) {
     // Observe's CPU slot is too short for the per-core box, so the count has
     // to come from the overall box's own title.
-    let expected = format!("· {IDLE_CORES} cores");
+    //
+    // Matching `· N cores` alone would prove nothing: it is a suffix of the
+    // per-core box's own title too, so the step would pass whether or not the
+    // count was folded. Assert the whole folded title, and that the box it
+    // would otherwise have come from is absent.
+    let folded = format!("CPU · 2.0% · {IDLE_CORES} cores");
     session(world)
-        .wait_for_screen(&expected, default_timeout())
+        .wait_for_screen_where(
+            "the CPU title carries the core count and no per-core box is drawn",
+            |screen| screen.contains(&folded) && !screen.contains("Per-core"),
+            default_timeout(),
+        )
         .await
         .unwrap_or_else(|e| panic!("the CPU box did not report the core count: {e}"));
 }

@@ -225,7 +225,10 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     }
     lines.push(Line::raw(""));
     lines.push(header("GPU STATE"));
-    if let Some(s) = state.latest.as_ref() {
+    // Same rule the sparkline below uses: a snapshot with no GPUs has nothing
+    // to report, and folding over an empty list would print a measured-looking
+    // "peak util 0.0%" for a host that never reported one.
+    if let Some(s) = state.latest.as_ref().filter(|s| !s.gpus.is_empty()) {
         let util = s
             .gpus
             .iter()
@@ -489,6 +492,69 @@ mod tests {
         assert_ne!(
             fg, theme.fg,
             "cancelled job line must not stay the old neutral theme.fg"
+        );
+    }
+
+    #[test]
+    fn a_gpu_less_host_reports_no_telemetry_rather_than_a_measured_zero() {
+        // Both halves of the GPU STATE section: the peak-util line and the
+        // trace under it. Folding over an empty `gpus` list yields 0, and the
+        // widget draws a baseline for every sample it is handed, so without
+        // the skip a host with no GPU reads as one idling at 0%.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot::default());
+        for _ in 0..8 {
+            s.history.push_back(Snapshot::default());
+        }
+        let backend = TestBackend::new(DOCK_W, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| context_rail(f, f.area(), &s, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(
+            out.contains("no telemetry"),
+            "a GPU-less host should report nothing: {out:?}"
+        );
+        assert!(
+            !out.contains("peak util"),
+            "a GPU-less host reported a measured peak: {out:?}"
+        );
+        // The trace under it, too: the widget draws a baseline for any sample
+        // it is handed, so an unfiltered series would paint one here.
+        assert!(
+            !out.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "a GPU-less host drew a trace: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_gpu_bearing_history_still_draws_its_trace() {
+        // The other side of the same filter: real GPU snapshots must survive
+        // it, so reverting the call site to an unfiltered fold is not the only
+        // thing this catches.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        let with_gpu = || Snapshot {
+            gpus: vec![GpuMetrics {
+                gpu_utilization_pct: 60.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        s.latest = Some(with_gpu());
+        for _ in 0..8 {
+            s.history.push_back(with_gpu());
+        }
+        let backend = TestBackend::new(DOCK_W, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| context_rail(f, f.area(), &s, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(out.contains("peak util"), "no peak util line: {out:?}");
+        assert!(
+            !out.contains("no telemetry"),
+            "a GPU-bearing host was reported as having none: {out:?}"
         );
     }
 

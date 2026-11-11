@@ -875,10 +875,10 @@ Feature: Interactive dashboard
   # instead of a graph. Any sample whose fill rounded below one braille dot row
   # was dropped, which on an idle machine is nearly every sample. The widget
   # tests pin the dot maths; this scenario pins what the user sees, since the
-  # regression was only ever visible as a picture. A recording supplies the idle
-  # host the demo generator never produces: it oscillates around 28%, far above
-  # the rounding that caused the bug, where the recording reports 2% overall and
-  # 1% per core. Sixty entries two seconds apart outlast the scenario, the
+  # regression was only ever visible as a picture. The recording reports 2%
+  # overall and 1% per core, the idle host the demo generator never produces:
+  # that generator oscillates around 28%, far above the rounding that caused
+  # the bug. Sixty entries two seconds apart outlast the scenario, the
   # recording technique dash-39 introduced.
   #
   # Observe gives its CPU slot about four rows, too few for the separate

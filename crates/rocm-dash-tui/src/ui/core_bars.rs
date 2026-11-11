@@ -136,7 +136,9 @@ impl Widget for CoreBars<'_> {
 
 /// Cores `[lo, hi)` sharing column `cx` when cores outnumber columns.
 ///
-/// The groups tile `0..n`, so every core lands in exactly one column.
+/// The groups tile `0..n`, so every core lands in exactly one column. The
+/// `lo + 1` arm is defensive rather than reachable: `render` only calls this
+/// with `n > width`, where `n / width >= 1` makes every group non-empty.
 const fn core_group(cx: usize, n: usize, width: usize) -> (usize, usize) {
     let lo = cx * n / width;
     let hi = (cx + 1) * n / width;
@@ -345,6 +347,36 @@ mod tests {
         // Columns whose cores are all idle still read as a baseline.
         assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "\u{28c0}");
         assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "\u{28c0}");
+    }
+
+    #[test]
+    fn a_group_draws_its_busiest_core_not_the_sum_of_them() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        // Two unequal non-zero cores in one group. Every other test leaves a
+        // single non-zero value per group, where the sum and the max agree, so
+        // a `max` -> `sum` slip would draw the same thing and go unnoticed.
+        // 30 + 40 would saturate the bar; the busiest of them must not.
+        let mut values = [0.0_f32; 8];
+        values[0] = 30.0;
+        values[1] = 40.0;
+        assert_eq!(core_group(0, 8, 4), (0, 2), "group shape changed");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        CoreBars::new(&values).max(100.0).render(buf.area, &mut buf);
+        // Over 4 cell rows the bar has 16 dot rows. The busiest core, 40%,
+        // lights 6 of them and so reaches cell row 2 but not row 1; their sum,
+        // 70%, lights 11 and would reach row 1. Row 0 stays blank either way,
+        // which is why it cannot be the assertion.
+        assert_eq!(
+            buf.cell((0, 1)).unwrap().symbol(),
+            " ",
+            "the group drew the sum of its cores, not the busiest"
+        );
+        assert_ne!(
+            buf.cell((0, 2)).unwrap().symbol(),
+            " ",
+            "the group did not draw its busiest core"
+        );
     }
 
     #[test]
