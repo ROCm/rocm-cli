@@ -112,6 +112,17 @@ impl ExamineSummary {
             // none. Unlike `Unknown` below, there is nothing left to go and find
             // out on this host, so the advice is to install a driver rather than
             // to serve a model and read back what happened.
+            // Looked at, nothing found, and nothing that could have found it.
+            // Says what was searched and how to settle it, rather than either
+            // promising a backend or declaring one absent — neither of which
+            // the evidence supports. See `GpuSupportLevel::VulkanUnconfirmed`.
+            GpuSupportLevel::VulkanUnconfirmed => format!(
+                "  rocm_support: GPU detected ({}) but not supported by ROCm; no Vulkan driver \
+                 was found either, and `vulkaninfo` is not installed to confirm that - install \
+                 `vulkaninfo` to check, or a Vulkan driver (Mesa RADV on Linux, the AMD display \
+                 driver on Windows) to run models on this GPU\n",
+                detected.unwrap_or_default()
+            ),
             GpuSupportLevel::NoGpuBackend => format!(
                 "  rocm_support: GPU detected ({}) but not supported by ROCm, and {}\n",
                 detected.unwrap_or_default(),

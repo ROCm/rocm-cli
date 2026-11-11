@@ -1087,6 +1087,13 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         // `Unknown`, because what it means is the opposite: `Unknown` promises
         // that a command can still answer, and here the question is already
         // answered and the answer is no.
+        // Looked at and inconclusive. Says the same "no ROCm/HIP" fact as the
+        // arm below, but stops short of its claim about Vulkan, because
+        // nothing here established it either way.
+        rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
+             Vulkan driver is present could not be determined - run `rocm examine`"
+        }
         rocm_core::GpuSupportLevel::NoGpuBackend => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
         }

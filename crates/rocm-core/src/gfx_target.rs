@@ -577,6 +577,22 @@ pub enum GpuSupportLevel {
     /// a host with no Vulkan driver installed, or with only a software
     /// rasteriser, was sent to a backend that cannot start.
     VulkanOnly,
+    /// Recognized, confirmed to have no ROCm/HIP build, and the Vulkan probe
+    /// could not reach an answer — no ICD manifest, no enumerated device, and
+    /// no `vulkaninfo` to ask.
+    ///
+    /// Deliberately NOT folded into [`Self::NoGpuBackend`]. That level renders
+    /// as a confirmed fact and is serialized for JSON consumers, and this state
+    /// has not earned it: on Windows the Khronos `Drivers` key is legacy and
+    /// `vulkaninfo` is rarely on PATH, so a working Adrenalin laptop — the
+    /// machine shape ROCMAI-550 was reported from — can land here. Telling it
+    /// there is no GPU backend would be a worse answer than the static claim
+    /// this change replaced.
+    ///
+    /// Nor is it [`Self::VulkanOnly`], which promises a backend that may not be
+    /// there. It is its own answer: say what was looked for, that nothing was
+    /// found, and how to settle it.
+    VulkanUnconfirmed,
     /// Recognized, confirmed to have no ROCm/HIP build, **and** no Vulkan GPU
     /// driver was found: this host has no GPU path at all.
     ///
@@ -624,10 +640,16 @@ pub fn gpu_support_level(
             // no-driver shape, since most such hosts have no `vulkaninfo`
             // either. The wording it gets is hedged rather than a confirmed
             // absence — see `render.rs`.
-            if vulkan.is_usable() || vulkan == crate::host_gpu::VulkanStatus::Unknown {
-                GpuSupportLevel::VulkanOnly
-            } else {
-                GpuSupportLevel::NoGpuBackend
+            match vulkan {
+                // A platform the probe cannot look at keeps the benefit of the
+                // doubt, as it did before any probe existed.
+                v if v.is_usable() || v == crate::host_gpu::VulkanStatus::Unknown => {
+                    GpuSupportLevel::VulkanOnly
+                }
+                // Looked at, and nothing either way. Not a confirmed absence —
+                // see `VulkanUnconfirmed`.
+                crate::host_gpu::VulkanStatus::Inconclusive => GpuSupportLevel::VulkanUnconfirmed,
+                _ => GpuSupportLevel::NoGpuBackend,
             }
         }
         _ => GpuSupportLevel::Unknown,
@@ -1151,8 +1173,11 @@ mod tests {
                 None,
                 crate::host_gpu::VulkanStatus::Inconclusive
             ),
-            GpuSupportLevel::NoGpuBackend,
-            "a host that was probed and showed nothing must not be told it runs on Vulkan"
+            GpuSupportLevel::VulkanUnconfirmed,
+            "a host probed with no answer must be told neither that Vulkan runs nor \
+             that it is absent — a Windows box with a working Adrenalin driver lands \
+             here, since the legacy Khronos key and a missing `vulkaninfo` leave no \
+             evidence to find"
         );
         assert_eq!(
             gpu_support_level(Some("gfx90c"), None, crate::host_gpu::VulkanStatus::Unknown),
