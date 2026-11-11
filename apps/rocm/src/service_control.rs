@@ -861,13 +861,21 @@ fn record_restart_readiness(
             return Ok(read_managed_service_manifest(paths, &started.service_id)
                 .map_or_else(|_| started.clone(), |(record, _)| record));
         }
-        let _ = update_restarting_record(paths, started, |current| {
+        // Gated on the manifest write having landed, exactly as the early-exit
+        // branch above is: `update_restarting_record`'s CAS returns `None` when
+        // a newer stop or restart owns the record, and
+        // `refresh_from_engine_state` reads the engine state file straight back
+        // into the manifest — so stamping it unconditionally would round-trip
+        // the clobber the CAS just refused.
+        let recorded_failed = update_restarting_record(paths, started, |current| {
             current.status = "failed".to_owned();
         })?;
-        let _ = rocm_core::merge_json_state_file(
-            &started.engine_state_path,
-            &serde_json::json!({ "status": "failed" }),
-        );
+        if recorded_failed.is_some() {
+            let _ = rocm_core::merge_json_state_file(
+                &started.engine_state_path,
+                &serde_json::json!({ "status": "failed" }),
+            );
+        }
         bail!(
             "{}",
             crate::service_launch::managed_engine_exit_failure_detail(

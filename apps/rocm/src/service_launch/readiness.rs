@@ -471,11 +471,6 @@ pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &
 /// stop cleared it (`stop_internal_managed_service_confirmed_with`): anything
 /// still set has been written since this restart began, so it belongs to a
 /// *new* stop racing the restart rather than to the one the restart performed.
-/// `cfg(not(windows))` to match its only caller: the restart's early-exit
-/// branch is Unix-only, because the Windows restart has no `try_wait()` of its
-/// own to land in — it sleeps the same 200ms and goes straight to recording the
-/// child.
-#[cfg(not(windows))]
 pub(crate) fn managed_service_stop_marker_present(paths: &AppPaths, service_id: &str) -> bool {
     crate::services_text::read_managed_service_manifest(paths, service_id)
         .is_ok_and(|(record, _)| record.stop_requested_unix_ms.is_some())
@@ -515,7 +510,15 @@ impl StopWatch {
     /// once latched.
     pub(crate) fn sample(&mut self, paths: &AppPaths, service_id: &str) {
         if !self.seen {
-            self.seen = managed_service_stop_was_requested(paths, service_id);
+            // The MARKER alone, never `managed_service_stop_was_requested`: its
+            // `status == "stopped"` term is what liveness reconciliation
+            // (`rocmd`, `dash`, `rocm services`) writes for a *crashed* server,
+            // so latching on it would turn a crash reconciled mid-wait into a
+            // clean stop and exit 0 — the original bug. The marker is only ever
+            // written by a stop, which is what makes this latch sound and the
+            // type's doc above true. The status term still backs the one-shot
+            // check at the end of a wait, where no latch is available.
+            self.seen = managed_service_stop_marker_present(paths, service_id);
         }
     }
 
@@ -880,6 +883,81 @@ mod tests {
     /// during the 45s launch readiness wait must not be reported as a crash —
     /// no `failed` status, no non-zero exit — and the in-memory `record` must
     /// come back refreshed from disk so a caller's own follow-up write cannot
+    /// The `stop_seen_while_waiting` latch, which nothing else exercised:
+    /// every other caller test passes `false`, so deleting the latch left the
+    /// whole suite green.
+    ///
+    /// The case it exists for is a stop that both begins and finishes inside
+    /// the readiness wait. `stop_internal_managed_service_confirmed_with`
+    /// clears its own marker once it confirms, so by the time the one-shot
+    /// check runs there is nothing left on disk to find — only the latch,
+    /// sampled while the marker was briefly up, still knows. Here the manifest
+    /// is deliberately left with NO marker and a non-`stopped` status, so the
+    /// point check cannot answer and the latch is the only thing that can.
+    #[test]
+    fn finalize_managed_launch_readiness_trusts_the_latch_after_the_marker_is_cleared() -> Result<()>
+    {
+        let (root, paths) = test_paths("finalize-readiness-latched-stop");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-latched-stop",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11534,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write()?;
+
+        // What `StopWatch` would have latched: sample while the marker is up,
+        // then let the confirmed stop clear it again, as production does.
+        let mut watch = StopWatch::default();
+        let mut marked = record.clone();
+        marked.stop_requested_unix_ms = Some(4_242);
+        marked.write()?;
+        watch.sample(&paths, "svc-latched-stop");
+        marked.stop_requested_unix_ms = None;
+        marked.write()?;
+        assert!(
+            watch.stop_was_requested(),
+            "the watch must latch a marker it saw, and keep it after the clear"
+        );
+        assert!(
+            !managed_service_stop_was_requested(&paths, "svc-latched-stop"),
+            "the one-shot check must be blind here, or this test would pass \
+             without the latch"
+        );
+
+        let proceed = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            watch.stop_was_requested(),
+        )?;
+
+        let (on_disk, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-latched-stop")?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !proceed,
+            "a latched stop must tell the caller to skip its own follow-up write"
+        );
+        assert_ne!(
+            on_disk.status, "failed",
+            "a stop the latch saw must not be recorded as a crash"
+        );
+        Ok(())
+    }
+
     /// clobber the stop marker the stop itself just wrote.
     #[test]
     fn finalize_managed_launch_readiness_treats_a_requested_stop_as_clean() -> Result<()> {

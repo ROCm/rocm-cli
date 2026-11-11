@@ -459,6 +459,20 @@ fn record_engine_serve_http_failure(
 /// stamp proceeds, because failing to prove a stop must never swallow a crash
 /// report.
 fn engine_stop_was_deliberate(service_id: &str, state_path: &Path) -> bool {
+    engine_stop_was_deliberate_in(AppPaths::discover().ok().as_ref(), service_id, state_path)
+}
+
+/// [`engine_stop_was_deliberate`] with the paths injected.
+///
+/// Split so a test can plant the manifest marker under an isolated root: the
+/// production entry point resolves `AppPaths::discover()`, which reads the real
+/// environment, so a test calling it would answer from the developer's own
+/// services directory rather than its fixture.
+fn engine_stop_was_deliberate_in(
+    paths: Option<&AppPaths>,
+    service_id: &str,
+    state_path: &Path,
+) -> bool {
     let engine_status = fs::read(state_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -471,8 +485,8 @@ fn engine_stop_was_deliberate(service_id: &str, state_path: &Path) -> bool {
     if matches!(engine_status.as_deref(), Some("stopping" | "stopped")) {
         return true;
     }
-    AppPaths::discover().is_ok_and(|paths| {
-        ManagedServiceRecord::read_manifest(&paths, service_id)
+    paths.is_some_and(|paths| {
+        ManagedServiceRecord::read_manifest(paths, service_id)
             .is_ok_and(|record| record.stop_requested_unix_ms.is_some())
     })
 }
@@ -597,22 +611,49 @@ mod tests {
     /// `Err`. This is the guard that keeps the stamp from agreeing with them.
     #[test]
     fn a_deliberate_stop_is_not_stamped_failed_by_the_backstop() {
-        let (root, _paths) = test_paths("engine-ipc-deliberate-stop");
+        let (root, paths) = test_paths("engine-ipc-deliberate-stop");
         let state_path = root.join("engine-state.json");
         fs::create_dir_all(&root).unwrap();
 
         // What `aim`'s `stop_service` writes before it kills the container.
         fs::write(&state_path, br#"{"status":"stopping"}"#).unwrap();
         assert!(
-            engine_stop_was_deliberate("svc-stopping", &state_path),
+            engine_stop_was_deliberate_in(Some(&paths), "svc-stopping", &state_path),
             "a `stopping` engine state is an operator stop, not a crash"
         );
 
         fs::write(&state_path, br#"{"status":"running"}"#).unwrap();
         assert!(
-            !engine_stop_was_deliberate("svc-no-such-service", &state_path),
+            !engine_stop_was_deliberate_in(Some(&paths), "svc-no-such-service", &state_path),
             "a running engine with no stop recorded anywhere must still be \
              reported as a crash — failing to prove a stop must never swallow one"
+        );
+
+        // The manifest-marker branch, which is the one `lemonade` and `vllm`
+        // actually rely on: their engine state never says `stopping`, so the
+        // only trace of an operator stop is `stop_requested_unix_ms` on the
+        // record. Planted under the isolated root, not the real environment.
+        paths.ensure().unwrap();
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-marked-stopping",
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            11_500,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.stop_requested_unix_ms = Some(1_234);
+        record.write().unwrap();
+        assert!(
+            engine_stop_was_deliberate_in(Some(&paths), "svc-marked-stopping", &state_path),
+            "a stop marker on the manifest is an operator stop even when the \
+             engine state file says nothing about it"
         );
 
         let _ = fs::remove_dir_all(root);
