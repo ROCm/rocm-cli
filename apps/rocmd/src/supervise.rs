@@ -192,6 +192,13 @@ fn supervise_service_on(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
+    // Until the child is waited for, leaving this function any other way — an
+    // error from a record write below, or a panic — terminates and reaps it.
+    // `Child` itself does not kill on drop, and an engine left running here
+    // would hold the GPU under a record that may not even name it.
+    let mut engine_child = EngineChild::new(&mut child);
+    #[cfg(test)]
+    tests::engine_spawned(paths, &record.service_id, engine_child.pid());
 
     // Every write from here on goes through `update_supervised_record`: it
     // applies only this supervisor's own fields to the record as it is on disk
@@ -200,7 +207,7 @@ fn supervise_service_on(
     //
     // Captured while the child is known alive, so a later stop verifies this
     // exact process instead of whatever has since inherited its PID.
-    let engine_pid = child.id();
+    let engine_pid = engine_child.pid();
     update_supervised_record(paths, &record, |current| {
         current.record_engine_identity(engine_pid);
         current.status = "running".to_owned();
@@ -227,7 +234,9 @@ fn supervise_service_on(
         })?;
     }
 
-    let exit_status = child.wait().context("failed waiting for engine child")?;
+    let exit_status = engine_child
+        .wait()
+        .context("failed waiting for engine child")?;
     record_supervised_exit(paths, &record, exit_status.success())?;
 
     if exit_status.success() {
@@ -763,9 +772,97 @@ fn fail_recovery(
     error
 }
 
-/// Grace given to a recovery supervisor that must be terminated because its
-/// record could not be published. Short: it is milliseconds old.
+/// Grace given to a child this daemon spawned and now has to terminate: a
+/// recovery supervisor whose record could not be published, or an engine whose
+/// supervisor is leaving before it waited for it. Short: neither has anything
+/// to flush that outweighs freeing the port and the GPU.
 const RECOVERY_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Terminate `child`, which this process spawned and has not reaped, and its
+/// descendants, then reap it.
+///
+/// Through [`rocm_core::terminate_recorded_pid_within`], the routine `rocm
+/// services stop` uses: on Windows it takes the processes under the child down
+/// with a separate tree kill first, where a kill through
+/// [`rocm_core::terminate_verified`] alone reaches only the child itself — and
+/// both callers' children run their real work one level below.
+///
+/// The reap blocks only once the child is known gone. When the termination
+/// reports it still alive or unverifiable, a blocking `wait` could hang the
+/// caller for good, so the child is reaped only if it has already exited.
+fn terminate_and_reap(
+    child: &mut std::process::Child,
+    identity: &rocm_core::ProcessIdentity,
+) -> rocm_core::TerminationOutcome {
+    let outcome = rocm_core::terminate_recorded_pid_within(identity, RECOVERY_CLEANUP_GRACE);
+    if matches!(
+        outcome,
+        rocm_core::TerminationOutcome::TimedOut | rocm_core::TerminationOutcome::Unverified
+    ) {
+        let _ = child.try_wait();
+    } else {
+        let _ = child.wait();
+    }
+    outcome
+}
+
+// Test-only, thread-scoped count of the engine children `EngineChild` had to
+// terminate, so a test can tell a guard that was waited for from one that
+// signalled a child which had already exited.
+#[cfg(test)]
+thread_local! {
+    static ENGINE_CHILD_TERMINATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The engine child of [`supervise_service`], terminated and reaped if the
+/// supervisor stops supervising it before it waited for it.
+///
+/// Every return between the spawn and the wait — a record write that fails, a
+/// wait that errors — and a panic would otherwise leave the engine running
+/// with no supervisor, reparented to init and holding the GPU. When the failed
+/// write was the one recording the engine's PID, the record does not name it
+/// either, so `rocm services stop` has nothing to stop and reports success.
+struct EngineChild<'a> {
+    child: &'a mut std::process::Child,
+    /// Captured right after the spawn, while the child is certainly alive.
+    identity: rocm_core::ProcessIdentity,
+    waited: bool,
+}
+
+impl<'a> EngineChild<'a> {
+    fn new(child: &'a mut std::process::Child) -> Self {
+        let identity = rocm_core::ProcessIdentity::capture(child.id());
+        Self {
+            child,
+            identity,
+            waited: false,
+        }
+    }
+
+    const fn pid(&self) -> u32 {
+        self.identity.pid
+    }
+
+    /// Wait for the engine to exit. Only a wait that returns its exit status
+    /// disarms the guard: after a failed one, nothing says the engine is gone.
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.waited = true;
+        Ok(status)
+    }
+}
+
+impl Drop for EngineChild<'_> {
+    fn drop(&mut self) {
+        if self.waited {
+            return;
+        }
+        #[cfg(test)]
+        ENGINE_CHILD_TERMINATIONS.with(|calls| calls.set(calls.get() + 1));
+        let _outcome = terminate_and_reap(self.child, &self.identity);
+    }
+}
 
 // Test-only, thread-scoped call counter: `restart_managed_service`'s rollback
 // branch asserts this to prove the kill is actually reached (not just that the
@@ -783,20 +880,15 @@ thread_local! {
 
 /// Terminate and reap a recovery supervisor that could not be recorded.
 ///
-/// Tree scope, forced: the supervisor may already have started an engine child,
-/// and leaving either alive would keep the recorded port occupied by a process
-/// no stop or recovery path can find. Reaping afterwards keeps the daemon free
-/// of zombies.
+/// Tree scope, forced, through [`terminate_and_reap`]: the supervisor may
+/// already have started an engine child, and leaving either alive would keep
+/// the recorded port occupied by a process no stop or recovery path can find.
+/// Reaping afterwards keeps the daemon free of zombies.
 fn terminate_recovery_supervisor(child: &mut std::process::Child) {
     #[cfg(test)]
     TERMINATE_RECOVERY_SUPERVISOR_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let _outcome = rocm_core::terminate_verified(
-        &rocm_core::ProcessIdentity::capture(child.id()),
-        rocm_core::KillScope::Tree,
-        RECOVERY_CLEANUP_GRACE,
-        true,
-    );
-    let _ = child.wait();
+    let identity = rocm_core::ProcessIdentity::capture(child.id());
+    let _outcome = terminate_and_reap(child, &identity);
 }
 
 /// Between the restart's first write — which clears the recorded PIDs, since
@@ -2408,29 +2500,78 @@ mod tests {
         Ok(())
     }
 
+    /// A test that sleeps for two minutes when spawned by [`spawn_sleeper_child`]
+    /// and does nothing otherwise.
+    ///
+    /// It writes the marker file named in `ROCMD_TEST_SLEEPER_CHILD` before it
+    /// sleeps, and the spawner waits for that marker: a filter that no longer
+    /// names this test runs zero tests and exits at once, which a kill test would
+    /// otherwise read as a kill. That happened once already, when this test moved
+    /// modules and the hard-coded filter kept the old path.
     #[test]
-    #[ignore = "spawned as a child process by terminate_recovery_supervisor_kills_and_reaps_the_child"]
+    #[ignore = "spawned as a child process by spawn_sleeper_child"]
     fn recovery_cleanup_sleeper_child() {
-        if std::env::var_os("ROCMD_TEST_SLEEPER_CHILD").is_none() {
+        let Some(marker) = std::env::var_os("ROCMD_TEST_SLEEPER_CHILD") else {
             return;
-        }
+        };
+        fs::write(marker, b"sleeping").expect("write the sleeper's marker");
         thread::sleep(Duration::from_mins(2));
+    }
+
+    /// The libtest filter naming [`recovery_cleanup_sleeper_child`], derived from
+    /// this module's own path so it cannot drift from the test's location again.
+    /// libtest names tests without the crate, so the crate segment is dropped.
+    fn sleeper_child_test_name() -> String {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_crate, module)| module);
+        format!("{module}::recovery_cleanup_sleeper_child")
+    }
+
+    /// Spawn this test binary running [`recovery_cleanup_sleeper_child`], and
+    /// return once it is provably sleeping, so terminating it quickly can only be
+    /// the work of a kill.
+    fn spawn_sleeper_child(label: &str) -> std::process::Child {
+        let root = unique_test_root(&format!("rocmd-sleeper-{label}-{}", std::process::id()));
+        let marker = root.join("sleeping");
+        fs::remove_file(&marker).ok();
+        let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg(sleeper_child_test_name())
+            .arg("--exact")
+            .arg("--ignored")
+            .env("ROCMD_TEST_SLEEPER_CHILD", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                fs::remove_dir_all(&root).ok();
+                panic!(
+                    "the sleeper exited ({status}) before it started sleeping: the filter {:?} \
+                     does not name it",
+                    sleeper_child_test_name()
+                );
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                fs::remove_dir_all(&root).ok();
+                panic!("the sleeper did not start sleeping within 30s");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_dir_all(&root).ok();
+        child
     }
 
     #[test]
     fn terminate_recovery_supervisor_kills_and_reaps_the_child() {
         // A real long-lived process stands in for a supervisor that was spawned
         // but whose record could not be published.
-        let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
-            .arg("watchers::tests::recovery_cleanup_sleeper_child")
-            .arg("--exact")
-            .arg("--ignored")
-            .env("ROCMD_TEST_SLEEPER_CHILD", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleeper child");
+        let mut child = spawn_sleeper_child("recovery-supervisor");
         let child_pid = child.id();
 
         let started = std::time::Instant::now();
@@ -2451,6 +2592,302 @@ mod tests {
         // The helper already reaped it; wait again so the child is provably
         // handled on every path in this function (and reaping is idempotent).
         assert!(child.wait().is_ok());
+    }
+
+    /// A supervisor that leaves before waiting for its engine — an error between
+    /// the spawn and the wait, or a panic — drops the guard, and the engine must
+    /// go with it: terminated, and reaped rather than left a zombie.
+    #[test]
+    fn an_engine_child_dropped_before_its_wait_is_terminated_and_reaped() {
+        let mut child = spawn_sleeper_child("engine-child-drop");
+        let child_pid = child.id();
+        let terminations_before = ENGINE_CHILD_TERMINATIONS.with(std::cell::Cell::get);
+
+        let started = std::time::Instant::now();
+        drop(EngineChild::new(&mut child));
+        let elapsed = started.elapsed();
+        let still_running = rocm_core::process_is_running(child_pid);
+        if still_running {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+
+        assert_eq!(
+            ENGINE_CHILD_TERMINATIONS.with(std::cell::Cell::get),
+            terminations_before + 1,
+            "an engine that was never waited for must be terminated when its guard drops"
+        );
+        // The sleeper sleeps for two minutes by itself.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "dropping the guard took {elapsed:?}: the engine was waited out, not killed"
+        );
+        assert!(
+            !still_running,
+            "the engine must be terminated and reaped when its guard drops unwaited"
+        );
+    }
+
+    /// The other side: an engine the supervisor waited for has exited and been
+    /// reaped, so dropping its guard signals nothing — its PID may already belong
+    /// to someone else.
+    #[test]
+    fn an_engine_child_that_was_waited_for_is_not_signalled_on_drop() {
+        // The test binary with a filter matching no test exits at once, cleanly.
+        let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("no-test-has-this-name")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let terminations_before = ENGINE_CHILD_TERMINATIONS.with(std::cell::Cell::get);
+
+        let mut engine = EngineChild::new(&mut child);
+        let status = engine.wait().expect("wait for the child");
+        drop(engine);
+
+        assert!(status.success(), "the child exits cleanly: {status}");
+        assert_eq!(
+            ENGINE_CHILD_TERMINATIONS.with(std::cell::Cell::get),
+            terminations_before,
+            "a waited-for engine must not be signalled when its guard drops"
+        );
+    }
+
+    /// What [`engine_spawned`] does for one registered service. Only the Linux
+    /// tests register one; elsewhere the seam is compiled but never armed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    struct EngineSpawnSeam {
+        service_id: String,
+        /// Overwrite the service's manifest with something that does not parse,
+        /// so the supervisor's next record write fails.
+        corrupt_manifest: bool,
+        /// The engine PID the supervisor reported, once it spawned one.
+        engine_pid: Option<u32>,
+    }
+
+    /// Services [`engine_spawned`] acts for. Keyed by service id, so a test
+    /// running in parallel with an unregistered service is unaffected.
+    static ENGINE_SPAWN_SEAMS: std::sync::Mutex<Vec<EngineSpawnSeam>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Test seam run by `supervise_service_on` right after the engine spawn, before
+    /// the write that records the engine's PID. For a service registered in
+    /// [`ENGINE_SPAWN_SEAMS`] it remembers the engine PID — which the record may
+    /// never name — and can corrupt the manifest so that write fails. A corrupt
+    /// manifest fails the write as root too, which a read-only directory does not.
+    pub(super) fn engine_spawned(paths: &AppPaths, service_id: &str, engine_pid: u32) {
+        let mut seams = ENGINE_SPAWN_SEAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(seam) = seams.iter_mut().find(|seam| seam.service_id == service_id) {
+            seam.engine_pid = Some(engine_pid);
+            if seam.corrupt_manifest {
+                fs::write(
+                    paths.service_manifest_path(service_id),
+                    b"not a service record",
+                )
+                .expect("corrupt the service manifest");
+            }
+        }
+    }
+
+    /// Register `service_id` with [`engine_spawned`]; read what it saw back with
+    /// [`take_engine_spawn_seam`].
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn register_engine_spawn_seam(service_id: &str, corrupt_manifest: bool) {
+        ENGINE_SPAWN_SEAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(EngineSpawnSeam {
+                service_id: service_id.to_owned(),
+                corrupt_manifest,
+                engine_pid: None,
+            });
+    }
+
+    /// Unregister `service_id`, returning the engine PID [`engine_spawned`] saw.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn take_engine_spawn_seam(service_id: &str) -> Option<u32> {
+        let mut seams = ENGINE_SPAWN_SEAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = seams
+            .iter()
+            .position(|seam| seam.service_id == service_id)?;
+        seams.remove(index).engine_pid
+    }
+
+    /// Run `supervise_service_on` with the `rocm` at `root/rocm` beside a
+    /// `rocmd` that is not there, bounded so a supervisor that keeps supervising
+    /// fails the test instead of hanging it.
+    #[cfg(target_os = "linux")]
+    fn supervise_on_stand_in_rocm(
+        root: &Path,
+        paths: &AppPaths,
+        service_id: &'static str,
+        port: u16,
+    ) -> std::result::Result<(), String> {
+        let mut outcome = Err("not attempted".to_owned());
+        for _ in 0..10 {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let (paths, daemon_host) = (paths.clone(), DaemonHost::new(root.join("rocmd"), false));
+            thread::spawn(move || {
+                let outcome = supervise_service_on(
+                    &daemon_host,
+                    &paths,
+                    service_id.to_owned(),
+                    "llamacpp".to_owned(),
+                    "a-model".to_owned(),
+                    "a-model".to_owned(),
+                    None,
+                    None,
+                    "127.0.0.1".to_owned(),
+                    port,
+                    "gpu_required".to_owned(),
+                    None,
+                    None,
+                );
+                let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
+            });
+            outcome = receiver
+                .recv_timeout(Duration::from_mins(1))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the supervisor did not return: a failed record write left it \
+                         supervising its engine instead of terminating it"
+                    )
+                });
+            // The first exec of a new file can lose a race with an unrelated
+            // fork (ETXTBSY): the spawn fails at once, and the next attempt
+            // starts again.
+            if !matches!(&outcome, Err(error) if error.contains("Text file busy")) {
+                break;
+            }
+        }
+        outcome
+    }
+
+    /// Whether `pid` is still running; if it is, it is killed, so a failing test
+    /// does not leave a two-minute sleeper behind.
+    #[cfg(target_os = "linux")]
+    fn running_then_killed(pid: Option<u32>) -> bool {
+        let Some(pid) = pid else { return false };
+        let running = rocm_core::process_is_running(pid);
+        if running {
+            let _ = rocm_core::terminate_verified(
+                &rocm_core::ProcessIdentity::capture(pid),
+                rocm_core::KillScope::Single,
+                Duration::from_secs(1),
+                true,
+            );
+        }
+        running
+    }
+
+    /// The write that records the engine's PID fails after the engine started.
+    /// The supervisor returns the error — and must take the engine with it: the
+    /// record names no engine PID, so `rocm services stop` would find nothing to
+    /// stop and report success while the engine kept the GPU.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_terminates_the_engine_when_recording_its_pid_fails() -> Result<()> {
+        let _serial = lock_script_tests();
+        let tools = script_tools();
+        let (root, paths) = temp_app_paths("supervise-engine-pid-write-fails");
+        paths.ensure()?;
+        write_executable_script(
+            &root.join("rocm"),
+            &tools,
+            &format!(
+                "case \"$1\" in\n\
+                 __engine-serve-http) exec '{sleep}' 120 ;;\n\
+                 *) exit 2 ;;\nesac\n",
+                sleep = tools.sleep.display(),
+            ),
+        )?;
+        let service_id = "svc-supervise-engine-pid-write-fails";
+        register_engine_spawn_seam(service_id, true);
+
+        let outcome = supervise_on_stand_in_rocm(&root, &paths, service_id, 11473);
+        let engine_pid = take_engine_spawn_seam(service_id);
+        let engine_survived = running_then_killed(engine_pid);
+        fs::remove_dir_all(&root).ok();
+
+        let error = outcome.expect_err("the engine PID write was made to fail");
+        assert!(
+            error.contains(service_id),
+            "failed somewhere other than the record write: {error}"
+        );
+        assert!(
+            engine_pid.is_some(),
+            "the engine was never spawned: {error}"
+        );
+        assert!(
+            !engine_survived,
+            "the supervisor returned with its engine {engine_pid:?} still running"
+        );
+        Ok(())
+    }
+
+    /// The write that marks the service ready fails after the engine answered
+    /// ready. The supervisor returns the error, and the engine goes with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_terminates_the_engine_when_recording_ready_fails() -> Result<()> {
+        let _serial = lock_script_tests();
+        let tools = script_tools();
+        let (root, paths) = temp_app_paths("supervise-ready-write-fails");
+        paths.ensure()?;
+        let service_id = "svc-supervise-ready-write-fails";
+        let ready = serde_json::to_string(&rocm_engine_protocol::EngineResponseEnvelope::success(
+            rocm_engine_protocol::HealthcheckResponse {
+                status: "ready".to_owned(),
+                model_loaded: true,
+                device: "cpu".to_owned(),
+                uptime_sec: 1,
+                queue_depth: 0,
+                last_error: None,
+                tokens_per_sec: None,
+            },
+        ))?;
+        // The readiness check spoils the manifest before it answers, so the
+        // engine PID write before it lands and only the ready write fails.
+        write_executable_script(
+            &root.join("rocm"),
+            &tools,
+            &format!(
+                "case \"$1\" in\n\
+                 __engine-serve-http) exec '{sleep}' 120 ;;\n\
+                 __engine-stdio)\n  printf 'not a service record' > '{manifest}'\n  read -r _request\n  printf '%s\\n' '{ready}'\n  ;;\n\
+                 *) exit 2 ;;\nesac\n",
+                sleep = tools.sleep.display(),
+                manifest = paths.service_manifest_path(service_id).display(),
+            ),
+        )?;
+        register_engine_spawn_seam(service_id, false);
+
+        let outcome = supervise_on_stand_in_rocm(&root, &paths, service_id, 11474);
+        let engine_pid = take_engine_spawn_seam(service_id);
+        let engine_survived = running_then_killed(engine_pid);
+        fs::remove_dir_all(&root).ok();
+
+        let error = outcome.expect_err("the ready write was made to fail");
+        assert!(
+            error.contains(service_id),
+            "failed somewhere other than the record write: {error}"
+        );
+        assert!(
+            engine_pid.is_some(),
+            "the engine was never spawned: {error}"
+        );
+        assert!(
+            !engine_survived,
+            "the supervisor returned with its engine {engine_pid:?} still running"
+        );
+        Ok(())
     }
 
     /// If publishing the `recovering` transition fails, nothing has been
