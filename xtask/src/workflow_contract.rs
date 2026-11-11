@@ -6212,17 +6212,14 @@ fi
         }
     }
 
-    /// `build-and-test` heads the Linux critical path (build, then the mock E2E
-    /// lane that needs it), so it waits for `prek`, the cheap hygiene gate, but not
-    /// for `clippy`: the two run in parallel and `clippy` stays a required check of
-    /// its own. Putting `clippy` back in `needs:` would silently add its whole
-    /// runtime to every run, so the list is pinned exactly. The `clippy` job must
-    /// still exist, otherwise dropping it from `needs:` would have dropped the check.
     /// The Linux lane runs the no-fallback smoke gate as a step that can fail
     /// the job. `ci_windows_jobs_keep_every_gating_step_enabled` pins the
     /// Windows lane's copy; without this, the Linux step could be dropped,
     /// renamed, set to `continue-on-error`, or pointed back at a script, and
-    /// no test would notice.
+    /// no test would notice. A shell `||` in the step would swallow the gate's
+    /// exit status the same way, so it is refused too. That the step runs after
+    /// the build `--skip-build` relies on is not checked here; running it first
+    /// fails loudly on the missing binaries.
     #[test]
     fn ci_build_and_test_keeps_the_smoke_gate_enabled() {
         let ci = read_workflow("ci.yml");
@@ -6244,6 +6241,10 @@ fi
             "build-and-test's smoke step must run `cargo xtask smoke --skip-build`:\n{step}"
         );
         assert!(
+            !code.contains("||"),
+            "build-and-test's smoke step must not swallow the gate's failure with `||`:\n{step}"
+        );
+        assert!(
             !step_keys(step).iter().any(|key| key == "continue-on-error"),
             "build-and-test's smoke step must not set continue-on-error:\n{step}"
         );
@@ -6255,6 +6256,12 @@ fi
         );
     }
 
+    /// `build-and-test` heads the Linux critical path (build, then the mock E2E
+    /// lane that needs it), so it waits for `prek`, the cheap hygiene gate, but not
+    /// for `clippy`: the two run in parallel and `clippy` stays a required check of
+    /// its own. Putting `clippy` back in `needs:` would silently add its whole
+    /// runtime to every run, so the list is pinned exactly. The `clippy` job must
+    /// still exist, otherwise dropping it from `needs:` would have dropped the check.
     #[test]
     fn ci_build_and_test_waits_for_prek_but_not_clippy() {
         let ci = read_workflow("ci.yml");
