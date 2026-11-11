@@ -470,7 +470,7 @@ repository.
 | synthez | 0.4.0 | BlueOak-1.0.0 |
 | synthez-codegen | 0.4.0 | BlueOak-1.0.0 |
 | synthez-core | 0.4.0 | BlueOak-1.0.0 |
-| sysinfo | 0.39.6 | MIT |
+| sysinfo | 0.40.1 | MIT |
 | system-configuration | 0.7.0 | MIT OR Apache-2.0 |
 | system-configuration-sys | 0.6.0 | MIT OR Apache-2.0 |
 | tar | 0.4.46 | MIT OR Apache-2.0 |
