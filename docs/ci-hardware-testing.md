@@ -58,15 +58,17 @@ since the queue runs Linux pods. See
 [`nightly-canary.yml`](../.github/workflows/nightly-canary.yml) runs daily at
 07:23 UTC (and on `workflow_dispatch`) on GitHub-hosted `ubuntu-24.04` and
 `windows-2022`. It needs no GPU and installs nothing. For each of
-`gfx110X-all` and `gfx120X-all` (plus `gfx950-dcgpu`, on Linux only: the Windows run does not
+`gfx1100` and `gfx1200` (plus `gfx950`, on Linux only: the Windows run does not
 probe an Instinct target) it runs
 `rocm install sdk --channel nightly --family <family> --dry-run` and checks the
 plan with [`nightly_canary.py`](../scripts/nightly_canary.py):
 
 - the channel, source URL and source layout generation are the canonical
-  nightly ones, read from [`source.rs`](../apps/rocm/src/therock/source.rs)
-  rather than copied, so a legacy endpoint, the stable stream or another
-  channel taking part in nightly resolution fails the run;
+  current (next-layout) nightly ones, which an unpinned nightly install
+  resolves to, read from [`source.rs`](../apps/rocm/src/therock/source.rs)
+  rather than copied, so the earlier multi-arch endpoint, the stable stream or
+  another channel taking part in nightly resolution fails the run. The probes
+  name exact arches because that layout refuses a grouped family;
 - the selected version is a dated nightly and its build is at most three days
   old, which is how a stream that stopped publishing, or a resolver stuck on an
   old train, shows up. No expected version is hard-coded;
