@@ -1039,26 +1039,47 @@ mod tests {
         requires_api_key: bool,
         key: Option<&str>,
     ) -> String {
-        restart_outcome_on_port(test, host, requires_api_key, key, RESTART_SITE_PORT)
+        restart_outcome(test, host, requires_api_key, key, None).0
     }
 
-    /// The port the planted record has unless a test is about the port.
-    const RESTART_SITE_PORT: u16 = 8123;
-
-    /// [`restart_outcome_for`] for a record on `port`.
-    fn restart_outcome_on_port(
+    /// The restart's error, and the port the record had.
+    ///
+    /// The record is a Lemonade service, so a restart the guard lets through
+    /// begins with a real unload request to the recorded host and port before the
+    /// termination stand-in runs. `port` of `None` keeps the fixture's own port,
+    /// which nothing listens on, so such a restart cannot reach a server the test
+    /// does not own. A fixed `port` is only for a case the guard refuses, which
+    /// returns before anything is stopped; that is asserted before the restart
+    /// runs, so a case that would be let through cannot use one.
+    fn restart_outcome(
         test: &str,
         host: &str,
         requires_api_key: bool,
         key: Option<&str>,
-        port: u16,
-    ) -> String {
+        port: Option<u16>,
+    ) -> (String, u16) {
         let (root, paths) = test_paths(test);
         paths.ensure().unwrap();
         let service_id = "svc-restart-key-site";
         let mut record = stop_test_record(&paths, service_id);
         record.host = host.to_owned();
-        record.port = port;
+        if let Some(port) = port {
+            assert!(
+                rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    key.is_some(),
+                    requires_api_key,
+                    rocm_core::ServiceStart::Restart,
+                    service_id,
+                    port,
+                )
+                .is_err(),
+                "a fixed port is for a restart the guard refuses; this one would stop a \
+                 service on a port the test does not own"
+            );
+            record.port = port;
+        }
+        let recorded_port = record.port;
         record.requires_api_key = requires_api_key;
         record.write().unwrap();
         if let Some(key) = key {
@@ -1075,9 +1096,12 @@ mod tests {
         LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
         drop(holder);
         let _ = fs::remove_dir_all(root);
-        format!(
-            "{:#}",
-            result.expect_err("the restart never starts a child here")
+        (
+            format!(
+                "{:#}",
+                result.expect_err("the restart never starts a child here")
+            ),
+            recorded_port,
         )
     }
 
@@ -1086,7 +1110,7 @@ mod tests {
         // A loopback service that asked for `--require-api-key` and has lost its
         // key is refused. Only `requires_api_key` makes it so, and every other
         // test plants it false, so this is what pins the argument.
-        let error = restart_outcome_for("restart-site-requires", "127.0.0.1", true, None);
+        let (error, port) = restart_outcome("restart-site-requires", "127.0.0.1", true, None, None);
         assert_eq!(
             error,
             rocm_core::ensure_public_service_has_endpoint_key(
@@ -1095,7 +1119,7 @@ mod tests {
                 true,
                 rocm_core::ServiceStart::Restart,
                 "svc-restart-key-site",
-                RESTART_SITE_PORT,
+                port,
             )
             .unwrap_err()
             .to_string()
@@ -1112,12 +1136,12 @@ mod tests {
         // so the port the restart reads off the record is what the guard prints.
         for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
             for port in [8123_u16, 9001] {
-                let error = restart_outcome_on_port(
+                let (error, _) = restart_outcome(
                     "restart-site-port",
                     host,
                     requires_api_key,
                     None,
-                    port,
+                    Some(port),
                 );
                 assert_eq!(
                     error,
