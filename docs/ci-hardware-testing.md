@@ -109,14 +109,25 @@ scenario to pass / xfail / skip for that host from its `@id` and
 `@requires-*` tags, a capability probe, and `expectations.toml` — there is no
 separate tier flag or tag filter to maintain.
 
-| Job | Workflow | Platform | Runner labels |
-|---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` |
-| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
-| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
-| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` |
+| Job | Workflow | Platform | Runner labels | GPU declared (`E2E_EXPECT_GPU`) |
+|---|---|---|---|---|
+| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` | unset |
+| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` | `1` |
+| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` | `1` |
+| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` | `1` |
+| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` | `0` |
+| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` | `1` |
+
+The last column is the lane's declaration of whether it has a GPU. On a lane
+that declares `1`, the harness fails before any scenario runs if its capability
+probe finds no usable AMD GPU, and after the run if no `@requires-gpu` scenario
+executed; on every lane it fails if the probe could not read the binary under
+test or if no scenario executed at all. `nightly.yml`'s self-hosted lanes
+declare the same way (`0` only for `e2e-wsl-nightly`), as does every lane of
+[`run-e2e-lane.sh`](../scripts/run-e2e-lane.sh). `every_self_hosted_lane_declares_whether_it_has_a_gpu`
+in [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) fails when a
+self-hosted lane declares neither. See the [E2E README](../tests/e2e-cucumber/README.md)'s
+"Lane verdict".
 
 `e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
 nightly]` axis — two concurrent legs on the same job, channel-suffixed
@@ -182,8 +193,8 @@ resolve to skip here, and known bugs resolve to xfail from
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
 `e2e-wsl`, and `e2e-gpu-w7900`) run on AMD GPU systems, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
-scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
-described below.
+scenarios that the mock job cannot. The WSL lane declares no usable GPU
+(`E2E_EXPECT_GPU=0`) and its GPU preflight is advisory, as described below.
 
 `e2e-wsl` runs on the DevLab Dispatch pool. Its WSL2/Ubuntu-24.04 distro is
 built fresh inside every job (see above), so there is nothing of its own for
@@ -197,9 +208,13 @@ preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
 with no hand filtering. It covers WSL host detection, the
 Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
 machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
-what the lane is proving out: where it is unavailable the capability probe
-resolves those scenarios to not-applicable and the rest of the suite still
-runs. Scenarios the product deliberately routes around on WSL carry
+what the lane is proving out. The lane declares `E2E_EXPECT_GPU=0` (forwarded
+into the guest through `WSLENV`), because its distro is deliberately left
+without the driver bridge (see "What the WSL distro needs"): the capability
+probe resolves `@requires-gpu` scenarios to not-applicable, the harness prints
+a note saying so rather than failing, and the rest of the suite still runs. If
+the probe finds a usable GPU anyway, the harness notes that the declaration is
+stale and runs the GPU scenarios. Scenarios the product deliberately routes around on WSL carry
 `@requires-bare-metal`;
 scenarios whose premise *is* a WSL host carry `@requires-wsl`, and this is the
 only lane that runs them.
@@ -224,7 +239,9 @@ driver scenarios assert on the plan that command produces — a lane that
 pre-installed it would hand those scenarios a host already in the state the
 command under test exists to reach. That costs no coverage today, because
 `rocm-smi` is absent too, so `@requires-gpu` scenarios resolve to skip either
-way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
+way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`). This is why
+the lane declares `E2E_EXPECT_GPU=0`; a lane that provisions the bridge
+declares `1` instead.
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
 `/dev/dxg` and dxcore alone are not enough, `librocdxg.so` must be present and

@@ -1714,6 +1714,98 @@ jobs:
         }
     }
 
+    /// Self-hosted E2E lanes that declare no usable GPU, each with the reason.
+    /// Every other self-hosted lane must declare one.
+    const NO_GPU_LANES: [(&str, &str); 2] = [
+        (
+            "e2e-wsl",
+            "the WSL distro is deliberately left without ROCm's WSL driver bridge, \
+             which `rocm install driver` installs under test",
+        ),
+        (
+            "e2e-wsl-nightly",
+            "the nightly twin of e2e-wsl, set up the same way",
+        ),
+    ];
+
+    /// Every self-hosted E2E lane declares whether it has a GPU, so the harness
+    /// can fail a GPU lane whose probe found none instead of passing it with
+    /// every `@requires-gpu` scenario skipped.
+    ///
+    /// Derived from the workflows like the GPU-preflight check above, so a new
+    /// lane is held to it the day it lands. The declaration is read from the
+    /// job-level `env:` mapping only: a step-level one would leave the other
+    /// steps, and a reader of the job header, without it. A lane that runs the
+    /// suite inside WSL must also name the variable in every `WSLENV` it sets,
+    /// since `wsl.exe` passes nothing else into the guest.
+    #[test]
+    fn every_self_hosted_lane_declares_whether_it_has_a_gpu() {
+        let name = e2e_report::EXPECT_GPU_ENV;
+        let mut no_gpu_seen = Vec::new();
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, _) in self_hosted_e2e_jobs(&text) {
+                let block = job_block(&text, &job);
+                let env = job_mapping(block, "env");
+                let exempt = NO_GPU_LANES.iter().any(|(lane, _)| *lane == job);
+                match env.get(name).map(String::as_str) {
+                    Some("1") => assert!(
+                        !exempt,
+                        "{workflow} job `{job}` is listed in NO_GPU_LANES but declares \
+                         {name}: \"1\"; drop it from the list"
+                    ),
+                    Some("0") => {
+                        assert!(
+                            exempt,
+                            "{workflow} job `{job}` declares {name}: \"0\" but is not in \
+                             NO_GPU_LANES; a self-hosted lane without a GPU needs its reason \
+                             recorded there"
+                        );
+                        no_gpu_seen.push(job.clone());
+                    }
+                    other => panic!(
+                        "{workflow} job `{job}` runs on self-hosted hardware but its job-level \
+                         `env:` sets {name} to {other:?}; it must be \"1\" (a GPU lane) or \
+                         \"0\" (listed in NO_GPU_LANES)"
+                    ),
+                }
+                let wslenvs: Vec<&str> = block
+                    .lines()
+                    .filter_map(|line| line.trim().strip_prefix("$env:WSLENV = "))
+                    .collect();
+                assert!(
+                    !block.contains("Invoke-WslBash.ps1") || !wslenvs.is_empty(),
+                    "{workflow} job `{job}` runs commands in WSL but sets no WSLENV, so \
+                     {name} never reaches the suite"
+                );
+                for wslenv in wslenvs {
+                    let vars = wslenv.trim_matches(|c| c == '\'' || c == '"');
+                    assert!(
+                        vars.split(':')
+                            .any(|var| var.split('/').next() == Some(name)),
+                        "{workflow} job `{job}` sets WSLENV without {name}, so the suite \
+                         inside WSL reads the lane as undeclared: {wslenv}"
+                    );
+                }
+            }
+        }
+        for (lane, _) in NO_GPU_LANES {
+            assert!(
+                no_gpu_seen.iter().any(|seen| seen == lane),
+                "NO_GPU_LANES lists `{lane}`, which no self-hosted workflow declares \
+                 {name}: \"0\"; drop the stale entry"
+            );
+        }
+        // The queue lanes run through this script, not a workflow job; every
+        // queue lane is given a GPU.
+        let script = std::fs::read_to_string(repo_root().join("scripts/run-e2e-lane.sh"))
+            .expect("reading the lane script");
+        let export = format!("export {name}=\"${{{name}-1}}\"");
+        assert!(
+            script.lines().any(|line| line.trim() == export),
+            "scripts/run-e2e-lane.sh must declare its lanes' GPU with `{export}`"
+        );
+    }
+
     /// A job's `steps:` items as `(name, whole step)` pairs, in file order;
     /// `None` when the job has no `steps:` list. `block` is what `job_block`
     /// returns.
@@ -5069,14 +5161,16 @@ fi
 
         let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
             .expect("read hardware testing docs");
-        let documented: Vec<Vec<String>> =
-            markdown_table_rows(&docs, "| Job | Workflow | Platform | Runner labels |")
-                .into_iter()
-                .filter(|row| {
-                    row.get(1)
-                        .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
-                })
-                .collect();
+        let documented: Vec<Vec<String>> = markdown_table_rows(
+            &docs,
+            "| Job | Workflow | Platform | Runner labels | GPU declared (`E2E_EXPECT_GPU`) |",
+        )
+        .into_iter()
+        .filter(|row| {
+            row.get(1)
+                .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
+        })
+        .collect();
 
         let documented_jobs: Vec<String> = documented.iter().map(|row| row[0].clone()).collect();
         let declared_jobs: Vec<String> = lanes.iter().map(|(job, _)| format!("`{job}`")).collect();
@@ -5103,6 +5197,15 @@ fi
                 flattened_list_items(&quoted[0]),
                 flattened_list_items(runs_on),
                 "the documented runner labels for `{job}` must match its actual runs-on"
+            );
+            let declared = job_mapping(job_block(&self_hosted, job), "env")
+                .get(e2e_report::EXPECT_GPU_ENV)
+                .map(|value| format!("`{value}`"));
+            assert_eq!(
+                row.get(4),
+                declared.as_ref(),
+                "the GPU declared cell for `{job}` must match its job-level {}",
+                e2e_report::EXPECT_GPU_ENV
             );
         }
 

@@ -11,6 +11,7 @@ pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
+pub mod lane_verdict;
 pub mod lemonade_diagnostics;
 pub mod loopback_http;
 pub mod mock_server;

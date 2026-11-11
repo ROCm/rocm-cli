@@ -416,6 +416,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
       E2E_INCLUDE_NIGHTLY: "1"
       # Serve-readiness floor; a `@serve-timeout` tag lengthens it for the large
@@ -521,6 +524,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
@@ -602,6 +608,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
@@ -685,6 +694,9 @@ jobs:
         channel: [release, nightly]
     continue-on-error: true
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
@@ -780,6 +792,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
       RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
@@ -875,6 +890,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
@@ -1142,6 +1160,13 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # Declared GPU-less on purpose: the distro is left without ROCm's WSL
+      # driver bridge (see the "NO librocdxg provisioning step" note below), so
+      # the probe finds no usable GPU and @requires-gpu scenarios are not
+      # applicable. The harness reports that rather than failing on it; set "1"
+      # here if this lane ever provisions a GPU. Forwarded into the guest via
+      # WSLENV in the run step.
+      E2E_EXPECT_GPU: "0"
       # wsl.exe emits UTF-16 by default; without this its own error/status text
       # comes back mangled when captured through PowerShell. Matches the
       # ubuntu/WSL composite action's own env.
@@ -1341,8 +1366,9 @@ jobs:
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
-      # rocm-smi is a reported condition, not a job failure: the capability probe
-      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # rocm-smi is a reported condition, not a job failure: the lane declares
+      # E2E_EXPECT_GPU=0, so the harness reports @requires-gpu scenarios as not
+      # applicable instead of failing on them, and the rest still runs. A
       # GPU that IS present but stays held fails the job, since that would
       # corrupt the serve scenarios' results.
       #
@@ -1363,7 +1389,7 @@ jobs:
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
-            echo "::warning::rocm-smi not found in this WSL distro — GPU scenarios will resolve to skip"
+            echo "::warning::rocm-smi not found in this WSL distro — expected on this lane (E2E_EXPECT_GPU=0); @requires-gpu scenarios are not applicable"
             exit 0
           fi
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
@@ -1463,7 +1489,7 @@ jobs:
             sleep 5
           done
           if [ "$saw_vram" -eq 0 ]; then
-            echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
+            echo "::warning::rocm-smi reported no VRAM figures under WSL — this lane declares no GPU (E2E_EXPECT_GPU=0); @requires-gpu scenarios are not applicable"
             exit 0
           fi
           if [ "$unmeasurable" -eq 1 ]; then
@@ -1514,7 +1540,7 @@ jobs:
         shell: powershell
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
+          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli

@@ -33,3 +33,17 @@ pub use single_report::generate;
 /// typo previously would not fail to compile or fail a test, silently turning
 /// `@requires-oom-fault-injection` into a skip (green suite, zero coverage).
 pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
+
+/// Environment variable in which a CI lane declares whether it has a GPU.
+///
+/// `1` means the lane runs on GPU hardware, so the `e2e-cucumber` harness fails
+/// before any scenario runs when its capability probe finds no usable AMD GPU,
+/// and after the run when no `@requires-gpu` scenario executed. `0` means the
+/// lane deliberately has no usable GPU (the WSL lanes, whose distro is left
+/// without ROCm's WSL driver bridge). Unset or empty leaves the lane undeclared,
+/// as on the GitHub-hosted lanes and local runs; any other value is an error.
+///
+/// Shared by the harness, which reads it, and xtask's workflow contract test,
+/// which checks that every self-hosted E2E lane sets it, so the two cannot name
+/// different variables.
+pub const EXPECT_GPU_ENV: &str = "E2E_EXPECT_GPU";

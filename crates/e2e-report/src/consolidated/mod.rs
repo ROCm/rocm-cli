@@ -895,6 +895,21 @@ mod tests {
         assert_eq!(r.status_text(), "EMPTY");
     }
 
+    /// The artifact a lane uploads when the harness refuses to run (a failed
+    /// capability probe, or a declared GPU the probe did not find): the harness
+    /// creates `report.json` empty before probing and exits before writing
+    /// `platform.json`. That lane must read as needing attention, never green.
+    #[test]
+    fn a_lane_that_stopped_before_any_scenario_is_not_ok() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = dir.path().join("report.json");
+        std::fs::write(&report, "").expect("write empty report.json");
+        let r = PlatformReport::load("e2e-gpu-report".into(), &report);
+        assert!(r.manifest.is_none(), "no platform.json was written");
+        assert!(!r.ok(), "an empty run must not count as healthy");
+        assert_eq!(r.status_text(), "EMPTY");
+    }
+
     #[test]
     fn rendering_uses_the_bundle_not_the_artifacts_on_disk() {
         // The render functions must work from what `load_platform_reports`

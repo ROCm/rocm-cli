@@ -164,6 +164,17 @@ pub struct HostCapability {
     /// running the suite. Gates `@requires-dir-permissions`; see
     /// [`probe_dir_permissions_bind`].
     pub dir_permissions_bind: bool,
+    /// `examine`'s `driver_status:` line, empty when it printed none. Only
+    /// decides GPU usability on WSL (see [`host_has_usable_gpu`]); kept so a
+    /// lane whose GPU went missing can say why.
+    pub driver_status: String,
+    /// Why the probe could not read the binary under test, if it could not:
+    /// the first failure of `rocm examine` or `rocm engines list` (see
+    /// [`ProbeError`]). When set, the rest of this struct holds the same
+    /// no-GPU values an empty `examine` would give, so callers never panic, and
+    /// the harness refuses to run (see `lane_verdict::preflight_verdict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
 }
 
 /// Environment variable `xtask e2e` sets to `1` when it compiled the binary
@@ -247,7 +258,11 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // OS distro from `examine` — ALWAYS collected (every platform, incl. mock and
     // hosts without a shared runtime dir). Isolated throwaway root reads the host.
     if let Ok(tmp) = tempfile::TempDir::with_prefix("rocm-e2e-ver-") {
-        let examine = run_probe(tmp.path(), &["examine"]);
+        // Best-effort, unlike the capability probe: a failed `examine` here
+        // only leaves the report heading's OS blank. The capability probe ran
+        // the same command before any scenario and already refused the run if
+        // it failed.
+        let examine = run_probe(tmp.path(), &["examine"]).unwrap_or_default();
         v.os = examine
             .lines()
             .find_map(|l| l.trim().strip_prefix("distro:"))
@@ -420,6 +435,29 @@ fn probe_host_capability() -> HostCapability {
     // what the scenarios see.
     let examine = run_probe(root, &["examine"]);
     let engines = run_probe(root, &["engines", "list"]);
+    capability_from_probes(examine, engines, root)
+}
+
+/// Build a [`HostCapability`] from the two probes' results; `root` is the
+/// throwaway directory the filesystem probes write under.
+///
+/// Split from [`probe_host_capability`] so a test can hand it a failed probe
+/// without a binary to run.
+fn capability_from_probes(
+    examine: Result<String, ProbeError>,
+    engines: Result<String, ProbeError>,
+    root: &std::path::Path,
+) -> HostCapability {
+    // The first failure is the one reported; either one means the facts below
+    // were not read from the binary, so they fall back to the no-GPU values an
+    // empty dump parses to.
+    let probe_error = examine
+        .as_ref()
+        .err()
+        .or_else(|| engines.as_ref().err())
+        .map(ToString::to_string);
+    let examine = examine.unwrap_or_default();
+    let engines = engines.unwrap_or_default();
 
     let ExamineFacts {
         os_family,
@@ -450,6 +488,8 @@ fn probe_host_capability() -> HostCapability {
         oom_fault_injection,
         case_sensitive_fs,
         dir_permissions_bind,
+        driver_status,
+        probe_error,
     }
 }
 
@@ -515,18 +555,161 @@ fn probe_case_sensitive_fs(dir: &std::path::Path) -> bool {
     probe().unwrap_or(false)
 }
 
-/// Run `rocm <args>` with an isolated config/data/cache root, returning stdout
-/// (empty string on any failure — the probe must never panic the suite).
-fn run_probe(root: &std::path::Path, args: &[&str]) -> String {
-    let mut cmd = std::process::Command::new(rocm_binary());
+/// Why a probe of the binary under test produced nothing the harness can read.
+///
+/// Every variant is fatal to the run: an unreadable probe parses as a host with
+/// no GPU, so every capability-gated scenario would resolve to skip and the run
+/// would pass without testing them. `command` is the binary and arguments as
+/// run, so the message names exactly what failed.
+#[derive(Debug)]
+pub enum ProbeError {
+    /// The binary could not be started at all (wrong path, not executable).
+    Spawn {
+        command: String,
+        source: std::io::Error,
+    },
+    /// It ran and exited non-zero: the CLI exits 0 for every finding, so this
+    /// means it could not examine the host at all.
+    Exit {
+        command: String,
+        status: std::process::ExitStatus,
+        stderr_tail: String,
+    },
+    /// It exited 0 but printed nothing on stdout.
+    EmptyOutput { command: String },
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn { command, source } => write!(
+                f,
+                "could not start `{command}`: {source}. Set ROCM_CLI_BINARY to the rocm binary \
+                 under test, or run the suite through `cargo xtask e2e`, which builds it and \
+                 sets ROCM_CLI_BINARY"
+            ),
+            Self::Exit {
+                command,
+                status,
+                stderr_tail,
+            } => write!(
+                f,
+                "`{command}` exited with {status}\n{}",
+                crate::section("stderr (last lines)", stderr_tail)
+            ),
+            Self::EmptyOutput { command } => {
+                write!(f, "`{command}` exited 0 but produced no output on stdout")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn { source, .. } => Some(source),
+            Self::Exit { .. } | Self::EmptyOutput { .. } => None,
+        }
+    }
+}
+
+/// How many trailing stderr lines a [`ProbeError::Exit`] keeps.
+const PROBE_STDERR_TAIL_LINES: usize = 20;
+
+/// Turn one probe's spawn result into its stdout, or the reason it has none.
+///
+/// Pure, so each outcome is unit-tested without a binary to run. Stdout that is
+/// only whitespace counts as empty: no `examine` field can be parsed from it.
+pub fn classify_probe_output(
+    command: &str,
+    result: std::io::Result<std::process::Output>,
+) -> Result<String, ProbeError> {
+    let out = result.map_err(|source| ProbeError::Spawn {
+        command: command.to_owned(),
+        source,
+    })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines[lines.len().saturating_sub(PROBE_STDERR_TAIL_LINES)..].join("\n");
+        return Err(ProbeError::Exit {
+            command: command.to_owned(),
+            status: out.status,
+            stderr_tail: tail,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if stdout.trim().is_empty() {
+        return Err(ProbeError::EmptyOutput {
+            command: command.to_owned(),
+        });
+    }
+    Ok(stdout)
+}
+
+/// Run `rocm <args>` with an isolated config/data/cache root and return its
+/// stdout, or why there is none. Never panics: the caller decides whether a
+/// failure is fatal.
+fn run_probe(root: &std::path::Path, args: &[&str]) -> Result<String, ProbeError> {
+    run_probe_with(std::ffi::OsStr::new(&rocm_binary()), root, args)
+}
+
+/// [`run_probe`] with the binary passed in, so a test can name one without
+/// setting a process-wide environment variable.
+pub fn run_probe_with(
+    binary: &std::ffi::OsStr,
+    root: &std::path::Path,
+    args: &[&str],
+) -> Result<String, ProbeError> {
+    let mut cmd = std::process::Command::new(binary);
     cmd.args(args);
     cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
     cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
     cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
-    match cmd.output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
+    let command = std::iter::once(binary.to_string_lossy().into_owned())
+        .chain(args.iter().map(|a| (*a).to_owned()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    classify_probe_output(&command, cmd.output())
+}
+
+/// One line naming the probe facts that decide GPU usability, for a lane whose
+/// declared GPU the probe did not find.
+///
+/// Reads the visibility masks from the environment the way
+/// [`host_has_usable_gpu`] does; [`probe_facts_summary_with_mask`] is the pure
+/// form.
+#[must_use]
+pub fn probe_facts_summary(cap: &HostCapability) -> String {
+    let hip = std::env::var_os("HIP_VISIBLE_DEVICES");
+    let rocr = std::env::var_os("ROCR_VISIBLE_DEVICES");
+    probe_facts_summary_with_mask(cap, hip.as_deref(), rocr.as_deref())
+}
+
+/// Pure form of [`probe_facts_summary`]. Names the mask that is in force by the
+/// same precedence as [`selected_visibility_mask`]: HIP wins when set, even
+/// empty.
+#[must_use]
+pub fn probe_facts_summary_with_mask(
+    cap: &HostCapability,
+    hip: Option<&std::ffi::OsStr>,
+    rocr: Option<&std::ffi::OsStr>,
+) -> String {
+    let mask = match (hip, rocr) {
+        (Some(v), _) => format!("HIP_VISIBLE_DEVICES={:?}", v.to_string_lossy()),
+        (None, Some(v)) => format!("ROCR_VISIBLE_DEVICES={:?}", v.to_string_lossy()),
+        (None, None) => "no visibility mask".to_owned(),
+    };
+    let driver_status = if cap.driver_status.is_empty() {
+        "<none>"
+    } else {
+        cap.driver_status.as_str()
+    };
+    format!(
+        "detected_gfx_target={}, wsl={}, driver_status={driver_status}, {mask}",
+        cap.gfx_target.as_deref().unwrap_or("<none>"),
+        cap.is_wsl,
+    )
 }
 
 /// The `examine` fields the capability probe reads.
@@ -926,6 +1109,8 @@ mod tests {
             oom_fault_injection: false,
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -943,6 +1128,8 @@ mod tests {
             oom_fault_injection: false,
             case_sensitive_fs: true,
             dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -1326,5 +1513,262 @@ Local model engines
         let refused = std::fs::File::create(direct.join("file")).is_err();
         std::fs::set_permissions(&direct, std::fs::Permissions::from_mode(0o755)).expect("restore");
         assert_eq!(probe_dir_permissions_bind(tmp.path()), refused);
+    }
+
+    /// An exit status that reports failure with code 1, built the way each
+    /// platform encodes it, so the non-zero-exit row runs on both CI gates.
+    fn failed_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // A wait status: the exit code sits in the second byte.
+            std::process::ExitStatus::from_raw(1 << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1)
+        }
+    }
+
+    fn succeeded_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+    }
+
+    fn output(
+        status: std::process::ExitStatus,
+        stdout: &str,
+        stderr: &str,
+    ) -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// The regression: a probe that exits non-zero is an error even when it
+    /// printed something, rather than stdout parsed as a GPU-less host.
+    #[test]
+    fn a_probe_that_exits_non_zero_is_an_error_with_its_stderr_tail() {
+        let result = classify_probe_output(
+            "rocm examine",
+            Ok(output(
+                failed_status(),
+                "rocm examine\n  os: linux\n",
+                "warning: early\nError: could not read the host\n",
+            )),
+        );
+        let Err(error @ ProbeError::Exit { .. }) = result else {
+            panic!("a non-zero exit must be ProbeError::Exit, got {result:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`rocm examine` exited with {}\n--- stderr (last lines) ---\n\
+                 warning: early\nError: could not read the host",
+                failed_status()
+            )
+        );
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_only_the_last_lines() {
+        let stderr = (1..=30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Err(ProbeError::Exit { stderr_tail, .. }) =
+            classify_probe_output("rocm examine", Ok(output(failed_status(), "", &stderr)))
+        else {
+            panic!("a non-zero exit must be ProbeError::Exit");
+        };
+        let expected: Vec<String> = (11..=30).map(|i| format!("line {i}")).collect();
+        assert_eq!(stderr_tail, expected.join("\n"));
+    }
+
+    #[test]
+    fn a_probe_that_exits_zero_with_output_returns_its_stdout() {
+        let stdout = "rocm examine\n  os: linux\n  detected_gfx_target: gfx1151\n";
+        assert_eq!(
+            classify_probe_output("rocm examine", Ok(output(succeeded_status(), stdout, "")))
+                .expect("exit 0 with output is a reading"),
+            stdout
+        );
+    }
+
+    #[test]
+    fn a_probe_that_exits_zero_with_no_output_is_an_error() {
+        for stdout in ["", "  \n\n"] {
+            let result =
+                classify_probe_output("rocm examine", Ok(output(succeeded_status(), stdout, "")));
+            let Err(error @ ProbeError::EmptyOutput { .. }) = result else {
+                panic!("empty stdout {stdout:?} must be ProbeError::EmptyOutput, got {result:?}");
+            };
+            assert_eq!(
+                error.to_string(),
+                "`rocm examine` exited 0 but produced no output on stdout"
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_whose_binary_does_not_exist_is_a_spawn_error_naming_it() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let missing = tmp.path().join("no-such-rocm");
+        let result = run_probe_with(missing.as_os_str(), tmp.path(), &["examine"]);
+        let Err(error @ ProbeError::Spawn { .. }) = result else {
+            panic!("a missing binary must be ProbeError::Spawn, got {result:?}");
+        };
+        let ProbeError::Spawn { command, source } = &error else {
+            unreachable!()
+        };
+        assert_eq!(command, &format!("{} examine", missing.display()));
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "could not start `{} examine`: {source}. Set ROCM_CLI_BINARY to the rocm binary \
+                 under test, or run the suite through `cargo xtask e2e`, which builds it and \
+                 sets ROCM_CLI_BINARY",
+                missing.display()
+            )
+        );
+    }
+
+    const GPU_EXAMINE: &str = "rocm examine\n  os: linux\n  detected_gfx_target: gfx1151\n  wsl: false\n  driver_status: ok\n";
+
+    /// A failed probe records why, and leaves the struct at the no-GPU values
+    /// so no caller panics.
+    #[test]
+    fn a_failed_examine_records_the_error_and_falls_back_to_no_gpu() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Err(ProbeError::EmptyOutput {
+                command: "rocm examine".to_owned(),
+            }),
+            Ok("lemonade\n".to_owned()),
+            tmp.path(),
+        );
+        assert_eq!(
+            cap.probe_error.as_deref(),
+            Some("`rocm examine` exited 0 but produced no output on stdout")
+        );
+        assert!(!cap.has_amd_gpu);
+        assert_eq!(cap.gfx_target, None);
+        assert_eq!(cap.platform_slug, "mock");
+    }
+
+    /// The `engines list fails, examine OK` row: the GPU facts were read, but
+    /// the probe still failed, so the run must not proceed on them.
+    #[test]
+    fn a_failed_engines_list_is_recorded_even_when_examine_succeeded() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Ok(GPU_EXAMINE.to_owned()),
+            Err(ProbeError::Exit {
+                command: "rocm engines list".to_owned(),
+                status: failed_status(),
+                stderr_tail: "boom".to_owned(),
+            }),
+            tmp.path(),
+        );
+        assert_eq!(
+            cap.probe_error,
+            Some(format!(
+                "`rocm engines list` exited with {}\n--- stderr (last lines) ---\nboom",
+                failed_status()
+            ))
+        );
+        assert!(cap.available_engines.is_empty());
+    }
+
+    #[test]
+    fn the_first_failure_is_the_one_recorded() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Err(ProbeError::EmptyOutput {
+                command: "rocm examine".to_owned(),
+            }),
+            Err(ProbeError::EmptyOutput {
+                command: "rocm engines list".to_owned(),
+            }),
+            tmp.path(),
+        );
+        assert_eq!(
+            cap.probe_error.as_deref(),
+            Some("`rocm examine` exited 0 but produced no output on stdout")
+        );
+    }
+
+    #[test]
+    fn successful_probes_record_no_error_and_keep_the_driver_status() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Ok(GPU_EXAMINE.to_owned()),
+            Ok("lemonade\nvllm\n".to_owned()),
+            tmp.path(),
+        );
+        assert_eq!(cap.probe_error, None);
+        assert_eq!(cap.gfx_target.as_deref(), Some("gfx1151"));
+        assert_eq!(cap.driver_status, "ok");
+        // `probe_error` is left out of platform.json when there is none.
+        let json = serde_json::to_value(&cap).expect("serializes");
+        assert!(json.get("probe_error").is_none(), "{json}");
+    }
+
+    #[test]
+    fn the_probe_facts_summary_names_the_mask_in_force() {
+        let cap = HostCapability {
+            os_family: "linux".to_owned(),
+            is_wsl: true,
+            gfx_target: Some("gfx1151".to_owned()),
+            has_amd_gpu: false,
+            amd_gpu_count: None,
+            available_engines: vec![],
+            effective_serve_engine: "lemonade".to_owned(),
+            platform_slug: "mock".to_owned(),
+            oom_fault_injection: false,
+            case_sensitive_fs: true,
+            dir_permissions_bind: true,
+            driver_status: "wsl_rocdxg_missing".to_owned(),
+            probe_error: None,
+        };
+        let base = "detected_gfx_target=gfx1151, wsl=true, driver_status=wsl_rocdxg_missing";
+        assert_eq!(
+            probe_facts_summary_with_mask(&cap, None, None),
+            format!("{base}, no visibility mask")
+        );
+        assert_eq!(
+            probe_facts_summary_with_mask(
+                &cap,
+                Some(std::ffi::OsStr::new("")),
+                Some(std::ffi::OsStr::new("0"))
+            ),
+            format!("{base}, HIP_VISIBLE_DEVICES=\"\"")
+        );
+        assert_eq!(
+            probe_facts_summary_with_mask(&cap, None, Some(std::ffi::OsStr::new("1"))),
+            format!("{base}, ROCR_VISIBLE_DEVICES=\"1\"")
+        );
+        let none = HostCapability {
+            gfx_target: None,
+            is_wsl: false,
+            driver_status: String::new(),
+            ..cap
+        };
+        assert_eq!(
+            probe_facts_summary_with_mask(&none, None, None),
+            "detected_gfx_target=<none>, wsl=false, driver_status=<none>, no visibility mask"
+        );
     }
 }

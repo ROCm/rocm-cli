@@ -114,7 +114,11 @@ run's inputs above). Each channel starts with the GPU preflight, as each
 channel's job in `nightly.yml` does, so a model server the previous channel's
 suite left on the GPU is reclaimed first; the lane log shows it. Both always
 run, so a failing channel does not hide the other, and the lane fails if either
-did.
+did. The default command also declares that every lane has a GPU
+(`E2E_EXPECT_GPU`, default `1`), so a channel whose suite finds no usable AMD
+GPU, or runs no `@requires-gpu` scenario, fails instead of passing with every
+GPU scenario skipped; see "Lane verdict" in the
+[E2E README](../tests/e2e-cucumber/README.md).
 
 The queue's results are an additional signal, not a replacement: the lanes
 write only into the queue artifact, and the `e2e-gpu-<channel>-report`

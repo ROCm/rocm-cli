@@ -753,6 +753,34 @@ export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3
   --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
+## E2E runs that test nothing fail
+
+`cargo xtask e2e` fails a run whose result could not mean anything, instead of
+reporting it green:
+
+- before any scenario runs, when the capability probe could not read the binary
+  under test: `rocm examine` or `rocm engines list` could not be started (check
+  `ROCM_CLI_BINARY`), exited non-zero, or printed nothing;
+- after the run, when no scenario executed, which includes a
+  `cargo xtask e2e -- -n <regex>` whose regex matches no scenario name.
+
+`E2E_EXPECT_GPU` declares whether the host has a GPU. With `1`, the run also
+fails before any scenario if the probe found no usable AMD GPU, and after the
+run if no `@requires-gpu` scenario executed. With `0`, it only notes that GPU
+scenarios are not applicable (and that the declaration is stale if a GPU is
+found). Unset, as on a local run, it makes no GPU claim. Every self-hosted CI
+lane sets it; see "Lane verdict" in the [E2E README](../tests/e2e-cucumber/README.md)
+and the Platforms table in [ci-hardware-testing.md](ci-hardware-testing.md). The
+checks are unit-tested in [lane_verdict.rs](../tests/e2e-cucumber/src/lane_verdict.rs)
+and, for each way a probe can fail, in
+[capability.rs](../tests/e2e-cucumber/src/capability.rs):
+
+```bash
+cargo test -p e2e-cucumber --lib lane_verdict
+cargo test -p e2e-cucumber --lib capability::tests::a_probe
+cargo test -p xtask every_self_hosted_lane_declares_whether_it_has_a_gpu
+```
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs

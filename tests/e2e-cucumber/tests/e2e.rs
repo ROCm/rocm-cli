@@ -243,6 +243,9 @@ struct Resolution {
     engine: String,
     feature: String,
     scenario: String,
+    /// Tagged `@requires-gpu` or `@requires-multi-gpu`, for the post-run check
+    /// that a GPU-declaring lane executed at least one of them.
+    requires_gpu: bool,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -1374,6 +1377,7 @@ async fn run_suite() {
     use e2e_cucumber::expectation::{
         Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
     };
+    use e2e_cucumber::lane_verdict;
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1433,6 +1437,24 @@ async fn run_suite() {
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
     );
+
+    // Refuse to run when the result could not mean anything: a probe that could
+    // not read the binary, or a lane that declares a GPU the probe did not find,
+    // would resolve every GPU scenario to skip and pass. See `lane_verdict`.
+    let gpu_declaration = lane_verdict::parse_gpu_declaration(
+        std::env::var_os(lane_verdict::EXPECT_GPU_ENV).as_deref(),
+    )
+    .unwrap_or_else(|error| lane_failure(&error));
+    let preflight = lane_verdict::preflight_verdict(
+        cap.probe_error.as_deref(),
+        cap.has_amd_gpu,
+        &e2e_cucumber::capability::probe_facts_summary(cap),
+        gpu_declaration,
+    );
+    print_lane_notes(&preflight.notes);
+    if let Some(fatal) = &preflight.fatal {
+        lane_failure(fatal);
+    }
 
     // Shared record of each scenario's resolved expectation, keyed by @id.
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
@@ -1556,6 +1578,7 @@ async fn run_suite() {
                             engine,
                             feature: feature.name.clone(),
                             scenario: scenario.name.clone(),
+                            requires_gpu: decl.requires_gpu || decl.requires_multi_gpu,
                         },
                     );
                     // Two scenarios sharing an `@id` would silently overwrite each
@@ -1668,6 +1691,27 @@ async fn run_suite() {
         }
     }
 
+    // A run with nothing to fail passes; check it executed something, and on
+    // a GPU-declaring lane something that needed the GPU. `resolutions` is empty
+    // when a cucumber `--name`/`--tags` filter replaced `filter_run`, and then
+    // which scenarios need a GPU is unknown.
+    let gpu_counts = (!resolutions.is_empty()).then(|| {
+        let gpu_ids: std::collections::BTreeSet<&str> = resolutions
+            .iter()
+            .filter(|(_, r)| r.requires_gpu)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        lane_verdict::GpuScenarioCounts {
+            resolved: gpu_ids.len(),
+            executed: actual
+                .iter()
+                .filter(|(id, _)| gpu_ids.contains(id.as_str()))
+                .count(),
+        }
+    });
+    let post_run = lane_verdict::post_run_verdict(actual.len(), gpu_counts, gpu_declaration);
+    print_lane_notes(&post_run.notes);
+
     eprintln!(
         "Reconciliation: {xfail_count} xfail (failed as expected), {} XPASS ({} flaky, {} stale), {} unexpected failure(s).",
         flaky_xpass.len() + stale_xpass.len(),
@@ -1680,7 +1724,7 @@ async fn run_suite() {
             "XPASS (flaky, tolerated): '{x}' passed this run; the intermittent bug remains tracked."
         );
     }
-    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() {
+    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() || post_run.fatal.is_some() {
         for x in &stale_xpass {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
@@ -1692,6 +1736,27 @@ async fn run_suite() {
                 "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
             );
         }
+        if let Some(fatal) = &post_run.fatal {
+            lane_failure(fatal);
+        }
         std::process::exit(1);
+    }
+}
+
+/// Print a lane-verdict failure as a GitHub annotation and a plain line, then
+/// exit non-zero. The annotation encodes newlines (a probe's stderr tail) as
+/// `%0A`, which is how a workflow command carries more than one line.
+fn lane_failure(message: &str) -> ! {
+    eprintln!(
+        "::error::E2E lane check failed: {}",
+        message.replace('\n', "%0A")
+    );
+    eprintln!("E2E lane check failed: {message}");
+    std::process::exit(1);
+}
+
+fn print_lane_notes(notes: &[String]) {
+    for note in notes {
+        eprintln!("::notice::E2E lane: {note}");
     }
 }
