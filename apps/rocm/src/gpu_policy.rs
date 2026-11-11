@@ -31,8 +31,9 @@
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
 //! instead of moving: `const fn device_policy_name` sits immediately after
-//! `detect_gpu_count` and before the next cluster's (ROCMAI-215)
-//! `EngineSelection`/`resolve_engine_selection`, but it already had callers
+//! `detect_gpu_count` and before the engine-selection cluster's
+//! `EngineSelection`/`resolve_engine_selection` (now in
+//! `engine_runtime_select.rs`), but it already had callers
 //! outside this cluster — `engine_ipc.rs` and `service_launch.rs` reach it
 //! unqualified via `use crate::{...}`, same as `serve_cmd.rs` does — plus its
 //! own test, so it is not part of this cluster's relocation.
