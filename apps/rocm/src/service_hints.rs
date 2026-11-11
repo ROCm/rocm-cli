@@ -59,7 +59,7 @@ pub(crate) fn service_stop_hint(service_id: &str) -> String {
 /// that service. Shared so a startup failure and the deployment summary cannot
 /// name two different log commands.
 pub(crate) fn service_logs_hint(service_id: &str) -> String {
-    format!("rocm logs --service {service_id}")
+    format!("rocm logs --service {}", shell_quote(service_id))
 }
 
 /// The directly-runnable `<remote_cli> services stop <id> --yes` hint for a
@@ -128,6 +128,10 @@ mod tests {
             remote_service_stop_hint("rocm", "vllm-qwen-8000"),
             "rocm services stop vllm-qwen-8000 --yes"
         );
+        assert_eq!(
+            service_logs_hint("vllm-qwen-8000"),
+            "rocm logs --service vllm-qwen-8000"
+        );
     }
 
     proptest! {
@@ -153,6 +157,19 @@ mod tests {
                     hint
                 );
             }
+            // Mutation: printing `service_id` bare in the logs hint fails this.
+            let logs = service_logs_hint(&service_id);
+            prop_assert_eq!(
+                shlex::split(&logs),
+                Some(vec![
+                    "rocm".to_owned(),
+                    "logs".to_owned(),
+                    "--service".to_owned(),
+                    service_id,
+                ]),
+                "{}",
+                logs
+            );
         }
     }
 }

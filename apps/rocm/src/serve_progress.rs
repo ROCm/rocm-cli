@@ -800,9 +800,13 @@ fn is_secret_name(word: &str) -> bool {
     }
     name == "authorization"
         || name == "bearer"
-        || ["api_key", "apikey", "token", "password", "secret"]
+        || ["api_key", "apikey", "token", "password", "secret", "private_key"]
             .iter()
             .any(|suffix| name.ends_with(suffix))
+        // `secret_key`, `token_value`: a secret word anywhere in a `_` name.
+        || name
+            .split('_')
+            .any(|part| matches!(part, "secret" | "token" | "password" | "passwd"))
 }
 
 /// A flag (`--api-key`), a key ending in `:` (`'api_key':`,
@@ -825,9 +829,12 @@ fn mask_value(word: &str) -> String {
     let body_start = word
         .find(|c: char| !matches!(c, '\'' | '"' | '(' | '['))
         .unwrap_or(word.len());
+    // The end of the last body character, which may be wider than one byte.
     let body_end = word
-        .rfind(|c: char| !matches!(c, '\'' | '"' | ',' | ')' | ']' | '}'))
-        .map_or(body_start, |index| index + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !matches!(c, '\'' | '"' | ',' | ')' | ']' | '}'))
+        .map_or(body_start, |(index, c)| index + c.len_utf8());
     if body_end <= body_start {
         return word.to_owned();
     }
@@ -1632,6 +1639,46 @@ mod tests {
         );
     }
 
+    /// The two silent limits read different clocks: the unreachable one
+    /// counts from the start of the wait, the load one from the last change
+    /// of the log line. Each row moves one clock past its limit and holds the
+    /// other below it, so swapping the fields in either check fails a row.
+    #[test]
+    fn silent_limits_read_their_own_clocks() {
+        let decide = |log_line: Option<&str>, elapsed: Duration, since: Duration| {
+            let mut signals = alive();
+            signals.log_line = log_line.map(str::to_owned);
+            decide_serve_startup(
+                "qwen",
+                "vllm",
+                EndpointReadiness::Unreachable,
+                &signals,
+                ServeStartupTiming {
+                    elapsed,
+                    since_progress: since,
+                },
+                &interactive(),
+            )
+        };
+        let short = Duration::from_secs(1);
+        // Unreachable, no log: the time since the start decides.
+        let stop = assert_stop(decide(None, SILENT_UNREACHABLE, short));
+        assert_eq!(stop.reason, ServeStartupStopReason::Silent);
+        assert!(matches!(
+            decide(None, short, SILENT_UNREACHABLE),
+            ServeStartupDecision::Continue(_)
+        ));
+        // Loading: the time since the line last changed decides, however long
+        // the wait has run.
+        let load = Some("Loading safetensors checkpoint shards: 40%");
+        let stop = assert_stop(decide(load, SILENT_LOAD, SILENT_LOAD));
+        assert_eq!(stop.reason, ServeStartupStopReason::SilentLoad);
+        assert!(matches!(
+            decide(load, SILENT_LOAD * 2, short),
+            ServeStartupDecision::Continue(_)
+        ));
+    }
+
     #[test]
     fn only_a_stall_or_the_deadline_leaves_the_server_running() {
         let stop = |reason, process_alive| ServeStartupStop {
@@ -1851,6 +1898,20 @@ mod tests {
     fn redact_log_line_masks_keys_tokens_and_secret_flags() {
         let key = "sk-endpoint-0123456789";
         for (raw, expected) in [
+            (
+                "launch --secret-key abc123 --private-key def456 --port 8000",
+                "launch --secret-key [redacted] --private-key [redacted] --port 8000",
+            ),
+            // A value ending in a multi-byte character is cut at a character
+            // boundary, not one byte past the start of that character.
+            (
+                "launch --api-key clé --port 8000",
+                "launch --api-key [redacted] --port 8000",
+            ),
+            (
+                "launch --api-key 'clé', --port 8000",
+                "launch --api-key '[redacted]', --port 8000",
+            ),
             (
                 "non-default args: {'model': 'qwen', 'api_key': 'sk-endpoint-0123456789', 'port': 8000}",
                 "non-default args: {'model': 'qwen', 'api_key': '[redacted]', 'port': 8000}",

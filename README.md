@@ -1150,7 +1150,7 @@ is already on is refused rather than silently ignored; omit `--port` to reuse
 the running service, or stop it first to serve on the new port.
 
 By default the server runs in the background under ROCm CLI's supervision.
-In a terminal it first prints the service id, how to follow its log
+For a fresh launch in a terminal it first prints the service id, how to follow its log
 (`rocm logs --service <service-id> --follow`) and, for a public bind, the
 API key. While it starts, the status line follows the engine: a download, a weight
 load, or the latest log line, until the server is ready or that wait fails

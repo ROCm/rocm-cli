@@ -182,12 +182,17 @@ pub(crate) fn start_managed_service(
     } else {
         status_for_readiness(readiness)
     };
-    record_wait_outcome(
+    let recorded = record_wait_outcome(
         paths,
         &mut record,
         launch_status,
         readiness == EndpointReadiness::Serving,
-    )?;
+    );
+    // After a stop, the stop is what the user needs to read; a record that
+    // could not be rewritten is best-effort there, as `settle_ended_launch` is.
+    if startup_stop.is_none() {
+        recorded?;
+    }
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
         paths,

@@ -430,8 +430,8 @@ rocm model --verbose"
     /// Picks an engine and ROCm runtime automatically unless overridden. An
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
-    /// server runs as a managed background service. In a terminal it first prints the
-    /// service id and how to follow its log; while it starts, the status line
+    /// server runs as a managed background service. For a fresh launch in a terminal it
+    /// first prints the service id and how to follow its log; while it starts, the status line
     /// follows what the engine is doing (download, load, or the latest log line) until
     /// the server is ready or that wait fails. A ready server then prints a deployment
     /// summary (status, endpoint, model, and smoke-test metrics). A wait that fails
