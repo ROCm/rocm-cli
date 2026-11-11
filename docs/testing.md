@@ -1563,6 +1563,52 @@ List registered managed or read-only runtimes and their exact side-by-side keys:
 rocm runtimes list
 ```
 
+Each runtime's row is followed by its `install_root:` and a `provenance:` line
+naming the `channel`, the package `source` (the wheel index, or the downloaded
+archive for a tarball install), the `source_layout_generation` and the exact
+`device_target` its manifest recorded, for example:
+
+```text
+      provenance: channel=nightly source=<wheel-index-url> source_layout_generation=next-v1 device_target=gfx1201
+```
+
+The values are the ones the manifest recorded: the package index, else the
+artifact URL (never the marker an adopted runtime keeps there); the layout
+field, else the wheel composition's; the recorded target, else the
+`device-<target>` extra in the package specs. For the layout and target this
+chooses the same recorded field `rocm update` uses, through the same accessors;
+`rocm update` then uses the value as recorded, while the listing trims it and
+prints a blank one as `unrecorded`. Each step moves on only when a field is
+absent, so a blank field is not skipped in favour of the next one, and a fact
+recorded nowhere also prints `unrecorded`. Nothing is guessed from other
+facts: a family-wide or tarball install shows `device_target=unrecorded` rather
+than a target guessed from its family, and a runtime registered with
+`rocm runtimes adopt` shows `source=unrecorded`. The chains, their precedence,
+the blank and trimming rules are pinned by
+`runtime_list_reads_each_provenance_fact_from_where_it_was_recorded`; blank or
+padded values are not what `rocm install sdk` writes, but can come from a
+hand-edited manifest or one brought in with `rocm runtimes import`. An adopted
+runtime's channel is the one adoption recorded: `release` when none was named
+(`adopted_runtime_lists_its_source_as_unrecorded`) and `nightly` after
+`--channel nightly` (`adopted_nightly_runtime_lists_its_channel_as_nightly`),
+both in [runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs).
+`rocm examine` prints the same four facts for the active runtime as
+`active_runtime_channel`, `active_runtime_source`,
+`active_runtime_source_layout_generation` and `active_runtime_device_target`,
+from the same fields. The unit tests
+`runtime_list_names_where_each_runtime_came_from` and
+`examine_names_the_active_runtime_provenance_the_listing_shows` in
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pin the values;
+`@id:runtime-lifecycle-list-names-runtime-provenance` (`runtime-lifecycle-19`)
+checks the listing end to end with a planted nightly runtime and an older one
+that recorded neither its layout nor an exact target, and
+`@id:examine-reports-where-the-active-runtime-came-from` (`examine-49`) checks
+the `examine` lines. Both plant read-only manifests and run on the mock lane:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-19 |examine-49 '
+```
+
 Activate one validated runtime:
 
 ```bash

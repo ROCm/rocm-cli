@@ -705,12 +705,29 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
 
-`list` shows each runtime's version, GPU family, mode, and whether it carries
-the compiler toolchain (`toolchain=included|excluded`). Runtimes are told apart
-by the packages they were installed from, not by version alone, so one version
-can appear more than once: a `--devel` install and a plain one of the same
-version are two separate runtimes, as are two installs that resolved different
-GPU device payloads.
+`list` shows each runtime's version (with its build date when the version
+encodes one), GPU family, mode, and whether it carries the compiler toolchain
+(`toolchain=included|excluded`). A `provenance:` line under each runtime names
+where it came from: its `channel`, the package `source` it was installed from
+(the wheel index, or the downloaded archive for a tarball install), its
+`source_layout_generation`, and the exact `device_target` its packages were
+installed for. The values are the ones the runtime's manifest recorded: the
+package index, else the artifact URL; the layout field, else the wheel
+composition's; the recorded target, else the `device-<target>` extra in the
+package specs. For the layout and target that is the same recorded field
+`rocm update` uses; the listing then trims the value and prints a blank one as
+`unrecorded`, as it does a fact recorded nowhere. Nothing is guessed from other
+facts (the target is never the family) — so a tarball or family-wide install
+shows `device_target=unrecorded`, and an adopted runtime, which installed
+nothing, shows `source=unrecorded`. An adopted runtime's channel is the one adoption
+recorded: `nightly` after `--channel nightly`, `release` when none was named.
+`rocm examine` reports the same four facts for the active runtime as
+`active_runtime_channel`, `active_runtime_source`,
+`active_runtime_source_layout_generation` and `active_runtime_device_target`.
+Runtimes are told apart by the packages they were installed from, not by
+version alone, so one version can appear more than once: a `--devel` install
+and a plain one of the same version are two separate runtimes, as are two
+installs that resolved different GPU device payloads.
 
 `activate` and `rollback` change which runtime the next install or server
 picks up. A server that is already running is not moved: it keeps serving on
