@@ -870,3 +870,43 @@ Feature: Interactive dashboard
     Then the serve wizard is closed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #796: on an idle host the Observe CPU panel drew a few scattered dots
+  # instead of a graph. Any sample whose fill rounded below one braille dot row
+  # was dropped, which on an idle machine is nearly every sample. The widget
+  # tests pin the dot maths; this scenario pins what the user sees, since the
+  # regression was only ever visible as a picture. The recording reports 2%
+  # overall and 1% per core, the idle host the demo generator never produces:
+  # that generator oscillates around 28%, far above the rounding that caused
+  # the bug. Sixty entries two seconds apart outlast the scenario, the
+  # recording technique dash-39 introduced.
+  #
+  # Observe gives its CPU slot about four rows, too few for the separate
+  # per-core box, so the dashboard keeps the box carrying history and folds the
+  # core count into its title. Both halves of that are asserted here: the count
+  # survived the dropped box, and the idle trace is a line rather than a gap.
+  @id:dash-idle-cpu-graph-is-continuous @requires-os:linux
+  Scenario: dash-50 - The CPU graph stays a line when the host is idle
+    When the user opens the dashboard replaying an idle host
+    When the user opens the Observe view
+    Then the CPU graph is drawn as a continuous line
+    And the CPU box reports the host's core count
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The other half of #796's layout change. dash-50 replays a 64-core host,
+  # which leaves the slot too narrow to split, so the per-core box is dropped
+  # and nothing there exercises the side-by-side layout.
+  #
+  # The core count decides this, not the terminal: the split wants two columns
+  # per core on each half, and widening does not help, because Observe grows
+  # side docks past a certain width and its centre column comes out *narrower*
+  # than at the detail geometry. So this replays a 16-core host at the same
+  # geometry dash-50 uses.
+  @id:dash-cpu-boxes-side-by-side @requires-os:linux
+  Scenario: dash-51 - A modest core count puts the CPU graph beside the per-core strip
+    When the user opens the dashboard replaying an idle 16-core host
+    When the user opens the Observe view
+    Then the CPU graph and the per-core strip sit side by side
+    When the user quits the dashboard
+    Then the dashboard exits successfully
