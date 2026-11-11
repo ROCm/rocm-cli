@@ -16,8 +16,8 @@
 //! [`ServiceRuntimeState`], [`RuntimeServiceEntry`], [`FailedServiceRestart`],
 //! [`RuntimeServiceReconciliation`] and [`ServiceRuntimePin`]. `RuntimesCommand`
 //! lives in `cli.rs` (part of the `Command`/`Cli` clap definition); `fn
-//! runtimes()` itself moved to `runtimes_cmd.rs` in Phase 6c (ROCMAI-89), which
-//! calls back into this file via `crate::runtime_services`.
+//! runtimes()` itself lives in `runtimes_cmd.rs`, which calls back into this
+//! file via `crate::runtime_services`.
 
 use std::fmt::Write as _;
 

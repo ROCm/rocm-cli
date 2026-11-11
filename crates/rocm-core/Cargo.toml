@@ -62,7 +62,7 @@ flate2 = "1"
 # its text, so the spelling and layout of a literal do not matter to it (its doc
 # comment lists what it still cannot see). Test-only; already in the lockfile
 # through the derive macros.
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 tar = "0.4"
 tempfile = "3"
 # `report_trend` writes its own civil calendar so the shipped crate needs no date

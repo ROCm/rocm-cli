@@ -61,7 +61,7 @@ cargo test -p xtask module_size
 
 ### Module map check
 
-Every production source file must have an entry in [architecture.md](architecture.md). The
+Every production source file, and every `.rs` file of `xtask` and the end-to-end harness, must have an entry in [architecture.md](architecture.md). The
 check runs in the `clippy` CI job and in the `architecture-doc` prek hook, and you can run it
 on its own:
 
@@ -69,9 +69,12 @@ on its own:
 cargo xtask check-architecture-doc
 ```
 
-It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
-does not link, and there is no exemption list; see
-[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
+It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src`, or under
+`xtask/src`, `tests/e2e-cucumber/src` or `tests/e2e-cucumber/tests`, that the doc does not
+link, and there is no exemption list; see
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers of a production
+crate need no entry; a file in the `xtask` and `tests/e2e-cucumber` trees does, whatever its
+name. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
