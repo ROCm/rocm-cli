@@ -28,10 +28,21 @@
 //!
 //! A publish by `rename` leaves the destination with the staged file's
 //! attributes and the ACL its directory hands down, where `ReplaceFileW` carries
-//! over those of the file it replaces. No caller of this module sets a hidden or
-//! read-only flag or a custom ACL on a file it writes, so nothing is lost today.
-//! A file that must keep such settings across a rewrite should not rely on this
-//! writer to carry them over.
+//! over those of the file it replaces. No caller of [`write_file_atomically`]
+//! sets a hidden or read-only flag or a custom ACL on a file it writes, so
+//! nothing is lost today. A file that must keep such settings across a rewrite
+//! should not rely on this writer to carry them over.
+//!
+//! [`write_owner_only_file_atomically`] is the variant for secrets. It stages
+//! the bytes in a file only the current user can open (see
+//! [`crate::owner_only_file`]) instead of copying the old file's permissions,
+//! and publishes by `rename` alone on every platform, never `ReplaceFileW`,
+//! because `ReplaceFileW` would carry the old file's ACL — possibly a loose
+//! one — over to the new contents. A destination another process holds open
+//! without delete sharing therefore makes it fail rather than fall back. It
+//! does not resolve a symbolic link at the destination either: the rename
+//! replaces the link with the new file instead of writing the secret through
+//! it to wherever it points.
 //!
 //! The fallback is the one path that can leave the destination absent:
 //! Microsoft documents that `ReplaceFileW`, called without a backup name, can
@@ -50,7 +61,8 @@
 //! the old file or the new one rather than an empty one. Windows has no
 //! directory flush here; there the rename's durability is the filesystem's.
 //!
-//! Replacing a file this way must not quietly change what the user set up:
+//! Replacing a file with [`write_file_atomically`] must not quietly change what
+//! the user set up:
 //!
 //! - on Unix the new file keeps the old one's permission bits, applied to the
 //!   temp file before any byte is written into it (on Windows nothing is
@@ -219,6 +231,17 @@ fn process_temp_id() -> String {
     format!("{}-{}", std::process::id(), unix_time_millis())
 }
 
+/// How a staged file gets its permissions before any byte is written into it.
+#[derive(Clone, Copy, Debug)]
+enum StagingMode {
+    /// Copy the permission bits of the file it will replace, if any (Unix
+    /// only; see `keep_existing_permissions`).
+    KeepExisting,
+    /// Create it readable and writable by the current user only, whatever the
+    /// file it replaces allowed.
+    OwnerOnly,
+}
+
 /// Replace `path` with `bytes` atomically, creating missing parent directories.
 pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = process_temp_id();
@@ -280,9 +303,36 @@ where
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
     let path = resolve_symlink_target(path)?;
-    let tmp = stage_file_for_atomic_publish_with(&path, bytes, suffix_for_attempt)?;
+    let tmp = stage_file_for_atomic_publish_with(
+        &path,
+        bytes,
+        suffix_for_attempt,
+        StagingMode::KeepExisting,
+    )?;
     before_publish();
     publish_staged_file_with(&tmp, &path, publish)
+}
+
+/// Replace `path` with `bytes` atomically, as a file only the current user can open.
+///
+/// Mode `0600` on Unix, a protected DACL granting only the current user on
+/// Windows. Creates missing parent directories.
+///
+/// Unlike [`write_file_atomically`], nothing of the file being replaced is
+/// kept: a key file someone loosened to `0644`, or one that inherited a
+/// readable ACL, comes back owner-only. The publish is a plain rename on every
+/// platform, so it fails, leaving the old file in place, when another process
+/// holds the destination open without delete sharing. A symbolic link at
+/// `path` is replaced, not followed. See the module doc.
+pub fn write_owner_only_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_id = process_temp_id();
+    let tmp = stage_file_for_atomic_publish_with(
+        path,
+        bytes,
+        |attempt| OsString::from(format!("{temp_id}-{attempt}")),
+        StagingMode::OwnerOnly,
+    )?;
+    publish_staged_file_with(&tmp, path, rename_file)
 }
 
 /// The file a write to `path` should replace: `path` itself, or — when it is
@@ -326,15 +376,19 @@ fn resolve_symlink_target(path: &Path) -> Result<PathBuf> {
 /// publishing it over that `path` replaces the link with a regular file.
 pub fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let temp_id = process_temp_id();
-    stage_file_for_atomic_publish_with(path, bytes, |attempt| {
-        OsString::from(format!("{temp_id}-{attempt}"))
-    })
+    stage_file_for_atomic_publish_with(
+        path,
+        bytes,
+        |attempt| OsString::from(format!("{temp_id}-{attempt}")),
+        StagingMode::KeepExisting,
+    )
 }
 
 fn stage_file_for_atomic_publish_with<S>(
     path: &Path,
     bytes: &[u8],
     suffix_for_attempt: S,
+    mode: StagingMode,
 ) -> Result<PathBuf>
 where
     S: FnMut(u32) -> OsString,
@@ -342,9 +396,13 @@ where
     // Flushed before it can be published: a rename that reaches the disk
     // before the data would leave an empty file under the real name after a
     // crash. A full disk can surface in the flush rather than in `write_all`.
-    stage_file_for_atomic_publish_with_writer(path, bytes, suffix_for_attempt, |file, bytes| {
-        write_then_flush(file, bytes, fs::File::sync_all)
-    })
+    stage_file_for_atomic_publish_with_writer(
+        path,
+        bytes,
+        suffix_for_attempt,
+        mode,
+        |file, bytes| write_then_flush(file, bytes, fs::File::sync_all),
+    )
 }
 
 /// [`stage_file_for_atomic_publish_with`] with the write into the reserved
@@ -354,6 +412,7 @@ fn stage_file_for_atomic_publish_with_writer<S, W>(
     path: &Path,
     bytes: &[u8],
     mut suffix_for_attempt: S,
+    mode: StagingMode,
     write: W,
 ) -> Result<PathBuf>
 where
@@ -367,11 +426,14 @@ where
     for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
         let suffix = suffix_for_attempt(attempt);
         let tmp = temp_sibling_path(path, &suffix)?;
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
+        let opened = match mode {
+            StagingMode::KeepExisting => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp),
+            StagingMode::OwnerOnly => crate::owner_only_file::open_new_owner_only(&tmp),
+        };
+        match opened {
             Ok(file) => {
                 reserved = Some((tmp, file));
                 break;
@@ -391,8 +453,13 @@ where
     };
 
     // Before any byte is written, so a private file's new contents are never
-    // readable under the wider default mode, even for a moment.
-    if let Err(error) = keep_existing_permissions(path, &tmp) {
+    // readable under the wider default mode, even for a moment. An owner-only
+    // file was created narrow and must not be widened to the old file's mode.
+    let kept = match mode {
+        StagingMode::KeepExisting => keep_existing_permissions(path, &tmp),
+        StagingMode::OwnerOnly => Ok(()),
+    };
+    if let Err(error) = kept {
         drop(file);
         let _ = fs::remove_file(&tmp);
         return Err(error);
@@ -611,11 +678,11 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
     recover_partial_replace(io::Error::last_os_error(), replacement, path, rename_file)
 }
 
-/// `fs::rename` with both paths borrowed, the shape `recover_partial_replace`
-/// and `publish_rename_first` take. `fs::rename` itself is generic over
-/// `AsRef<Path>`, so passed directly it is pinned to one lifetime per argument
-/// and does not satisfy their `FnOnce(&Path, &Path)` bounds.
-#[cfg(windows)]
+/// `fs::rename` with both paths borrowed, the shape `recover_partial_replace`,
+/// `publish_rename_first` and `publish_staged_file_with` take. `fs::rename`
+/// itself is generic over `AsRef<Path>`, so passed directly it is pinned to one
+/// lifetime per argument and does not satisfy their `FnOnce(&Path, &Path)`
+/// bounds.
 fn rename_file(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
@@ -648,6 +715,7 @@ mod tests {
             &destination,
             b"payload",
             |attempt| OsString::from(format!("full-disk-{attempt}")),
+            StagingMode::KeepExisting,
             |_, _| Err(io::Error::from(io::ErrorKind::StorageFull)),
         )
         .expect_err("a write that hits a full disk must fail");
@@ -683,10 +751,15 @@ mod tests {
         fs::write(&taken, b"another writer's staged file").unwrap();
         let mut tries = 0;
 
-        let error = stage_file_for_atomic_publish_with(&destination, b"payload", |_| {
-            tries += 1;
-            OsString::from("taken")
-        })
+        let error = stage_file_for_atomic_publish_with(
+            &destination,
+            b"payload",
+            |_| {
+                tries += 1;
+                OsString::from("taken")
+            },
+            StagingMode::KeepExisting,
+        )
         .expect_err("a writer that finds every name taken must fail");
 
         let foreign = fs::read(&taken);
@@ -969,14 +1042,18 @@ mod tests {
                     // Both threads ask for the same first name, as two writers
                     // sharing a pid and a millisecond would, so the collision
                     // happens every run rather than when the clock lines up.
-                    let staged =
-                        stage_file_for_atomic_publish_with(&destination, bytes, |attempt| {
+                    let staged = stage_file_for_atomic_publish_with(
+                        &destination,
+                        bytes,
+                        |attempt| {
                             if attempt == 0 {
                                 OsString::from("same-millisecond")
                             } else {
                                 OsString::from(format!("same-millisecond-{writer}-{attempt}"))
                             }
-                        })?;
+                        },
+                        StagingMode::KeepExisting,
+                    )?;
                     before_publish.wait();
                     publish_staged_file(&staged, &destination)
                 })
@@ -1340,7 +1417,6 @@ mod tests {
     }
 
     /// The names in `dir`, sorted.
-    #[cfg(unix)]
     fn names_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -1394,6 +1470,7 @@ mod tests {
                 &destination,
                 b"secret",
                 |attempt| OsString::from(format!("mode-{attempt}")),
+                StagingMode::KeepExisting,
                 |file, bytes| {
                     mode_while_writing = Some(file.metadata()?.permissions().mode() & 0o777);
                     file.write_all(bytes)
@@ -1561,5 +1638,153 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(names, ["a.json", "b.json"]);
+    }
+
+    /// A secret file someone loosened comes back owner-only: unlike
+    /// [`write_file_atomically`], the owner-only writer does not keep the old
+    /// mode, and does not leave a temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn write_owner_only_file_atomically_tightens_a_loosened_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch_dir("owner-only-loosened");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("svc.endpoint-key");
+        fs::write(&destination, b"old").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_owner_only_file_atomically(&destination, b"new").unwrap();
+
+        let mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        let contents = fs::read(&destination).unwrap();
+        let names = names_in(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+        assert_eq!(contents, b"new");
+        assert_eq!(names, ["svc.endpoint-key"]);
+    }
+
+    /// A new file, in a directory that does not exist yet, is created 0600.
+    #[cfg(unix)]
+    #[test]
+    fn write_owner_only_file_atomically_creates_a_new_file_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch_dir("owner-only-new");
+        let destination = root.join("services").join("svc.endpoint-key");
+
+        write_owner_only_file_atomically(&destination, b"key").unwrap();
+
+        let mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        let contents = fs::read(&destination).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+        assert_eq!(contents, b"key");
+    }
+
+    /// A symbolic link at the destination is replaced by the new file, not
+    /// followed: the secret must not be written to wherever the link points,
+    /// and the link's target keeps its contents and mode.
+    #[cfg(unix)]
+    #[test]
+    fn write_owner_only_file_atomically_replaces_a_symlink_instead_of_following_it() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = scratch_dir("owner-only-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("elsewhere");
+        fs::write(&target, b"untouched").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let destination = root.join("svc.endpoint-key");
+        symlink(&target, &destination).unwrap();
+
+        write_owner_only_file_atomically(&destination, b"secret").unwrap();
+
+        let is_link = fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let contents = fs::read(&destination).unwrap();
+        let mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        let target_contents = fs::read(&target).unwrap();
+        let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&root);
+        assert!(!is_link, "the link was kept and followed");
+        assert_eq!(contents, b"secret");
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+        assert_eq!(target_contents, b"untouched");
+        assert_eq!(target_mode, 0o644);
+    }
+
+    /// A publish that cannot rename over the destination fails, leaves the
+    /// destination alone and removes the staged file, so no stray copy of the
+    /// secret stays on disk.
+    #[test]
+    fn write_owner_only_file_atomically_cleans_up_when_the_rename_fails() {
+        let root = scratch_dir("owner-only-rename-fails");
+        let destination = root.join("svc.endpoint-key");
+        // A non-empty directory cannot be replaced by a rename on any platform.
+        fs::create_dir_all(destination.join("occupied")).unwrap();
+
+        let error = write_owner_only_file_atomically(&destination, b"secret")
+            .expect_err("renaming a file over a directory must fail");
+
+        let names = names_in(&root);
+        let still_a_dir = destination.join("occupied").is_dir();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            format!("{error:#}").contains("failed to publish"),
+            "{error:#}"
+        );
+        assert_eq!(names, ["svc.endpoint-key"]);
+        assert!(still_a_dir);
+    }
+
+    /// On Windows a destination that inherited or was given a loose DACL comes
+    /// back with a protected DACL granting only the current user, because the
+    /// publish is a rename of a file created owner-only, never a
+    /// `ReplaceFileW` that would carry the old DACL over.
+    #[cfg(windows)]
+    #[test]
+    fn write_owner_only_file_atomically_replaces_a_loose_dacl_with_an_owner_only_one() {
+        use crate::owner_only_file::owner_only_sddl;
+        use crate::owner_only_file::win32::test_support::{
+            canonical_sddl, dacl_sddl, flags_and_entries,
+        };
+        use crate::owner_only_file::win32::{create_new_with_sddl, current_user_sid};
+
+        let root = scratch_dir("owner-only-dacl");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("svc.endpoint-key");
+        let sid = current_user_sid().unwrap();
+        // Everyone (`WD`) may read and write it, and it inherits too.
+        let loose = format!("D:(A;;FA;;;WD)(A;;FA;;;{sid})");
+        let mut file = create_new_with_sddl(&destination, &loose).unwrap();
+        file.write_all(b"old").unwrap();
+        drop(file);
+        let before = dacl_sddl(&destination).unwrap();
+
+        write_owner_only_file_atomically(&destination, b"new").unwrap();
+
+        let after = dacl_sddl(&destination).unwrap();
+        let expected = canonical_sddl(&owner_only_sddl(&sid)).unwrap();
+        let contents = fs::read(&destination).unwrap();
+        let names = names_in(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            before.contains(";;;WD)"),
+            "the setup DACL is not loose: {before}"
+        );
+        let (flags, entries) = flags_and_entries(&after);
+        let (_, expected_entries) = flags_and_entries(&expected);
+        assert!(flags.contains('P'), "the DACL is not protected: {after}");
+        assert_eq!(
+            entries, expected_entries,
+            "the DACL grants more than the user"
+        );
+        assert_eq!(contents, b"new");
+        assert_eq!(names, ["svc.endpoint-key"]);
     }
 }

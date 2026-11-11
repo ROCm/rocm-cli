@@ -697,7 +697,7 @@ mod tests {
     ///
     /// `rocm` passes `endpoint_key_file: None` for every external engine
     /// plugin — a third-party binary — and the path it would otherwise carry
-    /// points at a mode-0600 file holding a live endpoint credential. Merely
+    /// points at an owner-only file holding a live endpoint credential. Merely
     /// not setting it would still hand the value through whenever this process
     /// inherited one.
     ///

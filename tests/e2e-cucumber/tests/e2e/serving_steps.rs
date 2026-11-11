@@ -3627,3 +3627,82 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
         std::fs::read_to_string(&claim_path).ok()
     );
 }
+
+/// Serve this host's small model on loopback with `--require-api-key`, so the
+/// CLI generates a key and stores it before the engine starts. Readiness is not
+/// awaited — the key file is what the scenario checks, and it exists from before
+/// the spawn — and the World's teardown stops the service.
+#[when("the user serves a model that requires an API key")]
+async fn user_serves_model_requiring_api_key(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--require-api-key",
+        ],
+    );
+    assert_eq!(
+        rc, 0,
+        "`rocm serve {model} --engine {engine} --managed --require-api-key` failed:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The one key file the serve wrote belongs to the service it recorded, holds
+/// a key, and is mode 0600 exactly: no group or other bit, and nothing the
+/// owner would need missing.
+#[then("the server's API key is kept where only that user can read it")]
+async fn endpoint_key_is_owner_only(world: &mut E2eWorld) {
+    let services_dir = world.app_paths().data_dir.join("services");
+    let key_files: Vec<PathBuf> = std::fs::read_dir(&services_dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", services_dir.display()))
+        .map(|entry| entry.expect("services dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "endpoint-key"))
+        .collect();
+    assert_eq!(
+        key_files.len(),
+        1,
+        "expected exactly one endpoint key file in {}, found {key_files:?}",
+        services_dir.display()
+    );
+    let key_file = &key_files[0];
+    let record = key_file.with_extension("json");
+    assert!(
+        record.is_file(),
+        "the key file {} has no service record beside it",
+        key_file.display()
+    );
+    let key = std::fs::read_to_string(key_file).expect("the owner can read the key back");
+    assert!(
+        !key.trim().is_empty(),
+        "the key file {} is empty",
+        key_file.display()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(key_file)
+            .expect("key file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "the key file {} is mode {mode:o}, not 0600",
+            key_file.display()
+        );
+    }
+    #[cfg(not(unix))]
+    panic!("this step checks a Unix file mode; its scenario is tagged @requires-os:linux");
+}

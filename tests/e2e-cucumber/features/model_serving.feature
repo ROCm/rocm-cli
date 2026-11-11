@@ -906,3 +906,23 @@ Feature: Model serving
     And the user is told the model needs an explicit GGUF variant
     And no quantization is suggested for a repo the CLI has not inspected
     And no local server was recorded
+
+  # A served endpoint's API key sits in `<data>/services/<id>.endpoint-key`, and
+  # nobody but the user who started the server may read it. Here: a loopback
+  # serve with `--require-api-key` (so no public port is opened on the GPU box),
+  # then the key file's mode is checked to be exactly 0600. The file is replaced
+  # by a freshly created owner-only one on every store, so a mode loosened in
+  # place is tightened again; that re-store case is covered by the unit tests in
+  # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
+  # the key before a restart writes it back. Readiness is not awaited: the key is
+  # written before the engine starts, and the scenario's teardown stops the
+  # service. Linux-only: on Windows the key is protected by an owner-only DACL
+  # instead, but the Windows GPU lane serves with Lemonade, which refuses a
+  # key-protected bind there (`ensure_public_bind_engine_supported` in
+  # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the
+  # `rocm-core` unit tests that read the DACL back on the Windows build job.
+  @id:serve-endpoint-key-readable-by-owner-only @requires-gpu @requires-os:linux
+  Scenario: serve-57 - Only the user who started a key-protected server can read its key
+    Given a managed runtime is active
+    When the user serves a model that requires an API key
+    Then the server's API key is kept where only that user can read it

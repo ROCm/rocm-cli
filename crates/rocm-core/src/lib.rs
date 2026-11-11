@@ -40,6 +40,7 @@ pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
+pub mod owner_only_file;
 mod package_plan;
 pub mod paths;
 pub mod placeholder;

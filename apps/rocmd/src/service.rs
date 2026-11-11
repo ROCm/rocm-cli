@@ -147,7 +147,7 @@ pub(crate) fn stop_managed_service_via(
         record.stop_requested_unix_ms = Some(requested_at);
     }
     record.write()?;
-    // Drop the 0600 endpoint key file with the service, rather than stranding a
+    // Drop the owner-only endpoint key file with the service, rather than stranding a
     // plaintext secret on disk for something that is no longer running.
     // Best-effort and idempotent: a missing key file is not an error, so a
     // loopback service that never had one, and a repeated stop, both pass

@@ -1124,7 +1124,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let managed_runtime_id = resolved_selection.runtime_id.clone();
     let managed_env_id = resolved_selection.env_id.clone();
 
-    // Persist the endpoint key (public bind only) in a 0600 file so the engine
+    // Persist the endpoint key (public bind only) in an owner-only file so the engine
     // child, the restart/recovery path, and inspection commands can retrieve it by
     // service id. Loopback binds resolve to `None` and store nothing.
     if let Some(key) = endpoint_auth.as_deref() {
@@ -1239,7 +1239,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
                 spinner.set_label("Running smoke test…");
                 // The local provider resolves the endpoint key from the per-service
-                // 0600 key file by service id, so the smoke test authenticates
+                // owner-only key file by service id, so the smoke test authenticates
                 // against a protected public endpoint without threading the secret
                 // through here.
                 serve_summary::run_smoke_test(&paths, resolve.served_model_name())

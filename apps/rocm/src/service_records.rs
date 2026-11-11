@@ -164,7 +164,7 @@ fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result
 /// state file, and `refresh_managed_service_runtime_liveness` then returns early
 /// for any non-live status without ever consulting the recorded pids — so a
 /// server whose engine reported failure while its process is still up reads as
-/// removable, and deleting it takes the log and the 0600 endpoint key out from
+/// removable, and deleting it takes the log and the owner-only endpoint key out from
 /// under a process that may still be serving.
 ///
 /// A recorded process that could not be queried (on Windows, a live one this
@@ -465,7 +465,7 @@ fn describe_hours(hours: u64) -> String {
 /// reason.
 ///
 /// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
-/// like: `serve` writes the 0600 `<id>.endpoint-key` before
+/// like: `serve` writes the owner-only `<id>.endpoint-key` before
 /// `spawn_managed_engine_child` (in `service_launch/spawn.rs`) writes the first
 /// `<id>.json`. Nothing about
 /// the file distinguishes the two cases — under `--any-age` there is no age gate
@@ -730,7 +730,7 @@ fn apply_service_prune_plan_with(
     for entry in &plan.remove {
         // Liveness was snapshotted while the plan was built. A
         // `rocm services restart <id> --yes` landing in that window would have
-        // its log and 0600 endpoint key deleted out from under a live process,
+        // its log and owner-only endpoint key deleted out from under a live process,
         // so re-read the record immediately before touching its files —
         // `remove` narrows the same window by loading the record it deletes.
         // Neither closes it: the check and the delete are not atomic either way.
@@ -774,7 +774,7 @@ fn apply_service_prune_plan_with(
 ///
 /// [`collect_service_orphans`] calls a file with no `<id>.json` beside it a
 /// leftover, and that is also what a launch looks like mid-flight: `serve`
-/// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
+/// writes the owner-only `<id>.endpoint-key` at the top of the managed path, and the
 /// first `<id>.json` only lands at `record.write()` inside
 /// `spawn_managed_engine_child` (in `service_launch/spawn.rs`). Between those two
 /// writes a live server's secret is indistinguishable from a leftover, and
@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     /// The window the launch lock exists to close here: `serve` writes
-    /// the 0600 endpoint key *before* the first manifest, so between those two
+    /// the owner-only endpoint key *before* the first manifest, so between those two
     /// writes a live server's key has no `<id>.json` beside it — the exact shape
     /// the sweep calls a leftover, and `--any-age` leaves no age gate to hide it
     /// behind. `serve` holds the managed-launch lock across the whole of that
@@ -1656,7 +1656,7 @@ mod tests {
     /// adopts `failed` straight from the engine's own state file and the
     /// liveness refresh then returns early for a non-live status, so a server
     /// whose engine reported failure while its process is still up would be
-    /// removable — taking the log and the 0600 endpoint key of a live process.
+    /// removable — taking the log and the owner-only endpoint key of a live process.
     #[test]
     fn services_removal_refuses_a_failed_record_whose_process_is_still_alive() -> Result<()> {
         let (root, paths) = test_paths("services-remove-live-pid");
@@ -1778,7 +1778,7 @@ mod tests {
     /// The window the pre-delete liveness re-check exists to narrow: the plan is
     /// built from a snapshot, and a `rocm services restart <id> --yes` landing
     /// between that snapshot and the delete would otherwise have its log and its
-    /// 0600 endpoint key deleted out from under a serving process.
+    /// owner-only endpoint key deleted out from under a serving process.
     ///
     /// Driven through [`apply_service_prune_plan`] with a hand-built plan
     /// because the window cannot be opened from outside: `prune` builds and
@@ -1830,7 +1830,7 @@ mod tests {
         );
         assert!(
             key_exists,
-            "the 0600 endpoint key of a live process must survive:\n{}",
+            "the owner-only endpoint key of a live process must survive:\n{}",
             outcome.text
         );
         assert_eq!(outcome.removed_records, 0);

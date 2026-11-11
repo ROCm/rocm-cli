@@ -25,7 +25,7 @@ const ENGINE: &str = "vllm";
 /// A record whose manifest a user already deleted by hand, leaving its engine
 /// state file stranded — the state this feature has to be able to clean up.
 const ORPHAN_ID: &str = "vllm-e2e-hand-deleted";
-/// A service whose `rocm serve` has written its 0600 endpoint key but not yet
+/// A service whose `rocm serve` has written its owner-only endpoint key but not yet
 /// its record — the launch-in-progress shape the leftover sweep must not
 /// mistake for something to delete.
 const STARTING_ID: &str = "vllm-e2e-still-starting";
@@ -242,7 +242,7 @@ async fn orphaned_engine_state(world: &mut E2eWorld) {
 }
 
 /// A managed launch caught between its two writes, staged exactly as `rocm
-/// serve` stages it: the 0600 endpoint key is on disk, the record is not, and
+/// serve` stages it: the owner-only endpoint key is on disk, the record is not, and
 /// the managed-launch lock is held across the whole of that interval.
 ///
 /// The lock is taken with the production [`rocm_core::FileLock`] on the real
@@ -547,7 +547,7 @@ async fn prune_did_not_return_before_the_hold(world: &mut E2eWorld) {
     );
 }
 
-/// The scenario's discriminating assertion: the 0600 key of a launch that has
+/// The scenario's discriminating assertion: the owner-only key of a launch that has
 /// not published its record yet must survive the sweep.
 ///
 /// It discriminates only while `rocm`'s startup is shorter than the staged hold.

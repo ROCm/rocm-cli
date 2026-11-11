@@ -6,8 +6,8 @@ Feature: Local server record cleanup
   #
   # A record owns FOUR files, and only two of them sit in the services folder:
   # the details file and the log live there, the engine state file lives under
-  # `<data>/engines/<engine>/state/`, and a public serve also leaves a 0600
-  # endpoint key file. Deleting the two obvious ones — the documented manual
+  # `<data>/engines/<engine>/state/`, and a public serve also leaves an
+  # owner-only endpoint key file. Deleting the two obvious ones — the documented manual
   # workaround — is what orphans the rest, so these scenarios assert on all of
   # them rather than on the command's own summary line.
   #
@@ -84,7 +84,7 @@ Feature: Local server record cleanup
     And the record's other files are gone
     And the prune is still recorded in the audit log
 
-  # `rocm serve` writes the 0600 endpoint key file *before* it writes the
+  # `rocm serve` writes the owner-only endpoint key file *before* it writes the
   # record, so a server that is still coming up has a key with no record beside
   # it — exactly what the leftover sweep above looks for, and `--any-age` leaves
   # no age rule to hide behind. `serve` holds the shared launch lock across both

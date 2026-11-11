@@ -2062,15 +2062,28 @@ on a non-default `--host` is still required: automatic selection only probes
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
 credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
-variable, or let one be generated. The key is handed to the engine via a 0600
-key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
-which is unavailable on headless serving hosts), and printed once as client
+variable, or let one be generated. The key is handed to the engine via a key
+file (never argv), persisted as a per-service file (not the OS keychain, which
+is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
-audit log. Verifying that the running server actually *rejects* an
-unauthenticated request requires a live engine; that end-to-end assertion is a
-deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
-(`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
-generation, the 0600 key file, and key-file resolution.
+audit log. Only the serving user can read the key file: it is mode 0600 on Unix
+and has a protected DACL granting only that user on Windows, and every store
+replaces it with a freshly created owner-only file, so permissions loosened in
+place do not survive a re-store. Verifying that the running server actually
+*rejects* an unauthenticated request requires a live engine; that end-to-end
+assertion is a deferred follow-up and is **not yet** exercised by the GPU
+acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
+key policy, generation, the owner-only key file (including one whose
+permissions were loosened before a re-store, and on the Windows build job the
+DACL read back from disk), and key-file resolution; `serve-57`
+(`@id:serve-endpoint-key-readable-by-owner-only` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature))
+checks the mode of a real serve's key file on the Linux GPU lanes.
+
+```bash
+cargo test -p rocm-core --lib owner_only
+cargo test -p rocm --bin rocm endpoint_keys
+```
 
 The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
@@ -2096,7 +2109,7 @@ service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being
-deleted, so keeping its key would strand a 0600 secret belonging to a service
+deleted, so keeping its key would strand an owner-only secret belonging to a service
 that can no longer be restarted. Neither will touch a record the liveness
 refresh still reads as running, and `prune` re-checks liveness immediately
 before each delete — but the check and the delete are not atomic, so that
@@ -2120,7 +2133,7 @@ error names to confirm it works and does not list the id.
 
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
-writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
+writes the owner-only endpoint key before it writes the record, and `--any-age` leaves
 no age rule to hide that window behind. `serve` already holds the shared
 managed-launch lock across both writes, so `prune` acquires the same lock before
 it reads the directory.

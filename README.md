@@ -1174,7 +1174,8 @@ the memory fraction when a small model shouldn't reserve most of a large card.
 
 `--require-api-key` makes a loopback endpoint require an API key too, which
 matters when something else republishes the port. A public bind generates a key
-automatically unless you supply one. Set `ROCM_SERVE_API_KEY` rather than
+automatically unless you supply one. The key is kept in a file under the data
+directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather than
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 

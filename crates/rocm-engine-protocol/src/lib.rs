@@ -23,7 +23,7 @@ pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
 pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 
-/// Environment variable holding a *path* to a 0600 file whose contents are the
+/// Environment variable holding a *path* to an owner-only file whose contents are the
 /// endpoint API key.
 ///
 /// `rocm serve` sets this explicitly on the internal `__engine-serve-http` child
@@ -110,7 +110,7 @@ pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Deterministic path of the 0600 endpoint key file for `service_id`.
+/// Deterministic path of the owner-only endpoint key file for `service_id`.
 ///
 /// Shared so both binaries that need to locate a service's key file — `rocm`
 /// (which owns writing and clearing it) and `rocmd` (which only re-threads

@@ -267,7 +267,7 @@ pub(crate) fn serve_direct_llama_server(
     }
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
-    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
+    // CLI-managed owner-only key file via `--api-key-file` (a path, not the value, so the
     // secret never lands in the process table). Reusing the managed file rather than
     // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
     // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.

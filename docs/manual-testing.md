@@ -985,6 +985,31 @@ Expected result:
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
 
+#### Endpoint key permissions
+
+A server's API key file must be readable by the user who started it and nobody
+else. On Linux, serve with a key and check the file's mode:
+
+```bash
+rocm serve <model> --managed --require-api-key
+stat -c '%a %U' <data>/services/<service-id>.endpoint-key
+```
+
+Expected result: `600` and your user name.
+
+On native Windows `rocm serve` writes no key file today (a key-protected bind
+is refused for Lemonade there, and vLLM does not run natively), but
+`rocm remote serve <machine> <model>` stores its session key the same way.
+From PowerShell, after it reports the endpoint:
+
+```powershell
+icacls <data>\remote-sessions\<session-id>.endpoint-key
+```
+
+Expected result: exactly one entry, for your own account, with `(F)` and no
+`(I)` (inherited) flag — no `Administrators`, `SYSTEM`, `Users` or
+`Authenticated Users` entry, even when `<data>` is a folder those can read.
+
 ### 4a. Dashboard Doctor Report
 
 On a machine whose hardware `rocm diagnose --report` can describe (see
