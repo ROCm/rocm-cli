@@ -3046,6 +3046,100 @@ async fn assert_only_the_summary_reports_the_cpu_on_wsl(world: &mut E2eWorld) {
     );
 }
 
+// ── A probe tool that leaves a background process behind ───────────────────
+
+/// How long the stand-in `lspci`'s background process keeps the pipes it
+/// inherited open, which is how long a probe that waits for end of output waits.
+const LEFTOVER_PROCESS_SECONDS: u64 = 30;
+
+/// An inspection that finishes within this did not wait for that process. Half
+/// its life, so a loaded runner has the whole of the other half to be slow in.
+const INSPECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The PCI address and the line the stand-in `lspci` prints for its one GPU. The
+/// bus number is one no real machine's first adapter has, so the line cannot be
+/// mistaken for a card of the runner's own.
+const LEFTOVER_LSPCI_ADDRESS: &str = "0000:fe:00.0";
+const LEFTOVER_LSPCI_LINE: &str = "0000:fe:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX] [1002:744c] (rev c8)";
+
+#[given(
+    "a machine whose lspci prints a GPU and leaves a background process holding its output open"
+)]
+async fn machine_whose_lspci_leaves_a_background_process(world: &mut E2eWorld) {
+    // A simulated native Linux root: the PCI probe is skipped on WSL, so a runner
+    // that is a WSL host would otherwise never reach the stand-in.
+    plant_os_release(world, "ID=ubuntu\nVERSION_ID=\"24.04\"\n");
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("leftover-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in lspci's directory");
+    // The `sleep` starts in the background of the script, so it inherits the
+    // script's stdout and stderr, the pipes `rocm` reads the listing from, and
+    // outlives the script, which exits 0 straight after printing.
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("lspci"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{LEFTOVER_LSPCI_LINE}'\nsleep {LEFTOVER_PROCESS_SECONDS} &\n"
+        ),
+    )
+    .expect("failed to write the stand-in lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user inspects that machine in machine-readable form and the time it takes is measured")]
+async fn user_times_an_inspection_of_the_planted_machine(world: &mut E2eWorld) {
+    let started = std::time::Instant::now();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_elapsed = Some(started.elapsed());
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the inspection finishes long before the background process does")]
+async fn assert_the_inspection_did_not_wait_for_the_background_process(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let elapsed = world.cli_elapsed.expect("the inspection was not timed");
+    assert!(
+        elapsed < INSPECTION_BUDGET,
+        "the inspection took {elapsed:?}, so it waited for the {LEFTOVER_PROCESS_SECONDS}s \
+         background process that held `lspci`'s output open"
+    );
+}
+
+#[then("the inspection lists the GPU that lspci printed")]
+async fn assert_the_gpu_lspci_printed_is_listed(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let listed = json
+        .pointer("/gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no `gpus` array:\n{json:#}"))
+        .iter()
+        .find(|gpu| {
+            gpu.pointer("/pci_id").and_then(serde_json::Value::as_str)
+                == Some(LEFTOVER_LSPCI_ADDRESS)
+        })
+        .unwrap_or_else(|| {
+            panic!("the GPU `lspci` printed at {LEFTOVER_LSPCI_ADDRESS} is not listed:\n{json:#}")
+        });
+    assert_eq!(
+        listed
+            .pointer("/is_amd")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "{listed:#}"
+    );
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]
