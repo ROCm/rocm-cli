@@ -138,6 +138,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn managed_child_liveness_windows_tracks_a_real_child_through_termination() {
+        // In scope implicitly while this lived in `process.rs`; named here
+        // because the move took it out of that module.
+        use crate::process::terminate_process;
+        use std::ffi::OsString;
+        use std::process::Command;
         use std::time::{Duration, Instant};
 
         // A child that outlives the assertions below without finishing on its

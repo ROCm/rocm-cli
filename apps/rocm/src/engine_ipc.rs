@@ -53,9 +53,15 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+// Both are reached only from `run_scripted_e2e_engine_serve_http`, which is
+// itself behind this feature; ungated they are unused in a default build.
+#[cfg(feature = "e2e-test-hooks")]
+use std::thread;
 #[cfg(feature = "e2e-test-hooks")]
 use std::time::Duration;
 
+#[cfg(feature = "e2e-test-hooks")]
+use anyhow::bail;
 use anyhow::{Context, Result};
 use rocm_core::{
     AppPaths, ENGINE_ENVS_ROOT_ENV, ManagedServiceRecord, engine_binary_path, engine_plugin_dirs,
