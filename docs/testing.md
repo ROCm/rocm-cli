@@ -1991,7 +1991,7 @@ cargo test -p rocm-engine-protocol endpoint_api_key
 cargo test -p rocm-core is_public_bind_host
 cargo test -p rocm-core endpoint_key
 cargo test -p rocm --bin rocm the_command_a_respawn_refusal_names_clears_the_refusal
-cargo test -p rocmd recovery_respawn_fails_closed
+cargo test -p rocmd server_recover_passes_
 cargo test -p rocmd supervising_a_
 cargo test -p rocmd server_recover_refuses_a_keyless_public_service
 cargo test -p rocmd apply_endpoint_key_env
