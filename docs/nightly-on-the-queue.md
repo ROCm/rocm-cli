@@ -108,9 +108,10 @@ channels are the command's, not the queue's: the default command runs the
 nightly`), each with its own runtimes and its own suite run, so a lane takes
 about twice as long as one channel would. That time has not been measured on a
 queue lane from a cold start, so a lane that cannot finish both channels within
-the run's wait (which also covers waiting for a GPU, and is 14400 s, 4 h, unless a run
-sets another) is reported as **incomplete**; the wait can be raised for a run, up to its limit. Both always run, so a failing
-channel does not hide the other, and the lane fails if either did.
+the run's wait (which also covers waiting for a GPU) is reported as
+**incomplete**; the wait can be raised for a run, up to its limit (see the
+run's inputs above). Both always run, so a failing channel does not hide the
+other, and the lane fails if either did.
 
 The queue's results are an additional signal, not a replacement: the lanes
 write only into the queue artifact, and the `e2e-gpu-<channel>-report`

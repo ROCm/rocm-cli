@@ -9011,9 +9011,11 @@ permissions:
 
     /// What in `workflow` would route a job to the queue-report runner or make
     /// it depend on the workflow named `queue_workflow_name`: the runner's
-    /// label, the workflow's file stem, or its name. Compared with case, quotes
-    /// and every whitespace character (line breaks included) removed, so a name
-    /// split across lines still counts; comments do not.
+    /// label, the workflow's file stem, or its name. Comments do not count. The
+    /// label and the file stems are matched as whole words (case and quotes
+    /// ignored), so `queue-runner` is not `queue-run`; only the workflow's name
+    /// is matched with whitespace removed too (line breaks included), so a name
+    /// split across lines still counts.
     fn queue_runner_references(workflow: &str, queue_workflow_name: &str) -> Vec<String> {
         let squeeze = |text: &str| -> String {
             text.to_lowercase()
@@ -9622,6 +9624,28 @@ permissions:
         assert!(out.join("release/results/junit.xml").is_file(), "{log}");
         assert!(!out.join("nightly/results/junit.xml").exists(), "{log}");
         assert!(log.contains("channel nightly failed"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_whose_first_preflight_fails_builds_and_runs_nothing() {
+        // The first preflight is the lane's own, before the build: the script
+        // is `set -e` there, so the lane stops, with the preflight's status,
+        // before any channel runs or reports.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(1),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        assert!(!log.contains("cargo "), "{log}");
+        assert!(!log.contains("== channel"), "{log}");
+        assert!(!out.join("release").exists(), "{log}");
+        assert!(!out.join("nightly").exists(), "{log}");
     }
 
     #[cfg(unix)]
