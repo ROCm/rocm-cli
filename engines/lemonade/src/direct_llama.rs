@@ -18,8 +18,8 @@ use crate::process::{
     spawn_lemond, wait_for_lemonade_cli_status,
 };
 use crate::state::{
-    free_local_port, mark_json_status, merge_json_state, resolve_lemonade_model_ref, terminate_pid,
-    write_running_state,
+    free_local_port, mark_json_status, merge_json_state, record_server_or_stop_it,
+    resolve_lemonade_model_ref, terminate_pid, write_running_state,
 };
 use crate::{
     DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_MODEL_GGUF, DEFAULT_MODEL_REPO_DIR, ROCM_BACKEND_NAME,
@@ -290,13 +290,16 @@ pub(crate) fn serve_direct_llama_server(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", server.display()))?;
-    write_running_state(
-        request,
-        runtime,
-        std::process::id(),
-        Some(child.id()),
-        "running",
-    )?;
+    let server_pid = child.id();
+    record_server_or_stop_it(&mut child, || {
+        write_running_state(
+            request,
+            runtime,
+            std::process::id(),
+            Some(server_pid),
+            "running",
+        )
+    })?;
     // If the server never becomes ready (or fails the smoke test), don't leak the child
     // or leave the state stuck at `running`: kill it and mark the service failed.
     let readiness = (|| -> Result<()> {
@@ -317,25 +320,27 @@ pub(crate) fn serve_direct_llama_server(
         let _ = mark_json_status(&request.state_path, "failed");
         return Err(error);
     }
-    merge_json_state(
-        &request.state_path,
-        &json!({
-            "status": "ready",
-            "server_pid": child.id(),
-            // Identity token for the server PID, captured while the child is alive.
-            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
-            "backend_state": "ready",
-            "backend_requested": backend,
-            "backend_mode": "lemonade-packaged-llama-server",
-            "load_response": {
-                "status": "loaded",
-                "method": "lemonade-packaged-llama-server",
-                "model_name": request.model_ref,
-                "model_path": model_path,
-                "llamacpp_backend": backend
-            },
-        }),
-    )?;
+    record_server_or_stop_it(&mut child, || {
+        merge_json_state(
+            &request.state_path,
+            &json!({
+                "status": "ready",
+                "server_pid": server_pid,
+                // Identity token for the server PID, captured while the child is alive.
+                "server_start_ticks": rocm_core::process_start_ticks(server_pid),
+                "backend_state": "ready",
+                "backend_requested": backend,
+                "backend_mode": "lemonade-packaged-llama-server",
+                "load_response": {
+                    "status": "loaded",
+                    "method": "lemonade-packaged-llama-server",
+                    "model_name": request.model_ref,
+                    "model_path": model_path,
+                    "llamacpp_backend": backend
+                },
+            }),
+        )
+    })?;
     let status = child
         .wait()
         .context("failed waiting for Lemonade packaged llama-server")?;

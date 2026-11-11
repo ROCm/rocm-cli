@@ -625,13 +625,16 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         log_path,
         &process_env,
     )?;
-    crate::state::write_running_state(
-        &request,
-        &runtime,
-        std::process::id(),
-        Some(child.id()),
-        "running",
-    )?;
+    let server_pid = child.id();
+    crate::state::record_server_or_stop_it(&mut child, || {
+        crate::state::write_running_state(
+            &request,
+            &runtime,
+            std::process::id(),
+            Some(server_pid),
+            "running",
+        )
+    })?;
     crate::process::wait_for_lemonade_cli_status(
         &runtime.manifest,
         &request.host,
@@ -721,23 +724,25 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
             )
         });
     }
-    crate::state::merge_json_state(
-        &request.state_path,
-        &json!({
-            "status": "ready",
-            "server_pid": child.id(),
-            // Identity token for the server PID, captured while the child is alive.
-            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
-            "backend_state": "ready",
-            "backend_requested": backend,
-            "load_response": {
-                "status": "loaded",
-                "method": "lemonade-cli",
-                "model_name": request.model_ref,
-                "llamacpp_backend": backend
-            },
-        }),
-    )?;
+    crate::state::record_server_or_stop_it(&mut child, || {
+        crate::state::merge_json_state(
+            &request.state_path,
+            &json!({
+                "status": "ready",
+                "server_pid": server_pid,
+                // Identity token for the server PID, captured while the child is alive.
+                "server_start_ticks": rocm_core::process_start_ticks(server_pid),
+                "backend_state": "ready",
+                "backend_requested": backend,
+                "load_response": {
+                    "status": "loaded",
+                    "method": "lemonade-cli",
+                    "model_name": request.model_ref,
+                    "llamacpp_backend": backend
+                },
+            }),
+        )
+    })?;
     let status = child.wait().context("failed waiting for Lemonade server")?;
     crate::state::mark_json_status(
         &request.state_path,

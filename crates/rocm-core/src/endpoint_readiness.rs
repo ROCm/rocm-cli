@@ -11,17 +11,24 @@
 //! (`engine_state_inference_verified`), and the model-reference matching that
 //! decides whether a listed model id is the one a service was started with.
 //!
+//! The engine state file that latch writes into has several writers, so the
+//! locked, atomic writers for it live here too ([`merge_json_state_file`],
+//! [`write_json_state_file`]).
+//!
 //! The loopback HTTP and TCP primitives these probes are built on live in
 //! `net.rs`; the state-file keys and the probe retry interval that tie the
 //! probes to a [`ManagedServiceRecord`] live in `service_record.rs`.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::atomic_write::write_file_atomically;
 use crate::model_catalog::builtin_model_recipes;
 use crate::net::{http_get_text_with_auth, http_post_json_with_auth};
+use crate::process::FileLock;
 use crate::service_record::{
     INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL,
     INFERENCE_VERIFIED_STATE_KEY, ManagedServiceRecord,
@@ -35,34 +42,116 @@ use crate::unix_time_millis;
 /// processing before it answers.
 pub const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Name of the lock file that serializes every write of a JSON state file in
+/// one directory, taken by [`merge_json_state_file`] and
+/// [`write_json_state_file`].
+///
+/// One lock per directory rather than one per state file, so it can be left in
+/// place for good: deleting a lock file while another writer holds or waits on
+/// it would let a third writer lock a fresh file of the same name and run
+/// alongside them. It is never removed, holds no data, and its `.lock`
+/// extension keeps it out of every scan that looks for `*.json` state files.
+pub const JSON_STATE_LOCK_FILE_NAME: &str = ".json-state.lock";
+
+/// The lock [`merge_json_state_file`] and [`write_json_state_file`] take for
+/// `path`: [`JSON_STATE_LOCK_FILE_NAME`] in `path`'s directory.
+#[must_use]
+pub fn json_state_lock_path(path: &Path) -> PathBuf {
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(JSON_STATE_LOCK_FILE_NAME)
+}
+
 /// Merge `patch`'s top-level keys into the JSON object stored at `path`.
 ///
-/// Creates the file (and its parent) when absent, and replaces a non-object
-/// document rather than failing — the caller is recording a fact about a live
-/// service, not validating an existing file.
+/// Every writer of the state file — the engine wrapper that owns the service,
+/// a healthcheck latching that inference was verified, `rocmd` publishing the
+/// Anthropic endpoint — patches the same document, so the read, the merge and
+/// the write run under one cross-process lock ([`json_state_lock_path`]) and
+/// no writer can drop a key another just recorded. The result is published
+/// atomically ([`crate::atomic_write::write_file_atomically`]), so a reader
+/// that takes no lock still sees a whole document, never a truncated one.
+///
+/// Creates the file (and its parent) when absent. An existing file that is
+/// empty, is not valid JSON or does not hold a JSON object is an error, and the
+/// file is left exactly as it was: it may hold the only record of a running
+/// process (`server_pid`), and replacing it with `patch` alone would lose it.
+/// A `patch` that is not an object has no keys to merge; the file is not
+/// touched and the call succeeds.
 pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<()> {
-    let mut value = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !value.is_object() {
-        value = serde_json::json!({});
-    }
-    let object = value.as_object_mut().expect("object checked above");
-    if let Some(patch) = patch.as_object() {
-        for (key, patch_value) in patch {
-            object.insert(key.clone(), patch_value.clone());
+    let Some(patch) = patch.as_object() else {
+        return Ok(());
+    };
+    let _lock = FileLock::acquire(json_state_lock_path(path))?;
+    let mut object = match fs::read(path) {
+        Ok(bytes) => existing_state_object(path, &bytes)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read {}; left it untouched and recorded nothing",
+                    path.display()
+                )
+            });
         }
+    };
+    for (key, patch_value) in patch {
+        object.insert(key.clone(), patch_value.clone());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    publish_json_state(path, &serde_json::Value::Object(object))
+}
+
+/// Replace the JSON state file at `path` with `value`.
+///
+/// Takes the same lock as [`merge_json_state_file`] and publishes the same
+/// atomic way, so a full rewrite cannot land in the middle of another
+/// writer's merge.
+pub fn write_json_state_file(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let _lock = FileLock::acquire(json_state_lock_path(path))?;
+    publish_json_state(path, value)
+}
+
+/// The object an existing state file holds, or an error that says the file
+/// was left untouched.
+fn existing_state_object(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let refuse = |what: String| {
+        anyhow!(
+            "{} {what}; left it untouched and recorded nothing, rather than replace what it holds",
+            path.display()
+        )
+    };
+    if bytes.is_empty() {
+        return Err(refuse("is empty".to_owned()));
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&value).context("failed to serialize service state")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(object)) => Ok(object),
+        Ok(other) => Err(refuse(format!(
+            "holds a JSON {}, not an object",
+            json_kind(&other)
+        ))),
+        Err(error) => Err(refuse(format!("is not valid JSON ({error})"))),
+    }
+}
+
+const fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Atomic publish of `value`; the caller holds [`json_state_lock_path`].
+fn publish_json_state(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).context("failed to serialize service state")?;
+    write_file_atomically(path, &bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Whether inference has been confirmed for a service, from its engine state
@@ -1001,6 +1090,371 @@ mod tests {
                 .iter()
                 .all(|request| request.contains("Authorization: Bearer test-key")),
             "a protected service must not read as unready for want of its own key"
+        );
+        Ok(())
+    }
+
+    // The locked, atomic state-file writers. One test per state the file can
+    // be found in when a merge starts: absent, empty, torn, valid but not an
+    // object, unreadable, a valid object; plus a patch with nothing to merge.
+
+    fn json_state_dir(tag: &str) -> std::path::PathBuf {
+        let dir = crate::test_support::workspace_test_artifact_dir().join(format!(
+            "json-state-{tag}-{}",
+            crate::test_support::unique_suffix()
+        ));
+        fs::create_dir_all(&dir).expect("create the test directory");
+        dir
+    }
+
+    /// The merge refused `path`, said so naming the file and saying it was left
+    /// untouched, and the file does still hold exactly `before` — the message
+    /// and the state it claims, checked together.
+    fn assert_refused_and_untouched(result: Result<()>, path: &Path, before: &[u8], why: &str) {
+        let error = format!(
+            "{:#}",
+            result.expect_err("an unusable state file must be refused")
+        );
+        assert!(
+            error.contains(&path.display().to_string()),
+            "the error names the file: {error}"
+        );
+        assert!(
+            error.contains("left it untouched and recorded nothing"),
+            "the error says the file was left as it was: {error}"
+        );
+        assert!(error.contains(why), "the error says why ({why}): {error}");
+        assert_eq!(
+            fs::read(path).expect("the refused file is still there"),
+            before,
+            "a refused merge must leave the file byte for byte as it was"
+        );
+    }
+
+    #[test]
+    fn merging_into_an_absent_state_file_creates_it_with_the_patch() -> Result<()> {
+        let dir = json_state_dir("absent");
+        let path = dir.join("not-yet").join("svc.json");
+
+        merge_json_state_file(
+            &path,
+            &serde_json::json!({ "status": "starting", "pid": 7 }),
+        )?;
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            written,
+            serde_json::json!({ "status": "starting", "pid": 7 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merging_into_an_empty_state_file_is_refused_and_leaves_it_untouched() {
+        let dir = json_state_dir("empty");
+        let path = dir.join("svc.json");
+        fs::write(&path, b"").unwrap();
+
+        let result = merge_json_state_file(&path, &serde_json::json!({ "status": "ready" }));
+
+        assert_refused_and_untouched(result, &path, b"", "is empty");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The case behind the lost `server_pid`: a writer caught another
+    /// mid-write, read half a document, and replaced it with its own patch.
+    #[test]
+    fn merging_into_a_torn_state_file_is_refused_and_leaves_it_untouched() {
+        let dir = json_state_dir("torn");
+        let path = dir.join("svc.json");
+        let torn = br#"{"status": "running", "server_pid": 42"#;
+        fs::write(&path, torn).unwrap();
+
+        let result = merge_json_state_file(
+            &path,
+            &serde_json::json!({ INFERENCE_PROBE_ATTEMPTED_STATE_KEY: 1 }),
+        );
+
+        assert_refused_and_untouched(result, &path, torn, "is not valid JSON");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merging_into_a_state_file_that_is_not_an_object_is_refused_and_leaves_it_untouched() {
+        let dir = json_state_dir("non-object");
+        let path = dir.join("svc.json");
+        for (document, kind) in [
+            (&b"[1, 2]"[..], "holds a JSON array, not an object"),
+            (&b"null"[..], "holds a JSON null, not an object"),
+            (&b"\"x\""[..], "holds a JSON string, not an object"),
+        ] {
+            fs::write(&path, document).unwrap();
+            let result = merge_json_state_file(&path, &serde_json::json!({ "status": "ready" }));
+            assert_refused_and_untouched(result, &path, document, kind);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_file_that_cannot_be_read_is_refused_and_left_in_place() {
+        let dir = json_state_dir("unreadable");
+        // A directory where the file should be: reading it fails with an
+        // error other than "not found" on every platform.
+        let path = dir.join("svc.json");
+        fs::create_dir_all(&path).unwrap();
+
+        let error = format!(
+            "{:#}",
+            merge_json_state_file(&path, &serde_json::json!({ "status": "ready" }))
+                .expect_err("an unreadable state file must be refused")
+        );
+
+        let still_a_directory = path.is_dir();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            error.contains(&format!("failed to read {}", path.display())),
+            "{error}"
+        );
+        assert!(
+            error.contains("left it untouched and recorded nothing"),
+            "{error}"
+        );
+        assert!(still_a_directory, "the refused path must be left in place");
+    }
+
+    #[test]
+    fn merging_into_a_state_object_keeps_its_other_keys() -> Result<()> {
+        let dir = json_state_dir("merge");
+        let path = dir.join("svc.json");
+        fs::write(
+            &path,
+            br#"{"status": "running", "server_pid": 42, "server_start_ticks": 9}"#,
+        )?;
+
+        merge_json_state_file(
+            &path,
+            &serde_json::json!({ "status": "ready", INFERENCE_VERIFIED_STATE_KEY: 5 }),
+        )?;
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "status": "ready",
+                "server_pid": 42,
+                "server_start_ticks": 9,
+                INFERENCE_VERIFIED_STATE_KEY: 5,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_patch_that_is_not_an_object_changes_nothing() -> Result<()> {
+        let dir = json_state_dir("non-object-patch");
+        let path = dir.join("svc.json");
+        let before = br#"{"server_pid": 42}"#;
+        fs::write(&path, before)?;
+        let absent = dir.join("absent.json");
+
+        merge_json_state_file(&path, &serde_json::json!(["status"]))?;
+        merge_json_state_file(&absent, &serde_json::Value::Null)?;
+
+        let after = fs::read(&path)?;
+        let created = absent.exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(after, before, "nothing to merge, so nothing is written");
+        assert!(!created, "nothing to merge, so no file is created");
+        Ok(())
+    }
+
+    #[test]
+    fn writing_a_state_file_replaces_it_whole() -> Result<()> {
+        let dir = json_state_dir("write");
+        let path = dir.join("nested").join("svc.json");
+
+        write_json_state_file(
+            &path,
+            &serde_json::json!({ "status": "starting", "pid": 1 }),
+        )?;
+        let first: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        write_json_state_file(&path, &serde_json::json!({ "status": "running" }))?;
+        let second: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(first, serde_json::json!({ "status": "starting", "pid": 1 }));
+        assert_eq!(second, serde_json::json!({ "status": "running" }));
+        Ok(())
+    }
+
+    /// The writers leave behind the state file and the directory's one lock
+    /// file, and nothing else: no temp file, no per-file lock.
+    #[test]
+    fn state_writes_leave_only_the_state_file_and_the_directory_lock() -> Result<()> {
+        let dir = json_state_dir("leftovers");
+        let path = dir.join("svc.json");
+
+        write_json_state_file(&path, &serde_json::json!({ "status": "starting" }))?;
+        merge_json_state_file(&path, &serde_json::json!({ "status": "ready" }))?;
+        let _ = merge_json_state_file(&dir.join("other.json"), &serde_json::json!({ "a": 1 }));
+
+        let mut names: Vec<String> = fs::read_dir(&dir)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<_>>()?;
+        names.sort();
+        let lock = json_state_lock_path(&path);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(names, [JSON_STATE_LOCK_FILE_NAME, "other.json", "svc.json"]);
+        assert_eq!(lock, dir.join(JSON_STATE_LOCK_FILE_NAME));
+        assert_eq!(
+            lock.extension().and_then(|value| value.to_str()),
+            Some("lock"),
+            "scans for `*.json` state files must not pick the lock up"
+        );
+        Ok(())
+    }
+
+    /// A merge publishes through `atomic_write`, which reserves its own temp
+    /// file: another writer's file sitting on the name the merge would try
+    /// first is neither written through nor moved.
+    #[test]
+    fn a_merge_spares_another_writers_staged_file() -> Result<()> {
+        let dir = json_state_dir("foreign-temp");
+        let path = dir.join("svc.json");
+        crate::foreign_temp_probe::assert_write_spares_foreign_temp_files(
+            |millis| dir.join(format!("svc.json.tmp-{}-{millis}-0", std::process::id())),
+            || {
+                fs::write(&path, br#"{"server_pid": 42}"#)?;
+                merge_json_state_file(&path, &serde_json::json!({ "status": "ready" }))
+            },
+        )?;
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            written,
+            serde_json::json!({ "server_pid": 42, "status": "ready" })
+        );
+        Ok(())
+    }
+
+    const MERGE_CHILD_PATH_ENV: &str = "ROCM_CORE_TEST_JSON_STATE_MERGE_CHILD_PATH";
+    const MERGE_CHILD_WRITER_ENV: &str = "ROCM_CORE_TEST_JSON_STATE_MERGE_CHILD_WRITER";
+    const MERGES_PER_WRITER: usize = 40;
+
+    fn merge_distinct_keys(path: &Path, writer: &str) -> Result<()> {
+        for n in 0..MERGES_PER_WRITER {
+            merge_json_state_file(path, &serde_json::json!({ format!("{writer}-{n}"): n }))?;
+        }
+        Ok(())
+    }
+
+    /// The regression for the lost `server_pid`: writers in this process and
+    /// in two child processes (this test binary run again) each merge their
+    /// own keys into one state file while a reader that takes no lock reads it
+    /// over and over. Every key and the original `server_pid` must survive,
+    /// and the reader must only ever see a whole object.
+    #[test]
+    fn concurrent_merges_across_threads_and_processes_keep_every_key() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        if let (Some(path), Some(writer)) = (
+            std::env::var_os(MERGE_CHILD_PATH_ENV),
+            std::env::var(MERGE_CHILD_WRITER_ENV).ok(),
+        ) {
+            return merge_distinct_keys(Path::new(&path), &writer);
+        }
+
+        let dir = json_state_dir("concurrent");
+        let path = dir.join("svc.json");
+        fs::write(&path, br#"{"server_pid": 4242, "server_start_ticks": 7}"#)?;
+
+        let exe = std::env::current_exe().context("current test executable")?;
+        let child_writers = ["process-a", "process-b"];
+        let mut children = Vec::new();
+        for writer in child_writers {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args([
+                        "endpoint_readiness::tests::concurrent_merges_across_threads_and_processes_keep_every_key",
+                        "--exact",
+                        "--quiet",
+                    ])
+                    .env(MERGE_CHILD_PATH_ENV, &path)
+                    .env(MERGE_CHILD_WRITER_ENV, writer)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .context("spawn a merging child process")?,
+            );
+        }
+
+        let done = AtomicBool::new(false);
+        let thread_writers = ["thread-a", "thread-b", "thread-c", "thread-d"];
+        let (thread_results, torn_reads) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut torn = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    // Windows may refuse a read while a rename is in flight; a
+                    // refusal is not a torn document, so only what was read
+                    // is judged.
+                    let Ok(bytes) = fs::read(&path) else { continue };
+                    let whole = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .is_some_and(|value| value.get("server_pid").is_some());
+                    if !whole {
+                        torn.push(String::from_utf8_lossy(&bytes).into_owned());
+                    }
+                }
+                torn
+            });
+            // Every writer is started before any is joined, so they overlap.
+            let shared_path = path.as_path();
+            let mut writers = Vec::new();
+            for writer in thread_writers {
+                writers.push(scope.spawn(move || merge_distinct_keys(shared_path, writer)));
+            }
+            let results: Vec<Result<()>> = writers
+                .into_iter()
+                .map(|writer| writer.join().expect("writer thread"))
+                .collect();
+            for child in &mut children {
+                let _ = child.wait();
+            }
+            done.store(true, Ordering::Relaxed);
+            (results, reader.join().expect("reader thread"))
+        });
+
+        let statuses: Vec<_> = children
+            .iter_mut()
+            .map(|child| child.wait().map(|status| status.success()))
+            .collect::<std::io::Result<_>>()?;
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+
+        for result in thread_results {
+            result?;
+        }
+        assert_eq!(statuses, [true, true], "both merging children must succeed");
+        assert!(
+            torn_reads.is_empty(),
+            "a lock-free reader saw {} partial documents, e.g. {:?}",
+            torn_reads.len(),
+            torn_reads.first()
+        );
+        assert_eq!(written["server_pid"], 4242, "{written}");
+        assert_eq!(written["server_start_ticks"], 7, "{written}");
+        let missing: Vec<String> = thread_writers
+            .iter()
+            .chain(child_writers.iter())
+            .flat_map(|writer| (0..MERGES_PER_WRITER).map(move |n| format!("{writer}-{n}")))
+            .filter(|key| written.get(key).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} merged keys were lost, e.g. {:?}",
+            missing.len(),
+            missing.first()
         );
         Ok(())
     }

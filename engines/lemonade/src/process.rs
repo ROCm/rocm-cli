@@ -131,6 +131,28 @@ impl LemondChild {
     }
 }
 
+impl crate::state::StartedServer for LemondChild {
+    fn pid(&self) -> u32 {
+        self.id()
+    }
+
+    fn force_kill(&mut self) {
+        match self {
+            Self::Child(child) => {
+                let _ = child.kill();
+            }
+            // Terminating by pid is already `TerminateProcess`, a hard kill;
+            // there is nothing harder to fall back to.
+            #[cfg(windows)]
+            Self::Pid(_) => {}
+        }
+    }
+
+    fn wait_for_exit(&mut self) -> Result<()> {
+        self.wait().map(|_| ())
+    }
+}
+
 pub(crate) struct LemondExitStatus {
     success: bool,
     description: String,

@@ -11,6 +11,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 
 use crate::device_policy::device_policy_name;
 use crate::install::{LemonadeInstallManifest, LemonadeRuntime};
@@ -118,26 +119,21 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Replace the service's state file whole. Shares the state directory's lock
+/// with every merge (`rocm_core::write_json_state_file`), so a full rewrite
+/// never lands inside another writer's merge, and publishes atomically, so a
+/// lock-free reader such as `rocm services list` never sees half a document.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("failed to write {}", path.display()))
+    rocm_core::write_json_state_file(path, value)
 }
 
+/// Merge `patch` into the service's state file under the lock the healthcheck's
+/// inference latch and `rocmd`'s endpoint publish also take
+/// (`rocm_core::merge_json_state_file`), so none of them drops a key another
+/// just wrote — `server_pid` above all, which a later stop needs. A state file
+/// that is empty, torn or not a JSON object is an error and left as it was.
 pub(crate) fn merge_json_state(path: &Path, patch: &Value) -> Result<()> {
-    let mut value = read_service_state(path).unwrap_or_else(|_| json!({}));
-    if !value.is_object() {
-        value = json!({});
-    }
-    let object = value.as_object_mut().expect("object checked above");
-    if let Some(patch) = patch.as_object() {
-        for (key, value) in patch {
-            object.insert(key.clone(), value.clone());
-        }
-    }
-    write_state(path, &value)
+    rocm_core::merge_json_state_file(path, patch)
 }
 
 pub(crate) fn mark_json_status(path: &Path, status: &str) -> Result<()> {
@@ -182,6 +178,57 @@ pub(crate) fn identity_from_state(state: &Value) -> Option<rocm_core::ProcessIde
 
 pub(crate) fn terminate_pid(pid: u32, _force: bool) -> bool {
     rocm_core::terminate_process(pid).is_ok()
+}
+
+/// A server process the wrapper started and has to reap before it returns.
+pub(crate) trait StartedServer {
+    fn pid(&self) -> u32;
+    /// Kill the server outright; called only when terminating it by pid failed.
+    fn force_kill(&mut self);
+    /// Wait for the server to exit.
+    fn wait_for_exit(&mut self) -> Result<()>;
+}
+
+impl StartedServer for Child {
+    fn pid(&self) -> u32 {
+        self.id()
+    }
+
+    fn force_kill(&mut self) {
+        let _ = self.kill();
+    }
+
+    fn wait_for_exit(&mut self) -> Result<()> {
+        self.wait().map(|_| ()).map_err(Into::into)
+    }
+}
+
+/// Run `record`, the state write that names a server the wrapper has just
+/// started; when it fails, stop and reap `server` before returning the error.
+///
+/// The wrapper waits on its server only after recording it, so returning the
+/// error alone would leave a server running that no state file names, which
+/// `rocm services stop` could then not find.
+pub(crate) fn record_server_or_stop_it(
+    server: &mut impl StartedServer,
+    record: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let Err(error) = record() else {
+        return Ok(());
+    };
+    let pid = server.pid();
+    if !terminate_pid(pid, true) {
+        server.force_kill();
+    }
+    let outcome = match server.wait_for_exit() {
+        Ok(()) => "stopped it".to_owned(),
+        Err(wait_error) => {
+            format!("tried to stop it, but waiting for it failed: {wait_error:#}")
+        }
+    };
+    Err(error.context(format!(
+        "could not record the server (pid {pid}) in its state file, so {outcome}"
+    )))
 }
 
 pub(crate) fn free_local_port() -> Result<u16> {
@@ -446,5 +493,162 @@ mod tests {
             parse_http_endpoint("http://[::1]:11435/v1"),
             Some(("::1".to_owned(), 11435))
         );
+    }
+
+    /// A wrapper merge into a torn state file — the half-written document the
+    /// old non-atomic writers could leave — fails and keeps the file as it
+    /// was, rather than replacing it with the patch and losing `server_pid`.
+    #[test]
+    fn a_merge_into_a_torn_state_file_fails_and_keeps_it() {
+        let dir = scratch_dir("torn-state");
+        let path = dir.join("svc.json");
+        let torn = br#"{"status": "running", "server_pid": 4242, "server_st"#;
+        fs::write(&path, torn).unwrap();
+
+        let merge = merge_json_state(&path, &json!({ "status": "ready" }));
+        let mark = mark_json_status(&path, "stopped");
+
+        let after = fs::read(&path).unwrap();
+        fs::remove_dir_all(&dir).ok();
+        for result in [merge, mark] {
+            let error = format!(
+                "{:#}",
+                result.expect_err("a torn state file must be refused")
+            );
+            assert!(error.contains("is not valid JSON"), "{error}");
+            assert!(
+                error.contains("left it untouched and recorded nothing"),
+                "{error}"
+            );
+        }
+        assert_eq!(after, torn, "the torn file must be left as it was");
+    }
+
+    /// The race behind the lost `server_pid`: the wrapper merging into its own
+    /// state file while a healthcheck latches its inference probe into the same
+    /// file. Both must keep the server's identity, so a later stop still
+    /// targets the server rather than the wrapper.
+    #[test]
+    fn wrapper_and_healthcheck_merges_keep_the_server_identity() {
+        const ROUNDS: u64 = 150;
+        let dir = scratch_dir("merge-race");
+        let path = dir.join("svc.json");
+        write_state(
+            &path,
+            &json!({
+                "status": "running",
+                "pid": 100,
+                "start_ticks": 111_u64,
+                "server_pid": 4242,
+                "server_start_ticks": 99_u64,
+            }),
+        )
+        .unwrap();
+
+        let (wrapper, healthcheck) = std::thread::scope(|scope| {
+            let wrapper = scope.spawn(|| -> Result<()> {
+                for round in 0..ROUNDS {
+                    merge_json_state(&path, &json!({ "backend_state": "ready", "round": round }))?;
+                    mark_json_status(&path, "ready")?;
+                }
+                Ok(())
+            });
+            let healthcheck = scope.spawn(|| -> Result<()> {
+                for round in 0..ROUNDS {
+                    rocm_core::merge_json_state_file(
+                        &path,
+                        &json!({ rocm_core::INFERENCE_PROBE_ATTEMPTED_STATE_KEY: round }),
+                    )?;
+                }
+                Ok(())
+            });
+            (
+                wrapper.join().expect("wrapper thread"),
+                healthcheck.join().expect("healthcheck thread"),
+            )
+        });
+
+        let state = read_service_state(&path);
+        fs::remove_dir_all(&dir).ok();
+        wrapper.expect("every wrapper merge succeeds");
+        healthcheck.expect("every healthcheck merge succeeds");
+        let state = state.expect("the state file is still a whole document");
+        let identity = identity_from_state(&state).expect("an identity to stop");
+        assert_eq!(identity.pid, 4242, "a stop must target the server: {state}");
+        assert_eq!(identity.start_ticks, Some(99), "{state}");
+        assert_eq!(state["round"], ROUNDS - 1, "{state}");
+        assert_eq!(
+            state[rocm_core::INFERENCE_PROBE_ATTEMPTED_STATE_KEY],
+            ROUNDS - 1,
+            "{state}"
+        );
+    }
+
+    const SLEEPER_CHILD_ENV: &str = "ROCM_LEMONADE_TEST_SLEEPER_CHILD";
+
+    /// This test binary, run again as a stand-in server that stays up for a
+    /// minute unless something stops it.
+    fn spawn_stand_in_server() -> Child {
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "state::tests::a_server_whose_state_cannot_be_recorded_is_stopped",
+                "--exact",
+                "--quiet",
+            ])
+            .env(SLEEPER_CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in server")
+    }
+
+    #[test]
+    fn a_server_whose_state_cannot_be_recorded_is_stopped() {
+        if std::env::var_os(SLEEPER_CHILD_ENV).is_some() {
+            std::thread::sleep(Duration::from_mins(1));
+            return;
+        }
+        let mut server = spawn_stand_in_server();
+        let pid = server.id();
+
+        let result =
+            record_server_or_stop_it(&mut server, || Err(anyhow::anyhow!("state file is torn")));
+
+        // Already reaped by the helper, so this returns the recorded status at
+        // once; `None` would mean the server is still running.
+        let exited = server.try_wait().expect("query the stand-in server");
+        if exited.is_none() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let error = format!("{:#}", result.expect_err("the record failed"));
+        assert_eq!(
+            error,
+            format!(
+                "could not record the server (pid {pid}) in its state file, so stopped it: \
+                 state file is torn"
+            )
+        );
+        let status = exited.expect("the server must have been stopped and reaped");
+        assert!(
+            !status.success(),
+            "the server was stopped, not left to finish its minute: {status}"
+        );
+    }
+
+    #[test]
+    fn a_server_whose_state_is_recorded_is_left_running() {
+        let mut server = spawn_stand_in_server();
+
+        let result = record_server_or_stop_it(&mut server, || Ok(()));
+
+        let running = server
+            .try_wait()
+            .expect("query the stand-in server")
+            .is_none();
+        let _ = server.kill();
+        let _ = server.wait();
+        result.expect("the record succeeded");
+        assert!(running, "a recorded server is the wrapper's to wait on");
     }
 }
