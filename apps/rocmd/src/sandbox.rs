@@ -865,12 +865,12 @@ mod tests {
 
     #[test]
     fn sandbox_check_updates_value_is_read_only_and_preserves_output() {
-        let value = sandbox_check_updates_value(CommandCapture {
-            argv: vec!["rocm".to_owned(), "update".to_owned()],
-            exit_status: 0,
-            stdout: "update\n  runtime release status=up_to_date\n".to_owned(),
-            stderr: String::new(),
-        });
+        let value = sandbox_check_updates_value(CommandCapture::from_text(
+            vec!["rocm".to_owned(), "update".to_owned()],
+            0,
+            "update\n  runtime release status=up_to_date\n".to_owned(),
+            String::new(),
+        ));
 
         assert_eq!(
             value.get("tool").and_then(Value::as_str),
@@ -894,12 +894,12 @@ mod tests {
 
     #[test]
     fn sandbox_check_updates_value_marks_runtime_update_available() {
-        let value = sandbox_check_updates_value(CommandCapture {
-            argv: vec!["rocm".to_owned(), "update".to_owned()],
-            exit_status: 0,
-            stdout: "update\n  runtime release-pip-gfx120x-all status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
-            stderr: String::new(),
-        });
+        let value = sandbox_check_updates_value(CommandCapture::from_text(
+            vec!["rocm".to_owned(), "update".to_owned()],
+            0,
+            "update\n  runtime release-pip-gfx120x-all status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
+            String::new(),
+        ));
 
         assert_eq!(
             value.get("tool").and_then(Value::as_str),
@@ -933,12 +933,12 @@ mod tests {
 
     #[test]
     fn sandbox_check_updates_value_marks_runtime_repair_available() {
-        let value = sandbox_check_updates_value(CommandCapture {
-            argv: vec!["rocm".to_owned(), "update".to_owned()],
-            exit_status: 0,
-            stdout: "update\n  runtime release-wheel-multi-arch-7-14-0 status=repair_available installed=7.14.0 latest=7.14.0\n".to_owned(),
-            stderr: String::new(),
-        });
+        let value = sandbox_check_updates_value(CommandCapture::from_text(
+            vec!["rocm".to_owned(), "update".to_owned()],
+            0,
+            "update\n  runtime release-wheel-multi-arch-7-14-0 status=repair_available installed=7.14.0 latest=7.14.0\n".to_owned(),
+            String::new(),
+        ));
 
         assert_eq!(
             value.get("status").and_then(Value::as_str),
@@ -961,12 +961,12 @@ mod tests {
 
     #[test]
     fn a_newer_version_outranks_a_composition_repair_in_the_watcher_report() {
-        let value = sandbox_check_updates_value(CommandCapture {
-            argv: vec!["rocm".to_owned(), "update".to_owned()],
-            exit_status: 0,
-            stdout: "update\n  runtime old status=repair_available installed=7.14.0 latest=7.14.0\n  runtime stale status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
-            stderr: String::new(),
-        });
+        let value = sandbox_check_updates_value(CommandCapture::from_text(
+            vec!["rocm".to_owned(), "update".to_owned()],
+            0,
+            "update\n  runtime old status=repair_available installed=7.14.0 latest=7.14.0\n  runtime stale status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
+            String::new(),
+        ));
 
         assert_eq!(
             value.get("status").and_then(Value::as_str),
@@ -976,18 +976,18 @@ mod tests {
 
     #[test]
     fn sandbox_driver_plan_value_is_read_only_and_preserves_output() {
-        let value = sandbox_driver_plan_value(CommandCapture {
-            argv: vec![
+        let value = sandbox_driver_plan_value(CommandCapture::from_text(
+            vec![
                 "rocm".to_owned(),
                 "install".to_owned(),
                 "driver".to_owned(),
                 "--dkms".to_owned(),
                 "--dry-run".to_owned(),
             ],
-            exit_status: 0,
-            stdout: "driver install plan\n  supported: true\n".to_owned(),
-            stderr: String::new(),
-        });
+            0,
+            "driver install plan\n  supported: true\n".to_owned(),
+            String::new(),
+        ));
 
         assert_eq!(
             value.get("tool").and_then(Value::as_str),
