@@ -617,6 +617,13 @@ pub fn gpu_support_level(
     match (detected_gfx_target, compatible_therock_family) {
         (_, Some(_)) => GpuSupportLevel::RocmHip,
         (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => {
+            // `Unknown` only — a platform the probe cannot look at, which keeps
+            // the benefit of the doubt. `Inconclusive` is a host that WAS
+            // looked at and showed nothing, and promising it Vulkan is the
+            // symptom this change exists to remove; it is the common
+            // no-driver shape, since most such hosts have no `vulkaninfo`
+            // either. The wording it gets is hedged rather than a confirmed
+            // absence — see `render.rs`.
             if vulkan.is_usable() || vulkan == crate::host_gpu::VulkanStatus::Unknown {
                 GpuSupportLevel::VulkanOnly
             } else {
@@ -1129,6 +1136,31 @@ mod tests {
     /// gfx table alone, so a Renoir laptop with no Vulkan driver installed — or
     /// with only a CPU rasteriser — was told to go and serve a model on a
     /// backend that cannot start.
+    /// The common no-driver host: no ICD, no device, and no `vulkaninfo` to
+    /// ask. It must not be promised a Vulkan path — that is the symptom this
+    /// change exists to remove, and it is the usual shape, since a host with no
+    /// driver generally has no `vulkaninfo` either.
+    ///
+    /// `Unknown` (a platform the probe cannot look at) keeps the benefit of the
+    /// doubt; `Inconclusive` has been looked at and showed nothing.
+    #[test]
+    fn a_probed_host_with_no_evidence_is_not_promised_vulkan() {
+        assert_eq!(
+            gpu_support_level(
+                Some("gfx90c"),
+                None,
+                crate::host_gpu::VulkanStatus::Inconclusive
+            ),
+            GpuSupportLevel::NoGpuBackend,
+            "a host that was probed and showed nothing must not be told it runs on Vulkan"
+        );
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None, crate::host_gpu::VulkanStatus::Unknown),
+            GpuSupportLevel::VulkanOnly,
+            "a platform that cannot be probed keeps the benefit of the doubt"
+        );
+    }
+
     #[test]
     fn gpu_support_level_reports_no_gpu_backend_when_the_vulkan_probe_found_none() {
         assert_eq!(

@@ -58,6 +58,16 @@ pub enum VulkanStatus {
     /// The probe looked and found no GPU Vulkan driver. A software rasteriser
     /// alone lands here, not in [`Self::Available`].
     Absent,
+    /// The probe looked and came away with nothing either way: no ICD manifest,
+    /// no enumerated device, and no `vulkaninfo` to ask.
+    ///
+    /// Distinct from [`Self::Unknown`], which is a platform that cannot be
+    /// probed at all. The difference decides what the host is told: an
+    /// unprobed platform keeps the benefit of the doubt, while this one has
+    /// been looked at and nothing was found, so it must not be promised a
+    /// Vulkan path — but neither may it be told a driver is definitely absent,
+    /// since the sources that came back empty are not exhaustive.
+    Inconclusive,
     /// The probe could not look (an unsupported platform).
     ///
     /// The default: a value nobody has filled in is one nobody has probed, and
@@ -416,7 +426,7 @@ pub fn classify_vulkan_support(
         // `vulkaninfo` and gets nothing from it, and that is a real answer.
         if icds.is_empty() && devices.is_empty() && !enumerated {
             return VulkanSupport {
-                status: VulkanStatus::Unknown,
+                status: VulkanStatus::Inconclusive,
                 detail: Some(
                     "no Vulkan driver was found, but `vulkaninfo` is not installed either, so \
                      nothing here confirms one is absent"
@@ -617,8 +627,9 @@ GPU0:
         let unasked = classify_vulkan_support(Vec::new(), Vec::new(), true, false);
         assert_eq!(
             unasked.status,
-            VulkanStatus::Unknown,
-            "with no ICD and no way to enumerate, absence is unproven"
+            VulkanStatus::Inconclusive,
+            "with no ICD and no way to enumerate, absence is unproven — but the \
+             host WAS looked at, which `Unknown` (an unprobed platform) does not say"
         );
         assert!(
             unasked

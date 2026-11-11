@@ -789,3 +789,15 @@ Feature: GPU detection and system inspection
     When the user inspects that machine
     Then the inspection does not claim models can run through Vulkan
     And the inspection says the only renderer it found runs on the CPU
+
+  # The shape examine-51 does not reach. examine-51 plants a `vulkaninfo` that
+  # fails, which is a confirmed absence; most hosts without a driver have no
+  # `vulkaninfo` at all, and that host must be told the check could not be made
+  # rather than either promised Vulkan or declared to have nothing.
+  @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
+  Scenario: examine-53 - A machine that cannot be checked for Vulkan is not told either way
+    Given a machine whose GPU has no official support and no way to check Vulkan
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not claim models can run through Vulkan
+    And the inspection says it could not confirm whether a Vulkan driver is there

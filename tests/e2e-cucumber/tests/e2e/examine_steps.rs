@@ -3486,6 +3486,37 @@ async fn unsupported_gpu_without_vulkan(world: &mut E2eWorld) {
     plant_unsupported_gpu(world, None, None);
 }
 
+/// The *common* no-driver shape, and the one examine-51 does not cover: a host
+/// with no ICD and no `vulkaninfo` to ask. `plant_unsupported_gpu` always writes
+/// a `vulkaninfo`, so this removes it again — the probe must then report that it
+/// could not confirm, rather than either promising Vulkan or declaring it absent.
+#[given("a machine whose GPU has no official support and no way to check Vulkan")]
+async fn unsupported_gpu_without_vulkaninfo(world: &mut E2eWorld) {
+    plant_unsupported_gpu(world, None, None);
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::remove_file(bin.join("vulkaninfo")).expect("failed to remove the planted vulkaninfo");
+}
+
+#[then("the inspection says it could not confirm whether a Vulkan driver is there")]
+async fn assert_vulkan_unconfirmed(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let line = rocm_support_line(output).expect("no rocm_support line");
+    assert!(
+        line.contains("`vulkaninfo` is not installed"),
+        "the support line must name the gap that stopped it confirming, not assert \
+         a driver is absent: {line}\n{output}"
+    );
+    assert!(
+        !line.contains("Vulkan backend") && !line.contains("runs on"),
+        "and it must not promise a Vulkan path it never established: {line}\n{output}"
+    );
+}
+
 #[given("a machine whose GPU has no official support and only a software renderer")]
 async fn unsupported_gpu_with_software_renderer(world: &mut E2eWorld) {
     plant_unsupported_gpu(

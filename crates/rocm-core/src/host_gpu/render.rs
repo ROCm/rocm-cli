@@ -34,6 +34,7 @@ impl ExamineSummary {
             VulkanStatus::Available => "available",
             VulkanStatus::DriverPresentDevicesUnverified => "driver_present_devices_unverified",
             VulkanStatus::Absent => "absent",
+            VulkanStatus::Inconclusive => "inconclusive",
             VulkanStatus::Unknown => "unknown",
         };
         vulkan.detail.as_deref().map_or_else(
@@ -95,10 +96,15 @@ impl ExamineSummary {
                     VulkanStatus::DriverPresentDevicesUnverified =>
                         "a Vulkan driver is installed, so the Vulkan backend is expected to work"
                             .to_owned(),
-                    VulkanStatus::Absent | VulkanStatus::Unknown =>
+                    VulkanStatus::Unknown =>
                         "Vulkan was not probed on this platform, so the Vulkan backend is \
                          unconfirmed"
                             .to_owned(),
+                    VulkanStatus::Inconclusive =>
+                        "no Vulkan driver was found, and `vulkaninfo` is not installed to \
+                         confirm it"
+                            .to_owned(),
+                    VulkanStatus::Absent => "no Vulkan GPU driver was found".to_owned(),
                 }
             ),
             // Both halves are established facts: the catalog confirmed there is
@@ -107,10 +113,25 @@ impl ExamineSummary {
             // out on this host, so the advice is to install a driver rather than
             // to serve a model and read back what happened.
             GpuSupportLevel::NoGpuBackend => format!(
-                "  rocm_support: GPU detected ({}) but not supported by ROCm, and no Vulkan GPU \
-                 driver was found - install one (Mesa RADV on Linux, the AMD display driver on \
-                 Windows) to run models on this GPU\n",
-                detected.unwrap_or_default()
+                "  rocm_support: GPU detected ({}) but not supported by ROCm, and {}\n",
+                detected.unwrap_or_default(),
+                // Two different evidentiary states reach this level, and they
+                // owe the user different sentences. `Absent` is a confirmed
+                // negative — the probe found something and ruled it out, so
+                // "install a driver" is the whole story. `Inconclusive` was
+                // looked at and showed nothing either way; claiming a
+                // confirmed absence there would tell a host that already has a
+                // working driver to install one, so it names the gap and the
+                // way to close it.
+                match vulkan {
+                    VulkanStatus::Inconclusive =>
+                        "no Vulkan GPU driver was found either - `vulkaninfo` is not installed, \
+                         so install it to check, or install a driver (Mesa RADV on Linux, the \
+                         AMD display driver on Windows) to run models on this GPU",
+                    _ =>
+                        "no Vulkan GPU driver was found - install one (Mesa RADV on Linux, the \
+                         AMD display driver on Windows) to run models on this GPU",
+                }
             ),
             // The covering family is the fact; it is already printed on its own
             // line above, so this one says what it means rather than repeating
