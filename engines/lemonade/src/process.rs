@@ -802,46 +802,75 @@ mod tests {
 
     /// Start the stand-in through `spawn_lemond`'s Linux path, with the host's
     /// libraries given rather than probed.
+    ///
+    /// A script written a moment ago can fail to exec with `ETXTBSY` when
+    /// another test thread forks while the write handle is still open; that,
+    /// and only that, is retried.
     #[cfg(target_os = "linux")]
     fn start_on(
         manifest: &LemonadeInstallManifest,
         host_libraries: &crate::host_libraries::HostLibraries,
     ) -> Result<()> {
-        let mut child = spawn_lemond_on(
-            host_libraries,
-            manifest,
-            "127.0.0.1",
-            1,
-            None,
-            &LemonadeProcessEnvironment::default(),
-        )?;
+        let mut attempts = 0;
+        let mut child = loop {
+            match spawn_lemond_on(
+                host_libraries,
+                manifest,
+                "127.0.0.1",
+                1,
+                None,
+                &LemonadeProcessEnvironment::default(),
+            ) {
+                Err(error)
+                    if attempts < 50
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .and_then(std::io::Error::raw_os_error)
+                                == Some(libc::ETXTBSY)
+                        }) =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => break result?,
+            }
+        };
         child.wait()?;
         Ok(())
     }
 
+    /// Host libraries as a test writes them: a version, or `missing` for a
+    /// library the loader cache does not list.
     #[cfg(target_os = "linux")]
     fn libraries(glibc: &str, openssl: &str) -> crate::host_libraries::HostLibraries {
+        use crate::host_libraries::{HostLibrary, LibVersion};
+        let library = |text: &str| match text {
+            "missing" => HostLibrary::Missing,
+            text => HostLibrary::Version(LibVersion::parse(text).unwrap()),
+        };
         crate::host_libraries::HostLibraries {
-            glibc: crate::host_libraries::LibVersion::parse(glibc),
-            openssl: crate::host_libraries::LibVersion::parse(openssl),
+            glibc: library(glibc),
+            openssl: library(openssl),
         }
     }
 
-    /// On a host older than the pinned `lemond` needs, the refusal names both
-    /// versions of each short library and says `lemond` was not started, and
-    /// it really was not: the stand-in never ran.
+    /// On a host older than the pinned `lemond` needs (Ubuntu 20.04: glibc 2.31
+    /// and OpenSSL 1.1 only), the refusal names what each short library needs
+    /// and what the host has, says `lemond` was not started, and it really was
+    /// not: the stand-in never ran.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_pinned_lemond_is_not_started_on_a_host_with_too_old_libraries() {
         let (_dir, manifest, marker) = marker_lemond(rocm_deps::LEMONADE_VERSION);
-        let error = start_on(&manifest, &libraries("2.17", "1.1.1"))
+        let error = start_on(&manifest, &libraries("2.31", "missing"))
             .expect_err("a host older than the pinned lemond needs is refused")
             .to_string();
         let needs = &crate::install::LINUX_LEMOND_NEEDS;
         for expected in [
-            format!("glibc {} or newer (this host has glibc 2.17)", needs.glibc),
+            format!("glibc {} or newer (this host has glibc 2.31)", needs.glibc),
             format!(
-                "OpenSSL {} or newer (this host has OpenSSL 1.1.1)",
+                "OpenSSL {} or newer (this host's loader cache has no libssl.so.3)",
                 needs.openssl
             ),
             format!("the Lemonade {} server", rocm_deps::LEMONADE_VERSION),
@@ -866,7 +895,7 @@ mod tests {
         );
 
         let (_dir, manifest, marker) = marker_lemond("0.0.1");
-        start_on(&manifest, &libraries("2.17", "1.1.1")).unwrap();
+        start_on(&manifest, &libraries("2.31", "missing")).unwrap();
         assert!(
             marker.exists(),
             "a tree of another version was refused by this pin's needs"

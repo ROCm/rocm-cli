@@ -14,13 +14,22 @@
 //! newest `GLIBC_*` / `OPENSSL_*` version node each one defines, which is the
 //! same thing the loader compares.
 //!
-//! A host version that cannot be read (no `ldconfig`, a library the cache does
-//! not list, a file that does not parse) is reported as unknown and never
-//! refuses: `lemond`'s own loader error still reaches the startup log tail then,
-//! and a false refusal would block a host that runs it fine.
+//! Each library is found through the `ldconfig` cache, with one of three
+//! results ([`HostLibrary`]):
+//!
+//! - a version, read from the library the cache lists;
+//! - missing: the cache was read and lists `libc.so.6`, but not this library's
+//!   soname. A host with only OpenSSL 1.1 has no `libssl.so.3`, so this is how
+//!   such a host reads, and it refuses, since `lemond` cannot load at all;
+//! - unknown: no cache could be read, the cache lists not even `libc.so.6`, or
+//!   the library listed did not parse. Unknown never refuses: `lemond`'s own
+//!   loader error still reaches the startup log tail then, and a false refusal
+//!   would block a host that runs it fine.
 
 use std::cmp::Ordering;
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 
@@ -96,36 +105,57 @@ pub(crate) struct LemondHostNeeds {
     pub(crate) openssl: &'static str,
 }
 
-/// The host's glibc and OpenSSL versions, each `None` when it could not be read.
+/// What the probe found for one library.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HostLibraries {
-    pub(crate) glibc: Option<LibVersion>,
-    pub(crate) openssl: Option<LibVersion>,
+pub(crate) enum HostLibrary {
+    /// Not read: no loader cache, a cache that lists not even `libc.so.6`, or a
+    /// library that did not parse. Never refuses.
+    #[default]
+    Unknown,
+    /// The cache was read and lists `libc.so.6`, but not this library's soname.
+    Missing,
+    /// The newest version node the library defines.
+    Version(LibVersion),
 }
 
+/// The host's glibc and OpenSSL, as the probe found them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostLibraries {
+    pub(crate) glibc: HostLibrary,
+    pub(crate) openssl: HostLibrary,
+}
+
+/// The soname `lemond` loads for glibc and for OpenSSL, and the prefix of the
+/// version nodes it defines.
+const GLIBC_SONAME: &str = "libc.so.6";
+const OPENSSL_SONAME: &str = "libssl.so.3";
+
 /// Why this host cannot run the pinned `lemond`, or `None` when it can or when
-/// nothing older than needed was found.
+/// nothing short of the needs was found.
 ///
-/// Names each library that is too old with the version needed and the version
-/// the host has, so the message alone says what to upgrade.
+/// Names each library that falls short with the version needed and what the
+/// host has: its version, or that the loader cache has no library of that
+/// soname. So the message alone says what to upgrade.
 pub(crate) fn host_shortfall(
     lemonade_version: &str,
     needs: &LemondHostNeeds,
     host: &HostLibraries,
 ) -> Option<String> {
     let mut short = Vec::new();
-    for (name, needed, have) in [
-        ("glibc", needs.glibc, host.glibc),
-        ("OpenSSL", needs.openssl, host.openssl),
+    for (name, soname, needed, have) in [
+        ("glibc", GLIBC_SONAME, needs.glibc, host.glibc),
+        ("OpenSSL", OPENSSL_SONAME, needs.openssl, host.openssl),
     ] {
         let needed = LibVersion::parse(needed)
             .unwrap_or_else(|| panic!("pinned {name} need {needed:?} is not a version"));
-        if let Some(have) = have
-            && have < needed
-        {
-            short.push(format!(
+        match have {
+            HostLibrary::Version(have) if have < needed => short.push(format!(
                 "{name} {needed} or newer (this host has {name} {have})"
-            ));
+            )),
+            HostLibrary::Missing => short.push(format!(
+                "{name} {needed} or newer (this host's loader cache has no {soname})"
+            )),
+            HostLibrary::Version(_) | HostLibrary::Unknown => {}
         }
     }
     if short.is_empty() {
@@ -177,6 +207,29 @@ pub(crate) fn x86_64_library_path<'a>(ldconfig_cache: &'a str, soname: &str) -> 
     })
 }
 
+/// Read the host's libraries from `ldconfig -p`'s text (`None` when it could not
+/// be run), with `read_version(path, prefix)` reading one library's newest
+/// version node. Pure apart from `read_version`, so a test plants the cache.
+pub(crate) fn host_libraries_from_cache(
+    cache: Option<&str>,
+    read_version: impl Fn(&str, &str) -> Option<LibVersion>,
+) -> HostLibraries {
+    let Some(cache) = cache else {
+        return HostLibraries::default();
+    };
+    // A cache that lists not even the C library says nothing about the others.
+    let cache_lists_libc = x86_64_library_path(cache, GLIBC_SONAME).is_some();
+    let probe = |soname: &str, prefix: &str| match x86_64_library_path(cache, soname) {
+        Some(path) => read_version(path, prefix).map_or(HostLibrary::Unknown, HostLibrary::Version),
+        None if cache_lists_libc => HostLibrary::Missing,
+        None => HostLibrary::Unknown,
+    };
+    HostLibraries {
+        glibc: probe(GLIBC_SONAME, "GLIBC_"),
+        openssl: probe(OPENSSL_SONAME, "OPENSSL_"),
+    }
+}
+
 /// The version node names an ELF shared library defines (`SHT_GNU_VERDEF`).
 #[cfg(target_os = "linux")]
 fn defined_version_names(bytes: &[u8]) -> Option<Vec<&[u8]>> {
@@ -205,37 +258,38 @@ fn library_version(path: &str, prefix: &str) -> Option<LibVersion> {
 
 /// Debug/test override of what [`probe_host_libraries`] reports, so a
 /// black-box scenario reaches the refusal on a host whose libraries are new.
+/// Each takes a version, or `missing` for a library the cache does not list.
 #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
 const HOST_GLIBC_TEST_ENV: &str = "ROCM_E2E_LEMONADE_HOST_GLIBC";
 #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
 const HOST_OPENSSL_TEST_ENV: &str = "ROCM_E2E_LEMONADE_HOST_OPENSSL";
 
 /// This host's glibc and OpenSSL, as the libraries the loader cache lists for
-/// `libc.so.6` and `libssl.so.3` define them.
+/// `libc.so.6` and `libssl.so.3` define them. Probed once per process: the
+/// install and every `lemond` start ask, and the answer does not change.
 #[cfg(target_os = "linux")]
 pub(crate) fn probe_host_libraries() -> HostLibraries {
-    #[cfg(feature = "e2e-test-hooks")]
-    {
-        let read = |key: &str| {
-            std::env::var(key)
-                .ok()
-                .and_then(|value| LibVersion::parse(&value))
-        };
-        let (glibc, openssl) = (read(HOST_GLIBC_TEST_ENV), read(HOST_OPENSSL_TEST_ENV));
-        if glibc.is_some() || openssl.is_some() {
-            return HostLibraries { glibc, openssl };
+    static PROBED: OnceLock<HostLibraries> = OnceLock::new();
+    *PROBED.get_or_init(|| {
+        #[cfg(feature = "e2e-test-hooks")]
+        {
+            let read = |key: &str| match std::env::var(key).ok().as_deref() {
+                Some("missing") => HostLibrary::Missing,
+                Some(value) => {
+                    LibVersion::parse(value).map_or(HostLibrary::Unknown, HostLibrary::Version)
+                }
+                None => HostLibrary::Unknown,
+            };
+            let hooked = HostLibraries {
+                glibc: read(HOST_GLIBC_TEST_ENV),
+                openssl: read(HOST_OPENSSL_TEST_ENV),
+            };
+            if hooked != HostLibraries::default() {
+                return hooked;
+            }
         }
-    }
-    let Some(cache) = rocm_core::ldconfig_cache() else {
-        return HostLibraries::default();
-    };
-    let probe = |soname: &str, prefix: &str| {
-        x86_64_library_path(&cache, soname).and_then(|path| library_version(path, prefix))
-    };
-    HostLibraries {
-        glibc: probe("libc.so.6", "GLIBC_"),
-        openssl: probe("libssl.so.3", "OPENSSL_"),
-    }
+        host_libraries_from_cache(rocm_core::ldconfig_cache().as_deref(), library_version)
+    })
 }
 
 #[cfg(test)]
@@ -252,10 +306,20 @@ mod tests {
         Some(LibVersion::parse(text).unwrap())
     }
 
+    /// One library as a test writes it: a version, `missing`, or `None` for
+    /// unknown.
+    fn library(text: Option<&str>) -> HostLibrary {
+        match text {
+            None => HostLibrary::Unknown,
+            Some("missing") => HostLibrary::Missing,
+            Some(text) => HostLibrary::Version(LibVersion::parse(text).unwrap()),
+        }
+    }
+
     fn host(glibc: Option<&str>, openssl: Option<&str>) -> HostLibraries {
         HostLibraries {
-            glibc: glibc.and_then(LibVersion::parse),
-            openssl: openssl.and_then(LibVersion::parse),
+            glibc: library(glibc),
+            openssl: library(openssl),
         }
     }
 
@@ -271,11 +335,13 @@ mod tests {
         }
     }
 
-    /// The states the check can be in, one row each: every library new enough
-    /// (Ubuntu 24.04 against the 2026.44.1 needs, and exactly at the need), one
-    /// too old, both too old, and unknown host versions, which never refuse.
+    /// The states the check can be in, one row each, as the probe can produce
+    /// them: every library new enough (Ubuntu 24.04 against the 2026.44.1
+    /// needs, and exactly at the need); glibc too old (Ubuntu 22.04); OpenSSL 3
+    /// missing with glibc too old (Ubuntu 20.04, OpenSSL 1.1 only); OpenSSL 3
+    /// missing alone; and unknown versions, which never refuse.
     #[test]
-    fn shortfall_names_each_library_that_is_too_old_with_both_versions() {
+    fn shortfall_names_each_library_that_falls_short_and_what_the_host_has() {
         let rows: [(HostLibraries, Option<&str>); 7] = [
             (host(Some("2.39"), Some("3.0.13")), None),
             (host(Some("2.38"), Some("3.0.0")), None),
@@ -284,20 +350,19 @@ mod tests {
                 Some("it needs glibc 2.38 or newer (this host has glibc 2.35)"),
             ),
             (
-                host(Some("2.39"), Some("1.1.1")),
-                Some("it needs OpenSSL 3.0.0 or newer (this host has OpenSSL 1.1.1)"),
-            ),
-            (
-                host(Some("2.17"), Some("1.1.1")),
+                host(Some("2.31"), Some("missing")),
                 Some(
-                    "it needs glibc 2.38 or newer (this host has glibc 2.17) and \
-                     OpenSSL 3.0.0 or newer (this host has OpenSSL 1.1.1)",
+                    "it needs glibc 2.38 or newer (this host has glibc 2.31) and \
+                     OpenSSL 3.0.0 or newer (this host's loader cache has no libssl.so.3)",
                 ),
             ),
             (
-                host(None, Some("1.1.1")),
-                Some("it needs OpenSSL 3.0.0 or newer (this host has OpenSSL 1.1.1)"),
+                host(Some("2.39"), Some("missing")),
+                Some(
+                    "it needs OpenSSL 3.0.0 or newer (this host's loader cache has no libssl.so.3)",
+                ),
             ),
+            (host(None, Some("3.0.13")), None),
             (host(None, None), None),
         ];
         for (host, expected) in rows {
@@ -318,6 +383,25 @@ mod tests {
         }
     }
 
+    /// An OpenSSL 3 older than a pin needs is reported by version: no pin needs
+    /// that today, but 2026.45.3 needed 3.2.0, which Ubuntu 24.04's 3.0.13 is not.
+    #[test]
+    fn an_openssl_3_older_than_the_need_is_named_by_version() {
+        let needs = LemondHostNeeds {
+            archive_sha256: "",
+            glibc: "2.43",
+            openssl: "3.2.0",
+        };
+        let message = host_shortfall("9.9.9", &needs, &host(Some("2.39"), Some("3.0.13"))).unwrap();
+        assert!(
+            message.ends_with(
+                "it needs glibc 2.43 or newer (this host has glibc 2.39) and \
+                 OpenSSL 3.2.0 or newer (this host has OpenSSL 3.0.13)"
+            ),
+            "{message}"
+        );
+    }
+
     #[test]
     fn refusal_appends_what_it_left_undone_and_passes_a_new_enough_host() {
         let error = refuse_if_host_too_old(
@@ -333,6 +417,63 @@ mod tests {
             "{error}"
         );
         refuse_if_host_too_old("9.9.9", &NEEDS, &host(Some("2.39"), Some("3.0.13")), "x").unwrap();
+    }
+
+    const LIBC_LINE: &str =
+        "\tlibc.so.6 (libc6,x86-64, OS ABI: Linux 3.2.0) => /lib/x86_64-linux-gnu/libc.so.6\n";
+    const LIBSSL_LINE: &str = "\tlibssl.so.3 (libc6,x86-64) => /lib/x86_64-linux-gnu/libssl.so.3\n";
+    const LIBSSL11_LINE: &str =
+        "\tlibssl.so.1.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libssl.so.1.1\n";
+
+    /// A reader standing in for the ELF read: glibc 2.31 and OpenSSL 3.0.13,
+    /// or `None` for a library that does not parse.
+    fn planted_reader(unparseable: &'static str) -> impl Fn(&str, &str) -> Option<LibVersion> {
+        move |path, _prefix| {
+            if path.ends_with(unparseable) {
+                None
+            } else if path.ends_with("libc.so.6") {
+                LibVersion::parse("2.31")
+            } else {
+                LibVersion::parse("3.0.13")
+            }
+        }
+    }
+
+    /// The probe over a planted `ldconfig -p`, one row per state: an OpenSSL
+    /// 1.1-only host reads OpenSSL as missing and is refused; a host with both
+    /// reads versions; and an unreadable cache, a cache that lists no C library,
+    /// and a listed library that does not parse all read unknown.
+    #[test]
+    fn a_read_cache_without_libssl_3_reports_openssl_missing_and_refuses() {
+        let header = "3 libs found in cache `/etc/ld.so.cache'\n";
+        let openssl_1_1_only = format!("{header}{LIBC_LINE}{LIBSSL11_LINE}");
+        let probed = host_libraries_from_cache(Some(&openssl_1_1_only), planted_reader("-"));
+        assert_eq!(probed, host(Some("2.31"), Some("missing")));
+        let message = host_shortfall("9.9.9", &NEEDS, &probed).expect("refused");
+        assert!(
+            message
+                .contains("OpenSSL 3.0.0 or newer (this host's loader cache has no libssl.so.3)"),
+            "{message}"
+        );
+
+        let both = format!("{header}{LIBC_LINE}{LIBSSL_LINE}");
+        assert_eq!(
+            host_libraries_from_cache(Some(&both), planted_reader("-")),
+            host(Some("2.31"), Some("3.0.13"))
+        );
+        assert_eq!(
+            host_libraries_from_cache(Some(&both), planted_reader("libssl.so.3")),
+            host(Some("2.31"), None)
+        );
+        assert_eq!(
+            host_libraries_from_cache(None, planted_reader("-")),
+            HostLibraries::default()
+        );
+        let no_libc = format!("{header}{LIBSSL11_LINE}");
+        assert_eq!(
+            host_libraries_from_cache(Some(&no_libc), planted_reader("-")),
+            HostLibraries::default()
+        );
     }
 
     #[test]

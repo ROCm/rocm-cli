@@ -149,9 +149,13 @@ and `OPENSSL_*` versions `objdump -T lemond` lists, into `LINUX_LEMOND_NEEDS`
 beside those digests; a unit test fails until that record names the new Linux
 archive. On Linux, `rocm engines install lemonade` refuses a host whose glibc
 or OpenSSL is older than that before downloading anything, and the engine
-refuses to start that `lemond` on such a host, naming the version needed and
-the version the host has for each library
-([host_libraries.rs](../engines/lemonade/src/host_libraries.rs)). Lemonade
+refuses to start that `lemond` on such a host
+([host_libraries.rs](../engines/lemonade/src/host_libraries.rs)). For each
+library that falls short, the message names the version needed and what the
+host has: its version, read from the library the `ldconfig` cache lists, or
+that the cache has no such library at all. A host with only OpenSSL 1.1 has no
+`libssl.so.3`, so it reads that way. A host whose cache cannot be read, or
+whose library does not parse, is not refused. Lemonade
 2026.44.1, the current pin, needs glibc 2.38 and OpenSSL 3.0.0, which Ubuntu
 24.04 meets; 2026.45.3's `lemond` needs glibc 2.43 and OpenSSL 3.2.0, which it
 does not.

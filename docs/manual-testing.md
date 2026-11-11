@@ -391,6 +391,22 @@ folder run `rocm engines install lemonade --yes`. Expected result:
   carries on: Lemonade picks the backend after this point and a smaller one may
   fit. (Stop it before the download if you do not want one.)
 
+To check the refusal of a Linux or WSL host too old for the pinned Lemonade
+server (no download needed): the pinned build needs glibc 2.38 and OpenSSL 3
+(`libssl.so.3`). On a real older host, such as Ubuntu 22.04 (glibc 2.35) or
+Ubuntu 20.04 (glibc 2.31, OpenSSL 1.1 only), run
+`rocm engines install lemonade --yes` in a fresh data folder. On a newer host,
+use a debug build and set `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and
+`ROCM_E2E_LEMONADE_HOST_OPENSSL=missing` first. Expected result:
+
+- It fails with `this host's libraries are too old for the Lemonade <version>
+  server: it needs glibc 2.38 or newer (this host has glibc <version>)`, followed
+  on a host without OpenSSL 3 by `and OpenSSL 3.0.0 or newer (this host's loader
+  cache has no libssl.so.3)`, and ends `Nothing was downloaded.`.
+- The data folder's `engines/lemonade` has no `downloads` or `runtime`
+  subfolder, and `rocm storage report` lists no Lemonade install.
+- On Ubuntu 24.04 or newer the same command installs Lemonade as usual.
+
 With room to spare, on Windows from an interactive console: install Lemonade
 with no runtime active, then `rocm install sdk`, then `rocm serve <gguf-model>`.
 Expected result:

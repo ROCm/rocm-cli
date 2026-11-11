@@ -1721,14 +1721,19 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   disk that nothing was downloaded. That variable also waives serve's no-GPU
   refusal, as serve-18's failure hook does.
 - `lemonade-installs-07` (Linux) reaches the refusal of a host whose glibc
-  or OpenSSL is older than the pinned `lemond` needs, with glibc 2.17 and
-  OpenSSL 1.1.1 reported through `ROCM_E2E_LEMONADE_HOST_GLIBC` and
-  `ROCM_E2E_LEMONADE_HOST_OPENSSL` (same `rocm/e2e-test-hooks` build). It checks
-  that the message names both versions of each library and that nothing was
-  downloaded. Refusing to start `lemond` itself on such a host, the version
-  comparison and the probe that reads the host's `libc.so.6` and `libssl.so.3`
-  are unit-tested in [host_libraries.rs](../engines/lemonade/src/host_libraries.rs)
-  and [process.rs](../engines/lemonade/src/process.rs).
+  or OpenSSL falls short of what the pinned `lemond` needs. It reports an
+  Ubuntu 20.04-like host through `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and
+  `ROCM_E2E_LEMONADE_HOST_OPENSSL=missing` (same `rocm/e2e-test-hooks` build):
+  glibc 2.31, and no `libssl.so.3` in the loader cache because only OpenSSL 1.1
+  is installed. It checks that the message names what each library needs and
+  what the host has, and that nothing was downloaded. The probe itself,
+  including a planted `ldconfig -p` that lists `libc.so.6` but no
+  `libssl.so.3`, and refusing to start `lemond` on such a host are unit-tested
+  in [host_libraries.rs](../engines/lemonade/src/host_libraries.rs) and
+  [process.rs](../engines/lemonade/src/process.rs). No scenario reaches the
+  start-time refusal: `rocm serve` runs the install check first, a Linux serve
+  with a packaged `llama-server` never starts `lemond`, and the mock lane has
+  no GPU for serve to resolve.
 - `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
   and checks `rocm storage report` lists both and flags the unused one.
 - `lemonade-installs-04` uninstalls that runtime and checks the install record
