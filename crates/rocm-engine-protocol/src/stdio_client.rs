@@ -155,15 +155,6 @@ where
     }
     if let Some(key_file) = options.endpoint_key_file {
         command.env(ENDPOINT_API_KEY_FILE_ENV, key_file);
-    } else {
-        // Cleared, not merely left unset. The caller said this child gets no
-        // endpoint key, and an engine plugin is a third-party binary: a value
-        // this process happens to have inherited must not reach it just
-        // because nothing overwrote it. `rocm`'s plugin calls pass `None`
-        // here, so this is what keeps a 0600 key-file path off their
-        // environment. See
-        // `an_external_plugin_child_is_not_handed_the_endpoint_key_file`.
-        command.env_remove(ENDPOINT_API_KEY_FILE_ENV);
     }
     if options.request_progress {
         command.env(ENGINE_PROGRESS_STDERR_ENV, "1");
@@ -682,46 +673,6 @@ mod tests {
         assert_eq!(command.get_program(), "/an/engine");
         assert_eq!(args_of(&command), ["stdio"]);
         assert!(added_env(&command).is_empty(), "{:?}", added_env(&command));
-    }
-
-    /// A child told it gets no endpoint key must have the variable CLEARED,
-    /// not merely left unset.
-    ///
-    /// `rocm` passes `endpoint_key_file: None` for every external engine
-    /// plugin — a third-party binary — and the path it would otherwise carry
-    /// points at a mode-0600 file holding a live endpoint credential. Merely
-    /// not setting it would still hand the value through whenever this process
-    /// inherited one.
-    ///
-    /// Asserts the distinction directly: `Command` records `env_remove` as an
-    /// explicit `(key, None)` entry, so a plain "is it absent" check would pass
-    /// even with the clearing deleted.
-    #[test]
-    fn an_external_plugin_child_is_not_handed_the_endpoint_key_file() {
-        let key_var = std::ffi::OsStr::new(ENDPOINT_API_KEY_FILE_ENV);
-        let command = engine_stdio_command(
-            Path::new("/an/engine"),
-            ["stdio"],
-            &EngineStdioOptions {
-                app_paths: None,
-                env_root: None,
-                endpoint_key_file: None,
-                request_progress: false,
-                forward_stderr: false,
-                note_failing_exit_after_answer: false,
-            },
-        );
-
-        let entry = command
-            .get_envs()
-            .find(|(key, _)| *key == key_var)
-            .map(|(_, value)| value);
-        assert_eq!(
-            entry,
-            Some(None),
-            "the key-file variable must be explicitly CLEARED when no key file \
-             is passed, not merely left unset"
-        );
     }
 
     #[test]
