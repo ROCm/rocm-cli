@@ -69,13 +69,18 @@ pub(crate) fn healthcheck_response_recoverable(response: &HealthcheckResponse) -
 /// resolve it with `endpoint_api_key_from_file` and enforce nothing when that
 /// yields `None`, so treating an empty or malformed file as "protected" would
 /// let the guard pass while the endpoint served anonymously.
+///
+/// `key_file_of` answers which key file the service has: production passes
+/// [`usable_endpoint_key_file`], and the supervisor takes it as a parameter so a
+/// test can change the answer between its two guard checks.
 #[must_use]
 pub(crate) fn apply_endpoint_key_env(
     command: &mut ProcessCommand,
     paths: &AppPaths,
     service_id: &str,
+    key_file_of: impl FnOnce(&AppPaths, &str) -> Option<PathBuf>,
 ) -> bool {
-    if let Some(key_file) = usable_endpoint_key_file(paths, service_id) {
+    if let Some(key_file) = key_file_of(paths, service_id) {
         command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         return true;
     }
@@ -92,7 +97,7 @@ pub(crate) fn has_usable_endpoint_key(paths: &AppPaths, service_id: &str) -> boo
 }
 
 /// The service's endpoint key file, when it exists and holds a usable key.
-fn usable_endpoint_key_file(paths: &AppPaths, service_id: &str) -> Option<PathBuf> {
+pub(crate) fn usable_endpoint_key_file(paths: &AppPaths, service_id: &str) -> Option<PathBuf> {
     rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
         .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
 }
@@ -229,7 +234,7 @@ mod tests {
             // reports as present is exactly what it threads onto the child.
             let mut command = ProcessCommand::new("true");
             assert_eq!(
-                apply_endpoint_key_env(&mut command, &paths, service_id),
+                apply_endpoint_key_env(&mut command, &paths, service_id, usable_endpoint_key_file),
                 usable,
                 "{contents:?}"
             );
@@ -246,7 +251,12 @@ mod tests {
         // Loopback service: no key file has ever been written, so the child's
         // environment must be left untouched.
         let mut command = ProcessCommand::new("true");
-        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(!apply_endpoint_key_env(
+            &mut command,
+            &paths,
+            service_id,
+            usable_endpoint_key_file
+        ));
         assert!(
             command
                 .get_envs()
@@ -261,7 +271,12 @@ mod tests {
         fs::create_dir_all(paths.services_dir()).unwrap();
         fs::write(&key_path, "secret-key").unwrap();
         let mut command = ProcessCommand::new("true");
-        assert!(apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(apply_endpoint_key_env(
+            &mut command,
+            &paths,
+            service_id,
+            usable_endpoint_key_file
+        ));
         let env_value = command
             .get_envs()
             .find_map(|(key, value)| {
@@ -277,7 +292,12 @@ mod tests {
         // respawn guard pass and still open an anonymous listener.
         fs::write(&key_path, "   \n").unwrap();
         let mut command = ProcessCommand::new("true");
-        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(!apply_endpoint_key_env(
+            &mut command,
+            &paths,
+            service_id,
+            usable_endpoint_key_file
+        ));
         assert!(
             command
                 .get_envs()
