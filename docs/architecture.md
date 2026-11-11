@@ -377,7 +377,7 @@ Boundaries:
   - [`runtime.rs`](../crates/rocm-core/src/runtime.rs)'s `runtime_python_env_root_for_executable` and `install_root_has_payload` are the one definitions of those rules.
   - [`vllm_oom.rs`](../crates/rocm-core/src/vllm_oom.rs)'s `VLLM_OOM_DETECTED_PREFIX` and `VLLM_OOM_DIAGNOSE_COMMAND` must match byte for byte in the vLLM engine and `apps/rocm`.
 - **Dependency direction.** [`automation.rs`](../crates/rocm-core/src/automation.rs) reads `WatcherMode` from [`config.rs`](../crates/rocm-core/src/config.rs), which imports nothing back; the built-in watcher catalog sits beside `WatcherMode` in [`config.rs`](../crates/rocm-core/src/config.rs) to keep it that way.
-- **Unbounded readers.** [`process.rs`](../crates/rocm-core/src/process.rs)'s `run_with_timeout` is not yet the only bounded runner: [`therock/process.rs`](../apps/rocm/src/therock/process.rs), `probe_exec`'s `run_raw` and the `host_gpu` capture helpers still join their reader threads with no time limit, so a grandchild holding a pipe can outlast their timeout.
+- **Reader threads.** [`process.rs`](../crates/rocm-core/src/process.rs)'s `run_with_timeout` abandons a pipe reader that has not finished shortly after the child is gone, so a grandchild holding a pipe cannot outlast its timeout. [`therock/process.rs`](../apps/rocm/src/therock/process.rs), `probe_exec`'s `run_raw` and the `host_gpu` capture helpers join their reader threads with no time limit, so a grandchild holding a pipe can outlast their timeouts.
 
 ### `crates/rocm-dash-core` — dashboard types and reducer
 
