@@ -947,6 +947,161 @@ mod tests {
         assert!(error.to_string().contains("was not found"), "{error:#}");
     }
 
+    /// Sets the signed recipe-index environment for the lifetime of the guard.
+    /// The environment is process-wide, so callers hold `RECIPE_INDEX_ENV_LOCK`
+    /// for as long as the guard lives.
+    struct RecipeIndexEnv {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl RecipeIndexEnv {
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        fn set(vars: &[(&'static str, &std::path::Path)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in vars {
+                unsafe { std::env::set_var(key, value) };
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for RecipeIndexEnv {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    static RECIPE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drives `prefetch_artifact` through `run_sandbox_tool` with an artifact
+    /// reference that the recipe registry resolves (the built-in catalog lists no
+    /// artifacts, so a signed recipe index supplies one). The callee's own tests
+    /// in `artifact_prefetch.rs` call it directly, and the two tests above stop
+    /// before it, so this is the one test that covers the dispatch seam: the
+    /// reference resolves to its recipe's canonical model id, and the caller's
+    /// policy reaches the policy decision.
+    #[test]
+    fn sandbox_prefetch_resolves_artifact_and_applies_policy_through_run_sandbox_tool() -> Result<()>
+    {
+        let (root, paths) = temp_app_paths("sandbox-prefetch-dispatch");
+        paths.ensure()?;
+        let index = root.join("recipes.json");
+        let signature = root.join("recipes.json.sig");
+        let public_key = root.join("recipes-public.pem");
+        let document = json!({
+            "schema_version": 1,
+            "source": "sandbox-prefetch-dispatch-test",
+            "recipes": [{
+                "canonical_model_id": "Dispatch/Test-1B",
+                "aliases": [],
+                "task": "chat",
+                "source": "signed_recipe_index",
+                "revision": "main",
+                "loader": "transformers",
+                "trust_remote_code": false,
+                "dtype": "float16",
+                "device_policy": "gpu_required",
+                "artifacts": [{
+                    "artifact_id": "direct-bin",
+                    "kind": "url",
+                    "uri": "https://example.invalid/should-not-be-fetched.bin",
+                    "revision": null,
+                    "sha256": "a".repeat(64),
+                    "size_bytes": 12,
+                    "license": "test-only",
+                    "gated": false,
+                    "quantization": null,
+                    "engines": ["vllm"]
+                }],
+                "engine_recipes": [],
+                "manual_alternatives": [],
+                "featured": false,
+                "chat_template_mode": "auto",
+                "preferred_engines": ["vllm"],
+                "warnings": []
+            }]
+        });
+        let payload = serde_json::to_vec_pretty(&document)?;
+        let (private_pem, public_pem) = rocm_core::generate_rsa_signing_keypair()?;
+        fs::write(&index, &payload)?;
+        fs::write(
+            &signature,
+            rocm_core::sign_rsa_pkcs1_sha256_signature(&private_pem, &payload)?,
+        )?;
+        fs::write(&public_key, public_pem)?;
+
+        let run = |policy: SandboxToolPolicy| {
+            let _lock = RECIPE_INDEX_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _env = RecipeIndexEnv::set(&[
+                ("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.as_path()),
+                (
+                    "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH",
+                    signature.as_path(),
+                ),
+                (
+                    "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+                    public_key.as_path(),
+                ),
+            ]);
+            run_sandbox_tool(
+                &paths,
+                SandboxToolArg::PrefetchArtifact,
+                None,
+                Some("Dispatch/Test-1B#direct-bin".to_owned()),
+                None,
+                policy,
+            )
+        };
+
+        // No download approval: the reference resolves, the answer names the
+        // recipe's canonical model, and nothing is fetched or cached.
+        let blocked = run(SandboxToolPolicy::default())?;
+        let marker_path = std::path::PathBuf::from(
+            blocked["cache"]["marker_path"]
+                .as_str()
+                .expect("the report names the cache marker path"),
+        );
+        assert_eq!(blocked["status"], "source_policy_required", "{blocked}");
+        assert_eq!(blocked["model"], "Dispatch/Test-1B", "{blocked}");
+        assert_eq!(blocked["artifact_ref"], "Dispatch/Test-1B#direct-bin");
+        assert_eq!(blocked["artifact"]["artifact_id"], "direct-bin");
+        assert_eq!(blocked["network_used"], false);
+        assert_eq!(blocked["mutating"], false);
+        assert!(
+            !marker_path.exists(),
+            "a blocked prefetch must not write the cache marker"
+        );
+
+        // Download approved and a marker already present: the policy the caller
+        // passed is the one that is applied, so the answer is `cached`, still
+        // without a network request.
+        rocm_core::atomic_write::write_file_atomically(&marker_path, br#"{"cached":true}"#)?;
+        let cached = run(SandboxToolPolicy {
+            allow_artifact_download: true,
+            artifact_max_bytes: Some(1024),
+            ..SandboxToolPolicy::default()
+        })?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(cached["status"], "cached", "{cached}");
+        assert_eq!(cached["model"], "Dispatch/Test-1B", "{cached}");
+        assert_eq!(cached["network_used"], false);
+        Ok(())
+    }
+
     #[test]
     fn sandbox_tool_stop_server_updates_manifest_and_skips_current_pid() -> Result<()> {
         let (root, paths) = temp_app_paths("sandbox-stop-current-pid");
