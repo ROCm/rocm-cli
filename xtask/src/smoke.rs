@@ -314,11 +314,39 @@ fn assert_path_missing(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// A release tag as `apps/rocm/build.rs`'s `release_version` reads one: the
+/// pattern and length are its `RELEASE_TAG_PATTERN` and
+/// `RELEASE_VERSION_MAX_LEN` (+1 for the `v`), and its test
+/// `release_tag_grammar_is_the_same_everywhere` fails if these differ.
+const RELEASE_TAG_PATTERN: &str = r"^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$";
+const RELEASE_TAG_MAX_LEN: usize = 65;
+
+fn is_release_tag(git_ref: &str) -> bool {
+    git_ref.len() <= RELEASE_TAG_MAX_LEN
+        && regex::Regex::new(RELEASE_TAG_PATTERN)
+            .expect("the release-tag pattern compiles")
+            .is_match(git_ref)
+}
+
+/// The version `rocm` must report for a build from `git_ref`, by the same
+/// contract as `format_cli_version` in `apps/rocm/build.rs`: an exact release
+/// tag `vX.Y.Z` (see [`is_release_tag`]) is reported with that one leading `v`
+/// removed, and every other resolved ref, `main` included, as `0.0.0-dev`
+/// rather than the workspace package version. It is derived from the ref
+/// alone, so a tag build that printed `0.0.0-dev` fails.
+fn expected_version(git_ref: &str) -> &str {
+    if is_release_tag(git_ref) {
+        &git_ref[1..]
+    } else {
+        "0.0.0-dev"
+    }
+}
+
 /// Accept only the traceable build string `rocm-cli <version> (<ref>, <hash>)`,
-/// and reject the placeholder `unknown` ref a build with no resolvable
-/// tag/branch emits.
+/// reject the placeholder `unknown` ref a build with no resolvable tag/branch
+/// emits, and require the version the ref calls for.
 fn assert_version_string(text: &str, label: &str) -> Result<()> {
-    let Some((_version, git_ref, _hash)) = parse_version_line(text) else {
+    let Some((version, git_ref, _hash)) = parse_version_line(text) else {
         bail!("{label} did not match 'rocm-cli <version> (<ref>, <hash>)':\n{text}");
     };
     if git_ref == "unknown" {
@@ -331,6 +359,10 @@ fn assert_version_string(text: &str, label: &str) -> Result<()> {
              A detached HEAD or a source tree without git metadata produces this; \
              build from a branch or tag:\n{text}"
         );
+    }
+    let expected = expected_version(git_ref);
+    if version != expected {
+        bail!("{label} reported {version:?} for ref {git_ref:?}; expected {expected:?}:\n{text}");
     }
     Ok(())
 }
@@ -1395,8 +1427,44 @@ mod tests {
         let error = assert_version_string("rocm-cli 0.2.0 (unknown, a1b2c3d)", "rocm version")
             .expect_err("an unknown ref is rejected");
         assert!(format!("{error}").contains("unresolved ref"), "{error}");
-        assert_version_string("rocm-cli 0.2.0 (main, a1b2c3d)", "rocm version")
+        assert_version_string("rocm-cli 0.0.0-dev (main, a1b2c3d)", "rocm version")
             .expect("a real ref");
+    }
+
+    /// The version must be the one the ref calls for: a release tag's own
+    /// version, and `0.0.0-dev` for anything else — never the workspace
+    /// package version a branch build used to report.
+    #[test]
+    fn the_reported_version_must_be_the_one_the_ref_calls_for() {
+        for ok in [
+            "rocm-cli 0.0.0-dev (main, a1b2c3d)",
+            "rocm-cli 0.0.0-dev (vllm, a1b2c3d)",
+            "rocm-cli 0.2.1 (v0.2.1, a1b2c3d)",
+            "rocm-cli 1.2.3-rc.1+build.5 (v1.2.3-rc.1+build.5, a1b2c3d)",
+            "rocm-cli 0.0.0-dev (v1.2.3-rc_1, a1b2c3d)",
+        ] {
+            assert_version_string(ok, "rocm version")
+                .unwrap_or_else(|error| panic!("{ok}: {error}"));
+        }
+        for bad in [
+            "rocm-cli 0.1.0 (main, a1b2c3d)",
+            "rocm-cli 0.0.0-dev (v0.2.1, a1b2c3d)",
+            "rocm-cli v0.2.1 (v0.2.1, a1b2c3d)",
+            "rocm-cli 1.2.3-rc_1 (v1.2.3-rc_1, a1b2c3d)",
+        ] {
+            let error = assert_version_string(bad, "rocm version")
+                .expect_err(&format!("{bad} is rejected"));
+            assert!(format!("{error}").contains("expected"), "{error}");
+        }
+    }
+
+    /// A release tag is at most 65 characters, `v` included.
+    #[test]
+    fn a_release_tag_over_the_length_bound_is_not_a_release() {
+        let at_limit = format!("v1.2.3-{}", "a".repeat(RELEASE_TAG_MAX_LEN - 7));
+        assert_eq!(at_limit.len(), RELEASE_TAG_MAX_LEN);
+        assert!(is_release_tag(&at_limit));
+        assert!(!is_release_tag(&format!("{at_limit}a")));
     }
 
     /// Each JSON variant must reject a wrong payload, and say which check and
@@ -1877,7 +1945,7 @@ mod tests {
         assert!(cache_dir.starts_with(root) && data_dir.starts_with(root));
     }
 
-    const FAKE_VERSION: &str = "rocm-cli 0.1.0 (main, a1b2c3d)";
+    const FAKE_VERSION: &str = "rocm-cli 0.0.0-dev (main, a1b2c3d)";
     const FAKE_PORT: &str = "45678";
 
     /// Output that satisfies a check's own expectations, built from the check —

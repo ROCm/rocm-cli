@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-use crate::metrics::{GpuMetrics, Instance};
+use crate::metrics::{GpuMetrics, Instance, ObservationFreshness, Snapshot};
 
 /// Normalize a GPU identifier to a bare index for joining.
 ///
@@ -103,6 +103,80 @@ pub fn attribute_power_w<S: BuildHasher>(
         .collect()
 }
 
+/// Whole-node efficiency: aggregate generation throughput over aggregate power.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeEfficiency {
+    /// Σ `gen_tps` ÷ Σ board `power_w`, in tokens per watt.
+    pub tokens_per_watt: f64,
+    /// Freshness of the throughput behind the figure (instances at zero tok/s
+    /// contribute nothing and are not counted): `Held` when any of it is
+    /// carried from a prior scrape window, `Fresh` when all of it is known to
+    /// be current, and `None` when some of it has no freshness metadata (a
+    /// legacy recording) and none is known to be held. Unknown is never
+    /// reported as fresh. The figure is still reported when held, so a
+    /// one-scrape hiccup does not blank it, but a consumer must mark it: a
+    /// held value expires within the observation validity window.
+    pub freshness: Option<ObservationFreshness>,
+}
+
+impl NodeEfficiency {
+    /// Whether any throughput behind the figure is held.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.freshness == Some(ObservationFreshness::Held)
+    }
+}
+
+/// Node-level efficiency for a snapshot, or `None` when it cannot be stated.
+///
+/// Throughput is summed over instances with a finite `gen_tps` (a single
+/// NaN/Inf must not poison the node), power over every GPU's board power. It is
+/// `None` with no traffic (`Σ gen_tps == 0`), no power telemetry
+/// (`Σ power_w == 0`), or a non-finite quotient. Power here is the whole board,
+/// including GPUs no instance occupies, because the question is the node's
+/// efficiency, not an instance's: per-instance figures use attributed power
+/// ([`attribute_power_w`]) instead.
+#[must_use]
+pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
+    let mut tps = 0.0_f64;
+    let mut held = false;
+    let mut unknown = false;
+    for inst in &snap.instances {
+        let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) else {
+            continue;
+        };
+        tps += v;
+        // An instance at zero tok/s adds nothing to the figure, so its
+        // freshness says nothing about the figure's either: a held idle
+        // instance must not mark a figure that comes from fresh ones as held.
+        if v <= 0.0 {
+            continue;
+        }
+        match inst.gen_tps_observation.as_ref().map(|m| m.freshness) {
+            Some(ObservationFreshness::Held) => held = true,
+            Some(ObservationFreshness::Fresh) => {}
+            None => unknown = true,
+        }
+    }
+    let freshness = if held {
+        Some(ObservationFreshness::Held)
+    } else if unknown {
+        None
+    } else {
+        Some(ObservationFreshness::Fresh)
+    };
+    let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
+    if tps > 0.0 && power > 0.0 {
+        let tokens_per_watt = tps / power;
+        tokens_per_watt.is_finite().then_some(NodeEfficiency {
+            tokens_per_watt,
+            freshness,
+        })
+    } else {
+        None
+    }
+}
+
 /// Tokens-per-watt for one serving instance: generation throughput (tok/s)
 /// divided by the power (W) attributed to it by [`attribute_power_w`].
 ///
@@ -133,6 +207,166 @@ mod tests {
         assert_eq!(normalize_gpu_id("gpu-7"), "7");
         assert_eq!(normalize_gpu_id("0"), "0");
         assert_eq!(normalize_gpu_id("3"), "3");
+    }
+
+    fn snap_with(instances: Vec<Instance>, gpus: Vec<GpuMetrics>) -> Snapshot {
+        Snapshot {
+            gpus,
+            instances,
+            ..Snapshot::default()
+        }
+    }
+
+    fn serving(
+        id: &str,
+        gen_tps: Option<f64>,
+        freshness: Option<ObservationFreshness>,
+    ) -> Instance {
+        use crate::metrics::ObservationMetadata;
+        Instance {
+            container_id: id.into(),
+            gen_tps,
+            gen_tps_observation: freshness.map(|freshness| ObservationMetadata {
+                observed_at: chrono::Utc::now(),
+                freshness,
+            }),
+            ..Instance::default()
+        }
+    }
+
+    #[test]
+    fn node_efficiency_divides_total_throughput_by_total_board_power() {
+        let snap = snap_with(
+            vec![
+                serving("a", Some(300.0), None),
+                serving("b", Some(200.0), None),
+            ],
+            vec![gpu("gpu-0", 400.0), gpu("gpu-1", 600.0)],
+        );
+        // (300 + 200) / (400 + 600) = 0.5 tok/W
+        let n = node_efficiency(&snap).expect("some");
+        assert!((n.tokens_per_watt - 0.5).abs() < 1e-9, "got {n:?}");
+        assert!(!n.held());
+    }
+
+    #[test]
+    fn node_efficiency_counts_power_of_gpus_no_instance_occupies() {
+        // The node pays for an idle GPU too, so it stays in the denominator.
+        let snap = snap_with(
+            vec![serving("a", Some(100.0), None)],
+            vec![gpu("gpu-0", 100.0), gpu("gpu-1", 300.0)],
+        );
+        let n = node_efficiency(&snap).expect("some");
+        assert!((n.tokens_per_watt - 0.25).abs() < 1e-9, "got {n:?}");
+    }
+
+    #[test]
+    fn node_efficiency_is_none_without_power_or_traffic() {
+        let no_power = snap_with(
+            vec![serving("a", Some(100.0), None)],
+            vec![gpu("gpu-0", 0.0)],
+        );
+        assert_eq!(node_efficiency(&no_power), None);
+        let no_traffic = snap_with(vec![serving("a", None, None)], vec![gpu("gpu-0", 500.0)]);
+        assert_eq!(node_efficiency(&no_traffic), None);
+        let zero_traffic = snap_with(
+            vec![serving("a", Some(0.0), None)],
+            vec![gpu("gpu-0", 500.0)],
+        );
+        assert_eq!(node_efficiency(&zero_traffic), None);
+    }
+
+    #[test]
+    fn a_held_idle_instance_does_not_mark_a_figure_that_comes_from_fresh_ones() {
+        let gpus = vec![gpu("gpu-0", 500.0)];
+        let snap = snap_with(
+            vec![
+                serving("busy", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("idle", Some(0.0), Some(ObservationFreshness::Held)),
+            ],
+            gpus.clone(),
+        );
+        let n = node_efficiency(&snap).unwrap();
+        assert!(
+            !n.held(),
+            "a zero-throughput held instance must not flag the node"
+        );
+        assert_eq!(n.freshness, Some(ObservationFreshness::Fresh));
+        // ...and one with unknown freshness at zero does not make it unknown.
+        let snap = snap_with(
+            vec![
+                serving("busy", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("idle", Some(0.0), None),
+            ],
+            gpus,
+        );
+        assert_eq!(
+            node_efficiency(&snap).unwrap().freshness,
+            Some(ObservationFreshness::Fresh)
+        );
+    }
+
+    #[test]
+    fn node_efficiency_ignores_non_finite_gen_tps() {
+        // One NaN sample must not poison the sum for the whole node.
+        let snap = snap_with(
+            vec![
+                serving("finite", Some(250.0), Some(ObservationFreshness::Held)),
+                serving("poisoned", Some(f64::NAN), Some(ObservationFreshness::Held)),
+            ],
+            vec![gpu("gpu-0", 500.0)],
+        );
+        let n = node_efficiency(&snap).expect("finite gen_tps must still produce a result");
+        assert!((n.tokens_per_watt - 0.5).abs() < 1e-9, "got {n:?}");
+    }
+
+    #[test]
+    fn node_efficiency_is_held_when_any_contributing_throughput_is_held() {
+        let gpus = vec![gpu("gpu-0", 500.0)];
+        let fresh = snap_with(
+            vec![serving("a", Some(250.0), Some(ObservationFreshness::Fresh))],
+            gpus.clone(),
+        );
+        let n = node_efficiency(&fresh).unwrap();
+        assert!(!n.held());
+        assert_eq!(n.freshness, Some(ObservationFreshness::Fresh));
+        // Unknown freshness (legacy snapshot) is neither held nor claimed
+        // fresh: nothing measured it.
+        let unknown = snap_with(vec![serving("a", Some(250.0), None)], gpus.clone());
+        let n = node_efficiency(&unknown).unwrap();
+        assert!(!n.held());
+        assert_eq!(n.freshness, None);
+        // One unknown among fresh ones keeps the whole figure unknown.
+        let partly = snap_with(
+            vec![
+                serving("a", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("b", Some(10.0), None),
+            ],
+            gpus.clone(),
+        );
+        assert_eq!(node_efficiency(&partly).unwrap().freshness, None);
+        let mixed = snap_with(
+            vec![
+                serving("a", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("b", Some(100.0), Some(ObservationFreshness::Held)),
+            ],
+            gpus.clone(),
+        );
+        assert!(node_efficiency(&mixed).unwrap().held());
+        // A held instance whose throughput is non-finite does not contribute,
+        // so it cannot mark the node held.
+        let excluded = snap_with(
+            vec![
+                serving("a", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("b", Some(f64::INFINITY), Some(ObservationFreshness::Held)),
+            ],
+            gpus,
+        );
+        assert!(!node_efficiency(&excluded).unwrap().held());
+        assert_eq!(
+            node_efficiency(&excluded).unwrap().freshness,
+            Some(ObservationFreshness::Fresh)
+        );
     }
 
     fn inst(id: &str, gpu_ids: &[&str]) -> Instance {

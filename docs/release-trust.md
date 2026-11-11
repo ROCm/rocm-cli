@@ -312,10 +312,12 @@ is already trusted.
 ## Simulated Host Root
 
 rocm-cli decides what hardware it is running on by reading fixed host paths:
-`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
-under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
-`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
-`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the
+`/sys/class/kfd/kfd` class device and the KFD topology under it, the DRM cards
+under `/sys/class/drm`, the amdgpu PCI driver directory
+`/sys/bus/pci/drivers/amdgpu`, `/sys/module/amdgpu` and its `version` file,
+`/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`,
+`/proc/modules`, `/proc/1/cgroup`, the
 container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
 (falling back to `/usr/lib/os-release` when absent, per `os-release(5)`) behind
 the distro fields and name `rocm examine` reports, the modprobe
@@ -323,7 +325,8 @@ configuration directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and
 `/run/modprobe.d`, the WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
 `lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
 `lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
-discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+discovered ROCm install, and `lib/librocdxg.so` again in each directory on
+`LD_LIBRARY_PATH`. The E2E suite can point those reads at a directory it populated with a
 simulated host instead, but only in builds compiled with the `e2e-test-hooks`
 Cargo feature:
 

@@ -23,6 +23,7 @@ mod demos;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
+mod engine_stdio_client_contract;
 mod env_mutation_contract;
 mod eval_fixtures;
 mod lychee;
@@ -158,15 +159,10 @@ pub(crate) enum Command {
     /// is one limit for every file and no way to exempt one; the definition is
     /// in `xtask/src/module_size.rs`.
     CheckModuleSize,
-    /// The same check as `check-module-size`, but it only reports: it prints the
-    /// offenders and exits successfully, including when the check itself cannot
-    /// run (`cargo metadata` fails, a file does not parse). That holds once xtask
-    /// has built: if xtask or `rocm-core` fails to compile, `cargo xtask` exits
-    /// non-zero before this code runs. The local pre-commit hook runs this until
-    /// the limit is enforced.
-    CheckModuleSizeAdvisory,
     /// Fail if a production source file (a `.rs` file under `apps/*/src`,
-    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`.
+    /// `crates/*/src` or `engines/*/src`), or a `.rs` file under `xtask/src`,
+    /// `tests/e2e-cucumber/src` or `tests/e2e-cucumber/tests`, has no entry in
+    /// `docs/architecture.md`.
     CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
@@ -445,7 +441,6 @@ fn run() -> Result<()> {
         command @ Command::PrePushCheck { .. } => run_pre_push_check(command, prepush::run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckModuleSize => module_size::run()?,
-        Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
         Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,

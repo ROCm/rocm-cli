@@ -67,7 +67,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -117,35 +116,17 @@ pub(crate) struct Outcome {
 /// `cargo xtask check-module-size`: fail, naming each file and its count, if any
 /// source file is over [`MAX_PRODUCTION_LINES`].
 pub fn run() -> Result<()> {
-    let outcome = evaluate()?;
+    verdict(evaluate()?)
+}
+
+/// The error is what fails the CI step and the pre-commit hook, so the pass and
+/// fail branches are split out to be tested without walking the workspace.
+fn verdict(outcome: Outcome) -> Result<()> {
     if outcome.offenders.is_empty() {
         println!("{}", passed_text(&outcome));
         return Ok(());
     }
     bail!("{}", failed_text(&outcome))
-}
-
-/// `cargo xtask check-module-size-advisory`: the same check, but it only reports.
-/// This is the wrapper the local hook runs while the limit is not yet blocking; once
-/// xtask has built it cannot fail a commit, including when the check itself cannot
-/// run. A compile failure in xtask or `rocm-core` never reaches this function.
-pub fn run_advisory() -> Result<()> {
-    advisory_to(evaluate(), &mut std::io::stdout());
-    Ok(())
-}
-
-/// Print the report. A failed write (a closed pipe, say) is dropped: the wrapper
-/// exists so that nothing here can fail a commit.
-fn advisory_to(result: Result<Outcome>, out: &mut impl Write) {
-    let text = match result {
-        Ok(outcome) if outcome.offenders.is_empty() => passed_text(&outcome),
-        Ok(outcome) => format!(
-            "warning: not blocking yet, but this will fail once the limit is enforced\n{}",
-            failed_text(&outcome)
-        ),
-        Err(error) => format!("warning: the module-size check could not run: {error:#}"),
-    };
-    let _ = writeln!(out, "{text}");
 }
 
 fn passed_text(outcome: &Outcome) -> String {
@@ -154,6 +135,10 @@ fn passed_text(outcome: &Outcome) -> String {
         outcome.checked
     )
 }
+
+/// The document that states the rule for a file over the limit, which the failure
+/// text points at.
+const SPLIT_RULE_DOC: &str = "docs/architecture.md";
 
 fn failed_text(outcome: &Outcome) -> String {
     let mut text = format!(
@@ -170,6 +155,10 @@ fn failed_text(outcome: &Outcome) -> String {
             offender.lines - MAX_PRODUCTION_LINES
         );
     }
+    let _ = write!(
+        text,
+        "\nto fix: split the file in the same PR, as a pure move with its tests moving along with the code; the rule is in {SPLIT_RULE_DOC}"
+    );
     text
 }
 
@@ -966,6 +955,83 @@ trait T {
         assert!(offenders(&files, MAX_PRODUCTION_LINES).is_empty());
     }
 
+    // The CI step and the pre-commit hook both block on this exit status, so it is
+    // asserted here with the offender the error names.
+    #[test]
+    fn an_offender_fails_the_check_and_a_clean_tree_passes() {
+        let clean = Outcome {
+            checked: 3,
+            offenders: Vec::new(),
+        };
+        assert!(verdict(clean).is_ok());
+
+        let over = Outcome {
+            checked: 3,
+            offenders: vec![Offender {
+                path: "src/big.rs".to_string(),
+                lines: MAX_PRODUCTION_LINES + 1,
+            }],
+        };
+        let error = format!("{:#}", verdict(over).unwrap_err());
+        assert!(
+            error.contains("src/big.rs: 1501 production lines (1 over)"),
+            "{error}"
+        );
+    }
+
+    fn repo_file(relative: &str) -> String {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        fs::read_to_string(root.join(relative)).unwrap()
+    }
+
+    // The failure text gives remediation advice, so this asserts the advice
+    // together with the rule it points at: the document exists and states it.
+    #[test]
+    fn the_failure_text_points_at_a_split_rule_the_document_states() {
+        let text = failed_text(&Outcome {
+            checked: 1,
+            offenders: vec![Offender {
+                path: "src/big.rs".to_string(),
+                lines: MAX_PRODUCTION_LINES + 1,
+            }],
+        });
+        assert!(text.contains(SPLIT_RULE_DOC), "{text}");
+        assert!(text.contains("same PR"), "{text}");
+        assert!(text.contains("pure move"), "{text}");
+        assert!(text.contains("tests moving along with the code"), "{text}");
+
+        let doc = repo_file(SPLIT_RULE_DOC);
+        assert!(
+            doc.contains("splits it in the same change"),
+            "{SPLIT_RULE_DOC}"
+        );
+        assert!(doc.contains("a pure move"), "{SPLIT_RULE_DOC}");
+        assert!(
+            doc.contains("the tests moving with the code"),
+            "{SPLIT_RULE_DOC}"
+        );
+    }
+
+    // The docs say the check blocks merges, and the hook comment calls itself the
+    // local mirror of this step. Both rest on this step being the bare strict command.
+    #[test]
+    fn the_ci_step_runs_the_strict_check_with_no_non_blocking_wrapper() {
+        let workflow = repo_file(".github/workflows/ci.yml");
+        let start = workflow
+            .find("- name: Source files are within the module-size limit")
+            .expect("the module-size step is in ci.yml");
+        let step = &workflow[start..];
+        let step = &step[..step[1..]
+            .find("\n      - name:")
+            .map_or(step.len(), |n| n + 1)];
+        assert!(
+            step.lines()
+                .any(|line| line.trim() == "run: cargo xtask check-module-size"),
+            "{step}"
+        );
+        assert!(!step.contains("continue-on-error"), "{step}");
+    }
+
     #[test]
     fn offenders_are_listed_largest_first() {
         let files = [
@@ -1446,48 +1512,5 @@ trait T {
         let error = format!("{:#}", counted(dir.path()).unwrap_err());
         assert!(error.contains("src/generated.rs"), "{error}");
         assert!(error.contains("src/hidden.rs"), "{error}");
-    }
-
-    // --- the advisory wrapper ----------------------------------------------
-
-    #[test]
-    fn the_advisory_wrapper_reports_offenders_and_still_succeeds() {
-        let outcome = Outcome {
-            checked: 3,
-            offenders: vec![Offender {
-                path: "src/big.rs".to_string(),
-                lines: 1600,
-            }],
-        };
-        let mut out = Vec::new();
-        advisory_to(Ok(outcome), &mut out);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("src/big.rs: 1600 production lines"), "{text}");
-        assert!(text.contains("not blocking yet"), "{text}");
-    }
-
-    #[test]
-    fn the_advisory_wrapper_succeeds_even_when_the_check_cannot_run() {
-        let mut out = Vec::new();
-        advisory_to(Err(anyhow!("cargo metadata failed")), &mut out);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("could not run"), "{text}");
-        assert!(text.contains("cargo metadata failed"), "{text}");
-    }
-
-    #[test]
-    fn the_advisory_wrapper_succeeds_even_when_the_report_cannot_be_written() {
-        struct Closed;
-        impl Write for Closed {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-        }
-        // `advisory_to` returns nothing, so the test is that it returns at all
-        // instead of panicking; `run_advisory` is `Ok(())` around it.
-        advisory_to(Err(anyhow!("cargo metadata failed")), &mut Closed);
     }
 }
