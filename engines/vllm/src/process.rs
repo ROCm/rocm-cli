@@ -127,6 +127,24 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     })
 }
 
+/// Force-stop the server tree this process spawned and still holds as an
+/// unreaped child, and report whether it is confirmed gone.
+///
+/// `SIGTERM` to the whole tree, then `SIGKILL` for whatever outlives `grace`, so
+/// the call returns within about twice `grace` and a following `child.wait()`
+/// does not hang on a server that ignores `SIGTERM`. The identity is captured
+/// here, which is safe only while the caller holds the unreaped child: until it
+/// is reaped its PID cannot be reused.
+fn stop_spawned_server(pid: u32, grace: Duration) -> bool {
+    rocm_core::terminate_verified(
+        &rocm_core::ProcessIdentity::capture(pid),
+        STOP_SCOPE,
+        grace,
+        true,
+    )
+    .stopped()
+}
+
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
     let runtime = crate::runtime::resolve_vllm_runtime(request.runtime_id.as_deref())?;
@@ -143,8 +161,9 @@ pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         request.log_path.as_deref(),
     ) {
         // Terminate the whole vLLM process tree so the EngineCore worker (which
-        // holds the GPU allocation) does not survive and leak device memory.
-        let _ = rocm_core::terminate_process_tree(child.id());
+        // holds the GPU allocation) does not survive and leak device memory, and
+        // escalate so the `wait` below cannot hang on a server ignoring SIGTERM.
+        let _ = stop_spawned_server(child.id(), STOP_GRACE);
         let _ = child.wait();
         crate::state::write_terminal_state(&request.state_path, "failed")?;
         return Err(e);
@@ -1204,5 +1223,57 @@ mod tests {
             .flatten();
         assert_eq!(flag, Some(std::ffi::OsStr::new("TRUE")));
         Ok(())
+    }
+
+    /// The readiness-failure teardown: a server that ignores `SIGTERM`, and a
+    /// worker under it that does too, must both be gone once the helper returns,
+    /// so the `child.wait()` after it cannot hang.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_spawned_server_kills_a_tree_that_ignores_sigterm() {
+        use std::io::BufRead;
+        use std::os::unix::process::ExitStatusExt;
+        // Both shells ignore SIGTERM (`SIG_IGN` survives `exec`); the inner one
+        // prints its PID once it runs, which is after the outer trap is set.
+        let mut child = ProcessCommand::new("sh")
+            .args([
+                "-c",
+                r#"trap '' TERM; sh -c "echo \$\$; exec sleep 300" & wait"#,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("read readiness line");
+        let worker = rocm_core::ProcessIdentity::capture(line.trim().parse().expect("worker pid"));
+        let server = rocm_core::ProcessIdentity::capture(child.id());
+        let kill_if_running = |identity: &rocm_core::ProcessIdentity| {
+            if rocm_core::identity_state(identity) == rocm_core::IdentityState::Matches {
+                let _ = ProcessCommand::new("kill")
+                    .args(["-KILL", &identity.pid.to_string()])
+                    .status();
+            }
+        };
+
+        let stopped = stop_spawned_server(child.id(), Duration::from_millis(500));
+        let status = child.try_wait().expect("try_wait");
+        let worker_state = rocm_core::identity_state(&worker);
+
+        kill_if_running(&worker);
+        kill_if_running(&server);
+        let _ = child.wait();
+        assert!(stopped, "a forced stop must report the server stopped");
+        let status = status.expect("the server must have exited before wait is called");
+        assert_eq!(status.signal(), Some(9), "{status}");
+        assert!(
+            matches!(
+                worker_state,
+                rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
+            ),
+            "the worker under the server must be stopped too, got {worker_state:?}"
+        );
     }
 }

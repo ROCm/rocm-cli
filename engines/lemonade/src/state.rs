@@ -11,6 +11,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::device_policy::device_policy_name;
 use crate::install::{LemonadeInstallManifest, LemonadeRuntime};
@@ -180,8 +181,48 @@ pub(crate) fn identity_from_state(state: &Value) -> Option<rocm_core::ProcessIde
     Some(rocm_core::ProcessIdentity::new(pid, start_ticks))
 }
 
-pub(crate) fn terminate_pid(pid: u32, _force: bool) -> bool {
-    rocm_core::terminate_process(pid).is_ok()
+/// Stop a process this engine spawned and still holds as an unreaped child, and
+/// report whether it is confirmed gone.
+///
+/// On Unix: sends `SIGTERM` to the process tree, waits up to
+/// [`STOP_GRACE`](crate::STOP_GRACE) for every process in it to exit, and under
+/// `force` escalates to `SIGKILL` and waits up to the grace period again, so the
+/// call blocks for up to about twice [`STOP_GRACE`](crate::STOP_GRACE). The
+/// caller's following `child.wait()` therefore returns instead of hanging on a
+/// process that ignores `SIGTERM`. With `force == false` a process that outlives
+/// the grace period is left running and `false` is returned. On Windows there is
+/// no graceful signal and no tree walk: a forced stop terminates `pid` itself and
+/// waits for it, and an unforced one returns `false` without signalling.
+///
+/// The process identity is captured here, at call time, not when the process was
+/// spawned. That is safe only while the caller holds an unreaped child for `pid`
+/// (a `std::process::Child` not yet waited on): until it is reaped, the PID
+/// cannot be handed to another process. A Windows `LemondChild::Pid` holds no
+/// process handle, so that guarantee does not cover it: if that `lemond` has
+/// already exited, its PID may name another process by the time of this call.
+/// Do not call this with a PID read back from a state file; stop recorded
+/// processes through `rocm_core::terminate_verified` with their recorded
+/// identity instead.
+pub(crate) fn terminate_pid(pid: u32, force: bool) -> bool {
+    terminate_pid_within(pid, force, crate::STOP_GRACE)
+}
+
+/// [`terminate_pid`] with the grace period chosen by the caller, so a test can
+/// drive the escalation without waiting the production grace period.
+fn terminate_pid_within(pid: u32, force: bool, grace: Duration) -> bool {
+    // `Tree`, unlike the `Single` scope the recorded-state stop uses
+    // (`crate::STOP_SCOPE`): the children stopped here are often `lemond`, the
+    // Lemonade router, which runs each loaded model in a `llama-server` child
+    // process. A forced kill of `lemond` alone would orphan that child, still
+    // holding the GPU. A child with no children of its own (a direct
+    // `llama-server`) is stopped exactly as `Single` would stop it.
+    rocm_core::terminate_verified(
+        &rocm_core::ProcessIdentity::capture(pid),
+        rocm_core::KillScope::Tree,
+        grace,
+        force,
+    )
+    .stopped()
 }
 
 pub(crate) fn free_local_port() -> Result<u16> {
@@ -446,5 +487,208 @@ mod tests {
             parse_http_endpoint("http://[::1]:11435/v1"),
             Some(("::1".to_owned(), 11435))
         );
+    }
+
+    // ---- `terminate_pid`: bounded termination of a spawned child. ----
+
+    /// A grace period short enough to keep these tests fast, and long enough
+    /// for a cooperative `sh` to act on `SIGTERM`.
+    #[cfg(target_os = "linux")]
+    const TEST_GRACE: Duration = Duration::from_millis(500);
+
+    /// Spawn `sh -c script`, which must print one line once it is ready (for a
+    /// trapping script: after the trap is installed, so `SIGTERM` can never
+    /// arrive first), and return the child with that line.
+    #[cfg(target_os = "linux")]
+    fn spawn_ready(script: &str) -> (std::process::Child, String) {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("read readiness line");
+        (child, line.trim().to_owned())
+    }
+
+    /// `SIGKILL` `identity` if it is still that process, so a failing test does
+    /// not leave a stray process behind.
+    #[cfg(target_os = "linux")]
+    fn kill_if_still_running(identity: &rocm_core::ProcessIdentity) {
+        if rocm_core::identity_state(identity) == rocm_core::IdentityState::Matches {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &identity.pid.to_string()])
+                .status();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const TRAP_TERM: &str = "trap '' TERM; echo ready; while :; do sleep 1; done";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_terminate_pid_kills_a_child_that_ignores_sigterm() {
+        use std::os::unix::process::ExitStatusExt;
+        let (mut child, _) = spawn_ready(TRAP_TERM);
+        let identity = rocm_core::ProcessIdentity::capture(child.id());
+
+        let stopped = terminate_pid_within(child.id(), true, TEST_GRACE);
+
+        let status = child.try_wait().expect("try_wait");
+        if status.is_none() {
+            kill_if_still_running(&identity);
+            let _ = child.wait();
+        }
+        assert!(stopped, "a forced stop must report the child stopped");
+        let status = status.expect("the child must have exited after a forced stop");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "a child that ignores SIGTERM can only have been stopped by SIGKILL: {status}"
+        );
+    }
+
+    /// The pattern every caller uses, `terminate_pid` then `child.wait()`, must
+    /// return within about twice the grace period for a child that ignores
+    /// `SIGTERM`. Before the fix this hung forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_then_wait_returns_for_a_child_that_ignores_sigterm() {
+        let (mut child, _) = spawn_ready(TRAP_TERM);
+        let identity = rocm_core::ProcessIdentity::capture(child.id());
+        let (done, finished) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            let stopped = terminate_pid_within(child.id(), true, TEST_GRACE);
+            let status = child.wait();
+            let _ = done.send((stopped, status.is_ok()));
+        });
+
+        let bound = TEST_GRACE * 2 + Duration::from_secs(3);
+        let result = finished.recv_timeout(bound);
+        if result.is_err() {
+            // Unblock the teardown thread's `wait` so the test fails rather than hangs.
+            kill_if_still_running(&identity);
+        }
+        let _ = teardown.join();
+        let (stopped, waited) =
+            result.unwrap_or_else(|_| panic!("terminate + wait did not return within {bound:?}"));
+        assert!(stopped);
+        assert!(waited);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unforced_terminate_pid_leaves_a_child_that_ignores_sigterm_running() {
+        let (mut child, _) = spawn_ready(TRAP_TERM);
+        let identity = rocm_core::ProcessIdentity::capture(child.id());
+
+        let stopped = terminate_pid_within(child.id(), false, TEST_GRACE);
+        let still_running = child.try_wait().expect("try_wait").is_none();
+
+        kill_if_still_running(&identity);
+        let _ = child.wait();
+        assert!(
+            !stopped,
+            "an unforced stop must not claim a surviving child stopped"
+        );
+        assert!(still_running, "an unforced stop must not kill the child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_pid_stops_a_cooperative_child_with_sigterm_well_within_grace() {
+        use std::os::unix::process::ExitStatusExt;
+        let (mut child, _) = spawn_ready("echo ready; while :; do sleep 1; done");
+        let identity = rocm_core::ProcessIdentity::capture(child.id());
+        let grace = Duration::from_secs(5);
+
+        let started = std::time::Instant::now();
+        let stopped = terminate_pid_within(child.id(), true, grace);
+        let elapsed = started.elapsed();
+
+        kill_if_still_running(&identity);
+        let status = child.wait().expect("wait");
+        assert!(stopped);
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
+        assert!(
+            elapsed < grace / 2,
+            "a cooperative child should stop on SIGTERM, not at the grace deadline: {elapsed:?}"
+        );
+    }
+
+    /// `lemond` runs models in `llama-server` children; a forced stop must take
+    /// those down too, not orphan them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_terminate_pid_kills_a_grandchild_that_ignores_sigterm() {
+        // Both shells ignore SIGTERM (`SIG_IGN` survives `exec`); the inner one
+        // prints its PID once it is running, after the outer trap is installed.
+        let (mut child, grandchild_pid) =
+            spawn_ready(r#"trap '' TERM; sh -c "echo \$\$; exec sleep 300" & wait"#);
+        let identity = rocm_core::ProcessIdentity::capture(child.id());
+        let grandchild =
+            rocm_core::ProcessIdentity::capture(grandchild_pid.parse().expect("grandchild pid"));
+        assert_eq!(
+            rocm_core::identity_state(&grandchild),
+            rocm_core::IdentityState::Matches,
+            "grandchild should be running before the stop"
+        );
+
+        let stopped = terminate_pid_within(child.id(), true, TEST_GRACE);
+        let grandchild_state = rocm_core::identity_state(&grandchild);
+
+        kill_if_still_running(&grandchild);
+        kill_if_still_running(&identity);
+        let _ = child.wait();
+        assert!(stopped);
+        assert!(
+            matches!(
+                grandchild_state,
+                rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
+            ),
+            "a forced stop must kill the child's whole tree, got {grandchild_state:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_terminate_pid_stops_a_long_running_child_and_wait_returns() {
+        let mut child = std::process::Command::new(rocm_core::windows_system_tool("ping.exe"))
+            .args(["-n", "300", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id();
+        let (done, finished) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            let stopped = terminate_pid(pid, true);
+            let _ = done.send(stopped);
+            child
+        });
+
+        let bound = crate::STOP_GRACE * 2 + Duration::from_secs(5);
+        let result = finished.recv_timeout(bound);
+        if result.is_err() {
+            // Unblock the teardown thread so the test fails rather than hangs.
+            let _ = rocm_core::terminate_process(pid);
+        }
+        let mut child = teardown.join().expect("teardown thread");
+        let exited = child.try_wait().expect("try_wait").is_some();
+        if !exited {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        assert_eq!(
+            result,
+            Ok(true),
+            "terminate_pid must stop the child within {bound:?}"
+        );
+        assert!(exited, "the child must have exited after terminate_pid");
     }
 }
