@@ -4118,6 +4118,12 @@ is what the verdict turns on.
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
 ```
 
+`examine-48` plants a native Linux machine (a simulated host root that is not WSL, because the PCI probe is skipped on WSL) whose `lspci` is a stand-in on `PATH` that prints one AMD GPU, exits 0 and leaves a `sleep` holding its output pipes for 30 seconds. The host probes now stop reading a tool's output shortly after the tool exits, so `rocm examine --json` must finish in under 15 seconds, well inside the background process's life, and must still list the GPU the stand-in printed at `0000:fe:00.0`, so what the tool printed before it exited is still collected (the length of the grace is not pinned here). It runs on the Linux lanes and needs no GPU; the unit tests behind it (`subprocess_runners_pair` in `host_gpu/capture.rs`) pin the same bound for each of the three runners.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-48 '
+```
+
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 
 ```bash
