@@ -17,7 +17,7 @@ use super::super::family::{family_resolution_hint, resolve_family};
 use super::super::fetch::download_text_cached;
 use super::super::platform_tarball_token;
 use super::super::source::{
-    RuntimeVersionSelector, SourceLayout, TheRockChannel, resolve_source, select_source_layout,
+    RuntimeVersionSelector, SourceLayout, TheRockChannel, gate_install_layout, resolve_source,
 };
 use super::super::version::{
     compare_version_strings, is_parseable_runtime_version, is_stable_runtime_version,
@@ -74,10 +74,12 @@ pub(in crate::therock) fn resolve_tarball_artifact_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let layout = match layout_override {
-        Some(layout) => layout,
-        None => select_source_layout(channel, &family_resolution, version_selector)?,
-    };
+    let layout = gate_install_layout(
+        channel,
+        &family_resolution,
+        version_selector,
+        layout_override,
+    )?;
     let source = resolve_source(channel, layout);
     let catalog_cache_key = match layout {
         SourceLayout::Canonical => format!("tarball-index-{}", channel.as_str()),

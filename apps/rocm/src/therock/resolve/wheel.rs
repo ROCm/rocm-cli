@@ -43,7 +43,7 @@ use super::super::python::WheelCompatibility;
 use super::super::slugify;
 use super::super::source::{
     FamilyResolution, RuntimeVersionSelector, SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel,
-    resolve_source, select_source_layout,
+    gate_install_layout, resolve_source,
 };
 use super::super::version::{
     ParsedVersion, compare_version_strings, is_stable_runtime_version, parse_version,
@@ -749,10 +749,12 @@ fn resolve_pip_runtime_plan(
         acquire: &|| ensure_uv_binary(paths),
     };
     let family_resolution = resolve_family(paths, family_override)?;
-    let layout = match layout_override {
-        Some(layout) => layout,
-        None => select_source_layout(channel, &family_resolution, version_selector)?,
-    };
+    let layout = gate_install_layout(
+        channel,
+        &family_resolution,
+        version_selector,
+        layout_override,
+    )?;
     let source = resolve_source(channel, layout);
     let root_url = format!("{}/", source.wheel_index.trim_end_matches('/'));
     // Distinct cache keys per layout: the two streams answer the same request

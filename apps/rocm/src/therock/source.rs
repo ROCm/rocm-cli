@@ -319,15 +319,31 @@ pub(super) fn select_source_layout(
         );
     }
     if family_resolution.raw_arch.is_none() {
+        let arch = example_arch_for_family(&family_resolution.family).unwrap_or("<exact-gfx-arch>");
         bail!(
             "this install reads the ROCm {THEROCK_NEXT_MIN_MAJOR} package layout, which requires an exact GPU arch, but the resolved target family `{}` names a group of them.\n\
-             That layout selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --family gfx1200`.\n\
-             An earlier build, which still publishes grouped families, is installed by pinning it in a wheel install (`--format wheel`; a tarball install takes no pin): `--version 7.14.1` on the release channel, or `--build-date` for a nightly.\n\n{}",
+             That layout selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --family {arch}`.\n\
+             An earlier build, which still publishes grouped families, is installed by pinning it in a wheel install (`--format wheel`; a tarball install takes no pin): `--version 7.14.1` on the release channel, or `--build-date YYYY-MM-DD` with a date before {THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE} for a nightly.\n\n{}",
             family_resolution.family,
             detect_host_gpu_diagnostics()
         );
     }
     Ok(SourceLayout::Next)
+}
+
+/// One real arch that `family` groups, for the remediation text. `None` for a
+/// family with no entry here, which the caller words as a placeholder rather
+/// than naming an arch from a different family.
+fn example_arch_for_family(family: &str) -> Option<&'static str> {
+    match family {
+        "gfx101X-dgpu" => Some("gfx1010"),
+        "gfx103X-dgpu" => Some("gfx1030"),
+        "gfx110X-all" => Some("gfx1100"),
+        "gfx120X-all" => Some("gfx1200"),
+        "gfx125X-dcgpu" => Some("gfx1250"),
+        "gfx94X-dcgpu" => Some("gfx942"),
+        _ => None,
+    }
 }
 
 /// The pre-install gate: [`select_source_layout`] for a fresh request, and the
@@ -502,6 +518,51 @@ mod tests {
         assert_eq!(
             select_source_layout(TheRockChannel::Release, &grouped, Some(&escape)).unwrap(),
             SourceLayout::Canonical
+        );
+    }
+
+    /// The example arch in the refusal must belong to the family being refused:
+    /// naming `gfx1200` for an MI300X host would install the wrong kernels.
+    #[test]
+    fn the_refusal_example_arch_belongs_to_the_refused_family() {
+        for family in [
+            "gfx101X-dgpu",
+            "gfx103X-dgpu",
+            "gfx110X-all",
+            "gfx120X-all",
+            "gfx125X-dcgpu",
+            "gfx94X-dcgpu",
+        ] {
+            let arch = example_arch_for_family(family).expect(family);
+            assert_eq!(
+                rocm_core::normalize_therock_family(arch).as_deref(),
+                Some(family),
+                "{arch} is not a member of {family}"
+            );
+            let error = select_source_layout(
+                TheRockChannel::Release,
+                &family_for_test(family, None),
+                None,
+            )
+            .expect_err("grouped family")
+            .to_string();
+            assert!(error.contains(&format!("--family {arch}`")), "{error}");
+            assert!(
+                !error.contains("--family gfx1200") || family == "gfx120X-all",
+                "{error}"
+            );
+        }
+        let error = select_source_layout(
+            TheRockChannel::Release,
+            &family_for_test("gfx90X-dcgpu", None),
+            None,
+        )
+        .expect_err("grouped family")
+        .to_string();
+        assert!(error.contains("--family <exact-gfx-arch>"), "{error}");
+        assert!(
+            error.contains("--build-date YYYY-MM-DD` with a date before 2026-08-23"),
+            "{error}"
         );
     }
 
