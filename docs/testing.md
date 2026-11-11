@@ -52,7 +52,8 @@ files that are committed. It runs only for contributors who installed the hooks,
 CI step stays the authority.
 The counting rules are unit-tested in `xtask/src/module_size.rs`, and
 [workflow_contract.rs](../xtask/src/workflow_contract.rs) pins that the hook runs the
-strict check:
+strict check in `module_size_hook_runs_the_strict_check_at_pre_commit`; the `module_size`
+filter below selects both:
 
 ```bash
 cargo test -p xtask module_size
