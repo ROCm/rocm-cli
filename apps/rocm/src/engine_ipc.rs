@@ -222,9 +222,6 @@ const fn stdio_options<'a>(
         app_paths: paths,
         env_root,
         endpoint_key_file: None,
-        // An external plugin is a third-party binary: never hand it a path to
-        // a live endpoint credential, including one we inherited ourselves.
-        withhold_inherited_key_file: true,
         request_progress: stream_progress,
         forward_stderr: true,
         note_failing_exit_after_answer: false,
