@@ -370,7 +370,7 @@ jobs:
 
       - name: Install native build deps
         if: needs.changes.outputs.heavy == 'true'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+        run: scripts/ci-apt-install.sh pkg-config libcap-dev
 
       # Installs the sccache binary. Both this and the probe below run BEFORE
       # setup-rust-toolchain, because its rust-cache step runs `cargo metadata`,
@@ -577,7 +577,7 @@ jobs:
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+        run: scripts/ci-apt-install.sh pkg-config libcap-dev
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.rust == 'true'
@@ -1330,7 +1330,7 @@ jobs:
       # Docker and the OpenSSH client are both present on the hosted Ubuntu
       # images; jq is the only extra, and only for asserting on JSON contracts.
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: scripts/ci-apt-install.sh jq
 
       - name: Check the control-channel contracts
         run: tests/remote-ssh/run.sh
@@ -1556,7 +1556,7 @@ jobs:
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+        run: scripts/ci-apt-install.sh pkg-config libcap-dev
 
       - uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
         if: needs.changes.outputs.rust == 'true'
@@ -1955,7 +1955,7 @@ jobs:
 
       - name: Install native build deps
         if: steps.gate.outputs.run == 'true'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+        run: scripts/ci-apt-install.sh pkg-config libcap-dev
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: steps.gate.outputs.run == 'true'
