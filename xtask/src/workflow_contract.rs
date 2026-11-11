@@ -6876,6 +6876,13 @@ fi
         block.lines().any(|line| strip_comment(line).trim() == flag)
     }
 
+    /// True when `word` appears in the hook block outside comments, so a comment
+    /// that merely mentions a key (for example "no `files:` filter here") does not
+    /// count as setting it.
+    fn hook_block_mentions(block: &str, word: &str) -> bool {
+        block.lines().any(|line| strip_comment(line).contains(word))
+    }
+
     /// Regression guard: the `license-headers` hook once had a `types_or`
     /// filter (`types_or: [rust, python, shell]`) that let a
     /// `licenserc.toml`- or Markdown-only commit skip it entirely, while
@@ -6985,6 +6992,59 @@ fi
             ci[start..end].contains("- 'docs/architecture.md'"),
             "the `rust` path filter must include docs/architecture.md, so a doc-only edit \
              re-runs `{command}`"
+        );
+    }
+
+    /// The `cargo-module-size` hook is the local mirror of the module-size step in
+    /// the `clippy` CI job, and it only stops a commit if it runs the strict
+    /// command itself: the `check-module-size-advisory` wrapper it used to run
+    /// exits 0 on an offender. The entry is exact, so a wrapper (or any flag that
+    /// changes the exit status) fails here. The check takes no file arguments
+    /// (clap rejects them), so prek must not append the staged filenames
+    /// (`pass_filenames: false`); and it runs only when Rust source is staged
+    /// (`types: [rust]`, with no `files:` or `exclude:` filter narrowing that).
+    #[test]
+    fn module_size_hook_runs_the_strict_check_at_pre_commit() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "cargo-module-size");
+        assert!(
+            hook_block_sets(block, "entry: cargo xtask check-module-size"),
+            "cargo-module-size hook must run exactly `cargo xtask check-module-size`, which \
+             exits non-zero on an offender; a wrapper that always succeeds cannot stop a \
+             commit:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "stages: [pre-commit]"),
+            "cargo-module-size hook must run at pre-commit, like the other xtask checks:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "cargo-module-size hook must set `pass_filenames: false`: the check takes no \
+             file arguments, so appending the staged filenames would make it fail on every \
+             commit:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "language: system"),
+            "cargo-module-size hook must run its entry as a system command:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "types: [rust]"),
+            "cargo-module-size hook must be triggered by Rust source:\n{block}"
+        );
+        for filter_key in ["files:", "exclude:", "types_or:"] {
+            assert!(
+                !hook_block_mentions(block, filter_key),
+                "cargo-module-size hook must not narrow `types: [rust]` with `{filter_key}`, \
+                 or a commit that stages Rust source could skip it:\n{block}"
+            );
+        }
+        assert!(
+            !block
+                .lines()
+                .any(|line| strip_comment(line).contains("advisory")),
+            "the cargo-module-size hook's name and entry must not say advisory:\n{block}"
         );
     }
 
@@ -7138,6 +7198,25 @@ fi
             "        # always_run: true\n        always_run: false",
             "always_run: true"
         ));
+    }
+
+    #[test]
+    fn hook_block_mentions_ignores_comments_but_reads_real_keys() {
+        // A comment, whole-line or trailing, that names a filter key is not a filter.
+        assert!(!hook_block_mentions(
+            "        # no files: or exclude: filter here\n        types: [rust]  # not types_or:",
+            "files:"
+        ));
+        assert!(!hook_block_mentions(
+            "        # no files: or exclude: filter here\n        types: [rust]  # not types_or:",
+            "types_or:"
+        ));
+        // The real key still counts, with or without a trailing comment.
+        assert!(hook_block_mentions(
+            "        files: '^src/'  # narrows the hook",
+            "files:"
+        ));
+        assert!(hook_block_mentions("        exclude: '^x/'", "exclude:"));
     }
 
     #[test]
@@ -9051,9 +9130,12 @@ permissions:
 
     /// What in `workflow` would route a job to the queue-report runner or make
     /// it depend on the workflow named `queue_workflow_name`: the runner's
-    /// label, the workflow's file stem, or its name. Compared with case, quotes
-    /// and every whitespace character (line breaks included) removed, so a name
-    /// split across lines still counts; comments do not.
+    /// label, the workflow's file stem, or its name. Whole-line comments do not
+    /// count (a trailing `# ...` after content does). The
+    /// label and the file stems are matched as whole words (case and quotes
+    /// ignored), so `queue-runner` is not `queue-run`; only the workflow's name
+    /// is matched with whitespace removed too (line breaks included), so a name
+    /// split across lines still counts.
     fn queue_runner_references(workflow: &str, queue_workflow_name: &str) -> Vec<String> {
         let squeeze = |text: &str| -> String {
             text.to_lowercase()
@@ -9061,16 +9143,32 @@ permissions:
                 .filter(|c| !(c.is_whitespace() || *c == '"' || *c == '\''))
                 .collect()
         };
-        let text = squeeze(&without_comments(workflow));
-        [
-            "queue-report".to_owned(),
-            "nightly-queue".to_owned(),
-            "queue-run".to_owned(),
-            squeeze(queue_workflow_name),
-        ]
-        .into_iter()
-        .filter(|reference| text.contains(reference.as_str()))
-        .collect()
+        let uncommented = without_comments(workflow);
+        let squeezed = squeeze(&uncommented);
+        // The label and the file stems are whole words, so `queue-runner` is
+        // not a reference to `queue-run`; the workflow's name may be split
+        // across lines and is matched squeezed.
+        let lowered = uncommented.to_lowercase().replace(['"', '\''], "");
+        let word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+        let names_word = |word: &str| {
+            lowered.match_indices(word).any(|(at, _)| {
+                !lowered[..at].chars().next_back().is_some_and(word_char)
+                    && !lowered[at + word.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(word_char)
+            })
+        };
+        let mut found: Vec<String> = ["queue-report", "nightly-queue", "queue-run"]
+            .into_iter()
+            .filter(|word| names_word(word))
+            .map(str::to_owned)
+            .collect();
+        let name = squeeze(queue_workflow_name);
+        if squeezed.contains(name.as_str()) {
+            found.push(name);
+        }
+        found
     }
 
     #[test]
@@ -9101,6 +9199,17 @@ permissions:
                 job("    uses: ./.github/workflows/queue-run.yml"),
                 vec!["queue-run"],
             ),
+            (job("    needs: [queue-run]"), vec!["queue-run"]),
+            (
+                job("    needs:\n      - queue-run\n      - lint"),
+                vec!["queue-run"],
+            ),
+            // Whole words only: these are other names.
+            (
+                job("    uses: ./.github/workflows/queue-runner.yml"),
+                vec![],
+            ),
+            (job("    runs-on: [queue-reporter]"), vec![]),
             (job("    runs-on: ubuntu-latest"), vec![]),
             (job("    runs-on: [self-hosted, linux, mi300x]"), vec![]),
             (
@@ -9329,6 +9438,8 @@ permissions:
         checksum_ok: bool,
         cargo_installed: bool,
         out_blocked: bool,
+        /// The preflight call (1-based) that fails, if any.
+        preflight_fails_on: Option<u32>,
     }
 
     #[cfg(unix)]
@@ -9343,6 +9454,7 @@ permissions:
                 checksum_ok: true,
                 cargo_installed: true,
                 out_blocked: false,
+                preflight_fails_on: None,
             }
         }
     }
@@ -9382,7 +9494,14 @@ permissions:
         .expect("copy the lane script");
         std::fs::write(
             root.join(".github/scripts/gpu-preflight.sh"),
-            "echo \"preflight ran\"\n",
+            format!(
+                "echo \"preflight ran\"\n\
+                 n=0; [ -f \"{counter}\" ] && read -r n < \"{counter}\"\n\
+                 n=$((n + 1)); echo \"$n\" > \"{counter}\"\n\
+                 [ \"$n\" -ne {fails_on} ]\n",
+                counter = dir.path().join("preflight-calls").display(),
+                fails_on = case.preflight_fails_on.unwrap_or(0),
+            ),
         )
         .expect("stub the preflight");
         if case.out_blocked {
@@ -9535,6 +9654,10 @@ permissions:
                     .to_owned(),
             ];
             for channel in ["release", "nightly"] {
+                // The first channel's preflight is the one before the build.
+                if channel == "nightly" {
+                    steps.push("preflight ran\n".to_owned());
+                }
                 steps.extend([
                     format!(
                         "cargo xtask e2e-prewarm --channel {channel} --prewarm-dir {}/prewarm-{channel}\n",
@@ -9559,6 +9682,8 @@ permissions:
                 from += at + step.len();
             }
             assert_eq!(log.matches("cargo build").count(), 1, "{log}");
+            // One preflight per channel, never two for the same one.
+            assert_eq!(log.matches("preflight ran").count(), 2, "{log}");
             assert!(!log.contains("curl"), "cargo was there already:\n{log}");
         }
     }
@@ -9598,6 +9723,49 @@ permissions:
         assert_eq!(rc, 1, "{log}");
         assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
         assert!(log.contains("channel release failed (status 1)"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_channel_whose_preflight_fails_does_not_report_the_last_ones_results() {
+        // The second preflight call is the second channel's. It fails, so that
+        // channel never ran its suite: it must report nothing, not a copy of
+        // the first channel's results, and the lane is red.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(2),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+        assert!(!out.join("nightly/results/junit.xml").exists(), "{log}");
+        assert!(log.contains("channel nightly failed"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_whose_first_preflight_fails_builds_and_runs_nothing() {
+        // The first preflight is the lane's own, before the build: the script
+        // is `set -e` there, so the lane stops, with the preflight's status,
+        // before any channel runs or reports.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(1),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        assert!(!log.contains("cargo "), "{log}");
+        assert!(!log.contains("== channel"), "{log}");
+        assert!(!out.join("release").exists(), "{log}");
+        assert!(!out.join("nightly").exists(), "{log}");
     }
 
     #[cfg(unix)]

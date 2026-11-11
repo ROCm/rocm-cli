@@ -791,7 +791,11 @@ rocm install sdk --family gfx110X-all --dry-run\n  \
 rocm install sdk --devel\n  \
 rocm install sdk --version 10.0.0 --python-version 3.12")]
     Sdk {
-        /// Package channel to install, such as release or nightly.
+        /// TheRock ROCm SDK channel to install from: `release` or `nightly`.
+        ///
+        /// This picks the ROCm SDK stream only. It is separate from the channel
+        /// the `rocm` binary itself was installed from (`install.sh`,
+        /// `install.ps1`); `rocm update` updates SDK runtimes, not the binary.
         #[arg(long, default_value = "release")]
         channel: String,
         /// Package format to install [possible values: wheel, tarball].

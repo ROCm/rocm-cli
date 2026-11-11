@@ -879,10 +879,6 @@ mod tests {
         Ok(())
     }
 
-    /// ROCMAI-541: a `rocm services stop`/`rocm dash` stop that lands
-    /// during the 45s launch readiness wait must not be reported as a crash —
-    /// no `failed` status, no non-zero exit — and the in-memory `record` must
-    /// come back refreshed from disk so a caller's own follow-up write cannot
     /// The `stop_seen_while_waiting` latch, which nothing else exercised:
     /// every other caller test passes `false`, so deleting the latch left the
     /// whole suite green.
@@ -958,6 +954,10 @@ mod tests {
         Ok(())
     }
 
+    /// ROCMAI-541: a `rocm services stop`/`rocm dash` stop that lands
+    /// during the 45s launch readiness wait must not be reported as a crash —
+    /// no `failed` status, no non-zero exit — and the in-memory `record` must
+    /// come back refreshed from disk so a caller's own follow-up write cannot
     /// clobber the stop marker the stop itself just wrote.
     #[test]
     fn finalize_managed_launch_readiness_treats_a_requested_stop_as_clean() -> Result<()> {

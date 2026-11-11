@@ -96,10 +96,12 @@ pub struct E2eWorld {
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
-    /// lock was still held cannot have waited for it. It is a one-sided bound:
-    /// the measurement brackets the whole child process, so a long elapsed time
-    /// does not establish that the prune blocked. Set by the When step that
-    /// measures it; `None` everywhere else.
+    /// lock was still held cannot have waited for it, and `examine-48`, where an
+    /// inspection that finished long before a probe tool's background process
+    /// did cannot have waited for it. Both assert the short side of a one-sided
+    /// bound: the measurement brackets the whole child process, so a long elapsed
+    /// time does not establish that the command blocked. Set by the When step
+    /// that measures it; `None` everywhere else.
     pub cli_elapsed: Option<std::time::Duration>,
     /// The `ROCM_CLI_DATA_DIR` value a refusal told the user to set, read from
     /// its stderr by the first step that follows that advice, so later steps
