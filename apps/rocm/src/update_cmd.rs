@@ -11,8 +11,8 @@
 //! update-source/installed-runtime pickers behind it
 //! (`select_runtime_update_source`, `select_installed_update_runtime`).
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-210) of the `main.rs` modularization (see `docs/architecture.md`).
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`).
 //! The `update` command arm of `dispatch()` calls `update`, the handler whose
 //! body was that arm's own and which was relocated here verbatim, re-imported
 //! via `use crate::update_cmd::update;`; `update` in turn calls
