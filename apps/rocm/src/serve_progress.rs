@@ -1493,13 +1493,8 @@ mod tests {
         let deadline = Duration::from_secs(5);
         let started = Instant::now();
         let mut labels = Vec::new();
-        // Nothing is listening: the probe fails fast on connection refused.
-        let port = {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-            port
-        };
+        // The endpoint never lists the model, and answers at once.
+        let port = not_listing_port();
         let result = wait_for_serve_startup(
             "vllm",
             "qwen",
@@ -1579,10 +1574,25 @@ mod tests {
         );
     }
 
-    fn refused_port() -> u16 {
+    /// A local endpoint that answers every request with 503 at once: the
+    /// model is never listed. Not a closed port: on Windows a refused loopback
+    /// connect takes about two seconds, which outlasts these tests' limits.
+    fn not_listing_port() -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let body = r#"{"error":"loading"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
         port
     }
 
@@ -1591,12 +1601,7 @@ mod tests {
     /// 45-second contract scripts and CI read, and it has no stop.
     #[test]
     fn piped_wait_ignores_engine_failure_and_a_dead_process() {
-        let port = {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-            port
-        };
+        let port = not_listing_port();
         let mut policy = ServeStartupPolicy::status_budget(Duration::from_millis(200));
         policy.poll = Duration::from_millis(20);
         let mut polls = 0;
@@ -1687,7 +1692,7 @@ mod tests {
             "vllm",
             "qwen",
             "127.0.0.1",
-            refused_port(),
+            not_listing_port(),
             None,
             &short_policy(Duration::from_secs(5), Duration::from_secs(30)),
             &mut || {
@@ -1781,7 +1786,7 @@ mod tests {
             "vllm",
             "qwen",
             "127.0.0.1",
-            refused_port(),
+            not_listing_port(),
             None,
             &short_policy(Duration::from_millis(1_200), stall),
             &mut || {
@@ -1822,7 +1827,7 @@ mod tests {
             "vllm",
             "qwen",
             "127.0.0.1",
-            refused_port(),
+            not_listing_port(),
             None,
             &policy,
             &mut || {
@@ -1901,7 +1906,7 @@ mod tests {
             "vllm",
             "qwen",
             "127.0.0.1",
-            refused_port(),
+            not_listing_port(),
             Some(key),
             &short_policy(Duration::from_secs(5), Duration::from_secs(30)),
             &mut || {
