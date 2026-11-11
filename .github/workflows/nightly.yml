@@ -671,9 +671,9 @@ jobs:
           name: e2e-gpu-mi350p-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # W7900 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-w7900 lane
-  # in e2e-selfhosted.yml (w7900 label, shared uv cache, GPU preflight), with
-  # @nightly scenarios enabled. Keep the two in step: the report crate asserts
+  # W7900 counterpart to e2e-gpu-nightly. Mirrors the e2e-gpu-w7900 lane (which
+  # no longer runs on pull_request) in e2e-selfhosted.yml (w7900 label, shared
+  # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step: the report crate asserts
   # the nightly lanes publish the same platforms as the per-PR lanes.
   e2e-gpu-nightly-w7900:
     name: E2E tests (W7900, incl. nightly-only)

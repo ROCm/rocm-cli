@@ -376,7 +376,7 @@ run there; WSL reports `os_family` `"linux"` and stays vLLM-eligible);
 otherwise `vllm` is only preferred for the `*-dcgpu` families and
 `gfx906`/`gfx908`/`gfx90a`. Consequences for the lanes above:
 
-- Strix Halo is `gfx1151` on every OS, so all three per-PR Strix lanes
+- Strix Halo is `gfx1151` on every OS, so all three Strix lanes
   (Ubuntu, Windows, WSL2) and their nightly counterparts are lemonade-only —
   no matrix value turns a Strix lane into a vLLM lane.
 - `e2e-gpu` (MI300X) is the only per-PR lane where vLLM is the effective
@@ -391,8 +391,9 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request` (all lanes but `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and
-`merge_group` (every GPU lane except MI300X, which is not required for merging and so is skipped in the merge queue rather than left
-queued on limited runner capacity after its PR has merged) when the workflow's
+`merge_group` (every GPU lane except MI300X, which is not required for merging
+and so is skipped in the merge queue rather than left queued on limited runner
+capacity after its PR has merged) when the workflow's
 own `changes` job's `serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy

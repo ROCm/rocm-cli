@@ -7723,8 +7723,10 @@ jobs:
     /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
     /// RUSTUP_HOME, TMPDIR and PIP_CACHE_DIR pointed at `/home/ubuntu/actions-runner`)
     /// to the DevLab Dispatch pool. A pool host has none of those paths, so the job
-    /// must neither set them nor read one it does not set: an unset variable is
-    /// empty, not defaulted, and a step that built a path from it would write to `/`.
+    /// must not name the static tree, must not read one of those four variables it
+    /// does not set (an unset variable is empty, not defaulted), and may read
+    /// `$HOME` only for the Rust bootstrap under `$HOME/.cargo/bin`. This is a
+    /// textual guard over the job's non-comment lines, not proof the job runs.
     #[test]
     fn nightly_strix_ubuntu_job_holds_no_static_host_paths() {
         let nightly = read_workflow("nightly.yml");
@@ -7743,6 +7745,18 @@ jobs:
             assert!(
                 env.contains_key(var) || !uncommented.contains(var),
                 "e2e-gpu-nightly-strix reads {var} but no longer sets it"
+            );
+        }
+        for (index, _) in uncommented
+            .match_indices("$HOME")
+            .chain(uncommented.match_indices("${HOME"))
+        {
+            let rest = &uncommented[index..];
+            assert!(
+                rest.starts_with("$HOME/.cargo/bin"),
+                "e2e-gpu-nightly-strix reads $HOME outside the Rust bootstrap, which a pool \
+                 host does not provision: `{}`",
+                rest.lines().next().unwrap_or_default().trim()
             );
         }
     }
