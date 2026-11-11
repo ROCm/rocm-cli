@@ -106,7 +106,31 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) {
     let on_disk = latest.status.clone();
     let _ = latest.refresh_from_engine_state();
     if crate::managed_service_status::managed_service_is_live(&latest) {
-        latest.status = "stopped".to_owned();
+        // The record still reads live even after the death was observed, so
+        // nothing has recorded *why* it died: the engine's own in-process
+        // backstop (`record_engine_serve_http_failure`) never got to run. A
+        // SIGKILL, an OOM kill or a segfault all land here — plausible for an
+        // inference server, which is why the surrounding code already carries
+        // OOM guidance — and calling any of them a clean stop is the ROCMAI-541
+        // defect at the one exit point the launch/attach/restart fix did not
+        // cover.
+        //
+        // An engine that *did* stamp `failed` itself is not reached: that record
+        // no longer reads live, so it takes the branch below and keeps its own
+        // reason.
+        if managed_service_stop_was_requested(paths, service_id) {
+            latest.status = "stopped".to_owned();
+        } else {
+            latest.status = "failed".to_owned();
+            // The engine state file is what ROCMAI-541's acceptance criterion
+            // names, and `latest.write()` below only covers the manifest. A
+            // merge, not a whole-file write, for the same reason
+            // `mark_service_failed` uses one.
+            let _ = rocm_core::merge_json_state_file(
+                &latest.engine_state_path,
+                &serde_json::json!({ "status": "failed" }),
+            );
+        }
     } else if latest.status == on_disk {
         return;
     }
@@ -1135,18 +1159,53 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A `--wait` that ends in a death nobody asked for is a crash, and used to
+    /// be written as `stopped` whatever happened. That is the same defect
+    /// ROCMAI-541 fixes on the launch, attach and restart paths, left open at
+    /// the one exit point none of them covers: a death that bypasses the
+    /// engine's own backstop (SIGKILL, OOM kill, segfault) leaves the record
+    /// still reading live, so there is nothing on disk saying why.
+    ///
+    /// All three arms are pinned together because they are one decision. Only
+    /// asserting the crash arm would pass a version that stopped reading the
+    /// stop marker entirely and called every `--wait` death a crash — the
+    /// mirror-image defect, and the one that would start telling users a
+    /// deliberate stop had failed.
     #[test]
-    fn settle_exited_service_demotes_a_live_manifest_and_spares_a_settled_one() {
+    fn a_wait_death_is_a_crash_unless_a_stop_asked_for_it() {
         let (root, paths) = test_paths("wait-settle");
         paths.ensure().expect("paths");
+        // The stop arm runs first, while nothing has stamped `failed` anywhere:
+        // the marker is the sound evidence, so a stop that landed during the
+        // wait settles as a clean stop.
         let mut record = record_tracking_pid(&paths, 0, "starting");
+        record.stop_requested_unix_ms = Some(1);
         record.write().expect("write");
         settle_exited_service(&paths, &record.service_id);
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
-        assert_eq!(after.status, "stopped");
+        assert_eq!(
+            after.status, "stopped",
+            "a stop that asked for this death must not be reported as a crash"
+        );
+
+        // Same service, same death, with nothing having asked for it.
+        record.stop_requested_unix_ms = None;
+        record.status = "starting".to_owned();
+        record.write().expect("write");
+        settle_exited_service(&paths, &record.service_id);
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(
+            after.status, "failed",
+            "nothing asked this server to stop, so its death is a crash"
+        );
+        let engine_state = fs::read_to_string(&record.engine_state_path).expect("engine state");
+        assert!(
+            engine_state.contains("\"failed\""),
+            "the engine state file is the one ROCMAI-541 names: {engine_state}"
+        );
 
         // A record that already failed keeps its reason: the guard, not the
-        // overwrite, is what spares it (a `stopped` -> `stopped` rewrite would
+        // overwrite, is what spares it (a `failed` -> `failed` rewrite would
         // be invisible).
         record.status = "failed".to_owned();
         record.write().expect("write");
@@ -1237,7 +1296,11 @@ mod tests {
             message.contains(&format!("rocm logs --service {id}")),
             "{message}"
         );
-        assert_eq!(status(), "stopped");
+        // `failed`, not `stopped`: nothing asked this server to stop, so the
+        // death is a crash. This assertion used to read "stopped", which was
+        // the ROCMAI-541 defect surviving at the `--wait` exit point — see
+        // `a_wait_death_is_a_crash_unless_a_stop_asked_for_it`.
+        assert_eq!(status(), "failed");
         let _ = fs::remove_dir_all(root);
     }
 
