@@ -48,10 +48,9 @@ A pull request now runs on exactly one Linux GPU node and one Windows GPU
 node: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
 the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu (`e2e-gpu-strix-ubuntu`) and W7900 (`e2e-gpu-w7900`) lanes no longer
-start on `pull_request`; they keep their `push`/dispatch triggers (Strix
-Ubuntu also `merge_group`; W7900 does not run in the merge queue) and run
-nightly (`e2e-gpu-nightly-strix` on the same DevLab Dispatch pool labels,
-`e2e-gpu-nightly-w7900`).
+start on `pull_request` or in the merge queue; they keep their
+`push`/dispatch triggers and run nightly (`e2e-gpu-nightly-strix` on the same
+DevLab Dispatch pool labels, `e2e-gpu-nightly-w7900`).
 
 [`queue-run.yml`](../.github/workflows/queue-run.yml) runs GPU lanes on a
 shared GPU queue, one per GPU model, so no runner holds a GPU for the length
@@ -129,17 +128,19 @@ separate tier flag or tag filter to maintain.
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` |
 
-On `pull_request`, `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900` are skipped; the
-other lanes above run (one Linux node, MI300X, and the Windows Strix Halo pool).
-Both still run on `push`, dispatch and nightly; Strix Ubuntu also on `merge_group`,
-W7900 does not (a single runner on borrowed quota would sit behind the queue).
+On `pull_request` and `merge_group`, `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`
+are skipped; both still run on `push`, dispatch and nightly. In the merge queue
+W7900 is one runner on borrowed quota that would sit behind the queue, and over
+7 days 35% of Strix Ubuntu's merge-queue jobs (98 of 281) were cancelled at the
+45 min cap; neither check is required and the queue does not wait for it. On a
+PR the other lanes above run (one Linux node, MI300X, and the Windows Strix Halo
+pool).
 
 `e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
 nightly]` axis: two concurrent legs on the same job, channel-suffixed artifact
 names, so that lane proves the nightly package channel boots. It no longer runs
 on `pull_request`, so on a PR no lane exercises the nightly channel; it runs on
-`push`, `merge_group`, dispatch and in `nightly.yml`'s channel matrix
-(ROCMAI-429).
+`push`, dispatch and in `nightly.yml`'s channel matrix (ROCMAI-429).
 
 All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
 runner is registered per job and destroyed after, opt-in only via the
@@ -393,9 +394,10 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request` (all lanes but `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and
-`merge_group` (every GPU lane except MI300X and W7900, which are not required for
-merging and so are skipped in the merge queue rather than left queued on limited runner
-capacity after its PR has merged) when the workflow's own `changes` job's
+`merge_group` (the Windows Strix Halo lanes only: MI300X, Strix Ubuntu and
+W7900 are not required for merging and so are skipped in the merge queue rather
+than left queued on limited runner capacity or hung at their cap after its PR
+has merged) when the workflow's own `changes` job's
 `serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
@@ -441,7 +443,7 @@ plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust chang
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix (minus MI300X in the merge queue)
+filter is forced `true`, so the full matrix (minus MI300X, Strix Ubuntu and W7900 in the merge queue)
 always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`

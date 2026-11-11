@@ -12,9 +12,8 @@ name: E2E self-hosted
 # Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
 # MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
 # node (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
-# Ubuntu lane keeps its push / merge_group / dispatch triggers and the W7900
-# lane its push / dispatch triggers (no merge_group); both run nightly
-# (nightly.yml) and neither starts on pull_request.
+# Ubuntu and W7900 lanes keep their push / dispatch triggers and run nightly
+# (nightly.yml); neither starts on pull_request or merge_group.
 #
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
@@ -117,7 +116,8 @@ jobs:
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
       # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
-      # full matrix (every lane but MI300X and W7900, which skip merge_group) and its
+      # full matrix (every lane but MI300X, Strix Ubuntu and W7900, which skip
+      # merge_group) and its
       # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
       # ROCMAI-430: the three most recent rows of the official release list
@@ -478,15 +478,18 @@ jobs:
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
     # Not on pull_request: a PR gets exactly one Linux GPU node (MI300X, the only
-    # lane where vLLM runs) and one Windows node (the Strix Halo pool). This lane
-    # still runs on push/merge_group/dispatch and nightly (nightly.yml,
-    # e2e-gpu-nightly-strix, same pool labels).
+    # lane where vLLM runs) and one Windows node (the Strix Halo pool). Not on
+    # merge_group either: over 7 days 35% of its merge-queue jobs (98 of 281) were
+    # cancelled at the 45 min cap, and the queue does not wait for this
+    # non-required check. Still runs on push (main, release/**), dispatch and
+    # nightly (nightly.yml, e2e-gpu-nightly-strix, same pool labels).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
           && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
@@ -520,8 +523,6 @@ jobs:
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

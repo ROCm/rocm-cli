@@ -7693,25 +7693,23 @@ jobs:
             );
         }
         // A pull request runs one Linux node (MI300X) and one Windows node (the
-        // Strix Halo pool). Strix Ubuntu is off the pull_request path but must
-        // still run on push and in the merge queue; W7900 is off pull_request AND
-        // merge_group (one runner on borrowed quota, the queue does not wait for
-        // it) but still runs on push and dispatch. Pin the WHOLE gate, not a
-        // substring: the event exclusions must sit in the non-dispatch branch (so
-        // a dispatch can still select the lane) and nothing else about the event
-        // may be named, so a gate that dropped push some other way fails too.
-        for (job, platform, excluded) in [
-            ("e2e-gpu-strix-ubuntu", "strix-ubuntu", ""),
-            (
-                "e2e-gpu-w7900",
-                "w7900",
-                "&& github.event_name != 'merge_group' ",
-            ),
+        // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND
+        // merge_group (W7900 is one runner on borrowed quota; 35% of Strix
+        // Ubuntu's merge-queue jobs hit the 45 min cap; neither check is required
+        // and the queue does not wait for it) but still run on push and dispatch.
+        // Pin the WHOLE gate, not a substring: the event exclusions must sit in the
+        // non-dispatch branch (so a dispatch can still select the lane) and nothing
+        // else about the event may be named, so a gate that dropped push some other
+        // way fails too.
+        for (job, platform) in [
+            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
+            ("e2e-gpu-w7900", "w7900"),
         ] {
             let expected = format!(
                 "always() && needs.changes.result == 'success' && ( \
                  (github.event_name != 'workflow_dispatch' \
-                 && github.event_name != 'pull_request' {excluded}\
+                 && github.event_name != 'pull_request' \
+                 && github.event_name != 'merge_group' \
                  && needs.changes.outputs.serve == 'true') \
                  || (github.event_name == 'workflow_dispatch' \
                  && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
@@ -7719,14 +7717,14 @@ jobs:
             assert_eq!(
                 normalized_whitespace(&gate(job)),
                 normalized_whitespace(&expected),
-                "`{job}` has the wrong event gate (pull_request, plus merge_group for W7900, \
-                 excluded in the non-dispatch branch only)"
+                "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
+                 the non-dispatch branch only)"
+            );
+            assert!(
+                !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
+                "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
             );
         }
-        assert!(
-            !job_block(&sh, "e2e-gpu-w7900").contains("E2E_MERGE_QUEUE"),
-            "e2e-gpu-w7900 never runs in the merge queue, so it must not opt into @merge-queue scenarios"
-        );
     }
 
     /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
