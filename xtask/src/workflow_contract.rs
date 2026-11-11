@@ -7417,6 +7417,40 @@ jobs:
     }
 
     #[test]
+    fn closing_a_pr_supersedes_its_self_hosted_runs() {
+        // A merged or closed PR's queued GPU run is dead work that still takes a
+        // runner. `closed` is not a default `pull_request` activity type, so it
+        // must be listed; the run it starts joins the PR's group (same key as the
+        // opened/synchronize runs) and so cancels the earlier one. It must run
+        // nothing but the no-op job: `changes` skips, and with it every lane.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let on = normalized_whitespace(
+            &top_level_block(&sh, "on")
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            on.contains("types: [opened, synchronize, reopened, closed]"),
+            "pull_request must list `closed` next to the default types, got `{on}`"
+        );
+        assert!(
+            sh.contains(
+                "if: github.event_name != 'pull_request' || github.event.action != 'closed'"
+            ),
+            "the `changes` job must skip on `closed`, or every GPU lane would run for a closed PR"
+        );
+        assert!(
+            sh.contains("  pr-closed:\n")
+                && sh.contains(
+                    "github.event_name == 'pull_request' && github.event.action == 'closed'"
+                ),
+            "a no-op `pr-closed` job must exist so the closed run has something to run"
+        );
+    }
+
+    #[test]
     fn mi300x_lane_is_skipped_in_the_merge_queue() {
         // The MI300X check is not required for merging, so a merge_group run's
         // job is never waited for and, behind a single runner, outlives the PR it

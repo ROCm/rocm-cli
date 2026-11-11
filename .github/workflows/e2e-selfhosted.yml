@@ -31,6 +31,10 @@ on:
   # Mirror ci.yml: run on PRs against ANY base branch so a stacked PR still gets
   # the GPU lanes. Affected-crate/heavy selection diffs against github.base_ref.
   pull_request:
+    # `closed` (merge OR close) joins the PR's concurrency group below, so it
+    # supersedes that PR's queued/running GPU runs. It runs only the no-op
+    # `pr-closed` job; every GPU lane skips because `changes` skips.
+    types: [opened, synchronize, reopened, closed]
   merge_group:
     branches: [main]
     types: [checks_requested]
@@ -93,6 +97,8 @@ jobs:
   # forced true, matching ci.yml.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
+    # Skipped on `closed`: every lane gates on `needs.changes.result == 'success'`.
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     permissions:
       contents: read
       pull-requests: read
@@ -182,6 +188,18 @@ jobs:
           else
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
           fi
+
+  # Exists only to start a run in the PR's concurrency group when the PR is
+  # merged or closed: that run cancels the PR's older run, and with it any GPU
+  # job still queued for a head nobody will look at again.
+  pr-closed:
+    name: Supersede runs of a closed PR
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: echo "PR closed; its earlier E2E runs are superseded by this run."
 
   e2e-gpu:
     name: E2E tests (MI300X, ${{ matrix.sdk_version }})
