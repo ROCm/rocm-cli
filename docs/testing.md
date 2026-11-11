@@ -544,13 +544,15 @@ cargo xtask smoke --skip-build
 ```
 
 `--profile release` builds and smokes release binaries; it builds only the four
-binaries the gate runs (`rocm`, `rocmd`, and the two engines), not the whole
-workspace. `--target-dir <dir>` builds into that directory and looks for the
-binaries there; without it, a configured `CARGO_TARGET_DIR` is honoured.
-Before its first check, a run names the binaries and the throwaway state root
-it uses. The build's output streams as it runs. Each smoked command must finish
-within three minutes; one that does not is killed, and the gate fails naming
-it.
+binaries the gate runs (`rocm`, `rocmd`, `rocm-engine-lemonade` and
+`rocm-engine-vllm`), not the whole workspace. `--target-dir <dir>` builds into
+that directory and looks for the binaries there; without it, a configured
+`CARGO_TARGET_DIR` is honoured, and otherwise `target`. The build is always
+given that directory, so a `build.target-dir` in cargo config does not move it.
+Before its first check, a run names the binaries' directory and the throwaway
+state root it uses. The build's output streams as it runs. Each smoked command
+must finish within three minutes; one that does not is killed and the gate
+fails naming it, though a process that command started can outlive it.
 
 ### Property tests
 

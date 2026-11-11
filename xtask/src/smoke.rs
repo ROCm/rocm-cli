@@ -445,11 +445,13 @@ fn parse_json(text: &str, label: &str) -> Result<Value> {
 }
 
 /// Environment overrides that point the CLI's own state directories, and the
-/// platform profile directories under them, at `smoke_root`.
+/// platform config, data and cache directories, at `smoke_root`.
 ///
 /// This is the script's allowlist, not a sandbox: a `ROCM_CLI_*` variable
 /// outside the four below is still inherited, so an exported one can change
-/// what the gate sees.
+/// what the gate sees. On Windows `USERPROFILE` is inherited too, as in the
+/// script, so code that finds the home directory through it still sees the
+/// real one.
 fn isolated_env(smoke_root: &Path) -> BTreeMap<&'static str, OsString> {
     let mut env = BTreeMap::new();
     env.insert("ROCM_CLI_UPDATE_USER_PATH", OsString::from("0"));
@@ -527,7 +529,7 @@ const CHILD_POLL: Duration = Duration::from_millis(20);
 /// it was launched.
 ///
 /// On the deadline the child is killed and the failure names the check and
-/// prints what it had written. A process the child started and left behind is
+/// carries what it had written. A process the child started and left behind is
 /// not killed (the standard library can only kill the child itself), but the
 /// gate does not wait for it either.
 fn run_command(
@@ -573,8 +575,10 @@ fn run_command(
             // Best effort: the child may have exited between the poll and here.
             let _ = child.kill();
             let _ = child.wait();
-            print_output(&combined(&stdout, &stderr));
-            bail!("{label} did not finish within {deadline:?} and was killed");
+            bail!(
+                "{label} did not finish within {deadline:?} and was killed; it had written:\n{}",
+                combined(&stdout, &stderr)
+            );
         }
         std::thread::sleep(CHILD_POLL);
     };
@@ -582,9 +586,10 @@ fn run_command(
     // open; wait for them only until the same deadline.
     while !(stdout.closed() && stderr.closed()) {
         if started.elapsed() >= deadline {
-            print_output(&combined(&stdout, &stderr));
             bail!(
-                "{label} exited, but a process it started still held its output open after {deadline:?}"
+                "{label} exited, but a process it started still held its output open after \
+                 {deadline:?}; it had written:\n{}",
+                combined(&stdout, &stderr)
             );
         }
         std::thread::sleep(CHILD_POLL);
@@ -956,19 +961,14 @@ fn build_args(profile: Profile, target_dir: Option<&Path>) -> Vec<String> {
 /// Resolve a `--target-dir` override against the workspace root once, so the
 /// build and the binary lookup are handed the same absolute path.
 fn resolve_target_dir(root: &Path, dir: &Path) -> PathBuf {
-    if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        root.join(dir)
-    }
+    // `join` returns an absolute `dir` unchanged.
+    root.join(dir)
 }
 
 /// Directory the built binaries are looked for in: the resolved override, or
 /// the active cargo target directory.
-fn binary_dir(root: &Path, profile: Profile, target_dir: Option<&Path>) -> PathBuf {
-    target_dir
-        .map_or_else(|| crate::paths::target_dir(root), Path::to_path_buf)
-        .join(profile.dir_name())
+fn binary_dir(target_dir: &Path, profile: Profile) -> PathBuf {
+    target_dir.join(profile.dir_name())
 }
 
 /// Label printed for the build step, so the log says what was compiled.
@@ -994,25 +994,34 @@ struct Plan {
 }
 
 impl Plan {
+    /// `default_target_dir` is where the binaries are when no `--target-dir`
+    /// is given: [`run`] passes [`crate::paths::target_dir`], which honours
+    /// `CARGO_TARGET_DIR`.
     fn new(
         root: &Path,
+        default_target_dir: &Path,
         profile: Profile,
         skip_build: bool,
         target_dir_override: Option<&Path>,
     ) -> Self {
-        // Resolved once, so the build and the binary lookup get the same path.
-        let target_dir = target_dir_override.map(|dir| resolve_target_dir(root, dir));
-        // Rooted at the checkout, not the active target dir: `docs/testing.md`
-        // tells contributors to share one `CARGO_TARGET_DIR` across checkouts,
-        // and this directory is wiped at the start of every run — two worktrees
-        // sharing a target dir would delete each other's state mid-run.
+        // Resolved once, and handed to the build as well as the lookup, so the
+        // build lands where the binaries are looked for even where cargo
+        // config (`build.target-dir`) would send it elsewhere.
+        let target_dir = target_dir_override.map_or_else(
+            || default_target_dir.to_path_buf(),
+            |dir| resolve_target_dir(root, dir),
+        );
+        // Rooted at the checkout, not the active target dir: a target dir may
+        // be shared between checkouts, and this directory is wiped at the start
+        // of every run — two worktrees sharing a target dir would delete each
+        // other's state mid-run.
         let env_root = root.join("target").join("smoke-local");
         Self {
             root: root.to_path_buf(),
             env: isolated_env(&env_root),
             env_root,
-            binaries: Binaries::new(binary_dir(root, profile, target_dir.as_deref())),
-            build: (!skip_build).then(|| build_args(profile, target_dir.as_deref())),
+            binaries: Binaries::new(binary_dir(&target_dir, profile)),
+            build: (!skip_build).then(|| build_args(profile, Some(&target_dir))),
         }
     }
 }
@@ -1024,9 +1033,9 @@ type Runner<'a> = dyn FnMut(&str, &Path, &[&str], bool) -> Result<String> + 'a;
 
 /// The gate: the version comparison, every table check in order, and the
 /// first-run assertions, against binaries the plan has located.
-fn execute(plan: &Plan, port: &str, run: &mut Runner<'_>) -> Result<()> {
+fn execute(plan: &Plan, port: &str, run: &mut Runner<'_>, say: &mut dyn FnMut(&str)) -> Result<()> {
     plan.binaries.require_all_present(plan.build.is_none())?;
-    println!("{}", run_header(plan));
+    say(&run_header(plan));
 
     if plan.env_root.exists() {
         std::fs::remove_dir_all(&plan.env_root)
@@ -1122,7 +1131,13 @@ fn child_runner(plan: &Plan) -> impl FnMut(&str, &Path, &[&str], bool) -> Result
 /// `child_runner` to `execute` — which runs only when the gate itself is run.
 pub fn run(profile: Profile, skip_build: bool, target_dir_override: Option<PathBuf>) -> Result<()> {
     let root = workspace_root()?;
-    let plan = Plan::new(&root, profile, skip_build, target_dir_override.as_deref());
+    let plan = Plan::new(
+        &root,
+        &crate::paths::target_dir(&root),
+        profile,
+        skip_build,
+        target_dir_override.as_deref(),
+    );
 
     if let Some(args) = &plan.build {
         let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
@@ -1135,7 +1150,9 @@ pub fn run(profile: Profile, skip_build: bool, target_dir_override: Option<PathB
     }
 
     let port = free_tcp_port()?.to_string();
-    execute(&plan, &port, &mut child_runner(&plan))?;
+    execute(&plan, &port, &mut child_runner(&plan), &mut |line| {
+        println!("{line}");
+    })?;
     println!("smoke: ok");
     Ok(())
 }
@@ -1618,6 +1635,13 @@ mod tests {
         let error = assert_version_string("rocm-cli 0.2.0 (unknown, a1b2c3d)", "rocm version")
             .expect_err("an unknown ref is rejected");
         assert!(format!("{error}").contains("unresolved ref"), "{error}");
+        assert!(
+            format!("{error}").contains(
+                "A detached HEAD or a source tree without git metadata produces this; \
+                 build from a branch or tag"
+            ),
+            "{error}"
+        );
         assert_version_string("rocm-cli 0.0.0-dev (main, a1b2c3d)", "rocm version")
             .expect("a real ref");
     }
@@ -1647,6 +1671,26 @@ mod tests {
                 .expect_err(&format!("{bad} is rejected"));
             assert!(format!("{error}").contains("expected"), "{error}");
         }
+    }
+
+    /// The release-tag grammar here is a copy of `apps/rocm/build.rs`'s.
+    /// `release_tag_grammar_is_the_same_everywhere` there holds the two equal,
+    /// but it runs only when `rocm` is tested; this runs whenever `xtask` is,
+    /// so changing the copy here alone is caught on the same run.
+    #[test]
+    fn the_release_tag_grammar_matches_build_rs() {
+        let build_rs = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps/rocm/build.rs"),
+        )
+        .expect("read apps/rocm/build.rs")
+        .replace("\r\n", "\n");
+        let pattern = format!(r#"const RELEASE_TAG_PATTERN: &str = r"{RELEASE_TAG_PATTERN}";"#);
+        assert!(build_rs.contains(&pattern), "build.rs lacks `{pattern}`");
+        let bound = format!(
+            "const RELEASE_VERSION_MAX_LEN: usize = {};",
+            RELEASE_TAG_MAX_LEN - 1
+        );
+        assert!(build_rs.contains(&bound), "build.rs lacks `{bound}`");
     }
 
     /// A release tag is at most 65 characters, `v` included.
@@ -1734,12 +1778,22 @@ mod tests {
             "text": "x",
             "empty_list": [],
             "list": [1],
+            "empty_map": {},
+            "map": {"k": 1},
             "null": null,
         });
-        for field in ["yes", "one", "text", "list"] {
+        for field in ["yes", "one", "text", "list", "map"] {
             assert!(json_truthy(&value, field), "{field} should be truthy");
         }
-        for field in ["no", "zero", "empty_text", "empty_list", "null", "absent"] {
+        for field in [
+            "no",
+            "zero",
+            "empty_text",
+            "empty_list",
+            "empty_map",
+            "null",
+            "absent",
+        ] {
             assert!(!json_truthy(&value, field), "{field} should be falsy");
         }
     }
@@ -1941,6 +1995,38 @@ mod tests {
         );
     }
 
+    /// The child is killed, not merely abandoned: `exec` keeps the shell's pid
+    /// for `sleep`, so the pid the child wrote is the process the deadline must
+    /// end, and it must be gone when the check fails. What it wrote before the
+    /// deadline is in the failure.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_leaves_no_child_running_after_its_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = run_command(
+            "demo",
+            Path::new("sh"),
+            &["-c", "echo $$ > pid; echo waiting; exec sleep 60"],
+            &BTreeMap::new(),
+            dir.path(),
+            false,
+            Duration::from_millis(500),
+        )
+        .expect_err("a child past its deadline fails the check");
+        assert!(
+            format!("{error}").contains("it had written:\nwaiting"),
+            "{error}"
+        );
+        let pid = std::fs::read_to_string(dir.path().join("pid")).expect("the child wrote its pid");
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(!alive, "process {} outlived its deadline", pid.trim());
+    }
+
     /// A child that exits but leaves a process holding its output open must
     /// not hold the gate either.
     #[cfg(unix)]
@@ -1964,6 +2050,28 @@ mod tests {
             "{error}"
         );
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    /// The direct form of the closed-stdin check above, which does not depend
+    /// on what stdin the test harness itself was given: the child's fd 0 must
+    /// be `/dev/null`, for the smoked commands and for the build alike.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_child_and_the_build_get_dev_null_as_stdin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = r#"[ "$(readlink /proc/self/fd/0)" = /dev/null ]"#;
+        run_command(
+            "demo",
+            Path::new("sh"),
+            &["-c", probe],
+            &BTreeMap::new(),
+            dir.path(),
+            false,
+            TEST_DEADLINE,
+        )
+        .expect("a smoked command's stdin is /dev/null");
+        run_build("build demo", Path::new("sh"), &["-c", probe], dir.path())
+            .expect("the build's stdin is /dev/null");
     }
 
     #[test]
@@ -2226,11 +2334,7 @@ mod tests {
             .expect("the build is told where to put the binaries");
         assert_eq!(args[target_flag + 1], out.display().to_string());
 
-        let root = dir.path().join("repo");
-        assert_eq!(
-            binary_dir(&root, Profile::Release, Some(&out)),
-            out.join("release")
-        );
+        assert_eq!(binary_dir(&out, Profile::Release), out.join("release"));
     }
 
     /// A relative `--target-dir` is resolved once, against the workspace root,
@@ -2259,10 +2363,14 @@ mod tests {
             Some(root.join("rel").display().to_string().as_str()),
             "the build receives the resolved path, not the relative one"
         );
-        assert_eq!(
-            binary_dir(&root, Profile::Debug, resolved.as_deref()),
-            root.join("rel").join("debug")
+        let plan = Plan::new(
+            &root,
+            &dir.path().join("default"),
+            Profile::Debug,
+            true,
+            Some(Path::new("rel")),
         );
+        assert_eq!(plan.binaries.dir, root.join("rel").join("debug"));
     }
 
     /// The first-run assertions look where the CLI was told to write.
@@ -2311,7 +2419,13 @@ mod tests {
         for bin in Bin::ALL {
             std::fs::write(bin_dir.join(binary_name(bin.stem())), b"").expect("stub binary");
         }
-        Plan::new(&dir.join("repo"), Profile::Debug, true, Some(&target))
+        Plan::new(
+            &dir.join("repo"),
+            &dir.join("default-target"),
+            Profile::Debug,
+            true,
+            Some(&target),
+        )
     }
 
     /// Drive `execute` with a fake runner that answers every command with
@@ -2322,8 +2436,19 @@ mod tests {
         overrides: &BTreeMap<&str, String>,
         on_call: &mut dyn FnMut(&str),
     ) -> (Result<()>, Vec<Call>) {
+        let (result, calls, _said) = execute_saying(plan, overrides, on_call);
+        (result, calls)
+    }
+
+    /// [`execute_with`], also returning the lines `execute` reported.
+    fn execute_saying(
+        plan: &Plan,
+        overrides: &BTreeMap<&str, String>,
+        on_call: &mut dyn FnMut(&str),
+    ) -> (Result<()>, Vec<Call>, Vec<String>) {
         let table = checks();
         let mut calls = Vec::new();
+        let mut said = Vec::new();
         let result = execute(
             plan,
             FAKE_PORT,
@@ -2343,7 +2468,9 @@ mod tests {
                 }
                 Ok(match label {
                     "rocm --version" | "rocm -V" => FAKE_VERSION.to_string(),
-                    "rocm version" => format!("{FAKE_VERSION}\nROCm SDK: none\nGPU driver: none"),
+                    "rocm version" => {
+                        format!("{FAKE_VERSION}\nROCm SDK: not detected\nGPU driver: not detected")
+                    }
                     _ => satisfying_output(
                         table
                             .iter()
@@ -2352,8 +2479,20 @@ mod tests {
                     ),
                 })
             },
+            &mut |line| said.push(line.to_string()),
         );
-        (result, calls)
+        (result, calls, said)
+    }
+
+    /// The run reports which binaries and state root it uses, once, through
+    /// the same channel as the rest of its output.
+    #[test]
+    fn execute_reports_the_binaries_and_state_root_it_uses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        let (result, _calls, said) = execute_saying(&plan, &BTreeMap::new(), &mut |_| {});
+        result.expect("every check is satisfied");
+        assert_eq!(said, vec![run_header(&plan)]);
     }
 
     /// The gate runs the version surfaces, then every table check in table
@@ -2425,13 +2564,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = fake_plan(dir.path());
 
-        let short = BTreeMap::from([("rocm -V", "rocm-cli 0.1.0 (main, ffffff)".to_string())]);
+        let short = BTreeMap::from([("rocm -V", "rocm-cli 0.1.0 (main, fffffff)".to_string())]);
         let (result, _) = execute_with(&plan, &short, &mut |_| {});
         assert!(format!("{}", result.expect_err("-V disagrees")).contains("version flag surfaces"),);
 
         let long = BTreeMap::from([(
             "rocm version",
-            "rocm-cli 0.1.0 (main, ffffff)\nROCm SDK: none\nGPU driver: none".to_string(),
+            "rocm-cli 0.1.0 (main, fffffff)\nROCm SDK: not detected\nGPU driver: not detected"
+                .to_string(),
         )]);
         let (result, _) = execute_with(&plan, &long, &mut |_| {});
         assert!(
@@ -2449,17 +2589,17 @@ mod tests {
         let cases = [
             (
                 unknown,
-                format!("{unknown}\nROCm SDK: none\nGPU driver: none"),
+                format!("{unknown}\nROCm SDK: not detected\nGPU driver: not detected"),
                 "unresolved ref",
             ),
             (
                 FAKE_VERSION,
-                format!("{FAKE_VERSION}\nGPU driver: none"),
+                format!("{FAKE_VERSION}\nGPU driver: not detected"),
                 "did not contain expected text: ROCm SDK:",
             ),
             (
                 FAKE_VERSION,
-                format!("{FAKE_VERSION}\nROCm SDK: none"),
+                format!("{FAKE_VERSION}\nROCm SDK: not detected"),
                 "did not contain expected text: GPU driver:",
             ),
         ];
@@ -2589,7 +2729,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("repo");
 
-        let release = Plan::new(&root, Profile::Release, false, Some(Path::new("rel")));
+        let default = dir.path().join("default-target");
+        let release = Plan::new(
+            &root,
+            &default,
+            Profile::Release,
+            false,
+            Some(Path::new("rel")),
+        );
         assert_eq!(
             release.build,
             Some(build_args(Profile::Release, Some(&root.join("rel"))))
@@ -2602,8 +2749,18 @@ mod tests {
         );
         assert_eq!(release.binaries.dir, root.join("rel").join("release"));
 
-        let skipped = Plan::new(&root, Profile::Release, true, None);
+        let skipped = Plan::new(&root, &default, Profile::Release, true, None);
         assert_eq!(skipped.build, None);
+
+        // Without `--target-dir`, the default target dir is used for both, and
+        // the build is still told it explicitly, so cargo config cannot send
+        // the binaries somewhere the lookup does not search.
+        let defaulted = Plan::new(&root, &default, Profile::Debug, false, None);
+        assert_eq!(defaulted.binaries.dir, default.join("debug"));
+        assert_eq!(
+            defaulted.build,
+            Some(build_args(Profile::Debug, Some(&default)))
+        );
 
         assert_eq!(release.env_root, root.join("target").join("smoke-local"));
         assert!(PathBuf::from(&release.env["ROCM_CLI_DATA_DIR"]).starts_with(&release.env_root));

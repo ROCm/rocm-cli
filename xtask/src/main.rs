@@ -399,7 +399,8 @@ pub(crate) enum Command {
         skip_build: bool,
         /// Target directory to build into and to find the binaries in, under its
         /// profile subdirectory. Relative paths resolve against the workspace
-        /// root. Defaults to the active cargo target directory.
+        /// root. Defaults to `CARGO_TARGET_DIR`, or `target` under the workspace
+        /// root; either way the build is given the same directory explicitly.
         #[arg(long)]
         target_dir: Option<PathBuf>,
     },
