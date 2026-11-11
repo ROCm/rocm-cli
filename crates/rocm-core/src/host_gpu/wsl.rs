@@ -79,10 +79,29 @@ pub(super) fn local_windows_host_driver_probe(
     )
 }
 
-/// Ask the Windows host, from inside the distro, which AMD display driver it runs.
-pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
+/// One AMD display adapter the Windows host reports, as the guest sees it.
+///
+/// Carries what an `examine` GPU entry is built from and no more. The driver
+/// version is deliberately not here: it is a fact about the host, and
+/// [`WslHostDriverProbe`] can say "the host was never asked", which a
+/// per-adapter `Option<String>` could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WslHostDisplayAdapter {
+    pub name: String,
+    /// `PCI\VEN_1002&DEV_...`, or empty when the row carried no id.
+    pub pnp_device_id: String,
+}
+
+/// Ask the Windows host, from inside the distro, which AMD display driver it
+/// runs *and* which AMD adapters it has.
+///
+/// Both answers come out of one query on purpose. The inventory is a
+/// PowerShell call with its own timeout, on a path the user is waiting on, so
+/// asking once for the version and again for the adapters would pay the
+/// slowest part of the WSL probe twice for data the first call already parsed.
+pub(crate) fn detect_wsl_host_displays() -> (WslHostDriverProbe, Vec<WslHostDisplayAdapter>) {
     if !is_wsl_host() {
-        return WslHostDriverProbe::Unreachable;
+        return (WslHostDriverProbe::Unreachable, Vec::new());
     }
     let Some(output) = capture_optional_command_with_timeout(
         "powershell.exe",
@@ -95,14 +114,31 @@ pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
         ],
         WINDOWS_INVENTORY_QUERY_TIMEOUT,
     ) else {
-        return WslHostDriverProbe::Unreachable;
+        return (WslHostDriverProbe::Unreachable, Vec::new());
     };
-    parse_windows_examine_inventory(&output)
-        .amd_display_driver_version()
-        .map_or(
-            WslHostDriverProbe::NoAmdDisplay,
-            WslHostDriverProbe::Version,
-        )
+    let inventory = parse_windows_examine_inventory(&output);
+    let adapters = inventory
+        .amd_displays()
+        .map(|display| WslHostDisplayAdapter {
+            name: display.name.trim().to_owned(),
+            pnp_device_id: display
+                .pnp_device_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        })
+        .collect();
+    let driver = inventory.amd_display_driver_version().map_or(
+        WslHostDriverProbe::NoAmdDisplay,
+        WslHostDriverProbe::Version,
+    );
+    (driver, adapters)
+}
+
+/// Ask the Windows host, from inside the distro, which AMD display driver it runs.
+pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
+    detect_wsl_host_displays().0
 }
 
 pub(super) fn detect_wsl_windows_display_probe_text() -> Option<String> {

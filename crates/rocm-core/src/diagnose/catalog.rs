@@ -67,8 +67,7 @@ const CHECKERS: &[Checker] = &[
     (check_6_path_missing, &["linux", "windows", "wsl"]),
     (check_7_stale_repos, &["linux"]),
     (check_8_wheel_rocm_mismatch, &["linux", "windows", "wsl"]),
-    // Not "wsl": WSL2 exposes no per-device topology to collide over.
-    (check_9_igpu_dgpu_collision, &["linux", "windows"]),
+    (check_9_igpu_dgpu_collision, &["linux", "windows", "wsl"]),
     (check_10_container_devices, &["linux"]),
     (check_11_iommu_hang, &["linux"]),
     (check_12_repo_native_broken, &["linux"]),
@@ -218,6 +217,43 @@ mod tests {
     use crate::diagnose::windows::DISPLAY_DRIVER_OLD_SCORE;
     use crate::diagnose::{MIN_SCORE_FOR_MATCH, diagnose, render_report_text};
     use crate::examine::Gpu;
+
+    /// An APU paired with a discrete card is a finding on WSL2, not silence.
+    ///
+    /// Both halves are asserted together because either alone still reports
+    /// nothing useful: the checker has to run, *and* the catalog has to name the
+    /// WSL family, or applicability falls back to print-only and the fix the
+    /// finding offers cannot be run at all.
+    #[test]
+    fn an_apu_beside_a_discrete_card_is_reported_on_wsl_as_it_is_on_bare_metal() {
+        let mut e = igpu_dgpu_host("linux");
+        e.is_wsl = true;
+        assert_eq!(platform_family(&e), "wsl", "the fixture must read as WSL");
+
+        let report = diagnose(&e, "");
+        let found = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-9-igpu-dgpu")
+            .expect("the iGPU/dGPU pairing is reported on WSL");
+
+        assert!(
+            found.score >= MIN_SCORE_FOR_MATCH,
+            "a reported pairing has to clear the match threshold, not merely exist: {}",
+            found.score
+        );
+        let fix = found.fix.as_ref().expect("the finding carries its fix");
+        assert_eq!(
+            fix.class,
+            crate::fix::FixClass::NeedsArgument,
+            "WSL is its own catalog family; without an entry the fix degrades to print-only"
+        );
+        assert_eq!(
+            fix.needs.as_deref(),
+            Some("--device-index"),
+            "and the argument that makes it runnable must be named"
+        );
+    }
 
     /// A pasted HIP-loading error still opens fix-13 when no AMD GPU was
     /// detected at all — deliberately, and this is the test that says so.
@@ -460,15 +496,15 @@ mod tests {
 
     #[test]
     fn the_shared_checks_under_report_on_wsl_rather_than_over_report() {
-        // WSL does not collect GPU topology: `gpus` stays empty because the
-        // probes that fill it read KFD and DRM, which do not exist there. The
-        // cross-platform checks enabled on WSL read those fields, so they run on
-        // less evidence here than on bare metal.
+        // WSL enumerates from the Windows host inventory rather than KFD and
+        // DRM, so a host whose inventory could not be read records no adapters
+        // at all. The cross-platform checks enabled on WSL then run on less
+        // evidence than they would on bare metal.
         //
-        // That degradation has to be one-directional. Missing topology must mean
+        // That degradation has to be one-directional. Missing evidence must mean
         // a check cannot reach its threshold on structure alone -- never that it
         // invents a fault. This pins the direction: on a healthy host with a
-        // framework installed, no shared check may fire at all.
+        // framework installed and no adapters recorded, no shared check may fire.
         let mut e = wsl_base();
         e.framework = "pytorch".to_owned();
         e.framework_version = "2.6.0".to_owned();
@@ -478,7 +514,7 @@ mod tests {
         e.rocm_path = "/opt/rocm".to_owned();
         e.env
             .insert("PATH".to_owned(), "/opt/rocm/bin:/usr/bin".to_owned());
-        assert!(e.gpus.is_empty(), "WSL collects no GPU topology");
+        assert!(e.gpus.is_empty(), "this fixture records no adapters");
 
         let report = diagnose(&e, "");
         assert!(
