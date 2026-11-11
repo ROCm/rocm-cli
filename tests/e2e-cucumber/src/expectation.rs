@@ -745,6 +745,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -758,6 +760,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -771,6 +775,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: false,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -793,6 +799,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -809,6 +817,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -824,6 +834,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -837,6 +849,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
         }
     }
@@ -1824,6 +1838,8 @@ serve_timeout_secs = 90
         let folded = HostCapability {
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
             ..cap("wsl2")
         };
         let both = decl(&[
@@ -1875,6 +1891,8 @@ serve_timeout_secs = 90
         // scenario run and pass without testing anything.
         let as_root = HostCapability {
             dir_permissions_bind: false,
+            driver_status: String::new(),
+            probe_error: None,
             ..cap("wsl2")
         };
         match resolve(&d, &as_root, &m, none) {
@@ -1929,6 +1947,8 @@ serve_timeout_secs = 90
         );
         let host = HostCapability {
             dir_permissions_bind: false,
+            driver_status: String::new(),
+            probe_error: None,
             ..cap("strix-windows")
         };
         assert_ne!(host.os_family, "linux", "fixture must fail the OS premise");
@@ -1965,6 +1985,8 @@ reason = "unrelated open bug"
         let folded = HostCapability {
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
             ..cap("strix-ubuntu")
         };
         assert!(matches!(

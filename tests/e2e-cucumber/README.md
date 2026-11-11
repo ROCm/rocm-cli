@@ -64,7 +64,7 @@ runs the suite. Extra arguments after `--` are forwarded to the cucumber CLI.
 # All features:
 cargo xtask e2e
 
-# Filter by scenario name:
+# Filter by scenario name (bypasses capability gating; see below):
 cargo xtask e2e -- -n "model name"
 
 # Stop on first failure:
@@ -101,6 +101,37 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 | `ROCM_CLI_CONFIG_DIR` | (temp dir) | Isolated config directory per scenario |
 | `ROCM_CLI_DATA_DIR` | (temp dir) | Isolated data directory per scenario |
 | `ROCM_CLI_CACHE_DIR` | (temp dir) | Isolated cache directory per scenario |
+| `E2E_EXPECT_GPU` | unset (undeclared) | Whether the lane has a GPU: `1` = GPU expected, `0` = deliberately none, unset or empty = no claim; any other value fails the run. Set on every self-hosted CI lane; see "Lane verdict" below |
+
+### Lane verdict
+
+Scenarios that resolve to skip never reach `report.json`, so scenario results
+alone cannot tell a lane that tested its GPU from one on which every GPU
+scenario was skipped. The harness checks the run itself, before and after the
+scenarios:
+
+- **Before any scenario runs**, it fails when the capability probe could not
+  read the binary under test (`rocm examine` or `rocm engines list` could not be
+  started, exited non-zero, or printed nothing), naming the command, its exit
+  status and the tail of its stderr. On a lane that sets `E2E_EXPECT_GPU=1` it
+  also fails when the probe found no usable AMD GPU, naming the detected gfx
+  target, WSL flag, driver status and visibility mask it decided from.
+- **After the run**, it fails when no scenario executed (for example a `-n`
+  filter that matches nothing), and on an `E2E_EXPECT_GPU=1` lane when no
+  `@requires-gpu` scenario executed.
+
+`E2E_EXPECT_GPU=0` is for a lane that deliberately has no usable GPU, such as
+the WSL lanes: the harness prints a note that `@requires-gpu` scenarios are not
+applicable, and a note that the declaration is stale if the probe finds a GPU
+anyway; neither fails the run. Both checks are in
+[`src/lane_verdict.rs`](src/lane_verdict.rs).
+
+A cucumber `-n`/`--name` or `--tags` filter on the command line replaces the
+harness's own scenario filter, so the scenarios it selects run without the
+capability gating, the opt-in sets and the expectation matrix described below,
+and the after-run GPU check does not apply. Use it to run a known scenario on a
+host that can satisfy it; use `E2E_ONLY_LIFECYCLE` with `E2E_ALSO_RUN_IDS` to
+select scenarios with the gating kept.
 
 ## Tags and per-scenario expectations
 
@@ -137,7 +168,7 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. On a lane that sets `E2E_EXPECT_GPU=1` a host with none fails the run instead; see "Lane verdict" above. |
 | `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
