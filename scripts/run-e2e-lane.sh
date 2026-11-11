@@ -145,7 +145,8 @@ export ROCM_CLI_ROCMD_BINARY="${CARGO_TARGET_DIR}/release/rocmd"
 run_channel() {
   local channel="$1"
   # The suite writes here, and a channel must not report the last one's files,
-  # even when its own preflight fails below. Returned, not ignored: the caller's `||` turns `set -e` off in here.
+  # even when its own preflight fails below. Returned, not ignored: the
+  # caller's `||` turns `set -e` off in here.
   rm -rf tests/e2e-cucumber/results || return $?
   # The first channel's preflight ran before the build. A later one runs after
   # the previous suite, which may have left a model server on the GPU, as each

@@ -9011,7 +9011,8 @@ permissions:
 
     /// What in `workflow` would route a job to the queue-report runner or make
     /// it depend on the workflow named `queue_workflow_name`: the runner's
-    /// label, the workflow's file stem, or its name. Comments do not count. The
+    /// label, the workflow's file stem, or its name. Whole-line comments do not
+    /// count (a trailing `# ...` after content does). The
     /// label and the file stems are matched as whole words (case and quotes
     /// ignored), so `queue-runner` is not `queue-run`; only the workflow's name
     /// is matched with whitespace removed too (line breaks included), so a name

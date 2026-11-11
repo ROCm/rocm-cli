@@ -110,8 +110,11 @@ about twice as long as one channel would. That time has not been measured on a
 queue lane from a cold start, so a lane that cannot finish both channels within
 the run's wait (which also covers waiting for a GPU) is reported as
 **incomplete**; the wait can be raised for a run, up to its limit (see the
-run's inputs above). Both always run, so a failing channel does not hide the
-other, and the lane fails if either did.
+run's inputs above). Each channel starts with the GPU preflight, as each
+channel's job in `nightly.yml` does, so a model server the previous channel's
+suite left on the GPU is reclaimed first; the lane log shows it. Both always
+run, so a failing channel does not hide the other, and the lane fails if either
+did.
 
 The queue's results are an additional signal, not a replacement: the lanes
 write only into the queue artifact, and the `e2e-gpu-<channel>-report`
