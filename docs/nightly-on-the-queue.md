@@ -119,9 +119,10 @@ did.
 A lane starts cold, so its first steps fetch from the network: the build
 packages, the rustup installer, the toolchain and the crates for the host
 being built. The lane command tries each of those up to four times, and never
-retries a build or a test. The pre-warm's package downloads and the suite's model downloads are left to the
-tools doing them, so a model that downloads more slowly than its scenario waits
-fails that scenario.
+retries a build or a test. The pre-warm's package downloads and the suite's
+model downloads are left to the tools doing them, so a model that downloads
+more slowly than its scenario waits fails that scenario. The lane fetches only
+the host's crates, so it refuses to start with `CARGO_BUILD_TARGET` set.
 
 The queue's results are an additional signal, not a replacement: the lanes
 write only into the queue artifact, and the `e2e-gpu-<channel>-report`
