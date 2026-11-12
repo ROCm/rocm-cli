@@ -142,8 +142,8 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
   not edit your dotfiles. So on Linux it never prompts, `--dry-run` has nothing
   to preview, and `--yes` is never read. Do not tell a Linux user a dry run
   previewed a change that was never going to happen.
-- **`fix-9-igpu-dgpu` needs `--device-index N` wherever it applies (Linux and
-  Windows) and is never marked AUTO.** Without the flag the runner just prints
+- **`fix-9-igpu-dgpu` needs `--device-index N` wherever it applies (Linux,
+  Windows and WSL) and is never marked AUTO.** Without the flag the runner just prints
   the `rocminfo`/`hipInfo` query that identifies which index is the discrete
   GPU and returns 0: no prompt, nothing for `--dry-run` to preview, nothing
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
@@ -167,7 +167,7 @@ reporting confident nonsense.
 | `fix-6-path` | linux/windows/wsl | ROCm/HIP binaries not on PATH after install | `rocminfo: command not found`, `hipInfo` missing from PATH | auto |
 | `fix-7-stale-repos` | linux | Stale/conflicting APT/DNF/zypper repos from prior installer runs | apt 404 `repo.radeon.com`, unmet deps, ≥2 ROCm repo files | print-only |
 | `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm major than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | print-only |
-| `fix-9-igpu-dgpu` | linux/windows | iGPU enumerated alongside dGPU, destabilising the runtime | APU + discrete AMD present, `HIP_VISIBLE_DEVICES` unset, crash/segfault | needs-arg |
+| `fix-9-igpu-dgpu` | linux/windows/wsl | iGPU enumerated alongside dGPU, destabilising the runtime | APU + discrete AMD present, `HIP_VISIBLE_DEVICES` unset, crash/segfault | needs-arg |
 | `fix-10-container` | linux | Container can't see `/dev/kfd` or `/dev/dri/renderD*` | running in docker/podman, kfd/render devices missing | print-only |
 | `fix-11-iommu` | linux | Multi-GPU hang with IOMMU enabled | ≥2 AMD GPUs, `iommu=` not `pt`, hang/deadlock/timeout | print-only |
 | `fix-12-installer` | linux | Repo-native package-manager install left a broken DKMS / repo state | dpkg half-configured, DKMS build failure, dpkg/apt error | print-only |
@@ -200,8 +200,8 @@ entry would leave a hole rather than renumber the ones after it.
 
 Linux-only: fix-3, -4, -5, -7, -10, -11, -12. Windows-only: fix-13, -14, -15, -21, -22.
 Linux + Windows: info-20 (diagnose-only).
-WSL-only: fix-wsl-1 through fix-wsl-7. Linux + Windows: fix-9.
-Linux + WSL: fix-16, -17, -18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8.
+WSL-only: fix-wsl-1 through fix-wsl-7.
+Linux + WSL: fix-16, -17, -18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8, -9.
 
 ## Framework routing
 

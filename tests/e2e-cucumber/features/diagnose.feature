@@ -79,11 +79,10 @@ Feature: Diagnosing failures and listing fixes
   #
   # @requires-bare-metal on top of that: the scenario needs a fix that both
   # applies here AND reaches the consent gate, and only fix-9 does that on a host
-  # with nothing installed. fix-9 does not apply on WSL2 — a single device with
-  # no topology cannot have an iGPU/dGPU collision — so there the run stops at
-  # the wrong-platform refusal before the gate is ever reached. That is designed
-  # behaviour, not a bug, so it is a skip rather than an xfail. The gate is
-  # shared code and stays covered by the mock and Linux GPU lanes.
+  # with nothing installed. fix-9 now applies on WSL2 as well, so the wrong-platform
+  # refusal no longer stops the run there, but this scenario has not been run on a
+  # WSL2 lane and stays a skip there until it has. The gate is shared code and
+  # stays covered by the mock and Linux GPU lanes.
   @id:diagnose-fix-requires-agreement-before-changing-anything @requires-os:linux @requires-bare-metal
   Scenario: diagnose-08 - A fix that changes the machine is not applied without agreement
     Given a user who has chosen a fix that would change the machine

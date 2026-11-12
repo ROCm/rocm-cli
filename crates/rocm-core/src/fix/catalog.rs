@@ -103,9 +103,9 @@ const NEEDS_DEVICE_INDEX: &[Platform] = &[
     },
 ];
 
-/// `info-20-gpu-no-rocm-support`. Not "wsl": WSL2 reports no GPU topology, so
-/// the checker that produces this id never fires there and `rocm fix` would be
-/// claiming an answer for a host it was never asked about.
+/// `info-20-gpu-no-rocm-support`. Not "wsl": the checker that produces this id
+/// does not run there, so `rocm fix` would be claiming an answer for a host it
+/// was never asked about.
 const DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS: &[Platform] = &[
     on("linux", FixClass::DiagnoseOnly),
     on("windows", FixClass::DiagnoseOnly),
