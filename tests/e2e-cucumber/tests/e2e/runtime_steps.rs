@@ -737,6 +737,13 @@ async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
 
 /// The last day the earlier (canonical) nightly stream published a build is
 /// 2026-08-22, so a pin before it can only be read from there.
+///
+/// The pin is 2026-08-19, not the 20th: the stream has no native Windows
+/// (`win_amd64`) torch, torchvision or torchaudio wheel for 2026-08-20, only
+/// Linux ones, so on a Windows host that pin finds no mutually compatible
+/// stack (the Strix Halo Windows lanes failed on it from 2026-11-12). The 19th
+/// has all four packages on both platforms for cp314, the Python this ROCm
+/// layout installs.
 #[when("the user dry-runs a nightly SDK install pinned to a build from the earlier stream")]
 async fn user_dry_runs_earlier_nightly_sdk(world: &mut E2eWorld) {
     let stdout = crate::run_rocm_ok(
@@ -749,7 +756,7 @@ async fn user_dry_runs_earlier_nightly_sdk(world: &mut E2eWorld) {
             "--family",
             "gfx1200",
             "--build-date",
-            "2026-08-20",
+            "2026-08-19",
             "--dry-run",
         ],
     );
