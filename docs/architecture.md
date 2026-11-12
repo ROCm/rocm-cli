@@ -488,7 +488,7 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs) | The chat-agent seam: the `AgentClient` trait, `AgentError`, `StateSnapshot`, `InferenceParams` and `REQUEST_TIMEOUT`. | relocation |
+| [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs) | The chat-agent seam: the `AgentClient` trait, `AgentError`, `StateSnapshot`, `InferenceParams`, and the request budget — `DEFAULT_REQUEST_TIMEOUT`, the `ROCM_DASH_CHAT_TIMEOUT_SECS` override (`REQUEST_TIMEOUT_ENV`) and the `request_timeout()` that resolves between them. | relocation |
 | [`agent/clients.rs`](../crates/rocm-dash-tui/src/agent/clients.rs) | The `AgentClient` backends: Rig (OpenAI-compatible), ChatGPT (OAuth device code), Anthropic, and the in-memory `MockAgentClient`. | relocation |
 | [`agent/snapshot.rs`](../crates/rocm-dash-tui/src/agent/snapshot.rs) | Pure JSON summaries of the cached telemetry snapshot for the agent's tools, with no `rig` dependency. | relocation |
 | [`agent/tools.rs`](../crates/rocm-dash-tui/src/agent/tools.rs) | The Rig `Tool` wrappers: the telemetry tools over the cached snapshot, the read-only and mutating ROCm tools, and their registration on an agent builder. | relocation |
