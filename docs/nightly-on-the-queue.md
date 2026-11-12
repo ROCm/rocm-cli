@@ -22,10 +22,10 @@ GPU jobs of [`nightly.yml`](../.github/workflows/nightly.yml) do (see
 way those jobs' results are: the queue runs on the same infrastructure and under
 the same access as the self-hosted runners, and neither signs what it reports.
 
-**The remaining gap is native Windows and WSL.** The queue runs Linux pods, so
-the native Windows and WSL lanes stay on their dedicated runners, in `nightly.yml`
-and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml); nothing
-here replaces them. Which checks are required before merging is a repository
+**The remaining gap is Strix Halo.** The queue has no Strix lane and runs Linux
+pods, so the Strix Halo nightlies (Ubuntu, Windows and WSL) stay on the shared Strix pool,
+in `nightly.yml` and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml);
+nothing here replaces them. Which checks are required before merging is a repository
 setting, outside this page.
 
 This page is the **contract** between this repository and the queue side: what
@@ -123,10 +123,13 @@ pre-warm's package downloads and the suite's model downloads are left to the
 tools doing them, so a model that downloads more slowly than its scenario waits
 fails that scenario.
 
-The queue's results are an additional signal, not a replacement: the lanes
-write only into the queue artifact, and the `e2e-gpu-<channel>-report`
-artifacts that `nightly.yml`'s consolidated report reads are not produced from
-them.
+The queue is the only scheduled run of the R9700, MI350P and W7900 lanes: their
+self-hosted nightly jobs were removed from `nightly.yml`. The MI300X nightly
+job is still there, and the queue's `mi300x` lane is an additional signal to it.
+The lanes write only into the queue artifact, and the
+`e2e-gpu-<channel>-report` artifacts that `nightly.yml`'s consolidated report
+reads are not produced from them, so the consolidated report and the support
+matrix no longer have rows for R9700, MI350P or W7900 Linux.
 
 ## Output
 
