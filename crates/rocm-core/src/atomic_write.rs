@@ -213,6 +213,10 @@ where
     rename(replacement, path).map_err(|retry| destination_removed_error(error, retry))
 }
 
+/// What separates a staged file's name from the name of the file it will
+/// replace: `{file name}.tmp-{suffix}`.
+const STAGED_NAME_MARKER: &str = ".tmp-";
+
 /// A temp path next to `path`, preserving the full file name so a
 /// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
 /// `sdk.tar.gz.tmp-<suffix>`, where `with_extension` would drop `.gz`).
@@ -222,9 +226,65 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
         .file_name()
         .context("file path has no file name")?
         .to_os_string();
-    file_name.push(".tmp-");
+    file_name.push(STAGED_NAME_MARKER);
     file_name.push(suffix);
     Ok(parent.join(file_name))
+}
+
+/// The name of the file a staged file named `file_name` was going to replace,
+/// or `None` when `file_name` is not a staged file's name.
+///
+/// A writer killed between staging and publishing leaves its staged file
+/// behind, and for a secret written with [`write_owner_only_file_atomically`]
+/// that file holds the secret. This lets a cleanup that removes the
+/// destination recognise those leftovers as belonging to it.
+///
+/// Only the suffix this module's own writers produce is recognised —
+/// `{pid}-{millis}-{attempt}`, three runs of digits — so a file whose name
+/// merely contains `.tmp-` is not taken for a staged one. That matters where
+/// names are chosen by someone else: the service id `a.endpoint-key.tmp-x`
+/// gives a key file named `a.endpoint-key.tmp-x.endpoint-key`, which must not
+/// read as a staged copy of service `a`'s key. Names are compared as text, so
+/// a staged file whose name is not Unicode is not recognised.
+pub fn staged_destination_name(file_name: &str) -> Option<&str> {
+    let (destination, suffix) = file_name.rsplit_once(STAGED_NAME_MARKER)?;
+    let mut parts = suffix.split('-');
+    let well_formed = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none();
+    (!destination.is_empty() && well_formed).then_some(destination)
+}
+
+/// Every staged file next to `path` that was going to replace it — what a
+/// writer killed before publishing leaves behind. Empty when there are none or
+/// the directory cannot be read.
+///
+/// A writer that is still running has its staged file listed too, so remove
+/// these only when the destination itself is being removed. Removing one under
+/// a live writer is fail-closed by design: that writer's publish then fails
+/// with an error instead of recreating a secret its owner just deleted.
+pub fn staged_siblings(path: &Path) -> Vec<PathBuf> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut staged: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(OsStr::to_str)
+                .and_then(staged_destination_name)
+                .is_some_and(|destination| OsStr::new(destination) == name)
+        })
+        .collect();
+    staged.sort();
+    staged
 }
 
 fn process_temp_id() -> String {
@@ -325,14 +385,32 @@ where
 /// holds the destination open without delete sharing. A symbolic link at
 /// `path` is replaced, not followed. See the module doc.
 pub fn write_owner_only_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = stage_owner_only_file(path, bytes)?;
+    publish_staged_file_with(&tmp, path, rename_file)
+}
+
+/// The staging half of [`write_owner_only_file_atomically`].
+fn stage_owner_only_file(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let temp_id = process_temp_id();
-    let tmp = stage_file_for_atomic_publish_with(
+    stage_file_for_atomic_publish_with(
         path,
         bytes,
         |attempt| OsString::from(format!("{temp_id}-{attempt}")),
         StagingMode::OwnerOnly,
-    )?;
-    publish_staged_file_with(&tmp, path, rename_file)
+    )
+}
+
+/// Test support: what a [`write_owner_only_file_atomically`] killed between
+/// staging and publishing leaves behind — `bytes` in an owner-only staged file
+/// next to `path`, never published. Returns the staged file's path.
+///
+/// Compiled only for this crate's tests and under the `test-support` feature,
+/// so the tests of the cleanups that must remove such leftovers start from the
+/// file a real store leaves rather than a hand-made look-alike.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn stage_owner_only_file_unpublished(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    stage_owner_only_file(path, bytes)
 }
 
 /// The file a write to `path` should replace: `path` itself, or — when it is
@@ -1638,6 +1716,82 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(names, ["a.json", "b.json"]);
+    }
+
+    /// What a writer killed before publishing leaves — a file the real staging
+    /// path names — is found as belonging to its destination, and nothing
+    /// else is: not the destination, not another file's staged copy whose
+    /// name merely starts the same way.
+    #[test]
+    fn staged_siblings_finds_the_files_staging_left_for_that_destination_only() {
+        let root = scratch_dir("staged-siblings");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("svc.endpoint-key");
+        fs::write(&destination, b"published").unwrap();
+        let staged = stage_owner_only_file_unpublished(&destination, b"secret").unwrap();
+        for unrelated in [
+            "svc.endpoint-key2.tmp-1-2-0",
+            "other-svc.endpoint-key.tmp-1-2-0",
+            "svc.endpoint-key.tmp-",
+            "svc.log",
+        ] {
+            fs::write(root.join(unrelated), b"x").unwrap();
+        }
+
+        let found = staged_siblings(&destination);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(found, [staged]);
+    }
+
+    /// The name the real owner-only staging writes is read back as its
+    /// destination's; a name that merely contains the marker is not.
+    #[test]
+    fn staged_destination_name_reads_back_only_what_staging_writes() {
+        let root = scratch_dir("staged-name");
+        let destination = root.join("svc-1.endpoint-key");
+        let staged = stage_owner_only_file_unpublished(&destination, b"secret").unwrap();
+        let name = staged.file_name().unwrap().to_str().unwrap().to_owned();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(staged_destination_name(&name), Some("svc-1.endpoint-key"));
+        assert_eq!(staged_destination_name("svc-1.endpoint-key"), None);
+        assert_eq!(staged_destination_name(".tmp-1-2-0"), None);
+        assert_eq!(staged_destination_name("svc-1.endpoint-key.tmp-"), None);
+        assert_eq!(staged_destination_name("svc-1.endpoint-key.tmp-1-2"), None);
+        assert_eq!(
+            staged_destination_name("svc-1.endpoint-key.tmp-1-2-0-3"),
+            None
+        );
+        assert_eq!(
+            staged_destination_name("svc-1.endpoint-key.tmp-1-x-0"),
+            None
+        );
+        // The key file of a service whose id itself contains the marker.
+        assert_eq!(
+            staged_destination_name("a.endpoint-key.tmp-x.endpoint-key"),
+            None
+        );
+        assert_eq!(
+            staged_destination_name("a.endpoint-key.tmp-1-2-3.endpoint-key"),
+            None
+        );
+    }
+
+    /// Cleaning up service `a`'s key must not take the live key of a service
+    /// whose id was chosen to look like a staged copy of it.
+    #[test]
+    fn staged_siblings_ignores_a_key_named_like_a_staged_copy() {
+        let root = scratch_dir("staged-adversarial");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("a.endpoint-key");
+        fs::write(&destination, b"a's key").unwrap();
+        for id in ["a.endpoint-key.tmp-x", "a.endpoint-key.tmp-1-2-3"] {
+            fs::write(root.join(format!("{id}.endpoint-key")), b"another key").unwrap();
+        }
+
+        let found = staged_siblings(&destination);
+        let _ = fs::remove_dir_all(&root);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A secret file someone loosened comes back owner-only: unlike

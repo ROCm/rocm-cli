@@ -11,8 +11,11 @@
 //! `prune_managed_service_records`) together with the age gate behind them
 //! (`DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`, `service_prune_min_age_hours`).
 //!
-//! Mechanically relocated from `main.rs` with no behavior change; see
-//! `docs/architecture.md`. This module reads record state through
+//! Mechanically relocated from `main.rs` with no behavior change at the time;
+//! see `docs/architecture.md`. Since then both commands also delete the copy
+//! of a record's endpoint key an interrupted save left beside it
+//! (`staged_endpoint_keys_by_service`), and prune sweeps such a copy whose
+//! record is gone. This module reads record state through
 //! `managed_service_status.rs` and `services_text.rs` (`load_managed_service`,
 //! `validate_service_id`) and builds its advice text with `service_hints.rs`;
 //! none of those modules depends on this one. `services_cmd.rs`'s `services()`
@@ -72,17 +75,22 @@ struct ServiceRecordArtifacts {
     log: PathBuf,
     engine_state: PathBuf,
     endpoint_key: PathBuf,
+    /// Copies of the endpoint key a store killed between staging and
+    /// publishing left beside it, found when the artifacts are listed.
+    staged_endpoint_keys: Vec<PathBuf>,
 }
 
 impl ServiceRecordArtifacts {
     /// Every artifact, in the order they are reported and deleted.
-    fn paths(&self) -> [&Path; 4] {
+    fn paths(&self) -> impl Iterator<Item = &Path> {
         [
-            &self.manifest,
-            &self.log,
-            &self.engine_state,
-            &self.endpoint_key,
+            self.manifest.as_path(),
+            self.log.as_path(),
+            self.engine_state.as_path(),
+            self.endpoint_key.as_path(),
         ]
+        .into_iter()
+        .chain(self.staged_endpoint_keys.iter().map(PathBuf::as_path))
     }
 }
 
@@ -102,10 +110,14 @@ fn validate_engine_component(engine: &str) -> Result<()> {
     Ok(())
 }
 
+/// `staged_keys` is [`staged_endpoint_keys_by_service`], taken once by the
+/// caller: `prune` builds artifacts for every record, and listing the folder
+/// per record would make the plan quadratic in the number of records.
 fn service_record_artifacts(
     paths: &AppPaths,
     service_id: &str,
     engine: &str,
+    staged_keys: &HashMap<String, Vec<PathBuf>>,
 ) -> Result<ServiceRecordArtifacts> {
     validate_service_id(service_id)?;
     validate_engine_component(engine)?;
@@ -114,7 +126,37 @@ fn service_record_artifacts(
         log: paths.service_log_path(service_id),
         engine_state: paths.service_engine_state_path(engine, service_id),
         endpoint_key: endpoint_keys::endpoint_key_file_path(paths, service_id),
+        staged_endpoint_keys: staged_keys.get(service_id).cloned().unwrap_or_default(),
     })
+}
+
+/// The service a leftover staged copy of an endpoint key belongs to: `svc` for
+/// `svc.endpoint-key.tmp-<pid>-<millis>-<attempt>`, the name a store killed
+/// between staging and publishing leaves. `None` for any other file.
+fn staged_endpoint_key_owner(file_name: &str) -> Option<&str> {
+    rocm_core::atomic_write::staged_destination_name(file_name)?.strip_suffix(".endpoint-key")
+}
+
+/// Every leftover staged endpoint-key copy in the services folder, keyed by the
+/// service it belongs to, from one listing of the folder.
+fn staged_endpoint_keys_by_service(paths: &AppPaths) -> HashMap<String, Vec<PathBuf>> {
+    let mut staged: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let Ok(entries) = fs::read_dir(paths.services_dir()) else {
+        return staged;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if let Some(owner) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(staged_endpoint_key_owner)
+        {
+            staged.entry(owner.to_owned()).or_default().push(path);
+        }
+    }
+    for copies in staged.values_mut() {
+        copies.sort();
+    }
+    staged
 }
 
 /// Delete every artifact that exists, collecting failures instead of stopping at
@@ -308,7 +350,12 @@ pub(crate) fn remove_managed_service_record_with(
         bail!("Removing local server record `{service_id}` requires --yes.\n\nTry: {hint}");
     }
 
-    let artifacts = service_record_artifacts(paths, &record.service_id, &record.engine)?;
+    let artifacts = service_record_artifacts(
+        paths,
+        &record.service_id,
+        &record.engine,
+        &staged_endpoint_keys_by_service(paths),
+    )?;
     let mut output = String::new();
     // Printed *before* the delete, because after it there is nothing left to
     // point at: this is the last moment the log path is useful.
@@ -473,19 +520,20 @@ fn describe_hours(hours: u64) -> String {
 /// managed-launch lock held, which excludes that window outright; see
 /// [`prune_managed_service_records`].
 ///
+/// A staged copy of an endpoint key (`<id>.endpoint-key.tmp-…`, left by a store
+/// killed before it published) is judged the same way, by `<id>.json`: it holds
+/// the key in plaintext, and nothing else would ever remove it.
+///
 /// `services_dir` also holds `launch.lock`, which is shared by every managed
 /// launch rather than owned by one service (see
-/// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
-/// extensions are considered, so the lock is never a candidate — including the
-/// one this sweep is itself running under.
+/// [`AppPaths::managed_launch_lock_path`]). Only the per-service extensions and
+/// staged endpoint keys are considered, so the lock is never a candidate —
+/// including the one this sweep is itself running under.
 fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
     let services_dir = paths.services_dir();
     let mut orphans = Vec::new();
 
-    let push_if_orphaned = |path: &Path, orphans: &mut Vec<PathBuf>| {
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            return;
-        };
+    let push_if_orphaned = |path: &Path, stem: &str, orphans: &mut Vec<PathBuf>| {
         if services_dir.join(format!("{stem}.json")).exists() {
             return;
         }
@@ -500,7 +548,15 @@ fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime)
                 path.extension().and_then(|value| value.to_str()),
                 Some("log" | "endpoint-key")
             ) {
-                push_if_orphaned(&path, &mut orphans);
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    push_if_orphaned(&path, stem, &mut orphans);
+                }
+            } else if let Some(stem) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(staged_endpoint_key_owner)
+            {
+                push_if_orphaned(&path, stem, &mut orphans);
             }
         }
     }
@@ -516,8 +572,10 @@ fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime)
                 continue;
             };
             for path in states.flatten().map(|entry| entry.path()) {
-                if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                    push_if_orphaned(&path, &mut orphans);
+                if path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                {
+                    push_if_orphaned(&path, stem, &mut orphans);
                 }
             }
         }
@@ -543,6 +601,7 @@ fn build_service_prune_plan(
     // `load_managed_services` refreshes each record against the engine state and
     // the real processes before returning it, so liveness below is read from the
     // refreshed view, never from the manifest as it was on disk.
+    let staged_keys = staged_endpoint_keys_by_service(paths);
     for record in load_managed_services(paths)? {
         if managed_service_record_is_in_use_with(&record, probe) {
             plan.skipped_live += 1;
@@ -568,13 +627,15 @@ fn build_service_prune_plan(
             plan.skipped.push(skipped);
             continue;
         }
-        let artifacts = match service_record_artifacts(paths, &record.service_id, &record.engine) {
-            Ok(artifacts) => artifacts,
-            Err(error) => {
-                plan.skipped.push(format!("{}: {error}", record.service_id));
-                continue;
-            }
-        };
+        let artifacts =
+            match service_record_artifacts(paths, &record.service_id, &record.engine, &staged_keys)
+            {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    plan.skipped.push(format!("{}: {error}", record.service_id));
+                    continue;
+                }
+            };
         if !prunable_by_modified(
             manifest_times.get(&artifacts.manifest).copied(),
             min_age,
@@ -1116,8 +1177,8 @@ mod tests {
         let (root, paths) = test_paths("services-remove-traversal");
         paths.ensure()?;
 
-        let by_engine = service_record_artifacts(&paths, "svc-ok", "../../../etc");
-        let by_id = service_record_artifacts(&paths, "../../etc/passwd", "vllm");
+        let by_engine = service_record_artifacts(&paths, "svc-ok", "../../../etc", &HashMap::new());
+        let by_id = service_record_artifacts(&paths, "../../etc/passwd", "vllm", &HashMap::new());
         let _ = fs::remove_dir_all(&root);
 
         assert!(
@@ -1172,6 +1233,145 @@ mod tests {
             "`rocm services prune` output must be ASCII-only; non-ASCII punctuation renders \
              as mojibake on a Windows console using the OEM code page (ROCMAI-543):\n{}",
             outcome.text
+        );
+        Ok(())
+    }
+
+    /// A store killed between staging the key and publishing it leaves a
+    /// second, plaintext copy beside the key. Removing the record takes it
+    /// too, and leaves another service's staged copy alone.
+    #[test]
+    fn services_remove_takes_a_staged_copy_of_the_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-staged-key");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-remove-me", "failed", 999_999_999)?;
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-remove-me");
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"secret")?;
+        let other_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-remove-me-too");
+        let other_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&other_key, b"other")?;
+
+        let rendered = remove_managed_service_record(&paths, "svc-remove-me", true);
+        let staged_exists = staged.exists();
+        let other_staged_exists = other_staged.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let rendered = rendered?;
+        assert!(!staged_exists, "the staged key copy must be deleted");
+        assert!(
+            other_staged_exists,
+            "another service's staged key must be left"
+        );
+        assert!(rendered.contains("  files removed: 5"), "{rendered}");
+        Ok(())
+    }
+
+    /// Pruning a record that is still on disk takes the staged key copy an
+    /// interrupted save left beside its key, as `remove` does.
+    #[test]
+    fn services_prune_takes_a_pruned_records_staged_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-record-staged-key");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-pruned", "failed", 999_999_999)?;
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-pruned");
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"secret")?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let record_exists = paths.service_manifest_path("svc-pruned").exists();
+        let staged_exists = staged.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let outcome = outcome?;
+        assert!(
+            !record_exists,
+            "premise: prune must remove the record:\n{}",
+            outcome.text
+        );
+        assert!(
+            !staged_exists,
+            "the pruned record's staged key copy must go with it:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// A staged key copy whose record is gone is an orphan like the key itself;
+    /// one whose record is still there is not.
+    #[test]
+    fn services_prune_sweeps_a_staged_endpoint_key_whose_record_is_gone() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-staged-key");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-orphaned", "failed", 999_999_999)?;
+        fs::remove_file(&record.manifest_path)?;
+        let orphan_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-orphaned");
+        let orphan_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&orphan_key, b"secret")?;
+        // A record whose server is still running keeps its staged copy: the
+        // sweep only takes what no record owns.
+        plant_service_record(&paths, "svc-kept", "ready", std::process::id())?;
+        let kept_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-kept");
+        let kept_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&kept_key, b"kept")?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let orphan_staged_exists = orphan_staged.exists();
+        let kept_staged_exists = kept_staged.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let outcome = outcome?;
+        assert!(
+            !orphan_staged_exists,
+            "the orphaned staged key must be swept:\n{}",
+            outcome.text
+        );
+        assert!(
+            kept_staged_exists,
+            "a live record's staged key must be left"
+        );
+        Ok(())
+    }
+
+    /// The sweep takes only staged endpoint-key copies: a record that was
+    /// being rewritten when its writer died leaves `<id>.json.tmp-…`, which is
+    /// not a key and is not the sweep's to judge.
+    #[test]
+    fn the_orphan_sweep_leaves_a_half_written_manifest_alone() -> Result<()> {
+        let (root, paths) = test_paths("orphans-manifest-tmp");
+        paths.ensure()?;
+        let manifest = paths.service_manifest_path("svc-mid-write");
+        let staged_manifest =
+            rocm_core::atomic_write::stage_file_for_atomic_publish(&manifest, b"{}")?;
+
+        let orphans = collect_service_orphans(&paths, Duration::ZERO, SystemTime::now());
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !orphans.contains(&staged_manifest),
+            "a staged manifest was swept: {orphans:?}"
+        );
+        Ok(())
+    }
+
+    /// A staged key copy goes through the same age gate as every other
+    /// leftover: one written just now is kept under a non-zero age, and taken
+    /// once the gate is lifted.
+    #[test]
+    fn the_age_gate_applies_to_a_staged_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("orphans-staged-key-age");
+        paths.ensure()?;
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-fresh");
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"secret")?;
+        let now = SystemTime::now();
+
+        let gated = collect_service_orphans(&paths, Duration::from_hours(24), now);
+        let ungated = collect_service_orphans(&paths, Duration::ZERO, now);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !gated.contains(&staged),
+            "a fresh staged key was swept: {gated:?}"
+        );
+        assert!(
+            ungated.contains(&staged),
+            "a staged orphan key was missed: {ungated:?}"
         );
         Ok(())
     }
@@ -1794,7 +1994,12 @@ mod tests {
         let record = plant_service_record(&paths, "svc-relaunched", "ready", std::process::id())?;
         // The entry a plan built moments earlier, while the record was still
         // stopped, would carry into the delete loop.
-        let artifacts = match service_record_artifacts(&paths, "svc-relaunched", "vllm") {
+        let artifacts = match service_record_artifacts(
+            &paths,
+            "svc-relaunched",
+            "vllm",
+            &staged_endpoint_keys_by_service(&paths),
+        ) {
             Ok(artifacts) => artifacts,
             Err(error) => {
                 let _ = fs::remove_dir_all(&root);

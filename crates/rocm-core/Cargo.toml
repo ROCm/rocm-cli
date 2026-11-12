@@ -14,9 +14,11 @@ workspace = true
 # Lets the E2E suite re-root the hardware probes under a simulated host; see
 # `src/hardware_root.rs`. Never enabled in a release build.
 e2e-test-hooks = []
-# Compiles the `foreign_temp_probe` test probe so a dependent crate's tests can
-# use it. Enabled only from a `[dev-dependencies]` entry; never in a shipped
-# build.
+# Compiles test helpers so a dependent crate's tests can use them: the
+# `foreign_temp_probe` probe, `atomic_write::stage_owner_only_file_unpublished`
+# (the leftover a killed owner-only store leaves) and, on Windows,
+# `owner_only_file::owner_only_dacl_mismatch` (reads a file's DACL back).
+# Enabled only from a `[dev-dependencies]` entry; never in a shipped build.
 test-support = []
 
 [build-dependencies]

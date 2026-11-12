@@ -1445,7 +1445,8 @@ bound by another process, it refuses and the service stays stopped
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
-its engine state file, and its endpoint key file; a running server is refused,
+its engine state file, its endpoint key file and any copy of that key an
+interrupted save left behind; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
 alone, and additionally clears leftover files whose record is already gone. A
 server counts as running while any process it recorded may be running, which on

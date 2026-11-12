@@ -61,11 +61,13 @@ pub(crate) fn endpoint_key_file_if_present(paths: &AppPaths, service_id: &str) -
     rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
 }
 
-/// Remove the stored key for `service_id`. Idempotent and best-effort: a missing
-/// file is not an error, so this is safe to call unconditionally when any service
-/// stops.
+/// Remove the stored key for `service_id`, with any staged copy a store killed
+/// before publishing left beside it. Idempotent and best-effort: a missing file
+/// is not an error, so this is safe to call unconditionally when any service
+/// stops. A store for the same service still in flight loses its staged copy
+/// and fails to publish; that is deliberate, so a cleared key stays cleared.
 pub(crate) fn clear_endpoint_api_key(paths: &AppPaths, service_id: &str) {
-    let _ = std::fs::remove_file(endpoint_key_file_path(paths, service_id));
+    rocm_engine_protocol::remove_endpoint_key_files(paths, service_id);
 }
 
 #[cfg(test)]
@@ -87,6 +89,29 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    /// A store killed between staging the key and publishing it leaves a
+    /// second copy beside the key file; clearing the key takes that copy too.
+    #[test]
+    fn clearing_a_key_removes_a_staged_copy_a_killed_store_left() {
+        let (root, paths) = temp_paths("staged-leftover");
+        store_endpoint_api_key(&paths, "svc-staged", "secret-key").unwrap();
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(
+            &endpoint_key_file_path(&paths, "svc-staged"),
+            b"secret-key",
+        )
+        .unwrap();
+
+        clear_endpoint_api_key(&paths, "svc-staged");
+        let staged_exists = staged.exists();
+        let key_exists = endpoint_key_file_path(&paths, "svc-staged").exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!key_exists, "the key file must be removed");
+        assert!(
+            !staged_exists,
+            "the staged copy of the key must be removed too"
+        );
     }
 
     #[test]
@@ -153,5 +178,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(mode, 0o600, "endpoint key file was left at {mode:o}");
         assert_eq!(stored, Some("new-key".to_owned()));
+    }
+
+    /// On Windows the stored key has a protected DACL granting only the user
+    /// who stored it, whatever the data directory hands down.
+    #[cfg(windows)]
+    #[test]
+    fn stored_key_file_has_an_owner_only_dacl() {
+        let (root, paths) = temp_paths("dacl");
+        store_endpoint_api_key(&paths, "svc-dacl", "secret-key").unwrap();
+        let mismatch = rocm_core::owner_only_file::owner_only_dacl_mismatch(
+            &endpoint_key_file_path(&paths, "svc-dacl"),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            mismatch.unwrap(),
+            None,
+            "the key file's DACL is not owner-only"
+        );
     }
 }

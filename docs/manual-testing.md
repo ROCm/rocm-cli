@@ -893,14 +893,18 @@ Expected result:
 - After a successful removal, `rocm services list --all` no longer lists the
   record, `rocm services logs <service-id>` fails, and all of
   `<data>/services/<service-id>.json`, `<data>/services/<service-id>.log`,
-  `<data>/engines/<engine>/state/<service-id>.json` and any
-  `<data>/services/<service-id>.endpoint-key` are gone.
+  `<data>/engines/<engine>/state/<service-id>.json`, any
+  `<data>/services/<service-id>.endpoint-key`, and any
+  `<data>/services/<service-id>.endpoint-key.tmp-<pid>-<millis>-<n>` (a copy
+  of the key an interrupted save left behind) are gone; the summary's
+  `files removed:` count includes that copy.
 - `<data>/services/launch.lock` is untouched — it is shared by every launch.
 - `rocm services prune --dry-run` prints the plan and removes nothing. (It still
   refreshes each record against the real processes, so a record whose server has
   since died can have its status corrected on disk; nothing is deleted.)
 - `rocm services prune` leaves running servers alone and says how many it
-  skipped, and also removes leftover engine state files whose record is gone.
+  skipped, and also removes leftover engine state files, logs, endpoint keys
+  and interrupted-save key copies whose record is gone.
 - With no age argument, a record written in the last 24 hours is left alone, and
   the output both counts it ("too recent, kept: 1") and names the flag to
   include it: `rocm services prune --any-age --yes`.
@@ -997,10 +1001,13 @@ stat -c '%a %U' <data>/services/<service-id>.endpoint-key
 
 Expected result: `600` and your user name.
 
-On native Windows `rocm serve` writes no key file today (a key-protected bind
-is refused for Lemonade there, and vLLM does not run natively), but
-`rocm remote serve <machine> <model>` stores its session key the same way.
-From PowerShell, after it reports the endpoint:
+On native Windows a key-protected `rocm serve` has no engine that can run
+behind it: Lemonade refuses a key-protected bind there, vLLM does not run
+natively, and `--engine aim` stores the key but then cannot start, because
+rocm-cli supports AIM GPU passthrough only on Linux and WSL and AIM serves
+only on a GPU. `rocm remote serve <machine> <model>`
+stores its session key with the same owner-only file, so check that one. From
+PowerShell, after it reports the endpoint:
 
 ```powershell
 icacls <data>\remote-sessions\<session-id>.endpoint-key

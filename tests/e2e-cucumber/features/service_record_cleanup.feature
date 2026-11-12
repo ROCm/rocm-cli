@@ -11,6 +11,12 @@ Feature: Local server record cleanup
   # workaround — is what orphans the rest, so these scenarios assert on all of
   # them rather than on the command's own summary line.
   #
+  # A save of the endpoint key that was killed part-way can also leave a second
+  # copy of the key beside it (`<id>.endpoint-key.tmp-<pid>-<millis>-<attempt>`,
+  # the shared atomic writer's staged file). It holds the key in plaintext, so
+  # removing a record deletes and counts it, and prune sweeps one whose record
+  # is gone. service-cleanup-01 and -03 plant one.
+  #
   # A new feature file rather than appended scenarios: `feature_naming.rs`
   # requires per-file indexes to be sequential in declaration order, so an
   # appended scenario must claim its file's *next* index, and several open
@@ -20,9 +26,12 @@ Feature: Local server record cleanup
   @id:service-cleanup-removes-every-file-a-record-owns
   Scenario: service-cleanup-01 - Removing a stopped record deletes every file it owns
     Given a local server record that is no longer running
+    And an interrupted save left a second copy of that server's API key
     When the user removes that local server record
     Then the CLI names the log file before deleting it
     And every file belonging to that record is gone
+    And the second copy of that server's API key is gone
+    And the CLI counts that copy among the files it removed
     And the shared launch lock is still there
     And the record no longer appears in the full list
 
@@ -37,12 +46,15 @@ Feature: Local server record cleanup
   Scenario: service-cleanup-03 - Pruning previews first, then sweeps leftover engine state
     Given a local server record that is no longer running
     And an engine state file whose local server record was deleted by hand
+    And an interrupted save left a copy of the API key of the record deleted by hand
     When the user previews a prune of every record that is not running
     Then the preview lists the record and the leftover file
+    And the preview lists the leftover copy of the API key
     And every file belonging to that record is still there
     When the user prunes every record that is not running
     Then every file belonging to that record is gone
     And the leftover engine state file is gone
+    And the leftover copy of the API key is gone
 
   # The age rule only helps if the way past it is discoverable. A user who ran
   # `prune`, saw nothing happen and read the summary has to be able to act on
