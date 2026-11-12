@@ -112,6 +112,8 @@ jobs:
       windows: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Filter changed paths (pull requests only)
         id: filter
@@ -179,10 +181,11 @@ jobs:
               # file-type-filter gap must still run that test on the PR.
               - '.pre-commit-config.yaml'
               - '.github/workflows/**'
-            # build-and-test runs cargo AND the python/shell smoke steps plus the
-            # install-lifecycle E2E (`cargo xtask package` + the real installer),
-            # so it depends on the Rust set, the packaging xtask, the lifecycle
-            # feature/steps, and the installer inputs.
+            # build-and-test runs cargo, the smoke gate and the remaining
+            # python/shell self-tests, plus the install-lifecycle E2E (`cargo
+            # xtask package` + the real installer), so it depends on the Rust
+            # set, the packaging xtask, the lifecycle feature/steps, and the
+            # installer inputs.
             heavy:
               - '**/*.rs'
               - '**/Cargo.toml'
@@ -272,6 +275,7 @@ jobs:
         with:
           # Need the PR range to read its commit messages.
           fetch-depth: 0
+          persist-credentials: false
       - name: Warn on referenced bugs that still have xfail rows
         # Title/body are passed via env (never interpolated into the shell) so a
         # crafted PR description can't inject commands.
@@ -362,6 +366,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install native build deps
         if: needs.changes.outputs.heavy == 'true'
@@ -436,7 +442,7 @@ jobs:
             disable
           fi
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.heavy == 'true'
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
@@ -466,7 +472,7 @@ jobs:
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
-        run: python scripts/smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       - name: Acceptance harness self-tests
         if: needs.changes.outputs.heavy == 'true'
@@ -499,9 +505,20 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
 
+      - name: Nightly canary self-test
+        if: needs.changes.outputs.heavy == 'true'
+        run: python scripts/nightly_canary.py --self-test
+
       - name: Pinned key consistency check
         if: needs.changes.outputs.heavy == 'true'
         run: cargo xtask verify-pinned-keys
+
+      # Hermetic: a signed local bundle and a stub `rocm`, no network and no
+      # GPU, so a fish-profile regression fails in this fast step instead of
+      # only inside a full release install.
+      - name: Installer fish profile checks
+        if: needs.changes.outputs.heavy == 'true'
+        run: sh tests/install-sh/run.sh
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
@@ -557,12 +574,13 @@ jobs:
           # base history and the real PR head (not the synthetic merge ref).
           fetch-depth: 0
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          persist-credentials: false
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.rust == 'true'
         with:
           # Keep the PR (subset) and push/merge (`--workspace`) builds in separate
@@ -575,7 +593,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: nextest
 
@@ -586,8 +604,8 @@ jobs:
           # The `cargo xtask` alias builds xtask in release (target/release), so
           # computing the selection doesn't perturb the debug feature resolution
           # the nextest build below uses.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            sel=$(cargo xtask affected --base "origin/${{ github.base_ref }}")
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            sel=$(cargo xtask affected --base "origin/${GITHUB_BASE_REF}")
           else
             sel="--workspace"
           fi
@@ -620,7 +638,11 @@ jobs:
         # fields and the distro name, in
         # `os_release_reads_follow_the_simulated_host_root` and, for the
         # `/usr/lib/os-release` fallback, in
-        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`). The other routed
+        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`), and the
+        # driver-presence reads `/sys/class/kfd/kfd`, `/dev/kfd` and
+        # `/sys/bus/pci/drivers/amdgpu` (`kfd_present_on_host`,
+        # `amdgpu_present_on_host`, `driver_states` and the three
+        # `probe_modules_reports_*` tests). The other routed
         # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
         # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
         # ROCDXG checks) have no planted-root unit assertion; they are covered
@@ -685,6 +707,8 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
       # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
@@ -744,7 +768,7 @@ jobs:
           }
           exit 0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
@@ -797,7 +821,7 @@ jobs:
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: python .\scripts\smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       # One command per step: pwsh carries on past a failing native command and
       # the step reports only the last command's exit code, so a multi-line
@@ -859,6 +883,8 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
       # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
@@ -918,7 +944,7 @@ jobs:
           }
           exit 0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
@@ -1141,8 +1167,10 @@ jobs:
       && needs.changes.outputs.heavy == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -1241,9 +1269,11 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # cargo-fmt hook needs rustfmt (no build).
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           components: rustfmt
           cache: false
@@ -1295,6 +1325,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Docker and the OpenSSH client are both present on the hosted Ubuntu
       # images; jq is the only extra, and only for asserting on JSON contracts.
@@ -1308,7 +1340,7 @@ jobs:
       # other cargo job in this workflow uses. Without it this lane builds the
       # whole workspace cold against a different compiler from the rest of CI,
       # inside a 30-minute timeout.
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -1356,6 +1388,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
       # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
@@ -1402,7 +1436,7 @@ jobs:
             disable
           fi
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.rust == 'true'
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
@@ -1441,33 +1475,13 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask eval-fixtures --check
 
-      # Advisory for now. `cargo xtask check-module-size` is strict on its own;
-      # only this step is non-blocking. `continue-on-error` keeps the job green
-      # while the warning annotation and the job summary list the offenders. When
-      # files are over the limit the step itself shows as failed (red) in the
-      # job's step list, because it ends in `exit 1`, while the job and the check
-      # stay green: that is the advisory phase, not a failure to chase.
-      # Making the limit blocking means deleting `continue-on-error` and the
-      # capture below, leaving the bare command.
-      - name: Source files are within the module-size limit (advisory)
+      # Blocking: a source file over the limit fails this job, which is a required
+      # check. `merge_group` runs it too (`changes` forces `rust` on every event
+      # but a pull request), so two PRs that each pass alone cannot together
+      # push a file over the limit.
+      - name: Source files are within the module-size limit
         if: needs.changes.outputs.rust == 'true'
-        continue-on-error: true
-        run: |
-          report="$RUNNER_TEMP/module-size.txt"
-          if cargo xtask check-module-size > "$report" 2>&1; then
-            cat "$report"
-          else
-            cat "$report"
-            echo "::warning title=Module size (advisory)::$(sed 's/%/%25/g' "$report" | tr '\n' ' ')"
-            {
-              echo '### Source files over the module-size limit (advisory)'
-              echo
-              echo '```'
-              cat "$report"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
+        run: cargo xtask check-module-size
 
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
@@ -1487,8 +1501,10 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.tpn == 'true'
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
@@ -1536,6 +1552,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install native build deps
         if: needs.changes.outputs.rust == 'true'
@@ -1548,7 +1566,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-llvm-cov
 
@@ -1592,8 +1610,10 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: needs.changes.outputs.lint == 'true'
 
       - name: Install PSScriptAnalyzer (PowerShell 7)
@@ -1650,6 +1670,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.skills == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The `skillscope` step below names skills/rocm-doctor explicitly, so a
       # third skills/<name>/ folder added later would pass this job green
@@ -1718,6 +1740,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Cache hawkeye binary
         id: cache-hawkeye
@@ -1754,6 +1778,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check markdown links
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
@@ -1774,6 +1800,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.docs == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Cache pip packages
         id: cache-pip
@@ -1817,8 +1845,9 @@ jobs:
           # so these are normal commits that preserve their Signed-off-by trailer
           # and are GitHub "Verified" (web-flow signed).
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -1881,6 +1910,8 @@ jobs:
           || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Whether the real work runs this time. On push/PR/merge_group: only when
       # `clippy` passed, build-and-test ran to a verdict, and the change is
@@ -1927,7 +1958,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         if: steps.gate.outputs.run == 'true'
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
@@ -2001,8 +2032,10 @@ jobs:
         || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.

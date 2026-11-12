@@ -41,7 +41,7 @@ use crate::engine_install_env::{
 };
 use crate::engine_ipc::{engine_request, engine_request_with_env_root};
 use crate::engine_runtime_select::{
-    apply_app_path_env, resolve_engine_selection, resolve_runtime_selector_to_exact_key,
+    resolve_engine_selection, resolve_runtime_selector_to_exact_key,
     validate_engine_selection_runtime,
 };
 use crate::runtime_install_finalize::{
@@ -469,7 +469,7 @@ fn engine_shell(
         .env("ROCM_CLI_ENV_ID", &resolved.env_id)
         .env("ROCM_CLI_RUNTIME_ID", &resolved.runtime_id)
         .env("ROCM_CLI_PYTHON", &resolved.python_executable);
-    apply_app_path_env(&mut command, &paths);
+    paths.apply_env(&mut command);
 
     let prompt = format!("(rocm:{engine}) ");
     let mut prompt_marked = false;

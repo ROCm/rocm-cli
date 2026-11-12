@@ -28,16 +28,16 @@
 //! `parse_device_policy`, `parse_gpu_selection`,
 //! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
 //! and `validate_pinned_gpu_index` moved out of `main.rs` into
-//! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); `resolve_engine_selection` and
+//! `gpu_policy.rs`; `resolve_engine_selection` and
 //! `validate_engine_selection_runtime` moved out of `main.rs` into
-//! `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this file's `use`
+//! `engine_runtime_select.rs`; this file's `use`
 //! list below points to both now instead of at the crate root. The
 //! managed-service-spawning tail this file calls into — `start_managed_service`,
 //! `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,
 //! `drop_orphaned_endpoint_key_on_already_running`, `print_managed_launch_plain`,
 //! `validate_bind_host`, `ensure_background_helper_running_quiet` — was relocated
-//! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
+//! to `service_launch.rs`, along with its test module;
 //! this file's `use` list below points there now instead of at the crate root.
 
 use anyhow::{Context as _, Result, bail};
@@ -1660,6 +1660,94 @@ mod tests {
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
             "Qwen3-4B-Instruct-2507-GGUF"
+        );
+    }
+
+    #[test]
+    fn serve_small_assistant_resolves_the_gguf_build_on_lemonade() {
+        // The small assistant recipe is published as safetensors under its
+        // canonical id and as GGUF under a companion repo. Lemonade can only
+        // serve the latter, and only with a quantization variant pinned, so
+        // every way of naming the recipe has to arrive at that ref.
+        for model in [
+            "qwen2.5",
+            "qwen2.5-1.5b",
+            "qwen2.5-1.5b-instruct",
+            "qwen-small",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        ] {
+            let recipe = resolve_builtin_model_recipe(model)
+                .unwrap_or_else(|| panic!("{model} resolves to a recipe"));
+            // With no engine named and no GPU family preferring one, automatic
+            // selection follows the recipe. A host whose family prefers vLLM
+            // takes the earlier branch in `select_serve_engine` and is not
+            // covered here; the ref each engine resolves to is, below.
+            assert_eq!(
+                select_serve_engine(None, None, Some(&recipe), None),
+                ServeEngineSelection {
+                    engine: "lemonade".to_owned(),
+                    source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+                },
+                "{model}"
+            );
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "lemonade"),
+                "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M",
+                "{model}"
+            );
+            // vLLM keeps the safetensors repo the canonical id names.
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "vllm"),
+                "Qwen/Qwen2.5-1.5B-Instruct",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_lemonade_catalog_recipe_resolves_to_a_servable_ref() {
+        // Lemonade passes a Hugging Face `owner/repo` through untouched, and the
+        // engine then refuses it without a `:variant` -- on Windows from inside
+        // the detached engine process, where the user never sees the reason. The
+        // catalog is what has to supply the variant, so no recipe that lists
+        // Lemonade may resolve to a bare `owner/repo`. A bare registry name (no
+        // `/`) is a Lemonade model id, not a Hugging Face repo, and is fine.
+        //
+        // Scope: recipes that list Lemonade, and only those. Lemonade can still
+        // be reached for a recipe that does not -- an explicit `--engine
+        // lemonade`, a configured `default_engine`, or the platform default when
+        // nothing else fits -- and that recipe is handed its canonical id, which
+        // is what a recipe with no Lemonade build should get. Refusing a bare
+        // ref before the engine starts is the other half of that, and is not
+        // this test's job.
+        let offenders = rocm_core::builtin_model_recipes()
+            .into_iter()
+            .filter(|recipe| model_recipe_supports_engine(recipe, "lemonade"))
+            .map(|recipe| {
+                let resolved = serve_model_ref_for_engine(
+                    &recipe.canonical_model_id,
+                    Some(&recipe),
+                    "lemonade",
+                );
+                (recipe.canonical_model_id, resolved)
+            })
+            .filter(|(_, resolved)| {
+                // A trailing `:` is as unservable as no colon at all, so the
+                // variant has to be there, not merely the separator.
+                resolved.contains('/')
+                    && resolved
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.split_once(':'))
+                        .is_none_or(|(_, variant)| variant.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "these recipes hand Lemonade a Hugging Face repo with no `:variant`, which the \
+             engine refuses after it has already been launched; give each one a lemonade \
+             engine_recipes entry whose model_id_override names the GGUF repo and variant: \
+             {offenders:?}"
         );
     }
 

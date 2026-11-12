@@ -47,7 +47,7 @@ mod torch_alignment;
 
 use torch_alignment::{
     TorchAlignment, TorchRetention, classify_retained_torch, deliberately_diverged_package,
-    report_torch_alignment, report_torch_retention, retained_diverged_package,
+    diverged_packages, report_torch_alignment, report_torch_retention, retained_diverged_package,
     runtime_library_paths_for_key, runtime_python_for_key, sdk_torch_build_for_key,
 };
 
@@ -58,6 +58,11 @@ pub(crate) struct SdkInstallFinalization {
     family: String,
     pub(crate) previous_runtime_key: Option<String>,
     services: runtime_services::RuntimeServiceReconciliation,
+    /// The Python the installed runtime was built on, for a ROCm 10+ runtime and
+    /// `None` for any other (see [`therock::recorded_python_version`]). Read from
+    /// the installed manifest rather than the `--python-version` text, so a ROCm 7
+    /// install that was handed a redundant `3.12` is not mistaken for a moved one.
+    sdk_python_version: Option<&'static str>,
 }
 
 pub(crate) fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
@@ -117,6 +122,27 @@ impl SdkInstallConsents {
     }
 }
 
+/// Why `engine` cannot be installed onto a ROCm 10+ SDK runtime built on
+/// `sdk_python_version` (`rocm install sdk --python-version`), or `None` when it can
+/// (including `None` for a runtime of any other layout).
+///
+/// Only vLLM has a Python of its own: for ROCm 10 it is published for
+/// [`therock::NEXT_MANAGED_PYTHON_VERSION`] alone, so installing it onto a runtime
+/// the user moved off that Python would fail. The line names the flag that clears
+/// the condition: repeating the install with that Python moves the runtime back.
+fn engine_skipped_for_sdk_python(engine: &str, sdk_python_version: Option<&str>) -> Option<String> {
+    let version = sdk_python_version?;
+    if engine != "vllm" || version == therock::NEXT_MANAGED_PYTHON_VERSION {
+        return None;
+    }
+    Some(format!(
+        "note: vLLM for ROCm 10 needs Python {}, and this runtime uses Python {version}; \
+         re-run this `rocm install sdk` with --python-version {} to move it there and install vLLM",
+        therock::NEXT_MANAGED_PYTHON_VERSION,
+        therock::NEXT_MANAGED_PYTHON_VERSION
+    ))
+}
+
 pub(crate) fn maybe_auto_install_sdk_preferred_engine(
     paths: &AppPaths,
     finalized: &SdkInstallFinalization,
@@ -133,6 +159,11 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
     );
     println!("  engine: {engine}");
     println!("  runtime_id: {}", finalized.runtime_key);
+    if let Some(note) = engine_skipped_for_sdk_python(engine, finalized.sdk_python_version) {
+        println!("  status: skipped");
+        println!("  {note}");
+        return Ok(());
+    }
 
     ensure_openmpi_for_vllm(approved)?;
 
@@ -164,7 +195,7 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
                 &finalized.runtime_key,
                 // The engine install failed, so no alignment ran and any
                 // divergence found here is a real one.
-                None,
+                &[],
             );
             return Err(error);
         }
@@ -245,9 +276,9 @@ fn report_engine_dependency_check(
     engine: &str,
     python: Option<&Path>,
     runtime_key: &str,
-    realigned_package: Option<&str>,
+    diverged: &[&str],
 ) {
-    let outcome = engine_dependency_check(paths, engine, python, realigned_package);
+    let outcome = engine_dependency_check(paths, engine, python, diverged);
     print!("{}", render_engine_dependency_check(engine, &outcome));
     let (level, message) = match &outcome {
         EngineDependencyCheck::Satisfied => (
@@ -764,7 +795,13 @@ pub(crate) fn settle_engine_install(
             (retained_diverged_package(&retention), probed)
         }
     };
-    report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
+    report_engine_dependency_check(
+        paths,
+        engine,
+        Some(python),
+        runtime_key,
+        &diverged_packages(diverged, rocm_core::torch_alignment_disabled()),
+    );
     let devices = report_runtime_device_check(paths, engine, runtime_key, devices);
 
     // Only a runtime that cannot serve raises the question the host answers, so
@@ -792,7 +829,7 @@ fn engine_dependency_check(
     paths: &AppPaths,
     engine: &str,
     python: Option<&Path>,
-    realigned_package: Option<&str>,
+    diverged: &[&str],
 ) -> EngineDependencyCheck {
     let Some(python) = python else {
         return EngineDependencyCheck::NotVerified(
@@ -806,7 +843,7 @@ fn engine_dependency_check(
                 .iter()
                 .map(|violation| violation.detail.clone())
                 .collect();
-            classify_dependency_details(details, realigned_package)
+            classify_dependency_details(details, diverged)
         }
         Err(error) => EngineDependencyCheck::NotVerified(error.to_string()),
     }
@@ -819,25 +856,25 @@ fn engine_dependency_check(
 /// and must not drag it along. Lumping the two together loses the distinction
 /// exactly where it matters most — the remedy for the genuine violation would
 /// reinstall the engine and undo the alignment.
-fn classify_dependency_details(
-    details: Vec<String>,
-    realigned_package: Option<&str>,
-) -> EngineDependencyCheck {
+fn classify_dependency_details(details: Vec<String>, diverged: &[&str]) -> EngineDependencyCheck {
     if details.is_empty() {
         return EngineDependencyCheck::Satisfied;
     }
-    let Some(package) = realigned_package else {
+    if diverged.is_empty() {
         return EngineDependencyCheck::Violated {
             violations: details,
             expected: Vec::new(),
         };
-    };
+    }
     // A line whose subject cannot be parsed is not evidence of a divergence, so it
     // stays a violation: the conservative side keeps saying something is wrong.
     let (expected, violations): (Vec<String>, Vec<String>) =
         details.into_iter().partition(|detail| {
-            rocm_core::violation_subject(detail)
-                .is_some_and(|subject| subject.package.eq_ignore_ascii_case(package))
+            rocm_core::violation_subject(detail).is_some_and(|subject| {
+                diverged
+                    .iter()
+                    .any(|package| subject.package.eq_ignore_ascii_case(package))
+            })
         });
     if violations.is_empty() {
         EngineDependencyCheck::ExpectedDivergence(expected)
@@ -901,7 +938,7 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
             // the two this is, the block above has already said.
             let _ = writeln!(
                 output,
-                "  action: none; this torch is kept on purpose (see torch_alignment above)"
+                "  action: none; this torch stack is kept on purpose (see torch_alignment above)"
             );
         }
     }
@@ -964,6 +1001,7 @@ pub(crate) fn finalize_successful_sdk_install(
 
     Ok(Some(SdkInstallFinalization {
         runtime_key: activation.runtime_key,
+        sdk_python_version: therock::recorded_python_version(&manifest),
         install_root: manifest.install_root,
         family: manifest.family,
         previous_runtime_key: activation.previous_runtime_key,
@@ -1119,7 +1157,7 @@ pub(crate) mod tests {
             vec![
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
             ],
-            Some("torch"),
+            &["torch"],
         );
 
         assert!(matches!(
@@ -1145,7 +1183,7 @@ pub(crate) mod tests {
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
                 "The package `vllm` requires `numpy==1.26.4`, but `2.0.0` is installed".to_owned(),
             ],
-            Some("torch"),
+            &["torch"],
         );
 
         let EngineDependencyCheck::Violated {
@@ -1176,7 +1214,7 @@ pub(crate) mod tests {
         // the divergence was intended, so it must not be quietly excused.
         let outcome = classify_dependency_details(
             vec!["something uv said that this parser does not recognise".to_owned()],
-            Some("torch"),
+            &["torch"],
         );
 
         assert!(matches!(outcome, EngineDependencyCheck::Violated { .. }));
@@ -1317,6 +1355,7 @@ pub(crate) mod tests {
             family: "gfx94X-dcgpu".to_owned(),
             previous_runtime_key: None,
             services: runtime_services::RuntimeServiceReconciliation::default(),
+            sdk_python_version: None,
         }
     }
 
@@ -1334,6 +1373,51 @@ pub(crate) mod tests {
             |_, _| outcome,
         );
         (result, finalized)
+    }
+
+    /// vLLM is the one engine with a Python of its own: for ROCm 10 it exists for 3.14
+    /// only, so an SDK the user moved off 3.14 cannot take it. The note names the
+    /// command that clears the condition, and every other row has no note.
+    #[test]
+    fn engine_is_skipped_only_for_vllm_on_an_sdk_moved_off_the_vllm_python() {
+        let note = engine_skipped_for_sdk_python("vllm", Some("3.12"))
+            .expect("vLLM cannot be installed onto a Python 3.12 ROCm 10 runtime");
+        assert!(
+            note.contains("--python-version 3.14") && note.contains("Python 3.14"),
+            "{note}"
+        );
+        assert_eq!(engine_skipped_for_sdk_python("vllm", Some("3.14")), None);
+        assert_eq!(engine_skipped_for_sdk_python("vllm", None), None);
+        assert_eq!(
+            engine_skipped_for_sdk_python("lemonade", Some("3.12")),
+            None
+        );
+    }
+
+    /// The note is a promise that the engine install does not run, so the entry
+    /// point is held to it: on a vLLM family and a runtime on 3.12 it returns
+    /// without an engine request, which would otherwise fail here (no engine
+    /// binary exists in this test).
+    ///
+    /// Native Windows never prefers vLLM (`preferred_serve_engine_for_host_gpu_summary`),
+    /// so the skip path is unreachable there and the precondition below cannot hold.
+    #[cfg_attr(
+        windows,
+        ignore = "vLLM is never the preferred engine on native Windows"
+    )]
+    #[test]
+    fn auto_install_skips_vllm_on_an_sdk_moved_off_its_python() {
+        let (_root, paths) = test_paths("auto-engine-skipped-for-python");
+        let finalized = SdkInstallFinalization {
+            sdk_python_version: Some("3.12"),
+            ..sdk_install_finalization()
+        };
+        assert_eq!(
+            preferred_engine_for_sdk_family(&finalized.family),
+            Some("vllm")
+        );
+        maybe_auto_install_sdk_preferred_engine(&paths, &finalized, false)
+            .expect("the engine install is skipped, not attempted");
     }
 
     #[test]
@@ -1547,7 +1631,7 @@ pub(crate) mod tests {
         // than fall through to `satisfied`.
         let (root, paths) = test_paths("engine-dependency-no-python");
 
-        let outcome = engine_dependency_check(&paths, "vllm", None, None);
+        let outcome = engine_dependency_check(&paths, "vllm", None, &[]);
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(

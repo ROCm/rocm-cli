@@ -1167,8 +1167,10 @@ mod tests {
     /// `running`, and there is no process or listener behind it. That status
     /// string is the whole of what decides the count — this path never consults
     /// a pid and never probes the port, and the on-disk view it deserializes
-    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
-    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) does carry pid fields
+    /// now, for the daemon's process attribution. Discovery on this path derives
+    /// ancestry roots from them too, but the count asserted here comes from the
+    /// record's status string alone and never reads a pid. Asserting 0 is asserting that no refresh happens on this path —
     /// if someone later adds one, this test fails and they are pointed at the
     /// doc comment explaining the trade-off rather than silently flipping a
     /// launch-time read into network I/O.

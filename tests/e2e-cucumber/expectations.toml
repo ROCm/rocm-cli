@@ -48,6 +48,12 @@
 # The rows keep their all-hosts scope until the scenarios get a managed runtime or
 # are gated on the engine and the rows are narrowed to the real bug; their reasons
 # name both shapes so neither becomes a false claim.
+#
+# Looking forward rather than back, and not yet observed on any lane: the catalog
+# now gives `qwen2.5` a per-engine model id, so the name lemonade prints is
+# expected to become `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M` while vLLM keeps
+# `Qwen/Qwen2.5-1.5B-Instruct`. The two differing is by design, which is why
+# serve-02 asks each engine to expand the alias rather than to agree on a name.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
@@ -56,7 +62,7 @@ reason = "A vLLM serve of a short name shows no expanded full model name: it eit
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
+reason = "A serve of a short name does not show the full model name the engine will serve: vLLM either stops before printing a serve plan or prints the alias unexpanded, and the lemonade half is only reached once that stops happening."
 
 # ROCMAI-898 tracks multiple Strix Halo Ubuntu Lemonade serve signatures (first
 # tracked as GitHub issue ROCm/rocm-cli#897, since closed; ROCMAI-898 is the open
@@ -116,10 +122,30 @@ reason = "Lemonade managed serve never exposes the model, so the Anthropic reque
 serve_timeout_secs = 90
 flaky = true
 
+[["serve-anthropic-messages-tool-use"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the tool-use request never gets an answer."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-messages-tool-use"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7223"
+reason = "The served vLLM model is started without a tool-call parser, so it rejects a request that names a tool; the endpoint relays that refusal."
+serve_timeout_secs = 90
+
 [["serve-anthropic-endpoint-readiness"]]
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model, so readiness never covers the Anthropic endpoint."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-messages-streaming"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the streaming Anthropic request never gets an answer."
 serve_timeout_secs = 90
 flaky = true
 
@@ -233,3 +259,13 @@ reason = "Lemonade 11.5.1 fetches TheRock only from repo.amd.com/rocm/tarball/, 
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-900"
 reason = "The Windows large-model serve crashes in the SDK's Tensile library on the first inference request; the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
+
+# Scoped to native Linux Strix Halo, the only place it has been seen (evidence is
+# in the tracking issue); `is_wsl = false` keeps WSL2, which also reports
+# `os = "linux"` on gfx1151, out of it, so a WSL host that gains Docker and passes
+# the scenario is not an XPASS. A host without Docker skips the scenario before
+# this row applies.
+[["serve-aim-lifecycle-parity"]]
+when = { os = "linux", is_wsl = false, therock_family = "gfx1151*", has_amd_gpu = true }
+bug = "rocm-cli#1058"
+reason = "Stopping a running AIM service on Strix Halo Ubuntu reports `Local server stop not confirmed` (exit 1); the serve itself works."

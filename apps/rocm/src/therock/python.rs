@@ -35,7 +35,7 @@ const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 
 /// Interpreter `uv` provisions for a [`SourceLayout::Next`] install. See
 /// [`python_requirement`] for why this differs from the canonical default.
-const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
+pub(crate) const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
 
 #[derive(Debug, Clone)]
 pub(super) struct WheelCompatibility {
@@ -212,8 +212,30 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// `config.json` for the managed-Python step, failing with what was left
+/// alone and how to recover (the advice comes from [`RocmCliConfig::load`]).
+fn load_config_for_managed_python(paths: &AppPaths) -> Result<RocmCliConfig> {
+    RocmCliConfig::load(paths).with_context(|| {
+        format!(
+            "cannot record the managed Python in {} because that file cannot be read; it was \
+             left unchanged",
+            paths.config_path().display()
+        )
+    })
+}
+
+/// Record the managed interpreter under `tools.python` in `config.json`.
+///
+/// A `config.json` that exists but cannot be read is an error here, as it is
+/// for [`RocmCliConfig::load`] itself: it is not "no config yet", and saving
+/// over it would replace the user's active runtime, TheRock folder, providers
+/// and preferences with defaults. The callers fail rather than skip the
+/// record: the install cannot finish against that file anyway (activating the
+/// new runtime loads it strictly). `ensure_managed_python` checks the file
+/// before it downloads anything, so this only fails there when the file
+/// changed meanwhile.
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
-    let mut config = RocmCliConfig::load(paths).unwrap_or_default();
+    let mut config = load_config_for_managed_python(paths)?;
     config.tools.insert(
         "python".to_owned(),
         ManagedToolConfig {
@@ -244,8 +266,8 @@ fn managed_python_bootstrap_disabled() -> bool {
 /// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PythonRequirement {
-    tag: &'static str,
-    version: &'static str,
+    pub(super) tag: &'static str,
+    pub(super) version: &'static str,
 }
 
 /// The interpreter required to install from `layout`.
@@ -253,11 +275,12 @@ pub(super) struct PythonRequirement {
 /// Keyed on the layout rather than on a resolved ROCm version because the
 /// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
 /// wheels using the interpreter's own tags, so the resolved version is not
-/// available yet. The layout is an honest stand-in only when it was decided
-/// from an explicit stable pin (`next_layout_requested`); a fresh install with
-/// no pin, or a nightly build-date/prerelease pin, needs
-/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
-/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+/// available yet. For a request routed to the next layout (`layout_serving`:
+/// no pin, a stable ROCm 10+ pin, or a nightly built since the next layout began)
+/// the layout is an honest stand-in. A pin routed to the canonical stream can
+/// still resolve a ROCm 10+ build there (the earlier nightly stream carries ROCm
+/// 10 alphas), so [`canonical_auto_select_needs_next_python`] checks that feed's
+/// own listing for a build at or past [`THEROCK_NEXT_MIN_MAJOR`].
 ///
 /// [`canonical_auto_select_needs_next_python`]: super::canonical_auto_select_needs_next_python
 /// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR
@@ -271,6 +294,88 @@ pub(super) const fn python_requirement(layout: SourceLayout) -> PythonRequiremen
             tag: "cp312",
             version: DEFAULT_MANAGED_PYTHON_VERSION,
         },
+    }
+}
+
+/// The CPython versions a ROCm 10+ install can run on when nothing needs vLLM:
+/// the SDK device wheels are `py3-none` and the torch stack is published for
+/// each of these. [`NEXT_MANAGED_PYTHON_VERSION`] stays the default because
+/// vLLM, flash-attn and amd-aiter for ROCm 10 exist for it alone.
+const NEXT_SDK_PYTHONS: [PythonRequirement; 5] = [
+    PythonRequirement {
+        tag: "cp310",
+        version: "3.10",
+    },
+    PythonRequirement {
+        tag: "cp311",
+        version: "3.11",
+    },
+    PythonRequirement {
+        tag: "cp312",
+        version: "3.12",
+    },
+    PythonRequirement {
+        tag: "cp313",
+        version: "3.13",
+    },
+    PythonRequirement {
+        tag: "cp314",
+        version: NEXT_MANAGED_PYTHON_VERSION,
+    },
+];
+
+/// The interpreter `layout` requires when the user asked for `version`
+/// (`rocm install sdk --python-version`).
+///
+/// Only a [`SourceLayout::Next`] install has a choice; the canonical stream is
+/// published for one interpreter, so naming anything else for it is refused
+/// instead of ignored.
+pub(super) fn python_requirement_for_version(
+    layout: SourceLayout,
+    version: &str,
+) -> Result<PythonRequirement> {
+    let version = version.trim();
+    match layout {
+        SourceLayout::Next => NEXT_SDK_PYTHONS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.version == version)
+            .with_context(|| {
+                let supported = NEXT_SDK_PYTHONS
+                    .iter()
+                    .map(|candidate| candidate.version)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "--python-version {version} is not one ROCm 10 and newer is published for; use one of {supported}"
+                )
+            }),
+        SourceLayout::Canonical => {
+            let required = python_requirement(layout);
+            if version == required.version {
+                return Ok(required);
+            }
+            bail!(
+                "--python-version applies only to ROCm 10 and newer installs; this install uses Python {}",
+                required.version
+            )
+        }
+    }
+}
+
+/// The requirement a runtime installed from `layout` was built for, read from
+/// the wheel `tag` of the interpreter it recorded. `None` for a tag the layout
+/// is not published for, so the caller falls back to the layout's default.
+pub(super) fn python_requirement_for_tag(
+    layout: SourceLayout,
+    tag: &str,
+) -> Option<PythonRequirement> {
+    match layout {
+        SourceLayout::Next => NEXT_SDK_PYTHONS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.tag == tag),
+        SourceLayout::Canonical => None,
     }
 }
 
@@ -290,6 +395,10 @@ fn ensure_managed_python(
     requirement: PythonRequirement,
     version: String,
 ) -> Result<PythonLauncher> {
+    // The step ends by recording the interpreter in config.json. Check that
+    // the file can be read before downloading uv or Python, so an unreadable
+    // one stops the step before it fetches anything.
+    load_config_for_managed_python(paths)?;
     progress_line(format!("Preparing Python {version}..."));
 
     let uv = ensure_uv_binary(paths)?;
@@ -309,7 +418,7 @@ fn ensure_managed_python(
             "Using existing Python {version} at {}.",
             manifest.executable.display()
         ));
-        let _ = record_managed_python_config(paths, &manifest.executable);
+        record_managed_python_config(paths, &manifest.executable)?;
         return Ok(PythonLauncher {
             executable: manifest.executable,
             source: PythonSource::Managed,
@@ -379,7 +488,7 @@ fn ensure_managed_python(
         installed_at_unix_ms: unix_time_millis(),
     };
     save_managed_python_manifest(paths, &manifest)?;
-    let _ = record_managed_python_config(paths, &executable);
+    record_managed_python_config(paths, &executable)?;
     progress_line(format!(
         "Python {version} is ready at {}.",
         executable.display()
@@ -1010,6 +1119,10 @@ fn python_venv_probe_temp_root() -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+#[path = "python_config_props.rs"]
+mod config_props;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
@@ -1103,6 +1216,75 @@ exit 1
     #[test]
     fn managed_python_defaults_to_312() {
         assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12");
+    }
+
+    /// `--python-version` is a choice among the interpreters the layout is
+    /// published for. ROCm 10 takes 3.10 to 3.14 (each with its own wheel tag and
+    /// the version `uv` is asked for); the canonical layout takes only its own 3.12;
+    /// everything else is refused with the allowed set named, not ignored.
+    #[test]
+    fn python_version_is_a_choice_among_the_layouts_published_pythons() {
+        for (version, tag) in [
+            ("3.10", "cp310"),
+            ("3.11", "cp311"),
+            ("3.12", "cp312"),
+            ("3.13", "cp313"),
+            ("3.14", "cp314"),
+            (" 3.12 ", "cp312"),
+        ] {
+            let requirement = python_requirement_for_version(SourceLayout::Next, version)
+                .unwrap_or_else(|error| panic!("{version} must be accepted: {error:#}"));
+            assert_eq!(requirement.tag, tag, "{version}");
+            assert_eq!(requirement.version, version.trim(), "{version}");
+        }
+        for version in ["3.9", "3.15", "3", "3.12.1", "cpython-3.12", ""] {
+            let error = python_requirement_for_version(SourceLayout::Next, version)
+                .expect_err("an unpublished Python must be refused");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("3.10, 3.11, 3.12, 3.13, 3.14"),
+                "{version}: {rendered}"
+            );
+        }
+
+        assert_eq!(
+            python_requirement_for_version(SourceLayout::Canonical, "3.12")
+                .expect("the canonical layout's own Python is accepted"),
+            python_requirement(SourceLayout::Canonical)
+        );
+        let error = python_requirement_for_version(SourceLayout::Canonical, "3.13")
+            .expect_err("the canonical layout has one Python");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("applies only to ROCm 10 and newer installs")
+                && rendered.contains("this install uses Python 3.12"),
+            "{rendered}"
+        );
+    }
+
+    /// An update keeps the interpreter a ROCm 10 runtime was built on. The tag
+    /// recorded in the runtime maps back to the requirement it came from for every
+    /// published Python, a tag the layout is not published for maps to none (so the
+    /// update falls back to the layout's default), and the canonical layout never
+    /// reads one.
+    #[test]
+    fn a_recorded_wheel_tag_maps_back_to_the_requirement_it_came_from() {
+        for requirement in NEXT_SDK_PYTHONS {
+            assert_eq!(
+                python_requirement_for_tag(SourceLayout::Next, requirement.tag),
+                Some(requirement)
+            );
+        }
+        assert_eq!(python_requirement_for_tag(SourceLayout::Next, "cp39"), None);
+        assert_eq!(
+            python_requirement_for_tag(SourceLayout::Canonical, "cp313"),
+            None
+        );
+        // The default stays the one vLLM needs, so a flag-less install is unchanged.
+        assert_eq!(
+            python_requirement(SourceLayout::Next),
+            python_requirement_for_tag(SourceLayout::Next, "cp314").expect("cp314 is published")
+        );
     }
 
     /// ROCm 10.x framework wheels (vLLM, flash-attn, amd-aiter) are published
@@ -2520,5 +2702,213 @@ exit 1
         );
 
         fs::remove_dir_all(root).ok();
+    }
+
+    /// A stand-in `uv` that records every invocation and answers
+    /// `python install` / `python find` without touching the network.
+    /// Planted where `ensure_uv_binary` looks for the managed copy, so no
+    /// download and no environment override is needed.
+    #[cfg(unix)]
+    fn plant_fake_uv(paths: &AppPaths, python: &Path, log: &Path) -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let dir = managed_tools_dir(&paths.data_dir).join("uv").join("latest");
+        fs::create_dir_all(&dir)?;
+        let uv = dir.join(rocm_core::uv_binary_name());
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ \"$1 $2\" = \"python find\" ]; then echo '{python}'; fi\nexit 0\n",
+            log = log.display(),
+            python = python.display(),
+        );
+        write_fake_executable(&uv, script)?;
+        Ok(())
+    }
+
+    /// A config.json `load` rejects, holding settings that must survive.
+    #[cfg(unix)]
+    fn plant_unreadable_config(paths: &AppPaths) -> Result<Vec<u8>> {
+        fs::create_dir_all(&paths.config_dir)?;
+        let damaged = br#"{"active_runtime_key": "kept-runtime", "onboarding_dismissed": "yes"}"#;
+        fs::write(paths.config_path(), damaged)?;
+        assert!(RocmCliConfig::load(paths).is_err());
+        Ok(damaged.to_vec())
+    }
+
+    /// The error names the exact file to rename and what to rename it to.
+    /// The advice text itself is `AppPaths::config_aside_advice`; that
+    /// following it keeps the data dir is
+    /// `config_rename_advice_keeps_a_recorded_data_dir_when_followed` in
+    /// rocm-core's paths.rs.
+    #[cfg(unix)]
+    fn assert_names_the_file_to_rename(message: &str, paths: &AppPaths) {
+        let config = paths.config_path();
+        assert!(
+            message.contains(&format!(
+                "rename \"{}\" to \"{}.broken\"",
+                config.display(),
+                config.display()
+            )) && message.contains(&paths.config_aside_advice()),
+            "the error does not name the file to rename: {message}"
+        );
+    }
+
+    /// The reuse path: a usable managed Python is already recorded, so
+    /// `ensure_managed_python` returns early. Meeting an unreadable config
+    /// there must fail — not report success with the record silently skipped
+    /// — before `uv` is run at all, and leave the file as it was.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_reuse_path_fails_on_an_unreadable_config() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        // Held because the uv and Python versions are read from the
+        // environment, which other tests in this module set.
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("ensure-python-reuse-unreadable");
+        let python_dir = managed_tools_dir(&paths.data_dir).join("python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        save_managed_python_manifest(
+            &paths,
+            &ManagedPythonManifest {
+                executable: python.clone(),
+                version: managed_python_version(python_requirement(SourceLayout::Canonical)),
+                installed_at_unix_ms: 1,
+            },
+        )?;
+        let uv_log = root.join("uv.log");
+        plant_fake_uv(&paths, &python, &uv_log)?;
+        let damaged = plant_unreadable_config(&paths)?;
+
+        // `PythonLauncher` is not `Debug`, so `expect_err` is unavailable.
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let Err(error) =
+            ensure_managed_python(&paths, requirement, managed_python_version(requirement))
+        else {
+            panic!("an unreadable config must fail the reuse path");
+        };
+        let uv_calls = fs::read_to_string(&uv_log).unwrap_or_default();
+        let after = fs::read(paths.config_path())?;
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged"),
+            "unexpected error: {message}"
+        );
+        assert_names_the_file_to_rename(&message, &paths);
+        assert_eq!(after, damaged, "config.json was rewritten");
+        assert!(
+            uv_calls.is_empty(),
+            "uv ran before the unreadable config stopped the step: {uv_calls}"
+        );
+        Ok(())
+    }
+
+    /// The install path: no managed Python yet, so `uv python install` runs
+    /// and the new interpreter is recorded at the end. An unreadable config
+    /// fails the bootstrap before `uv` is run at all, with the file left as it
+    /// was.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_install_path_fails_on_an_unreadable_config() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("ensure-python-install-unreadable");
+        let python_dir = root.join("uv-python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        let uv_log = root.join("uv.log");
+        plant_fake_uv(&paths, &python, &uv_log)?;
+        let damaged = plant_unreadable_config(&paths)?;
+
+        // `PythonLauncher` is not `Debug`, so `expect_err` is unavailable.
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let Err(error) =
+            ensure_managed_python(&paths, requirement, managed_python_version(requirement))
+        else {
+            panic!("an unreadable config must fail the install path");
+        };
+        let uv_calls = fs::read_to_string(&uv_log).unwrap_or_default();
+        let after = fs::read(paths.config_path())?;
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged"),
+            "unexpected error: {message}"
+        );
+        assert_names_the_file_to_rename(&message, &paths);
+        assert_eq!(after, damaged, "config.json was rewritten");
+        assert!(
+            uv_calls.is_empty(),
+            "uv ran before the unreadable config stopped the step: {uv_calls}"
+        );
+        Ok(())
+    }
+
+    /// A config.json that reads fine but cannot be saved: its folder is made
+    /// read-only, so the save cannot create its temp file. Both paths must
+    /// report that the interpreter was not recorded, rather than finish as if
+    /// it had been. Skipped where the folder stays writable (running as root).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_fails_when_the_record_cannot_be_saved() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        for reuse in [true, false] {
+            let (root, paths) = test_paths("ensure-python-record-unsaved");
+            let python_dir = if reuse {
+                managed_tools_dir(&paths.data_dir).join("python")
+            } else {
+                root.join("uv-python")
+            };
+            fs::create_dir_all(&python_dir)?;
+            let python = write_fake_python_with_venv(&python_dir, "python")?;
+            if reuse {
+                save_managed_python_manifest(
+                    &paths,
+                    &ManagedPythonManifest {
+                        executable: python.clone(),
+                        version: managed_python_version(python_requirement(
+                            SourceLayout::Canonical,
+                        )),
+                        installed_at_unix_ms: 1,
+                    },
+                )?;
+            }
+            plant_fake_uv(&paths, &python, &root.join("uv.log"))?;
+            RocmCliConfig::default().save(&paths)?;
+            fs::set_permissions(&paths.config_dir, fs::Permissions::from_mode(0o555))?;
+            let probe = paths.config_dir.join("probe");
+            if fs::write(&probe, b"").is_ok() {
+                fs::remove_file(&probe).ok();
+                fs::set_permissions(&paths.config_dir, fs::Permissions::from_mode(0o755))?;
+                fs::remove_dir_all(root).ok();
+                return Ok(());
+            }
+
+            let requirement = python_requirement(SourceLayout::Canonical);
+            let result =
+                ensure_managed_python(&paths, requirement, managed_python_version(requirement));
+            fs::set_permissions(&paths.config_dir, fs::Permissions::from_mode(0o755))?;
+            fs::remove_dir_all(root).ok();
+            let Err(error) = result else {
+                panic!("reuse={reuse}: an unsaved record must fail the step");
+            };
+            assert!(
+                format!("{error:#}").contains("config.json"),
+                "reuse={reuse}: {error:#}"
+            );
+        }
+        Ok(())
     }
 }

@@ -13,6 +13,7 @@ mod consent;
 mod family;
 mod fetch;
 mod io;
+mod kept_torch;
 mod probe;
 mod process;
 mod python;
@@ -40,8 +41,10 @@ pub(crate) use self::probe::{
     probe_runtime_devices, probe_torch_alignment, requirement_pinned_version, split_local_version,
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
+pub(crate) use self::python::NEXT_MANAGED_PYTHON_VERSION;
 use self::python::{
     ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
+    python_requirement_for_version,
 };
 use self::resolve::{
     AggregateDeviceTarget, PipRuntimePlan, canonical_auto_select_needs_next_python,
@@ -52,12 +55,12 @@ pub(crate) use self::source::RuntimeVersionSelector;
 #[cfg(test)]
 use self::source::resolve_source;
 use self::source::{
-    SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel, next_layout_requested,
-    requested_source_layout, select_source_layout,
+    SourceLayout, THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE, TheRockChannel, gate_install_layout,
+    layout_serving, requested_source_layout,
 };
 pub(crate) use self::update::{
-    RuntimeUpdatePlan, maybe_refresh_startup_update_check, render_update_json,
-    render_update_report, runtime_update_check, runtime_update_plan,
+    RuntimeUpdatePlan, maybe_refresh_startup_update_check, recorded_python_version,
+    render_update_json, render_update_report, runtime_update_check, runtime_update_plan,
 };
 pub(crate) use self::version::runtime_version_display;
 use self::version::{
@@ -143,6 +146,9 @@ struct InstallSourceOverride<'a> {
     family: Option<&'a str>,
     device_target: Option<&'a str>,
     layout: Option<SourceLayout>,
+    /// `--python-version`: the interpreter a ROCm 10+ install runs on in place
+    /// of the layout's default.
+    python_version: Option<&'a str>,
 }
 
 /// What to install, as resolved from the `rocm install sdk` arguments.
@@ -157,6 +163,9 @@ pub(crate) struct SdkInstallRequest<'a> {
     pub prefix: Option<PathBuf>,
     pub version_selector: Option<RuntimeVersionSelector>,
     pub family_override: Option<&'a str>,
+    /// `--python-version`: the Python a ROCm 10+ install runs on, when not the
+    /// default one. Only a wheel install has a Python to choose.
+    pub python_version: Option<&'a str>,
     pub dry_run: bool,
     /// Install the compiler and headers alongside the runtime libraries.
     pub include_devel: bool,
@@ -177,6 +186,7 @@ impl Default for SdkInstallRequest<'_> {
             prefix: None,
             version_selector: None,
             family_override: None,
+            python_version: None,
             dry_run: false,
             include_devel: false,
             // Withholding consent is the safe default: a caller that leaves it
@@ -198,11 +208,15 @@ pub(crate) fn install_sdk(
         prefix,
         version_selector,
         family_override,
+        python_version,
         dry_run,
         include_devel,
         consent,
     } = request;
     let channel = TheRockChannel::parse(channel)?;
+    if python_version.is_some() && format != "wheel" {
+        bail!("--python-version applies only to wheel installs; a tarball install uses no Python");
+    }
     ensure_install_format_supported(format)?;
     match format {
         "wheel" => install_wheel_runtime(
@@ -211,6 +225,7 @@ pub(crate) fn install_sdk(
             prefix,
             InstallSourceOverride {
                 family: family_override,
+                python_version,
                 ..InstallSourceOverride::default()
             },
             version_selector.as_ref(),
@@ -220,14 +235,15 @@ pub(crate) fn install_sdk(
         ),
         "tarball" => {
             // A tarball catalog lists whole archives, not a resolvable package
-            // graph, so there is nothing to pin a version against — except the
-            // ROCm 10 catalog, which is reachable *only* by naming a version,
-            // because nothing else distinguishes it from the canonical one.
+            // graph, so there is nothing to pin a version against — except in
+            // the next layout's catalogs, whose archives are named by the
+            // version they carry. The canonical catalogs do not support a pin,
+            // so an earlier version is a wheel install.
             if let Some(selector) = version_selector.as_ref()
-                && !next_layout_requested(selector)
+                && layout_serving(channel, Some(selector)) == SourceLayout::Canonical
             {
                 bail!(
-                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                    "specific TheRock version selection for tarball installs is supported only for the newer package layout: a stable ROCm 10+ release (e.g. `--version 10.0.0`) or a nightly built on or after {THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE}; for any earlier version, use `--format wheel`"
                 )
             }
             install_tarball_runtime(
@@ -268,6 +284,7 @@ pub(crate) fn install_sdk_for_update(
     device_target: Option<&str>,
     source_layout_generation: Option<&str>,
     include_devel: bool,
+    python_version: Option<&str>,
     dry_run: bool,
     activate_after_install: bool,
 ) -> Result<SdkInstallResult> {
@@ -286,22 +303,28 @@ pub(crate) fn install_sdk_for_update(
                 family: Some(family),
                 device_target,
                 layout,
+                python_version,
             },
             None,
             dry_run,
             include_devel,
             consent,
         ),
-        "tarball" => install_tarball_runtime(
-            paths,
-            channel,
-            None,
-            Some(family),
-            None,
-            layout,
-            dry_run,
-            consent,
-        ),
+        "tarball" => {
+            if python_version.is_some() {
+                bail!("a tarball install uses no Python, so it has no --python-version");
+            }
+            install_tarball_runtime(
+                paths,
+                channel,
+                None,
+                Some(family),
+                None,
+                layout,
+                dry_run,
+                consent,
+            )
+        }
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -334,6 +357,7 @@ fn install_wheel_runtime(
         family: family_override,
         device_target: device_target_override,
         layout: layout_override,
+        python_version: python_version_override,
     } = source_override;
     // `device_target_override` (an update apply's exact recorded arch) is only
     // otherwise consulted after `resolve_pip_runtime` returns — too late for the
@@ -346,28 +370,33 @@ fn install_wheel_runtime(
     // channel, or a grouped family with no exact arch) before paying for Python
     // provisioning below, which can mean a real download for a layout this host
     // or channel can never actually use.
-    select_source_layout(
+    gate_install_layout(
         channel,
         &resolve_family(paths, recovered_family_override.as_deref())?,
         version_selector,
+        layout_override,
     )?;
     // The interpreter has to be picked before `resolve_pip_runtime`, which
     // selects wheels using that interpreter's own tags. `requested_source_layout`
-    // only answers from the *request*: an explicit stable ROCm 10+ pin already
-    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
-    // nightly build-date/prerelease pin always reports `Canonical`, even once
-    // the canonical/nightly feed's own "latest" has rotated past that major on
-    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
-    // peeks the channel's own `rocm` listing to catch that case.
-    let python_requirement = match requested_source_layout(layout_override, version_selector) {
-        SourceLayout::Next => python_requirement(SourceLayout::Next),
+    // only answers from the *request*: a plain auto-select, a stable ROCm 10+
+    // pin and a nightly built since the next layout began all route to `Next`
+    // and get `cp314` that way. A pin into the canonical layout can still
+    // resolve a ROCm 10+ build on that feed (the legacy nightlies carry ROCm 10
+    // alphas), so `canonical_auto_select_needs_next_python` peeks the feed's own
+    // `rocm` listing to catch that case.
+    let python_layout = match requested_source_layout(channel, layout_override, version_selector) {
+        SourceLayout::Next => SourceLayout::Next,
         SourceLayout::Canonical => {
             if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
-                python_requirement(SourceLayout::Next)
+                SourceLayout::Next
             } else {
-                python_requirement(SourceLayout::Canonical)
+                SourceLayout::Canonical
             }
         }
+    };
+    let python_requirement = match python_version_override {
+        Some(version) => python_requirement_for_version(python_layout, version)?,
+        None => python_requirement(python_layout),
     };
     // A preview promises nothing here: whether a Python would be prepared, and
     // which, is only known once the search below has run (a version override can
@@ -463,6 +492,14 @@ fn install_wheel_runtime(
         resolution.newest_repo_version.as_deref(),
         &resolution.latest_version,
     );
+    // Under the alignment opt-out an environment that already holds torch keeps it:
+    // the install then asks `uv` for the ROCm packages alone. Decided here, from the
+    // environment the install will run in, so the preview and the install name the
+    // same requirements.
+    let planned_env_python = venv_python_path(&install_root);
+    let planned_kept = kept_torch::kept_torch_stack(rocm_core::torch_alignment_disabled(), || {
+        kept_torch::installed_torch_stack(&planned_env_python)
+    });
     let plan = WheelPlan {
         channel,
         version_selector,
@@ -483,6 +520,10 @@ fn install_wheel_runtime(
             install_root: &install_root,
             runtime_key: &runtime_key,
             package_specs: &wheel_composition.package_specs,
+            // A real install decides again once the environment is prepared (it may
+            // be recreated and lose its torch), and writes the one `torch_kept:` line
+            // then; a preview cannot know, so it prints the plan's.
+            kept_torch: if dry_run { planned_kept.as_ref() } else { None },
             manifest_path: &manifest_path,
         }),
     };
@@ -600,10 +641,27 @@ fn install_wheel_runtime(
     ));
     ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
+    // `ensure_uv_venv` recreates an environment built for another interpreter, and
+    // the recreated one holds no torch. Asked again, so that case installs the
+    // full stack instead of leaving the runtime without torch.
+    let kept = planned_kept.clone().filter(|_| {
+        kept_torch::kept_torch_stack(true, || kept_torch::installed_torch_stack(&env_python))
+            .is_some()
+    });
+    if let Some(kept) = &kept {
+        progress_line(format!(
+            "ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set: keeping the torch this runtime already holds ({}).",
+            kept.describe()
+        ));
+    }
+    if let Some(line) = kept_torch::install_line(planned_kept.as_ref(), kept.as_ref()) {
+        let _ = writeln!(output, "{line}");
+    }
+    let install_specs = kept_torch::install_specs(&wheel_composition.package_specs, kept.as_ref());
 
     progress_line(format!(
         "Installing {} from {}",
-        wheel_composition.package_specs.join(" "),
+        install_specs.join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -611,7 +669,7 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(wheel_composition.package_specs.iter().cloned());
+    install_args.extend(install_specs.iter().cloned());
     run_uv_progress_command(
         paths,
         &uv,
@@ -1080,6 +1138,35 @@ mod tests {
     use super::test_support::workspace_test_artifact_dir;
     use super::test_support::{test_paths, test_runtime_manifest};
     use super::*;
+
+    /// `--format tarball` installs no Python, so a Python choice cannot be honoured
+    /// and is refused before anything is resolved or downloaded. The refusal comes
+    /// ahead of the platform's tarball check so it reads the same on every host.
+    #[test]
+    fn python_version_is_refused_for_a_tarball_install() {
+        let (_root, paths) = test_paths("tarball-python-version-refused");
+        let error = install_sdk(
+            &paths,
+            SdkInstallRequest {
+                channel: "release",
+                format: "tarball",
+                prefix: None,
+                version_selector: None,
+                family_override: None,
+                python_version: Some("3.12"),
+                dry_run: true,
+                include_devel: false,
+                consent: SdkInstallConsent::Ask,
+            },
+        )
+        .expect_err("a tarball install has no Python to choose");
+        assert!(
+            error
+                .to_string()
+                .contains("--python-version applies only to wheel installs"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn download_space_requirement_includes_the_safety_margin() {
