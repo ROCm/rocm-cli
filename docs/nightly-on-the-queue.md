@@ -117,9 +117,9 @@ run, so a failing channel does not hide the other, and the lane fails if either
 did.
 
 A lane starts cold, so its first steps fetch from the network: the build
-packages, the rustup installer, the toolchain and the crates. The lane command
-tries each of those up to four times, and never retries a build or a test. The
-pre-warm's package downloads and the suite's model downloads are left to the
+packages, the rustup installer, the toolchain and the crates for the host
+being built. The lane command tries each of those up to four times, and never
+retries a build or a test. The pre-warm's package downloads and the suite's model downloads are left to the
 tools doing them, so a model that downloads more slowly than its scenario waits
 fails that scenario.
 
