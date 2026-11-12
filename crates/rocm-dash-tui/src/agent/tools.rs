@@ -366,6 +366,12 @@ fn cap_tool_result(value: Value, budget: usize) -> Value {
     if value.to_string().len() <= budget {
         return value;
     }
+    // The truncated form is a fresh object, so whatever the rest of the chat
+    // path reads off the envelope has to be carried over deliberately.
+    // `isError` is the success/failure signal (`turn.rs` reads it), and a
+    // command that failed must not read as a success merely because its
+    // output was too long to keep.
+    let is_error = value.get("isError").and_then(Value::as_bool);
     let full = tool_result_plain_text(&value);
     let total_chars = full.chars().count();
     // Candidate cuts: the start, then the end of every line, so a cut never
@@ -382,7 +388,7 @@ fn cap_tool_result(value: Value, budget: usize) -> Value {
     let (mut low, mut high, mut best) = (0usize, cuts.len() - 1, 0usize);
     while low <= high {
         let mid = low.midpoint(high);
-        if truncated_tool_result(&full, cuts[mid], total_chars)
+        if truncated_tool_result(&full, cuts[mid], total_chars, is_error)
             .to_string()
             .len()
             <= budget
@@ -395,17 +401,28 @@ fn cap_tool_result(value: Value, budget: usize) -> Value {
             high = mid - 1;
         }
     }
-    truncated_tool_result(&full, cuts[best], total_chars)
+    truncated_tool_result(&full, cuts[best], total_chars, is_error)
 }
 
-/// The truncated form of `full` kept up to the byte offset `cut`.
-fn truncated_tool_result(full: &str, cut: usize, total_chars: usize) -> Value {
+/// The truncated form of `full` kept up to the byte offset `cut`. `is_error`
+/// is the envelope's `isError`, carried over when it had one so truncating a
+/// failed command's output does not turn it into a success.
+fn truncated_tool_result(
+    full: &str,
+    cut: usize,
+    total_chars: usize,
+    is_error: Option<bool>,
+) -> Value {
     let kept = &full[..cut];
     let shown_chars = kept.chars().count();
-    json!({
+    let mut truncated = json!({
         "truncated": true,
         "tool_output": format!("{kept}{}", truncation_marker(shown_chars, total_chars)),
-    })
+    });
+    if let Some(is_error) = is_error {
+        truncated["isError"] = json!(is_error);
+    }
+    truncated
 }
 
 /// Shared body for every read-only ROCm tool: forward the intent to the injected
@@ -1188,6 +1205,54 @@ mod tests {
                 .is_some_and(|(kept, _)| kept.is_empty() || kept.ends_with('\n')),
             "the cut must land on a line boundary: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn truncating_a_failed_command_keeps_it_a_failure() {
+        // The capped form is a fresh object, so `isError` survives only if it
+        // is carried over. A command that failed with a lot of output would
+        // otherwise reach the model looking like a success, and the chat path
+        // reads that field to decide exactly that.
+        let (_, mut envelope) = command_envelope(200 * 1024);
+        envelope["isError"] = json!(true);
+        envelope["structuredContent"]["exit_status"] = json!(1);
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool.call(json!({ "args": ["model"] })).await.expect("ok");
+
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "the fixture must truncate: {out}"
+        );
+        assert_eq!(
+            out["isError"],
+            json!(true),
+            "a failed command must still read as failed after truncation: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncating_a_successful_command_keeps_it_a_success() {
+        // The mirror of the case above: carrying `isError` over must not
+        // invent a failure for output that was merely long.
+        let (_, envelope) = command_envelope(200 * 1024);
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool.call(json!({ "args": ["model"] })).await.expect("ok");
+
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "the fixture must truncate: {out}"
+        );
+        assert_eq!(out["isError"], json!(false), "{out}");
     }
 
     #[tokio::test]
