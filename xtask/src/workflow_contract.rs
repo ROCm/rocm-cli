@@ -9826,6 +9826,12 @@ permissions:
             ),
         )
         .expect("stub sha256sum");
+        let host_triple = format!("{}-unknown-linux-gnu", case.machine);
+        let host_reply = if case.host_line {
+            format!("echo \"host: {host_triple}\"")
+        } else {
+            "echo \"release: 1.96.0\"".to_owned()
+        };
         write_fake_executable(
             &cargo_bin.join("cargo"),
             format!(
@@ -9851,12 +9857,8 @@ permissions:
                 // own status.
                 version = fail_first("cargo-version", case.version_failures, 7).replace('\n', "; "),
                 fetch = fail_first("cargo-fetch", case.fetch_failures, 7).replace('\n', "; "),
-                triple = format!("{}-unknown-linux-gnu", case.machine),
-                host = if case.host_line {
-                    format!("echo \"host: {}-unknown-linux-gnu\"", case.machine)
-                } else {
-                    "echo \"release: 1.96.0\"".to_owned()
-                },
+                triple = host_triple,
+                host = host_reply,
                 rc = case.suite_rc,
                 nightly = case.nightly_rc.unwrap_or(case.suite_rc)
             ),
