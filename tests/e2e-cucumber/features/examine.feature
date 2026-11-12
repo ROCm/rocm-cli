@@ -108,15 +108,11 @@ Feature: GPU detection and system inspection
   # identical on every host, whereas asserting that a *named* framework was
   # probed would depend on what happens to be installed.
   #
-  # A bare-metal machine because the probe never reaches its framework step on
-  # WSL2 — it returns as soon as it recognises the platform — so `framework`
-  # stays "unknown" there whatever the flag says. That the probe gives up that
-  # early is its own defect, tracked separately; this scenario is about whether
-  # the choice is reachable, and it cannot answer that where no choice is acted
-  # on at all. The bare-metal machine is simulated, so a WSL2 lane runs this too.
-  @id:examine-can-skip-framework-probing @requires-os:linux
+  # Every platform reaches the framework step (bare-metal Linux, WSL2 and
+  # native Windows alike), so this needs no particular machine and runs on every
+  # lane, the GitHub-hosted one and the Windows ones included.
+  @id:examine-can-skip-framework-probing
   Scenario: examine-10 - The user can leave the frameworks out of the inspection
-    Given a bare-metal Linux machine with an AMD GPU
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks
     And it still states a verdict for this machine
