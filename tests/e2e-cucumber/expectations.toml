@@ -253,3 +253,13 @@ reason = "Lemonade 11.5.1 fetches TheRock only from repo.amd.com/rocm/tarball/, 
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-900"
 reason = "The Windows large-model serve crashes in the SDK's Tensile library on the first inference request; the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
+
+# Scoped to native Linux Strix Halo, the only place it has been seen (evidence is
+# in the tracking issue); `is_wsl = false` keeps WSL2, which also reports
+# `os = "linux"` on gfx1151, out of it, so a WSL host that gains Docker and passes
+# the scenario is not an XPASS. A host without Docker skips the scenario before
+# this row applies.
+[["serve-aim-lifecycle-parity"]]
+when = { os = "linux", is_wsl = false, therock_family = "gfx1151*", has_amd_gpu = true }
+bug = "#1058"
+reason = "Stopping a running AIM service on Strix Halo Ubuntu reports `Local server stop not confirmed` (exit 1); the serve itself works."

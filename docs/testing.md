@@ -1473,20 +1473,19 @@ install.
 `serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
 restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
-per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
-the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
-and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
-is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
-dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
-cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
-they stay reachable when the opt-in is set.
+Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
+them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
+i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
+`E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
+`include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
+gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
+the tagging and that they stay reachable when the opt-in is set.
 
-Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
-every nightly run, and only a manual `include_nightly` dispatch on a host with
-Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
-is reachable ("Report whether Docker is reachable"); check that line before
-relying on this coverage.
+Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
+logs whether Docker is reachable ("Report whether Docker is reachable").
+`serve-27`'s known failure on the Strix Halo pool is an xfail row in
+`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
+means the row is stale.
 
 ### Lemonade managed-serve failure evidence
 
