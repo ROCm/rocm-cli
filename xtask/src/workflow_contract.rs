@@ -2315,7 +2315,16 @@ jobs:
 
         // The deadlines are ordered, and the job's own cap lets the script stop
         // itself rather than being killed mid-wait.
-        let queue: u32 = env_value(settle, "QUEUE_DEADLINE_MINUTES").parse().unwrap();
+        // The value is `${{ inputs.queue_deadline_minutes || '60' }}`: the
+        // default after `||` is what a scheduled run uses.
+        let queue_expr = env_value(settle, "QUEUE_DEADLINE_MINUTES");
+        let queue: u32 = queue_expr
+            .rsplit('\'')
+            .nth(1)
+            .and_then(|default| default.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("QUEUE_DEADLINE_MINUTES has a numeric default: {queue_expr}")
+            });
         let hard: u32 = env_value(settle, "HARD_DEADLINE_MINUTES").parse().unwrap();
         let cap: u32 = job_scalar(settle, "timeout-minutes").parse().unwrap();
         let longest_lane = lanes
@@ -2671,6 +2680,40 @@ jobs:
         assert_eq!(code, 0, "{log}");
         assert_eq!(calls, 1, "the look-alike lane is not Lane A's leg");
         assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_refuses_a_deadline_that_is_not_a_whole_number() {
+        // The queue deadline is a dispatch input, and bash arithmetic reads a
+        // non-number as 0: unchecked, `abc` would give up on every lane at once.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        for bad in ["abc", "1.5", "-5", "60 "] {
+            // `timeout`: with the check gone the script would poll the API for
+            // ever, and a broken check must fail this test, not hang it.
+            let out = std::process::Command::new("timeout")
+                .arg("20")
+                .arg("bash")
+                .arg(&script)
+                .env("LANES", "lane-a=Lane A\n")
+                .env("QUEUE_DEADLINE_MINUTES", bad)
+                .env("HARD_DEADLINE_MINUTES", "240")
+                .env("GITHUB_REPOSITORY", "owner/repo")
+                .env("GITHUB_RUN_ID", "1")
+                .output()
+                .expect("running the settle script");
+            let log = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "deadline {bad:?} must be refused:\n{log}"
+            );
+            assert!(
+                log.contains("must be whole numbers"),
+                "the refusal must say why for {bad:?}:\n{log}"
+            );
+        }
     }
 
     #[test]

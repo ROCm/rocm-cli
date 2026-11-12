@@ -47,6 +47,14 @@ set -euo pipefail
 queue_minutes="${QUEUE_DEADLINE_MINUTES:?QUEUE_DEADLINE_MINUTES is required}"
 hard_minutes="${HARD_DEADLINE_MINUTES:?HARD_DEADLINE_MINUTES is required}"
 poll_secs="${POLL_SECS:-60}"
+# Bash arithmetic reads a non-number as 0, which would give up on every lane at
+# once; refuse it instead (the queue deadline is a dispatch input).
+for value in "${queue_minutes}" "${hard_minutes}" "${poll_secs}"; do
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "::error::deadline and poll values must be whole numbers, got '${value}'"
+    exit 1
+  fi
+done
 output_file="${GITHUB_OUTPUT:-/dev/null}"
 summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
