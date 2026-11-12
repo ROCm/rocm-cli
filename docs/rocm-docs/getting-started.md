@@ -6,6 +6,28 @@ SPDX-License-Identifier: MIT
 
 # Getting started with ROCm CLI
 
+## Quickstart
+
+<!-- Step 1 and the closing paragraph are deliberate copies of the README text,
+     with the cross-references retargeted to this site. The include between
+     them uses the end of README step 1 and the start of its closing paragraph
+     as anchors; edit both together. -->
+These steps take a computer with a supported AMD GPU from installing ROCm CLI to
+a chat reply from a model served on that GPU.
+
+1. Install ROCm CLI with the command for your platform in
+   [Installing ROCm CLI](install/installation.md). Then open a new terminal and
+   confirm that `rocm version` prints the CLI version.
+
+```{include} ../../README.md
+:start-after: "`rocm version` prints the CLI version."
+:end-before: "For other models and engine options, see"
+```
+
+For other models and engine options, see
+[Configure ROCm and serve a model](#configure-rocm-and-serve-a-model) and
+[Model serving](commands.md#model-serving).
+
 ## First run
 
 ```{include} ../../README.md

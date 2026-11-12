@@ -164,6 +164,73 @@ install -m 0755 target/release/rocm target/release/rocmd ~/.local/bin/
 See [CONTRIBUTING.md](https://github.com/ROCm/rocm-cli/blob/main/CONTRIBUTING.md) for the full development setup, test
 commands, and commit-signing requirements.
 
+## Quickstart
+
+These steps take a computer with a supported AMD GPU from installing ROCm CLI to
+a chat reply from a model served on that GPU.
+
+1. Install ROCm CLI with the command for your platform in
+   [Installation](#installation). Then open a new terminal and confirm that
+   `rocm version` prints the CLI version.
+
+2. Check the GPU, the ROCm runtime, and the serving engine:
+
+   ```
+   rocm examine
+   ```
+
+   Two lines in the output decide the next steps:
+
+   - `active_runtime_status`: `ready` means a managed ROCm runtime is already
+     active, and you can skip step 3.
+   - `effective_default_engine`: `lemonade` or `vllm`. The engine decides which
+     model you serve in step 4.
+
+3. Install a managed ROCm runtime:
+
+   ```
+   rocm install sdk
+   ```
+
+   This downloads TheRock ROCm wheels and a matching PyTorch stack into a
+   managed environment. Run `rocm examine` again and confirm that
+   `active_runtime_status` reports `ready`.
+
+4. Serve a model in the form your engine accepts:
+
+   - `lemonade` (Ryzen AI and Radeon GPUs) serves GGUF models:
+
+     ```
+     rocm serve qwen
+     ```
+
+   - `vllm` (Instinct GPUs) serves safetensors models:
+
+     ```
+     rocm serve Qwen/Qwen2.5-1.5B-Instruct
+     ```
+
+   The server runs in the background. When it's ready, `rocm serve` prints a
+   deployment summary with the endpoint, the service ID, and the commands that
+   stop the service and show its logs.
+
+5. Send the model a prompt. Pass the same model name you served:
+
+   ```
+   rocm chat --provider local --model qwen --prompt "Explain ROCm in one sentence"
+   ```
+
+   On a `vllm` engine, use `--model Qwen/Qwen2.5-1.5B-Instruct`. To open the
+   interactive chat instead, run `rocm chat` with no options. Chat is a preview
+   feature.
+
+6. Stop the server with the `stop` command from the deployment summary, or list
+   running servers with `rocm services list`.
+
+For other models and engine options, see
+[Configure ROCm and serve a model](#configure-rocm-and-serve-a-model) and
+[Model serving](#model-serving).
+
 ## First run
 
 Launch ROCm CLI with no arguments:
@@ -281,8 +348,12 @@ After the install finishes, serve a model:
 rocm serve qwen
 ```
 
-`qwen` is a built-in alias for a small assistant model that serves out of the
-box. You can also serve any compatible Hugging Face model directly. See
+`qwen` is a built-in alias for a small GGUF assistant model, served by the
+Lemonade engine on Ryzen AI and Radeon GPUs. On Instinct GPUs, which serve
+through vLLM, pass a safetensors model instead, such as
+`rocm serve Qwen/Qwen2.5-1.5B-Instruct`.
+
+You can also serve any compatible Hugging Face model directly. See
 [Model serving](#model-serving) for the GGUF versus safetensors rule, because which
 form works depends on the engine your GPU selects.
 
