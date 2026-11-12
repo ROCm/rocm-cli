@@ -751,8 +751,9 @@ fn compat_dir_has_shims(compat_dir: &Path) -> bool {
 /// from the launch path, before building the environment a server is spawned
 /// with — never from running-state payload assembly, which only needs the
 /// path list `therock_library_path_entries` derives, not the shims
-/// themselves. Returns the compat dir when a shim (the `libmpi_cxx` stub or the
-/// amd-smi link) is needed for *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to
+/// themselves. Returns the compat dir when a shim is needed for *this* launch:
+/// the `libmpi_cxx` stub `ensure_mpi_cxx_compat` wrote, or the amd-smi link
+/// [`rocm_core::ensure_amd_smi_compat`] wrote. Pass this on to
 /// [`therock_library_path_entries_for_launch`] rather than having that
 /// derivation re-check the directory itself. Returns `None` without touching
 /// the filesystem when `runtime.sdk_root` is absent, so this function stays

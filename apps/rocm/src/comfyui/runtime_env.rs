@@ -1969,6 +1969,39 @@ mod tests {
         Ok(())
     }
 
+    /// A second amd-smi library in the ComfyUI process makes torch count zero
+    /// devices; the launch environment must carry the link to the SDK's own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_environment_carries_the_amd_smi_link_dir() -> Result<()> {
+        let paths = test_paths("comfyui-amd-smi-link");
+        let venv_root = paths.data_dir.join("venv");
+        let sdk_lib = paths.data_dir.join("sdk-lib");
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+        let env = ComfyUiRuntimeEnvironment {
+            venv_root: Some(venv_root.clone()),
+            library_entries: vec![sdk_lib.clone()],
+            ..Default::default()
+        };
+
+        let assignments = runtime_environment_assignments(&env)?;
+
+        let compat = venv_root.join(rocm_core::RUNTIME_COMPAT_DIR_NAME);
+        let ld_library_path = assignments
+            .iter()
+            .find(|(key, _)| *key == "LD_LIBRARY_PATH")
+            .map(|(_, value)| value.clone())
+            .context("LD_LIBRARY_PATH was not assigned")?;
+        let entries: Vec<PathBuf> = std::env::split_paths(&ld_library_path).collect();
+        assert!(entries.contains(&compat), "{entries:?}");
+        assert_eq!(
+            fs::read_link(compat.join("libamd_smi.so"))?,
+            sdk_lib.join("libamd_smi.so.26")
+        );
+        Ok(())
+    }
+
     fn minimal_runtime_manifest(python: &Path) -> therock::InstalledRuntimeManifest {
         therock::InstalledRuntimeManifest {
             runtime_key: "therock-release-gfx120x-all".to_owned(),
