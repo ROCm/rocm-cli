@@ -5,10 +5,10 @@
 //! Managed-service liveness classification and the dashboard-sidebar
 //! status/counts helpers derived from it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-211) of the `main.rs` modularization (see
-//! `docs/architecture.md`). `dispatch()`'s call sites are unaffected: none of
-//! this module's functions are called directly from `dispatch()`.
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`). `dispatch()`'s call sites are
+//! unaffected: none of this module's functions are called directly from
+//! `dispatch()`.
 //!
 //! This module owns: reading and liveness-refreshing the on-disk managed-service
 //! registry (`load_managed_services`, `refresh_managed_service_runtime_liveness`,

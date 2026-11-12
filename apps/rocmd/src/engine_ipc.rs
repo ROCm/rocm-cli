@@ -211,6 +211,10 @@ const fn stdio_options<'a>(
         app_paths: Some(paths),
         env_root: None,
         endpoint_key_file,
+        // `None` here means "this loopback service needs no key", not "this
+        // child may not see one" — these are the daemon's own children, and
+        // clearing would change what they inherit.
+        withhold_inherited_key_file: false,
         request_progress: false,
         forward_stderr: false,
         note_failing_exit_after_answer: true,

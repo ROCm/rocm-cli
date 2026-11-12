@@ -274,11 +274,14 @@ This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. Running `rocm install sdk` creates a managed runtime alongside any
 legacy install.
 
-ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
-`rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
-add `--version`. If ROCm CLI can't tell which exact GPU arch this computer has,
-or you want a different one, also add `--family` with the raw `gfx` code from
-`rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+Without `--version`, `rocm install sdk` installs the newest stable release
+(ROCm 10.1 today) from `stable.repo.amd.com`, and `--channel nightly` installs the
+newest nightly build from `nightly.repo.amd.com`. Earlier releases stay
+installable by pinning them: `--version 7.14.1` installs the ROCm 7.14.1 release,
+and `--channel nightly --build-date 2026-08-20` installs a nightly from before
+the nightly channel moved on 2026-08-23. If ROCm CLI can't tell which exact GPU
+arch this computer has, or you want a different one, also add `--family` with the
+raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
@@ -477,7 +480,7 @@ hardware, not something an install or a setting can put right.
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
+                    [--family gfx1100] [--prefix PATH] [--devel] [--dry-run]
                     [--python-version X.Y]
                     [--approve-replacing-active-default] [--yes]
 
@@ -488,9 +491,9 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by ROCm CLI. ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
-it currently installs ROCm 7.14. To install 10.0 or 10.1, follow the steps under
-ROCm 10 and newer, below.
+by ROCm CLI. Without `--version` it installs the newest stable release, ROCm 10
+or newer, and a pin installs an earlier one: a ROCm 7 release, for example. The
+steps under ROCm 10 and newer, below, say what that layout needs.
 
 To remove ROCm CLI and what it manages, see
 [Logs and cleanup](#logs-and-cleanup).
@@ -564,7 +567,7 @@ active default runtime, not about what a named prefix loses.
 
 #### Which Python `install sdk` uses
 
-ROCm CLI picks the Python from the ROCm version it installs. ROCm 7.14 installs
+ROCm CLI picks the Python from the ROCm version it installs. ROCm 7 installs
 use Python 3.12. ROCm 10 and newer use Python 3.14 by default, because vLLM,
 flash-attn and amd-aiter for ROCm 10 are published for 3.14 only. The ROCm 10
 SDK and PyTorch wheels are also published for 3.10 to 3.14, so an install that
@@ -587,18 +590,24 @@ interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the version
 ROCm CLI prepares itself) must name a Python the install accepts.
 
 If you see Python 3.14 without asking for it, the install resolved to ROCm 10
-or newer. That happens with `--version 10.x.y`, and also when the channel's
-newest build is ROCm 10, as the nightly channel's is today. The install prints
-which Python it chose, and `--dry-run` shows it without changing anything.
+or newer. That happens with `--version 10.x.y`, and also with no `--version` at
+all, since the newest build of both channels is ROCm 10 or newer. The install
+prints which Python it chose, and `--dry-run` shows it without changing anything.
 
 #### ROCm 10 and newer
 
-ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version` (an unpinned nightly install also gets ROCm 10 while
-that channel's newest build is one, from the nightly sources as before). These versions select their device payload by exact
-GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
-a family of GPUs, or none), or you want to target a different GPU, also pass
-`--family` with the raw `gfx` code instead of a family label:
+ROCm 10 and newer ship from a different source layout than ROCm 7: stable
+releases from `stable.repo.amd.com` and nightlies from `nightly.repo.amd.com`.
+That is the layout an install reads unless it asks for something older. A stable
+pin of ROCm 10 or newer, a nightly pinned to a build date of 2026-08-23 or later,
+and an install with no pin at all all read it. The earlier release stream
+(`repo.amd.com`) and the earlier nightly stream (`rocm.nightlies.amd.com`), which
+stopped receiving builds on 2026-08-22, are read only when you pin something that
+exists only there: a ROCm 7 release, or a nightly from before 2026-08-23. These
+versions select their device payload by exact GPU arch, so when ROCm CLI can't
+resolve one for this computer (it detects only a family of GPUs, or none), or you
+want to target a different GPU, also pass `--family` with the raw `gfx` code
+instead of a family label:
 
 ```
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
@@ -617,7 +626,17 @@ instead of being resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
 `rocm examine` to see the arch this machine reports. If ROCm CLI detects a GPU
 family but not the exact arch, the error names the command to re-run. If it
-detects no GPU, pass the raw `gfx` code yourself.
+detects no GPU, pass the raw `gfx` code yourself. The earlier ROCm 7 releases
+still publish family payloads, so `--family gfx120X-all --version 7.14.1`
+installs one.
+
+An install with no pin on the nightly channel takes the newest build that has a
+complete PyTorch stack. A nightly `rocm` build is published before its PyTorch
+wheels, so when the newest one has none yet, the install uses the build before it
+and prints a warning naming both.
+
+A tarball catalog can be pinned only in this layout, so `--format tarball
+--version 7.14.1` is refused and points to `--format wheel`, which can.
 
 For ROCm 10, `install sdk` pins torchaudio itself, because its metadata names no
 ROCm build. When a torchaudio release has been verified on hardware for the
@@ -636,11 +655,11 @@ dependency metadata alongside the pinned torchaudio. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
-Nothing about this happens on its own on the release channel. Without a
-`--version` of 10 or newer, `install sdk` resolves the same release and nightly
-sources as before. It doesn't
-quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
-you what it couldn't find instead.
+`rocm update` keeps a runtime on the layout it was installed from. A runtime
+installed from an earlier stream is not moved to the newest layout, and those
+streams no longer publish new builds, so reinstall with `rocm install sdk` to
+move it. `install sdk` doesn't quietly retry against the other layout when a
+lookup finds nothing; it tells you what it couldn't find instead.
 
 #### Driver installation
 
@@ -1556,6 +1575,13 @@ standard input, it sends one prompt and prints the reply.
 - `--temperature`, `--top-p`, and `--max-tokens` are optional sampling controls
   forwarded to the request. Each is independent, so omit any of them to use the
   provider's default.
+- A dashboard chat message waits up to 2 minutes for the whole reply, including
+  any tool calls. The first message to a local model can take tens of seconds
+  while the model reads the system prompt and tool list. Set
+  `ROCM_DASH_CHAT_TIMEOUT_SECS` to a whole number of seconds from 1 to 3600 to
+  change the wait; an unset, empty, non-numeric or out-of-range value keeps the
+  2 minutes.
+  The timeout message names the wait that applied and this variable.
 
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
