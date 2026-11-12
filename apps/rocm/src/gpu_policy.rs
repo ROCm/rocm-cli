@@ -801,7 +801,14 @@ fn amd_smi_probe_json(args: &[&str], purpose: &str) -> Option<serde_json::Value>
 /// interface and return `None`.
 #[cfg(target_os = "linux")]
 fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
-    let rows = read_drm_vram_usage(Path::new("/sys/class/drm"));
+    // Through `host_path`, like every other DRM read. `rocm_core`'s
+    // `hardware_root` module already lists "the DRM cards under
+    // `/sys/class/drm`" among the paths a simulated host root re-roots, and
+    // this was the one caller naming the absolute path directly -- so a
+    // simulated APU could be planted for the gfx-target probe while this probe
+    // kept reading the runner's own cards. `host_path` is the identity in a
+    // release build, so nothing outside the E2E suite changes.
+    let rows = read_drm_vram_usage(&rocm_core::host_path("/sys/class/drm"));
     if rows.is_empty() { None } else { Some(rows) }
 }
 

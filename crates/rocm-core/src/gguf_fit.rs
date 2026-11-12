@@ -218,7 +218,10 @@ pub enum CannotEstimateReason {
     NoGpu,
     /// The GPU's memory could not be measured.
     AcceleratorMemoryUnknown,
-    /// An APU: the pool the engine allocates from is not readable.
+    /// An APU whose shared pool could not be read **on this host**: the figure
+    /// was absent or unparseable. The pool itself is readable in general -- see
+    /// [`crate::model_readiness::AcceleratorMemory::Unified`], which carries it
+    /// and does produce an estimate.
     UnifiedMemoryUnreadable,
 }
 
@@ -821,10 +824,15 @@ pub fn estimate_fit(
             ),
             AcceleratorMemory::UnifiedMemoryUnreadable => (
                 CannotEstimateReason::UnifiedMemoryUnreadable,
-                "this host has no dedicated VRAM and the CLI cannot yet read the memory pool its \
-                 engine allocates from, so there is nothing to compare the figures against",
+                "this host has no dedicated VRAM, and the figure for the memory pool its engine \
+                 allocates from could not be read here, so there is nothing to compare the \
+                 figures against",
             ),
-            AcceleratorMemory::Unknown | AcceleratorMemory::Dedicated(_) => (
+            // `Dedicated` and `Unified` both carry a figure, so neither reaches
+            // this branch; the arm exists because the match is exhaustive.
+            AcceleratorMemory::Unknown
+            | AcceleratorMemory::Dedicated(_)
+            | AcceleratorMemory::Unified { .. } => (
                 CannotEstimateReason::AcceleratorMemoryUnknown,
                 "the GPU memory on this host could not be read, so there is nothing to compare \
                  the figures against",
@@ -834,6 +842,19 @@ pub fn estimate_fit(
         estimate.detail = Some(detail.to_owned());
         return estimate;
     };
+    // `available_gib` is a ceiling on memory shared with the operating system
+    // here, not a dedicated pool, so a `Fits` below is "the machine would allow
+    // this at best" rather than "this much is waiting for it". Said on the
+    // estimate itself, because the figure is printed beside the totals with
+    // nothing else to tell the two kinds of number apart.
+    if memory.is_shared_pool() {
+        estimate.notes.push(
+            "this host's integrated GPU has no dedicated VRAM: the memory compared against is \
+             the ceiling on a pool it shares with the operating system, so how much is free \
+             depends on what else is running"
+                .to_owned(),
+        );
+    }
     // A layout whose figure can be too low gets the figures and no verdict: a
     // confident "fits" that is wrong costs a user a failed load, and a margin
     // with no measurement behind it would be a guess. The host's memory is

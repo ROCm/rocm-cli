@@ -70,4 +70,9 @@ tempfile = "3"
 chrono.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_System_LibraryLoader` is for `host_gpu/unified_memory.rs`, which loads
+# `dxgi.dll` by absolute System32 path to read the WDDM shared-memory budget.
+# There is no `Win32_Graphics_Dxgi` feature to use instead: windows-sys carries
+# no COM interfaces at all, so the three vtable slots that read are declared in
+# that module.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

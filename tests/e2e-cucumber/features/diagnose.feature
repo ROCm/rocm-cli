@@ -867,3 +867,57 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine whose only GPU is a released one
     When the user asks the CLI what that machine's report would carry in machine-readable form
     Then the report names the CLI version that `rocm version` leads with
+
+  # ROCMAI-912. An APU has no private VRAM: every adapter query reports the
+  # fixed BIOS carve-out as the device's memory (512 MiB on a Ryzen 7 4700U,
+  # ~4 GiB on a Strix Halo) while the engine allocates out of system memory the
+  # GPU is given an aperture onto. Comparing a recipe's minimum against the
+  # carve-out refuses nearly every curated model on machines that serve them,
+  # which is why `--model` used to answer "could not determine" on every APU.
+  #
+  # The aperture IS readable -- `mem_info_gtt_total` beside the carve-out on
+  # Linux, `DXGI_ADAPTER_DESC1::SharedSystemMemory` on Windows -- so the figure
+  # the verdict is reached against is that one. The host is simulated, as in
+  # diagnose-40: a kernel topology naming a gfx1151 part and a DRM card
+  # carrying both counters, so the scenario describes the same machine on every
+  # lane rather than whatever GPU the runner has. Linux-gated because the
+  # simulation seam re-roots Linux paths only; the Windows source is covered by
+  # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
+  # it can have (see the PR text).
+  @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
+  Scenario: diagnose-59 - An integrated GPU is judged on the pool it allocates from, not its carve-out
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the shared pool, not the carve-out
+    And the model is reported as degraded, because the pool is shared rather than set aside
+
+  # The other half: the pool is readable in general, not on every host. An
+  # older kernel exposes no `mem_info_gtt_total`, and a container may pass no
+  # DRM device through. That host must be told the figure could not be read --
+  # not handed installed system RAM, which over-estimates in the one direction
+  # that produces a confident wrong "it fits", and not the generic
+  # "could not measure the GPU" either, whose remedy is to run `amd-smi` again:
+  # `amd-smi` already answered here, with the wrong pool, and would answer
+  # identically forever.
+  @id:diagnose-model-an-unreadable-shared-pool-is-said-not-guessed @requires-os:linux
+  Scenario: diagnose-60 - An integrated GPU whose pool cannot be read is told so, not given a number
+    Given a machine whose only GPU shares system memory, with the pool it may use unreadable
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is that the shared pool could not be read, and no memory figure is claimed
+
+  # The hazard the aperture read introduces. `mem_info_gtt_total` exists on a
+  # discrete card too, so the figure reaches the classification on every host.
+  # A discrete card must be judged on its own VRAM and nothing else: added to
+  # it, an 8 GiB card would answer as 68 GiB and every model would "fit";
+  # replacing it would judge the card on a pool it never allocates from. The
+  # planted machine carries a large aperture beside a small VRAM figure, so a
+  # verdict reached on either wrong number is visible in the report.
+  @id:diagnose-model-a-discrete-card-is-never-credited-with-the-aperture @requires-os:linux
+  Scenario: diagnose-61 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
+    Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the card's own VRAM alone
