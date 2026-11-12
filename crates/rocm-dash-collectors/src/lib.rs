@@ -7,6 +7,7 @@
 //! Every collector implements one of the traits in `rocm_dash_core::traits`.
 
 pub mod amd_smi;
+pub mod ancestry;
 pub mod bench_load;
 pub mod bench_tail;
 pub mod cgroup;
