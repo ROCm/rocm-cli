@@ -366,8 +366,12 @@ Feature: Model serving
   # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
-  # skip every night (the nightly job logs whether Docker is reachable).
+  # Docker is reachable on the pool host the nightly Strix Halo lane runs on: a
+  # dispatch of the same lane (e2e-selfhosted.yml run 43025895270) passed
+  # serve-26 on both channel legs, so it does not skip there. serve-27 fails
+  # there at stopping the AIM service ("STOP FAILED (rc=1) ... Local server stop
+  # not confirmed"). On a host without Docker both skip (the nightly job logs
+  # whether Docker is reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
