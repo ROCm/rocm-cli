@@ -1902,12 +1902,19 @@ jobs:
                 "{workflow} `{report_job}`: LANE_REPORTS must map every self-hosted lane, \
                  in workflow order, to the artifact its upload step names"
             );
-            for (job, _) in &lanes {
-                assert!(
-                    block.lines().any(|line| line.trim() == format!("- {job}")),
-                    "{workflow} `{report_job}` must list `{job}` under needs, or the \
-                     missing-report check cannot see whether it ran"
-                );
+            // The nightly report job reads its lanes through `e2e-lanes-settled`
+            // (see `nightly_report_reads_lanes_through_the_queue_deadline_job`),
+            // not through `needs`: a lane in `needs` would hold the report for
+            // as long as the lane sits queued.
+            let reads_lanes_through_needs = workflow != "nightly.yml";
+            if reads_lanes_through_needs {
+                for (job, _) in &lanes {
+                    assert!(
+                        block.lines().any(|line| line.trim() == format!("- {job}")),
+                        "{workflow} `{report_job}` must list `{job}` under needs, or the \
+                         missing-report check cannot see whether it ran"
+                    );
+                }
             }
             assert!(
                 block.lines().any(|line| line.trim() == "actions: read"),
@@ -1916,10 +1923,15 @@ jobs:
             // `!cancelled()` rather than the implicit `success()`: the check has
             // to run precisely when an earlier step or a lane has failed.
             let step_lines: Vec<&str> = step.lines().map(str::trim).collect();
+            let needs_env = if reads_lanes_through_needs {
+                "NEEDS: ${{ toJSON(needs) }}"
+            } else {
+                "NEEDS: ${{ needs.e2e-lanes-settled.outputs.lane_results }}"
+            };
             for required in [
                 "if: ${{ !cancelled() }}",
                 "GH_TOKEN: ${{ github.token }}",
-                "NEEDS: ${{ toJSON(needs) }}",
+                needs_env,
             ] {
                 assert!(
                     step_lines.contains(&required),
@@ -2227,6 +2239,401 @@ jobs:
             log.contains("could not list this run's artifacts"),
             "an API failure must say so rather than fail silently:\n{log}"
         );
+    }
+
+    /// The `- item` entries of a job's `needs:` list.
+    fn job_needs(block: &str) -> Vec<String> {
+        let mut lines = block
+            .lines()
+            .skip_while(|line| line.trim_end() != "    needs:");
+        if lines.next().is_none() {
+            return Vec::new();
+        }
+        lines
+            .take_while(|line| line.starts_with("      - "))
+            .map(|line| line.trim_start_matches([' ', '-']).to_owned())
+            .collect()
+    }
+
+    /// A step env value, e.g. `QUEUE_DEADLINE_MINUTES: "120"`, as the bare value.
+    fn env_value(block: &str, key: &str) -> String {
+        let prefix = format!("{key}:");
+        block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("block sets `{key}`"))
+            .trim()
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    #[test]
+    fn nightly_report_reads_lanes_through_the_queue_deadline_job() {
+        // GitHub cannot time a job out while it waits for a runner, so a lane in
+        // the `needs` of any job that publishes a report holds that report back
+        // until the 24h limit when its runner pool is offline. The lanes are
+        // reached through `e2e-lanes-settled`, which gives up on a lane that
+        // never started; the run is then ended by `cancel-abandoned-e2e-lanes`.
+        let nightly = read_workflow("nightly.yml");
+        let lanes = self_hosted_e2e_jobs(&nightly);
+        assert!(!lanes.is_empty(), "nightly.yml has self-hosted lanes");
+
+        // No job may wait on a lane directly.
+        for job in job_ids(&nightly) {
+            let needs = job_needs(job_block(&nightly, &job));
+            for (lane, _) in &lanes {
+                assert!(
+                    !needs.contains(lane),
+                    "nightly.yml job `{job}` lists lane `{lane}` under needs, so a lane that is \
+                     queued on an offline pool would hold `{job}` for 24 hours; read the lane \
+                     through `e2e-lanes-settled`"
+                );
+            }
+        }
+        assert!(
+            job_needs(job_block(&nightly, "e2e-report-nightly"))
+                .contains(&"e2e-lanes-settled".to_owned()),
+            "the nightly report job must wait on `e2e-lanes-settled`"
+        );
+
+        // The settle job knows every lane, by the display name the API reports.
+        let settle = job_block(&nightly, "e2e-lanes-settled");
+        let expected: Vec<String> = lanes
+            .iter()
+            .map(|(job, _)| {
+                let name = job_scalar(job_block(&nightly, job), "name");
+                format!("{job}={name}")
+            })
+            .collect();
+        assert_eq!(
+            block_scalar_lines(settle, "LANES"),
+            expected,
+            "`e2e-lanes-settled` LANES must list every self-hosted nightly lane, in workflow \
+             order, as `job id=display name`; a lane missing here is never waited for and a \
+             misspelt name reads as `absent`"
+        );
+
+        // The deadlines are ordered, and the job's own cap lets the script stop
+        // itself rather than being killed mid-wait.
+        let queue: u32 = env_value(settle, "QUEUE_DEADLINE_MINUTES").parse().unwrap();
+        let hard: u32 = env_value(settle, "HARD_DEADLINE_MINUTES").parse().unwrap();
+        let cap: u32 = job_scalar(settle, "timeout-minutes").parse().unwrap();
+        let longest_lane = lanes
+            .iter()
+            .map(|(job, _)| {
+                job_scalar(job_block(&nightly, job), "timeout-minutes")
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| panic!("lane `{job}` has a numeric timeout-minutes"))
+            })
+            .max()
+            .unwrap();
+        assert!(
+            queue + longest_lane <= hard,
+            "a lane that starts just before the queue deadline ({queue}m) must finish \
+             ({longest_lane}m) before the hard deadline ({hard}m)"
+        );
+        assert!(
+            hard < cap,
+            "the script's hard deadline ({hard}m) must come before the job's timeout ({cap}m)"
+        );
+
+        // The canceller runs last, after every other job, or it would cancel a
+        // job that is still producing a report.
+        let cancel = job_block(&nightly, "cancel-abandoned-e2e-lanes");
+        let mut others: Vec<String> = job_ids(&nightly)
+            .into_iter()
+            .filter(|job| job != "cancel-abandoned-e2e-lanes")
+            .filter(|job| !lanes.iter().any(|(lane, _)| lane == job))
+            .collect();
+        let mut needs = job_needs(cancel);
+        others.sort();
+        needs.sort();
+        assert_eq!(
+            needs, others,
+            "`cancel-abandoned-e2e-lanes` must need every job except the lanes it cancels"
+        );
+        assert!(
+            cancel.lines().any(|line| line.trim() == "actions: write"),
+            "cancelling a run needs `actions: write`"
+        );
+        assert!(
+            cancel.contains("gh run cancel \"$GITHUB_RUN_ID\""),
+            "the canceller must cancel this run"
+        );
+        let condition = job_scalar(cancel, "if");
+        assert!(
+            condition.starts_with("${{ always()") && condition.contains("abandoned_count"),
+            "the canceller must run even after a failed job, and only when a lane was given up \
+             on: {condition}"
+        );
+    }
+
+    /// Run `.github/scripts/settle-e2e-lanes.sh` against canned job listings.
+    ///
+    /// `listings[n]` is what the `n`th `gh api` call returns (the last one
+    /// repeats; `FAIL` makes the call fail like an API outage). `minutes_since_created`
+    /// is "now" relative to every job's `created_at`. Returns the exit code,
+    /// the log, the `GITHUB_OUTPUT` file, the step summary and the call count.
+    #[cfg(unix)]
+    fn run_settle(
+        listings: &[&str],
+        minutes_since_created: u64,
+    ) -> (i32, String, String, String, u32) {
+        const CREATED: u64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stub = dir.path().join("gh");
+        rocm_core::fake_executable::write_fake_executable(
+            &stub,
+            "#!/bin/sh\n\
+             n=$(cat \"$STUB_DIR/count\" 2>/dev/null || echo 0)\n\
+             n=$((n+1))\n\
+             echo $n > \"$STUB_DIR/count\"\n\
+             f=\"$STUB_DIR/call.$n\"\n\
+             [ -f \"$f\" ] || f=\"$STUB_DIR/call.last\"\n\
+             if grep -qx FAIL \"$f\"; then echo 'HTTP 502' >&2; exit 1; fi\n\
+             cat \"$f\"\n",
+        )
+        .expect("plant gh stub");
+        for (n, listing) in listings.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("call.{}", n + 1)), listing)
+                .expect("write listing");
+        }
+        std::fs::write(
+            dir.path().join("call.last"),
+            listings.last().expect("at least one listing"),
+        )
+        .expect("write last listing");
+        let (output, summary) = (dir.path().join("output"), dir.path().join("summary"));
+        std::fs::write(&output, "").expect("write output");
+        std::fs::write(&summary, "").expect("write summary");
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        // `timeout`: a script that never settles must fail this test, not hang it.
+        let out = std::process::Command::new("timeout")
+            .arg("60")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", path)
+            .env("STUB_DIR", dir.path())
+            .env("LANES", "lane-a=Lane A (gpu)\nlane-b=Lane B (gpu)\n")
+            .env("QUEUE_DEADLINE_MINUTES", "120")
+            .env("HARD_DEADLINE_MINUTES", "300")
+            .env("POLL_SECS", "0")
+            .env(
+                "SETTLE_NOW_EPOCH",
+                (CREATED + minutes_since_created * 60).to_string(),
+            )
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .env("GITHUB_OUTPUT", &output)
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .expect("running the settle script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status.code().expect("settle exited with a status code"),
+            log,
+            std::fs::read_to_string(&output).expect("read output"),
+            std::fs::read_to_string(&summary).expect("read summary"),
+            std::fs::read_to_string(dir.path().join("count"))
+                .expect("gh was called")
+                .trim()
+                .parse()
+                .expect("call count"),
+        )
+    }
+
+    /// One line of a jobs listing, as `gh api --jq '.jobs[]'` prints it.
+    #[cfg(unix)]
+    fn listed_job(name: &str, status: &str, conclusion: Option<&str>) -> String {
+        serde_json::json!({
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "created_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string()
+            + "\n"
+    }
+
+    /// Both legs of a lane in one state, plus an unrelated job the script must ignore.
+    #[cfg(unix)]
+    fn lane_legs(lane: &str, status: &str, conclusion: Option<&str>) -> String {
+        listed_job(&format!("{lane} (release)"), status, conclusion)
+            + &listed_job(&format!("{lane} (nightly)"), status, conclusion)
+    }
+
+    #[cfg(unix)]
+    fn settle_results(output: &str) -> serde_json::Value {
+        let line = output
+            .lines()
+            .find_map(|line| line.strip_prefix("lane_results="))
+            .unwrap_or_else(|| panic!("no lane_results in {output:?}"));
+        serde_json::from_str(line).expect("lane_results is JSON")
+    }
+
+    #[cfg(unix)]
+    fn settle_has_jq() -> bool {
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !has_jq {
+            // As in the missing-report check's test: a skip reads as a pass, so
+            // on CI a missing `jq` must fail loudly.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`jq` is not on PATH, so the settle script's logic cannot be exercised; \
+                 install it on this runner"
+            );
+            eprintln!("skipping: no `jq` on PATH");
+        }
+        has_jq
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_reports_finished_lanes_and_gives_up_only_on_lanes_that_never_started() {
+        if !settle_has_jq() {
+            return;
+        }
+        let other = listed_job("Build Linux nightly assets", "queued", None);
+
+        // Everything finished: the results carry through in the `needs` shape.
+        let done = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("failure"))
+            + &other;
+        let (code, log, output, summary, _) = run_settle(&[&done], 10);
+        assert_eq!(code, 0, "{log}");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-a"]["result"], "success", "{results}");
+        assert_eq!(results["lane-b"]["result"], "failure", "{results}");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+        assert!(summary.is_empty(), "nothing given up on: {summary}");
+
+        // A lane still queued past the deadline is given up on, by name, while
+        // the lane that finished keeps its own result. This is the stuck-nightly
+        // case: it must settle instead of waiting for a runner that never comes.
+        let stuck = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "queued", None)
+            + &other;
+        let (code, log, output, summary, calls) = run_settle(&[&stuck], 121);
+        assert_eq!(
+            code, 0,
+            "a queued lane past the deadline must not hang:\n{log}"
+        );
+        assert_eq!(calls, 1, "nothing left to wait for");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-a"]["result"], "success", "{results}");
+        assert_eq!(results["lane-b"]["result"], "abandoned", "{results}");
+        assert!(output.contains("abandoned_count=2"), "both legs: {output}");
+        assert!(
+            summary.contains("Lane B (gpu) (release)")
+                && summary.contains("Lane B (gpu) (nightly)"),
+            "the summary must name each leg given up on: {summary}"
+        );
+        assert!(
+            !summary.contains("Lane A"),
+            "a finished lane is not given up on: {summary}"
+        );
+
+        // Within the deadline a queued lane is waited for, and its result is
+        // used once it runs.
+        let queued = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "queued", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (code, log, output, _, calls) = run_settle(&[&queued, &queued, &finished], 119);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 3, "must keep polling while a lane can still start");
+        assert_eq!(settle_results(&output)["lane-b"]["result"], "success");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_waits_for_a_lane_that_started_but_not_past_the_hard_deadline() {
+        if !settle_has_jq() {
+            return;
+        }
+        let running = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "in_progress", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+
+        // Started before the queue deadline and still running past it: a slow
+        // lane is waited for, since cutting it off would drop a partial report
+        // that is about to exist.
+        let (code, log, output, _, calls) = run_settle(&[&running, &finished], 200);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "a started lane must be waited for");
+        assert_eq!(settle_results(&output)["lane-b"]["result"], "success");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+
+        // But not forever: a runner that hangs is given up on at the hard deadline.
+        let (code, log, output, _, calls) = run_settle(&[&running], 301);
+        assert_eq!(code, 0, "a hung lane must not hang the wait:\n{log}");
+        assert_eq!(calls, 1, "{log}");
+        assert_eq!(settle_results(&output)["lane-b"]["result"], "abandoned");
+        assert!(output.contains("abandoned_count=2"), "{output}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_reports_skipped_cancelled_and_unknown_lanes_distinctly() {
+        if !settle_has_jq() {
+            return;
+        }
+        // `skipped` is the one result the missing-report check waves through, so
+        // it must mean every leg was skipped; `absent` is what a renamed lane
+        // reads as, and the check flags it.
+        let listing = lane_legs("Lane A (gpu)", "completed", Some("skipped"));
+        let (code, log, output, _, _) = run_settle(&[&listing], 5);
+        assert_eq!(code, 0, "{log}");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-a"]["result"], "skipped", "{results}");
+        assert_eq!(results["lane-b"]["result"], "absent", "{results}");
+
+        let mixed = listed_job("Lane A (gpu) (release)", "completed", Some("skipped"))
+            + &listed_job("Lane A (gpu) (nightly)", "completed", Some("cancelled"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (_, _, output, _, _) = run_settle(&[&mixed], 5);
+        assert_eq!(
+            settle_results(&output)["lane-a"]["result"],
+            "cancelled",
+            "one skipped leg does not make the lane skipped"
+        );
+
+        // A lane whose name merely starts with another lane's is not its leg.
+        let prefix = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane A (gpu, extra)", "queued", None)
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (code, log, output, _, calls) = run_settle(&[&prefix], 5);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 1, "the look-alike lane is not Lane A's leg");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_survives_a_failed_api_call() {
+        if !settle_has_jq() {
+            return;
+        }
+        let done = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        // A failed listing must neither settle (the lanes would read as absent)
+        // nor abort the job.
+        let (code, log, output, _, calls) = run_settle(&["FAIL\n", &done], 5);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "{log}");
+        assert!(log.contains("could not list this run's jobs"), "{log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
     }
 
     /// The `name:` of `step`, a block as `step_block` returns it (its first
