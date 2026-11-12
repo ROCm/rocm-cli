@@ -1203,6 +1203,12 @@ mod tests {
             entries.contains(&compat_dir),
             "the link only helps when its directory is on LD_LIBRARY_PATH: {entries:?}"
         );
+        // After the SDK's own directory, so a real bare name found there wins.
+        let position = |dir: &Path| entries.iter().position(|entry| entry == dir);
+        assert!(
+            position(&sdk_lib).unwrap() < position(&compat_dir).unwrap(),
+            "the link directory must come after the SDK's: {entries:?}"
+        );
     }
 
     #[test]

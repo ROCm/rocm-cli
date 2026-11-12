@@ -397,6 +397,67 @@ mod tests {
         });
     }
 
+    /// The torch probe runs with the amd-smi link's directory on its loader path
+    /// where an install or launch already made it, and never writes one: an
+    /// examination must not change the environment it reports on.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_framework_probe_picks_up_an_existing_amd_smi_link_and_never_writes_one() {
+        use crate::fake_executable::write_fake_executable;
+
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-amd-smi-{}",
+            crate::test_support::unique_suffix()
+        ));
+        let sdk_lib = root.join("sdk").join("lib");
+        let bin = root.join("env").join("bin");
+        let compat = root.join("env").join(crate::RUNTIME_COMPAT_DIR_NAME);
+        std::fs::create_dir_all(&sdk_lib).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let python = bin.join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\n\
+                 case \"${env}\" in\n\
+                 *{compat_name}*) printf '%s' '{ok}' ;;\n\
+                 *) printf '%s' '{broken}' ;;\n\
+                 esac\n",
+                env = RUNTIME_LIBRARY_PATH_ENV,
+                compat_name = crate::RUNTIME_COMPAT_DIR_NAME,
+                ok = RUNTIME_TORCH_OK_JSON,
+                broken = r#"{"ok":false,"error":"no amd-smi link on the loader path"}"#,
+            ),
+        )
+        .unwrap();
+        let interpreter = FrameworkInterpreter {
+            python,
+            library_paths: vec![sdk_lib.clone()],
+        };
+
+        let mut without = Examination::default();
+        probe_framework(&mut without, FrameworkProbe::PyTorch, Some(&interpreter));
+        let written = compat.exists();
+
+        std::fs::create_dir_all(&compat).unwrap();
+        std::os::unix::fs::symlink(
+            sdk_lib.join("libamd_smi.so.26"),
+            compat.join("libamd_smi.so"),
+        )
+        .unwrap();
+        let mut with = Examination::default();
+        probe_framework(&mut with, FrameworkProbe::PyTorch, Some(&interpreter));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(!written, "the probe wrote the shim directory");
+        assert_ne!(without.framework_version, "2.11.0+rocm7.14.1");
+        assert_eq!(with.framework_version, "2.11.0+rocm7.14.1");
+    }
+
     #[test]
     #[cfg(unix)]
     fn the_framework_probe_reads_the_active_runtimes_torch() {

@@ -454,7 +454,7 @@ mod tests {
     /// The device probe has to carry the amd-smi link's directory on its loader
     /// path, or a torch beside a host ROCm counts no devices. The interpreter here
     /// is a script that reports the `LD_LIBRARY_PATH` it was started with.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_device_probe_runs_with_the_amd_smi_link_on_its_loader_path() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;

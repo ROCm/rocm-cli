@@ -487,7 +487,7 @@ pub const RUNTIME_COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
 
 /// The shim directory of the environment `python` belongs to, or `None` for an
 /// interpreter that is not in a managed environment's `bin` folder.
-pub fn runtime_compat_dir_for_python(python: &Path) -> Option<PathBuf> {
+fn runtime_compat_dir_for_python(python: &Path) -> Option<PathBuf> {
     crate::runtime_python_env_root_for_executable(python)
         .map(|root| root.join(RUNTIME_COMPAT_DIR_NAME))
 }
@@ -510,9 +510,10 @@ pub fn runtime_compat_dir_for_python(python: &Path) -> Option<PathBuf> {
 /// loader path that carries `compat_dir` makes the package open the library that
 /// is already loaded rather than a second one. Returns `compat_dir` when it holds
 /// the link, for the caller to add to the loader path. Returns `None`, and writes
-/// nothing, when no directory in `library_dirs` holds the library, when the first
-/// that does already holds the bare name (the loader finds it there), or when the
-/// link cannot be made.
+/// nothing, when no directory in `library_dirs` holds the library, when any
+/// directory in `library_dirs` already holds the bare name (the loader finds it
+/// ahead of the link, which goes last), or when the link cannot be made. Where
+/// more than one soname is present in a directory, the highest by number is used.
 pub fn ensure_amd_smi_compat(compat_dir: &Path, library_dirs: &[PathBuf]) -> Option<PathBuf> {
     let library = amd_smi_library_needing_bare_name(library_dirs)?;
     crate::openmpi::ensure_compat_symlink(compat_dir, "libamd_smi.so", &library)

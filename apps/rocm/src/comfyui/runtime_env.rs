@@ -1994,7 +1994,12 @@ mod tests {
             .map(|(_, value)| value.clone())
             .context("LD_LIBRARY_PATH was not assigned")?;
         let entries: Vec<PathBuf> = std::env::split_paths(&ld_library_path).collect();
-        assert!(entries.contains(&compat), "{entries:?}");
+        // After the SDK's own directory, so a real bare name found there wins.
+        let position = |dir: &Path| entries.iter().position(|entry| entry == dir);
+        assert!(
+            position(&sdk_lib).unwrap() < position(&compat).context("link dir missing")?,
+            "the link directory must come after the SDK's: {entries:?}"
+        );
         assert_eq!(
             fs::read_link(compat.join("libamd_smi.so"))?,
             sdk_lib.join("libamd_smi.so.26")

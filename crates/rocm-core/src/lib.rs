@@ -162,8 +162,7 @@ pub use managed_runtime::{
     active_managed_framework_interpreter, active_managed_therock_channel,
     active_managed_therock_environment, active_managed_therock_version,
     detect_managed_therock_family, ensure_amd_smi_compat, prepend_runtime_paths,
-    runtime_compat_dir_for_python, runtime_loader_path_entries,
-    runtime_loader_path_entries_read_only,
+    runtime_loader_path_entries, runtime_loader_path_entries_read_only,
 };
 use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
