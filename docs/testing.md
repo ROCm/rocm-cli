@@ -4842,13 +4842,13 @@ generated. It was recorded once from a real older build and lives in
 
 A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
 `examine-fails`. The stub then answers `rocm examine --json`, and a case without a
-`host` still refuses it. The reply is the recorded examination with only the fields
-the host implies changed (`is_wsl`, `has_amd_gpu` and, for `amd-found`, one GPU), and
-its `status` is recomputed by `Examination::compute_status`, the rule the probe uses,
-so a recording cannot say a status the other fields contradict. The real command prints
-those fields plus a `summary` object that only the `rocm` binary can build, so the
-replay leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in
-it. Some fields are typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+`host` still refuses it. The reply is the recorded examination with the fields the host
+implies set, whatever the recording held for them, and its `status` is recomputed by
+`Examination::compute_status`, the rule the probe uses, so a recording cannot say a
+status the other fields contradict. The real command prints those fields plus a
+`summary` object that only the `rocm` binary can build, so the replay leaves `summary`
+out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
+typed, not probed: the one GPU of `amd-found`, and the WSL facts of
 `wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
 with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
 exits 1 with a fixed message on stderr, which is what the case pins.
