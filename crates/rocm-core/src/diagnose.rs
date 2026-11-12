@@ -51,6 +51,40 @@ pub const MIN_SCORE_FOR_MATCH: i32 = 50;
 /// At/above this score the agent may propose the fix immediately.
 pub const HIGH_CONFIDENCE: i32 = 75;
 
+/// The engine a `--symptom` came from, when the user says so.
+///
+/// Engine-specific catalog entries must not claim a generic framework error for
+/// their engine, so they look for the engine's name in the pasted text (see
+/// `check_16_vllm_oom`). A paste that is the engine's own error line often does
+/// not carry the name, and editing the user's text to add one -- what the
+/// rocm-doctor skill tells an agent to do today, with a `vllm: ` prefix --
+/// changes what the user said. Naming the engine instead states where the text
+/// came from and leaves the text alone; the skill is to move to `--engine` in a
+/// later change.
+///
+/// Only the engines the catalog tells apart are listed: naming one changes
+/// matching, so a value that changed nothing would read as if it had been
+/// taken into account. The serialized names are the ones `rocm serve --engine`
+/// takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymptomEngine {
+    /// The vLLM serving engine.
+    Vllm,
+}
+
+/// Where a diagnosed symptom came from: the engine the user named, and the
+/// text they passed, exactly as given.
+///
+/// Recorded so a reader of the report can see that the engine was stated by
+/// the user rather than found in the text, and that the text was not edited
+/// to make it match.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymptomProvenance {
+    pub engine: SymptomEngine,
+    pub symptom: String,
+}
+
 /// A proposed remediation for a [`Diagnosis`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Fix {
@@ -147,6 +181,15 @@ pub struct DiagnoseReport {
     /// driver is also misconfigured is two findings, not one.
     #[serde(default)]
     pub model: Option<crate::model_readiness::ModelReadiness>,
+    /// The engine the symptom came from and the symptom itself, verbatim, when
+    /// the caller named an engine (`rocm diagnose --engine`).
+    ///
+    /// Absent otherwise, so a report diagnosed without an engine is unchanged.
+    /// Additive and optional: a consumer that does not know the field ignores
+    /// it, and `#[serde(default)]` lets a payload written before it existed
+    /// still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SymptomProvenance>,
 }
 
 /// Whether any diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
@@ -179,7 +222,9 @@ impl DiagnoseReport {
 /// being printed as a runnable lookalike of the user's error.
 #[must_use]
 pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
-    scores_on_every_engine_host(symptom, "fix-16-vllm-oom", run_all_checks)
+    scores_on_every_engine_host(symptom, "fix-16-vllm-oom", |e, s| {
+        run_all_checks(e, s, None)
+    })
 }
 
 /// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the engine-startup
@@ -197,12 +242,30 @@ pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
 /// name a command that finds nothing.
 #[must_use]
 pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
-    scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", run_all_checks)
+    scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", |e, s| {
+        run_all_checks(e, s, None)
+    })
 }
 
 /// Diagnose an examination against the closed catalog.
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
+    diagnose_with_engine(e, symptom, None)
+}
+
+/// [`diagnose`], with the engine the symptom came from when the user named it.
+///
+/// `engine` changes only what an engine-specific entry may score: with
+/// [`SymptomEngine::Vllm`], every line of `symptom` counts as vLLM's, exactly
+/// as if each line carried the word `vllm`. The symptom itself is never
+/// edited, and it is recorded verbatim in [`DiagnoseReport::provenance`]
+/// beside the engine.
+#[must_use]
+pub fn diagnose_with_engine(
+    e: &Examination,
+    symptom: &str,
+    engine: Option<SymptomEngine>,
+) -> DiagnoseReport {
     // WSL2 used to be short-circuited here as out of scope. It is a real platform
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
@@ -219,7 +282,7 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     let mut matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
-        run_all_checks(e, symptom)
+        run_all_checks(e, symptom, engine)
     };
     take_applicability_from_the_catalog(&mut matched, platform_family(e));
     DiagnoseReport {
@@ -230,6 +293,10 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         route_when_no_match: route_when_no_match(e),
         out_of_scope,
         model: None,
+        provenance: engine.map(|engine| SymptomProvenance {
+            engine,
+            symptom: symptom.to_owned(),
+        }),
     }
 }
 

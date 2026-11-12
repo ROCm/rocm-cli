@@ -365,6 +365,11 @@ rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
 rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
 ```
 
+The `vllm: ` in that symptom is what lets the diagnosis claim the line for
+vLLM: the line on its own is what any PyTorch program prints. To diagnose your
+own failing line without editing it, name the engine instead:
+`rocm diagnose --symptom '<the error>' --engine vllm`.
+
 ## Engine import failures
 
 A startup failure can also come from the engine failing to import, with no

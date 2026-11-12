@@ -2,14 +2,16 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The clap value enums behind the `--framework`, `--format`, `--provider`,
-//! `--mode`, `--device`, `--telemetry` and `--permissions` style arguments, and
-//! the conversions from them to the library types they stand for.
+//! The clap value enums behind the `--framework`, `diagnose --engine`,
+//! `--format`, `--provider`, `--mode`, `--device`, `--telemetry` and
+//! `--permissions` style arguments, and the conversions from them to the
+//! library types they stand for.
 //!
 //! Mechanically relocated from `cli.rs` with no behavior change: attributes,
 //! help text, aliases and declaration order are unchanged. `cli.rs` re-exports
 //! each type, so every module keeps reaching them as `crate::cli::Provider` and
-//! so on.
+//! so on. `DiagnoseEngineArg` (`diagnose --engine`) is the exception: it was
+//! added here after the move rather than relocated.
 
 use clap::ValueEnum;
 use rocm_core::{
@@ -44,6 +46,26 @@ impl From<FrameworkArg> for rocm_core::FrameworkProbe {
             FrameworkArg::Pytorch => Self::PyTorch,
             FrameworkArg::LlamaCpp => Self::LlamaCpp,
             FrameworkArg::Skip => Self::Skip,
+        }
+    }
+}
+
+/// Which engine a `rocm diagnose --symptom` came from.
+///
+/// The CLI-facing mirror of [`rocm_core::diagnose::SymptomEngine`], for the
+/// same reason as [`FrameworkArg`]. It lists only the engines the diagnosis
+/// catalog tells apart, under the names `rocm serve --engine` uses; the others
+/// are rejected as a usage error rather than accepted and silently ignored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum DiagnoseEngineArg {
+    /// The vLLM serving engine (`rocm serve --engine vllm`).
+    Vllm,
+}
+
+impl From<DiagnoseEngineArg> for rocm_core::diagnose::SymptomEngine {
+    fn from(value: DiagnoseEngineArg) -> Self {
+        match value {
+            DiagnoseEngineArg::Vllm => Self::Vllm,
         }
     }
 }

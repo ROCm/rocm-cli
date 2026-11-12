@@ -820,6 +820,7 @@ mod tests {
             },
             out_of_scope: None,
             model: None,
+            provenance: None,
         };
         let out = render_report_text(&report, 5);
         assert!(

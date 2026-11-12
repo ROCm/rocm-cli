@@ -1246,6 +1246,29 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
+### 6c. Naming the engine instead of editing the error
+
+Take the failing line from 6a without any `vllm` in it (the
+`torch.OutOfMemoryError: HIP out of memory ...` line from
+`rocm services logs <service-id>`), and diagnose it as is, then with the engine
+named:
+
+```bash
+rocm diagnose --symptom '<the line, unedited>' --json
+rocm diagnose --symptom '<the line, unedited>' --engine vllm --json
+```
+
+Expected result:
+
+- The first reports no vLLM out-of-memory cause: the line alone could be any
+  PyTorch program's.
+- The second reports `fix-16-vllm-oom`, with the same score and evidence as
+  `rocm diagnose --symptom 'vllm: <the line>' --json`, and its `provenance`
+  holds `"engine": "vllm"` and your line exactly as you passed it.
+- `--engine lemonade` (or any other value) is refused with a usage error that
+  lists `vllm`, and nothing is diagnosed. `--engine` without `--symptom` is
+  refused too.
+
 ## 7. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

@@ -13,8 +13,8 @@
 //! keeps reaching them as `crate::Command`, `crate::Provider` and so on.
 
 pub(crate) use crate::cli_args::{
-    DevicePolicyArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider, SandboxToolArg,
-    TelemetryModeArg, WatcherModeArg,
+    DevicePolicyArg, DiagnoseEngineArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider,
+    SandboxToolArg, TelemetryModeArg, WatcherModeArg,
 };
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::{bootstrap, chat, comfyui, remote, storage};
@@ -98,6 +98,19 @@ pub(crate) enum Command {
         /// Raw error text from the user; sharpens keyword scoring.
         #[arg(long)]
         symptom: Option<String>,
+        /// The engine the --symptom text came from, so it can be matched as
+        /// that engine's error without editing it.
+        ///
+        /// Some failure modes belong to one engine, and the error it prints
+        /// (a PyTorch out-of-memory error, for one) is the same text any other
+        /// program could print. Without this, such an entry matches only a
+        /// line that names the engine itself. With it, every line of the
+        /// symptom is taken as that engine's, the symptom is used exactly as
+        /// given, and the JSON report records both under `provenance`. Only
+        /// engines the catalog tells apart are accepted; writing `vllm` in the
+        /// symptom text still works as before.
+        #[arg(long, value_enum, value_name = "ENGINE", requires = "symptom")]
+        engine: Option<DiagnoseEngineArg>,
         /// Show at most this many matches (default 5).
         #[arg(long, default_value_t = 5)]
         top: usize,
@@ -1900,6 +1913,44 @@ mod tests {
         let mut argv = vec!["rocm", "diagnose"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv)
+    }
+
+    // `--engine` names where a symptom came from (ROCMAI-955). It takes only
+    // the engines the catalog tells apart, so an engine `serve` knows but the
+    // catalog does not is a usage error rather than a value silently ignored,
+    // and without a symptom it would describe nothing.
+    #[test]
+    fn diagnose_engine_takes_the_engines_the_catalog_tells_apart() {
+        let cli = parse_diagnose(&["--symptom", "torch.OutOfMemoryError", "--engine", "vllm"])
+            .expect("vllm parses");
+        match cli.command {
+            Some(Command::Diagnose {
+                engine, symptom, ..
+            }) => {
+                assert_eq!(
+                    engine.map(rocm_core::SymptomEngine::from),
+                    Some(rocm_core::SymptomEngine::Vllm)
+                );
+                assert_eq!(symptom.as_deref(), Some("torch.OutOfMemoryError"));
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        for unknown in ["lemonade", "aim", "llama.cpp", "VLLM-ish"] {
+            let error = parse_diagnose(&["--symptom", "x", "--engine", unknown])
+                .expect_err("an engine the catalog does not tell apart must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{unknown}"
+            );
+            assert!(error.to_string().contains("vllm"), "{error}");
+        }
+        let error = parse_diagnose(&["--engine", "vllm"])
+            .expect_err("an engine with no symptom describes nothing");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     // The context options describe the model being asked about, so without
