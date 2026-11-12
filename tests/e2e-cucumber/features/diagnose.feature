@@ -522,11 +522,20 @@ Feature: Diagnosing failures and listing fixes
   # already knows, and a copy can go stale silently. This is the machine-readable
   # form that replaces the copying — what a tool reads instead of parsing the
   # listing meant for people.
+  #
+  # A meaning is only worth publishing if it is true, so the last two steps run
+  # the CLI and hold the published text to what it does. Exit 2 is the one code
+  # with two causes: a fix-id the catalog does not have, and a command line the
+  # argument parser rejects before any fix-id is looked up. They share the code
+  # on purpose (a code of its own would change what existing readers of 2
+  # receive), so the catalog has to say so and say how to tell them apart.
   @id:diagnose-fix-catalog-is-machine-readable
-  Scenario: diagnose-34 - A tool can read the catalog without parsing prose
+  Scenario: diagnose-34 - A tool can read the catalog without parsing prose, and the shared exit code 2 can be told apart
     When a tool asks the CLI for its catalog in machine-readable form
     Then the catalog names every entry and what the CLI does with each
     And it gives the meaning of every exit code the CLI can return
+    And asking for a fix it does not offer exits with the code the catalog describes for that
+    And a malformed command line exits with that same code, as the catalog warns, and is told apart by its message
 
   # `--json` describes the whole catalog, so pairing it with one entry is a
   # question with no answer. Refusing beats ignoring the flag: a caller that

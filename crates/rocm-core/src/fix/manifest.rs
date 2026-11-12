@@ -55,8 +55,17 @@ pub struct ManifestEntry {
 pub struct CatalogManifest {
     pub contract_version: u32,
     pub entries: Vec<ManifestEntry>,
-    /// What each exit code from `rocm fix` means.
+    /// The number behind each exit-code name from `rocm fix`.
     pub exit_codes: std::collections::BTreeMap<String, i32>,
+    /// What each exit-code name in [`Self::exit_codes`] means, keyed by the same
+    /// names. A sibling map rather than a richer value in `exit_codes`, so a
+    /// reader written against name -> number keeps working: an added field,
+    /// which does not raise the contract version.
+    ///
+    /// `unknown_id` (2) says that a malformed command line exits 2 as well, and
+    /// how to tell the two refusals apart.
+    #[serde(default)]
+    pub exit_code_descriptions: std::collections::BTreeMap<String, String>,
 }
 
 /// Describe the catalog for a machine to read.
@@ -88,17 +97,14 @@ pub fn catalog_manifest() -> CatalogManifest {
                 doc_url: r.doc_url.map(ToOwned::to_owned),
             })
             .collect(),
-        exit_codes: [
-            ("ok", exit::OK),
-            ("internal", exit::INTERNAL),
-            ("unknown_id", exit::UNKNOWN_ID),
-            ("not_applicable", exit::NOT_APPLICABLE),
-            ("failed", exit::FAILED),
-            ("declined", exit::DECLINED),
-        ]
-        .into_iter()
-        .map(|(name, code)| (name.to_owned(), code))
-        .collect(),
+        exit_codes: exit::MEANINGS
+            .iter()
+            .map(|m| (m.name.to_owned(), m.code))
+            .collect(),
+        exit_code_descriptions: exit::MEANINGS
+            .iter()
+            .map(|m| (m.name.to_owned(), m.description.to_owned()))
+            .collect(),
     }
 }
 
@@ -154,6 +160,135 @@ mod tests {
             assert_eq!(entry.needs_reboot, recipe.needs_reboot, "{}", entry.id);
             assert_eq!(entry.needs_relogin, recipe.needs_relogin, "{}", entry.id);
         }
+    }
+
+    /// Every published code carries a description, under the same name, and
+    /// the table they come from names each code once. A name with a number and
+    /// no meaning is the gap ROCMAI-955 reported; two names for one number would
+    /// leave a reader unable to say which it got.
+    #[test]
+    fn every_published_exit_code_is_described_once() {
+        let manifest = catalog_manifest();
+        let named: Vec<&String> = manifest.exit_codes.keys().collect();
+        let described: Vec<&String> = manifest.exit_code_descriptions.keys().collect();
+        assert_eq!(named, described, "every exit code needs a description");
+        for (name, text) in &manifest.exit_code_descriptions {
+            assert!(!text.trim().is_empty(), "`{name}` is described by nothing");
+        }
+        let mut codes: Vec<i32> = exit::MEANINGS.iter().map(|m| m.code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            exit::MEANINGS.len(),
+            "two names publish the same exit code"
+        );
+        assert_eq!(
+            manifest.exit_codes.len(),
+            exit::MEANINGS.len(),
+            "two entries share a name"
+        );
+    }
+
+    /// Exit 2 means two things, and the description has to say both and how to
+    /// tell them apart, or a caller that reads it still cannot. The message it
+    /// names is the one `apply` prints, held to the same constant; that the
+    /// argument parser really exits 2 is checked in `apps/rocm`, which owns it
+    /// (`a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id`).
+    #[test]
+    fn the_unknown_id_description_names_the_usage_error_it_shares_a_code_with() {
+        let manifest = catalog_manifest();
+        assert_eq!(manifest.exit_codes["unknown_id"], exit::UNKNOWN_ID);
+        let text = &manifest.exit_code_descriptions["unknown_id"];
+        for needed in [
+            exit::UNKNOWN_ID_PREFIX,
+            "argument parser",
+            "malformed command line",
+            "`error:`",
+            // A one-time `rocm:` notice can precede either refusal, so the
+            // promise is about a line, not about where stderr starts.
+            "stderr line",
+        ] {
+            assert!(
+                text.contains(needed),
+                "the unknown_id description must mention `{needed}`: {text}"
+            );
+        }
+    }
+
+    /// `MEANINGS` claims to list every code `rocm fix` returns. The runners
+    /// return the `exit::` constants (held by
+    /// `fix_runners_return_named_exit_constants_not_integers`), so the set of
+    /// constants is the set of codes, and this holds the table to it: a new
+    /// constant fails here until it is described and published.
+    #[test]
+    fn every_exit_constant_is_published_and_nothing_else_is() {
+        let file = syn::parse_file(include_str!("options.rs")).expect("options.rs parses");
+        let exit_mod = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(m) if m.ident == "exit" => m.content.as_ref(),
+                _ => None,
+            })
+            .expect("options.rs has an inline `mod exit`");
+        let mut declared: Vec<(String, i32)> = exit_mod
+            .1
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Const(c) if matches!(&*c.ty, syn::Type::Path(p) if p.path.is_ident("i32")) => {
+                    let syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Int(value),
+                        ..
+                    }) = &*c.expr
+                    else {
+                        panic!("exit::{} is not an integer literal", c.ident);
+                    };
+                    Some((
+                        c.ident.to_string(),
+                        value.base10_parse().expect("an i32 literal"),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        declared.sort_by_key(|(_, code)| *code);
+        let mut published: Vec<i32> = exit::MEANINGS.iter().map(|m| m.code).collect();
+        published.sort_unstable();
+        let declared_codes: Vec<i32> = declared.iter().map(|(_, code)| *code).collect();
+        assert_eq!(
+            declared_codes, published,
+            "every exit:: constant must have exactly one MEANINGS entry, and no entry may \
+             publish a code no constant names; constants: {declared:?}"
+        );
+        // Name by name too: the published name is the constant's, lower-cased,
+        // so a reader of the manifest and a reader of the code use one word.
+        for (constant, code) in &declared {
+            let meaning = exit::MEANINGS
+                .iter()
+                .find(|m| m.code == *code)
+                .expect("checked above");
+            assert_eq!(
+                meaning.name,
+                constant.to_lowercase(),
+                "exit::{constant} is published under another name"
+            );
+        }
+    }
+
+    /// A manifest written before the descriptions existed still reads: the
+    /// field was added, so the contract version did not move, and that is only
+    /// true if an older document parses.
+    #[test]
+    fn a_manifest_without_descriptions_still_parses() {
+        let mut value = serde_json::to_value(catalog_manifest()).expect("serializes");
+        value
+            .as_object_mut()
+            .expect("an object")
+            .remove("exit_code_descriptions");
+        let older: CatalogManifest = serde_json::from_value(value).expect("an older manifest");
+        assert!(older.exit_code_descriptions.is_empty());
+        assert_eq!(older.contract_version, CATALOG_CONTRACT_VERSION);
     }
 
     #[test]

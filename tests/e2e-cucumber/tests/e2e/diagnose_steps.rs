@@ -2797,6 +2797,90 @@ async fn assert_exit_codes_published(world: &mut E2eWorld) {
             "the published exit codes are missing `{name}`:\n{catalog:#}"
         );
     }
+    // A name without a meaning leaves the caller guessing just the same, so
+    // every published code needs a description that says something.
+    for name in codes.keys() {
+        let description = catalog["exit_code_descriptions"][name]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !description.trim().is_empty(),
+            "exit code `{name}` is published without a description:\n{catalog:#}"
+        );
+    }
+}
+
+/// The catalog `rocm fix --json` printed earlier in the scenario. The steps
+/// that run the CLI again after it keep their output local, so it stays here.
+fn published_catalog(world: &E2eWorld) -> serde_json::Value {
+    let output = world.cli_output.as_ref().expect("no catalog was read");
+    serde_json::from_str(output).expect("catalog parses")
+}
+
+/// The code the catalog publishes for `name`, and its description.
+fn published_exit_code(catalog: &serde_json::Value, name: &str) -> (i32, String) {
+    let code = catalog["exit_codes"][name]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no exit code published for `{name}`:\n{catalog:#}"));
+    let description = catalog["exit_code_descriptions"][name]
+        .as_str()
+        .unwrap_or_else(|| panic!("no description published for `{name}`:\n{catalog:#}"))
+        .to_owned();
+    (
+        i32::try_from(code).expect("an exit code fits i32"),
+        description,
+    )
+}
+
+/// Whether some line of `stderr` starts with `prefix`. The description promises
+/// a line, not the start of stderr: a one-time `rocm:` notice printed at startup
+/// can come before either refusal.
+fn has_line_starting_with(stderr: &str, prefix: &str) -> bool {
+    stderr.lines().any(|line| line.starts_with(prefix))
+}
+
+#[then("asking for a fix it does not offer exits with the code the catalog describes for that")]
+async fn assert_unknown_fix_exits_as_published(world: &mut E2eWorld) {
+    let catalog = published_catalog(world);
+    let (code, description) = published_exit_code(&catalog, "unknown_id");
+    let (_stdout, stderr, rc) = crate::run_rocm(world, &["fix", "fix-does-not-exist"]);
+    assert_eq!(
+        rc, code,
+        "an unknown fix-id must exit with the code the catalog publishes for it; stderr:\n{stderr}"
+    );
+    // The description names the message that sets this refusal apart; the
+    // refusal has to actually print it, or the advice sends a caller looking
+    // for a line that never comes.
+    let marker = "Unknown fix-id:";
+    assert!(
+        description.contains(marker) && has_line_starting_with(&stderr, marker),
+        "the description must name `{marker}`, and a stderr line must start with it.\n\
+         description: {description}\nstderr:\n{stderr}"
+    );
+}
+
+#[then(
+    "a malformed command line exits with that same code, as the catalog warns, and is told apart by its message"
+)]
+async fn assert_usage_error_shares_the_unknown_id_code(world: &mut E2eWorld) {
+    let catalog = published_catalog(world);
+    let (code, description) = published_exit_code(&catalog, "unknown_id");
+    assert!(
+        description.contains("malformed command line") && description.contains("`error:`"),
+        "the catalog must warn that a usage error exits {code} too, and say how to spot it:\n\
+         {description}"
+    );
+    let (_stdout, stderr, rc) = crate::run_rocm(world, &["fix", "--no-such-option"]);
+    assert_eq!(
+        rc, code,
+        "a malformed `rocm fix` command line must exit {code}, as the catalog warns; stderr:\n{stderr}"
+    );
+    // A line for the `error:`, the whole of stderr for the absence: the
+    // unknown-id message must appear nowhere in a usage error.
+    assert!(
+        has_line_starting_with(&stderr, "error:") && !stderr.contains("Unknown fix-id:"),
+        "a usage error must be distinguishable by its message, as the catalog says:\n{stderr}"
+    );
 }
 
 #[then("the CLI refuses and explains that the two cannot be combined")]
