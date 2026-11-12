@@ -278,7 +278,7 @@ Without `--version`, `rocm install sdk` installs the newest stable release
 (ROCm 10.1 today) from `stable.repo.amd.com`, and `--channel nightly` installs the
 newest nightly build from `nightly.repo.amd.com`. Earlier releases stay
 installable by pinning them: `--version 7.14.1` installs the ROCm 7.14.1 release,
-and `--channel nightly --build-date 2026-08-20` installs a nightly from before
+and `--channel nightly --build-date 2026-08-19` installs a nightly from before
 the nightly channel moved on 2026-08-23. If ROCm CLI can't tell which exact GPU
 arch this computer has, or you want a different one, also add `--family` with the
 raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.

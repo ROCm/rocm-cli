@@ -181,7 +181,7 @@ Expected result:
   `rocm` build does not yet). Pinning an earlier release or nightly reads the
   earlier stream instead: `--version 7.14.1` reads
   `https://repo.amd.com/rocm/whl-multi-arch` (`multi-arch-v2`), and `--channel
-  nightly --build-date 2026-08-20` reads
+  nightly --build-date 2026-08-19` reads
   `https://rocm.nightlies.amd.com/whl-multi-arch`, while `--build-date
   2026-09-01` reads the newest layout's nightly index. `--format tarball` with no
   pin reads `https://stable.repo.amd.com/rocm/core/tarball/` (or
