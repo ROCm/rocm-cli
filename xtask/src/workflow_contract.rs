@@ -7559,18 +7559,32 @@ jobs:
         // did, while a prefix check still passed. A new job has no entry here
         // and fails until it is added, which is the point: someone must decide
         // how it behaves on `closed`.
-        let lane_if = |extra: &str, platform: &str| {
+        // `extra` gates the whole lane; `inner` sits in the non-dispatch branch,
+        // where a lane that skips `pull_request` keeps the exclusion (see
+        // `mi300x_lane_is_skipped_in_the_merge_queue`).
+        let lane_if = |extra: &str, inner: &str, platform: &str| {
             format!(
                 "always() && needs.changes.result == 'success' && {extra}\
-                 ( (github.event_name != 'workflow_dispatch' \
-                 && needs.changes.outputs.serve == 'true') \
+                 ( (github.event_name != 'workflow_dispatch' && {inner}\
+                 needs.changes.outputs.serve == 'true') \
                  || (github.event_name == 'workflow_dispatch' \
                  && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
             )
         };
         let lane = |job, extra: &str, platform: &str| PinnedIf {
             job,
-            condition: lane_if(extra, platform),
+            condition: lane_if(extra, "", platform),
+            matrix_lane: true,
+        };
+        // Strix Ubuntu and W7900 are off `pull_request` and `merge_group`.
+        let off_pr_lane = |job, platform: &str| PinnedIf {
+            job,
+            condition: lane_if(
+                "",
+                "github.event_name != 'pull_request' \
+                 && github.event_name != 'merge_group' && ",
+                platform,
+            ),
             matrix_lane: true,
         };
         let expected = vec![
@@ -7579,10 +7593,10 @@ jobs:
                 "github.event_name != 'merge_group' && ",
                 "app-dev-gpu",
             ),
-            lane("e2e-gpu-strix-ubuntu", "", "strix-ubuntu"),
+            off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
-            lane("e2e-gpu-w7900", "", "w7900"),
+            off_pr_lane("e2e-gpu-w7900", "w7900"),
             // Skips because the `serve` output of a skipped `changes` is empty.
             PinnedIf {
                 job: "e2e-report",
