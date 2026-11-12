@@ -472,7 +472,7 @@ jobs:
     # ratio the 35 was chosen for.
     # An include_nightly dispatch also runs the AIM serve scenarios (serve-26/27,
     # @nightly, up to 1200s readiness each on a cold pull) and the large-model
-    # serve, which cannot fit the per-PR 45min budget.
+    # serve, which cannot fit the 45min budget of an ordinary push run.
     timeout-minutes: ${{ inputs.include_nightly && 105 || 45 }}
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]

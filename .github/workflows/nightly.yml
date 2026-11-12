@@ -763,11 +763,13 @@ jobs:
   # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
-    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits when
-    # this host has Docker; on a host without it they skip and cost nothing.
-    # Whether it has Docker is unconfirmed: nothing in this job installs or checks
-    # it, so the "Report whether Docker is reachable" step logs the answer. If it
-    # does not, no nightly lane runs AIM serve and a pool-based one is needed.
+    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits; on a
+    # host without Docker they skip and cost nothing. Docker is reachable on this
+    # pool: a dispatch of the same lane (e2e-selfhosted.yml run 43025895270) passed
+    # serve-26 on both channel legs. serve-27 fails there at stopping the AIM
+    # service (STOP FAILED rc=1) and has no xfail row yet, so expect it red in the
+    # nightly report; the job is continue-on-error. The "Report whether Docker is
+    # reachable" step still logs the answer each run.
     timeout-minutes: 120
     # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
     # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request

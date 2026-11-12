@@ -1481,12 +1481,13 @@ i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
 gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
 the tagging and that they stay reachable when the opt-in is set.
 
-Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
-every nightly run, and only a manual `include_nightly` dispatch on a host with
-Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
-is reachable ("Report whether Docker is reachable"); check that line before
-relying on this coverage.
+Docker is reachable on the pool the nightly Strix Halo lane runs on: an
+`include_nightly` dispatch of the same lane (`e2e-selfhosted.yml` run
+43025895270) passed `serve-26` on both channel legs. `serve-27` fails there at
+stopping the AIM service (`STOP FAILED rc=1`) and has no xfail row yet, so expect
+it red in the nightly report; the lane is `continue-on-error`. The
+`e2e-gpu-nightly-strix` job still logs whether Docker is reachable ("Report
+whether Docker is reachable"), and on a host without it both scenarios skip.
 
 ### Lemonade managed-serve failure evidence
 
