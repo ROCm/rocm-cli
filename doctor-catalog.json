@@ -153,6 +153,11 @@
           "os": "windows",
           "class": "needs-argument",
           "needs": "--device-index"
+        },
+        {
+          "os": "wsl",
+          "class": "needs-argument",
+          "needs": "--device-index"
         }
       ],
       "needs_sudo": false,

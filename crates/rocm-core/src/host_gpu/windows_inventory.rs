@@ -140,12 +140,6 @@ impl WindowsExamineInventory {
         }
     }
 
-    /// How many listed rows are AMD GPUs, by the stricter test the driver and
-    /// GPU-name picks use (`preferred_amd_display`), not the loose name match
-    /// `pnputil`'s rows are filtered with. The CIM sources do not filter by
-    /// vendor, so the rows also hold devices like "AMD Bluetooth Capture Audio
-    /// Device" and "Intel(R) UHD Graphics". A row counts only with an AMD PCI
-    /// device id (`PCI\VEN_1002`) or a marketing name `rocm examine` recognizes.
     /// The listed rows that are AMD GPUs, by the test
     /// [`Self::amd_display_count`] describes.
     ///
@@ -163,6 +157,12 @@ impl WindowsExamineInventory {
         })
     }
 
+    /// How many listed rows are AMD GPUs, by the stricter test the driver and
+    /// GPU-name picks use (`preferred_amd_display`), not the loose name match
+    /// `pnputil`'s rows are filtered with. The CIM sources do not filter by
+    /// vendor, so the rows also hold devices like "AMD Bluetooth Capture Audio
+    /// Device" and "Intel(R) UHD Graphics". A row counts only with an AMD PCI
+    /// device id (`PCI\VEN_1002`) or a marketing name `rocm examine` recognizes.
     #[cfg(any(windows, test))]
     fn amd_display_count(&self) -> usize {
         self.amd_displays().count()

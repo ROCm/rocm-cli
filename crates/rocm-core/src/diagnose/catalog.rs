@@ -48,15 +48,17 @@ use crate::examine::Examination;
 /// A checker plus the OS families it applies to.
 type Checker = (fn(&Examination, &str) -> Diagnosis, &'static [&'static str]);
 
-// The `wsl` entries below run on less evidence than on bare metal: WSL collects
-// no GPU topology (`gpus` is empty, because the probes that fill it read KFD and
-// DRM), so the parts of those checks that compare a detected gfx target against a
-// wheel's arch list cannot contribute. They still fire on the evidence WSL does
+// The `wsl` entries below run on different evidence than on bare metal. WSL has
+// no KFD or DRM topology, so its `gpus` are the adapters the Windows host lists,
+// which are not guaranteed to be devices the guest runtime can open. A check that
+// compares a detected gfx target against a wheel's arch list can therefore name
+// an adapter the runtime never sees. They also fire on the evidence WSL does
 // have -- environment, ROCm install, symptom keywords -- which is strictly better
 // than the previous behaviour of not running at all.
 //
-// The degradation is one-directional and must stay that way: less evidence means
-// a check may miss a real fault, never that it invents one. Pinned by
+// When the host inventory could not be read, `gpus` is empty and the degradation
+// is one-directional: less evidence means a check may miss a real fault, never
+// that it invents one. Pinned by
 // `the_shared_checks_under_report_on_wsl_rather_than_over_report`.
 const CHECKERS: &[Checker] = &[
     (check_1_arch_not_in_wheel, &["linux", "windows", "wsl"]),
@@ -100,8 +102,9 @@ const CHECKERS: &[Checker] = &[
     // same 64 MB default a container does, so leaving this tagged `linux` alone
     // would silence it on one of the two platforms most likely to have it.
     (check_19_shm_too_small, &["linux", "wsl"]),
-    // Not "wsl": WSL2 reports no GPU topology (`gpus` is empty), so this check
-    // has nothing to read there and would never fire.
+    // Not "wsl": this makes a claim about the whole machine's ROCm support, and
+    // WSL's `gpus` come from the Windows host inventory rather than from what the
+    // guest runtime can open.
     (check_20_gpu_unsupported_by_rocm, &["linux", "windows"]),
     // Windows only: the runtime is read from the Windows System32 folder. A WSL
     // distro is examined as a distro, so it has no such runtime to read.
