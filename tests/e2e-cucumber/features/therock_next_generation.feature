@@ -1,39 +1,47 @@
 Feature: TheRock "next" ROCm 10 install layout
 
-  # ROCm 10 ships from a different source layout than the canonical multi-arch
-  # release/nightly streams: a separate pip index and a separate tarball catalog
-  # whose listing mixes non-release `-tests-` siblings in with the real dist
-  # archive. The next layout is an explicit extension, never a default: it is
-  # reachable only by pinning a ROCm version whose major is 10 or newer AND
-  # naming an exact raw GFX arch, and the canonical streams keep resolving
-  # exactly as they do today when neither is asked for.
+  # AMD now publishes every channel to a newer source layout than the canonical
+  # multi-arch release/nightly streams: a separate pip index and a separate
+  # tarball catalog per channel (`stable.repo.amd.com`, `nightly.repo.amd.com`),
+  # whose tarball listing mixes non-release `-tests-` siblings in with the real
+  # dist archive. The canonical streams no longer receive builds, so a request
+  # with no pin reads the newer layout, and a pin reads whichever layout holds
+  # that build: a stable ROCm 10+ release or a nightly built on or after
+  # 2026-08-23 in the newer layout, an earlier ROCm 7 release or an earlier
+  # nightly in the canonical stream. The newer layout picks its device payload
+  # by exact arch, so a request that reads it also needs a raw GFX arch.
   #
-  # Scenarios 01-05 point source overrides at loopback fixtures through the
-  # explicit trust gate. Scenario 06 proves the same overrides are inert when
-  # the trust gate is absent; scenario 07 supplies the live GPU evidence.
+  # Scenarios 01-05 and 16-23 point source overrides at loopback fixtures
+  # through the explicit trust gate. Scenario 06 proves the same overrides are
+  # inert when the trust gate is absent; scenario 07 supplies the live GPU
+  # evidence.
   #
-  # A ROCm 10 preview has a real `uv pip compile` choose the torch and torchvision
-  # versions, and a preview never fetches `uv` itself. The scenarios below that
-  # print resolved package specs (02, 10, 11 and 13) therefore start from an
-  # installed `uv`, which is the precondition they always had when the preview
-  # fetched one for them. runtime-27 and runtime-28 in `runtime_setup.feature` pin
-  # the preview's behaviour with a `uv` present and with none.
+  # A preview of the newer layout has a real `uv pip compile` choose the torch
+  # and torchvision versions, and a preview never fetches `uv` itself. The
+  # scenarios below that print resolved package specs (01, 02, 10, 11, 13, 15,
+  # 20 and 22) therefore start from an installed `uv`, which is the
+  # precondition they always had when the preview fetched one for them.
+  # runtime-27 and runtime-28 in `runtime_setup.feature` pin the preview's
+  # behaviour with a `uv` present and with none.
 
-  # The regression this pins: a "next-first" dispatch that probes the ROCm 10
-  # sources before the canonical ones. An unpinned release install must never
-  # look at the next layout at all, so the next fixture is served and asserted
-  # untouched rather than left unconfigured.
-  @id:therock-next-01-unpinned-release-stays-canonical
-  Scenario: therock-next-01 - An unpinned release install stays on the canonical multi-arch source
+  # The release stream the CLI used to install by default stopped at ROCm 7.14,
+  # so an install with no pin that kept reading it would silently stay on old
+  # builds while the current ones sat in the newer layout. The canonical fixture
+  # is served and asserted untouched rather than left unconfigured, so reading
+  # it would show up as a failure and not as a coincidence.
+  @id:therock-next-01-unpinned-release-reads-the-newest-layout
+  Scenario: therock-next-01 - An unpinned release install reads the newest layout's source
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a uv is already installed
     When the user previews a wheel SDK install for arch gfx1200 with no version pin
-    Then the preview resolves the canonical release pip index
-    And the preview reports the canonical multi-arch source layout generation
-    And the preview never mentions the ROCm 10 pip index
+    Then the preview resolves the ROCm 10 pip index
+    And the preview reports the next source layout generation
+    And the preview never mentions the canonical release pip index
 
-  # `--version 10.0.0` plus a raw arch is the whole opt-in. The device payload is
-  # requested as an exact `device-gfx1200` extra on rocm, torch and torchvision;
-  # torchaudio carries no device extra because it publishes none.
+  # `--version 10.0.0` plus a raw arch selects the newer layout explicitly, the
+  # same layout an unpinned install reads. The device payload is requested as an
+  # exact `device-gfx1200` extra on rocm, torch and torchvision; torchaudio
+  # carries no device extra because it publishes none.
   @id:therock-next-02-wheel-pins-raw-device-extras
   Scenario: therock-next-02 - A pinned ROCm 10 wheel install resolves the next index with raw device extras
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
@@ -156,7 +164,7 @@ Feature: TheRock "next" ROCm 10 install layout
   #
   # The serve+inference tail matters because `serve-vllm-inference`
   # (model_serving.feature) does not cover this route: its runtime comes from
-  # a plain unpinned `rocm install sdk`, never the ROCm 10 preview source. A
+  # a plain unpinned `rocm install sdk`, which reads the newest layout. A
   # discovered wheel that installs cleanly but can't actually load or answer a
   # request (bad torch realignment, cp314 ABI mismatch, a `uv.toml` fallback
   # pulling an incompatible transitive dep) would pass every assertion above
@@ -269,10 +277,104 @@ Feature: TheRock "next" ROCm 10 install layout
   # folder whose name carries a lone `'` rendered bare and left a line no shell
   # can parse. The assertion reads the line back through a POSIX word-splitter
   # and requires the install folder to come back as one word. Reuses the
-  # loopback fixture from therock-next-01, so it resolves without live network
-  # or GPU and needs no gate.
+  # loopback fixture from therock-next-01 (an unpinned install reads its ROCm 10
+  # index, so it needs an installed `uv` like therock-next-01), so it resolves
+  # without live network or GPU and needs no gate.
   @id:therock-next-15-dry-run-command-keeps-a-quoted-folder-whole
   Scenario: therock-next-15 - The dry-run command line keeps an install folder named with a quote as one argument
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a uv is already installed
     When the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote
     Then the dry-run command line names that folder as a single argument
+
+  # The other half of therock-next-01. An earlier ROCm 7 release is published
+  # only in the canonical stream, so pinning one must keep reading it, from that
+  # stream and as that stream's layout, instead of failing against the newer
+  # layout's index. The newer layout's fixture is served and asserted untouched.
+  @id:therock-next-16-earlier-release-pin-reads-the-canonical-stream
+  Scenario: therock-next-16 - A release install pinned to an earlier ROCm 7 release reads the canonical stream
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
+    Then the preview resolves the canonical release pip index
+    And the preview reports the canonical multi-arch source layout generation
+    And the preview never mentions the ROCm 10 pip index
+
+  # No silent fallback, now for the default: with no pin the newer layout is
+  # the only place the newest build is, and a group label names no exact arch
+  # for it. The install must refuse and say which flag to pass, not drop back to
+  # the canonical stream and hand over an old build. The refusal also names
+  # pinning an earlier release as the way to still install a group family, so
+  # that command is run here: the message and the behaviour it promises are
+  # asserted together.
+  @id:therock-next-17-unpinned-group-family-refused-and-the-named-pin-works
+  Scenario: therock-next-17 - An unpinned release install refuses a group family, and the earlier-release pin it names installs
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user tries to preview a wheel SDK install for family gfx120X-all with no version pin
+    Then the install fails
+    And the failure asks for an exact GPU arch and names --family gfx1200
+    When the user previews a wheel SDK install for family gfx120X-all pinned to an earlier ROCm 7 release
+    Then the preview resolves the canonical release pip index
+
+  # Linux-only for the same reason as therock-next-04. The unpinned tarball
+  # install reads the newer layout's catalog and still skips the `-tests-`
+  # sibling that carries a later mtime than the real archive.
+  @id:therock-next-18-unpinned-tarball-reads-the-newest-catalog @requires-os:linux
+  Scenario: therock-next-18 - An unpinned release tarball install reads the newest layout's catalog
+    Given a canonical release tarball fixture and a ROCm 10 tarball fixture with a tests sibling
+    When the user previews a tarball SDK install for arch gfx1200 with no version pin
+    Then the preview resolves the ROCm 10 tarball catalog
+    And the preview reports the next source layout generation
+    And the preview selects the real tarball artifact
+    And the preview does not select the tests artifact
+
+  # A tarball catalog can only be pinned in the newer layout, so a pin into the
+  # earlier release stream is refused. The refusal points at the wheel install,
+  # and the wheel install it points at is run, so the advice is shown to work.
+  @id:therock-next-19-earlier-release-tarball-pin-points-to-wheel @requires-os:linux
+  Scenario: therock-next-19 - A release tarball install pinned to an earlier ROCm 7 release points to a wheel install
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user tries to preview a tarball SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
+    Then the install fails
+    And the failure points to a wheel install for that earlier release
+
+  # The nightly channel moved the same way on 2026-08-23. With no pin the
+  # install reads the newer layout's nightly index; that index publishes a
+  # `rocm` build before its PyTorch wheels land, so the install takes the newest
+  # build that has the whole stack and says it skipped the newer one, rather
+  # than failing on a build it cannot install.
+  @id:therock-next-20-unpinned-nightly-reads-the-newest-layout-and-skips-an-unbuilt-build
+  Scenario: therock-next-20 - An unpinned nightly install reads the newest layout's index at its newest installable build
+    Given an earlier nightly pip index fixture and a newest-layout nightly pip index fixture whose newest build has no PyTorch wheels yet
+    And a uv is already installed
+    When the user previews a nightly wheel SDK install for arch gfx1200 with no version pin
+    Then the preview resolves the newest layout's nightly pip index at its newest installable build
+    And the preview warns that the newest nightly build has no PyTorch wheels and installs the build before it
+
+  # The earlier nightly stream's last build is 2026-08-22, so a pin to that
+  # date can only be read from it, as that stream's layout.
+  @id:therock-next-21-earlier-nightly-pin-reads-the-canonical-stream
+  Scenario: therock-next-21 - A nightly install pinned to the earlier stream's last build date reads the canonical stream
+    Given an earlier nightly pip index fixture and a newest-layout nightly pip index fixture whose newest build has no PyTorch wheels yet
+    When the user previews a nightly wheel SDK install for arch gfx1200 pinned to the earlier stream's last build date
+    Then the preview resolves the earlier stream's nightly pip index
+
+  # The other side of therock-next-21's boundary: a pin to a date the newer
+  # layout publishes reads that layout, though both fixtures are served.
+  @id:therock-next-22-newer-nightly-pin-reads-the-newest-layout
+  Scenario: therock-next-22 - A nightly install pinned to a build date from the newest layout reads that layout
+    Given an earlier nightly pip index fixture and a newest-layout nightly pip index fixture whose newest build has no PyTorch wheels yet
+    And a uv is already installed
+    When the user previews a nightly wheel SDK install for arch gfx1200 pinned to a build date from the newest layout
+    Then the preview resolves the newest layout's nightly pip index for that build date
+
+  # The tarball half of therock-next-19, on the nightly channel, where the
+  # boundary is a date rather than a major. A tarball pin reads only the newest
+  # layout's catalog, so a pin to the earlier stream's last build date is
+  # refused, naming the date the newer layout begins and pointing to the wheel
+  # install, which is then run and resolves that build.
+  @id:therock-next-23-earlier-nightly-tarball-pin-points-to-wheel @requires-os:linux
+  Scenario: therock-next-23 - A nightly tarball install pinned to the earlier stream's last build date points to a wheel install
+    Given an earlier nightly pip index fixture and a newest-layout nightly pip index fixture whose newest build has no PyTorch wheels yet
+    When the user tries to preview a nightly tarball SDK install for arch gfx1200 pinned to the earlier stream's last build date
+    Then the install fails
+    And the failure names the first build date of the newer layout and points to a wheel install that resolves that earlier nightly

@@ -9,10 +9,9 @@
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays `automations(command)`, re-imported with
 //! `render_daemon_text` via
-//! `use crate::automations::{automations, render_daemon_text};`. As of
-//! Phase 6f (ROCMAI-210, see `docs/architecture.md`) this module also owns the
-//! rendering/classification
-//! helpers behind `render_automations_text` (the `rocm automations` status
+//! `use crate::automations::{automations, render_daemon_text};`. This
+//! module also owns the rendering/classification helpers behind
+//! `render_automations_text` (the `rocm automations` status
 //! report: watcher status/policy lines, recent automation activity, and
 //! plain-language proposal/audit summaries) and `render_daemon_text` (the
 //! `rocm daemon --status` summary) — both folded in from `main.rs` alongside

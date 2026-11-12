@@ -18,6 +18,12 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+/// Serializes the tests that set `ROCM_CLI_DATA_DIR`, and the ones whose
+/// expectations depend on it (the recovery advice for an unreadable
+/// `config.json` names it). Named `*_TEST_LOCK` so the env-mutation contract
+/// guard recognises the discipline by suffix.
+pub(crate) static DATA_DIR_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Sets an environment variable and puts the previous value back on drop.
 ///
 /// This RESTORES; it does not SERIALIZE. Two tests holding one of these for the

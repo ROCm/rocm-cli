@@ -24,9 +24,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{AppState, ConnState};
+use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
-use crate::ui::{format, widgets};
 
 /// True when we have no live daemon telemetry to show — i.e. not connected to a
 /// running daemon, or connected but no snapshot has arrived yet. The
@@ -67,7 +67,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 /// Two hero panels: Node efficiency (tok/watt + trend) and Node throughput
-/// (Σ gen_tps + total power W). Reuses `widgets::node_efficiency` and the
+/// (Σ gen_tps + total power W). Reuses `rocm_dash_core::efficiency::node_efficiency` and the
 /// braille sparkline; honest `—` when a metric is unavailable (color is never
 /// the only signal — every value carries a text label + unit).
 fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -93,22 +93,16 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
-    // Track aggregate held: an instance contributes if it has a finite gen_tps
-    // AND its observation metadata says Held. Mirrors the finite-value filter
-    // `node_efficiency` applies below, so this can't mark the aggregate held
-    // over an instance that `node_efficiency` itself excludes as NaN/Inf.
-    // Any contributing Held → whole aggregate is held.
-    let any_held = state.latest.as_ref().is_some_and(|snap| {
-        snap.instances.iter().any(|i| {
-            i.gen_tps.is_some_and(f64::is_finite)
-                && i.gen_tps_observation.as_ref().is_some_and(|m| {
-                    m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
-                })
-        })
-    });
-    let eff = state.latest.as_ref().and_then(widgets::node_efficiency);
+    // One shared implementation: the value, and whether any throughput behind it
+    // is held, come from the same function the Hardware tab and the assistant use.
+    let node = state
+        .latest
+        .as_ref()
+        .and_then(rocm_dash_core::efficiency::node_efficiency);
+    let eff = node.map(|n| n.tokens_per_watt);
+    let any_held = node.is_some_and(|n| n.held());
     let value_base = eff.map_or_else(|| "—".to_string(), |v| format!("{v:.2} tok/W"));
-    let value = if any_held && eff.is_some() {
+    let value = if any_held {
         format!("{value_base}{}", format::HELD_MARKER)
     } else {
         value_base
@@ -118,8 +112,8 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     let trend: Vec<u64> = state
         .history
         .iter()
-        .filter_map(widgets::node_efficiency)
-        .map(|v| (v * 1000.0).round().max(0.0) as u64)
+        .filter_map(rocm_dash_core::efficiency::node_efficiency)
+        .map(|n| (n.tokens_per_watt * 1000.0).round().max(0.0) as u64)
         .collect();
 
     // Layout: value | sparkline (min) | label/legend.
@@ -162,6 +156,16 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     );
 }
 
+/// What the node-throughput hero shows, worked out once from the snapshot.
+#[derive(Default)]
+struct ThroughputHero {
+    tps: f64,
+    has_tps: bool,
+    power: f64,
+    has_power: bool,
+    any_held: bool,
+}
+
 /// Node-throughput hero: Σ generation tok/s across instances + total board
 /// power (W). Both honest `—` when absent.
 fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -176,30 +180,29 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
-    let (tps, has_tps, power, has_power, any_held) =
-        state
-            .latest
-            .as_ref()
-            .map_or((0.0, false, 0.0_f32, false, false), |snap| {
-                let mut tps = 0.0;
-                let mut has_tps = false;
-                let mut any_held = false;
-                for inst in &snap.instances {
-                    // Finite-value filter: a single NaN/Inf sample must not
-                    // poison the whole sum, mirroring `node_efficiency`.
-                    if let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) {
-                        tps += v;
-                        has_tps = true;
-                        if inst.gen_tps_observation.as_ref().is_some_and(|m| {
-                            m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
-                        }) {
-                            any_held = true;
-                        }
-                    }
-                }
-                let power: f32 = snap.gpus.iter().map(|g| g.power_w).sum();
-                (tps, has_tps, power, !snap.gpus.is_empty(), any_held)
-            });
+    let ThroughputHero {
+        tps,
+        has_tps,
+        power,
+        has_power,
+        any_held,
+    } = state
+        .latest
+        .as_ref()
+        .map_or_else(ThroughputHero::default, |snap| {
+            // The same aggregate, and the same notion of "held", as the
+            // efficiency hero beside it.
+            let throughput = rocm_dash_core::efficiency::node_throughput(&snap.instances);
+            let power = rocm_dash_core::efficiency::node_power_w(&snap.gpus);
+            ThroughputHero {
+                tps: throughput.map_or(0.0, |t| t.tokens_per_sec),
+                has_tps: throughput.is_some(),
+                power,
+                // Zero or unusable power means no telemetry, not "0 W".
+                has_power: power > 0.0,
+                any_held: throughput.is_some_and(|t| t.held()),
+            }
+        });
     // Aggregate formatted via shared formatter: NaN/Inf guard + held marker.
     let tps_str = format::gen_tps_aggregate(has_tps.then_some(tps), any_held);
     let power_str = if has_power {
@@ -494,9 +497,71 @@ mod tests {
             out.contains(format::HELD_MARKER),
             "HELD_MARKER must appear in efficiency hero when any instance is held; got:\n{out}"
         );
+        // The throughput hero prints a `*` too, so pin the efficiency one: the
+        // marker must sit right after the tok/W figure.
+        assert!(
+            out.contains(&format!("tok/W{}", format::HELD_MARKER)),
+            "efficiency figure must carry the held marker; got:\n{out}"
+        );
         assert!(
             out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must appear in a hero when held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn throughput_hero_power_is_a_dash_when_gpus_report_no_usable_power() {
+        // GPUs that read exactly 0 W have no power telemetry (a platform with no
+        // power source). The hero used to print `0.0 W` for them; it now says
+        // `—`, like the other power figures. A usable reading still prints.
+        let busy = instance_with_obs("busy", 300.0, Some(fresh_obs()));
+        let mut state = connected_with_instances(vec![busy]);
+        if let Some(snap) = state.latest.as_mut() {
+            for g in &mut snap.gpus {
+                g.power_w = 0.0;
+            }
+        }
+        let out = render(&state, 160, 50);
+        assert!(
+            out.contains("power —"),
+            "no-telemetry power must be a dash:\n{out}"
+        );
+        assert!(!out.contains("power 0.0 W"), "must not print 0.0 W:\n{out}");
+        let with_power =
+            connected_with_instances(vec![instance_with_obs("busy", 300.0, Some(fresh_obs()))]);
+        assert!(render(&with_power, 160, 50).contains("power 300.0 W"));
+    }
+
+    #[test]
+    fn the_two_heroes_agree_for_a_held_instance_at_zero_throughput() {
+        use crate::ui::format;
+        // A held instance at 0 tok/s beside a fresh one with real throughput:
+        // neither hero may show the held marker, and they must say the same.
+        let busy = instance_with_obs("busy", 300.0, Some(fresh_obs()));
+        let idle = instance_with_obs("idle", 0.0, Some(held_obs()));
+        let state = connected_with_instances(vec![busy, idle]);
+        let out = render(&state, 160, 50);
+        // The Instances table below marks the held idle row, and prints its
+        // legend, correctly; only the two heroes are under test, so look at
+        // their own text. Each shows its figure unmarked and its plain footer
+        // (not the held legend).
+        assert!(
+            out.contains("300.0 tok/s")
+                && !out.contains(&format!("300.0 tok/s{}", format::HELD_MARKER)),
+            "{out}"
+        );
+        assert!(
+            out.contains("1.00 tok/W")
+                && !out.contains(&format!("1.00 tok/W{}", format::HELD_MARKER)),
+            "{out}"
+        );
+        assert!(
+            out.contains("tokens per watt · whole node"),
+            "efficiency hero footer: {out}"
+        );
+        assert!(
+            out.contains("Σ generation throughput · all instances"),
+            "throughput hero footer: {out}"
         );
     }
 

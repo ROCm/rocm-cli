@@ -30,6 +30,14 @@ out="${LANE_OUT:-/out}"
 work="${E2E_LANE_WORK:-/var/tmp/e2e-lane}"
 channels="${E2E_CHANNELS:-release nightly}"
 
+# The lane fetches only the host's crates, so a build target set from outside
+# would need crates it skips and meet the network without a retry. Refused
+# before anything is installed. This covers the environment variable only.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+  echo "CARGO_BUILD_TARGET is set; unset it: the lane fetches only the host's crates" >&2
+  exit 1
+fi
+
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
@@ -76,23 +84,45 @@ mkdir -p "${work}"
 export CARGO_TARGET_DIR="${work}/target"
 export E2E_SHARED_CACHE_DIR="${work}/shared"
 export E2E_SHARED_UV_CACHE_DIR="${work}/uv-cache"
-# What a cold Ubuntu build needs, as the WSL lane in e2e-selfhosted.yml
-# installs it; the ROCm dev images carry a compiler but not these. The update is
-# retried as there: a mirror mid-sync fails it for a few minutes.
-if ! command -v pkg-config >/dev/null || [[ ! -e /usr/include/sys/capability.h ]]; then
-  for attempt in 1 2 3 4; do
-    if apt-get update -qq; then
-      break
+# A command that reaches the network, run again when it fails: a mirror
+# mid-sync, a dropped connection, a node whose route out is down for a minute.
+# A lane starts cold, so each of these steps stands in front of the whole suite
+# and one failed fetch would cost the lane its night. For fetches only: a build
+# or a test that fails is not run again. A failure that will not change (a 404,
+# a lockfile out of date) is retried too, and costs the delays before the lane
+# fails with the command's own status.
+#   retry <attempts> <seconds between attempts> <command...>
+retry() {
+  local attempts="$1" delay="$2" attempt status
+  shift 2
+  for ((attempt = 1; ; attempt++)); do
+    status=0
+    "$@" || status=$?
+    if [[ "${status}" -eq 0 ]]; then
+      return 0
     fi
-    if [[ "${attempt}" -eq 4 ]]; then
-      echo "apt-get update failed after ${attempt} attempts" >&2
-      exit 1
+    if [[ "${attempt}" -ge "${attempts}" ]]; then
+      echo "$* failed after ${attempt} attempts (status ${status})" >&2
+      return "${status}"
     fi
-    echo "apt-get update failed (attempt ${attempt}); retrying in 60s" >&2
-    sleep 60
+    echo "$* failed (attempt ${attempt}, status ${status}); retrying in ${delay}s" >&2
+    sleep "${delay}"
   done
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    pkg-config build-essential libcap-dev >/dev/null
+}
+
+# What a cold Ubuntu build needs, as the WSL lane in e2e-selfhosted.yml
+# installs it; the ROCm dev images carry a compiler but not these. The update and
+# the install are retried together: a mirror mid-sync fails either for a few
+# minutes, and an install that fails on a pool that moved since the update needs
+# fresh lists.
+# shellcheck disable=SC2329 # run by `retry`, which shellcheck cannot follow
+apt_get_update_and_install() {
+  apt-get update -qq &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      pkg-config build-essential libcap-dev >/dev/null
+}
+if ! command -v pkg-config >/dev/null || [[ ! -e /usr/include/sys/capability.h ]]; then
+  retry 4 60 apt_get_update_and_install
 fi
 
 if ! command -v cargo >/dev/null; then
@@ -115,7 +145,10 @@ if ! command -v cargo >/dev/null; then
       ;;
   esac
   rustup_init="${work}/rustup-init"
-  curl --proto '=https' --tlsv1.2 -sSf -o "${rustup_init}" \
+  # Bounded in time as well: a stalled connection is no failure for `retry` to
+  # act on.
+  retry 4 15 curl --proto '=https' --tlsv1.2 -sSf -o "${rustup_init}" \
+    --connect-timeout 30 --max-time 300 \
     "https://static.rust-lang.org/rustup/archive/${rustup_version}/${rustup_triple}/rustup-init"
   if ! echo "${rustup_sha256}  ${rustup_init}" | sha256sum -c --quiet -; then
     echo "rustup-init ${rustup_version} does not match its recorded SHA-256" >&2
@@ -130,6 +163,26 @@ if ! command -v cargo >/dev/null; then
 fi
 
 bash .github/scripts/gpu-preflight.sh
+preflight_done=0
+
+# The two fetches in front of the build, each retried on its own. The first cargo
+# call in this checkout downloads the toolchain rust-toolchain.toml names: that
+# relies on rustup's proxy installing it on first call, and is a no-op where
+# cargo is not rustup-managed. Then the crates are fetched, so the build below
+# does not meet the network. Only the host's are: the build, the pre-warm and
+# the suite all run on the host (see the CARGO_BUILD_TARGET check at the top).
+retry 4 30 cargo --version
+# Captured first, so a cargo that fails here aborts the lane with its own error.
+cargo_info="$(cargo -vV)"
+host=""
+while read -r key value; do
+  if [[ "${key}" == "host:" ]]; then host="${value}"; fi
+done <<<"${cargo_info}"
+if [[ -z "${host}" ]]; then
+  echo "cargo did not report its host triple" >&2
+  exit 1
+fi
+retry 4 30 cargo fetch --locked --target "${host}"
 
 # The e2e-test-hooks feature must match what `cargo xtask e2e` builds for
 # itself; see the e2e-gpu job in e2e-selfhosted.yml.
@@ -143,11 +196,19 @@ export ROCM_CLI_ROCMD_BINARY="${CARGO_TARGET_DIR}/release/rocmd"
 # the build. A failure is returned, not fatal, so the next channel still runs.
 run_channel() {
   local channel="$1"
+  # The suite writes here, and a channel must not report the last one's files,
+  # even when its own preflight fails below. Returned, not ignored: the
+  # caller's `||` turns `set -e` off in here.
+  rm -rf tests/e2e-cucumber/results || return $?
+  # The first channel's preflight ran before the build. A later one runs after
+  # the previous suite, which may have left a model server on the GPU, as each
+  # channel's job in nightly.yml starts with its own.
+  if [[ "${preflight_done}" == 1 ]]; then
+    bash .github/scripts/gpu-preflight.sh || return $?
+  fi
+  preflight_done=1
   local prewarm="${work}/prewarm-${channel}"
   export E2E_SHARED_RUNTIMES_DIR="${prewarm}/data/runtimes"
-  # The suite writes here, and a channel must not report the last one's files.
-  # Returned, not ignored: the caller's `||` turns `set -e` off in here.
-  rm -rf tests/e2e-cucumber/results || return $?
   HF_HOME="${E2E_SHARED_CACHE_DIR}/huggingface" \
     UV_CACHE_DIR="${E2E_SHARED_UV_CACHE_DIR}" \
     cargo xtask e2e-prewarm --channel "${channel}" --prewarm-dir "${prewarm}" ||
