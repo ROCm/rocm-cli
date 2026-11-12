@@ -250,7 +250,8 @@ not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers the per-PR GPU platforms;
+`e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
+pull request runs only the MI300X and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
 platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
 per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
@@ -488,8 +489,8 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
 pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's workspace — persistent across runs on the long-lived
-`native`-labeled hosts, rebuilt by the prewarm step below on each ephemeral
+lives on the runner's workspace — persistent across runs on a long-lived
+runner, rebuilt by the prewarm step below on each ephemeral
 DevLab Dispatch pool run — survives `git clean`, and is namespaced
 by source-layout generation (`e2e-prewarm-multi-arch-v2`) so a branch using a new
 package layout cannot poison the cache consumed by code that only understands the
