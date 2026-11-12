@@ -1028,6 +1028,14 @@ Expected result:
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
   utilization and VRAM usage working and temperature/power/clock at their
   unmeasured values, with no crash.
+- Leave the dashboard open for at least 30 minutes on an AMD host with the
+  driver's `amdadlx64.dll` present. It must keep running and keep updating
+  temperature, power and clock. ADLX is initialised once for the whole
+  session; initialising it on every tick made the driver's `atiadlxx.dll`
+  abort the process (exit code `0xC0000409`) with no message. If the
+  dashboard still exits silently, Event Viewer > Windows Logs > Application
+  shows an `Application Error` entry for `rocm.exe` naming the faulting
+  module and offset.
 - No other output of this section needs a daemon: `rocm dash` must not report
   a failed daemon connection.
 
