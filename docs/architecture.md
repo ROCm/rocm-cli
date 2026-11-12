@@ -59,7 +59,8 @@ The `rocm` binary: the clap command tree, a handler module for most commands, an
 | [`comfyui/runtime_env.rs`](../apps/rocm/src/comfyui/runtime_env.rs) | Choosing the ROCm runtime ComfyUI runs against (`select_runtime`) and building the virtualenv, ROCm and library-path environment its process needs. | domain |
 | [`comfyui/source_swap.rs`](../apps/rocm/src/comfyui/source_swap.rs) | Replacing ComfyUI's code in an existing `source/` folder on reinstall while keeping the user's models, workflows, outputs and other files there. | domain |
 | [`config_cmd.rs`](../apps/rocm/src/config_cmd.rs) | `rocm config` (`config`): applies each subcommand to the saved configuration, prompts for a provider API key, and renders `rocm config show`. | relocation |
-| [`dash.rs`](../apps/rocm/src/dash.rs) | `rocm dash` and the other ways into the dashboard TUI (launcher, chat, bench, setup): builds the telemetry daemon options and starts an embedded daemon when none is listening. | domain |
+| [`dash.rs`](../apps/rocm/src/dash.rs) | `rocm dash` and the other ways into the dashboard TUI (launcher, chat, bench, setup): builds the telemetry daemon options and, for a live dashboard, starts the embedded daemon's keeper in [`dash_daemon.rs`](../apps/rocm/src/dash_daemon.rs). | domain |
+| [`dash_daemon.rs`](../apps/rocm/src/dash_daemon.rs) | The embedded telemetry daemon's keeper (unix only): `spawn_keeper` starts a task in every live dashboard that runs the daemon whenever no other one owns the socket, retrying every 250 ms on `SocketInUse` and backing off from 1 s to 30 s on other errors, so a dashboard still open takes the socket over when the owner closes or is killed; `stop_keeper` aborts and awaits it on exit so an owning daemon removes its own socket before the runtime is dropped. | domain |
 | [`dash_seam.rs`](../apps/rocm/src/dash_seam.rs) | The binary's implementation of the dashboard's `RocmToolExecutor` seam, reusing the CLI's own command functions with plain data in and out. The seam exists because `rocm-dash-tui` (like `rocm-dash-core`) must not depend on `rocm-core`; `rocm-dash-collectors` and `rocm-dash-daemon` do depend on it. | domain |
 | [`deletion_properties.rs`](../apps/rocm/src/deletion_properties.rs) | Unix-only property tests for the recursive deletions behind `rocm uninstall` and `rocm storage remove-downloads`, checked against a real sandbox filesystem. | flat |
 | [`diagnose_cmd.rs`](../apps/rocm/src/diagnose_cmd.rs) | `rocm diagnose` and `rocm fix` (`diagnose`, `fix`), and the `--report` step that builds a report naming this build's leading version (`prepare_cli_report`), shows it and offers to deliver it. | relocation |
@@ -447,7 +448,7 @@ Boundaries:
 
 ### `crates/rocm-dash-daemon` — telemetry daemon
 
-The daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) drives the collectors on tick cadences and [`server.rs`](../crates/rocm-dash-daemon/src/server.rs) streams snapshots and benchmark rows to TUI clients as NDJSON. `apps/rocm`'s [`dash.rs`](../apps/rocm/src/dash.rs) drives it.
+The daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) drives the collectors on tick cadences and [`server.rs`](../crates/rocm-dash-daemon/src/server.rs) streams snapshots and benchmark rows to TUI clients as NDJSON. `apps/rocm`'s [`dash.rs`](../apps/rocm/src/dash.rs) drives it, running the daemon through [`dash_daemon.rs`](../apps/rocm/src/dash_daemon.rs).
 
 | File | Responsibility | Class |
 | --- | --- | --- |
@@ -457,13 +458,14 @@ The daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) driv
 | [`persist.rs`](../crates/rocm-dash-daemon/src/persist.rs) | `SessionWriter`: appends every broadcast `Event` as a `PersistedEntry` line to one `session-*.ndjson` file per daemon session. | flat |
 | [`registry.rs`](../crates/rocm-dash-daemon/src/registry.rs) | Reads the managed-service records `rocm serve` writes and turns the live ones into `DiscoveredService` scrape targets, telling a registry read in full, an empty or absent one included, from one that could not be read in full. | flat |
 | [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) | The owner task: drives the collectors on their tick cadences, reconciles discovered services, derives rates and efficiency, and broadcasts `Snapshot`s. | flat |
-| [`server.rs`](../crates/rocm-dash-daemon/src/server.rs) | The listener, the per-client task loop and the broadcast from the runner to every client, including the history replay on subscribe. | flat |
+| [`server.rs`](../crates/rocm-dash-daemon/src/server.rs) | The listener, the per-client task loop and the broadcast from the runner to every client, including the history replay on subscribe, and `SocketClaim`, which owns the socket path for the daemon's life (see the boundary below). | flat |
 | [`snapshot_ring.rs`](../crates/rocm-dash-daemon/src/snapshot_ring.rs) | `SnapshotRing`, the bounded snapshot history a late-joining client is sent when it subscribes. | flat |
 | [`transport.rs`](../crates/rocm-dash-daemon/src/transport.rs) | NDJSON framing for the daemon's socket: `write_line` and `read_line`. | flat |
 
 Boundaries:
 
 - **A failed registry read retires nothing.** When a pass cannot read the registry in full, the runner retires no service; the records that did read still add and refresh their services, and the header warns until a read succeeds. A registry read in full, an empty one included, retires every known service it no longer holds and keeps the rest (a registry that goes from A and B to A retires B).
+- **One daemon per socket, and it removes only its own.** [`server.rs`](../crates/rocm-dash-daemon/src/server.rs)'s `SocketClaim` takes an exclusive lock on `<socket>.lock` (mode `0o600`) next to the socket and holds it for the daemon's life, so the OS releases it however the process exits; a second daemon at the same path gets the public `SocketInUse` error and changes nothing. Holding the lock, it replaces an existing socket only when a connection to it is refused, refuses a path that is not a socket without removing it, and on drop unlinks the socket only if the path is still the one it bound.
 - **Framing is copied, not shared.** [`transport.rs`](../crates/rocm-dash-daemon/src/transport.rs) and the TUI's [`transport.rs`](../crates/rocm-dash-tui/src/transport.rs) hold the same two functions because the TUI does not depend on the daemon crate, so a framing change must be made in both.
 
 ### `crates/rocm-dash-tui` — dashboard TUI

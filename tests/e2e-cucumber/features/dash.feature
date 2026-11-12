@@ -910,3 +910,21 @@ Feature: Interactive dashboard
     Then the CPU graph and the per-core strip sit side by side
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # Every live dashboard of a user shares one telemetry socket, and the daemon
+  # behind it runs inside whichever dashboard got there first. Closing that
+  # dashboard used to strand every other open one on "disconnected" until it
+  # was restarted; now a dashboard that is still open takes the daemon over
+  # and reconnects. Runs on the same simulated GPU-less host as dash-37, so
+  # the outcome does not depend on the runner's hardware. Unix only: there is
+  # no daemon socket on Windows.
+  @id:dash-second-session-survives-first-closing @requires-os:linux
+  Scenario: dash-52 - Closing one dashboard leaves another open dashboard connected
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the user opens a second dashboard
+    Then the second dashboard is connected to its telemetry daemon
+    When the user quits the first dashboard
+    Then the first dashboard exits successfully
+    And the second dashboard is connected to its telemetry daemon again

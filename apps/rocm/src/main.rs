@@ -24,6 +24,7 @@ mod cli_report;
 mod comfyui;
 mod config_cmd;
 mod dash;
+mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
