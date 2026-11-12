@@ -4,6 +4,14 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      skip_build:
+        description: >-
+          Skip building and publishing the nightly release and run only the E2E
+          lanes, the consolidated report and the readiness jobs. For testing a
+          change to those jobs from a branch without publishing a release.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -75,7 +83,17 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          SKIP_BUILD: ${{ inputs.skip_build }}
         run: |
+          # Every job that builds or publishes a release is gated on this
+          # output, so skipping here is what keeps a branch dispatch from
+          # publishing.
+          if [ "${SKIP_BUILD}" = "true" ]; then
+            echo "commits=0" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_build was set — not building or publishing a nightly"
+            exit 0
+          fi
           LAST=$(gh release view nightly --json createdAt --jq .createdAt 2>/dev/null || echo "1970-01-01T00:00:00Z")
           COMMITS=$(git log --since="${LAST}" --oneline | wc -l)
           echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"

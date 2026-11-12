@@ -512,6 +512,17 @@ jobs, which wait on every lane, never ran.
   report and readiness jobs are done, because cancelling the run also skips any
   job that is still gated on `!cancelled()`.
 
+To try a change to these jobs from a branch without publishing a nightly
+release, dispatch the workflow with `skip_build` set:
+
+```bash
+gh workflow run nightly.yml --ref <branch> -f skip_build=true
+```
+
+That skips the Linux and Windows builds and the release publish, and runs the
+lanes, the report, readiness and the settle job. The wiki publishers run only
+from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
+
 A lane added to `nightly.yml` must be added to the `LANES` list of
 `e2e-lanes-settled`;
 `nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,

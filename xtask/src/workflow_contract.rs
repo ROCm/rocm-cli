@@ -2368,6 +2368,60 @@ jobs:
         );
     }
 
+    #[test]
+    fn a_skip_build_dispatch_never_builds_or_publishes_a_release() {
+        // `skip_build` exists so a change to the lane, report and readiness jobs
+        // can be dispatched from a branch. Anything that builds or publishes a
+        // release under that input would put a branch's binaries on the public
+        // `nightly` release, so the guard is pinned on every such job.
+        let nightly = read_workflow("nightly.yml");
+        assert!(
+            top_level_block(&nightly, "on").contains("skip_build:"),
+            "workflow_dispatch must offer a `skip_build` input"
+        );
+
+        let build = job_block(&nightly, "nightly");
+        let steps = job_steps(build).expect("the nightly job has steps");
+        let check_at = steps
+            .iter()
+            .position(|(name, _)| name == "Check for changes since last nightly")
+            .expect("the nightly job decides whether to skip in a named step");
+        let check = &steps[check_at].1;
+        assert!(
+            check.contains("SKIP_BUILD: ${{ inputs.skip_build }}")
+                && check.contains("echo \"skip=true\" >> \"$GITHUB_OUTPUT\""),
+            "the check step must set skip=true when skip_build is set:\n{check}"
+        );
+        // The check's own early exit comes first; every later step must honour it.
+        for (name, step) in &steps[check_at + 1..] {
+            assert!(
+                step.contains("steps.check.outputs.skip != 'true'"),
+                "nightly step `{name}` runs after the skip decision and must be gated on it, or \
+                 a skip_build dispatch builds and stages a release:\n{step}"
+            );
+        }
+
+        // Every other job that can write a release waits on that decision too.
+        // The wiki publishers also hold `contents: write` (a wiki push, not a
+        // release) and are limited to `main` by their own condition instead.
+        for job in job_ids(&nightly) {
+            let block = job_block(&nightly, &job);
+            let writes_contents = block.lines().any(|line| line.trim() == "contents: write");
+            if job == "nightly" || !writes_contents {
+                continue;
+            }
+            let condition = job_scalar(block, "if");
+            if condition.contains("github.ref == 'refs/heads/main'") {
+                continue;
+            }
+            assert!(
+                condition.contains("needs.nightly.outputs.skip != 'true'"),
+                "job `{job}` has `contents: write` and must be gated on \
+                 `needs.nightly.outputs.skip != 'true'`, or a skip_build dispatch publishes"
+            );
+        }
+    }
+
     /// Run `.github/scripts/settle-e2e-lanes.sh` against canned job listings.
     ///
     /// `listings[n]` is what the `n`th `gh api` call returns (the last one
