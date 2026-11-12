@@ -42,11 +42,18 @@ every file: no flag, baseline or exemption. The `clippy` CI job runs
 `cargo xtask check-module-size` and fails when any file is over the limit; `clippy` is a
 required check and also runs on merge-queue runs. The failure text names each file and
 points at the split rule in [architecture.md](architecture.md). The `cargo-module-size`
-pre-commit hook still only reports: it runs `cargo xtask check-module-size-advisory`, the
-same check, but it exits successfully even when the check itself cannot run. That holds
-once xtask has built: a commit that leaves xtask or `rocm-core` not compiling still fails
-the hook.
-The counting rules are unit-tested in `xtask/src/module_size.rs`:
+pre-commit hook is the local mirror of that step: it runs the same
+`cargo xtask check-module-size`, so a commit that stages Rust source while a file is over the
+limit is refused, and the output names the file and its count. It only checks and never
+rewrites or restages anything. The check measures the working tree, so the hook also
+fails when a Rust file under a crate's `src/` is not declared by any `mod`, even an
+untracked scratch file; the error says to declare or delete it, where CI only sees the
+files that are committed. It runs only for contributors who installed the hooks, so the
+CI step stays the authority.
+The counting rules are unit-tested in `xtask/src/module_size.rs`, and
+[workflow_contract.rs](../xtask/src/workflow_contract.rs) pins that the hook runs the
+strict check in `module_size_hook_runs_the_strict_check_at_pre_commit`; the `module_size`
+filter below selects both:
 
 ```bash
 cargo test -p xtask module_size
@@ -54,7 +61,7 @@ cargo test -p xtask module_size
 
 ### Module map check
 
-Every production source file must have an entry in [architecture.md](architecture.md). The
+Every production source file, and every `.rs` file of `xtask` and the end-to-end harness, must have an entry in [architecture.md](architecture.md). The
 check runs in the `clippy` CI job and in the `architecture-doc` prek hook, and you can run it
 on its own:
 
@@ -62,9 +69,12 @@ on its own:
 cargo xtask check-architecture-doc
 ```
 
-It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
-does not link, and there is no exemption list; see
-[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
+It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src`, or under
+`xtask/src`, `tests/e2e-cucumber/src` or `tests/e2e-cucumber/tests`, that the doc does not
+link, and there is no exemption list; see
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers of a production
+crate need no entry; a file in the `xtask` and `tests/e2e-cucumber` trees does, whatever its
+name. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
@@ -270,6 +280,170 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### The engine stdio client
+
+`rocm` and `rocmd` run an engine child through one client,
+[`stdio_client.rs`](../crates/rocm-engine-protocol/src/stdio_client.rs) in
+`rocm-engine-protocol`. Its conversation (the request line, the environment each
+option sets, what a failing exit or an unusable answer is reported as, the
+SIGPIPE guard) is tested there against `FakeEngine`, a shell-script engine child
+from [`fake_engine.rs`](../crates/rocm-engine-protocol/src/fake_engine.rs) that
+records its argv, environment and stdin; the pure parts (the command a call
+builds, `decode_engine_response`, stderr collection) run on every platform, and
+the ones that start the fake are `#[cfg(unix)]`. The `rocm` and `rocmd` callers
+each run their own entry point against the same fake and pin only what they
+choose: the program and verb, the app paths, and whether stderr is forwarded (see
+`apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). These tests
+catch behavioural drift: a caller whose own copy of the conversation behaved
+differently from the shared client in what they pin (the framing, the
+environment, the exit and answer handling, the guards) would fail them. A copy
+that behaves the same passes them, so a second guard is on the existence of a
+second copy:
+[engine_stdio_client_contract.rs](../xtask/src/engine_stdio_client_contract.rs)
+is a static text scan over every `.rs` file in the tree (comments stripped) that
+fails when a file other than the shared client both pipes a child's stdin and
+names an engine request or response envelope, which is what an engine stdio
+client is made of. Both are looked for anywhere in the file, not on one line, so
+a copy that builds its `Stdio` in one place and passes it to `.stdin(..)` in
+another is seen too (a fixture covers it); the price is that a file which pipes
+some child's stdin for another reason and also names an envelope type is
+reported, and the answer to that is a reviewed allowlist entry. A caller that reaches an engine through `run_engine_stdio`
+has neither. Pasting the old rocmd copy back into `apps/rocmd/src/engine_ipc.rs`
+fails it by name (and, separately, five of rocmd's pinning tests: the
+app-paths, crash, unparseable-answer, nonzero-with-answer and SIGPIPE ones). Like
+the other allowlists it is bidirectional, so an exemption cannot outlive its
+reason.
+
+```bash
+cargo test -p xtask engine_stdio_client_contract
+```
+
+It is a source-text scan, not a call-graph analysis: a copy that makes its pipe
+by hand, or reaches the envelope types under another name, is outside what it
+can see, and it does not check that a caller uses the shared client correctly
+(the callers' tests do). It closes the cheap, likely regression of a
+spawn-write-read helper pasted back into a binary.
+
+An answer that is not a response envelope is reported as that, and when the
+child also exited with a failing status the error says so, because the status is
+often why the answer was cut short (a clean exit adds nothing). A failing child
+that printed nothing is reported by its status alone. The status is worded from
+the exit code (`exited with code N`) or, for a child ended by a signal on Unix,
+the signal (`was terminated by signal N`), not from `ExitStatus`'s own text, which
+already reads `exit status: N` and would double up (`a_child_ended_by_a_signal_is_reported_by_the_signal`). Both carry the child's
+stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
+the three cases against the fake, and `engine-ipc-02` below shows the same
+message in a `stop_server` report next to what the stop did.
+
+The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
+its default action, which is how `rocm` runs, because the test harness leaves it
+ignored and changing it process-wide would race sibling tests. A write that is
+not guarded kills that process, and the parent test reports the signal. Two
+writes are covered that way: the request to the child's stdin, and the forwarding
+of the child's stderr to this process's stderr (a line of progress, and the note
+recorded when reading it fails). The forwarding test writes into a real pipe whose
+reader is closed, because a mock sink that returns `BrokenPipe` itself never
+raises the signal. Each forwarding write is guarded on its own, never the loop
+around it, because the reads between lines block for as long as the engine is
+quiet and the disposition is process-wide; a third re-executed test,
+`forwarding_guards_each_write_and_never_the_reads_between_them`, records the
+disposition inside every read and every write and after the loop. `FakeEngine` quotes the response and its scratch directory
+for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
+apostrophe, reaches the client intact.
+
+The `forward_stderr` option, which is what shows a user an engine install's
+progress, is tested at both ends: the client runs against a private entry point
+that takes the sink (`a_childs_stderr_reaches_the_forwarding_sink_when_there_is_one`,
+a `Vec`-backed writer), and the public entry point is run in a re-executed test
+binary whose own stderr the parent reads
+(`forward_stderr_sends_the_childs_stderr_to_this_processs_stderr`: the child's
+line is there with the option and absent without it). Replacing the one
+`forward_stderr.then(io::stderr)` with `None` turns the second red.
+
+A child that answers and then exits with a failing status is read as having
+answered (see the doc comment of `run_engine_stdio`), and its status is not part
+of the answer. The daemon asks the client to leave a note on its stderr, which is
+its log (`note_failing_exit_after_answer`); the CLI does not, since its stderr is a
+terminal. `a_failing_exit_after_an_answer_is_noted_only_when_asked_for` reads the
+stderr of a re-executed test binary for both settings. The note is made only
+for an answer that parsed (an unreadable answer with a failing exit is reported
+by the error, with the status, and is not also logged as used), and it is written
+through the same SIGPIPE-guarded, error-ignoring write as the stderr forwarding,
+so a closed stderr neither ends a daemon hosted in `rocm` nor panics it
+(`the_note_is_made_only_for_an_answer_that_parsed` and
+`the_note_to_a_closed_stderr_neither_kills_nor_panics_the_process`, the latter
+with stderr a pipe without a reader under SIGPIPE's default action). A failed read of the
+answer carries the child's stderr like every other failure
+(`a_failed_read_of_the_answer_reports_the_stderr_too`), and a child whose stdin or
+stdout pipe is missing is killed and reaped, not left running
+(`a_missing_pipe_kills_and_reaps_the_child`, Linux only).
+
+What is forwarded to the terminal is complete UTF-8: stderr is read in chunks
+that can end in the middle of a multi-byte character, and Rust's stdio on a
+Windows console refuses a write that is not valid UTF-8, an error the best-effort
+forwarding discards, so a split character would silently lose output. The
+collector carries an incomplete trailing sequence to the next chunk (invalid
+bytes become U+FFFD, and a character cut off by the end of the stream is flushed
+lossily) while still publishing the raw bytes at once for the error. The logic is
+the pure `Utf8Carry`, tested on every platform by
+`text_split_across_chunks_is_forwarded_whole_and_valid_at_every_boundary` (every
+two-point split of a string with two-, three- and four-byte characters),
+`bytes_that_are_not_text_are_replaced_and_a_cut_off_tail_is_flushed` and
+`the_collector_forwards_a_split_character_whole_and_keeps_the_raw_bytes` (a source
+that hands out one byte at a time).
+
+A child whose answer cannot be read is killed and reaped before the error is
+returned, as it is when the request cannot be written, so the long-lived daemon
+does not collect a running engine or a zombie per failure.
+`a_failed_read_of_the_answer_kills_and_reaps_the_child` (Linux only) runs the
+read step on a real child with a reader that fails and checks that the child's
+`/proc` entry is gone: a killed child that was never waited on would keep it as a
+zombie.
+
+A request that cannot be written (the engine exited, or closed its stdin, before
+reading it) is reported with what the engine wrote to stderr, since that is
+usually the explanation, after the child has been killed and reaped. The child is
+killed whether or not a `try_wait` would show it gone, because its pipe closes
+while it is still exiting; the read of its stderr is bounded (a grandchild that
+holds the pipe cannot hold the error path). `a_request_to_an_engine_that_exited_reports_what_it_said_on_stderr`
+runs the whole client against a fake that exits without reading;
+`a_request_that_cannot_be_written_kills_and_reaps_a_child_that_is_still_running`
+(Linux only) checks the `/proc` entry of one that is still running, and
+`the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` one whose
+grandchild keeps the pipe open. The last two run the step on a real child with an
+injected write error, because whether a real write fails before the child has
+closed its stdin is a race. The answer of an engine that exits without draining a request larger than a pipe buffer is not read on this path (every engine here reads stdin to the end before answering, so that needs one that breaks the protocol); the module comment in `stdio_client.rs` states the limit. The stderr of a failed
+write is collected by a thread that starts before the request is written and is
+waited for with one deadline (`StderrCollector::finish`), returning what had
+arrived when it passes; `a_collector_stops_waiting_at_its_deadline_and_keeps_collecting`
+and `an_expired_deadline_returns_what_is_collected_without_waiting` run that on
+every platform. It publishes each chunk as it arrives, not each complete line, so
+a diagnostic with no trailing newline that arrived before the deadline is
+reported (`the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` uses
+`printf` without a newline for that reason). When the request has failed and the
+collector is dropped, the capture is marked abandoned: what it held is released,
+and the thread, which must keep draining the pipe so a surviving descendant is not
+sent a SIGPIPE, discards and no longer forwards what arrives later, in chunks of
+a fixed size, so a long-lived daemon does not grow with every failed request
+(`an_abandoned_collector_releases_what_it_held_and_discards_what_arrives_later`,
+red without the drop handling).
+
+Starting the collector before the write also means an engine that fills its
+stderr pipe before it has drained a request larger than a pipe buffer cannot
+deadlock the client (the engine blocked on a full stderr, the client on a full
+stdin, nobody reading either).
+`an_engine_that_writes_a_lot_of_stderr_before_reading_its_request_does_not_deadlock`
+runs that against a fake that writes 300 kB to stderr first and is red when the
+collector is started after the write.
+
+One wait is deliberately not bounded and has no test: after the child exits, the
+answer is read to the end of its stdout and its stderr collector is joined, so an
+engine that leaves a grandchild holding either pipe makes the request wait for
+it. The clients this one replaced had the same exposure, and bounding it would
+mean reading both pipes on their own threads and choosing what to report when a
+deadline passes, which is a timeout policy the engine contract does not have
+today. The module comment in `stdio_client.rs` states the limit and its tradeoff.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
@@ -360,14 +534,25 @@ cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ig
 Run the cross-platform smoke test:
 
 ```bash
-python scripts/smoke_local.py
+cargo xtask smoke
 ```
 
 If the workspace is already built:
 
 ```bash
-python scripts/smoke_local.py --skip-build
+cargo xtask smoke --skip-build
 ```
+
+`--profile release` builds and smokes release binaries; it builds only the four
+binaries the gate runs (`rocm`, `rocmd`, `rocm-engine-lemonade` and
+`rocm-engine-vllm`), not the whole workspace. `--target-dir <dir>` builds into
+that directory and looks for the binaries there; without it, a configured
+`CARGO_TARGET_DIR` is honoured, and otherwise `target`. The build is always
+given that directory, so a `build.target-dir` in cargo config does not move it.
+Before its first check, a run names the binaries' directory and the throwaway
+state root it uses. The build's output streams as it runs. Each smoked command
+must finish within three minutes; one that does not is killed and the gate
+fails naming it, though a process that command started can outlive it.
 
 ### Property tests
 
@@ -450,6 +635,25 @@ append a deliberately unparsable line to it, run the test with `--nocapture`
 `unparsable line, ignoring` warning naming that path, and remove the line.
 The check does not tell a seed that still reproduces from one that no longer
 does; it only confirms that something reads the file.
+
+### Property tests for persisted settings
+
+`config.json`, its migration from a legacy rocm-dash `config.toml`, and how
+the data directory is found from it have `proptest` properties, beside the
+code they drive. They run in the ordinary `cargo test`; to run only them:
+
+```bash
+cargo test -p rocm-core --lib config::props -- --nocapture
+cargo test -p rocm-core --lib persisted_paths_props -- --nocapture
+cargo test -p rocm --bin rocm therock::python::config_props -- --nocapture
+```
+
+Each property counts how many generated cases reached the input it is about
+(an unreadable `config.json`, a non-finite tick, non-ASCII text, and so on),
+prints that as a `reach:` line (`--nocapture` shows it), and fails when the
+count is zero, so a generator that stops producing that input fails the run
+instead of passing without testing anything. A property that fails prints its
+shrunk counterexample.
 
 ### Known-gap reproducers
 
@@ -831,10 +1035,12 @@ download could start. The printed `command:` line then shows
 `uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
 so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
 with a different Python 3.12 it can choose that one rather than the managed one
-a real install prepares. That scenario is a canonical-layout preview.
+a real install prepares. That scenario is a canonical-layout preview, pinned to
+an earlier ROCm 7 release because an unpinned install now reads the newest layout.
 
-A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
-to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later, a
+nightly built since 2026-08-23, or any install with no pin, which now reads that
+layout) is held to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
 is the one step that chooses the `torch` and `torchvision` versions (the CLI
 picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
@@ -856,6 +1062,7 @@ preview runs it exactly once, for the compile, and prints the resolved plan. The
 `therock-next` scenarios that print resolved package specs start from `And a uv
 is already installed`, which installs the managed `uv` into the scenario's data
 folder the way a real install would have.
+
 The decision is unit-tested on every platform, Windows included
 (`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
 [uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
@@ -872,6 +1079,30 @@ entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
 first is a network call, and the second is held only by the types (those entry
 points return a resolved plan and refuse the unresolved one) and by the lanes
 that install a ROCm 10 runtime for real.
+
+Which source an install reads is covered by the `therock-next` scenarios against
+loopback fixtures served through the trust gate (the
+`ROCM_CLI_THEROCK_*_BASE` variables, see [release-trust.md](release-trust.md)).
+`therock-next-01` is the default (an unpinned release install reads the newest
+layout) and `therock-next-16` its other half (a pin to an earlier ROCm 7 release
+reads the canonical stream); `therock-next-17` refuses a group family with no
+pin and then runs the earlier-release pin the refusal names; `therock-next-18`
+and `therock-next-19` are the same two shapes for a tarball install;
+`therock-next-20` to `therock-next-22` are the nightly channel: no pin reads the
+newest layout at its newest build that has PyTorch wheels, and a build date on
+either side of the 2026-08-22/2026-08-23 boundary reads the stream that holds
+it; `therock-next-23` is the tarball refusal for a nightly pin before that
+boundary, run together with the wheel install it points to. `update-11` holds
+that an update installs from the layout its runtime recorded: a runtime of the
+earlier release stream recorded with only a family label still updates, instead
+of being refused for an exact arch. The live counterparts, which resolve the real indexes and so run on
+gated lanes, are `runtime-08` and `runtime-31` (nightly, `@nightly` lane) and
+`runtime-09` and `runtime-32` (release, `@requires-gfx-target`: they need a
+detected GPU target). The routing rule
+itself, `layout_serving`, is a table of every request shape on both channels in
+[source.rs](../apps/rocm/src/therock/source.rs), including the boundary dates.
+The paced tarball download in `download-progress-01` reads the newest layout's
+catalog with an exact arch for the same reason.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
@@ -969,7 +1200,7 @@ Use a deterministic family only for developer tests that need fixed package
 selection:
 
 ```bash
-python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
+python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx1200
 ```
 
 ### GPU targets with no ROCm build
@@ -1242,20 +1473,19 @@ install.
 `serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
 restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
-per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
-the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
-and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
-is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
-dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
-cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
-they stay reachable when the opt-in is set.
+Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
+them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
+i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
+`E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
+`include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
+gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
+the tagging and that they stay reachable when the opt-in is set.
 
-Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
-every nightly run, and only a manual `include_nightly` dispatch on a host with
-Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
-is reachable ("Report whether Docker is reachable"); check that line before
-relying on this coverage.
+Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
+logs whether Docker is reachable ("Report whether Docker is reachable").
+`serve-27`'s known failure on the Strix Halo pool is an xfail row in
+`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
+means the row is stale.
 
 ### Lemonade managed-serve failure evidence
 
@@ -1817,7 +2047,7 @@ server exited on its own during the wait (a record settled without a stop marker
 saying it exited and naming `rocm logs --service <id>`.
 The `watched_detached_spawn_*` tests run on the required Windows lane.
 
-`serve-54` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
+`serve-55` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
 `e2e-test-hooks` build scripts the managed engine's death (the spawned `rocm`
 gets an argument it rejects), and the scenario checks that the serve fails naming
 the engine's own log, that the record left on disk reads `stopped` and names no
@@ -1827,7 +2057,7 @@ self-hosted Windows lane; the required `windows-build-and-test` lane builds
 without the hooks and does not. Run it locally with:
 
 ```bash
-cargo xtask e2e -- -n "serve-54 "
+cargo xtask e2e -- -n "serve-55 "
 ```
 
 Serve resolver focused tests:
@@ -2112,6 +2342,284 @@ directly, exits 0, and records whether that signal worked, adding a second
 stderr `note:` when it did not (`cargo test -p rocm --bin rocm services_stop_` and
 `cargo test -p rocm --bin rocm attached_ctrl_c_`).
 
+`rocm services stop` and `rocmd`'s `stop_server` terminate the processes a
+record names through one routine,
+[`terminate_recorded_service_pids`](../crates/rocm-core/src/proc_lifecycle.rs),
+and wait `MANAGED_STOP_GRACE` for each; neither binary keeps a copy. The
+routine is tested in `rocm-core` (`cargo test -p rocm-core proc_lifecycle::`):
+the supervisor is visited before the engine, each PID with its own start-time,
+a PID recorded under both roles once, and the stopping process's own PID is
+reported as `self` in `pid_outcomes` and never signalled, in both commands.
+On Windows the verified root is preceded by `taskkill /PID <pid> /T /F`, because
+`terminate_verified` cannot walk a process tree there; that step is tested
+through injected functions that run on every host (`the_tree_is_killed_before_the_root_is_terminated`
+and its neighbours) and, against a real tree, by a Windows-only scenario
+(`service-stop-07`, below). The callers' own tests check
+that each reaches the routine and reports what it returns
+(`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
+`cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
+that no private copy of the routine or its constant has come back. Those checks
+pin names only: they are a tripwire for a copy returning under the same name, not
+coverage of what either stop does. A confirmed
+stop also clears the PIDs and start-time tokens it stopped from the record
+(`ManagedServiceRecord::clear_recorded_processes`, one call from both
+binaries), and an unconfirmed one keeps them; a PID recorded without a token is
+signalled on trust alone once the OS has recycled it, so a stale one must not
+survive for a second stop to find.
+`a_confirmed_stop_clears_the_recorded_processes_so_a_second_stop_signals_nothing`
+runs the real routine with the per-PID signal injected, and asserts the
+persisted record after the first stop and that a second stop signals nothing;
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop` is the
+other direction. `service-stop-07`
+(`@requires-os:windows`, no GPU) is the live coverage of the Windows tree kill when it is run on a Windows host, which no CI job does:
+it records a PowerShell parent that has started a `ping` child, runs `rocm
+services stop --yes`, and asserts that both processes are gone together with the
+report (`Local server stopped`, `stopped processes: 1`) and the record (stopped,
+no process, no stop request, key file gone). The child is the tree kill's own
+work: with the `taskkill /T` step removed the stop ends only the recorded
+process and the scenario fails on the surviving child. The scenario keeps the
+child's own identity (`E2eWorld::recorded_descendant`) and teardown ends it when
+it is still that process, so a stop that fails to take it down does not leave
+`ping` running for its five minutes behind a dead parent; the decision is
+`e2e_cucumber::stray_process::leftover_action`, which a table test covers on
+every host (ended only while it is still the recorded process, never once gone,
+reused or unconfirmed). `service-stop-01` plants
+PID 0 and `service-stop-02` is Linux-only, so neither reaches that step; the
+injected unit tests above cover its ordering and verdicts on every host.
+
+The tree kill is behind the same identity gate as the rest of the stop. On
+Windows `process_start_ticks` is the process creation time (`GetProcessTimes`, a
+`FILETIME`), so a record written by this version refutes a PID that an unrelated
+process has taken, and the stop reports `identity_mismatch` without running
+`taskkill` on it; only a record written before Windows recorded a token has
+nothing to refute: a stop refuses a PID only when a token was recorded and the
+live one differs, and `what_a_stop_does_for_each_recorded_and_live_token` pins
+that for every case on every host (no token, which is also the shape
+`service-stop-07` records; a token that matches; one that differs; one that
+cannot be read back), asserting whether the tree kill runs and the verdict the
+stop reports together. `a_filetime_is_its_high_word_above_its_low_word` runs the
+conversion on every host. `terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
+runs the real stop against this test's own PID with a wrong token on Linux and
+Windows (a stop that went ahead would end the test process), and
+`terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+repeats it against a bystander on Windows only and then stops that bystander
+with its true token. `service-stop-08` is the live version on every OS: it
+records a running process under a token no live process has, stops the server,
+and asserts that the process is still running and the record names no process.
+None of the Windows-only paths has been run on a Windows host for this change,
+and I am not claiming a Windows result for this head. What the CI configuration
+does and does not run there, read from `.github/workflows/ci.yml`: the
+`windows-debug` job (`Windows build and test (debug)`), when Rust files change,
+runs clippy, the build, `cargo test --workspace --all-targets` and the harness
+self-tests. That test run includes unit tests in `proc_lifecycle.rs` that stop a
+real process on Windows: `terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+and `terminate_recorded_pid_stops_a_process_recorded_without_a_token` are
+`#[cfg(windows)]` and start a real `ping` child and stop it through
+`terminate_recorded_pid`, which takes the PID hold, reads the creation time,
+applies the identity gate (a wrong token leaves the process running; a matching
+or absent token stops it) and runs the System32 `taskkill /T /F`. The e2e target
+is excluded from `cargo test`, so no scenario runs there: the `service-stop-*`
+and `service-unqueryable-*` scenarios do not run on that job.
+`service-stop-07` (`@requires-os:windows`) and the Windows half of
+`service-stop-08` can run only through the harness on a Windows host, which is a
+manual step (see "Windows host check" in [manual-testing.md](manual-testing.md));
+on the Linux e2e jobs `-07` is skipped and `-08` runs its Linux half. Not covered
+by any CI job: the end-to-end tree kill of a parent with a child (`-07`), the
+failure cases that cannot be staged (an `OpenProcess` access-denied process, a
+failing or stalled `taskkill`, `taskkill` exiting 128), and the launch-cleanup
+branch run against a real Windows child. The failed-launch cleanup terminates its
+child through the same routine as a stop (`terminate_recorded_pid_within`, so on
+Windows the tree kill runs too), and what it asks of the termination is tested
+through an injected function on every host
+(`abandoned_launch_asks_the_termination_for_the_spawned_child_with_its_token`:
+the child's PID with the token captured at spawn, and nothing at all for a child
+with no token where tokens are recorded); that the production wiring reaches the tree
+kill is not observable on Linux, where the termination walks the tree itself, so it
+rests on the routine's own tests and on review. The unit tests above stop a `ping` that has no child of its own, so they
+do not show a descendant being taken down. A stop that cannot
+verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
+eq <pid>"` on Windows (`process_check_command`).
+Three further Windows paths of that stop are tested through injected functions
+that run on every host; no scenario forces their failure cases. A PID that cannot be
+queried (`ProcessProbe::Unqueryable`, which on Windows includes a live process
+the stop may not open) is `Indeterminate`, so the stop reports it unverified
+instead of already gone (`a_pid_that_cannot_be_queried_is_unverified_not_already_gone`,
+`a_stop_of_a_live_process_it_cannot_query_is_not_confirmed`, and
+`a_failed_open_is_gone_only_for_no_such_process` for the error codes). The PID is
+held open from before the identity read until the stop returns, so the creation
+time that was compared is that of the process the kill then reaches
+(`the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop`). A PID
+that could not be held (the process could not be opened) while its identity still
+reads as matching is not signalled either: nothing would reserve it between the
+read and `taskkill`, so the stop is `unverified` and neither the tree kill nor the
+termination runs
+(`a_tree_kill_is_not_run_for_a_pid_that_could_not_be_held_even_when_its_identity_matches`;
+a gone, recycled or unreadable PID keeps its own refusal,
+`an_unheld_pid_that_is_gone_recycled_or_unverifiable_keeps_its_refusal`, and
+where there is no tree-kill step the missing hold changes nothing,
+`without_a_tree_kill_step_an_unheld_pid_is_still_terminated`). And a
+`taskkill` that failed to start or exited nonzero leaves the stop unconfirmed,
+whatever the root's own termination says, because only the root's exit is
+watched on Windows. When the root itself was seen to exit (or was already gone)
+the outcome is `descendants_unconfirmed`, which says the root is gone and a
+process under it may still be running; it is not `timed_out`, which is kept for
+a root that outlived its deadline. `rocm services stop` prints it as a `not
+confirmed:` line, and `a_stop_with_an_unconfirmed_tree_kill_says_what_happened_and_keeps_the_service`
+asserts that line, that no `still running` line is printed, and the record, stop
+request and key that are kept. The warning lasts one run, and the line says so: the
+next `rocm services stop` finds the root gone and reports the stop confirmed, and
+a listing completes the pending stop the same way, neither with new evidence about
+the processes under the root (the same test runs that second stop and asserts it);
+keeping it durably would need a marker in the record, which is not done
+(`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
+`only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found`). A
+`taskkill` that exits 128 (process not found) is judged by the root's own re-read:
+with the root still there the kill counts as failed
+(`a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill`); with
+the root gone it exited by itself, and the outcome is `exited_before_tree_kill`,
+not a stop on its own, because `taskkill /T` reaches children only through a live
+parent and nothing recorded what was under the root
+(`a_tree_kill_that_found_no_process_with_the_root_gone_is_not_a_stop_by_itself`).
+Across the record, such a root becomes `already_gone`, and the stop confirmed,
+only when another recorded process is confirmed gone (`a_parent_that_exits_alone_is_confirmed_when_the_recorded_engine_is_confirmed_gone`,
+`two_roots_that_both_exited_alone_are_a_confirmed_stop`); with nothing else
+recorded, or the engine still running or unconfirmed, it stays unconfirmed
+(`a_parent_that_exits_alone_with_nothing_else_recorded_is_not_a_confirmed_stop`,
+`a_parent_that_exits_alone_stays_unconfirmed_while_the_recorded_engine_is_not_gone`,
+`the_stopping_process_does_not_corroborate_a_root_that_exited_alone`). Both
+callers fold every row, so the record, PIDs and key are kept unless every
+recorded role is confirmed
+(`a_root_that_exited_alone_confirms_the_stop_only_when_the_engine_role_does` in
+`rocm` and in `rocmd`, `a_lone_root_that_exited_alone_leaves_the_stop_unconfirmed`
+in both). A failed tree kill with the root gone stays unconfirmed
+(`a_failed_tree_kill_with_the_root_gone_is_still_unconfirmed`). That `taskkill` runs under
+a deadline of `MANAGED_STOP_GRACE`: one that stalls is killed and reaped and
+counts as a failed tree kill, so it cannot hang `rocm services stop`, `restart`
+or the attached Ctrl-C stop
+(`a_helper_that_stalls_is_killed_and_reaped_at_its_deadline` runs a long-sleeping
+child under a 200 ms deadline on every host and asserts the error, the bounded
+elapsed time, the reaped child and the failed verdict; `a_helper_that_exits_in_time_gives_its_exit_code`
+and `a_helper_that_cannot_be_started_is_an_error` are its neighbours). The report and the record
+a `timed_out` stop leaves are covered by
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. The
+`taskkill` is started from the system directory that `GetSystemDirectoryW`
+returns, not by a bare name `PATH` could resolve and not from the `SystemRoot`
+environment variable a caller could redirect
+(`a_system_tool_is_resolved_under_the_system_directory` builds the path from a
+given directory on every host; the Windows call itself is run only by the
+Windows job's tests that start `taskkill`; ComfyUI's own `taskkill` and `tasklist` calls use
+the same helper). A readable
+recorded token that differs outranks a failed query
+(`a_readable_token_mismatch_outranks_a_failed_query`), but the creation time and
+the query are read with the same access right, so on Windows this only reaches a
+process that opens and then fails the exit-code query; a process that cannot be
+opened has no readable token, stays unverifiable, and is cleared with
+`rocm services remove <id> --force --yes` (see "A record that stays unverified"
+in [manual-testing.md](manual-testing.md); the unit tests
+`force_removes_a_record_held_by_an_unqueryable_process_and_says_so`,
+`a_record_held_by_an_unqueryable_process_is_refused_naming_the_forced_removal`,
+`force_is_refused_for_a_running_process_and_without_a_requested_stop` and
+`force_on_a_record_that_is_not_running_is_an_ordinary_removal`,
+`a_forced_removal_missing_yes_names_the_command_that_completes_it` and
+`prune_names_the_forced_removal_for_a_record_held_by_an_unqueryable_process` (prune
+lists the record with the command, and running that command clears it) cover it with the
+probe injected, and `service-unqueryable-01` and `-02` drive the stop, the
+refusal naming `--force`, and the forced removal through the real binary, with
+the `e2e-test-hooks` variable `ROCM_E2E_UNQUERYABLE_PIDS` making the listed PIDs
+read as unqueryable; `-02` is Linux-only because it starts a real process). On
+Windows the happy paths of the PID hold, the creation-time read and the System32
+`taskkill` are exercised by the two `#[cfg(windows)]` unit tests named above when
+`windows-debug` runs the workspace tests (no result for this head is claimed
+here). What no test reaches there is the failure side of the Windows API: the
+`OpenProcess` failure codes against a real unopenable process, `taskkill`
+exiting 128 or failing or stalling, and a descendant actually being taken down;
+none of those has been run on a Windows host. What was moved out of the FFI so
+that it is unit-tested on Linux and, as plain `cargo test`, on the Windows unit
+job: the open-failure code mapping (`classify_open_failure`), the exit-code query
+mapping (`classify_exit_query`), the `taskkill` result and arguments
+(`classify_taskkill`, `taskkill_args`), the `System32` path building, the
+FILETIME join, and the deadline wait (a real child). The ordering of the hold,
+the identity read, the tree kill and the termination is tested through injected
+functions.
+
+The same unqueryable-process rule holds wherever a service's liveness decides
+something destructive. The deferred key cleanup and the reconciliation to
+`stopped` in the liveness refresh (`refresh_managed_service_runtime_liveness`) and
+the in-use check behind `rocm services remove` and `prune` read each recorded PID
+through `probe_process` and treat anything but a confirmed exit as possibly
+running. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
+drives the refresh with an unqueryable PID and then a confirmed-gone one,
+`an_unverified_stop_keeps_its_key_and_marker_through_a_later_liveness_refresh` runs
+an unverified stop and then the refresh over the record it wrote, and
+`a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
+removal guard; each takes the probe as an argument, so they run on every host.
+A pending stop of a container-backed engine (`engine_stop_decides_confirmation`,
+today `aim`) is never completed that way: its supervisor can be gone while the
+container still runs, and only the engine `Stop` decides that stop, so a listing
+does not complete it from PID evidence. The key, the marker and the recorded processes stay until a later
+`services stop` is confirmed
+(`a_pending_stop_of_a_container_engine_is_not_completed_by_a_gone_supervisor`).
+The same holds past the cleanup: the refresh does not read such a record as
+`stopped` from the supervisor's PID, and `remove` and `prune` count it as in use
+(`container_stop_unresolved`), so a listing followed by `remove --yes` or
+`prune --yes` deletes neither the record nor the key the container may still be
+enforcing (`a_pending_container_stop_survives_refresh_remove_and_prune`, for a
+record reading `ready` and one already reading `stopped`; a process engine in the
+same state is removed). A record that named no process at all, such as a `starting`
+one with a stale marker, has its key and marker cleaned as before but is not read as
+`stopped` (`a_stale_stop_marker_on_a_record_naming_no_process_is_cleaned_without_reading_it_stopped`).
+When that refresh completes a pending stop (every recorded process confirmed gone) it
+also forgets the recorded processes and reads the record as stopped, as a stop that
+confirmed the exit itself does, so a later `rocm services stop` visits no PID: a PID
+recorded without a token cannot be refuted, and on Windows the tree kill would take
+whatever process now holds the number. A process that may still be running stays
+named. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
+checks both halves (named while unqueryable, forgotten once gone),
+`a_completed_pending_stop_reads_stopped_whatever_live_status_it_had` that every live
+status, and `failed`, still ends as `stopped` in that one refresh (a `failed` record
+cleared but left `failed` would not be covered by `is_covered_by_stop_of`, and the stop
+finalizing would report itself unconfirmed), and
+`a_stop_completed_by_a_later_listing_leaves_no_pid_for_the_next_stop` runs the real
+termination routine over the record the listing wrote and asserts it visits nothing.
+Three gaps in the scenario coverage are deliberate. `service-stop-07` records no
+token, so the path a record written by this version takes on Windows (a token
+recorded, matching, with the tree kill then running) has no scenario; it rests on
+`what_a_stop_does_for_each_recorded_and_live_token` and the other injected tests,
+and on the `#[cfg(windows)]` unit tests that stop a real process with its true token. And
+the `self` row that `rocm` now puts in `pid_outcomes` has no scenario: it appears
+only in the JSON answer of the hidden `sandbox-run stop_server` and the sandbox
+tool, never in the text of `rocm services stop`, and it names the stopping
+process's own PID, which a scenario cannot plant in a record before the process
+that will read it exists. `a_stop_reports_its_own_pid_as_self` and
+`a_self_row_adds_no_line_to_an_unconfirmed_report` cover the answer and the report.
+Third, the `check:` line an unverified stop prints is a diagnostic, not a
+remediation: it shows whether the process is still running, and what clears the
+condition is that process ending (or, for a record held by a process `rocm`
+cannot open, `rocm services remove <id> --force --yes`; for a record still reading
+`ready` that nobody has tried to stop, `--force` is refused and names
+`rocm services stop <id> --yes` first, which reports the process unverified and
+records the request, so the clearing is those two commands, on purpose:
+`--force` never removes a record nobody tried to stop, and
+`a_ready_record_held_by_an_unqueryable_process_is_cleared_by_stop_then_force`
+runs the chain), after which a stop or a
+service listing confirms and drops the key. The command is a stock one the host
+has, pinned by `the_process_check_command_is_the_one_the_host_has`, and
+`service-stop-07` uses the same `tasklist /FI "PID eq <pid>"` filter (in CSV
+form, which does not depend on the display language) to see whether a process is
+running. A `tasklist` that does not exit successfully is no answer: the scenario
+fails instead of reading the missing row as an exit
+(`tasklist_reports_running` in `tests/e2e-cucumber/src/tasklist.rs`, a pure read of
+the status and output covered by `a_failed_run_is_no_answer_whatever_it_printed` on
+every host). No test follows the printed command on a Windows host and reads its
+default table output, because that output is localised. What follows once the
+process is gone is covered by
+`a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`.
+`service-stop-06` (Linux) is the same stop of a real recorded process through
+`rocm services stop`, checking the persisted state: the process exited and the
+record names none. Run the Windows scenario on a Windows host with
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-07"`
+and a prebuilt `ROCM_CLI_BINARY`.
+
 No scenario drives the attached Ctrl-C stop end to end. Attaching needs a real
 `rocm serve` launch — an engine and a runtime the mock lane does not have,
 which is why the chat scenarios there plant a record behind a mock server
@@ -2131,12 +2639,52 @@ verdict to the JSON; `rocm services stop` exits 1. The stop
 records the request in the manifest before it signals anything, and applies its
 result to the manifest as it is once the stop ends, so a write made meanwhile is
 kept — and a restart that recorded new processes meanwhile makes the stop
-unconfirmed rather than having its PIDs cleared.
+unconfirmed rather than having its PIDs cleared. What the stop's verdict still
+covers is decided by `ManagedServiceRecord::is_covered_by_stop_of`: the same
+processes, or none recorded because a liveness refresh that saw every process
+gone completed this same stop first (the record reads `stopped` and names
+nothing). A restart, whether it has recorded new processes or is mid-launch with
+none yet (status `starting`), is not covered, and neither is the empty `stopped`
+record a `rocm services restart` leaves between its own confirmed stop and the
+publication of its child: the restart stamps a relaunch generation
+(`relaunch_started_unix_ms`) before it restores the endpoint key or spawns, a
+stop covers only the generation it read, and publishing the child clears it
+(`an_older_stop_finalizing_before_a_restart_publishes_does_not_delete_its_key`
+finalizes an older stop in that window and asserts the restored key survives;
+`a_stop_does_not_cover_a_record_in_another_relaunch_generation` is the unit
+table; `a_restart_publishing_its_child_ends_the_relaunch_generation_and_respects_a_moved_one`
+covers the publication guard). The unit test
+`a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch`
+is the table, and it runs again from a stopping snapshot that names no process (an
+empty record is that stop only while it carries the stop's marker, reads
+`stopped`, or a liveness refresh consumed that marker and left its stamp in
+`settled_stop_unix_ms`; an empty `starting` relaunch has cleared the marker
+without leaving the stamp and is not covered,
+`stop_does_not_confirm_over_an_empty_relaunch_of_an_empty_record`); in `rocm`,
+`a_listing_clearing_the_marker_of_an_empty_stop_does_not_make_it_unconfirmed` runs the
+real refresh between the termination and the final read of an empty `starting` and an
+empty `failed` record (which the refresh leaves at their status) and asserts a confirmed
+stop, `a_relaunch_after_a_listing_consumed_the_marker_is_still_not_the_stop` that a
+restart following that listing is still not covered (it wipes the stamp), and
+`a_listing_that_completes_the_stop_before_finalization_does_not_unconfirm_it`
+persists a real liveness refresh between the termination and the final read and
+asserts a confirmed stop with the marker not restored,
+`a_restart_is_not_refused_because_a_listing_completed_its_stop` that a restart then
+carries on past its stop, and `stop_does_not_confirm_over_a_restart_that_has_recorded_no_process_yet`
+and `stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile` that a real
+relaunch is still detected; `rocmd` has the same three (`a_stop_completed_by_a_concurrent_listing_is_still_confirmed`,
+`a_stop_does_not_claim_a_restart_that_has_recorded_no_process_yet`,
+`a_stop_does_not_clear_processes_recorded_while_it_ran`) plus
+`a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed`, the
+listing's write made directly in those that need it because the refresh lives in the
+`rocm` binary (in the last one it is made in the engine `Stop` callback, the only
+step that runs for a record naming no PID, and the test asserts it ran).
 
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded
 process and checks the confirmed report against the process, the record and
-the endpoint key file. Run it with
+the endpoint key file, and that the standalone `rocmd` got an answer to its
+engine `Stop` request (it reaches the engine through the `rocm` beside it). Run it with
 `ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
 cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
 `service-stop-03`, `-04` and `-05` (Linux, mock lane) cover `rocm services
@@ -2150,7 +2698,27 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop"`.
+"service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
+suite's own host filter, so it would also run the Windows-only
+`service-stop-07` on a Linux host, where it fails for want of PowerShell.
+
+`features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
+covers how the daemon reads an engine child's answer, through the same
+`stop_server` tool. Each scenario copies the real `rocmd` into a scratch
+directory and puts a stand-in `rocm` shell script beside it, which is the
+executable the standalone daemon runs for an engine request; the stand-in
+records its argv and the request it was sent, and prints what the scenario
+says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
+report carries the engine's answer (not an error built from the exit status).
+`engine-ipc-02` has it print something that is not an answer, write to stderr
+and exit non-zero: the report's engine error is the parse failure, naming the
+exit status the engine ended with, followed by its stderr. Both check the report together with the server's process, record and
+endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
+one `stop` request line. The server is a `vllm` one, for which the engine's
+`Stop` is advisory, so in `-02` the stop still completes; an engine whose stop
+decides the confirmation (`aim`) is not staged here, because teardown would
+then run the real engine's stop. Run them with a hooks build and `-n
+"engine-ipc"`.
 
 Manual restricted-tool smoke:
 
@@ -2507,15 +3075,19 @@ cargo test -p rocm --bin rocm anthropic_endpoint
 
 The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
 (a real Messages request is answered by the served model) and `serve-52`
-(`services list` reports both endpoints healthy), and `serve-53` (a request that offers a
-tool and requires it gets a `tool_use` block back) in
+(`services list` reports both endpoints healthy), `serve-53` (a request that offers a
+tool and requires it gets a `tool_use` block back) and `serve-54`
+(`@id:serve-anthropic-messages-streaming`, which sends `stream: true` and
+checks the reply is an event stream that reassembles into text, with usage in
+`message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. Streaming is not translated yet, so no scenario covers it; a request
-for it is refused, and the unit tests above pin that. The tool-use translation
-(`tools`, `tool_choice`, `tool_use` and `tool_result` blocks, the `tool_use` stop
-reason) is unit-tested against a fake engine in the same module; `serve-53` is the
-real-engine check.
+serves with. The proxy's unit tests cover the stream event sequence, a stream
+that ends early, an engine refusal before the first byte, and the refusal of a
+streaming request that offers `tools` (no scenario covers that refusal). The
+tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
+blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
+same module; `serve-53` is the real-engine check.
 
 Natural-language plan handoff tests:
 
@@ -2699,6 +3271,16 @@ bash scripts/setup-wsl-portable-build-deps.sh --self-test
 bash scripts/reclaim-gpu.sh --self-test
 ```
 
+The nightly stream canary has its own self-test, which checks each rule
+against a fixture plan without the network:
+
+```bash
+python scripts/nightly_canary.py --self-test
+```
+
+What the scheduled canary checks, who is told and how to rerun it are in
+[ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
+
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
 as a whole string — so a change to its quoting, spacing or field order fails
 the test rather than slipping past a substring assertion — and then runs that
@@ -2793,6 +3375,62 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
+
+Fish profile setup in `install.sh` is covered on its own by
+[`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script signs a
+local bundle, points the installer at a temporary home, and checks:
+
+- a bash, zsh, or ksh login shell still updates its own profile and, with
+  `fish` on `PATH`, also writes the fish `PATH` block and records both
+  profiles;
+- the fish completion script, starting with the marker line that names the
+  install folder, and its `completions` record line, for a bash login shell
+  with `fish` on `PATH`, a bash login shell with only `~/.config/fish`, and a
+  fish login shell;
+- an absolute `$XDG_CONFIG_HOME` moves fish's config and completions there,
+  and a relative one leaves them in `~/.config/fish` (it names a different
+  folder from each directory; both with a bash login shell only);
+- a reinstall adds no second block or record line and reports fish's config
+  as already configured;
+- a fish config, or a bash profile, that already names the install folder with
+  the user's own line is left alone and not recorded;
+- a `rocm.fish` that is already there and was not written by the installer (a
+  file, a link, a link whose target carries the marker, a dangling link) is
+  left exactly as it is, not recorded, with a note, while one an earlier
+  install wrote is replaced and recorded;
+- a bash home with no fish install grows no fish config, and
+  `ROCM_CLI_UPDATE_SHELL_PATH=0` writes no profile and no completions;
+- a `rocm` that cannot print completions, or prints nothing, leaves the install
+  and the `PATH` block in place with a note. The stub fails only once, as a
+  failure that clears by itself would, and the printed lines, run as printed
+  from a bare environment in a home whose name holds a space, then create the
+  file; `rocm` is never handed the installer's stdin;
+- a profile that cannot be created is reported rather than claimed as updated,
+  and not recorded; as a non-root user only, so is one that cannot be written,
+  under both `sh` and `bash`.
+
+It needs no network or GPU. Set `INSTALL_SH` to run it against another copy of
+the installer. The Linux `build-and-test` job runs it when the change touches
+the heavy path (`needs.changes.outputs.heavy == 'true'`):
+
+```bash
+sh tests/install-sh/run.sh
+```
+
+The same path with the packaged binary, including `rocm uninstall` putting the
+bash and fish configs back and removing the fish completions, is
+`@id:lifecycle-linux-fish-configured-from-bash` (lifecycle-32) in the lifecycle
+set above. `@id:lifecycle-linux-fish-completions-not-ours-kept` (lifecycle-33)
+checks that uninstall leaves a `rocm.fish` the user wrote over the installer's
+and says so, `@id:lifecycle-linux-fish-completions-removal-failure-warns`
+(lifecycle-34) that a `rocm.fish` it cannot remove is a warning while the rest
+of the uninstall still happens, and
+`@id:lifecycle-linux-fish-existing-completions-left-alone` (lifecycle-35) that
+the installer leaves a `rocm.fish` it did not write, says so, and uninstall
+leaves it too. lifecycle-34 makes the `completions` folder read-only, so it
+needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path`
+(lifecycle-25) also seeds fish and checks the completions stay with
+`--keep-binaries`.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
@@ -3561,6 +4199,12 @@ is what the verdict turns on.
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
 ```
 
+`examine-48` plants a native Linux machine (a simulated host root that is not WSL, because the PCI probe is skipped on WSL) whose `lspci` is a stand-in on `PATH` that prints one AMD GPU, exits 0 and leaves a `sleep` holding its output pipes for 30 seconds. The host probes now stop reading a tool's output shortly after the tool exits, so `rocm examine --json` must finish in under 15 seconds, well inside the background process's life, and must still list the GPU the stand-in printed at `0000:fe:00.0`, so what the tool printed before it exited is still collected (the length of the grace is not pinned here). It runs on the Linux lanes and needs no GPU; the unit tests behind it (`subprocess_runners_pair` in `host_gpu/capture.rs`) pin the same bound for each of the three runners.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-48 '
+```
+
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 
 ```bash
@@ -3988,6 +4632,24 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
 `fix_offered`. This path has not been exercised against real hardware in CI;
 verifying it needs a lane whose GPU architecture is on the allowlist.
+`cli_version` is the leading version `rocm version` prints (`X.Y.Z` for a
+`vX.Y.Z` tag build, `0.0.0-dev` for any other resolved ref), never the ref and hash
+after it. A tag counts as a release only when its suffix uses letters,
+digits, `.`, `-` and `+` and its version is at most 64 characters, the same
+rule the report applies before publishing, so a release version is never
+published as `unknown`; `release_tag_grammar_is_the_same_everywhere` in
+[build.rs](../apps/rocm/build.rs) holds that rule equal in build.rs,
+[release.yml](../.github/workflows/release.yml) and
+[smoke.rs](../xtask/src/smoke.rs) (`cargo xtask smoke`). Scenario
+`diagnose-58` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
+the field equals that leading version and that the version is the one the ref
+calls for, on a simulated host whose planted GPU is on the allowlist, so it
+prepares a report on every Linux lane, GPU or not. Those lanes build from a
+branch, so they check the `0.0.0-dev` half; the tag half is checked on the
+shipped binaries by the "Check the release binary's version" steps in
+[release.yml](../.github/workflows/release.yml). On real hardware, compare the
+field with the first word after `rocm-cli` in `rocm version`.
 
 Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
 answer with a word rather than a value, and the words are not interchangeable.
@@ -4185,8 +4847,9 @@ that grades how the agent reads a diagnosis, or what it does on an older CLI, ne
 has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/), the
 hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
 removes it afterwards. The stub replays recorded output for `rocm --version`,
-`rocm fix --json` and `rocm diagnose`, and refuses every other command with exit
-code 2. It only prints text read from the recording, so whatever an agent asks it,
+`rocm fix --json` and `rocm diagnose`, plus `rocm examine --json` for a case that
+names a `host` (below), and refuses every other command with exit code 2. It only
+prints text read from the recording, so whatever an agent asks it,
 it cannot change a machine or send anything; that comes from answering a fixed set
 of commands, not from the refusals. It also refuses `diagnose` options the
 recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
@@ -4220,10 +4883,23 @@ changed is output the skill is now graded against. What an older CLI printed can
 generated. It was recorded once from a real older build and lives in
 [`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
 
+A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
+`examine-fails`. The stub then answers `rocm examine --json`, and a case without a
+`host` still refuses it. The reply is the recorded examination with the fields the host
+implies set, whatever the recording held for them, and its `status` is recomputed by
+`Examination::compute_status`, the rule the probe uses, so a recording cannot say a
+status the other fields contradict. The real command prints those fields plus a
+`summary` object that only the `rocm` binary can build, so the replay leaves `summary`
+out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
+typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+`wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
+with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
+exits 1 with a fixed message on stderr, which is what the case pins.
+
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
-case id, `current` or `older`, and the error text the agent would pass as the
-symptom), run the command above, and add the case to
+case id, `current` or `older`, the error text the agent would pass as the symptom,
+and optionally a `host`), run the command above, and add the case to
 [`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
 check also fails when a case id is not an id in `evals.json`, or when the part of the
 symptom before its first `:` does not appear in that case's prompt, because the hook
@@ -4247,7 +4923,37 @@ On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionle
 include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
 directory and Python path without spaces; a path with spaces or parentheses is not
 exercised, and neither is the agent's own shell on the amd/skills Windows leg.
-Both replay cases also say "on Linux" in the prompt: run on a Windows host, the
-agent answered that its own machine is Windows and declined to run the CLI there, so
-neither case passed (0 of 2 in a local run), while on a Linux host (WSL2) both
-passed. Treat them as Linux-host cases when reading a run.
+The two cases about the older and the current CLI name no operating system in their
+prompts. They used to say "on Linux", and on a Windows host the agent answered that its
+own machine is Windows and declined to run the CLI at all, so the recorded replies never
+printed. The vLLM cases still say Linux on purpose: their catalog entries apply on Linux
+and WSL2 only, so they are not expected to pass on a Windows host.
+
+A real `rocm` on the machine can answer before the stub. The agent's shell does not
+always keep the stub first on `PATH`, so a machine that has a `rocm` installed (a
+developer's, not a grading runner) may show the real CLI's output and miss the pins. A
+miss on the `logs_contain` pin with the agent otherwise behaving as expected is that,
+not a regression.
+
+## Dashboard Chat Request Timeout
+
+A dashboard chat message is cut off after a fixed wait so a hung backend ends the
+turn instead of freezing the pane. The wait is 2 minutes by default and
+`ROCM_DASH_CHAT_TIMEOUT_SECS` (whole seconds, 1 to 3600) changes it; an unset,
+empty, non-numeric or out-of-range value keeps the default.
+
+The behavior is covered by unit tests in
+[mod.rs](../crates/rocm-dash-tui/src/agent/mod.rs) (how the variable is read) and
+[clients.rs](../crates/rocm-dash-tui/src/agent/clients.rs) (a request that outlives
+its budget times out and names that budget, a slow reply inside it is returned, and
+the real request path takes its budget from the variable):
+
+```bash
+cargo test -p rocm-dash-tui --lib request_timeout
+cargo test -p rocm-dash-tui --lib agent::clients
+```
+
+There is no Gherkin scenario: the timeout is a dashboard (TUI) behavior that no
+`rocm` command output exposes, and driving it end to end needs a model that
+answers slower than the wait. The manual check is in
+[manual-testing.md](manual-testing.md#4d-dashboard-chat-request-timeout).

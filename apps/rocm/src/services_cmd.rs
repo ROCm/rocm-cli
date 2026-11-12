@@ -38,7 +38,7 @@ use crate::service_hints::{
     service_action_verb,
 };
 use crate::service_records::{
-    prune_managed_service_records, remove_managed_service_record, service_prune_min_age_hours,
+    prune_managed_service_records, remove_managed_service_record_with, service_prune_min_age_hours,
 };
 use crate::services_text::{
     follow_service_logs, render_service_action_result,
@@ -74,17 +74,32 @@ pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
         ServicesCommand::Restart { service_id, yes } => {
             run_approved_service_action(&paths, "restart_server", &service_id, yes)
         }
-        ServicesCommand::Remove { service_id, yes } => {
-            print!(
-                "{}",
-                remove_managed_service_record(&paths, &service_id, yes)?
-            );
+        ServicesCommand::Remove {
+            service_id,
+            yes,
+            force,
+        } => {
+            let removed = remove_managed_service_record_with(
+                &paths,
+                &service_id,
+                yes,
+                force,
+                rocm_core::probe_process,
+            )?;
+            print!("{}", removed.text);
+            let message = if removed.forced {
+                format!(
+                    "removed local server record {service_id} (--force: a recorded process could not be queried)"
+                )
+            } else {
+                format!("removed local server record {service_id}")
+            };
             record_cli_audit_event(
                 &paths,
                 "service",
                 "remove_record",
                 "info",
-                format!("removed local server record {service_id}"),
+                message,
                 Some(&service_id),
             );
             Ok(())

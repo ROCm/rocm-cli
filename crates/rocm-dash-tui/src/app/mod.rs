@@ -81,7 +81,16 @@ pub use types::{
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
 /// How many snapshots to keep for sparklines.
-pub const HISTORY_CAP: usize = 240;
+///
+/// The braille sparkline packs two samples into each character column, so this
+/// bounds how much of a panel the graph can ever cover: 600 samples fill an
+/// inner width of 300 columns. That covers the half-width CPU box on a very
+/// wide terminal and a full-width stacked panel up to about 305 columns; past
+/// that the graph still stops short of the left edge. At 240 it topped out at
+/// 120 columns, which a full-width panel exceeds on any ordinary terminal.
+/// Snapshots arrive about once a second, so this is also roughly 10 minutes of
+/// history before the oldest samples start falling off the left.
+pub const HISTORY_CAP: usize = 600;
 
 /// How many benchmark rows to keep client-side for the bench panel.
 pub const BENCH_CAP: usize = 200;

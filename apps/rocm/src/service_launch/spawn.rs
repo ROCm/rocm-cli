@@ -14,8 +14,6 @@ use super::launch_transaction::{
 };
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
-#[cfg(not(windows))]
-use crate::engine_runtime_select::apply_app_path_env;
 use crate::engine_runtime_select::managed_service_launcher_path;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
@@ -111,10 +109,11 @@ fn fail_if_engine_died_at_startup(startup_exit: Option<ExitStatus>, log_path: &P
 /// Put a watched spawn's engine on `record`, unless the watch saw it exit.
 ///
 /// The order is the point: the startup check runs *before* the pid is recorded,
-/// so an engine seen dead is never named by the record. Its pid is free, and on
-/// Windows, which records no start-time token, nothing else would stop a later
-/// cleanup or stop from signalling whatever process reuses it. A live engine is
-/// recorded before anything else can fail, so cleanup knows to terminate it.
+/// so an engine seen dead is never named by the record. Its pid is free, and a
+/// creation time read only after it died would describe whatever process reuses
+/// that pid, so nothing else would stop a later cleanup or stop from signalling
+/// it. A live engine is recorded before anything else can fail, so cleanup knows
+/// to terminate it.
 ///
 /// Called on Windows, where the spawn reports the exit itself; kept free of any
 /// platform API so its unit test runs on every lane, the Windows one included.
@@ -610,7 +609,7 @@ fn launch_managed_engine_child_locked(
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
-        apply_app_path_env(&mut command, paths);
+        paths.apply_env(&mut command);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
             command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
         }

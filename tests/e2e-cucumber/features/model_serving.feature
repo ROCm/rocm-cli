@@ -359,14 +359,16 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
-  # image and a 9B checkpoint on a cold runner and may wait out the full
-  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. They run only when
+  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
+  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
+  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
-  # skip every night (the nightly job logs whether Docker is reachable).
+  # On a host without Docker both skip (the nightly job logs whether Docker is
+  # reachable). serve-27's known failure on Strix Halo Ubuntu is an xfail row in
+  # expectations.toml, tracked in rocm-cli#1058.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -816,7 +818,8 @@ Feature: Model serving
   # beside the OpenAI one — the engine's own when it serves one, else a
   # translation front on its own port — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Streaming is not translated yet, so it has no scenario.
+  # Tool use is translated for non-streaming requests (serve-53); a streaming
+  # request that offers tools is refused, which only the unit tests cover.
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -850,12 +853,20 @@ Feature: Model serving
     Then the response contains a tool_use content block
     And the tool_use block names a tool and arguments from the request
 
+  @id:serve-anthropic-messages-streaming @requires-gpu
+  Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a streaming request to the Anthropic messages endpoint
+    Then the response is delivered as Anthropic-style server-sent events
+    And the streamed content reassembles into a complete reply
+
   # A managed engine is spawned detached, so if it dies on the way up there is no
   # terminal for it to report to: the child's own service log is the only account
   # of why. The launch fails naming that log, and leaves its record `stopped`
   # (not `failed`, which `rocmd`'s recovery would respawn) without naming the
-  # dead child: its pid is free, and on Windows no start-time token would stop a
-  # later cleanup from signalling whatever process reuses it. Serving the same
+  # dead child: its pid is free, and no start-time token was captured for it
+  # that would stop a later cleanup from signalling whatever process reuses it. Serving the same
   # model again then reaches the engine launch again. The engine is scripted to
   # die at startup in test builds (`rocm/e2e-test-hooks`), which also waives the
   # no-GPU pre-flight and engine preparation so this reaches a real spawn without
@@ -869,7 +880,7 @@ Feature: Model serving
   # hooks, so it cannot run this; the Windows watch itself is covered there by
   # `rocm-core`'s `watched_detached_spawn_*` unit tests.
   @id:serve-managed-engine-dies-at-startup
-  Scenario: serve-54 - An engine that dies at startup fails the serve and names its log
+  Scenario: serve-55 - An engine that dies at startup fails the serve and names its log
     Given the managed engine dies during startup
     When the user serves a model with Lemonade
     Then serving fails and names the engine's own log
