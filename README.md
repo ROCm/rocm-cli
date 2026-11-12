@@ -166,8 +166,11 @@ commands, and commit-signing requirements.
 
 ## Quickstart
 
-These steps take a computer with a supported AMD GPU from installing ROCm CLI to
-a chat reply from a model served on that GPU.
+These steps take a computer with a supported AMD GPU, running Linux, WSL2, or
+Windows, from installing ROCm CLI to a chat reply from a model served on that
+GPU. The first run downloads a lot: `rocm install sdk` fetches a ROCm runtime
+and a PyTorch stack, and `rocm serve qwen` fetches a model of about 2.5 GB. Allow
+time and disk space.
 
 1. Install ROCm CLI with the command for your platform in
    [Installation](#installation). Then open a new terminal and confirm that
@@ -179,7 +182,15 @@ a chat reply from a model served on that GPU.
    rocm examine
    ```
 
-   Two lines in the output decide the next steps:
+   Two lines in the output decide the next steps. For example:
+
+   ```
+     active_runtime_status: ready
+     effective_default_engine: lemonade
+   ```
+
+   On an Instinct GPU, the second line reads `effective_default_engine: vllm`.
+   The lines mean:
 
    - `active_runtime_status`: `ready` means a managed ROCm runtime is already
      active, and you can skip step 3.
@@ -224,8 +235,14 @@ a chat reply from a model served on that GPU.
    interactive chat instead, run `rocm chat` with no options. Chat is a preview
    feature.
 
-6. Stop the server with the `stop` command from the deployment summary, or list
-   running servers with `rocm services list`.
+6. Stop the server with the `stop` command from the deployment summary. It has
+   this form:
+
+   ```
+   rocm services stop <service-id> --yes
+   ```
+
+   To find the service ID later, run `rocm services list`.
 
 For other models and engine options, see
 [Configure ROCm and serve a model](#configure-rocm-and-serve-a-model) and
