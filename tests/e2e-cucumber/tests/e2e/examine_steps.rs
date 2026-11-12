@@ -143,6 +143,44 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The leading version `rocm version` must print for a resolved `reference`,
+/// derived here from the ref alone rather than read back from the binary, so a
+/// build that reports the wrong version for its ref fails instead of agreeing
+/// with itself. Mirrors `release_version` in `apps/rocm/build.rs`: an exact
+/// `vX.Y.Z` tag, with an optional non-empty pre-release (`-rc.1`) or build
+/// (`+meta`) suffix of ASCII letters, digits, `.`, `-` and `+`, and at most 64
+/// characters after the `v` (`RELEASE_TAG_PATTERN` and
+/// `RELEASE_VERSION_MAX_LEN` there), is that version without its leading `v`; any other
+/// resolved ref (`main`, a feature branch, `vllm`, `v0.2`) is `0.0.0-dev`.
+/// The `unknown` ref is not covered: both callers reject it first.
+pub(crate) fn expected_leading_version(reference: &str) -> &str {
+    const NON_RELEASE: &str = "0.0.0-dev";
+    let Some(rest) = reference.strip_prefix('v') else {
+        return NON_RELEASE;
+    };
+    if rest.len() > 64 {
+        return NON_RELEASE;
+    }
+    let core = match rest.split_once(['-', '+']) {
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
+        Some(_) => return NON_RELEASE,
+        None => rest,
+    };
+    let components: Vec<&str> = core.split('.').collect();
+    let is_release = components.len() == 3
+        && components
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if is_release { rest } else { NON_RELEASE }
+}
+
 #[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let outputs = world.cli_outputs.as_ref().expect("no commands were run");
@@ -184,6 +222,11 @@ async fn assert_version_returned(world: &mut E2eWorld) {
     assert!(
         !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "version hash is not hexadecimal: {output}"
+    );
+    assert_eq!(
+        version,
+        expected_leading_version(reference),
+        "the leading version does not follow from the ref: {output}"
     );
 
     // `rocm version`'s own two lines beyond the build string. Both are printed
@@ -1661,7 +1704,7 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
     }
 }
 
-/// The five AMD GPUs `examine-43` puts on the PCI bus, as `lspci -nn -D`
+/// The five AMD GPUs `examine-49` puts on the PCI bus, as `lspci -nn -D`
 /// prints them: `(PCI address, gfx target, integrated, lspci line)`.
 ///
 /// Which door answers each row: the RX 7900 XTX its marketing name (its device
@@ -1717,7 +1760,7 @@ async fn machine_with_five_amd_gpus_on_the_bus(world: &mut E2eWorld) {
     plant_pci_bus(world, PCI_BUS_GPUS, &[]);
 }
 
-/// The two AMD GPUs `examine-44` puts on the PCI bus, in [`PCI_BUS_GPUS`]'s
+/// The two AMD GPUs `examine-50` puts on the PCI bus, in [`PCI_BUS_GPUS`]'s
 /// shape, plus the KFD `gfx_target_version` the kernel topology reports for
 /// each. Neither row resolves a target from its PCI line: the Raven Ridge iGPU
 /// (`15dd`) is in neither lookup table, and the Navi 33 card (`7480`) is in
@@ -1751,7 +1794,7 @@ async fn machine_with_kernel_identified_gpus(world: &mut E2eWorld) {
     plant_pci_bus(world, KERNEL_IDENTIFIED_GPUS, KERNEL_IDENTIFIED_NODES);
 }
 
-/// The two GPUs `examine-45`'s kernel topology lists, as `(KFD
+/// The two GPUs `examine-51`'s kernel topology lists, as `(KFD
 /// gfx_target_version, gfx target, integrated)`: a Strix Halo iGPU and an RX
 /// 9070 XT. Neither node states a PCI address, so the report lists both from the
 /// topology alone, the way it does in a container with no `pciutils`.
@@ -2979,6 +3022,381 @@ async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
         rocminfo_answers(world),
         (false, false),
         "(host summary, examination)"
+    );
+}
+
+// ── Both reports read the kernel release from one `uname -r` ───────
+
+/// The release the stand-in `uname` reports, chosen so no real host has it.
+const STAND_IN_KERNEL_RELEASE: &str = "6.8.0-stand-in-kernel";
+
+/// Where the stand-in `uname` logs the arguments of every call, one line each,
+/// so a scenario can count the reads. Inside the isolated root.
+fn stand_in_uname_log(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-calls.log")
+}
+
+/// Plant a `uname` first on the `PATH` of the next `rocm` run. `-r` runs
+/// `release_body` (a shell fragment); `-v` answers a fixed string, so the
+/// examination's other `uname` read has nothing to wait for. Every call appends
+/// its arguments to [`stand_in_uname_log`]. Nothing else on the
+/// machine is planted: the stand-in is what `rocm examine` reads on any Linux
+/// host, native or WSL, because both stacks run `uname -r` there.
+fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in uname directory");
+    let log = stand_in_uname_log(world);
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(release_body, &log),
+    )
+    .expect("failed to write the stand-in uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a machine whose uname reports a kernel release")]
+async fn machine_whose_uname_reports_a_release(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}"));
+}
+
+#[given("a machine whose uname prints a kernel release and then fails")]
+async fn machine_whose_uname_prints_a_release_and_fails(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}; exit 3"));
+}
+
+/// The `probe_failures` entries of an `examine --json` document, whatever they
+/// say.
+fn probe_failures(json: &serde_json::Value) -> Vec<String> {
+    json.get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `probe_failures` of the same machine with a `uname` that works, for a
+/// baseline: entries this machine legitimately has for other reasons are not
+/// the kernel read's, and a failure the failing `uname` adds, however worded,
+/// is.
+fn probe_failures_with_a_working_uname(world: &E2eWorld) -> Vec<String> {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-baseline-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the baseline uname directory");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(
+            &format!("echo {STAND_IN_KERNEL_RELEASE}"),
+            &world
+                .isolated_root
+                .as_ref()
+                .expect("no isolated root")
+                .path()
+                .join("uname-baseline-calls.log"),
+        ),
+    )
+    .expect("failed to write the baseline uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    let path = path.to_str().expect("PATH is UTF-8").to_owned();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["examine", "--framework", "skip", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        rc, 0,
+        "the baseline `rocm examine --json` failed:\n{stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("the baseline run emitted JSON");
+    probe_failures(&json)
+}
+
+#[then("the summary and the examination report that kernel release")]
+async fn assert_both_report_the_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/kernel"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, "/kernel_release"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+}
+
+/// One `rocm examine --json` run asks `uname` for the release once, for the
+/// examination and the summary together: the stand-in logged a single `-r`. A
+/// second read would show as a second line, and it is what lets a transient
+/// failure make the two fields disagree.
+#[then("that run asked uname for the kernel release once")]
+async fn assert_uname_was_asked_for_the_release_once(world: &mut E2eWorld) {
+    let log = std::fs::read_to_string(stand_in_uname_log(world))
+        .expect("the stand-in uname was never called");
+    let release_reads = log.lines().filter(|line| line.trim() == "-r").count();
+    assert_eq!(release_reads, 1, "calls of the stand-in uname:\n{log}");
+}
+
+#[then(
+    "neither the summary nor the examination reports a kernel release, and neither calls it a failure"
+)]
+async fn assert_neither_reports_a_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert!(
+        json.pointer("/summary/kernel")
+            .is_some_and(serde_json::Value::is_null),
+        "the summary must read no kernel from a uname that failed:\n{json:#}"
+    );
+    assert_eq!(inspection_str(&json, "/kernel_release"), "", "{json:#}");
+    // No `probe_failures` entry beyond what the same machine has with a working
+    // `uname`, so a failure worded in any way cannot slip through.
+    let baseline = probe_failures_with_a_working_uname(world);
+    let new_failures: Vec<String> = probe_failures(&json)
+        .into_iter()
+        .filter(|failure| !baseline.contains(failure))
+        .collect();
+    assert_eq!(new_failures, Vec::<String>::new(), "{json:#}");
+}
+
+// ── Both reports read the CPU from one reader ──────────────────────
+
+/// The model a planted AMD `/proc/cpuinfo` names, spelled as `/proc/cpuinfo`
+/// does, with runs of spaces inside it.
+const PLANTED_AMD_CPUINFO: &str = "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 26\nmodel name\t: AMD  Ryzen 9   9950X 16-Core Processor  \nprocessor\t: 1\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD  Ryzen 9   9950X 16-Core Processor  \n";
+
+/// The same model with its whitespace collapsed: what both reports show.
+const PLANTED_AMD_CPU_MODEL: &str = "AMD Ryzen 9 9950X 16-Core Processor";
+
+/// An Arm board's cpuinfo: a `Hardware` line, no `model name` and no `vendor_id`.
+const PLANTED_HARDWARE_ONLY_CPUINFO: &str =
+    "processor\t: 0\nBogoMIPS\t: 38.40\nCPU implementer\t: 0x41\nHardware\t: BCM2835\n";
+
+/// Plant `cpuinfo` as `/proc/cpuinfo` under a simulated host root inside the
+/// scenario's isolated tree, with a `/dev/dxg` when `wsl`, and hand that root to
+/// the next `rocm` invocation. The root holds nothing else, so the machine reads
+/// as WSL only when asked to and every other re-rooted probe sees an empty one.
+fn plant_cpuinfo_machine(world: &mut E2eWorld, cpuinfo: &str, wsl: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(root.join("proc")).expect("failed to create planted /proc");
+    std::fs::write(root.join("proc").join("cpuinfo"), cpuinfo)
+        .expect("failed to write planted cpuinfo");
+    if wsl {
+        std::fs::create_dir_all(root.join("dev")).expect("failed to create planted /dev");
+        std::fs::write(root.join("dev").join("dxg"), "").expect("failed to plant /dev/dxg");
+    }
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
+}
+
+#[given(
+    "a machine that is not WSL whose cpuinfo names an AMD CPU with repeated spaces in its model"
+)]
+async fn machine_with_an_amd_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_AMD_CPUINFO, false);
+}
+
+#[given("a machine that is not WSL whose cpuinfo has a Hardware line and no model name")]
+async fn machine_with_a_hardware_only_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_HARDWARE_ONLY_CPUINFO, false);
+}
+
+#[given("a WSL machine whose cpuinfo names an AMD CPU")]
+async fn wsl_machine_with_an_amd_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_AMD_CPUINFO, true);
+}
+
+/// `summary.cpu`, `cpu_model`, `cpu_vendor` and `is_wsl` of one `rocm examine
+/// --json` run.
+fn cpu_answers(world: &E2eWorld) -> (Option<String>, String, String, bool) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let summary = json
+        .pointer("/summary/cpu")
+        .unwrap_or_else(|| panic!("`examine --json` has no summary.cpu:\n{json:#}"))
+        .as_str()
+        .map(str::to_owned);
+    let is_wsl = json
+        .pointer("/is_wsl")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("`examine --json` has no boolean is_wsl:\n{json:#}"));
+    (
+        summary,
+        inspection_str(&json, "/cpu_model").to_owned(),
+        inspection_str(&json, "/cpu_vendor").to_owned(),
+        is_wsl,
+    )
+}
+
+#[then(
+    "the summary and the examination report that CPU model, and the examination reports its vendor as amd"
+)]
+async fn assert_both_report_the_planted_amd_cpu(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some(PLANTED_AMD_CPU_MODEL.to_owned()),
+            PLANTED_AMD_CPU_MODEL.to_owned(),
+            "amd".to_owned(),
+            false
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+#[then(
+    "the summary and the examination report that CPU model, and the examination reports its vendor as unknown"
+)]
+async fn assert_both_report_the_hardware_line_cpu(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some("BCM2835".to_owned()),
+            "BCM2835".to_owned(),
+            "unknown".to_owned(),
+            false
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+#[then(
+    "the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor"
+)]
+async fn assert_only_the_summary_reports_the_cpu_on_wsl(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some(PLANTED_AMD_CPU_MODEL.to_owned()),
+            String::new(),
+            "unknown".to_owned(),
+            true
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+// ── A probe tool that leaves a background process behind ───────────────────
+
+/// How long the stand-in `lspci`'s background process keeps the pipes it
+/// inherited open, which is how long a probe that waits for end of output waits.
+const LEFTOVER_PROCESS_SECONDS: u64 = 30;
+
+/// An inspection that finishes within this did not wait for that process. Half
+/// its life, so a loaded runner has the whole of the other half to be slow in.
+const INSPECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The PCI address and the line the stand-in `lspci` prints for its one GPU. The
+/// bus number is one no real machine's first adapter has, so the line cannot be
+/// mistaken for a card of the runner's own.
+const LEFTOVER_LSPCI_ADDRESS: &str = "0000:fe:00.0";
+const LEFTOVER_LSPCI_LINE: &str = "0000:fe:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX] [1002:744c] (rev c8)";
+
+#[given(
+    "a machine whose lspci prints a GPU and leaves a background process holding its output open"
+)]
+async fn machine_whose_lspci_leaves_a_background_process(world: &mut E2eWorld) {
+    // A simulated native Linux root: the PCI probe is skipped on WSL, so a runner
+    // that is a WSL host would otherwise never reach the stand-in.
+    plant_os_release(world, "ID=ubuntu\nVERSION_ID=\"24.04\"\n");
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("leftover-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in lspci's directory");
+    // The `sleep` starts in the background of the script, so it inherits the
+    // script's stdout and stderr, the pipes `rocm` reads the listing from, and
+    // outlives the script, which exits 0 straight after printing.
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("lspci"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{LEFTOVER_LSPCI_LINE}'\nsleep {LEFTOVER_PROCESS_SECONDS} &\n"
+        ),
+    )
+    .expect("failed to write the stand-in lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user inspects that machine in machine-readable form and the time it takes is measured")]
+async fn user_times_an_inspection_of_the_planted_machine(world: &mut E2eWorld) {
+    let started = std::time::Instant::now();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_elapsed = Some(started.elapsed());
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the inspection finishes long before the background process does")]
+async fn assert_the_inspection_did_not_wait_for_the_background_process(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let elapsed = world.cli_elapsed.expect("the inspection was not timed");
+    assert!(
+        elapsed < INSPECTION_BUDGET,
+        "the inspection took {elapsed:?}, so it waited for the {LEFTOVER_PROCESS_SECONDS}s \
+         background process that held `lspci`'s output open"
+    );
+}
+
+#[then("the inspection lists the GPU that lspci printed")]
+async fn assert_the_gpu_lspci_printed_is_listed(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let listed = json
+        .pointer("/gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no `gpus` array:\n{json:#}"))
+        .iter()
+        .find(|gpu| {
+            gpu.pointer("/pci_id").and_then(serde_json::Value::as_str)
+                == Some(LEFTOVER_LSPCI_ADDRESS)
+        })
+        .unwrap_or_else(|| {
+            panic!("the GPU `lspci` printed at {LEFTOVER_LSPCI_ADDRESS} is not listed:\n{json:#}")
+        });
+    assert_eq!(
+        listed
+            .pointer("/is_amd")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "{listed:#}"
     );
 }
 

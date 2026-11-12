@@ -1265,10 +1265,7 @@ mod tests {
         assert!(rocm_install_siblings(&missing).is_empty());
     }
 
-    /// Serializes the tests that point `ROCM_CLI_DATA_DIR` at a scratch
-    /// registry. Named `*_TEST_LOCK` so the env-mutation contract guard
-    /// recognises the discipline by suffix.
-    static DATA_DIR_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_env::DATA_DIR_ENV_TEST_LOCK;
 
     /// A wheel-format managed runtime's recorded library directories reach the
     /// search through the real chain, even though none of them sits under the

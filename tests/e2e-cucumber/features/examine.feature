@@ -1,5 +1,8 @@
 Feature: GPU detection and system inspection
 
+  # A release tag `vX.Y.Z` is reported as `X.Y.Z (vX.Y.Z, <hash>)`. Any other
+  # resolved ref, including `main`, is reported as `0.0.0-dev` rather than the
+  # unpublished workspace package version. The step checks that shape.
   @id:examine-version
   Scenario: examine-01 - The CLI reports its version
     When the user asks for the version through every CLI surface
@@ -640,6 +643,96 @@ Feature: GPU detection and system inspection
     Then the inspection reports kfd as loaded
     And the inspection reports amdgpu as loaded
 
+  # `rocm examine --json` reads the kernel release twice: the host summary
+  # (`summary.kernel`, which the text form prints as `kernel:`) and the examination
+  # (`kernel_release`, which the WSL version check and the kernel-dependent
+  # diagnoses read). They used to run `uname -r` separately, with different limits
+  # and different rules for a failed or malformed answer, and could disagree. They
+  # share one read now, so one `--json` run holds the two level on a specific
+  # value, not only on both being filled, and the stand-in counts its calls to show
+  # that the run asked for the release once: the summary takes the examination's
+  # read, so a transient failure cannot make the two fields disagree and a hung
+  # `uname` costs one timeout.
+  #
+  # The stand-in `uname` is planted first on PATH, so the scenario describes a
+  # kernel no runner has. It runs on every Linux lane, native or WSL, because both
+  # stacks read `uname -r` on both; Windows is out of scope, where the examination
+  # leaves `kernel_release` empty and the summary reads `cmd /C ver`.
+  @id:examine-reports-one-kernel-release-in-both-forms @requires-os:linux
+  Scenario: examine-43 - The summary and the examination report the same kernel release
+    Given a machine whose uname reports a kernel release
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that kernel release
+    And that run asked uname for the kernel release once
+
+  # A `uname` that fails is not trusted for what it printed first: the examination
+  # used to keep that release while the summary dropped it. Neither reports a
+  # kernel now, and a failed read is not a probe failure, so a host without a
+  # usable `uname` does not read as degraded.
+  @id:examine-reports-no-kernel-release-from-a-failing-uname @requires-os:linux
+  Scenario: examine-44 - Neither report keeps a kernel release from a uname that failed
+    Given a machine whose uname prints a kernel release and then fails
+    When the user inspects that machine in machine-readable form
+    Then neither the summary nor the examination reports a kernel release, and neither calls it a failure
+
+  # `rocm examine --json` reads the CPU twice: the host summary (`summary.cpu`,
+  # which the text form prints as `cpu:`) and the examination (`cpu_model` and
+  # `cpu_vendor`). They used to read `/proc/cpuinfo` separately and spelled the
+  # same model differently; they share one reader now, so one `--json` run holds
+  # the two level on a specific value, not only on both being filled.
+  #
+  # The planted machine is a simulated host root holding only a `/proc/cpuinfo`,
+  # so the scenario describes a CPU no runner has, and it is not WSL whatever the
+  # runner is: the comparison is scoped to hosts where `is_wsl` is false, because
+  # on WSL the examination does not read the CPU at all (`examine-47`). The model
+  # in `/proc/cpuinfo` has repeated spaces, which the examination used to keep and
+  # the summary to collapse. Native Windows reads the same CPU through the system
+  # inventory and cannot run on this lane; the unit tests in
+  # `crates/rocm-core/src/host_gpu/os_facts.rs` cover it.
+  @id:examine-reports-one-cpu-in-both-forms @requires-os:linux
+  Scenario: examine-45 - The summary and the examination report the same CPU model and its vendor
+    Given a machine that is not WSL whose cpuinfo names an AMD CPU with repeated spaces in its model
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that CPU model, and the examination reports its vendor as amd
+
+  # A board whose cpuinfo has a `Hardware` line and no `model name` (an Arm board)
+  # showed a CPU in the summary and none in the examination. Both read the
+  # `Hardware` line now, and the vendor stays unknown because such a file names
+  # none.
+  @id:examine-reports-a-hardware-line-cpu-in-both-forms @requires-os:linux
+  Scenario: examine-46 - Both reports name a CPU that cpuinfo gives only as Hardware
+    Given a machine that is not WSL whose cpuinfo has a Hardware line and no model name
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that CPU model, and the examination reports its vendor as unknown
+
+  # The difference this change leaves as it is: on WSL the examination returns
+  # before it reads the CPU, so `cpu_model` is empty and `cpu_vendor` is
+  # `unknown` while the summary shows the CPU. Pinned so that collecting CPU
+  # facts on WSL is a visible change of its own, which would turn this scenario.
+  # The other two scenarios compare the two reports on hosts that are not WSL.
+  @id:examine-reports-no-cpu-model-on-wsl-where-the-summary-has-one @requires-os:linux
+  Scenario: examine-47 - On WSL the summary reports the CPU and the examination does not
+    Given a WSL machine whose cpuinfo names an AMD CPU
+    When the user inspects that machine in machine-readable form
+    Then the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor
+
+  # The host probes' subprocess helpers used to read a tool's output until every
+  # holder of the pipe had closed it, so a tool that left a background process
+  # behind (a helper the tool starts and does not wait for) held the whole
+  # inspection until that process exited, however quickly the tool itself did.
+  # They now stop reading shortly after the tool exits, and the inspection keeps
+  # what the tool printed before that. The stand-in `lspci` prints one AMD GPU,
+  # exits 0 and leaves a `sleep` holding its output for 30 seconds; the
+  # inspection must finish well inside that and still list the GPU, so what the
+  # tool printed before it exited is still collected. It does not pin the length
+  # of the grace: that is the unit tests' (`subprocess_runners_pair`).
+  @id:examine-lspci-leaving-a-background-process-does-not-hold-up-the-inspection @requires-os:linux
+  Scenario: examine-48 - A PCI listing tool that leaves a background process behind does not hold up the inspection
+    Given a machine whose lspci prints a GPU and leaves a background process holding its output open
+    When the user inspects that machine in machine-readable form and the time it takes is measured
+    Then the inspection finishes long before the background process does
+    And the inspection lists the GPU that lspci printed
+
   # Whether a GPU is integrated decides two things a user sees: `rocm serve`
   # withholds its low-VRAM warning on an APU (whose "VRAM" is a BIOS carve-out
   # of system RAM), and `rocm diagnose` raises `fix-9-igpu-dgpu` only on a host
@@ -657,7 +750,7 @@ Feature: GPU detection and system inspection
   # adds is covered one level down: on a real host its agents are dropped by
   # ROCm/rocm-cli#393, so the folds it feeds cannot be reached from here.)
   @id:examine-tells-integrated-gpus-from-discrete-ones @requires-os:linux
-  Scenario: examine-43 - The inspection tells integrated GPUs from discrete ones by the part they are
+  Scenario: examine-49 - The inspection tells integrated GPUs from discrete ones by the part they are
     Given a machine whose PCI bus lists a Radeon RX 7900 XTX and four integrated AMD GPUs
     When the user inspects that machine in machine-readable form
     Then the inspection names each GPU's architecture and reports only the RX 7900 XTX as discrete
@@ -675,7 +768,7 @@ Feature: GPU detection and system inspection
   # stand-in `lspci` lists the two GPUs, a stand-in `rocminfo` lists no agents,
   # and the simulated host root carries a kernel topology node for each card.
   @id:examine-classifies-an-igpu-from-the-kernel-topology @requires-os:linux
-  Scenario: examine-44 - An integrated GPU that only the kernel identifies is reported as integrated
+  Scenario: examine-50 - An integrated GPU that only the kernel identifies is reported as integrated
     Given a machine with a Raven Ridge integrated GPU and a discrete AMD GPU that only the kernel identifies
     When the user inspects that machine in machine-readable form
     Then the inspection reports the Raven Ridge GPU as an integrated gfx902 and the other card as discrete
@@ -685,10 +778,10 @@ Feature: GPU detection and system inspection
   # ships no `pciutils`, so the kernel's topology is the only list of GPUs. A
   # card listed from the topology alone used to carry no verdict whatever its
   # architecture, so such a host reported neither an integrated nor a discrete
-  # GPU. Simulated as `examine-44` is, with a stand-in `lspci` that lists
+  # GPU. Simulated as `examine-50` is, with a stand-in `lspci` that lists
   # nothing and no PCI address on either topology node.
   @id:examine-classifies-gpus-only-the-kernel-lists @requires-os:linux
-  Scenario: examine-45 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
+  Scenario: examine-51 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
     Given a machine whose only list of GPUs is the kernel's, naming a Strix Halo integrated GPU and a Radeon RX 9070 XT
     When the user inspects that machine in machine-readable form
     Then the inspection reports the Strix Halo GPU as integrated and the RX 9070 XT as discrete
