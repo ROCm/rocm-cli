@@ -22,15 +22,13 @@
 //! `service_model_gpu_ready`, `service_model_reports_rocm_backend`,
 //! `service_model_names_match`).
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-215) of the `main.rs` modularization (see
-//! `docs/architecture.md`). This is the last sub-phase of the `main.rs`
-//! Phase 6f split that lands before the file's single shared
-//! `#[cfg(test)] mod tests` block starts: the function immediately after this
-//! cluster in the original file, `treat_as_natural_language`, is
-//! dispatch-adjacent natural-language-invocation routing left over from an
-//! earlier phase (ROCMAI-87) and stays in `main.rs` on purpose — it is not
-//! part of this module and is not touched by this change.
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`). The cluster ended where the
+//! file's single shared `#[cfg(test)] mod tests` block starts: the function
+//! immediately after it in the original file, `treat_as_natural_language`, is
+//! dispatch-adjacent natural-language-invocation routing that stays in
+//! `main.rs` on purpose — it is not part of this module and is not touched by
+//! this change.
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
 //! instead of moving: `const fn status_for_readiness` sits between

@@ -177,6 +177,9 @@ const fn stdio_options<'a>(
         app_paths: paths,
         env_root,
         endpoint_key_file: None,
+        // An external plugin is a third-party binary: never hand it a path to
+        // a live endpoint credential, including one we inherited ourselves.
+        withhold_inherited_key_file: true,
         request_progress: stream_progress,
         forward_stderr: true,
         note_failing_exit_after_answer: false,
@@ -395,6 +398,30 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// `rocm` must actually ASK for the withholding, not merely be able to.
+    ///
+    /// The protocol crate's own test proves the flag causes the clearing; this
+    /// is the other half of the chain, and without it flipping the value here
+    /// to `false` would re-open the leak with every test still green. Asserted
+    /// on `stdio_options` rather than on a built `Command` because
+    /// `engine_stdio_command` is private to the protocol crate.
+    #[test]
+    fn every_external_plugin_spawn_asks_to_withhold_the_endpoint_key_file() {
+        for stream_progress in [false, true] {
+            let options = stdio_options(None, None, stream_progress);
+            assert!(
+                options.withhold_inherited_key_file,
+                "an engine plugin is a third-party binary: `rocm` must withhold \
+                 an inherited key-file path from it, whatever else this request \
+                 asks for"
+            );
+            assert!(
+                options.endpoint_key_file.is_none(),
+                "and it must never hand one over either"
+            );
+        }
+    }
 
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {

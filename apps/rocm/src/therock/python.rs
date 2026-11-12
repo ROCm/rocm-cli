@@ -297,11 +297,12 @@ pub(super) struct PythonRequirement {
 /// Keyed on the layout rather than on a resolved ROCm version because the
 /// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
 /// wheels using the interpreter's own tags, so the resolved version is not
-/// available yet. The layout is an honest stand-in only when it was decided
-/// from an explicit stable pin (`next_layout_requested`); a fresh install with
-/// no pin, or a nightly build-date/prerelease pin, needs
-/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
-/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+/// available yet. For a request routed to the next layout (`layout_serving`:
+/// no pin, a stable ROCm 10+ pin, or a nightly built since the next layout began)
+/// the layout is an honest stand-in. A pin routed to the canonical stream can
+/// still resolve a ROCm 10+ build there (the earlier nightly stream carries ROCm
+/// 10 alphas), so [`canonical_auto_select_needs_next_python`] checks that feed's
+/// own listing for a build at or past [`THEROCK_NEXT_MIN_MAJOR`].
 ///
 /// [`canonical_auto_select_needs_next_python`]: super::canonical_auto_select_needs_next_python
 /// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR

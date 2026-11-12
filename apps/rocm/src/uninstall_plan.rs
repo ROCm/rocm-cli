@@ -5,9 +5,9 @@
 //! The uninstall plan: what would be removed, how that plan is rendered for
 //! review, and the filesystem-removal primitive used to carry it out.
 //!
-//! First relocated mechanically from `main.rs` — Phase 6f (ROCMAI-212) of
-//! the `main.rs` modularization (see `docs/architecture.md`); the
-//! protected-root judgment described at the end was added here afterwards.
+//! First relocated mechanically from `main.rs` (the `relocation` class in
+//! `docs/architecture.md`); the protected-root judgment described at the end
+//! was added here afterwards.
 //! `dispatch()`'s call sites are unaffected: none of this module's functions
 //! are called directly from `dispatch()`.
 //!

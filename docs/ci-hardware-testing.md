@@ -58,15 +58,17 @@ since the queue runs Linux pods. See
 [`nightly-canary.yml`](../.github/workflows/nightly-canary.yml) runs daily at
 07:23 UTC (and on `workflow_dispatch`) on GitHub-hosted `ubuntu-24.04` and
 `windows-2022`. It needs no GPU and installs nothing. For each of
-`gfx110X-all` and `gfx120X-all` (plus `gfx950-dcgpu`, on Linux only: the Windows run does not
+`gfx1100` and `gfx1200` (plus `gfx950`, on Linux only: the Windows run does not
 probe an Instinct target) it runs
 `rocm install sdk --channel nightly --family <family> --dry-run` and checks the
 plan with [`nightly_canary.py`](../scripts/nightly_canary.py):
 
-- the channel, source URL and source layout generation are the canonical
-  nightly ones, read from [`source.rs`](../apps/rocm/src/therock/source.rs)
-  rather than copied, so a legacy endpoint, the stable stream or another
-  channel taking part in nightly resolution fails the run;
+- the channel, source URL and source layout generation are the
+  current (next-layout) nightly ones, which an unpinned nightly install
+  resolves to, read from [`source.rs`](../apps/rocm/src/therock/source.rs)
+  rather than copied, so the earlier multi-arch endpoint, the stable stream or
+  another channel taking part in nightly resolution fails the run. The probes
+  name exact arches because that layout refuses a grouped family;
 - the selected version is a dated nightly and its build is at most three days
   old, which is how a stream that stopped publishing, or a resolver stuck on an
   old train, shows up. No expected version is hard-coded;
@@ -90,7 +92,7 @@ owner of this one.
 
 **Rerun.** Actions, "Nightly stream canary", "Run workflow". Locally, with a
 built `rocm`: `python scripts/nightly_canary.py --rocm target/release/rocm`
-(add `--family gfx110X-all` to probe one family; `--self-test` runs the rules
+(add `--family gfx1100` to probe one arch; `--self-test` runs the rules
 against fixtures without the network).
 
 
@@ -262,6 +264,37 @@ setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
 
+Each row of that page is one lane and package channel. Its Platform cell lists
+the ROCm, vLLM and lemonade versions the run served on, then the exact GFX
+target and the package source (index URL and source layout generation) the
+active runtime was installed from. Both are read from that runtime's own
+registry record by the harness (`collect_versions` in
+[`capability.rs`](../tests/e2e-cucumber/src/capability.rs)), never from a
+workflow label, so a lane running on a legacy or different source shows that
+source instead of the one the workflow meant. The harness reads the record with its own copy of the CLI's lookup (`wheel_composition_device_target` and the source-layout fallback), tied to it only by a comment, so a change to the record shape needs the harness updated by hand. A row omits the target or the
+source when it has no managed runtime, when its runtime's record predates the
+field, when the record carries none (a tarball runtime has no index URL, and a
+wheel runtime whose device target was not resolved exactly has no target), or,
+for the source, when a legacy record has no index URL. What
+a lane skips on a given platform follows from the `@requires-*` tags above.
+
+To reproduce a lane's result locally, pre-warm a runtimes tree from the same
+target and source the Platform cell names and export `E2E_SHARED_RUNTIMES_DIR`
+to it (see [the shared pre-warmed runtime](#the-shared-pre-warmed-runtime)).
+Without that variable each scenario runs in its own isolated data directory,
+sees no runtime, and installs one itself at the default channel (a multi-GiB
+download that also occupies the GPU), so the run does not use the runtime you
+installed. Install with `rocm install sdk --channel release|nightly`;
+`--family` takes a family label such as `gfx110X-all`, not the exact target, and
+no flag selects the package source, so treat the cell as what to compare
+against, not what to pass. Then run a scenario that exercises the runtime, for
+example `cargo xtask e2e -- -n "serve-05"` on a vLLM lane or `-n "serve-07"` on
+a lemonade lane (the Strix Halo, R9700 and W7900 rows serve on lemonade). `-n` is a regex
+over the scenario name, not a prefix, and not the `@id:` slug the report
+anchors show. It skips the host capability checks, so pick a scenario whose
+`@requires-*` tags (such as `@requires-engine:vllm`) your host meets; see
+[testing.md](testing.md) for how to select a scenario.
+
 `nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
 via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
 build results, the consolidated E2E failure total, and the `e2e-report-nightly`
@@ -364,7 +397,12 @@ lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
 matches. `push` fires on `main` and on any `release/**` branch, so pushing to
 a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
-branch.
+branch. Merging or closing a pull request also starts a run (`closed` is a
+listed `pull_request` activity type) that joins that PR's group and runs only a
+no-op job, so it supersedes the PR's earlier run and frees runners where the
+cancel completes. A run whose job is still queued for a runner may not finish
+cancelling, so it can keep its place in the queue until the runner picks the
+job up.
 
 On a release-branch push, every self-hosted GPU job additionally expands into
 a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three
