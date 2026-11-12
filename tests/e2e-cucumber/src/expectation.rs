@@ -174,7 +174,9 @@ pub struct ScenarioDecl {
     /// per-engine canary on the fast path, so it is skipped on ordinary per-PR /
     /// on-demand runs and only runs in the merge queue, which opts in via
     /// `E2E_MERGE_QUEUE`. Keeps the PR feedback loop short while still exercising
-    /// the full serve matrix (on every lane but MI300X) before a change lands.
+    /// the heavy serves before a change lands. Only the Windows Strix and WSL2
+    /// lanes run in the merge queue; the native Linux GPU lanes (MI300X, W7900,
+    /// Strix Ubuntu) do not.
     pub merge_queue: bool,
 }
 
@@ -1196,10 +1198,11 @@ serve_timeout_secs = 90
     #[test]
     fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
         // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
-        // may each wait out a 1200s readiness cap. Run per-PR on the Strix Ubuntu
-        // pool they pushed the job (~25 min otherwise) into its 45 min cap on every
-        // run. They must resolve to Skip unless the nightly opt-in is set, and must
-        // still be reachable (not Skip for the nightly reason) when it is.
+        // may each wait out a 1200s readiness cap. Run on every PR on the Strix
+        // Ubuntu pool (before that lane left the PR path) they pushed the job
+        // (~25 min otherwise) into its 45 min cap on every run. They must
+        // resolve to Skip unless the nightly opt-in is set, and must still be
+        // reachable (not Skip for the nightly reason) when it is.
         let m = Expectations::default();
         for prefix in ["serve-26 -", "serve-27 -"] {
             let d = ScenarioDecl::from_tags(&model_serving_tags(prefix));
