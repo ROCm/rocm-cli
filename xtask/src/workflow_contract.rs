@@ -9717,6 +9717,10 @@ permissions:
         );
         let run_text = format!("{} h", run_secs / 3600);
         assert_eq!(run_secs % 3600, 0, "the run limit is whole hours");
+        assert!(
+            flat.contains(&format!("{run_text} ({run_secs} s")),
+            "the doc's start section must give the run limit as {run_text} ({run_secs} s"
+        );
         let text = read_workflow("queue-run.yml");
         assert!(
             text.contains(&format!("{wait_secs} s ({wait_text})")),
@@ -9737,9 +9741,23 @@ permissions:
             timeout_minutes * 60 >= wait_secs + run_secs + 30 * 60,
             "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait and a {run_secs} s run"
         );
+        // What the timeout holds beyond the two limits and the 30 minutes: the
+        // margin the comment names. Derived, so it cannot drift from the number.
+        assert_eq!(
+            (wait_secs + run_secs) % 60,
+            0,
+            "the limits are whole minutes"
+        );
+        let margin_minutes = timeout_minutes - (wait_secs + run_secs) / 60 - 30;
+        // The comment's last lines and the timeout line, exactly: a stale total or
+        // margin anywhere else in the file cannot satisfy this.
         assert!(
-            text.contains(&format!(": {timeout_minutes} min.")),
-            "queue-run.yml's comment must give the timeout as {timeout_minutes} min"
+            text.contains(&format!(
+                "    # publishing the run can take 30 min more, and {margin_minutes} min are margin for the\n\
+                 \x20   # runner's own delays: {timeout_minutes} min.\n\
+                 \x20   timeout-minutes: {timeout_minutes}\n"
+            )),
+            "queue-run.yml's comment must give the 30 min, the {margin_minutes} min margin and the {timeout_minutes} min total, right above timeout-minutes"
         );
     }
 
