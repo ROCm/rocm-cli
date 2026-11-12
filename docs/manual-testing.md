@@ -172,6 +172,24 @@ Expected result:
   asking and prints a line crediting that flag by name — not `--yes`.
 - `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
   active default is: the preview stops before the gate.
+- Which source a preview reads follows the request, and the plan's
+  `canonical_source:`, `index_url:` and `source_layout_generation:` lines say so.
+  With no pin, `--channel release --family gfx1200` reads
+  `https://stable.repo.amd.com/rocm/whl-next` (`next-v1`) and `--channel nightly
+  --family gfx1200` reads `https://nightly.repo.amd.com/rocm/whl-next`, at the
+  newest build that has its PyTorch wheels (with a `warning:` line when a newer
+  `rocm` build does not yet). Pinning an earlier release or nightly reads the
+  earlier stream instead: `--version 7.14.1` reads
+  `https://repo.amd.com/rocm/whl-multi-arch` (`multi-arch-v2`), and `--channel
+  nightly --build-date 2026-08-20` reads
+  `https://rocm.nightlies.amd.com/whl-multi-arch`, while `--build-date
+  2026-09-01` reads the newest layout's nightly index. `--format tarball` with no
+  pin reads `https://stable.repo.amd.com/rocm/core/tarball/` (or
+  `https://nightly.repo.amd.com/rocm/core/tarball/` on the nightly channel), and
+  `--format tarball --version 7.14.1` is refused, pointing to `--format wheel`.
+  No unpinned install asks for a family label: `--family gfx120X-all` with no
+  `--version` is refused naming `--family gfx1200`, while `--family gfx120X-all
+  --version 7.14.1` previews from the earlier stream.
 - On a host with no usable Python (a minimal container; run with `PATH` pointing
   at an empty folder and no `ROCM_CLI_PYTHON`) and a clean data folder,
   `rocm install sdk ... --dry-run` still prints a plan. Its `python_launcher:`
@@ -183,8 +201,11 @@ Expected result:
   plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
   interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
   resolves `3.12` itself and may pick a different Python 3.12 than the managed
-  one a real install prepares. This holds for every layout. A preview pinned
-  to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) needs `uv` to choose
+  one a real install prepares. This holds for every layout, and the version in
+  that line follows the install: 3.12 for a ROCm 7 pin (`--version 7.14.1`),
+  3.14 for the default and for ROCm 10 or newer. A preview of ROCm 10 or newer,
+  which is what an install with no pin gets (`--family gfx1200`, or
+  `--version 10.0.0 --family gfx1200`), needs `uv` to choose
   the `torch` and `torchvision` versions, so on a host with no `uv` installed it
   stops before that step: the data folder still has no `tools` folder, a
   `resolution_note:` line says why, and `target:`, `runtime_key:`,
@@ -211,14 +232,14 @@ Expected result:
 - `rocm install sdk --version 10.0.0 --family gfx1200 --python-version 3.12
   --dry-run` plans Python 3.12 (`python_wheel_tag: cp312`, and a managed Python
   3.12 in the note on a host with none), and nothing in the plan says 3.14.
-  `--python-version 3.13` on an unpinned ROCm 7 install is refused, naming
+  `--python-version 3.13` on a ROCm 7 install (`--version 7.14.1`) is refused, naming
   Python 3.12 as the one that install uses, and `--python-version 3.9` on a
   ROCm 10 install is refused naming 3.10 to 3.14. A real ROCm 10 install on a
   vLLM GPU family with `--python-version 3.12` skips the engine auto-install
   with a note, while a real ROCm 7 install on that family with `--python-version
   3.12` (the redundant, accepted value) still auto-installs vLLM.
-- On the ROCm 10 runtime installed on Python 3.12 (including an unpinned
-  nightly install that resolved to ROCm 10), `rocm engines install vllm` names
+- On the ROCm 10 runtime installed on Python 3.12 (including an install with
+  no pin, which now resolves to ROCm 10 or newer), `rocm engines install vllm` names
   the wheel tag it needs, and `rocm update` of that runtime builds the new one
   on Python 3.12 again.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
@@ -253,7 +274,7 @@ Expected result:
 Developer-only deterministic override:
 
 ```powershell
-python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
+python scripts\therock_sdk_install_test.py --dry-run --family gfx1200
 ```
 
 Use `--family` only when a test needs a fixed package family. Do not use it for
@@ -1044,7 +1065,34 @@ Expected result:
   nothing to compare. Start around 30 rows, confirm both are present, then
   shrink past the drop and confirm both go at once.
 
-### 4d. An Attached Serve That Crashes (ROCMAI-541)
+### 4d. Dashboard Chat Request Timeout
+
+The first chat message to a local model reads the whole system prompt and tool
+list, which can take tens of seconds on modest hardware. With a model served by
+`rocm serve`, open the dashboard chat and send a message:
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- A first message that needs 20 to 60 seconds to answer is answered, not cut off.
+- To see the timeout itself, shorten the wait and send a message the model cannot
+  answer in time:
+
+  ```powershell
+  $env:ROCM_DASH_CHAT_TIMEOUT_SECS = "5"
+  rocm dash
+  ```
+
+  The turn ends with `request timed out after 5s (set ROCM_DASH_CHAT_TIMEOUT_SECS
+  to allow longer)`.
+- An unusable value (`0`, `abc`, `99999`) keeps the 2 minute default instead of
+  disabling the wait. Clear the override with
+  `Remove-Item Env:ROCM_DASH_CHAT_TIMEOUT_SECS` afterwards.
+
+### 4e. An Attached Serve That Crashes (ROCMAI-541)
 
 Check that a managed engine dying under `--verbose` is reported rather than
 swallowed. This is the behavior that regressed on Windows, where the child's
@@ -1070,7 +1118,6 @@ Then repeat, but stop it deliberately from the second shell with `rocm services
 stop <service-id>` instead of killing it. That is the control: the attached
 shell must exit **0**, report a stop rather than a crash, and leave the record
 **not** `failed`.
-
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

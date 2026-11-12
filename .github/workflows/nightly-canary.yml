@@ -1,6 +1,6 @@
 name: Nightly stream canary
 
-# Metadata only: resolves the canonical TheRock nightly stream with
+# Metadata only: resolves the current TheRock nightly stream with
 # `rocm install sdk --channel nightly --dry-run` and fails when the plan no
 # longer comes from that stream, or the newest build it can offer is stale.
 # No GPU and no install; see scripts/nightly_canary.py and docs/testing.md
@@ -47,6 +47,6 @@ jobs:
       - name: Canary self-test
         run: python scripts/nightly_canary.py --self-test
 
-      - name: Resolve the canonical nightly stream
+      - name: Resolve the current nightly stream
         shell: bash
         run: python scripts/nightly_canary.py --rocm target/release/rocm
