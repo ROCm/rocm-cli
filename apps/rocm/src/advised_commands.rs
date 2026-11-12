@@ -1291,6 +1291,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "rocm services prune --any-age --older-than-hours 0",
         "the doc's expected result is that the parser rejects this combination",
     ),
+    (
+        "docs/manual-testing.md",
+        "rocm fix --no-such-option; echo $?",
+        "the doc's expected result is that the parser rejects the unknown option \
+         with exit 2, the code the catalog publishes for an unknown fix-id",
+    ),
 ];
 
 /// Natural-language examples must reach the planner with a multi-word request:

@@ -4790,6 +4790,41 @@ report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
 
+## Fix Catalog Exit Codes
+
+`rocm fix --json` publishes each exit code twice over: `exit_codes` maps a name
+to its number and `exit_code_descriptions` maps the same name to what it means.
+Both are built from one table, `exit::MEANINGS` in
+[options.rs](../crates/rocm-core/src/fix/options.rs), so a code cannot be named
+without being described. The descriptions are an added field, so
+`contract_version` did not move.
+
+Exit 2 has two causes, and the `unknown_id` description says so: a fix-id the
+catalog does not have, and a command line the argument parser rejects before
+any fix-id is looked up. They are told apart by the message (a stderr line
+starting `Unknown fix-id:` against one starting `error:`), never by the code.
+The claim is about a line, not the start of stderr, because `run()` can print a
+one-time `rocm:` notice before either refusal. Each half of that claim is
+checked where it lives:
+
+- `the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`,
+  `every_published_exit_code_is_described_once` and
+  `every_exit_constant_is_published_and_nothing_else_is` in
+  [manifest.rs](../crates/rocm-core/src/fix/manifest.rs) hold the text and the
+  table, and the table to the `exit::` constants.
+- `a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id` in
+  [main.rs](../apps/rocm/src/main.rs) parses malformed `rocm fix` command lines
+  with the real `clap` definition and checks they exit with the published
+  `unknown_id` code and have a line starting `error:`.
+- `diagnose-34` (`@id:diagnose-fix-catalog-is-machine-readable`) runs the binary:
+  it reads the catalog, then runs `rocm fix` with an unknown fix-id and with an
+  unknown option, and checks each exits with the code the catalog publishes and
+  prints the message the description names. It has no tags, so every lane runs it.
+
+The other five descriptions are claims about the runners. The comment above each
+entry in `exit::MEANINGS` names the unit tests that prove it, and the branches
+no test drives (a command that exits non-zero, a missing tool or install).
+
 ## Doctor Skill Eval Replays
 
 The rocm-doctor skill's behavioural evals

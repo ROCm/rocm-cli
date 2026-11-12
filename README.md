@@ -473,7 +473,20 @@ hardware, not something an install or a setting can put right.
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
 - `--json`, used without a fix id, prints the catalog manifest as JSON. It
   applies no fix and exits 0. Together with a fix id it is refused, with exit
-  code 1.
+  code 1. The manifest names every exit code `rocm fix` returns
+  (`exit_codes`, name to number) and says what each means
+  (`exit_code_descriptions`, name to text).
+
+Exit code 2 has two causes. It is `unknown_id`, a fix id the catalog does not
+have, refused with a stderr line starting `Unknown fix-id:`; and it is also what
+the argument parser returns for a malformed command line (an unknown option, a
+missing value, or a value it cannot read, such as a non-number for
+`--device-index`), refused with a stderr line starting `error:` instead. A
+one-time `rocm:` notice can come before either line. A script that needs to know
+which happened reads the message, not the code. A negative device index depends
+on how it is written: `--device-index=-1` is accepted by the parser and the fix
+refuses it with exit 3, while `--device-index -1` (with a space) is read as an
+unknown option `-1`, a usage error that exits 2.
 
 ### ROCm installation
 
