@@ -147,15 +147,17 @@ review and may decline:
   Compare absolute counts, and do not read a one-case move as a real change.
 - **These are our prompts, not the field.** Nothing here measures failures users
   actually hit.
-- **The grading host has no AMD GPU and no `rocm` CLI.** Most behavioral cases therefore
-  grade the skill's procedure (probing first, asking for consent before anything that
+- **The grading host has no AMD GPU and no `rocm` CLI.** A behavioral case therefore
+  grades the skill's procedure (probing first, asking for consent before anything that
   mutates, routing upstream when nothing is established), not whether a diagnosis was
-  correct. The exception is a case with a directory under
-  [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/): it gets a replayed `rocm`
+  correct, unless it has a directory under
+  [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/): such a case gets a replayed `rocm`
   that answers `--version`, `fix --json` and `diagnose` (and `examine --json` for a case
-  that names a host) from a recording, so it can grade the version check, how an answer
-  is read, or the question the skill asks when the examination finds no AMD GPU. The
-  recording is of a host with no GPU data, so even there a rise does not mean users get
-  fixed faster. See [Doctor Skill Eval Replays](testing.md#doctor-skill-eval-replays).
+  that names a host, and `fix <id>` with `--dry-run` or no flag for a case that names a
+  fix to apply) from a recording, so it can grade the version check, how an answer is
+  read, the question the skill asks when the examination finds no AMD GPU, or that
+  nothing is applied before the user said OK. The recordings describe a typed host, not a
+  real machine, so even there a rise does not mean users get fixed faster. See
+  [Doctor Skill Eval Replays](testing.md#doctor-skill-eval-replays).
 - **Editing the dataset moves the figures.** A changed content hash between two runs
   means the scenario set may have changed; look at that diff before comparing them.

@@ -128,9 +128,9 @@ pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
 pub use fix::{
-    CATALOG_CONTRACT_VERSION, CatalogManifest, FixOptions, ManifestEntry, ManifestPlatform,
-    apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
-    list_recipes as list_fix_recipes,
+    CATALOG_CONTRACT_VERSION, CatalogManifest, DRY_RUN_NOTICE, FixOptions, ManifestEntry,
+    ManifestPlatform, NON_INTERACTIVE_REFUSAL, apply as apply_fix, catalog_manifest,
+    catalog_manifest_json, exit as fix_exit, fix_plan_text, list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,

@@ -143,8 +143,13 @@ impl FixRecipe {
     /// it does not apply here at all — callers reach the OS gate in [`apply`]
     /// before the class is ever acted on, and understating is the safe default.
     pub(super) fn class_here(&self) -> FixClass {
-        self.platform(current_os())
-            .map_or(FixClass::PrintOnly, |p| p.class)
+        self.class_on_os(current_os())
+    }
+
+    /// What this recipe does on the platform `os`, [`FixClass::PrintOnly`] when it
+    /// does not apply there (the same understatement as [`Self::class_here`]).
+    pub(super) fn class_on_os(&self, os: &str) -> FixClass {
+        self.platform(os).map_or(FixClass::PrintOnly, |p| p.class)
     }
 
     /// The operating systems this applies on, in catalog order.

@@ -11,7 +11,7 @@
 //! the catalog in `fix/catalog.rs` names the entry point of each recipe's
 //! runner and the running OS decides which variant runs.
 
-use super::consent::{QUERY_TIMEOUT, RUN_TIMEOUT, confirm, fail, relay_output};
+use super::consent::{DRY_RUN_NOTICE, QUERY_TIMEOUT, RUN_TIMEOUT, confirm, fail, relay_output};
 use super::options::{FixOptions, exit};
 use crate::probe_exec::{run, which};
 use crate::quoting::ps_single_quote_escape;
@@ -106,7 +106,7 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
     };
     println!("Will run: {program} {}", args.join(" "));
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Add user to render,video groups?", opts.yes) {
@@ -261,7 +261,7 @@ fn report_and_clear_override_windows(
             shown.join(" ")
         );
         if opts.dry_run {
-            println!("  (dry-run; not executed)");
+            println!("  {DRY_RUN_NOTICE}");
         } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
             let (rc, out, err) = run("setx", &setx_args, RUN_TIMEOUT);
             relay_output(&out, &err);
@@ -333,7 +333,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
@@ -432,7 +432,7 @@ fn path_export_windows(
     println!("Plan: prepend {bin_dir} to your User PATH:");
     println!("  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Update User PATH?", opts.yes) {
@@ -519,7 +519,7 @@ fn pin_device_in_rc_file(
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !consent() {
@@ -567,7 +567,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     println!("Plan: persist HIP_VISIBLE_DEVICES in the User env scope:");
     println!("  setx HIP_VISIBLE_DEVICES {idx}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Set HIP_VISIBLE_DEVICES in the User scope?", opts.yes) {

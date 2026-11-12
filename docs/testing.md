@@ -4804,8 +4804,9 @@ has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/)
 hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
 removes it afterwards. The stub replays recorded output for `rocm --version`,
 `rocm fix --json` and `rocm diagnose`, plus `rocm examine --json` for a case that
-names a `host` (below), and refuses every other command with exit code 2. It only
-prints text read from the recording, so whatever an agent asks it,
+names a `host` and `rocm fix <id>` with `--dry-run` or no flag for a case that names
+an `apply` fix (both below), and refuses every other command with exit code 2, `--yes`
+included. It only prints text read from the recording, so whatever an agent asks it,
 it cannot change a machine or send anything; that comes from answering a fixed set
 of commands, not from the refusals. It also refuses `diagnose` options the
 recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
@@ -4831,31 +4832,51 @@ cargo xtask eval-fixtures --check  # fail if any recording is missing, stale, or
 The manifest comes from the compiled catalog and each diagnosis from
 `rocm_core::run_diagnose`, run over the recorded examination in
 [`tests/remote-ssh/examination.json`](../tests/remote-ssh/examination.json), so a
-catalog change cannot leave a stale recording behind. After a change to the failure
-catalog or to what `rocm diagnose` prints, run `cargo xtask eval-fixtures` and commit
-the result; the check names what is out of date. CI runs the check, and
+catalog change cannot leave a stale generated recording behind. After a change to the
+failure catalog or to what `rocm diagnose` prints, run `cargo xtask eval-fixtures` and
+commit the result; the check names what is out of date. CI runs the check, and
 `cargo test -p xtask` runs it too. Read the diff after regenerating: a recording that
 changed is output the skill is now graded against. What an older CLI printed cannot be
 generated. It was recorded once from a real older build and lives in
 [`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
 
-A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
-`examine-fails`. The stub then answers `rocm examine --json`, and a case without a
-`host` still refuses it. The reply is the recorded examination with the fields the host
-implies set, whatever the recording held for them, and its `status` is recomputed by
+A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found`,
+`examine-fails` or `container-small-shm` (an AMD GPU found, inside a Docker container
+with the default 64 MiB `/dev/shm`, which makes the shared-memory entry score from the
+host alone). The stub then answers `rocm examine --json`, and a case without a
+`host` still refuses it. The diagnosis a host gives is replayed too, so it is what the
+case's judged items rest on. The reply is the recorded examination with the fields the
+host implies set, whatever the recording held for them, and its `status` is recomputed by
 `Examination::compute_status`, the rule the probe uses, so a recording cannot say a
 status the other fields contradict. The real command prints those fields plus a
 `summary` object that only the `rocm` binary can build, so the replay leaves `summary`
 out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
-typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+typed, not probed: the one GPU of `amd-found` and `container-small-shm`, the container
+and `/dev/shm` figures of the latter, and the WSL facts of
 `wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
 with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
 exits 1 with a fixed message on stderr, which is what the case pins.
 
+A case may also name an `apply` fix id, for a case that reaches the apply step. The
+stub then answers `rocm fix <id> --dry-run` (the flag before or after the id) and
+`rocm fix <id>` with no flag, and never `--yes`, so an agent that applies before the
+user said OK meets the stub's refusal and the transcript shows the command. The fix
+must be `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
+`linux`), and the case's symptom and host must make the replayed
+diagnosis match it, that is list it at or above `min_score_for_match`; otherwise the
+generator fails with "the replayed diagnosis carries no match for ...". The plan is the CLI's own (`rocm_core::fix_plan_text`), so it
+carries the command's wording; only the `Will run:` line the runner adds is not there,
+because it names the user and the machine. The layout around the plan (the blank line,
+then the notice) is written by hand in the generator and checked only against the
+committed replay. The bare command's refusal exit code
+and message, and the dry-run notice, are the CLI's own constants, so they cannot drift
+from the command's.
+
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
 case id, `current` or `older`, the error text the agent would pass as the symptom,
-and optionally a `host`), run the command above, and add the case to
+and optionally a `host` and an `apply` fix id, which must be `auto` on the host's platform and matched
+by the replayed diagnosis), run the command above, and add the case to
 [`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
 check also fails when a case id is not an id in `evals.json`, or when the part of the
 symptom before its first `:` does not appear in that case's prompt, because the hook
@@ -4863,13 +4884,13 @@ finds a replay by id and a recording for a different question grades nothing. A
 directory that no case owns fails the check, and the command never deletes one:
 remove it by hand.
 
-Limits worth knowing. A replay says what the catalog says for a recorded host
-with no GPU data, so it grades how the agent reads and relays an answer, not whether
+Limits worth knowing. A replay says what the catalog says for a typed host (the
+recorded examination, which has no GPU, with the fields a `host` implies changed), not
+for a real machine, so it grades how the agent reads and relays an answer, not whether
 the CLI is right about a real machine; and it answers `diagnose` with the same
 recorded output whatever `--symptom` is. The current-CLI replay's `--version` line
-is not the format the real `rocm --version` prints (the older-CLI replay prints that
-one), so only `fix --json` tells
-the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
+is a fixed marker that no real build prints (the older-CLI replay prints what an
+older build printed), so only `fix --json` tells the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
 pin matches, and `cargo test -p xtask` fails if a pin is quoted in `SKILL.md` or
 `reference.md`, where it would stop proving the replay ran.
 
@@ -4879,11 +4900,13 @@ On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionle
 include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
 directory and Python path without spaces; a path with spaces or parentheses is not
 exercised, and neither is the agent's own shell on the amd/skills Windows leg.
-The two cases about the older and the current CLI name no operating system in their
-prompts. They used to say "on Linux", and on a Windows host the agent answered that its
-own machine is Windows and declined to run the CLI at all, so the recorded replies never
-printed. The vLLM cases still say Linux on purpose: their catalog entries apply on Linux
-and WSL2 only, so they are not expected to pass on a Windows host.
+A replayed case whose answer does not depend on the platform names no operating system
+in its prompt. The older- and current-CLI prompts used to say "on Linux", and on a
+Windows host the agent answered that its own machine is Windows and declined to run the
+CLI at all, so the recorded replies never printed. A case that cannot pass on a Windows
+host, because its catalog entries apply on Linux and WSL2 only or because the command
+it expects depends on the shell, says so in its `note` in
+[`evals.json`](../skills/rocm-doctor/evals/evals.json).
 
 A real `rocm` on the machine can answer before the stub. The agent's shell does not
 always keep the stub first on `PATH`, so a machine that has a `rocm` installed (a
