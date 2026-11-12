@@ -9592,14 +9592,16 @@ permissions:
         );
         let wait_text = format!("{} h {} min", wait_secs / 3600, wait_secs % 3600 / 60);
         assert!(flat.contains(&wait_text), "the doc must say {wait_text}");
-        // The run limit as the run inputs give it: "the run time ... at most N seconds".
+        // The run limit as the run inputs give it: the bullet "- the run time — ...
+        // at most N seconds". Anchored on the bullet's own opening, so that the
+        // phrase "the run time" appearing earlier in the doc cannot be picked up.
         let run_secs: u64 = flat
-            .split("the run time")
+            .split("- the run time — ")
             .nth(1)
             .and_then(|rest| rest.split("at most ").nth(1))
             .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
             .expect(
-                "the doc's run inputs give the run limit as `the run time ... at most N seconds`",
+                "the doc's run inputs give the run limit as a bullet `- the run time — ... at most N seconds`",
             );
         assert!(
             flat.contains(&format!("({run_secs} s")),
