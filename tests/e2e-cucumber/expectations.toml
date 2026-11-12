@@ -34,16 +34,18 @@
 
 # --- EAI-7219: short-name expansion (vLLM does not show an expanded name) ---
 # What the lane logs show, so the scope below is not read as more than it is:
-# lemonade USED TO print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
-# on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
-# stopped before it printed a serve plan, so the plan's name line was never
-# reached. Since ROCMAI-863 lemonade prints no name either: `qwen2.5` expands to
-# `Qwen/Qwen2.5-1.5B-Instruct`, a repo with no GGUF build, and lemonade now refuses
-# it on the pre-launch resolve -- which runs before the serve plan prints, so
-# neither engine reaches the name line any more. Only
-# serve-short-name-consistent-across-engines runs lemonade, so only that row
-# stays red for that reason and its reason below says so;
-# serve-short-name-expansion serves vLLM only. EAI-7219 as reported describes
+# lemonade prints the full name on the Strix Halo Ubuntu and Windows lanes, and
+# vLLM's stdout is empty -- the run stopped before it printed a serve plan, so the
+# plan's name line was never reached. vLLM is therefore the whole of what keeps
+# these rows red.
+#
+# ROCMAI-863's pre-launch refusal does NOT reach these rows, though an earlier
+# revision of this comment said it did. That was written when `qwen2.5` expanded
+# to the bare `Qwen/Qwen2.5-1.5B-Instruct`, which ships no GGUF; #1044 then gave
+# that recipe a per-engine ref, so lemonade is handed
+# `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M` with the variant already pinned and
+# the refusal has nothing to fire on. The lemonade half still prints its name.
+# EAI-7219 as reported describes
 # the other shape: a vLLM plan that prints `resolved model: qwen2.5`, the alias
 # left unexpanded; the lane logs have not shown it. The steps used to discard
 # stderr, so the cause of the empty stdout was not known. The first lane run

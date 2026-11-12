@@ -1194,19 +1194,36 @@ async fn user_serves_with_automatic_port(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-/// ROCMAI-863: serve the repository from the original report rather than a
-/// made-up `owner/repo`, so the scenario covers the case users hit. It ships
-/// only safetensors, so there is no GGUF for Lemonade to serve under any
-/// variant — the refusal is the only correct outcome, and it must arrive on the
-/// terminal, not in a log nobody reads. `--managed` is what `rocm serve` does by
-/// default; naming it keeps the scenario on the path the report describes.
+/// ROCMAI-863: serve a real safetensors-only `owner/repo` rather than a made-up
+/// one, so the scenario covers the case users hit. There is no GGUF for Lemonade
+/// to serve under any variant — the refusal is the only correct outcome, and it
+/// must arrive on the terminal, not in a log nobody reads. `--managed` is what
+/// `rocm serve` does by default; naming it keeps the scenario on the path the
+/// report describes.
+///
+/// The id must be one the catalog has NO recipe for. The original report named
+/// `Qwen/Qwen2.5-1.5B-Instruct`, but #1044 gave that one a per-engine recipe
+/// resolving to `...-GGUF:Q4_K_M`, so the variant arrives from the catalog, the
+/// refusal correctly does not fire, and the scenario silently inverted — it
+/// served, exited 0, and only the GPU lane noticed. The assertion below keeps
+/// that from recurring quietly if this id ever gains a recipe too.
+const HF_REPO_WITHOUT_VARIANT: &str = "Qwen/Qwen2.5-3B-Instruct";
+
 #[when("the user serves a Hugging Face repo with no quantization variant on Lemonade")]
 async fn user_serves_hf_repo_without_variant(world: &mut E2eWorld) {
+    assert!(
+        !rocm_core::model_catalog::builtin_model_recipes()
+            .iter()
+            .any(|recipe| recipe.matches_ref(HF_REPO_WITHOUT_VARIANT)),
+        "{HF_REPO_WITHOUT_VARIANT} now has a catalog recipe, which supplies the \
+         quantization variant this scenario exists to see refused; pick an id \
+         the catalog has no recipe for"
+    );
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
         world,
         &[
             "serve",
-            "Qwen/Qwen2.5-1.5B-Instruct",
+            HF_REPO_WITHOUT_VARIANT,
             "--engine",
             "lemonade",
             "--managed",
