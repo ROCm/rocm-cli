@@ -9677,28 +9677,54 @@ permissions:
         );
     }
 
-    /// The job's time limit, the lanes' wait limit and what the doc and the
-    /// workflow comment say of them move together: the limit must leave the
-    /// 30 minutes finishing and publishing a run can take after the longest wait.
+    /// The job's time limit, the lanes' wait and run limits and what the doc and
+    /// the workflow comment say of them move together: a lane may wait its whole
+    /// wait limit and then run its whole run limit, and the job's limit must
+    /// leave the 30 minutes finishing and publishing a run can take after both.
     #[test]
-    fn the_queue_run_timeout_covers_the_wait_limit_the_doc_gives() {
+    fn the_queue_run_timeout_covers_the_wait_and_run_limits_the_doc_gives() {
         let doc = docs_nightly_on_the_queue();
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
-        // The limit as the run inputs give it: "at most N seconds".
+        // The wait limit as the run inputs give it: the bullet "- the wait — ...
+        // at most N seconds", anchored on the bullet's own opening like the run
+        // limit below, so no earlier "at most N" in the doc can be picked up.
         let wait_secs: u64 = flat
-            .split("at most ")
-            .find_map(|rest| rest.split(" seconds").next()?.parse().ok())
-            .expect("the doc's run inputs give the wait limit as `at most N seconds`");
+            .split("- the wait — ")
+            .nth(1)
+            .and_then(|rest| rest.split("at most ").nth(1))
+            .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect("the doc's run inputs give the wait limit as a bullet `- the wait — ... at most N seconds`");
         assert!(
             flat.contains(&format!("({wait_secs} s")),
             "the doc's start section must give the same wait limit"
         );
         let wait_text = format!("{} h {} min", wait_secs / 3600, wait_secs % 3600 / 60);
         assert!(flat.contains(&wait_text), "the doc must say {wait_text}");
+        // The run limit as the run inputs give it: the bullet "- the run time — ...
+        // at most N seconds". Anchored on the bullet's own opening, so that the
+        // phrase "the run time" appearing earlier in the doc cannot be picked up.
+        let run_secs: u64 = flat
+            .split("- the run time — ")
+            .nth(1)
+            .and_then(|rest| rest.split("at most ").nth(1))
+            .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect(
+                "the doc's run inputs give the run limit as a bullet `- the run time — ... at most N seconds`",
+            );
+        assert!(
+            flat.contains(&format!("({run_secs} s")),
+            "the doc's start section must give the same run limit"
+        );
+        let run_text = format!("{} h", run_secs / 3600);
+        assert_eq!(run_secs % 3600, 0, "the run limit is whole hours");
         let text = read_workflow("queue-run.yml");
         assert!(
             text.contains(&format!("{wait_secs} s ({wait_text})")),
             "queue-run.yml's comment must give the wait as {wait_secs} s ({wait_text})"
+        );
+        assert!(
+            text.contains(&format!("{run_text} counted from its start")),
+            "queue-run.yml's comment must give the run limit as {run_text}"
         );
         let timeout_minutes: u64 = text
             .lines()
@@ -9708,8 +9734,12 @@ permissions:
             .parse()
             .expect("timeout-minutes is a number");
         assert!(
-            timeout_minutes * 60 >= wait_secs + 30 * 60,
-            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait"
+            timeout_minutes * 60 >= wait_secs + run_secs + 30 * 60,
+            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait and a {run_secs} s run"
+        );
+        assert!(
+            text.contains(&format!(": {timeout_minutes} min.")),
+            "queue-run.yml's comment must give the timeout as {timeout_minutes} min"
         );
     }
 
