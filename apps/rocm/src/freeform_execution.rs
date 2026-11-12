@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The freeform natural-language planner's plan-*execution*/consent cluster
-//! (ROCMAI-726, a Phase 6e, ROCMAI-87 follow-up).
+//! The freeform natural-language planner's plan-*execution*/consent cluster,
+//! the half that `freeform_planner.rs` left behind.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — `main.rs`'s
 //! `execute_freeform_next_action()` call sites stay byte-identical
@@ -18,7 +18,7 @@
 //! to execute.
 //!
 //! This is the other half of the freeform-planner cluster that
-//! `freeform_planner.rs` (Phase 6e, ROCMAI-87) deliberately left behind: that
+//! `freeform_planner.rs` deliberately left behind: that
 //! module builds a plan; this one reads/acts on its `FreeformPlanAction`
 //! internals, grants it the consent the outer `--yes` already carries, and
 //! computes planner-specific output text — a dispatch-adjacent concern
