@@ -1556,6 +1556,13 @@ standard input, it sends one prompt and prints the reply.
 - `--temperature`, `--top-p`, and `--max-tokens` are optional sampling controls
   forwarded to the request. Each is independent, so omit any of them to use the
   provider's default.
+- A dashboard chat message waits up to 2 minutes for the whole reply, including
+  any tool calls. The first message to a local model can take tens of seconds
+  while the model reads the system prompt and tool list. Set
+  `ROCM_DASH_CHAT_TIMEOUT_SECS` to a whole number of seconds from 1 to 3600 to
+  change the wait; an unset, empty, non-numeric or out-of-range value keeps the
+  2 minutes.
+  The timeout message names the wait that applied and this variable.
 
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.

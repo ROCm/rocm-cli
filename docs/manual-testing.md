@@ -1065,6 +1065,33 @@ Expected result:
   nothing to compare. Start around 30 rows, confirm both are present, then
   shrink past the drop and confirm both go at once.
 
+### 4d. Dashboard Chat Request Timeout
+
+The first chat message to a local model reads the whole system prompt and tool
+list, which can take tens of seconds on modest hardware. With a model served by
+`rocm serve`, open the dashboard chat and send a message:
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- A first message that needs 20 to 60 seconds to answer is answered, not cut off.
+- To see the timeout itself, shorten the wait and send a message the model cannot
+  answer in time:
+
+  ```powershell
+  $env:ROCM_DASH_CHAT_TIMEOUT_SECS = "5"
+  rocm dash
+  ```
+
+  The turn ends with `request timed out after 5s (set ROCM_DASH_CHAT_TIMEOUT_SECS
+  to allow longer)`.
+- An unusable value (`0`, `abc`, `99999`) keeps the 2 minute default instead of
+  disabling the wait. Clear the override with
+  `Remove-Item Env:ROCM_DASH_CHAT_TIMEOUT_SECS` afterwards.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are
