@@ -5,7 +5,8 @@
 //! A stand-in engine child for tests.
 //!
 //! It is a `/bin/sh` script that records how it was launched (arguments,
-//! environment, stdin) into a scratch directory and then runs a caller-supplied
+//! environment, stdin, and every request it was sent over all its runs) into a
+//! scratch directory and then runs a caller-supplied
 //! body, so a test can assert what an engine IPC client put on the child's
 //! command line, environment and stdin, and shape what comes back (a response
 //! envelope, a crash, stderr output).
@@ -59,7 +60,7 @@ impl FakeEngine {
         fs::create_dir_all(&dir).expect("create the fake engine's scratch directory");
         let script = dir.join("engine.sh");
         let read_stdin = if reads_stdin {
-            "cat > \"$dir/stdin\"\n"
+            "cat > \"$dir/stdin\"\ncat \"$dir/stdin\" >> \"$dir/requests\"\n"
         } else {
             ""
         };
@@ -97,7 +98,29 @@ impl FakeEngine {
             .collect()
     }
 
-    /// Everything the fake read from its stdin, verbatim.
+    /// Every request the fake read, one per time it was run, oldest first. A
+    /// fake that was never run (or never read its stdin) has an empty list.
+    pub fn requests(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(self.dir.join("requests"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|error| panic!("a request is not JSON ({error}): {line:?}"))
+            })
+            .collect()
+    }
+
+    /// The `method` of every request the fake read, oldest first.
+    pub fn methods(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Everything the fake read from its stdin the last time it was run,
+    /// verbatim.
     pub fn stdin(&self) -> String {
         fs::read_to_string(self.dir.join("stdin")).expect("the fake engine never read its stdin")
     }

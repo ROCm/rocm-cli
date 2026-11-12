@@ -424,10 +424,7 @@ mod tests {
         const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
 
         fn healthcheck_envelope() -> EngineRequestEnvelope {
-            EngineRequestEnvelope {
-                method: EngineMethod::Healthcheck,
-                payload: json!({"service_id": SERVICE_ID}),
-            }
+            EngineRequestEnvelope::new(EngineMethod::Healthcheck, json!({"service_id": SERVICE_ID}))
         }
 
         fn request(engine: &FakeEngine, paths: &AppPaths) -> Result<Value> {
@@ -454,7 +451,8 @@ mod tests {
             assert_eq!(engine.argv(), ["__engine-stdio", "vllm"]);
             assert_eq!(
                 engine.stdin(),
-                "{\"method\":\"healthcheck\",\"payload\":{\"service_id\":\"svc-stdio-child\"}}\n"
+                "{\"protocol_version\":\"0.1.0\",\"method\":\"healthcheck\",\
+                 \"payload\":{\"service_id\":\"svc-stdio-child\"}}\n"
             );
         }
 
@@ -536,7 +534,9 @@ mod tests {
                 FakeEngine::new("rocmd-garbage", true, "printf 'not json'\necho oops >&2");
             assert_eq!(
                 request(&garbage, &paths).unwrap_err().to_string(),
-                "failed to parse engine response envelope; stderr: oops"
+                "failed to parse engine response envelope: the engine's stdout is not JSON \
+                 (expected ident at line 1 column 2), starting with `not json` (an engine \
+                 writes only its JSON answer to stdout; logs go to stderr); stderr: oops"
             );
         }
 
@@ -560,10 +560,8 @@ mod tests {
                 let engine = FakeEngine::new("rocmd-sigpipe", false, "exit 3");
                 // Larger than a pipe buffer, so the write reaches the closed read end.
                 let big = "x".repeat(1 << 20);
-                let envelope = EngineRequestEnvelope {
-                    method: EngineMethod::Healthcheck,
-                    payload: json!({ "blob": big }),
-                };
+                let envelope =
+                    EngineRequestEnvelope::new(EngineMethod::Healthcheck, json!({ "blob": big }));
                 let result = engine_request_via::<Value>(
                     engine.path(),
                     &paths,

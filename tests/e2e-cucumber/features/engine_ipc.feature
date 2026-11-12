@@ -9,8 +9,10 @@ Feature: How the daemon reads an engine's answer
   # scenario controls. The stand-in records the argv and the request it was
   # given and prints what the scenario says.
   #
-  # service-stop-02 covers the engine that answers cleanly; the two below are the
-  # other ways an engine child ends. In each, the engine's message in the tool's
+  # service-stop-02 covers the engine that answers cleanly; engine-ipc-01 and -02
+  # are the other ways an engine child ends, and -03 to -07 are what the daemon
+  # makes of an answer written in another engine protocol, or not alone on
+  # stdout. In each, the engine's message in the tool's
   # report is checked together with what the stop did to the server: its process,
   # its record and its endpoint key. The server is a `vllm` one, for which the
   # engine's `Stop` is advisory (the recorded process decides whether the stop
@@ -42,6 +44,68 @@ Feature: How the daemon reads an engine's answer
     Then the engine received one stop request for that server over stdio
     And the tool reports the stop request failed, with the engine's exit status and stderr
     And the tool still reports the server stopped
+    And the recorded process is no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+
+  @id:engine-ipc-refuses-an-answer-in-a-protocol-it-cannot-use
+  @requires-os:linux
+  Scenario: engine-ipc-03 - An engine that answers in an engine protocol this release cannot use is not believed, and the stop still completes
+    Given a managed server whose recorded process is running
+    And the engine answers the stop request in an engine protocol this release cannot use
+    When the standalone daemon's stop_server tool stops that server
+    Then the engine received one stop request for that server over stdio
+    And the tool reports the stop request refused, naming the engine's protocol and this release's
+    And the tool still reports the server stopped
+    And the recorded process is no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+
+  @id:engine-ipc-refuses-an-answer-with-other-output-on-stdout
+  @requires-os:linux
+  Scenario: engine-ipc-04 - An engine that writes a log line on stdout before its answer is refused for it, and the stop still completes
+    Given a managed server whose recorded process is running
+    And the engine writes a log line on stdout before its answer to the stop request
+    When the standalone daemon's stop_server tool stops that server
+    Then the engine received one stop request for that server over stdio
+    And the tool reports the stop request refused for the other output the engine wrote alongside its answer
+    And the tool still reports the server stopped
+    And the recorded process is no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+
+  @id:engine-ipc-reads-an-answer-in-its-own-protocol
+  @requires-os:linux
+  Scenario: engine-ipc-05 - An engine that answers in this release's engine protocol is read as having answered
+    Given a managed server whose recorded process is running
+    And the engine answers the stop request in this release's engine protocol
+    When the standalone daemon's stop_server tool stops that server
+    Then the engine received one stop request for that server over stdio
+    And the tool reports the engine's answer to the stop
+    And the recorded process is no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+
+  @id:engine-ipc-reads-an-answer-in-a-newer-compatible-protocol
+  @requires-os:linux
+  Scenario: engine-ipc-06 - An engine that answers in a newer engine protocol that only adds to this release's is read as having answered
+    Given a managed server whose recorded process is running
+    And the engine answers the stop request in a newer engine protocol that only adds to this release's
+    When the standalone daemon's stop_server tool stops that server
+    Then the engine received one stop request for that server over stdio
+    And the tool reports the engine's answer to the stop
+    And the recorded process is no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+
+  @id:engine-ipc-reads-an-answer-that-names-no-protocol
+  @requires-os:linux
+  Scenario: engine-ipc-07 - An engine that names no engine protocol, as one from before the field, is read as having answered
+    Given a managed server whose recorded process is running
+    And the engine answers the stop request in no named engine protocol
+    When the standalone daemon's stop_server tool stops that server
+    Then the engine received one stop request for that server over stdio
+    And the tool reports the engine's answer to the stop
     And the recorded process is no longer running
     And the server's record reads stopped and names no process
     And the server's endpoint key file is gone

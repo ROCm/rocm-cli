@@ -450,6 +450,56 @@ async fn engine_prints_garbage_and_fails(world: &mut E2eWorld) {
     );
 }
 
+/// The version a stand-in engine names when it answers in a protocol this
+/// release cannot use: a later major, which no caret rule accepts.
+const INCOMPATIBLE_PROTOCOL: &str = "9.0.0";
+
+/// The stop answer every stand-in below gives, with `version` as its
+/// `protocol_version` (none at all for `None`, as an engine older than the
+/// field writes it).
+fn stop_answer(version: Option<&str>) -> String {
+    let mut answer = serde_json::json!({"ok": true, "data": {"stopped": true, "graceful": true}});
+    if let Some(version) = version {
+        answer["protocol_version"] = serde_json::Value::from(version);
+    }
+    answer.to_string()
+}
+
+#[given("the engine answers the stop request in an engine protocol this release cannot use")]
+async fn engine_answers_in_an_incompatible_protocol(world: &mut E2eWorld) {
+    install_standalone_daemon(
+        world,
+        &format!("echo '{}'", stop_answer(Some(INCOMPATIBLE_PROTOCOL))),
+    );
+}
+
+#[given("the engine writes a log line on stdout before its answer to the stop request")]
+async fn engine_logs_on_stdout_before_answering(world: &mut E2eWorld) {
+    install_standalone_daemon(
+        world,
+        &format!(
+            "echo 'stand-in engine: loading model'\necho '{}'",
+            stop_answer(Some("0.1.0"))
+        ),
+    );
+}
+
+/// An answer in this release's protocol (`0.1.0`), in a newer one that only
+/// added to it (`0.1.9`: same minor, so the caret rule accepts it), or with no
+/// version, as an engine from before the field writes it.
+#[given(
+    regex = r"^the engine answers the stop request in (this release's engine protocol|a newer engine protocol that only adds to this release's|no named engine protocol)$"
+)]
+async fn engine_answers_in_a_usable_protocol(world: &mut E2eWorld, protocol: String) {
+    let version = match protocol.as_str() {
+        "this release's engine protocol" => Some("0.1.0"),
+        "a newer engine protocol that only adds to this release's" => Some("0.1.9"),
+        "no named engine protocol" => None,
+        other => panic!("no stand-in for {other:?}"),
+    };
+    install_standalone_daemon(world, &format!("echo '{}'", stop_answer(version)));
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 /// Runs the pinned, directly-runnable form `serve_summary.rs`'s `stop` row
@@ -625,6 +675,8 @@ async fn engine_received_one_stop_request(world: &mut E2eWorld) {
         .unwrap_or_else(|error| panic!("the request is not JSON ({error}): {requests:?}"));
     assert_eq!(request["method"], "stop", "{request}");
     assert_eq!(request["payload"]["service_id"], SERVICE_ID, "{request}");
+    // The daemon writes its request in its own engine protocol.
+    assert_eq!(request["protocol_version"], "0.1.0", "{request}");
 }
 
 /// What the engine printed before it exited non-zero is what the report carries:
@@ -652,7 +704,9 @@ async fn unreadable_answer_reported_with_stderr(world: &mut E2eWorld) {
     assert_eq!(
         engine_stop["error"],
         "failed to parse engine response envelope \
-         (engine stdio process exited with code 1); \
+         (engine stdio process exited with code 1): the engine's stdout is not JSON \
+         (expected ident at line 1 column 2), starting with `this is not an answer` \
+         (an engine writes only its JSON answer to stdout; logs go to stderr); \
          stderr: engine exploded: no container runtime",
         "{report}"
     );
@@ -661,6 +715,61 @@ async fn unreadable_answer_reported_with_stderr(world: &mut E2eWorld) {
 
 /// For a `vllm` server the engine's `Stop` is advisory: the recorded process
 /// decides, so a failed request does not leave the server unconfirmed.
+/// An answer in a protocol this release cannot use is not taken as the stop's
+/// result, even though it says the engine stopped: the report carries the
+/// refusal, naming both versions, and nothing from the answer.
+#[then(
+    "the tool reports the stop request refused, naming the engine's protocol and this release's"
+)]
+async fn incompatible_answer_refused(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    let engine_stop = &report["result"]["engine_stop"];
+    assert_eq!(
+        *engine_stop,
+        serde_json::json!({
+            "attempted": true,
+            "error": format!(
+                "engine answered in engine protocol {INCOMPATIBLE_PROTOCOL}, which this \
+                 release (protocol 0.1.0) cannot use"
+            ),
+        }),
+        "{report}"
+    );
+}
+
+/// An answer with a log line before it on stdout is refused, and the error says
+/// what the engine did wrong, quoting the start of what it wrote.
+#[then(
+    "the tool reports the stop request refused for the other output the engine wrote alongside its answer"
+)]
+async fn contaminated_answer_refused(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    assert_eq!(
+        report["result"]["engine_stop"],
+        serde_json::json!({
+            "attempted": true,
+            "error": "failed to parse engine response envelope: the engine wrote other \
+                      output to stdout alongside its answer, starting with `stand-in engine: \
+                      loading model` (an engine writes only its JSON answer to stdout; logs go \
+                      to stderr)",
+        }),
+        "{report}"
+    );
+}
+
+/// The engine's own answer is the stop's engine result.
+#[then("the tool reports the engine's answer to the stop")]
+async fn engine_answer_reported(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    assert_eq!(
+        report["result"]["engine_stop"],
+        serde_json::json!({"attempted": true, "stopped": true, "graceful": true}),
+        "{report}"
+    );
+    assert_eq!(report["status"], "stopped", "{report}");
+    assert_eq!(report["result"]["stopped"], true, "{report}");
+}
+
 #[then("the tool still reports the server stopped")]
 async fn tool_still_reports_stopped(world: &mut E2eWorld) {
     let report = tool_report(world);
