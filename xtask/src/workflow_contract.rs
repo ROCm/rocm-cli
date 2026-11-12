@@ -9642,13 +9642,20 @@ permissions:
     const LANE_TOOLS: [&str; 7] = ["bash", "dirname", "mkdir", "cp", "cat", "rm", "chmod"];
 
     /// One run of the lane script against stubbed tools: how often
-    /// `apt-get update` fails first, what the suite exits with (on the nightly
-    /// channel too, unless `nightly_rc` says otherwise), the channels asked for,
-    /// whether cargo is already installed, and whether the out directory cannot
-    /// be written.
+    /// `apt-get update` and `apt-get install` fail first, how often the
+    /// rustup-init download and the crate fetch do, what the suite exits with
+    /// (on the nightly channel too, unless `nightly_rc` says otherwise), the
+    /// channels asked for, whether cargo is already installed, and whether the
+    /// out directory cannot be written.
     #[cfg(unix)]
     struct LaneCase {
         apt_failures: u32,
+        apt_install_failures: u32,
+        curl_failures: u32,
+        /// How often `cargo --version` (the toolchain download) and
+        /// `cargo fetch --locked` fail first, each with status 7.
+        version_failures: u32,
+        fetch_failures: u32,
         suite_rc: i32,
         nightly_rc: Option<i32>,
         channels: Option<&'static str>,
@@ -9667,6 +9674,10 @@ permissions:
         fn default() -> Self {
             Self {
                 apt_failures: 0,
+                apt_install_failures: 0,
+                curl_failures: 0,
+                version_failures: 0,
+                fetch_failures: 0,
                 suite_rc: 0,
                 nightly_rc: None,
                 channels: None,
@@ -9737,19 +9748,34 @@ permissions:
         for tool in LANE_TOOLS.iter().chain(&["sh"]) {
             std::os::unix::fs::symlink(host_tool(tool), tools.join(tool)).expect("link a tool");
         }
+        // Shell that counts its own calls in a file and fails the first
+        // `failures` of them, so a stub can fail a fetch a set number of times
+        // and then succeed.
+        // The status a failure exits with is the caller's to choose, so a test
+        // can tell the status the script reports from a constant.
+        let fail_first = |name: &str, failures: u32, status: i32| {
+            let counter = dir.path().join(format!("{name}-count"));
+            format!(
+                "n=0; [ -f {counter} ] && read -r n < {counter}\n\
+                 n=$((n + 1)); echo \"$n\" > {counter}\n\
+                 [ \"$n\" -gt {failures} ] || exit {status}\n",
+                counter = counter.display(),
+            )
+        };
         let calls = dir.path().join("apt-calls");
-        let updates = dir.path().join("apt-updates");
         write_fake_executable(
             &tools.join("apt-get"),
             format!(
                 "#!/bin/bash\necho \"apt-get $*\" >> {calls}\n\
-                 [ \"$1\" = update ] || exit 0\n\
-                 n=0; [ -f {updates} ] && read -r n < {updates}\n\
-                 n=$((n + 1)); echo \"$n\" > {updates}\n\
-                 [ \"$n\" -gt {failures} ]\n",
+                 case \"$1\" in\n\
+                 update) {update};;\n\
+                 install) {install};;\n\
+                 esac\n\
+                 exit 0\n",
                 calls = calls.display(),
-                updates = updates.display(),
-                failures = case.apt_failures,
+                update = fail_first("apt-update", case.apt_failures, 1).replace('\n', "; "),
+                install =
+                    fail_first("apt-install", case.apt_install_failures, 1).replace('\n', "; "),
             ),
         )
         .expect("stub apt-get");
@@ -9769,10 +9795,12 @@ permissions:
             &tools.join("curl"),
             format!(
                 "#!/bin/bash\necho \"curl $*\" >&2\n\
+                 {fail}\
                  while [ $# -gt 0 ]; do [ \"$1\" = -o ] && {{ dest=$2; shift; }}; shift; done\n\
                  printf '%s\\n' '#!/bin/bash' \
                  'echo \"rustup-init $*\"; mkdir -p \"$HOME/.cargo\"; \
                  echo \"export PATH={bin}:\\$PATH\" > \"$HOME/.cargo/env\"' > \"$dest\"\n",
+                fail = fail_first("curl", case.curl_failures, 1),
                 bin = home.join(".cargo/bin").display()
             ),
         )
@@ -9796,6 +9824,8 @@ permissions:
             format!(
                 "#!/bin/bash\necho \"cargo $*\"\n\
                  case \"$*\" in\n\
+                 \"--version\") {version};;\n\
+                 \"fetch --locked\") {fetch};;\n\
                  \"xtask e2e-prewarm\"*) echo \"prewarm HF_HOME=$HF_HOME UV_CACHE_DIR=$UV_CACHE_DIR\";;\n\
                  \"xtask e2e\")\n\
                  echo \"suite E2E_INCLUDE_NIGHTLY=${{E2E_INCLUDE_NIGHTLY-unset}} \
@@ -9809,6 +9839,10 @@ permissions:
                  *) exit {rc};;\n\
                  esac;;\n\
                  esac\n",
+                // Not 1, so a test sees the script report the failing command's
+                // own status.
+                version = fail_first("cargo-version", case.version_failures, 7).replace('\n', "; "),
+                fetch = fail_first("cargo-fetch", case.fetch_failures, 7).replace('\n', "; "),
                 rc = case.suite_rc,
                 nightly = case.nightly_rc.unwrap_or(case.suite_rc)
             ),
@@ -9870,6 +9904,9 @@ permissions:
             // included.
             let mut steps = vec![
                 "preflight ran\n".to_owned(),
+                // The toolchain and the crates, fetched before the build.
+                "cargo --version\n".to_owned(),
+                "cargo fetch --locked\n".to_owned(),
                 "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks\n"
                     .to_owned(),
             ];
@@ -10154,7 +10191,7 @@ permissions:
         });
         assert_eq!(rc, 1, "{log}");
         assert!(
-            log.contains("apt-get update failed after 4 attempts"),
+            log.contains("apt_get_update_and_install failed after 4 attempts"),
             "{log}"
         );
         assert!(
@@ -10162,5 +10199,131 @@ permissions:
             "nothing is built after apt-get gave up:\n{log}"
         );
         assert!(!out.exists());
+    }
+
+    /// `apt-get install` fails on a dropped connection or a pool that moved
+    /// since the update, as the update does on a mirror mid-sync. Each attempt
+    /// starts from fresh lists.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_rides_out_an_apt_install_that_fails() {
+        let LaneRun { rc, log, dir, .. } = run_lane(&LaneCase {
+            apt_install_failures: 2,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        let calls = std::fs::read_to_string(dir.path().join("apt-calls")).expect("apt-get ran");
+        assert_eq!(calls.matches("apt-get update").count(), 3, "{calls}");
+        assert_eq!(calls.matches("apt-get install").count(), 3, "{calls}");
+        assert_eq!(log.matches("sleep 60\n").count(), 2, "{log}");
+
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            apt_install_failures: 4,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("apt_get_update_and_install failed after 4 attempts"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("cargo"),
+            "nothing is built after apt-get gave up:\n{log}"
+        );
+        assert!(!out.exists());
+    }
+
+    /// The rustup-init download is retried, and only the download: a file that
+    /// does not match its sum is a refusal, not a transient failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_rides_out_a_failed_rustup_init_download() {
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            cargo_installed: false,
+            curl_failures: 2,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        // Each attempt is bounded in time as well, which `retry` cannot do for
+        // a connection that stalls instead of failing.
+        assert_eq!(
+            log.matches(
+                " --connect-timeout 30 --max-time 300 https://static.rust-lang.org/\
+                 rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init\n"
+            )
+            .count(),
+            3,
+            "{log}"
+        );
+        // A call's line ends with the URL; a retry's message ends with its delay.
+        assert_eq!(log.matches("linux-gnu/rustup-init\n").count(), 3, "{log}");
+        assert_eq!(log.matches("sleep 15\n").count(), 2, "{log}");
+        assert_eq!(log.matches("sha256sum").count(), 1, "{log}");
+
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            cargo_installed: false,
+            curl_failures: 4,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert_eq!(log.matches("linux-gnu/rustup-init\n").count(), 4, "{log}");
+        assert!(log.contains("failed after 4 attempts (status 1)"), "{log}");
+        assert!(!log.contains("sha256sum"), "nothing to check:\n{log}");
+        assert!(!log.contains("rustup-init -y"), "{log}");
+        assert!(!log.contains("cargo build"), "{log}");
+
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            cargo_installed: false,
+            checksum_ok: false,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert_eq!(
+            log.matches("linux-gnu/rustup-init\n").count(),
+            1,
+            "a bad sum is not retried:\n{log}"
+        );
+    }
+
+    /// The toolchain and the crates are fetched ahead of the build and retried;
+    /// the build itself runs once, and a failed fetch stops the lane before it
+    /// with the failing command's own status.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_rides_out_a_failed_toolchain_or_crate_fetch_and_never_builds_without_one() {
+        for (fetch, command) in [
+            ("version", "cargo --version"),
+            ("fetch", "cargo fetch --locked"),
+        ] {
+            let case = |failures| LaneCase {
+                version_failures: if fetch == "version" { failures } else { 0 },
+                fetch_failures: if fetch == "fetch" { failures } else { 0 },
+                ..LaneCase::default()
+            };
+            let LaneRun { rc, log, .. } = run_lane(&case(2));
+            assert_eq!(rc, 0, "{command}: {log}");
+            assert_eq!(log.matches(&format!("{command}\n")).count(), 3, "{log}");
+            assert_eq!(log.matches("sleep 30\n").count(), 2, "{log}");
+            assert_eq!(log.matches("cargo build").count(), 1, "{log}");
+
+            let LaneRun {
+                rc,
+                log,
+                out,
+                dir: _dir,
+            } = run_lane(&case(4));
+            assert_eq!(rc, 7, "{command}: {log}");
+            assert!(
+                log.contains(&format!("{command} failed after 4 attempts (status 7)")),
+                "{log}"
+            );
+            assert!(!log.contains("cargo build"), "{log}");
+            assert!(!out.exists());
+        }
     }
 }
