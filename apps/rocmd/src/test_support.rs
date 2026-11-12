@@ -11,9 +11,13 @@
 //! split into focused modules (see `docs/architecture.md`).
 
 use anyhow::Result;
-use rocm_core::{AppPaths, ManagedServiceRecord, unix_time_millis};
+use rocm_core::{
+    AppPaths, AutomationRuntimeState, ManagedServiceRecord, WatcherMode, WatcherRuntimeSnapshot,
+    unix_time_millis,
+};
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
@@ -94,6 +98,18 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
     );
 }
 
+/// A loopback port the OS just handed out and nothing holds now.
+///
+/// For tests that make the code under test bind the port for real: a fixed
+/// number inside the automatic range 11435-11535 fails whenever a real
+/// `rocm serve` is running on the developer's machine.
+pub(crate) fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("bind an ephemeral loopback port")
+        .port()
+}
+
 /// Build the record a supervisor would construct for `service_id`, to learn
 /// the paths it derives before the real call does. Not platform-gated:
 /// the supervisor exit-write tests use it on every platform.
@@ -165,8 +181,8 @@ pub(crate) fn seed_keyed_service(paths: &AppPaths, service_id: &str, port: u16) 
 }
 
 /// The state an unconfirmed stop must leave behind: not marked stopped, the
-/// PID kept so a later stop can still reach it, the deferred-cleanup marker
-/// set, and the endpoint key still on disk.
+/// PID kept because the record still names that process, the deferred-cleanup
+/// marker set, and the endpoint key still on disk.
 pub(crate) fn assert_unconfirmed_stop_kept_the_service(
     reloaded: &ManagedServiceRecord,
     key_kept: bool,
@@ -177,13 +193,54 @@ pub(crate) fn assert_unconfirmed_stop_kept_the_service(
     );
     assert_eq!(
         reloaded.supervisor_pid, UNCONFIRMED_STOP_PID,
-        "an unconfirmed stop must keep the PID a later stop needs"
+        "an unconfirmed stop must keep the PID of the process it may have left running"
     );
     assert!(
         reloaded.stop_requested_unix_ms.is_some(),
         "an unconfirmed stop must hand key cleanup to the liveness refresh"
     );
     assert!(key_kept, "an unconfirmed stop must keep the endpoint key");
+}
+
+/// One enabled watcher snapshot in `mode`, for tests that build an automation
+/// runtime state by hand.
+pub(crate) fn test_watcher_snapshot(
+    id: &str,
+    mode: WatcherMode,
+    last_event_unix_ms: Option<u128>,
+) -> WatcherRuntimeSnapshot {
+    WatcherRuntimeSnapshot {
+        id: id.to_owned(),
+        enabled: true,
+        mode,
+        summary: "test watcher".to_owned(),
+        last_event: None,
+        last_event_unix_ms,
+    }
+}
+
+/// A running automation runtime state carrying `active_watchers`.
+pub(crate) fn test_runtime_state(
+    active_watchers: Vec<WatcherRuntimeSnapshot>,
+) -> AutomationRuntimeState {
+    AutomationRuntimeState {
+        running: true,
+        automations_enabled: true,
+        daemon_pid: 1,
+        started_at_unix_ms: 1,
+        last_tick_unix_ms: 1,
+        local_webhook_endpoint: None,
+        active_watchers,
+    }
+}
+
+/// How many pending proposals to queue behind the one under test so it sits
+/// beyond a recent-window read: more than the reviewed-retention cap, and
+/// more than the 100 the code once read, so the tests keep guarding that
+/// window even if the cap is ever lowered below it.
+pub(crate) fn proposals_beyond_a_recent_window() -> usize {
+    const WINDOW_THE_CODE_ONCE_READ: usize = 100;
+    rocm_core::REVIEWED_PROPOSALS_RETAINED.max(WINDOW_THE_CODE_ONCE_READ) + 1
 }
 
 #[cfg(test)]
@@ -193,5 +250,149 @@ mod tests {
     #[test]
     fn temp_app_paths_gives_each_call_its_own_root_even_for_one_label() {
         assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
+    }
+}
+
+/// Tests that run a script they just wrote take this lock. Writing an
+/// executable while another thread forks can leave the new file "text file
+/// busy" at its first exec; the lock keeps these tests from doing it to each
+/// other, and each retries for the forks it cannot see.
+#[cfg(unix)]
+static SCRIPT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+pub(crate) fn lock_script_tests() -> std::sync::MutexGuard<'static, ()> {
+    SCRIPT_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The tools a stand-in script needs, each found once on `PATH` as an absolute
+/// path. A missing one fails the test by name, rather than being skipped or
+/// surfacing as a confusing exec error.
+#[cfg(unix)]
+pub(crate) struct ScriptTools {
+    pub(crate) sh: PathBuf,
+    pub(crate) sleep: PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(unix)]
+pub(crate) fn script_tools() -> ScriptTools {
+    let find = |name: &str| {
+        find_on_path(name)
+            .unwrap_or_else(|| panic!("this test needs `{name}` on PATH to stand in for a binary"))
+    };
+    ScriptTools {
+        sh: find("sh"),
+        sleep: find("sleep"),
+    }
+}
+
+/// Write `body` as a script for `tools.sh` at `path` and make it executable.
+/// Every writer is closed before this returns, so the first exec cannot find
+/// the file open for writing. The script may use the shell's own commands and
+/// the tools in `tools`.
+#[cfg(unix)]
+pub(crate) fn write_executable_script(
+    path: &std::path::Path,
+    tools: &ScriptTools,
+    body: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = fs::File::create(path)?;
+    write!(file, "#!{}\n{body}", tools.sh.display())?;
+    file.set_permissions(fs::Permissions::from_mode(0o755))?;
+    file.sync_all()?;
+    Ok(())
+}
+
+const RECIPE_INDEX_PATH_ENV: &str = "ROCM_CLI_MODEL_RECIPE_INDEX_PATH";
+const RECIPE_INDEX_SIGNATURE_ENV: &str = "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH";
+const RECIPE_INDEX_PUBLIC_KEY_ENV: &str = "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH";
+const REQUIRE_SIGNED_RECIPE_INDEX_ENV: &str = "ROCM_CLI_REQUIRE_MODEL_RECIPE_SIGNATURE";
+
+static RECIPE_INDEX_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds the process-wide model recipe registry configuration for one test.
+///
+/// `rocm_core::resolve_model_recipe_artifact` (reached through
+/// `run_sandbox_tool`'s `prefetch_artifact` arm) reads the recipe-index
+/// environment variables on every call, and the environment is shared by every
+/// test thread. A test that resolves a recipe reference, or sets those
+/// variables, therefore takes this guard first: it serialises them against each
+/// other, so a resolver never sees the index path set without its public key,
+/// or the variables mid-restore. The previous values come back on drop.
+pub(crate) struct RecipeIndexEnv {
+    previous: Vec<(&'static str, Option<OsString>)>,
+    _serialised: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RecipeIndexEnv {
+    /// The built-in catalog: no index configured and no signature required, whatever
+    /// the developer's shell exports.
+    pub(crate) fn builtin_catalog() -> Self {
+        Self::apply(&[
+            (RECIPE_INDEX_PATH_ENV, None),
+            (RECIPE_INDEX_SIGNATURE_ENV, None),
+            (RECIPE_INDEX_PUBLIC_KEY_ENV, None),
+            (REQUIRE_SIGNED_RECIPE_INDEX_ENV, None),
+        ])
+    }
+
+    /// A signed recipe index, set as the registry for as long as the guard lives.
+    pub(crate) fn signed_index(index: &Path, signature: &Path, public_key: &Path) -> Self {
+        Self::apply(&[
+            (RECIPE_INDEX_PATH_ENV, Some(index)),
+            (RECIPE_INDEX_SIGNATURE_ENV, Some(signature)),
+            (RECIPE_INDEX_PUBLIC_KEY_ENV, Some(public_key)),
+            (REQUIRE_SIGNED_RECIPE_INDEX_ENV, None),
+        ])
+    }
+
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+    fn apply(vars: &[(&'static str, Option<&Path>)]) -> Self {
+        let serialised = RECIPE_INDEX_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self {
+            previous,
+            _serialised: serialised,
+        }
+    }
+}
+
+impl Drop for RecipeIndexEnv {
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 }

@@ -10,10 +10,21 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
+  RUSTFLAGS: -D warnings
+  # aws-lc-sys 0.46 and later auto-detect an AWS-LC already installed on the
+  # build host and link it when found. Release binaries must not depend on
+  # what the runner or build container happens to have, so always build the
+  # vendored copy.
+  AWS_LC_SYS_USE_SYSTEM: "0"
   # REQUIRED, not dormant: every readiness step below runs --require-signatures,
   # which now means signatures must actually verify, so this is the public key
   # the release is verified against. Removing or blanking the secret fails every
@@ -35,14 +46,23 @@ env:
 
 jobs:
   release:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build Linux release assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          # No rust-cache restore/save: this job holds publishing credentials,
+          # so it builds from a clean tree rather than a restorable cache.
+          cache: false
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -50,7 +70,7 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          VERSION="${{ github.event.inputs.tag }}"
+          VERSION="${GITHUB_EVENT_INPUTS_TAG}"
           if [ -z "${VERSION}" ]; then
             VERSION="${GITHUB_REF_NAME}"
           fi
@@ -67,21 +87,20 @@ jobs:
               exit 1
               ;;
           esac
+          # `rocm version` reports a release only for this shape; any other
+          # tag would ship binaries that call themselves 0.0.0-dev. Checked
+          # here so it fails before the builds rather than after them. The
+          # pattern and the length are RELEASE_TAG_PATTERN and
+          # RELEASE_VERSION_MAX_LEN (+1 for the v) in apps/rocm/build.rs, and
+          # its test `release_tag_grammar_is_the_same_everywhere` fails if
+          # they differ.
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || [ "${#VERSION}" -gt 65 ]; then
+            echo "release version must be vX.Y.Z with an optional -pre or +build suffix of letters, digits, '.', '-' and '+', at most 65 characters, got: ${VERSION}" >&2
+            exit 1
+          fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Cargo home and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/registry/src
-            ~/.cargo/rustup
-            target
-          key: Linux-manylinux-release-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            Linux-manylinux-release-
+        env:
+          GITHUB_EVENT_INPUTS_TAG: ${{ github.event.inputs.tag }}
 
       - name: Build release binaries
         run: |
@@ -93,8 +112,7 @@ jobs:
           # Install system build deps as root: yum needs to write to
           # /var/cache/yum and the RPM db, which a non-root container user
           # cannot do. These land in the container's ephemeral layer (not the
-          # bind mount), so this runs every time; only the Cargo/rustup state
-          # below is cached.
+          # bind mount), so this runs every time.
           docker run --rm \
             -v "$PWD":/work \
             -w /work \
@@ -104,8 +122,8 @@ jobs:
               yum install -y pkgconfig libcap-devel
             '
 
-          # Build as the runner user so cached Cargo/rustup files are owned by
-          # the runner (the host-side cache save step must be able to read them).
+          # Build as the runner user so Cargo/rustup files written into the bind
+          # mount are owned by the runner, not root.
           #
           # ROCM_CLI_RELEASE_REF is forwarded explicitly: this container sees
           # none of GitHub's own GITHUB_REF_* env, which `apps/rocm/build.rs`
@@ -119,7 +137,8 @@ jobs:
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
-            -e ROCM_CLI_RELEASE_REF="${{ steps.version.outputs.value }}" \
+            -e ROCM_CLI_RELEASE_REF="${STEPS_VERSION_OUTPUTS_VALUE}" \
+            -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -132,13 +151,33 @@ jobs:
               export PATH="/host-cargo/bin:$PATH"
               cargo build --release -p rocm -p rocmd -p xtask
             '
+        env:
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
+
+      # The tag shape of `rocm version` (`X.Y.Z (vX.Y.Z, <hash>)`) is otherwise
+      # unit-tested only: every PR and nightly build resolves a branch, which
+      # reports `0.0.0-dev`. Run the binary this release ships and check that it
+      # leads with the tag's own version; "Determine version" has already
+      # checked that the tag has the `vX.Y.Z` shape that makes it a release.
+      - name: Check the release binary's version
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          OUTPUT="$(target/release/rocm --version)"
+          EXPECTED_PREFIX="rocm-cli ${VERSION#v} (${VERSION}, "
+          if [[ "${OUTPUT}" != "${EXPECTED_PREFIX}"*")" ]]; then
+            echo "release binary reports '${OUTPUT}', expected '${EXPECTED_PREFIX}<hash>)'" >&2
+            exit 1
+          fi
+          echo "release binary reports: ${OUTPUT}"
 
       - name: Package release bundle
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
+          VERSION="${STEPS_VERSION_OUTPUTS_VALUE}"
           DIST="rocm-cli-${VERSION}-linux-amd64"
 
           chmod +x install.sh
@@ -163,8 +202,9 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
+          VERSION="${STEPS_VERSION_OUTPUTS_VALUE}"
           NOTES="$(cat <<EOF
           Install the latest stable release on Linux x86_64:
 
@@ -205,13 +245,20 @@ jobs:
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
 
   windows-release:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build and upload Windows release
     runs-on: windows-latest
     needs: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
 
       - name: Verify pinned keys match the signing key
         shell: pwsh
@@ -227,13 +274,28 @@ jobs:
           ROCM_CLI_RELEASE_REF: ${{ needs.release.outputs.version }}
         run: cargo build --release -p rocm -p rocmd -p xtask
 
+      # See the Linux job's "Check the release binary's version" step.
+      - name: Check the release binary's version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $version = $env:VERSION
+          $output = (& .\target\release\rocm.exe --version | Out-String).Trim()
+          $prefix = "rocm-cli $($version.Substring(1)) ($version, "
+          if (-not ($output.StartsWith($prefix, [StringComparison]::Ordinal) -and $output.EndsWith(')', [StringComparison]::Ordinal))) {
+            throw "release binary reports '$output', expected '$prefix<hash>)'"
+          }
+          Write-Host "release binary reports: $output"
+
       - name: Package Windows bundle
         shell: pwsh
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          $version = "${{ needs.release.outputs.version }}"
+          $version = "$env:NEEDS_RELEASE_OUTPUTS_VERSION"
           $dist = "rocm-cli-$version-windows-amd64"
           cargo xtask package $dist
           Copy-Item "dist\$dist.zip" "dist\rocm-cli-windows-amd64.zip"
@@ -256,14 +318,18 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          $version = "${{ needs.release.outputs.version }}"
+          $version = "$env:NEEDS_RELEASE_OUTPUTS_VERSION"
           $assets = Get-ChildItem dist -File -Include *.zip,*.sha256,*.sig -Recurse | ForEach-Object { $_.FullName }
           gh release upload $version @assets --clobber
 
   publish-release:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: publishing only
     needs:
       - release
       - windows-release
@@ -272,7 +338,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          VERSION="${{ needs.release.outputs.version }}"
+          VERSION="${NEEDS_RELEASE_OUTPUTS_VERSION}"
           RELEASE_ID="$(gh release view "${VERSION}" --json databaseId -q .databaseId)"
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -f draft=false

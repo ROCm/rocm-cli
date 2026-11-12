@@ -60,7 +60,7 @@ async fn user_previews_sdk_install(world: &mut E2eWorld) {
     // this to a plan: no venv, no multi-GiB download.
     let stdout = crate::run_rocm_ok(
         world,
-        &["install", "sdk", "--family", "gfx110X-all", "--dry-run"],
+        &["install", "sdk", "--family", "gfx1100", "--dry-run"],
     );
     world.cli_output = Some(stdout);
 }
@@ -239,14 +239,22 @@ async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-/// TheRock package families this step may ask for, in preference order. Real
-/// published names, not placeholders: an unknown family is rejected during
+/// TheRock GPU targets this step may ask for, in preference order, each paired
+/// with the package family it resolves to. The install reads the newest layout,
+/// which picks its device payload by exact arch and refuses a grouped family
+/// name, so the request names the arch; the family is what the active runtime's
+/// `family=` column is compared against. Real published names, not placeholders:
+/// an unknown family is rejected during
 /// resolution, which would exit non-zero for a reason that has nothing to do
 /// with the consent gate and would still satisfy "the reinstall is refused".
 /// Each is published as a `therock-dist-linux-<family>-<version>.tar.gz` in the
-/// canonical release tarball catalog, for the same reason: an artifact the
+/// newest layout's release tarball catalog, for the same reason: an artifact the
 /// catalog does not carry fails resolution short of the gate.
-const OTHER_FAMILY_CANDIDATES: &[&str] = &["gfx110X-all", "gfx120X-all", "gfx94X-dcgpu"];
+const OTHER_FAMILY_CANDIDATES: &[(&str, &str)] = &[
+    ("gfx1100", "gfx110X-all"),
+    ("gfx1200", "gfx120X-all"),
+    ("gfx942", "gfx94X-dcgpu"),
+];
 
 #[when("the user installs a different GPU family without confirming")]
 async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
@@ -257,9 +265,9 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // case-preserving `family=` column — the runtime key alone would not do,
     // since it is lowercase-slugified and would never match `gfx110X-all`.
     let (runtimes, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
-    let family = OTHER_FAMILY_CANDIDATES
+    let (arch, _) = OTHER_FAMILY_CANDIDATES
         .iter()
-        .find(|candidate| !runtimes.contains(*candidate))
+        .find(|(_, family)| !runtimes.contains(*family))
         .copied()
         .unwrap_or_else(|| {
             panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
@@ -277,7 +285,7 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // `active_default_runtime_relation` shared by both formats — with a family
     // the host has genuinely never held. The refusal still costs only the
     // catalog listing: it bails before the multi-GiB archive is fetched.
-    let args = ["install", "sdk", "--format", "tarball", "--family", family];
+    let args = ["install", "sdk", "--format", "tarball", "--family", arch];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
@@ -429,6 +437,56 @@ async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
             "the skipped alignment does not name the variable that skipped it:\n{output}"
         );
     }
+}
+
+/// The SDK install did not write over the torch the runtime held.
+///
+/// Two things have to agree, because either alone can be satisfied without the
+/// other. The install says what it kept (`torch_kept:`, naming the torch version
+/// it found before running `uv`), and the runtime's own interpreter, asked after
+/// the install, reports that same version. The message by itself would certify the
+/// string, and the version by itself would pass on a runtime whose torch was
+/// rewritten to the same build.
+#[then("the SDK install leaves the torch the runtime held as it was")]
+async fn assert_sdk_install_kept_torch(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let kept_line = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("torch_kept: "))
+        .unwrap_or_else(|| {
+            panic!("the install did not say it kept the runtime's torch:\n{output}")
+        });
+    let Some((_, after_torch)) = kept_line.split_once(" already holds torch ") else {
+        panic!("`torch_kept:` names no torch version: {kept_line}");
+    };
+    let kept_version = after_torch
+        .split([',', ';'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    assert!(
+        !kept_version.is_empty(),
+        "`torch_kept:` names no torch version: {kept_line}"
+    );
+    let python = super::examine_steps::field_value(output, "python_executable")
+        .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
+    let probe = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; print(m.version('torch'))",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to ask {python} for its torch: {error}"));
+    assert!(
+        probe.status.success(),
+        "asking {python} for its torch failed: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let installed_version = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+    assert_eq!(
+        installed_version, kept_version,
+        "the SDK install replaced the torch it said it kept:\n{output}"
+    );
 }
 
 /// The kept torch is not sold to the user as a runtime to repair.
@@ -659,6 +717,9 @@ fn assert_engine_ready(world: &mut E2eWorld) {
 }
 #[when("the user dry-runs a nightly SDK install for a known family")]
 async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
+    // An exact arch, not the `gfx120X-all` group: an unpinned install reads the
+    // newest layout, which picks its device payload by exact arch and refuses a
+    // group.
     let stdout = crate::run_rocm_ok(
         world,
         &[
@@ -667,7 +728,28 @@ async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
             "--channel",
             "nightly",
             "--family",
-            "gfx120X-all",
+            "gfx1200",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
+/// The last day the earlier (canonical) nightly stream published a build is
+/// 2026-08-22, so a pin before it can only be read from there.
+#[when("the user dry-runs a nightly SDK install pinned to a build from the earlier stream")]
+async fn user_dry_runs_earlier_nightly_sdk(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--family",
+            "gfx1200",
+            "--build-date",
+            "2026-08-20",
             "--dry-run",
         ],
     );
@@ -706,7 +788,23 @@ fn requested_rocm_extras(rocm_spec: &str) -> &str {
 
 #[then("the SDK preview reports canonical nightly provenance")]
 async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
-    const AGGREGATE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
+    assert_nightly_provenance(
+        world,
+        "https://rocm.nightlies.amd.com/whl-multi-arch",
+        "multi-arch-v2",
+    );
+}
+
+#[then("the SDK preview reports next-layout nightly provenance")]
+async fn assert_next_nightly_provenance(world: &mut E2eWorld) {
+    assert_nightly_provenance(
+        world,
+        "https://nightly.repo.amd.com/rocm/whl-next",
+        "next-v1",
+    );
+}
+
+fn assert_nightly_provenance(world: &E2eWorld, aggregate: &str, generation: &str) {
     let output = world.cli_output.as_deref().expect("no SDK preview output");
 
     assert_eq!(
@@ -720,17 +818,17 @@ async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
     // disagrees with it is worse than either alone.
     assert_eq!(
         preview_field(output, "canonical_source"),
-        AGGREGATE,
-        "the preview declares a source other than the canonical nightly aggregate:\n{output}"
+        aggregate,
+        "the preview declares a source other than the expected nightly aggregate:\n{output}"
     );
     assert_eq!(
         preview_field(output, "index_url"),
-        AGGREGATE,
-        "the nightly install resolved something other than the canonical aggregate:\n{output}"
+        aggregate,
+        "the nightly install resolved something other than the expected aggregate:\n{output}"
     );
     assert_eq!(
         preview_field(output, "source_layout_generation"),
-        "multi-arch-v2",
+        generation,
         "the preview read the aggregate as some other layout:\n{output}"
     );
     // A `selected_rocm_version` line is provenance only if it names the version
@@ -758,9 +856,44 @@ async fn user_dry_runs_release_sdk(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user dry-runs a release SDK install pinned to an earlier ROCm 7 release")]
+async fn user_dry_runs_earlier_release_sdk(world: &mut E2eWorld) {
+    // Same as the unpinned preview above, with the pin the only difference, so
+    // the two scenarios differ in exactly the thing that picks the stream.
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--version",
+            "7.14.1",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
 #[then("the SDK preview reports canonical release provenance")]
 async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
-    const AGGREGATE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+    assert_release_provenance(
+        world,
+        "https://repo.amd.com/rocm/whl-multi-arch",
+        "multi-arch-v2",
+    );
+}
+
+#[then("the SDK preview reports next-layout release provenance")]
+async fn assert_next_release_provenance(world: &mut E2eWorld) {
+    assert_release_provenance(
+        world,
+        "https://stable.repo.amd.com/rocm/whl-next",
+        "next-v1",
+    );
+}
+
+fn assert_release_provenance(world: &E2eWorld, aggregate: &str, generation: &str) {
     let output = world.cli_output.as_deref().expect("no SDK preview output");
 
     assert_eq!(
@@ -774,17 +907,17 @@ async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
     // that says so — the URL the resolver chose, not the one it advertises.
     assert_eq!(
         preview_field(output, "canonical_source"),
-        AGGREGATE,
-        "the preview declares a source other than the canonical release aggregate:\n{output}"
+        aggregate,
+        "the preview declares a source other than the expected release aggregate:\n{output}"
     );
     assert_eq!(
         preview_field(output, "index_url"),
-        AGGREGATE,
-        "the release install resolved something other than the flat aggregate index:\n{output}"
+        aggregate,
+        "the release install resolved something other than the expected aggregate index:\n{output}"
     );
     assert_eq!(
         preview_field(output, "source_layout_generation"),
-        "multi-arch-v2",
+        generation,
         "the preview read the aggregate as some other layout:\n{output}"
     );
     // The release channel installs stable versions only, and a stable version
@@ -1061,24 +1194,12 @@ async fn assert_examine_reports_no_toolchain(world: &mut E2eWorld) {
 
 #[then("the managed runtime folder path is not recursively nested")]
 async fn assert_runtime_path_not_nested(world: &mut E2eWorld) {
-    // `rocm examine` prints `Folder: <install_root>` for the active runtime.
+    // `rocm examine` prints `active_runtime_root: <install_root>` for the active
+    // managed runtime; the judgement lives in the library so unit tests run it.
     let output = world.cli_output.as_ref().expect("no examine output");
-    let Some(folder) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Folder:"))
-        .map(str::trim)
-    else {
-        panic!("no 'Folder:' line in examine output:\n{output}");
-    };
-    // A healthy path contains `runtimes/wheel` at most once. Re-provisioning
-    // inside an existing runtime produces `runtimes/wheel/.../runtimes/wheel/`
-    // (dogfooding #17). Count occurrences of the marker segment.
-    let nested = folder.matches("runtimes/wheel").count() > 1
-        || folder.matches("runtimes\\wheel").count() > 1;
-    assert!(
-        !nested,
-        "managed runtime folder path is recursively nested (dogfooding #17):\n{folder}"
-    );
+    if let Err(reason) = e2e_cucumber::runtime_root::check_runtime_root_not_nested(output) {
+        panic!("{reason}\nexamine output:\n{output}");
+    }
 }
 
 #[when("the user checks for runtime updates")]
@@ -1456,4 +1577,137 @@ async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
             "the refusal must not offer `{family}` for a GPU with no ROCm build:\n{output}"
         );
     }
+}
+
+/// The folder scenario runtime-22 asks for: inside the scenario's own temp
+/// root, and with a lone `'` in its name — the shape the old quoter left bare.
+fn freeform_prefix_with_quote(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("it's-here")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[when("the user approves a natural-language SDK install into a folder whose name has a quote")]
+async fn user_approves_freeform_sdk_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = freeform_prefix_with_quote(world);
+    let request = format!("install the latest TheRock nightly for this GPU into {prefix}");
+    // `run_rocm`, not `run_rocm_ok`: the Given guarantees the dispatched install
+    // fails, and the exit code is not what this scenario is about.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["--yes", &request]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Read the section's `rocm install sdk` `tool_call:` line back the way a POSIX
+/// shell splits words, and require `--prefix` to be followed by exactly
+/// `prefix`. The install line specifically: the request plan lists a read-only
+/// `rocm examine` step ahead of it.
+fn assert_tool_call_has_prefix_as_one_word(section: &str, which: &str, prefix: &str) {
+    let line = section
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("tool_call: "))
+        .find(|line| line.starts_with("rocm install sdk"))
+        .unwrap_or_else(|| panic!("no install `tool_call:` line in the {which}:\n{section}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the {which} `tool_call:` line does not parse: `{line}`"));
+    let after_prefix = words
+        .iter()
+        .position(|word| word == "--prefix")
+        .and_then(|index| words.get(index + 1))
+        .unwrap_or_else(|| {
+            panic!("the {which} `tool_call:` line has no `--prefix` value: `{line}`")
+        });
+    assert_eq!(
+        after_prefix, prefix,
+        "the {which} `tool_call:` line must name the folder as one argument, got `{line}`"
+    );
+}
+
+#[then("the request plan names that folder as a single argument")]
+async fn assert_freeform_plan_prefix_is_one_word(world: &mut E2eWorld) {
+    let (plan, _) = freeform_plan_and_execution(world);
+    assert_tool_call_has_prefix_as_one_word(
+        &plan,
+        "request plan",
+        &freeform_prefix_with_quote(world),
+    );
+}
+
+#[then("the executed command names that folder as a single argument")]
+async fn assert_freeform_execution_prefix_is_one_word(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    assert_tool_call_has_prefix_as_one_word(
+        &execution,
+        "execution section",
+        &freeform_prefix_with_quote(world),
+    );
+}
+
+/// Where scenario runtime-26 plants its interpreter: inside a folder called `tools`,
+/// which is neither `bin` nor `Scripts`, so nothing about its location names an
+/// environment.
+fn interpreter_outside_a_venv(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("not-a-venv")
+        .join("tools")
+        .join("python")
+}
+
+/// A stand-in interpreter that answers the SDK probe with the smallest document the
+/// CLI parses. The refusal under test happens after the probe and before anything is
+/// read from the environment, so nothing else about the interpreter matters.
+///
+/// A POSIX shell script, so the scenario is Linux-only (`@requires-os:linux`).
+#[given("a Python interpreter that sits outside any environment's bin folder")]
+async fn setup_interpreter_outside_a_venv(world: &mut E2eWorld) {
+    let python = interpreter_outside_a_venv(world);
+    std::fs::create_dir_all(python.parent().expect("interpreter has a folder"))
+        .expect("failed to create the interpreter's folder");
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\necho '{\"import_ok\": true}'\n",
+    )
+    .expect("failed to write the stand-in interpreter");
+}
+
+#[when("the user adopts that interpreter without naming an environment folder")]
+async fn user_adopts_interpreter_without_root(world: &mut E2eWorld) {
+    let python = interpreter_outside_a_venv(world)
+        .to_string_lossy()
+        .into_owned();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "adopt", "--python", &python]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal asks for the environment folder with --root")]
+async fn assert_adopt_refusal_asks_for_root(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("could not infer the Python environment folder")
+            && combined.contains("pass --root"),
+        "the refusal does not ask for --root:\n{combined}"
+    );
+}
+
+#[then("no runtime is registered")]
+async fn assert_no_runtime_registered(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert!(
+        stdout.contains("installed: none") || stdout.contains("managed_runtimes: 0"),
+        "the refused adoption left a runtime registered:\n{stdout}"
+    );
 }

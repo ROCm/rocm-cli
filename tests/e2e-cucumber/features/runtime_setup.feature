@@ -70,14 +70,16 @@ Feature: Runtime configuration
   # see. This is the same reinstall as scenario 4 with the opt-out set, so what
   # differs between them is exactly the variable.
   #
-  # Four claims across three Thens, because the opt-out is only coherent if all
-  # four hold: torch was not rewritten; the skip is reported as its own verdict
-  # rather than folded into the generic `not_applicable`, which would leave the
-  # user unable to tell whether the variable did anything; the divergence the
-  # opt-out deliberately leaves behind is not then sold back to that user as a
-  # runtime to repair by reinstalling the engine — an instruction that would undo
-  # what they asked for; and the checks the opt-out does not suppress still run,
-  # because it suppresses the correction, not the diagnosis.
+  # Four claims, because the opt-out is only coherent if all four hold: torch
+  # was not rewritten by the alignment; the SDK install itself did not rewrite
+  # it either — it hands `uv` the torch requirements too, so
+  # before it honoured the opt-out the engine's torch was replaced by the SDK's
+  # build in the same command that reported the opt-out, and a GPU on which that
+  # build opens no device failed the install; the divergence the opt-out
+  # deliberately leaves behind is not then sold back to that user as a runtime to
+  # repair by reinstalling the engine — an instruction that would undo what they
+  # asked for; and the checks the opt-out does not suppress still run, because it
+  # suppresses the correction, not the diagnosis.
   #
   # Same lane as scenario 4 and for the same reasons: a real SDK install and a
   # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
@@ -88,6 +90,7 @@ Feature: Runtime configuration
     And the user has opted out of realigning torch
     When the user installs the SDK again
     Then the torch alignment reports the opt-out instead of rewriting torch
+    And the SDK install leaves the torch the runtime held as it was
     And the install does not offer to reinstall the engine over the kept torch
     And the runtime's device health is still reported
 
@@ -129,6 +132,7 @@ Feature: Runtime configuration
   @id:runtime-install-records-the-real-folder @nightly
   Scenario: runtime-06 - Previewing an install through a linked runtimes folder names the real folder
     Given a machine whose runtimes folder is a link to somewhere else
+    And a uv is already installed
     When the user previews an SDK install
     Then the planned runtime folder is inside the folder the link points at
     And the planned runtime folder is not expressed through the link
@@ -144,24 +148,29 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the error explains which install types can be adopted
 
-  # Both channels now resolve from one canonical aggregate index each, so the
-  # provenance the preview prints is the whole of what the user can check before
-  # committing to a multi-GiB install. This pins the nightly half: the source that
-  # was selected, the version that came back from it, and the layout generation
-  # that source was read as. `--family` is supplied so the scenario needs no GPU,
-  # and `@nightly` because it resolves the real index over the network — the same
-  # cost that keeps scenario runtime-06 off the unserialized mock lane.
+  # Both channels resolve from one aggregate index each, so the provenance the
+  # preview prints is the whole of what the user can check before committing to a
+  # multi-GiB install. This pins the nightly half: the source that was selected,
+  # the version that came back from it, and the layout generation that source was
+  # read as. With no pin that is the newest layout's nightly index
+  # (`nightly.repo.amd.com`); runtime-31 pins the earlier stream. `--family` is
+  # an exact arch so the scenario needs no GPU, and `@nightly` because it
+  # resolves the real index over the network — the same cost that keeps scenario
+  # runtime-06 off the unserialized mock lane.
   @id:runtime-resolve-canonical-nightly @nightly
-  Scenario: runtime-08 - Previewing a nightly SDK install reports canonical provenance
+  Scenario: runtime-08 - Previewing a nightly SDK install reports the newest layout's provenance
+    Given a uv is already installed
     When the user dry-runs a nightly SDK install for a known family
-    Then the SDK preview reports canonical nightly provenance
+    Then the SDK preview reports next-layout nightly provenance
 
   # The release channel is where this went wrong in the field (rocm-cli#271). The
   # resolver read a per-family index, `repo.amd.com/rocm/whl/{family}`, which is
   # frozen at 7.13.0 and has no device payloads at all, so every release install
   # got a stale SDK and a bare `rocm[libraries,devel]` — no GPU backend in it.
-  # Both halves are fixed by the same canonical model: one flat aggregate index
-  # for the channel, and the device payload for the chip this host actually has.
+  # Both halves are fixed by the same model: one flat aggregate index for the
+  # channel (now `stable.repo.amd.com` for an unpinned install; runtime-32 pins
+  # the earlier release stream), and the device payload for the chip this host
+  # actually has.
   #
   # The obvious regression test for that history is the one that does not work.
   # Asserting the broken per-family URL is *absent* passes with the bug present:
@@ -182,10 +191,11 @@ Feature: Runtime configuration
   # WSL hosts that can read the Windows-side target before ROCm passthrough is
   # ready, while mock hosts with no target skip it.
   @id:runtime-resolve-canonical-release @requires-gfx-target
-  Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
+  Scenario: runtime-09 - Previewing a release SDK install resolves the newest layout's aggregate for this GPU
     Given a machine with an AMD GPU
+    And a uv is already installed
     When the user dry-runs a release SDK install for this host
-    Then the SDK preview reports canonical release provenance
+    Then the SDK preview reports next-layout release provenance
     And the SDK preview requests the device payload for this host's GPU
 
   # `rollback` can only ever undo one step, not walk a history. A unit test on
@@ -327,7 +337,10 @@ Feature: Runtime configuration
   # against real hardware (Strix Halo, gfx1151): a fresh SDK's version does not
   # match Lemonade's packaged pin, Tier 1's install 404s (the pinned build
   # predates a matching ROCm-version asset), and Tier 2's newest build
-  # succeeds -- producing exactly the line this scenario asserts.
+  # succeeds -- producing exactly the line this scenario asserts. That held for
+  # an SDK whose TheRock tarball Lemonade could download; for a 7.14.x SDK Tier 2
+  # fails too (the tarball is not published where Lemonade 11.5.1 looks), which is
+  # why `expectations.toml` carries a Windows row for this scenario (ROCMAI-899).
   #
   # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
   # environment and has no llama.cpp backend to align; `@nightly` for the same
@@ -415,3 +428,276 @@ Feature: Runtime configuration
     When the user dry-runs an SDK install for the gfx90c Vega iGPU
     Then the install is refused as having no ROCm build for that GPU
     And the refusal offers no package family to install instead
+
+  # When the machine already has its own (unmanaged) ROCm and that ROCm is newer
+  # than the SDK the install picks, the preview says why the older SDK is
+  # selected. Such a host often reports its version with a packaging build
+  # number on the end, which must not stop the CLI from reading it.
+  #
+  # Linux-only: `--format tarball` is rejected outright on Windows. Hermetic:
+  # the catalog is a loopback fixture and `--family` is named, so no GPU and no
+  # network are needed and this runs on the ordinary E2E lane.
+  #
+  # Technical details: the host install is planted under the scenario's root
+  # and exported as ROCM_PATH; its `.info/version` reads `10.5.1-33`. The
+  # catalog serves one release tarball, ROCm 10.0.0, for `gfx120X-all`.
+  @id:runtime-install-preview-notes-newer-host-rocm @requires-os:linux
+  Scenario: runtime-20 - Previewing an install on a host with newer ROCm explains why the older SDK is selected
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a newer version with a packaging build number
+    When the user previews a tarball SDK install
+    Then the preview explains that the host's newer ROCm is passed over for the selected SDK
+
+  # A host version the CLI cannot read is "can't tell", and "can't tell" is
+  # never "newer". The regression this pins: a suffix that merely starts with a
+  # digit was dropped whole, so the host was read as a plain, newer release and
+  # the preview claimed so. runtime-20 is what makes the absence below
+  # evidence: it shows the same preview printing the note when the host
+  # version is readable and newer.
+  #
+  # Technical details: `.info/version` reads `10.5.1-33rc1`, which with its
+  # suffix dropped would be `10.5.1`, newer than the catalog's 10.0.0.
+  @id:runtime-install-preview-ignores-unreadable-host-rocm @requires-os:linux
+  Scenario: runtime-21 - Previewing an install on a host whose ROCm version cannot be read makes no newer-host claim
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a version with an unreadable build suffix
+    When the user previews a tarball SDK install
+    Then the preview selects the newest SDK in the catalog
+    And the preview does not claim the host's ROCm is newer
+
+  # The `tool_call:` lines `rocm <request>` prints are the command the operator
+  # reviews before re-running with `--yes`, and the one that then runs. Their
+  # quoter used to wrap a value only when it held whitespace, so a folder whose
+  # name carries a lone `'` rendered bare and left a line no shell can parse —
+  # the operator was shown something that denotes no argv at all. The
+  # assertion reads each line back through a POSIX word-splitter and demands
+  # `--prefix` followed by exactly the requested folder: what the line has to
+  # mean, rather than one spelling of it. (A space alone does not distinguish
+  # the two quoters on this surface — the old one wrapped whitespace — which is
+  # why the folder name carries a quote.)
+  #
+  # The argv the dispatched install receives is not observable here: the Given
+  # stops it on its first step, as in runtime-15, and for the same reasons —
+  # offline, instant, writes nothing, identical on every lane. The executed
+  # `tool_call:` line is the closest observable account of it.
+  @id:runtime-freeform-prefix-with-quote-is-one-argument
+  Scenario: runtime-22 - A natural-language install into a folder named with a quote keeps the folder one argument
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install into a folder whose name has a quote
+    Then the request plan names that folder as a single argument
+    And the executed command names that folder as a single argument
+
+  # A preview is a promise that nothing on the machine changes. On a host with
+  # no usable Python the install needs one, and the preview used to go and get
+  # it: it downloaded a managed `uv`, had `uv` install Python, and saved that
+  # Python's path in the configuration, all before printing a plan. The assistant's
+  # `install_sdk_dry_run` tool reaches the same code. Now the preview reports that
+  # a managed Python would be prepared and prepares nothing.
+  #
+  # The preview's own note says it prepared nothing, so the Then checks that note
+  # and the state together. The evidence is the recording `uv`: the CLI reaches
+  # it only by going on to prepare a Python, so its log not existing means no
+  # preparation was attempted, with no network needed. Beside it the Then checks
+  # that no managed tools folder and no configuration exist; a tool archive in the
+  # scenario's cache is checked too, but only as a backstop, since the stand-in
+  # `uv` is returned before any download could start. The first Then shows the
+  # preview still got as far as a plan, so the absences are not just a command
+  # that stopped early.
+  #
+  # The guarantee is the canonical layout's. A preview of a ROCm 10 or newer wheel
+  # resolves its package versions with `uv pip compile` and so can fetch the
+  # managed `uv` (creating the `tools` folder) on a clean host, though it still
+  # prepares no Python; this scenario is not that case and does not claim it.
+  #
+  # Linux only: the empty-`PATH` host is built for the Linux search order. The
+  # decision itself is unit-tested against an injected resolver environment on
+  # every platform, the Windows CI job included
+  # (`a_dry_run_decides_from_an_injected_environment_on_every_platform` in
+  # `apps/rocm/src/therock/python.rs`, which needs no interpreter); the Windows
+  # search order and a Windows run of this preview are not covered by a test.
+  #
+  # Technical details: the fixture serves one canonical release index, `PATH` is a
+  # single empty folder, `ROCM_CLI_UV_BINARY` names a stand-in that appends its
+  # arguments to a log file, and `ROCM_CLI_CACHE_DIR` is a folder of this
+  # scenario's own, so a tool archive left in the cache the suite shares across
+  # scenarios and runs cannot trip the backstop check.
+  @id:runtime-install-preview-prepares-no-python @requires-os:linux
+  Scenario: runtime-23 - Previewing an SDK install on a host with no usable Python prepares no Python
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    When the user previews a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
+    Then the preview says a real install would prepare a managed Python
+    And the preview prepared no Python, as it says
+
+  # A preview must not announce a plan the install would refuse.
+  # `ROCM_CLI_MANAGED_PYTHON_VERSION` can name a Python other than the one the
+  # wheels need (3.12 for this layout); a real install prepares it, finds its
+  # wheel tag is wrong and refuses. The preview refuses by the same rule instead
+  # of saying it would prepare 3.13, and still prepares nothing on the way to
+  # refusing, which the last Then checks against the folders, as runtime-23 does.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. The tag rule is
+  # unit-tested on every platform
+  # (`a_managed_python_version_is_read_as_the_wheel_tag_it_reports` in
+  # `apps/rocm/src/therock/python.rs`).
+  @id:runtime-install-preview-refuses-unusable-managed-python @requires-os:linux
+  Scenario: runtime-24 - Previewing an SDK install is refused when the install would refuse the managed Python version
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And the managed Python version is overridden to 3.13
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
+    Then the install fails
+    And the preview is refused because the install would refuse that Python
+
+  # The sibling of runtime-24 for the policy refusal. A preview must not say what
+  # a real install would do on a path where it would do nothing. Here the host's
+  # only Python cannot serve the install and managed Python is switched off with
+  # `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`, so a real install refuses; the
+  # preview used to print that it would use ROCm CLI's managed Python first. It
+  # now prints the finding about the PATH Python, neutrally, and then the same
+  # refusal as the install, with no line predicting anything. The state is checked
+  # as in runtime-23. Every other combination of PATH Python, saved Python,
+  # bootstrap policy and version override is pinned by the unit test
+  # `a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
+  # `apps/rocm/src/therock/python.rs`, which asserts each row's complete output.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23, with `fake-python`
+  # planted on it as the unusable interpreter.
+  @id:runtime-install-preview-refuses-disabled-managed-python @requires-os:linux
+  Scenario: runtime-25 - Previewing an SDK install is refused when managed Python is disabled and the host's Python is unusable
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And the only Python on the host's path is not usable
+    And managed Python bootstrap is disabled
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
+    Then the install fails
+    And the preview is refused because managed Python is disabled, without a promise
+
+  # `rocm runtimes adopt --python` takes the environment folder from where the
+  # interpreter sits: the folder that holds its `bin` (or `Scripts`) folder. An
+  # interpreter anywhere else has no environment folder to infer, and a guess (the
+  # interpreter's grandparent, which is what the command used to adopt) would
+  # register a folder that is not an environment as a runtime. The command refuses
+  # instead and names the flag that supplies the folder; nothing is saved.
+  #
+  # Linux-only: the stand-in interpreter is a POSIX shell script. The "adopts with
+  # --root" half is covered by the unit test
+  # `adopt_request_without_an_inferred_root_asks_for_root`, which shows an explicit
+  # root clears the refusal; adopting for real needs a genuine ROCm SDK environment.
+  @id:runtime-adopt-outside-a-venv-asks-for-root @requires-os:linux
+  Scenario: runtime-26 - Adopting a Python that sits outside any environment's bin folder asks for --root
+    Given a Python interpreter that sits outside any environment's bin folder
+    When the user adopts that interpreter without naming an environment folder
+    Then the adoption is refused
+    And the refusal asks for the environment folder with --root
+    And no runtime is registered
+
+  # A preview of a ROCm 10 or newer wheel has `uv pip compile` choose the torch
+  # and torchvision versions: nothing else does, and the plan's package specs, its
+  # runtime key and its command are made of them. When a `uv` is already there the
+  # preview must still run it, so the plan is the one a real install would print.
+  # This pins that half of the contract next to runtime-28, where no `uv` is there,
+  # so that skipping the step on a clean host cannot become skipping it everywhere.
+  #
+  # The recording `uv` is the one named by `ROCM_CLI_UV_BINARY`, so it counts as
+  # present, and it answers `uv pip compile` with the fixture's four pinned
+  # versions. Its log is the evidence the compile ran, once, and the plan
+  # carries the versions it printed.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23 (the Python the
+  # preview would prepare is not what this scenario is about).
+  @id:runtime-install-preview-of-rocm-10-uses-the-uv-that-is-present @requires-os:linux
+  Scenario: runtime-27 - Previewing a ROCm 10 SDK install with a uv already present resolves the package versions with it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a host with no usable Python and a recording uv
+    And the recording uv answers uv pip compile with the ROCm 10 fixture's versions
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview requests the gfx1200 device extras
+    And the preview resolved the versions with the uv that was present
+
+  # A preview is a promise that nothing on the machine changes, and runtime-23 held
+  # the Python half of it. The other half is `uv`: a preview of a ROCm 10 or newer
+  # wheel used to go and fetch the managed `uv` (creating the data folder's `tools`
+  # folder) because `uv pip compile` is the one step that knows the torch and
+  # torchvision versions. On a host with no `uv` the preview now runs nothing and
+  # downloads nothing. It prints what it can know without `uv` (the ROCm version,
+  # the torchaudio pin, the requirements `uv` would be asked about), says in a
+  # `resolution_note:` line and a progress line what it did not do, and marks the
+  # lines made from the missing versions as not resolved rather than printing a
+  # guess. A real install and `rocm update` still fetch `uv` as they always did.
+  #
+  # The Then checks the message and the state together: with no `uv` to log, the
+  # evidence is the folders. No managed `tools` folder, no tool archive in the
+  # scenario's own cache, no saved configuration, and no torch version anywhere in
+  # the output, so the unresolved lines are not covering for a guess. runtime-27
+  # is the other polarity: with a `uv` present the compile still runs.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. The decision is
+  # unit-tested for every combination of layout, who may fetch `uv` and whether one
+  # is present by `the_version_step_is_decided_by_layout_access_and_a_present_uv_alone`
+  # in `apps/rocm/src/therock/resolve/uv_access.rs`, and the plan's wording (written
+  # by `apps/rocm/src/therock/wheel_plan.rs`) by the tests in
+  # `apps/rocm/src/therock/resolve/wheel.rs`, on every platform.
+  @id:runtime-install-preview-of-rocm-10-fetches-no-uv @requires-os:linux
+  Scenario: runtime-28 - Previewing a ROCm 10 SDK install on a host with no uv fetches none and says what it did not resolve
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a host with no uv and no usable Python
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview says it did not resolve the ROCm 10 package versions, as it says
+
+  # ROCm 10 installs use Python 3.14 because vLLM, flash-attn and amd-aiter for
+  # ROCm 10 exist for it alone, but the SDK and PyTorch wheels are published for
+  # older Pythons too. `--python-version` lets an install that does not need vLLM
+  # pick one. The preview must plan what the install would do with it: the
+  # requested interpreter and its wheel tag, not the default's, with the same
+  # resolution as runtime-27. Only the plan is asserted here; no scenario runs
+  # resolution with the chosen interpreter.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23.
+  @id:runtime-install-preview-of-rocm-10-honours-python-version @requires-os:linux
+  Scenario: runtime-29 - Previewing a ROCm 10 SDK install with --python-version plans that Python and not the default
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a host with no usable Python and a recording uv
+    And the recording uv answers uv pip compile with the ROCm 10 fixture's versions
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 on Python 3.12
+    Then the preview plans Python 3.12 and its cp312 wheel tag and not the default
+
+  # The flag is a choice among the interpreters the layout is published for, so a
+  # request for one it is not published for is refused instead of ignored: a
+  # canonical (ROCm 7) install, whose one interpreter is 3.12. This scenario covers
+  # that refusal; the ROCm 10 refusal (a Python the index has no wheels for) is
+  # unit-tested only. The refusal names the Python that is allowed, and nothing is
+  # prepared on the way to it.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. Each combination of
+  # layout and version is also unit-tested on every platform
+  # (`python_version_is_a_choice_among_the_layouts_published_pythons` in
+  # `apps/rocm/src/therock/python.rs`).
+  @id:runtime-install-refuses-python-version-it-cannot-honour @requires-os:linux
+  Scenario: runtime-30 - Previewing an SDK install with a --python-version the layout is not published for is refused
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release on Python 3.13
+    Then the install fails
+    And the preview is refused because the layout has no wheels for that Python, and prepared none
+
+  # The other half of runtime-08. The newest layout took over the nightly channel
+  # on 2026-08-23; the earlier stream (`rocm.nightlies.amd.com`) stopped the day
+  # before, so a build from before then exists only there. Pinning one must
+  # keep resolving it, from that stream and read as that stream's layout, rather
+  # than failing against the newest layout's index. `@nightly` for the same
+  # reason as runtime-08: it resolves the real index.
+  @id:runtime-resolve-earlier-nightly @nightly
+  Scenario: runtime-31 - Previewing a nightly SDK install pinned to an earlier build reports the earlier stream's provenance
+    When the user dry-runs a nightly SDK install pinned to a build from the earlier stream
+    Then the SDK preview reports canonical nightly provenance
+
+  # The other half of runtime-09: an earlier ROCm 7 release is published only on
+  # the earlier stream (`repo.amd.com`), so pinning one has to keep reading it,
+  # while the unpinned install of runtime-09 reads the newest layout. Same
+  # `@requires-gfx-target` as runtime-09, since the preview detects the chip.
+  @id:runtime-resolve-earlier-release @requires-gfx-target
+  Scenario: runtime-32 - Previewing a release SDK install pinned to an earlier ROCm 7 release reports the earlier stream's provenance
+    Given a machine with an AMD GPU
+    When the user dry-runs a release SDK install pinned to an earlier ROCm 7 release
+    Then the SDK preview reports canonical release provenance

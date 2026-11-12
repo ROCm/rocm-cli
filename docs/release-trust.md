@@ -240,7 +240,7 @@ approval, or manual-only blocking. Existing signed indexes without
 ## TheRock Source Base Overrides
 
 rocm-cli hardcodes the pip index and tarball catalog bases it resolves TheRock
-SDK artifacts from. Six of those bases can be overridden, for fixture-server
+SDK artifacts from. Eight of those bases can be overridden, for fixture-server
 testing only:
 
 ```text
@@ -250,11 +250,16 @@ ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE
 ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE
 ROCM_CLI_THEROCK_NEXT_PIP_BASE
 ROCM_CLI_THEROCK_NEXT_TARBALL_BASE
+ROCM_CLI_THEROCK_NEXT_NIGHTLY_PIP_BASE
+ROCM_CLI_THEROCK_NEXT_NIGHTLY_TARBALL_BASE
 ```
 
-The last two address the ROCm 10 ("next") source layout, which is a layout
-rather than a channel: it has no nightly counterpart and is never resolved
-unless an install explicitly pins a ROCm version of 10 or newer.
+The first four address the canonical (earlier) layout, `repo.amd.com` and
+`rocm.nightlies.amd.com`, which an install reads only when it pins a build that
+exists only there: a ROCm 7 release, or a nightly built before 2026-08-23. The
+last four address the newest layout, `stable.repo.amd.com` and
+`nightly.repo.amd.com`, which an install with no pin reads, and which a stable
+ROCm 10 or newer pin or a nightly built on or after 2026-08-23 reads too.
 
 None of these take effect unless `ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE` is also
 set to a non-empty value. Without that gate, a stray override left in a
@@ -312,10 +317,12 @@ is already trusted.
 ## Simulated Host Root
 
 rocm-cli decides what hardware it is running on by reading fixed host paths:
-`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
-under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
-`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
-`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the
+`/sys/class/kfd/kfd` class device and the KFD topology under it, the DRM cards
+under `/sys/class/drm`, the amdgpu PCI driver directory
+`/sys/bus/pci/drivers/amdgpu`, `/sys/module/amdgpu` and its `version` file,
+`/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`,
+`/proc/modules`, `/proc/1/cgroup`, the
 container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
 (falling back to `/usr/lib/os-release` when absent, per `os-release(5)`) behind
 the distro fields and name `rocm examine` reports, the modprobe
@@ -323,7 +330,8 @@ configuration directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and
 `/run/modprobe.d`, the WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
 `lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
 `lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
-discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+discovered ROCm install, and `lib/librocdxg.so` again in each directory on
+`LD_LIBRARY_PATH`. The E2E suite can point those reads at a directory it populated with a
 simulated host instead, but only in builds compiled with the `e2e-test-hooks`
 Cargo feature:
 
@@ -375,6 +383,23 @@ signed sidecar publication, and hosted production recipe/source-policy
 documents. Do not generate those production keys inside CI. Once published, the
 installers, metadata cache, and model recipe index can make release-channel
 signature verification mandatory by default with those keys as trust roots.
+
+Those trust roots are pinned copies of the published keys: the
+`PINNED_RELEASE_PUBLIC_KEY_CURRENT`/`_NEXT` slots in
+[install.sh](../install.sh), `$PinnedReleasePublicKeyCurrent`/`Next` in
+[install.ps1](../install.ps1), and
+`PINNED_METADATA_PUBLIC_KEY_PEM` in
+[fetch.rs](../apps/rocm/src/therock/fetch.rs). `cargo xtask verify-pinned-keys`
+fails when a pinned copy differs from its canonical file under `docs/keys/`. The
+release and nightly workflows always run it; pull-request CI runs it when a
+change matches the `heavy` path filter in
+[ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
+installers, every Rust source and `xtask/`. It reads the one assignment
+the installer actually uses, so each slot must be assigned exactly once as a
+plain declaration, a slot whose key is not published yet must stay `""`, and
+`install.sh` must mark both of its slots `readonly`. The full rules, and what a
+textual check cannot catch, are in
+[verify_pinned_keys.rs](../xtask/src/verify_pinned_keys.rs).
 
 When those owner-controlled inputs exist, release operators can add
 `--require-production-trust` or set `ROCM_CLI_REQUIRE_PRODUCTION_TRUST=1` so the

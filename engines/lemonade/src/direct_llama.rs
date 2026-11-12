@@ -2,19 +2,25 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Result, anyhow, bail};
-use rocm_core::{AppPaths, runtime_home_dir};
+use anyhow::{Context, Result, anyhow, bail};
+use rocm_core::{AppPaths, format_http_base_url, http_get_text_with_auth, runtime_home_dir};
+use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::backend_alignment::{LemonadeRuntime, ROCM_LLAMACPP_BACKEND_DIRS};
-use crate::install::{LemonadeInstallManifest, platform_binary_name};
+use crate::install::{LemonadeInstallManifest, LemonadeRuntime, platform_binary_name};
 use crate::process::{
-    LemonadeProcessEnvironment, run_lemonade_model_load, run_lemonade_pull,
-    serve_direct_llama_server, spawn_lemond, wait_for_lemonade_cli_status,
+    LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
+    model_names_match, query_chat_smoke_endpoint, run_lemonade_model_load, run_lemonade_pull,
+    spawn_lemond, wait_for_lemonade_cli_status,
 };
-use crate::state::{free_local_port, resolve_lemonade_model_ref, terminate_pid};
+use crate::state::{
+    free_local_port, mark_json_status, merge_json_state, resolve_lemonade_model_ref, terminate_pid,
+    write_running_state,
+};
 use crate::{
     DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_MODEL_GGUF, DEFAULT_MODEL_REPO_DIR, ROCM_BACKEND_NAME,
     ServeHttpRequest,
@@ -97,7 +103,8 @@ fn ensure_hf_checkpoint_downloaded(
     log_path: Option<&Path>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+    if direct_llama_model_path(&paths, &runtime.manifest.runtime_dir, &request.model_ref).is_some()
+    {
         return Ok(());
     }
     let download_port = free_local_port()?;
@@ -125,7 +132,9 @@ fn ensure_hf_checkpoint_downloaded(
             log_path,
             process_env,
         )?;
-        if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+        if direct_llama_model_path(&paths, &runtime.manifest.runtime_dir, &request.model_ref)
+            .is_some()
+        {
             Ok(())
         } else {
             bail!(
@@ -147,7 +156,8 @@ pub(crate) fn ensure_direct_llama_model_available(
     log_path: Option<&Path>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+    let runtime_dir = runtime.manifest.runtime_dir.as_path();
+    if direct_llama_model_path(&paths, runtime_dir, &request.model_ref).is_some() {
         return Ok(());
     }
 
@@ -178,19 +188,232 @@ pub(crate) fn ensure_direct_llama_model_available(
             log_path,
             process_env,
         );
-        if direct_llama_model_path(&paths, &request.model_ref).is_some() {
+        if direct_llama_model_path(&paths, runtime_dir, &request.model_ref).is_some() {
             Ok(())
         } else {
             bail!(
-                "Lemonade did not download `{}` for direct ROCm serving (searched {})",
-                request.model_ref,
-                describe_hf_cache_roots(&paths)
+                "{}",
+                unresolved_model_message(&hf_cache_roots(&paths), runtime_dir, &request.model_ref)
             )
         }
     })();
     let _ = terminate_pid(child.id(), true);
     let _ = child.wait();
     result
+}
+
+/// Run one of Lemonade's packaged `llama-server` binaries (`server`) directly on a
+/// GGUF file, exposing the model under `request.model_ref` via `--alias`. This is how
+/// a canonical Hugging Face name is served under exactly that name — Lemonade's router
+/// renames registered models, but an llama-server alias is a free-form string.
+pub(crate) fn serve_direct_llama_server(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    process_env: &LemonadeProcessEnvironment,
+    server: &Path,
+    log_path: Option<&Path>,
+    reason: &anyhow::Error,
+) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let model_path =
+        direct_llama_model_path(&paths, &runtime.manifest.runtime_dir, &request.model_ref)
+            .with_context(|| {
+                format!(
+                    "Lemonade downloaded model `{}` was not found for direct serving",
+                    request.model_ref
+                )
+            })?;
+    if !server.is_file() {
+        bail!("Lemonade llama-server is missing at {}", server.display());
+    }
+    let backend = llama_server_backend_label(server);
+
+    if let Some(log_path) = log_path
+        && let Some(parent) = log_path.parent()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(log_path) = log_path {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        writeln!(
+            log,
+            "\nLaunching Lemonade packaged {backend} llama-server directly: {reason:#}"
+        )
+        .ok();
+    }
+
+    let mut direct_env = process_env.clone();
+    if let Some(server_dir) = server.parent() {
+        push_existing_path(&mut direct_env.path_entries, server_dir.to_path_buf());
+        push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
+    }
+
+    let mut command = ProcessCommand::new(server);
+    command
+        .arg("-m")
+        .arg(&model_path)
+        .arg("--host")
+        .arg(&request.host)
+        .arg("--port")
+        .arg(request.port.to_string())
+        .arg("--n-gpu-layers")
+        .arg("999")
+        .arg("--alias")
+        .arg(&request.model_ref)
+        .stdin(Stdio::null());
+    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
+        command.args(&engine_recipe.required_flags);
+    }
+    // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
+    // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
+    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
+    // secret never lands in the process table). Reusing the managed file rather than
+    // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
+    // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
+    if let Some(key_file) = rocm_engine_protocol::resolve_endpoint_api_key_file() {
+        command.arg("--api-key-file").arg(&key_file);
+    }
+    if let Some(log_path) = log_path {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        command.stdout(Stdio::from(log.try_clone()?));
+        command.stderr(Stdio::from(log));
+    } else {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    apply_lemonade_process_environment(&mut command, &direct_env)?;
+    hide_child_console_window(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", server.display()))?;
+    write_running_state(
+        request,
+        runtime,
+        std::process::id(),
+        Some(child.id()),
+        "running",
+    )?;
+    // If the server never becomes ready (or fails the smoke test), don't leak the child
+    // or leave the state stuck at `running`: kill it and mark the service failed.
+    let readiness = (|| -> Result<()> {
+        wait_for_openai_models_ready(
+            &request.host,
+            request.port,
+            &request.model_ref,
+            Duration::from_mins(2),
+        )?;
+        if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
+            bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
+        }
+        Ok(())
+    })();
+    if let Err(error) = readiness {
+        let _ = terminate_pid(child.id(), true);
+        let _ = child.wait();
+        let _ = mark_json_status(&request.state_path, "failed");
+        return Err(error);
+    }
+    merge_json_state(
+        &request.state_path,
+        &json!({
+            "status": "ready",
+            "server_pid": child.id(),
+            // Identity token for the server PID, captured while the child is alive.
+            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
+            "backend_state": "ready",
+            "backend_requested": backend,
+            "backend_mode": "lemonade-packaged-llama-server",
+            "load_response": {
+                "status": "loaded",
+                "method": "lemonade-packaged-llama-server",
+                "model_name": request.model_ref,
+                "model_path": model_path,
+                "llamacpp_backend": backend
+            },
+        }),
+    )?;
+    let status = child
+        .wait()
+        .context("failed waiting for Lemonade packaged llama-server")?;
+    mark_json_status(
+        &request.state_path,
+        if status.success() {
+            "stopped"
+        } else {
+            "failed"
+        },
+    )?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Lemonade packaged llama-server exited with status {status}")
+    }
+}
+
+fn wait_for_openai_models_ready(
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let endpoint = format_http_base_url(host, port);
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let start = std::time::Instant::now();
+    let mut last_error = None;
+    while start.elapsed() < timeout {
+        match http_get_text_with_auth(
+            &endpoint,
+            "/v1/models",
+            endpoint_api_key.as_deref(),
+            Duration::from_secs(3),
+        )
+        .and_then(|body| parse_models_ready(&body, model_ref))
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    bail!(
+        "Lemonade packaged llama-server did not become ready: {}",
+        last_error.unwrap_or_else(|| "not checked".to_owned())
+    )
+}
+
+fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
+    let value = serde_json::from_str::<Value>(body.trim())
+        .context("failed to parse /v1/models response")?;
+    Ok(models_payload_has_loaded_model(&value, model_ref))
+}
+
+fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
+    value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                ["id", "model", "name"]
+                    .into_iter()
+                    .filter_map(|field| model.get(field).and_then(Value::as_str))
+                    .any(|loaded| model_names_match(loaded, model_ref))
+            })
+        })
+}
+
+fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.exists() || paths.iter().any(|existing| existing == &path) {
+        return;
+    }
+    paths.push(path);
 }
 
 /// A canonical Hugging Face checkpoint reference: `owner/repo` with an optional
@@ -271,32 +494,8 @@ pub(crate) fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Op
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
 }
 
-/// Like [`find_llama_server_binary`], but scoped to the single backend Lemonade
-/// actually attempted (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s
-/// `"rocm"` / `"vulkan"`), rather than scanning every known backend directory in
-/// priority order. Lemonade reports the generic `"rocm"` — never the more specific
-/// `rocm-stable`/`rocm-nightly` — but may extract the actual build into either
-/// versioned directory, so `"rocm"` maps to the whole ROCm family; `"vulkan"` never
-/// does. This is what lets alignment verification reject a stale ROCm directory left
-/// by an earlier attempt when this round actually picked `vulkan` (or the reverse).
-pub(crate) fn find_llama_server_binary_for_backend(
-    manifest: &LemonadeInstallManifest,
-    backend_name: &str,
-) -> Option<PathBuf> {
-    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
-    let binary = platform_binary_name("llama-server");
-    let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
-        &ROCM_LLAMACPP_BACKEND_DIRS
-    } else {
-        &["vulkan"]
-    };
-    family
-        .iter()
-        .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
-}
-
 /// Look for `binary` directly in `dir`, then one level down in each subdirectory.
-fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
     let direct = dir.join(binary);
     if direct.is_file() {
         return Some(direct);
@@ -324,22 +523,103 @@ pub(crate) fn llama_server_backend_label(server: &Path) -> String {
         .to_owned()
 }
 
-pub(crate) fn direct_llama_model_path(paths: &AppPaths, model_ref: &str) -> Option<PathBuf> {
+/// Where the GGUF for `model_ref` is cached, if it is.
+///
+/// `model_ref` may be a file path, an `owner/repo[:variant]` checkpoint, the built-in
+/// default model, or a name from the Lemonade registry shipped in `runtime_dir` (e.g.
+/// `Qwen3-0.6B-GGUF`). The runtime directory is required rather than optional so that
+/// no caller can fall back to a lookup that cannot see registered names, which is the
+/// state in which every non-default model failed to serve on Linux.
+pub(crate) fn direct_llama_model_path(
+    paths: &AppPaths,
+    runtime_dir: &Path,
+    model_ref: &str,
+) -> Option<PathBuf> {
+    direct_llama_model_path_in(&hf_cache_roots(paths), runtime_dir, model_ref)
+}
+
+/// The lookup over explicit cache `roots`, so a test is not at the mercy of whichever
+/// models the host it runs on has cached.
+fn direct_llama_model_path_in(
+    roots: &[PathBuf],
+    runtime_dir: &Path,
+    model_ref: &str,
+) -> Option<PathBuf> {
     let as_path = PathBuf::from(model_ref);
     if as_path.is_file() {
         return Some(as_path);
     }
     if let Some(checkpoint) = parse_hf_checkpoint(model_ref) {
-        return hf_cache_roots(paths)
-            .into_iter()
-            .find_map(|root| find_hf_checkpoint_gguf(&root, &checkpoint));
+        return roots
+            .iter()
+            .find_map(|root| find_hf_checkpoint_gguf(root, &checkpoint));
     }
-    if resolve_lemonade_model_ref(model_ref) != DEFAULT_MODEL {
-        return None;
+    if resolve_lemonade_model_ref(model_ref) == DEFAULT_MODEL {
+        return roots.iter().cloned().find_map(find_default_qwen_gguf);
     }
-    hf_cache_roots(paths)
-        .into_iter()
-        .find_map(find_default_qwen_gguf)
+    // A name Lemonade registers, other than the default: its registry says which
+    // checkpoint it downloads, and that checkpoint's GGUF is what ends up in the cache.
+    // Aliases (`qwen-smoke`, `tiny`, ...) name a registered model too.
+    let checkpoint = registry_checkpoint(runtime_dir, &resolve_lemonade_model_ref(model_ref))?;
+    let mut matches = hf_checkpoint_gguf_matches_in(roots, &checkpoint);
+    // Lemonade fetches the one file its registry names, so a single match is the
+    // expected case. Several (a `Q4_0` label also naming an `IQ4_0` file, say) cannot
+    // be told apart from here, and serving a different quantization than the one
+    // registered is worse than not finding the file.
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+/// Why direct ROCm serving cannot find a GGUF for `model_ref` after Lemonade loaded it,
+/// worded from the same lookup that failed so the text cannot disagree with it: several
+/// cached files matching one registered checkpoint is a different problem, with a
+/// different remedy, from none being found.
+fn unresolved_model_message(roots: &[PathBuf], runtime_dir: &Path, model_ref: &str) -> String {
+    if let Some(checkpoint) =
+        registry_checkpoint(runtime_dir, &resolve_lemonade_model_ref(model_ref))
+    {
+        let matches = hf_checkpoint_gguf_matches_in(roots, &checkpoint);
+        if matches.len() > 1 {
+            let names = matches
+                .iter()
+                .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!(
+                "`{model_ref}` is registered as `{}/{}` and {} cached files match it ({names}), so direct ROCm serving cannot tell which to use; serve the one you want by its exact file name as `{}/{}:<file>.gguf`",
+                checkpoint.owner,
+                checkpoint.repo,
+                matches.len(),
+                checkpoint.owner,
+                checkpoint.repo,
+            );
+        }
+    }
+    format!(
+        "no cached GGUF was found for `{model_ref}`, so direct ROCm serving cannot start (searched {})",
+        render_hf_cache_roots(roots)
+    )
+}
+
+/// Lemonade's model registry inside the extracted embeddable, mapping each registered
+/// model name to the Hugging Face checkpoint it downloads.
+const SERVER_MODELS_RESOURCE: &str = "resources/server_models.json";
+
+/// The Hugging Face checkpoint Lemonade's registry in `runtime_dir` records for the
+/// registered model `name` (e.g. `Qwen3-0.6B-GGUF` -> `unsloth/Qwen3-0.6B-GGUF:Q4_0`),
+/// or `None` when the registry is absent or unreadable, does not list `name`, or
+/// records something that is not a safe `owner/repo[:variant]` checkpoint.
+///
+/// The checkpoint is validated by [`parse_hf_checkpoint`], which is what keeps a
+/// hand-edited registry from steering the cache lookup outside the cache.
+fn registry_checkpoint(runtime_dir: &Path, name: &str) -> Option<HfCheckpoint> {
+    let registry = fs::read_to_string(runtime_dir.join(SERVER_MODELS_RESOURCE)).ok()?;
+    let registry = serde_json::from_str::<Value>(&registry).ok()?;
+    let checkpoint = registry.get(name)?.get("checkpoint")?.as_str()?;
+    parse_hf_checkpoint(checkpoint)
 }
 
 fn hf_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
@@ -438,10 +718,15 @@ fn collect_hf_checkpoint_ggufs(cache_root: &Path, checkpoint: &HfCheckpoint) -> 
 /// deduplicated by file name. Used to detect an ambiguous variant (more than one match)
 /// so the caller can refuse to pick arbitrarily.
 fn hf_checkpoint_gguf_matches(paths: &AppPaths, checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
+    hf_checkpoint_gguf_matches_in(&hf_cache_roots(paths), checkpoint)
+}
+
+/// [`hf_checkpoint_gguf_matches`] over explicit cache `roots`.
+fn hf_checkpoint_gguf_matches_in(roots: &[PathBuf], checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
     let mut matches = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
-    for root in hf_cache_roots(paths) {
-        let ggufs = collect_hf_checkpoint_ggufs(&root, checkpoint);
+    for root in roots {
+        let ggufs = collect_hf_checkpoint_ggufs(root, checkpoint);
         for gguf in filter_ggufs_by_variant(ggufs, checkpoint.variant.as_deref()) {
             if let Some(name) = gguf.file_name().and_then(|name| name.to_str())
                 && seen_names.insert(name.to_owned())
@@ -698,6 +983,310 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A runtime tree holding a Lemonade registry, and a hub cache holding the GGUFs
+    /// named in `cached` (`(repo_dir, file)` pairs), under one scratch directory.
+    fn registry_fixture(
+        tag: &str,
+        registry: &str,
+        cached: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch_dir(tag);
+        let runtime_dir = dir.join("runtime");
+        let resources = runtime_dir.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(resources.join("server_models.json"), registry).unwrap();
+        let hub = dir.join("hub");
+        for (repo_dir, file) in cached {
+            let snapshot = hub.join(repo_dir).join("snapshots").join("rev0");
+            fs::create_dir_all(&snapshot).unwrap();
+            fs::write(snapshot.join(file), b"gguf").unwrap();
+        }
+        (dir, runtime_dir, hub)
+    }
+
+    /// Two entries trimmed from `resources/server_models.json` as shipped in the
+    /// Lemonade 11.5.1 embeddable (checked against the real file: top-level object keyed
+    /// by model name, each with a string `checkpoint`).
+    const SMALL_MODEL_REGISTRY: &str = r#"{
+        "Qwen3-0.6B-GGUF": {"checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_0", "recipe": "llamacpp"},
+        "Qwen3-4B-Instruct-2507-GGUF": {
+            "checkpoint": "unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+            "recipe": "llamacpp"
+        }
+    }"#;
+
+    /// The failure behind the Linux Lemonade serve lanes: `rocm serve Qwen3-0.6B-GGUF
+    /// --engine lemonade` loads the model through a short-lived `lemond`, which leaves
+    /// the GGUF in the hub cache, and the serve then bailed "did not download" because
+    /// only the built-in default model and `owner/repo:variant` refs could be found.
+    #[test]
+    fn a_registered_model_name_resolves_through_its_registry_checkpoint() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-model",
+            SMALL_MODEL_REGISTRY,
+            &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+        );
+        let found =
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Qwen3-0.6B-GGUF");
+        assert_eq!(
+            found,
+            Some(
+                hub.join("models--unsloth--Qwen3-0.6B-GGUF")
+                    .join("snapshots")
+                    .join("rev0")
+                    .join("Qwen3-0.6B-Q4_0.gguf")
+            )
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_registered_model_that_is_not_cached_resolves_to_nothing() {
+        let (dir, runtime_dir, hub) =
+            registry_fixture("registered-uncached", SMALL_MODEL_REGISTRY, &[]);
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A name the registry does not list is not guessed at, and without a runtime to
+    /// read a registry from nothing but the old lookups apply.
+    #[test]
+    fn an_unregistered_name_or_a_missing_registry_resolves_to_nothing() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "unregistered",
+            SMALL_MODEL_REGISTRY,
+            &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+        );
+        let roots = std::slice::from_ref(&hub);
+        assert_eq!(
+            direct_llama_model_path_in(roots, &runtime_dir, "Not-A-Registered-Model"),
+            None
+        );
+        let no_registry = dir.join("no-registry");
+        fs::create_dir_all(&no_registry).unwrap();
+        assert_eq!(
+            direct_llama_model_path_in(roots, &no_registry, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A malformed registry degrades to "not found", never a panic or a guess.
+    #[test]
+    fn a_malformed_registry_resolves_to_nothing() {
+        for (tag, registry) in [
+            ("registry-not-json", "not json"),
+            ("registry-not-object", "[]"),
+            (
+                "registry-no-checkpoint",
+                r#"{"Qwen3-0.6B-GGUF": {"recipe": "llamacpp"}}"#,
+            ),
+            (
+                "registry-checkpoint-not-string",
+                r#"{"Qwen3-0.6B-GGUF": {"checkpoint": 7}}"#,
+            ),
+        ] {
+            let (dir, runtime_dir, hub) = registry_fixture(
+                tag,
+                registry,
+                &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+            );
+            assert_eq!(
+                direct_llama_model_path_in(
+                    std::slice::from_ref(&hub),
+                    &runtime_dir,
+                    "Qwen3-0.6B-GGUF"
+                ),
+                None,
+                "{tag}"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The registry is a file inside the runtime tree, so a hand-edited one must not be
+    /// able to point the cache lookup outside the cache: the checkpoint's components
+    /// are joined into a path, and `b/../../x` would climb out of the hub through a
+    /// directory that exists. The target here sits outside the hub and is a real file,
+    /// so only the validation in `parse_hf_checkpoint` stops it being served.
+    #[test]
+    fn a_registry_checkpoint_cannot_point_outside_the_cache() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-escape",
+            r#"{"Evil-Model": {"checkpoint": "a/b/../../x:Q4_0"}}"#,
+            &[],
+        );
+        fs::create_dir_all(hub.join("models--a--b")).unwrap();
+        let outside = dir.join("x").join("snapshots").join("rev0");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escape-Q4_0.gguf"), b"gguf").unwrap();
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Evil-Model"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The registry's variant is a substring match, so a cache holding two files it
+    /// matches (`Q4_0` also names `IQ4_0`) must not have one picked arbitrarily.
+    #[test]
+    fn a_registered_model_matching_two_cached_files_is_not_guessed() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-ambiguous",
+            SMALL_MODEL_REGISTRY,
+            &[
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf"),
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-IQ4_0.gguf"),
+            ],
+        );
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A registry entry whose variant is an exact filename resolves to that file, which
+    /// is how the built-in default model is registered.
+    #[test]
+    fn a_registry_checkpoint_naming_an_exact_file_resolves_to_that_file() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-exact-file",
+            SMALL_MODEL_REGISTRY,
+            &[
+                (
+                    "models--unsloth--Qwen3-4B-Instruct-2507-GGUF",
+                    "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                ),
+                (
+                    "models--unsloth--Qwen3-4B-Instruct-2507-GGUF",
+                    "Qwen3-4B-Instruct-2507-Q8_0.gguf",
+                ),
+            ],
+        );
+        // Registered under a name that is not the built-in default's, so only the
+        // registry lookup can find it.
+        let registry =
+            SMALL_MODEL_REGISTRY.replace("Qwen3-4B-Instruct-2507-GGUF\": {", "Other-Name\": {");
+        fs::write(
+            runtime_dir.join("resources").join("server_models.json"),
+            registry,
+        )
+        .unwrap();
+        assert_eq!(
+            direct_llama_model_path_in(std::slice::from_ref(&hub), &runtime_dir, "Other-Name")
+                .and_then(|path| path.file_name().map(std::borrow::ToOwned::to_owned)),
+            Some("Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The message is derived from the lookup that failed: with two cached files
+    /// matching one registered checkpoint it names both and how to pick one, and with
+    /// none it says nothing was found rather than claiming nothing was downloaded.
+    #[test]
+    fn the_unresolved_message_follows_the_reason_the_lookup_failed() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "unresolved-ambiguous",
+            SMALL_MODEL_REGISTRY,
+            &[
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf"),
+                ("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-IQ4_0.gguf"),
+            ],
+        );
+        let roots = std::slice::from_ref(&hub);
+        // The state: the lookup refuses to pick.
+        assert_eq!(
+            direct_llama_model_path_in(roots, &runtime_dir, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        // The message: it says why, and what to do.
+        let ambiguous = unresolved_model_message(roots, &runtime_dir, "Qwen3-0.6B-GGUF");
+        assert!(ambiguous.contains("2 cached files match"), "{ambiguous}");
+        assert!(
+            ambiguous.contains("Qwen3-0.6B-Q4_0.gguf")
+                && ambiguous.contains("Qwen3-0.6B-IQ4_0.gguf"),
+            "{ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("unsloth/Qwen3-0.6B-GGUF:<file>.gguf"),
+            "{ambiguous}"
+        );
+        assert!(!ambiguous.contains("did not download"), "{ambiguous}");
+
+        // Nothing cached: the lookup finds nothing, and the text does not claim a
+        // download outcome it cannot know.
+        let (empty_dir, empty_runtime, empty_hub) =
+            registry_fixture("unresolved-empty", SMALL_MODEL_REGISTRY, &[]);
+        let empty_roots = std::slice::from_ref(&empty_hub);
+        assert_eq!(
+            direct_llama_model_path_in(empty_roots, &empty_runtime, "Qwen3-0.6B-GGUF"),
+            None
+        );
+        let none = unresolved_model_message(empty_roots, &empty_runtime, "Qwen3-0.6B-GGUF");
+        assert!(none.contains("no cached GGUF was found"), "{none}");
+        assert!(
+            none.contains(&empty_hub.display().to_string()),
+            "names the searched root: {none}"
+        );
+        assert!(!none.contains("did not download"), "{none}");
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&empty_dir).ok();
+    }
+
+    /// `rocm serve qwen-smoke` reaches the lookup under the alias, which Lemonade
+    /// registers as `Qwen3-0.6B-GGUF`: the registry is keyed by the registered name, so
+    /// the alias has to be resolved first or only the exact name would ever serve.
+    #[test]
+    fn a_model_alias_resolves_through_the_registry_like_its_registered_name() {
+        let (dir, runtime_dir, hub) = registry_fixture(
+            "registered-alias",
+            SMALL_MODEL_REGISTRY,
+            &[("models--unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_0.gguf")],
+        );
+        let roots = std::slice::from_ref(&hub);
+        let exact = direct_llama_model_path_in(roots, &runtime_dir, "Qwen3-0.6B-GGUF");
+        assert!(exact.is_some());
+        for alias in ["qwen-smoke", "tiny", "lemonade-tiny", "qwen3-0.6b-gguf"] {
+            assert_eq!(
+                direct_llama_model_path_in(roots, &runtime_dir, alias),
+                exact,
+                "{alias}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `direct_llama_model_path` is the entry point every serve path goes through, so it
+    /// must pass the runtime's registry on to the lookup: found here only through the
+    /// registry, in the cache directory the CLI itself owns.
+    #[test]
+    fn the_entry_point_threads_the_runtime_registry_through() {
+        let (dir, runtime_dir, _hub) = registry_fixture("entry-point", SMALL_MODEL_REGISTRY, &[]);
+        let cache_dir = dir.join("cli-cache");
+        let snapshot = cache_dir
+            .join("huggingface")
+            .join("hub")
+            .join("models--unsloth--Qwen3-0.6B-GGUF")
+            .join("snapshots")
+            .join("rev0");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("Qwen3-0.6B-Q4_0.gguf"), b"gguf").unwrap();
+        let paths = AppPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            cache_dir,
+        };
+        assert_eq!(
+            direct_llama_model_path(&paths, &runtime_dir, "Qwen3-0.6B-GGUF"),
+            Some(snapshot.join("Qwen3-0.6B-Q4_0.gguf"))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     fn test_manifest(runtime_dir: PathBuf) -> LemonadeInstallManifest {
         LemonadeInstallManifest {
             env_id: "test".to_owned(),
@@ -709,62 +1298,6 @@ mod tests {
             backend_name: ROCM_BACKEND_NAME.to_owned(),
             installed_at_unix_ms: 0,
         }
-    }
-
-    #[test]
-    fn find_llama_server_binary_for_backend_scopes_to_rocm_family() {
-        let dir = scratch_dir("find-server-scoped-rocm");
-        let runtime_dir = dir.join("runtime");
-        let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        // A stale vulkan install from an earlier attempt must never satisfy a "rocm"
-        // scoped lookup.
-        let vulkan_dir = llamacpp.join("vulkan");
-        fs::create_dir_all(&vulkan_dir).unwrap();
-        fs::write(vulkan_dir.join(&server), b"x").unwrap();
-        let manifest = test_manifest(runtime_dir);
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
-            None
-        );
-
-        // Any directory in the ROCm family satisfies it, matching the unscoped scan's
-        // priority order.
-        let nightly_dir = llamacpp.join("rocm-nightly");
-        fs::create_dir_all(&nightly_dir).unwrap();
-        fs::write(nightly_dir.join(&server), b"x").unwrap();
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
-            Some(nightly_dir.join(&server))
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn find_llama_server_binary_for_backend_scopes_to_vulkan_only() {
-        let dir = scratch_dir("find-server-scoped-vulkan");
-        let runtime_dir = dir.join("runtime");
-        let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        // A stale rocm-stable install from an earlier attempt must never satisfy a
-        // "vulkan" scoped lookup, even though it would win the unscoped priority scan.
-        let rocm_dir = llamacpp.join("rocm-stable");
-        fs::create_dir_all(&rocm_dir).unwrap();
-        fs::write(rocm_dir.join(&server), b"x").unwrap();
-        let manifest = test_manifest(runtime_dir);
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, "vulkan"),
-            None
-        );
-
-        let vulkan_dir = llamacpp.join("vulkan");
-        fs::create_dir_all(&vulkan_dir).unwrap();
-        fs::write(vulkan_dir.join(&server), b"x").unwrap();
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, "vulkan"),
-            Some(vulkan_dir.join(&server))
-        );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

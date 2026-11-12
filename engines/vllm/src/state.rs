@@ -484,9 +484,10 @@ mod tests {
         // Uses the test's own live PID rather than a fixed placeholder so that,
         // on Linux, the `start_ticks` assertion below exercises the real
         // `rocm_core::process_start_ticks` lookup rather than only checking
-        // the field is present. On other platforms `process_start_ticks` is a
-        // stub that always returns `None`, so there the assertion only checks
-        // `None == None`.
+        // the field is present. On Windows it is the process creation time and
+        // the assertion still compares like with like; on any other platform
+        // `process_start_ticks` is a stub that always returns `None`, so there
+        // the assertion only checks `None == None`.
         let own_pid = std::process::id();
         let state_path = probe_state_path("therock-env");
         let request = ServeHttpRequest {
@@ -503,16 +504,12 @@ mod tests {
             engine_recipe: None,
         };
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\vllm.exe"
             } else {
                 "/home/user/.venv/bin/vllm"
             }),
-            python_executable: None,
             version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk"
             } else {
@@ -533,7 +530,7 @@ mod tests {
             } else {
                 "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
             })],
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         write_running_state(&request, &runtime, own_pid)?;
@@ -652,6 +649,7 @@ mod tests {
             engine: crate::ENGINE_NAME.to_owned(),
             required_flags: vec!["--enable-auto-tool-choice".to_owned()],
             parser_settings: std::collections::BTreeMap::default(),
+            extra_env: std::collections::BTreeMap::default(),
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: Vec::new(),
@@ -670,17 +668,8 @@ mod tests {
             engine_recipe: Some(recipe),
         };
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
             version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         write_running_state(&request, &runtime, std::process::id())?;

@@ -23,33 +23,81 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// it proves both that the overlay opened and - as an absence - that it closed.
 const SERVICES_OVERLAY_TITLE: &str = "Services — managed inference servers";
 
-/// The Observe instances table's TTFT cell while the scripted mock is serving:
-/// its histogram pins time-to-first-token at exactly 50 ms
-/// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
-/// rendered `"{v:.0}ms"`. A *failed* scrape clears `ttft_ms`/`tpot_ms`
-/// (`runner.rs`), so this cell changing is the screen's own proof that the
-/// frame on display was assembled after the failure — the only frame the
-/// held-throughput assertion is about.
-const SCRIPTED_TTFT_CELL: &str = "50ms";
-
-/// Zero-based index of the TTFT cell within an Observe instances row, counting
-/// from the model id: `MODEL TOK/S TOK/W TTFT TPOT POWER QUEUE KV%`
-/// (`instances.rs`).
-///
-/// The cell is read by position on the scripted instance's own row rather than
-/// matched as a substring of the whole screen. A bare substring cannot tell a
-/// cleared cell from a surviving one: any future ms-suffixed value that merely
-/// *contains* the scripted one (`150ms`, `250ms`), or a second row whose TTFT
-/// is also 50 ms, would keep the marker on screen and time this step out for a
-/// reason that has nothing to do with the scrape it synchronises on.
-const TTFT_COLUMN: usize = 3;
-
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
     world
         .tui
         .as_mut()
         .expect("no interactive TUI session is open for this scenario")
+}
+
+/// Wait until `missing` reports nothing absent from the screen, and return the
+/// frame that satisfied the wait. The TUI writes a frame in several pty chunks,
+/// so a step that waits on one marker and then reads the screen again can read a
+/// frame that is still being drawn; asserting on the frame that ended the wait
+/// cannot.
+///
+/// `missing` names what a frame still lacks, one entry per absent piece; the
+/// frame is ready when it returns none. On failure the panic lists what a fresh
+/// read of the screen lacked, then the driver's own diagnostic, which carries
+/// the frame it read a moment earlier, so the two can differ if the screen
+/// changed between them. The list is computed from a fresh read rather than
+/// from the last frame the predicate saw, because the driver checks for a
+/// crashed or exited process before consulting the predicate, so the last frame
+/// the predicate saw can be older than the one the failure reports. That same
+/// order means a marker that only lands as the child exits counts as an exit,
+/// not as a pass, unlike `wait_for_screen`.
+///
+/// A negative assertion on the returned frame ("this text is not on screen")
+/// is only as strong as the frame is complete: the wait proves the positive
+/// markers are drawn, not that the rest of the screen is. When the absent text
+/// would be drawn in a particular region, include a marker from the end of that
+/// region (the last row of a popup, the last line of a pane) in the wait, so the
+/// frame is known to extend past where the absent text would be.
+async fn wait_for_frame(
+    tui: &mut TuiSession,
+    what: &str,
+    missing: impl Fn(&str) -> Vec<String> + Send + Sync,
+) -> String {
+    let mut ready_frame = String::new();
+    let outcome = tui
+        .wait_for_screen_where(
+            &format!("the screen shows all of {what}"),
+            |screen| {
+                let ready = missing(screen).is_empty();
+                if ready {
+                    screen.clone_into(&mut ready_frame);
+                }
+                ready
+            },
+            default_timeout(),
+        )
+        .await;
+    if let Err(error) = outcome {
+        // The driver's own message below carries the frame it read; this read is
+        // later, so it can already be complete (a frame that finished just after
+        // the deadline), and then there is nothing to list.
+        let lacked = missing(&tui.screen_text()).join(", ");
+        let clause = if lacked.is_empty() {
+            String::new()
+        } else {
+            format!("the screen lacked {lacked}: ")
+        };
+        panic!("{what}: {clause}{error}");
+    }
+    ready_frame
+}
+
+/// [`wait_for_frame`] for the common case: every marker is on screen at once.
+async fn wait_for_all_markers(tui: &mut TuiSession, what: &str, markers: &[&str]) -> String {
+    wait_for_frame(tui, what, |screen| {
+        markers
+            .iter()
+            .filter(|marker| !screen.contains(**marker))
+            .map(|marker| format!("{marker:?}"))
+            .collect()
+    })
+    .await
 }
 
 // ── Given ──────────────────────────────────────────────────────────
@@ -174,6 +222,269 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// Cores reported by `dash-50`'s idle recording. A distinctive count so the
+/// title assertion cannot match some other panel's text.
+const IDLE_CORES: usize = 64;
+
+/// Baseline braille cells: the bottom dot row of both columns lit.
+///
+/// Four consecutive cells cannot appear unless idle samples are drawn at all —
+/// before #796 a sample under a few percent of the scale rounded to zero lit
+/// dots and left a gap. Four rather than a longer run because the graph is
+/// right-aligned and grows two samples per column, so a longer run would be
+/// racing the replay's 2-second cadence against the step timeout.
+const IDLE_BASELINE_RUN: &str = "⣀⣀⣀⣀";
+
+#[then("the CPU graph is drawn as a continuous line")]
+async fn cpu_graph_is_continuous(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(IDLE_BASELINE_RUN, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the idle CPU graph did not render as a line: {e}"));
+}
+
+#[then("the CPU box reports the host's core count")]
+async fn cpu_box_reports_core_count(world: &mut E2eWorld) {
+    // Observe's CPU slot is too short for the per-core box, so the count has
+    // to come from the overall box's own title.
+    //
+    // Matching `· N cores` alone would prove nothing: it is a suffix of the
+    // per-core box's own title too, so the step would pass whether or not the
+    // count was folded. Assert the whole folded title, and that the box it
+    // would otherwise have come from is absent.
+    let folded = format!("CPU · 2.0% · {IDLE_CORES} cores");
+    session(world)
+        .wait_for_screen_where(
+            "the CPU title carries the core count and no per-core box is drawn",
+            |screen| screen.contains(&folded) && !screen.contains("Per-core"),
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the CPU box did not report the core count: {e}"));
+}
+
+/// Cores for `dash-51`. The side-by-side split wants two columns per core on
+/// each half of the CPU slot, and Observe's centre column is about 116 columns
+/// at the detail geometry, so 16 cores clear it with room to spare while
+/// `IDLE_CORES` does not. Widening the terminal is not the lever: past a
+/// threshold Observe grows side docks and the centre column gets narrower.
+const SIDE_BY_SIDE_CORES: usize = 16;
+
+#[when("the user opens the dashboard replaying an idle 16-core host")]
+async fn open_dashboard_replaying_idle_16_core_host(world: &mut E2eWorld) {
+    replay_idle_host(world, SIDE_BY_SIDE_CORES, "idle-16-core-recording.ndjson");
+}
+
+#[then("the CPU graph and the per-core strip sit side by side")]
+async fn cpu_boxes_sit_side_by_side(world: &mut E2eWorld) {
+    // Both titles on one screen row is what separates this layout from the
+    // stacked one, where each box owns its own row.
+    session(world)
+        .wait_for_screen_where(
+            "the CPU and per-core titles share a row",
+            |screen| {
+                screen
+                    .lines()
+                    .any(|row| row.contains("CPU · ") && row.contains("Per-core · 16 cores"))
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the CPU boxes were not drawn side by side: {e}"));
+}
+
+#[when("the user opens the dashboard replaying an idle host")]
+async fn open_dashboard_replaying_idle_host(world: &mut E2eWorld) {
+    replay_idle_host(world, IDLE_CORES, "idle-host-recording.ndjson");
+}
+
+/// Replay a quiet host with `cores` idle cores: 2% overall, 1% each.
+fn replay_idle_host(world: &mut E2eWorld, cores: usize, file_name: &str) {
+    let per_core = (0..cores)
+        .map(|_| "1.0".to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let host = format!(
+        concat!(
+            r#""cpu_overall_pct":2.0,"cpu_per_core_pct":[{per_core}],"memory_used_mb":0,"#,
+            r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+            r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0"#,
+        ),
+        per_core = per_core
+    );
+    replay_recorded_snapshots_with_host(
+        world,
+        file_name,
+        &host,
+        // The GPU is given a load rather than left at 0: the widget draws an
+        // idle series as the same baseline run this scenario looks for, so a
+        // quiet GPU panel could satisfy the assertion without the CPU graph
+        // ever rendering.
+        r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"gpu_utilization_pct":55.0,"temperature_c":40.0,"power_w":90.0,"clock_mhz":null}"#,
+        "",
+        "",
+    );
+}
+
+/// The one warning `dash-39`'s recording reports. Short and ASCII so it stays on
+/// one screen row inside the popup and is found by a plain substring match.
+const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
+
+/// Spawn `dash --replay` on a recording of identical snapshots. The dashboard
+/// forgets its latest snapshot the moment a replay ends, and replay caps the wait
+/// between entries at two seconds, so a single line would be gone before a
+/// scenario looked at it. Sixty entries two seconds apart keep the recording
+/// playing for two minutes, far longer than any scenario runs. `gpus`,
+/// `instances` and `warnings` are the JSON array bodies (without brackets) of
+/// the snapshot's fields of those names.
+fn replay_recorded_snapshots(
+    world: &mut E2eWorld,
+    file_name: &str,
+    gpus: &str,
+    instances: &str,
+    warnings: &str,
+) {
+    replay_recorded_snapshots_with_host(
+        world,
+        file_name,
+        IDLE_HOST_FIELDS,
+        gpus,
+        instances,
+        warnings,
+    );
+}
+
+/// A quiet host: the body most scenarios want, since they assert on GPUs or
+/// instances rather than on the host panels.
+const IDLE_HOST_FIELDS: &str = concat!(
+    r#""cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+    r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+    r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0"#,
+);
+
+/// As [`replay_recorded_snapshots`], with the snapshot's `host` body supplied
+/// by the caller for scenarios that assert on the host panels themselves.
+/// `host` is the object body without its braces.
+fn replay_recorded_snapshots_with_host(
+    world: &mut E2eWorld,
+    file_name: &str,
+    host: &str,
+    gpus: &str,
+    instances: &str,
+    warnings: &str,
+) {
+    let snapshot = |ts_us: u64| {
+        format!(
+            concat!(
+                r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
+                r#""timestamp":"2023-11-15T00:00:00Z","#,
+                r#""host":{{{host}}},"#,
+                r#""gpus":[{gpus}],"gpu_system_info":null,"instances":[{instances}],"#,
+                r#""warnings":[{warnings}]}}}}"#,
+            ),
+            ts_us = ts_us,
+            host = host,
+            gpus = gpus,
+            instances = instances,
+            warnings = warnings
+        )
+    };
+    let recording_text: String = (0..60u64)
+        .map(|i| snapshot(1_700_000_000_000_000 + i * 2_000_000) + "\n")
+        .collect();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let recording = root.join(file_name);
+    std::fs::write(&recording, recording_text)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
+    let path = recording.to_string_lossy().to_string();
+    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
+    world.tui = Some(session);
+}
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard.
+    replay_recorded_snapshots(
+        world,
+        "warning-recording.ndjson",
+        concat!(
+            r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+            r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}"#,
+        ),
+        "",
+        &format!(r#""{RECORDED_WARNING}""#),
+    );
+}
+
+/// One recorded instance per lifecycle state the Services manager colors. The
+/// model name carries the state so the scenario can find each row by it.
+fn recorded_instance(id: &str, model: &str, status_json: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"container_id":"{id}","container_name":"vllm-{id}","status":{status},"#,
+            r#""model_name":"{model}","gpu_ids":["0"],"tensor_parallel_size":1,"#,
+            r#""vram_used_mb":0,"vram_total_mb":0,"gen_tps":null,"launch_args":[],"env_vars":{{}}}}"#,
+        ),
+        id = id,
+        model = model,
+        status = status_json
+    )
+}
+
+#[when(
+    "the user opens the dashboard replaying a recording with running, starting, stopped and failed services"
+)]
+async fn open_dashboard_replaying_services_in_each_state(world: &mut E2eWorld) {
+    let instances = [
+        recorded_instance("c1", "state-running", r#""running""#),
+        recorded_instance("c2", "state-starting", r#"{"starting":{"phase":null}}"#),
+        recorded_instance("c3", "state-stopped", r#""stopped""#),
+        recorded_instance("c4", "state-failed", r#""error""#),
+    ]
+    .join(",");
+    replay_recorded_snapshots(world, "service-states-recording.ndjson", "", &instances, "");
+}
+
+#[then("the header shows that one warning is reported")]
+async fn header_shows_one_warning(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the header warning badge did not appear: {e}"));
+}
+
+#[when("the user opens the warnings")]
+async fn open_warnings(world: &mut E2eWorld) {
+    // `!` toggles the popup, so it is not safe to resend; the previous step
+    // already waited for a frame that shows the badge, so the event loop is up.
+    session(world)
+        .send("!")
+        .unwrap_or_else(|e| panic!("failed to open the warnings: {e}"));
+}
+
+#[then("the warning text is displayed")]
+async fn warning_text_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warning text was not shown: {e}"));
+}
+
+#[then("the warning text is no longer displayed")]
+async fn warning_text_is_gone(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warnings popup did not close: {e}"));
+}
+
 /// The name of a child directory `dash-25` plants under the scenario's cwd;
 /// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
 /// it by this fixed, short label rather than its full path — the browser's
@@ -259,6 +570,22 @@ async fn open_chat(world: &mut E2eWorld) {
     let session = TuiSession::spawn(world, args)
         .unwrap_or_else(|e| panic!("failed to open interactive chat: {e}"));
     world.tui = Some(session);
+}
+
+/// An empty simulated host root: no `/dev/kfd`, no WSL signals, so the
+/// dashboard daemon's GPU pre-flight fails whatever the runner really has.
+#[given("a machine with no GPU")]
+async fn machine_with_no_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(&root).expect("failed to create the simulated host root");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
 }
 
 #[when("the user opens the dashboard")]
@@ -501,6 +828,173 @@ async fn choose_serving(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to select Serving: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
+}
+
+#[when("the user opens the serve wizard")]
+async fn open_serve_wizard(world: &mut E2eWorld) {
+    // `w` opens the serve wizard, but only from the Observe tab (`actions.rs`),
+    // so the preceding `the user opens the Observe view` step is load-bearing
+    // — it also proves the event loop is reading input, the same way
+    // `open_services_overlay` relies on it for `s`.
+    let tui = session(world);
+    tui.send("w")
+        .unwrap_or_else(|e| panic!("failed to open the serve wizard: {e}"));
+    tui.wait_for_screen("Serve a model", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("serve wizard did not open: {e}"));
+}
+
+#[then("the serve wizard shows only the model, Advanced settings, and Launch")]
+async fn serve_wizard_shows_only_basic_fields(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("[ Launch ]", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("serve wizard did not finish drawing: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Model   ")
+            && screen.contains("Advanced settings ▸ Automatic")
+            && screen.contains("[ Launch ]"),
+        "serve wizard is missing one of its collapsed-view fields:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Engine  ")
+            && !screen.contains("Device  ")
+            && !screen.contains("Host    ")
+            && !screen.contains("Port    ")
+            && !screen.contains("Mode    "),
+        "serve wizard shows an advanced field while collapsed:\n{screen}"
+    );
+}
+
+// `Field::Model` is at index 0 of the collapsed `BASIC_FIELDS`, so one Down
+// reaches `Field::Advanced`. Arrow keys are sent as their raw VT100 escape
+// sequences, same as a real terminal would report them; the wizard's `on_key`
+// only matches literal `KeyCode::Up`/`Down`, not vim-style `j`/`k`, so those
+// would be typed straight into the focused field instead of moving focus.
+#[when("the user expands the serve wizard's Advanced settings")]
+async fn expand_serve_wizard_advanced(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("\x1b[B")
+        .unwrap_or_else(|e| panic!("failed to move to Advanced settings: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to expand Advanced settings: {e}"));
+    tui.wait_for_screen("Advanced settings ▾", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Advanced settings did not expand: {e}"));
+}
+
+// With Advanced expanded, focus is still on `Field::Advanced` (index 1 of the
+// full `FIELDS` order); three more Downs walk Engine → Device → Host.
+#[when("the user starts editing the serve wizard's Host field")]
+async fn start_editing_serve_wizard_host(world: &mut E2eWorld) {
+    let tui = session(world);
+    for _ in 0..3 {
+        tui.send("\x1b[B")
+            .unwrap_or_else(|e| panic!("failed to move toward the Host field: {e}"));
+    }
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to start editing the Host field: {e}"));
+    tui.wait_for_screen("editing host", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Host field editor did not open: {e}"));
+}
+
+#[when(expr = "the user types {string} into the serve wizard")]
+async fn type_into_serve_wizard(world: &mut E2eWorld, text: String) {
+    session(world)
+        .send(&text)
+        .unwrap_or_else(|e| panic!("failed to type {text:?} into the serve wizard: {e}"));
+}
+
+#[then("the serve wizard is still open with the host unchanged")]
+async fn serve_wizard_still_open_host_unchanged(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_until_gone("editing host", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Host edit was not cancelled by Escape: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model")
+            && screen.contains("[127.0.0.1]")
+            && !screen.contains("editing host"),
+        "Escape did not cleanly cancel the Host edit:\n{screen}"
+    );
+}
+
+#[when(expr = "the user presses Down {int} times in the serve wizard")]
+async fn press_down_in_serve_wizard(world: &mut E2eWorld, times: u32) {
+    for _ in 0..times {
+        session(world)
+            .send("\x1b[B")
+            .unwrap_or_else(|e| panic!("failed to move down in the serve wizard: {e}"));
+    }
+}
+
+#[when("the user presses Enter in the serve wizard")]
+async fn press_enter_in_serve_wizard(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to press Enter in the serve wizard: {e}"));
+}
+
+// The approval card is what the user is asked to approve, so the staged
+// command line is asserted there: an automatic form stages a bare
+// `serve <model>`, with no engine or port flag the CLI should be choosing.
+#[then(expr = "the serve wizard asks to approve {string} with an automatic port")]
+async fn serve_wizard_asks_to_approve_automatic(world: &mut E2eWorld, command: String) {
+    let tui = session(world);
+    tui.wait_for_screen(
+        "Port: automatic; endpoint shown after launch",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the serve wizard did not stage an approval: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains(&command) && !screen.contains("--engine") && !screen.contains("--port"),
+        "expected a bare `{command}` with no engine or port flag:\n{screen}"
+    );
+}
+
+#[then("the serve wizard approval closes and the wizard stays open")]
+async fn serve_wizard_approval_closes_wizard_stays(world: &mut E2eWorld) {
+    // Waiting for the approval to clear between two Escapes keeps them from
+    // coalescing into one in the same PTY read, and shows the first one closed
+    // only the approval.
+    let tui = session(world);
+    tui.wait_until_gone(
+        "Port: automatic; endpoint shown after launch",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the serve approval did not close: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model"),
+        "Escape on the approval closed the whole wizard:\n{screen}"
+    );
+}
+
+#[then(expr = "the serve wizard refuses to launch and says {string}")]
+async fn serve_wizard_refuses_to_launch(world: &mut E2eWorld, message: String) {
+    let tui = session(world);
+    tui.wait_for_screen(&message, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve wizard did not refuse the launch: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model") && !screen.contains("Port: automatic;"),
+        "a refused launch must leave the form open and stage nothing:\n{screen}"
+    );
+}
+
+#[then("the serve wizard is closed")]
+async fn serve_wizard_closed(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone("Serve a model", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve wizard is still open after Escape: {e}"));
 }
 
 #[when("the user opens onboarding setup")]
@@ -831,7 +1325,7 @@ async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
 /// mention of the model name — directly answering AGENTS.md §3's rule that a
 /// remediation command must be asserted, not just its wording.
 ///
-/// The command sits on its own screen row (`ui::quit_confirm_body` pushes it
+/// The command sits on its own screen row (`ui::quit_confirm::quit_confirm_body` pushes it
 /// as a separate line from the model-name row above it) rather than trailing
 /// the model name on one combined line, so at this PTY's width it is not
 /// expected to word-wrap. Whitespace is still
@@ -929,7 +1423,7 @@ async fn try_quit_launcher(world: &mut E2eWorld) {
 
 /// Launcher counterpart of `quit_confirm_is_displayed`: same marker, same
 /// prompt (`ui::launcher::draw`'s own quit_confirm arm renders the identical
-/// `ui::quit_confirm_body`), reached from the launcher's own event loop
+/// `ui::quit_confirm::quit_confirm_body`), reached from the launcher's own event loop
 /// instead of the dashboard's.
 #[then("the launcher asks whether to quit while a model is still being served")]
 async fn launcher_quit_confirm_is_displayed(world: &mut E2eWorld) {
@@ -945,7 +1439,7 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
         .send("n")
         .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
     // The prompt's own body names the serving model (`quit_confirm_body` in
-    // `ui/mod.rs`), so the very next assertion — "the managed model is
+    // `ui/quit_confirm.rs`), so the very next assertion — "the managed model is
     // displayed" (dash-26) or "the launcher shows the model serving"
     // (dash-27; a different step, same risk) — could pass on the prompt's
     // own text even if `n` did nothing and the prompt never actually closed.
@@ -1174,7 +1668,7 @@ async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
     // see `request_quit`'s doc comment.
     //
     // No `i` here, unlike `try_quit_chat`: that step's own comment notes "a
-    // fresh session starts unfocused", but `accept_chat_consent` (`app/mod.rs`)
+    // fresh session starts unfocused", but `accept_chat_consent` (`app/chat_state.rs`)
     // sets `chat_focused = true` as part of accepting the endpoint prompt this
     // step's caller (`open_chat_from_launcher`) already sent `y` to, so the
     // input here is already focused. Sending `i` first — as a first attempt
@@ -1271,16 +1765,102 @@ async fn told_replay_file_not_found(world: &mut E2eWorld) {
 
 #[then("the dashboard home view is displayed")]
 async fn home_view_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
     // The Home tab's summary cards (Running / Health / Updates) are drawn at any
     // size; the wider "GPU UTILIZATION" hero is not, so assert on the cards.
-    tui.wait_for_screen("Updates", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the home view did not appear: {e}"));
+    wait_for_all_markers(
+        session(world),
+        "the home summary cards",
+        &["Running", "Health", "Updates"],
+    )
+    .await;
+}
+
+#[then("the hero reports no GPU telemetry available")]
+async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
+    let tui = session(world);
+    // The VRAM/TEMP/POWER/T/S rows sit low in the hero, and a short pty
+    // squeezes the hero until `hero_rows` drops its bottom rows; enlarge first.
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    // Runs after the resize: the header line carries the socket path and is
+    // cut off before "rocm daemon" at the default 80-column pty.
+    // A client that never reached the daemon also reads "Unknown GPU" with
+    // "—" values (`Disconnected` ends the pending placeholder), so first
+    // require the connected header, which proves a snapshot channel exists.
+    // Match "rocm daemon" rather than "connected", which "disconnected"
+    // contains.
+    tui.wait_for_screen_where(
+        "the connected header",
+        |screen| screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dashboard never connected to its daemon: {e}"));
+
+    // `use_wide_size` only resizes the pty; the TUI redraws asynchronously
+    // once it processes the resulting SIGWINCH. Wait for that redraw by
+    // polling for the hero's wide-layout content, not just "Unknown GPU"
+    // (already visible pre-resize from the title bar alone).
+    // The VRAM, TEMP and POWER rows are drawn one under the other, so VRAM on
+    // screen does not mean TEMP and POWER are. Wait until all three carry their
+    // placeholder in the same frame; a fake reading in one of them leaves it
+    // lacking, and the failure names the row.
+    wait_for_frame(tui, "the hero's wide VRAM/TEMP/POWER layout", |screen| {
+        let mut lacking = Vec::new();
+        if !screen.contains("Unknown GPU") {
+            lacking.push("\"Unknown GPU\"".to_string());
+        }
+        for label in ["VRAM", "TEMP", "POWER"] {
+            let Some(row) = screen.lines().find(|line| line.contains(label)) else {
+                lacking.push(format!("a {label} row"));
+                continue;
+            };
+            // Check the text *after* the label, not the whole row: the
+            // utilization gauge on the same row draws its own "—" placeholder,
+            // which would make this pass even if this mini-spark's value were a
+            // fake reading instead of the placeholder.
+            if !row
+                .split_once(label)
+                .is_some_and(|(_, rest)| rest.contains('—'))
+            {
+                lacking.push(format!("the \"—\" placeholder after {label}"));
+            }
+        }
+        lacking
+    })
+    .await;
+}
+
+#[then("the hero reports no generation throughput")]
+async fn hero_reports_no_generation_throughput(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Self-contained rather than relying on a preceding step: cucumber matches
+    // step text globally, so this has to hold wherever it is written. The T/S
+    // row sits low in the hero and a short pty drops it, so enlarge and wait
+    // for the redraw before reading the screen.
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen_where(
+        "the hero's T/S row",
+        |screen| screen.contains("T/S"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the hero's T/S row did not render: {e}"));
+
     let screen = tui.screen_text();
-    assert!(
-        screen.contains("Running") && screen.contains("Health"),
-        "home summary cards missing:\n{screen}"
+    let row = screen
+        .lines()
+        .find(|line| line.contains("T/S"))
+        .unwrap_or_else(|| panic!("no T/S row on screen:\n{screen}"));
+    let value = row
+        .split_once("T/S")
+        .and_then(|(_, rest)| rest.split('│').next())
+        .map_or_else(|| panic!("no text after T/S on row:\n{row}"), str::trim);
+    assert_eq!(
+        value, "—",
+        "T/S should show the \"—\" placeholder when nothing is served:\n{row}"
     );
 }
 
@@ -1315,13 +1895,17 @@ async fn select_rocm_diagnose_action(world: &mut E2eWorld) {
 
 #[then("the diagnose action says it runs rocm examine")]
 async fn diagnose_action_runs_examine(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Runs: rocm examine", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the diagnose action's `Runs:` line did not appear: {e}"));
-    let screen = tui.screen_text();
+    // The detail pane draws top to bottom and the 80x24 session clips it at the
+    // `Runs:` line, so that line is the last one drawn: once it is on screen,
+    // everything the `rocm doctor` check below could find in the pane is too.
+    let screen = wait_for_all_markers(
+        session(world),
+        "the diagnose action",
+        &["Diagnose & fix", "Runs: rocm examine"],
+    )
+    .await;
     assert!(
-        screen.contains("Diagnose & fix") && !screen.contains("rocm doctor"),
+        !screen.contains("rocm doctor"),
         "the `Runs:` line must belong to the diagnose action and name a real \
          subcommand, not `rocm doctor`:\n{screen}"
     );
@@ -1345,15 +1929,16 @@ async fn gpu_response_displayed(world: &mut E2eWorld) {
 
 #[then("a tool approval prompt is displayed")]
 async fn approval_prompt_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Review: Install TheRock ROCm SDK?", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the approval prompt did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Approve (y)") && screen.contains("Deny (n)"),
-        "approval prompt is missing its Approve/Deny buttons:\n{screen}"
-    );
+    wait_for_all_markers(
+        session(world),
+        "the approval prompt",
+        &[
+            "Review: Install TheRock ROCm SDK?",
+            "Approve (y)",
+            "Deny (n)",
+        ],
+    )
+    .await;
 }
 
 #[then("the tool call is shown as declined")]
@@ -1544,16 +2129,42 @@ async fn managed_model_shown_loading(world: &mut E2eWorld) {
     // the selected instance exposes the status a user uses to diagnose startup.
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open instance details: {e}"));
-    tui.wait_for_screen("LOADING", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the loading state did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(screen.contains(&model), "managed model missing:\n{screen}");
+    let screen = wait_for_all_markers(
+        tui,
+        "the loading instance details",
+        &["LOADING", model.as_str()],
+    )
+    .await;
     assert!(
         !screen
             .lines()
             .any(|line| line.contains(&model) && line.contains("READY")),
         "loading model was presented as ready:\n{screen}"
+    );
+}
+
+#[then("the Home view counts the managed model as running and shows it as loading")]
+async fn home_counts_loading_model_as_running(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let tui = session(world);
+    tui.use_detail_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen("Running · 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Home did not count the starting model: {e}"));
+    tui.wait_for_screen(&model, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the starting model did not appear on Home: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(&model) && l.contains("loading")),
+        "the loading stage is not on the model's row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Nothing running"),
+        "Home claims nothing is running:\n{screen}"
     );
 }
 
@@ -1564,34 +2175,36 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     tui.wait_for_screen(&model, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
-    tui.wait_for_screen("50ms", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("TTFT metrics did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(screen.contains("20ms"), "TPOT metrics missing:\n{screen}");
-    let row = screen
-        .lines()
-        .find(|line| line.contains(&model))
-        .unwrap_or_default();
-    assert!(
-        row.contains("50ms") && row.contains("20ms") && row.contains("1/0") && row.contains("25%"),
-        "managed serving metrics were incomplete:\n{screen}"
-    );
+    // Wait for the whole row, not its first cell: the cells are drawn left to
+    // right, so "50ms" can be on screen while "20ms", "1/0" and "25%" are not.
+    wait_for_frame(tui, "the managed model's metrics row", |screen| {
+        let Some(row) = screen.lines().find(|line| line.contains(&model)) else {
+            return vec![format!("a row naming {model:?}")];
+        };
+        ["50ms", "20ms", "1/0", "25%"]
+            .into_iter()
+            .filter(|cell| !row.contains(cell))
+            .map(|cell| format!("{cell:?} in the model's row"))
+            .collect()
+    })
+    .await;
 }
 
 #[then("navigation and next-step guidance are displayed")]
 async fn navigation_guidance_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("toggle this help", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("next / previous tab")
-            && screen.contains("Home tab")
-            && screen.contains("jump ±60s"),
-        "navigation or contextual guidance missing:\n{screen}"
-    );
+    // The markers sit at different depths of the help popup, so the first one
+    // on screen does not mean the popup is fully drawn.
+    wait_for_all_markers(
+        session(world),
+        "the dashboard help",
+        &[
+            "toggle this help",
+            "next / previous tab",
+            "Home tab",
+            "jump ±60s",
+        ],
+    )
+    .await;
 }
 
 #[then("the services manager is displayed")]
@@ -1602,25 +2215,84 @@ async fn services_manager_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the services manager did not appear: {e}"));
 }
 
+#[then("each service's status is colored by its state")]
+async fn services_status_colored_by_state(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Every row carries its model name; waiting for the last one means the whole
+    // list has rendered.
+    tui.wait_for_screen("state-failed", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services list did not render every row: {e}"));
+    // A row is read only when it carries both the model name and the status
+    // word, and every such row (the Instances tab behind the overlay can draw
+    // one too) must agree, so no layout order can hide a wrong color.
+    let color = |model: &str, label: &str| {
+        let found = tui.foregrounds_in_rows_with(model, label);
+        let first = *found.first().unwrap_or_else(|| {
+            panic!(
+                "no row shows {label} next to {model}:\n{}",
+                tui.screen_text()
+            )
+        });
+        assert!(
+            found.iter().all(|c| *c == first),
+            "{label} next to {model} is not colored consistently: {found:?}\n{}",
+            tui.screen_text()
+        );
+        first
+    };
+    let running = color("state-running", "RUNNING");
+    let starting = color("state-starting", "STARTING");
+    let stopped = color("state-stopped", "STOPPED");
+    let failed = color("state-failed", "ERROR");
+    // Before the fix every row's status was painted the "ok" color, so a stopped
+    // or failed service looked as healthy as a running one.
+    assert_ne!(
+        running, stopped,
+        "a stopped service is colored like a running one"
+    );
+    assert_ne!(
+        running, failed,
+        "a failed service is colored like a running one"
+    );
+    assert_ne!(
+        running, starting,
+        "a starting service is colored like a running one"
+    );
+    assert_ne!(
+        starting, stopped,
+        "a stopped service is colored like a starting one"
+    );
+    assert_eq!(
+        stopped, failed,
+        "stopped and failed services are both errors and share a color"
+    );
+}
+
 #[then("the services manager is closed")]
 async fn services_manager_closed(world: &mut E2eWorld) {
     let tui = session(world);
     tui.wait_until_gone("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager is still open after Escape: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("● Observe"),
-        "Escape left the Observe tab entirely, not just the manager:\n{screen}"
-    );
-    // Belt-and-suspenders: `wait_until_gone` above is the primary regression
-    // check (the manager itself closed). This additionally guards against
-    // Esc falling through to open the main menu instead — "Options"/"Quit"
-    // are unique to `Modal::Menu`.
-    assert!(
-        !screen.contains("Options") && !screen.contains("Quit"),
-        "the main menu is open on top of the closed manager:\n{screen}"
-    );
+    // The tab bar is drawn above the manager and stays on screen while it is
+    // open, so "● Observe" alone proves nothing about the redraw. The footer is
+    // the last row drawn, and its Esc chip reads "menu" only when no manager and
+    // no modal is open (`footer.rs`): waiting for it means the frame is drawn
+    // through the rows where the main menu would be. The same chip is what
+    // guards against Esc falling through to open the main menu instead: with
+    // `Modal::Menu` open it reads "close", so this wait fails rather than
+    // passing on a frame with the menu over the closed manager. The literal
+    // depends on the chip's spacing and on the "menu" arm, which the dash-tui
+    // unit test `footer_esc_chip_renders_the_text_the_e2e_dashboard_steps_wait_for`
+    // (`footer.rs`) pins for both the idle and the menu-open footer, so a change
+    // to either fails there rather than as a timeout here.
+    wait_for_all_markers(
+        tui,
+        "the Observe tab, with no main menu opened by Escape",
+        &["● Observe", "Esc  menu"],
+    )
+    .await;
 }
 
 #[then("instance details are displayed")]
@@ -1629,6 +2301,29 @@ async fn instance_details_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Instance · ", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("instance details did not appear: {e}"));
+}
+
+#[then("the instance detail lists recent throughput samples")]
+async fn detail_lists_recent_throughput_samples(world: &mut E2eWorld) {
+    // A populated row is "<N>s ago" then a numeric tok/s cell. The panel title
+    // and the idle placeholder both contain "recent throughput", and the
+    // summary's freshness line ("held · 1s ago") contains " ago", so neither
+    // substring alone distinguishes rows from the placeholders.
+    session(world)
+        .wait_for_screen_where(
+            "the detail modal's recent throughput panel lists an 'Ns ago <tok/s>' row",
+            |screen| {
+                screen.lines().any(|line| {
+                    line.split_once("s ago").is_some_and(|(head, tail)| {
+                        head.ends_with(|c: char| c.is_ascii_digit())
+                            && tail.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                    })
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("recent throughput samples never appeared: {e}"));
 }
 
 #[then("the instance detail footer shows the scroll hint")]
@@ -1647,10 +2342,15 @@ async fn detail_footer_does_not_show_scroll_hint(world: &mut E2eWorld) {
     // enlarged pre-shrink geometry must genuinely have no hint yet, or the
     // shrink step's own wait would silently revert to a no-op (its marker
     // already present) for the same reason a prior round of this scenario
-    // was flagged for. A plain read is correct here — this runs right after
-    // `open_instance_detail`'s own wait, with no action in between that
-    // could still be in flight.
-    let screen = session(world).screen_text();
+    // was flagged for. `open_instance_detail` only waited for the popup's
+    // title, and the footer is the last thing the popup draws, so wait for its
+    // "log: " label before asserting the hint is absent from it.
+    let screen = wait_for_all_markers(
+        session(world),
+        "the instance detail footer",
+        &["Instance · ", "log: "],
+    )
+    .await;
     assert!(
         !screen.contains("↑/↓ scroll"),
         "footer must not show the scroll hint before the terminal shrinks:\n{screen}"
@@ -1682,15 +2382,21 @@ async fn backdrop_is_dimmed(world: &mut E2eWorld) {
 
 #[then("dashboard destinations are displayed")]
 async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Go to", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("command palette did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Home") && screen.contains("Serving") && screen.contains("Observe"),
-        "command-palette destinations missing:\n{screen}"
-    );
+    // The tab bar behind the palette already draws "Home", "Serving", "Observe"
+    // and "Chat", and the dimmed backdrop can carry any of those words beside
+    // the popup, so the words alone are not evidence the popup is on screen.
+    // Each destination is therefore looked for as a palette row (the cursor
+    // column `PALETTE_DESTS` rows start with, then the label) at the popup's own
+    // text column, on a later line than the row before it
+    // (`e2e_cucumber::palette_rows`, unit-tested). Chat is the palette's last
+    // destination row, so the wait ends only once every row is drawn.
+    wait_for_frame(session(world), "the command palette", |screen| {
+        e2e_cucumber::palette_rows::palette_rows_missing(
+            screen,
+            &["Home", "ROCm", "Serving", "Observe", "Chat"],
+        )
+    })
+    .await;
 }
 
 #[then("the dashboard menu is displayed")]
@@ -1704,8 +2410,8 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
 }
 
-/// Navigates `Modal::Menu`'s items (`["Options", "Help", "Quit"]`,
-/// `ui/modal.rs`) down to "Quit" and activates it — `j` twice from the
+/// Navigates `Modal::Menu`'s items (Options, Help, Quit: `MENU_ITEMS` in
+/// the dash-TUI's `app/types.rs`) down to "Quit" and activates it — `j` twice from the
 /// default `menu_sel: 0`, then `Enter` (`KeyAction::MenuActivate`). Requires
 /// the menu to already be open (`the dashboard menu is displayed`).
 #[when("the user selects Quit from the dashboard menu")]
@@ -1815,15 +2521,14 @@ async fn approval_preview_quotes_whitespace_root(world: &mut E2eWorld) {
         .join(ADOPT_WHITESPACE_ROOT)
         .canonicalize()
         .unwrap_or_else(|e| panic!("failed to canonicalize the scenario root: {e}"));
-    // `quote_display_arg` (`crates/rocm-dash-tui/src/ui/exec.rs`, #500) wraps
-    // any whitespace-containing argument value in a pair of quote characters
-    // with no other transformation (our path has no embedded quote to
-    // escape), so the rendered `--root` argument is this exact string,
-    // quoted. #693's contract is "rendered as one unambiguous, quoted unit" —
-    // not any particular quote character — so this accepts either common
-    // convention rather than pinning the double-quote `quote_display_arg`
-    // happens to use today; a future change to the escaping character alone
-    // should not read as a regression here.
+    // `quote_display_arg` (`crates/rocm-dash-tui/src/ui/exec.rs`) wraps any
+    // value that is not one inert word in POSIX single quotes, escaping only
+    // an embedded `'` (our path has none), so the rendered `--root` argument
+    // is this exact string, single-quoted. #500 first introduced it with
+    // double quotes. #693's contract is "rendered as one unambiguous, quoted
+    // unit" — not any particular quote character — so this accepts either
+    // convention; a change to the quote character alone should not read as a
+    // regression here.
     //
     // Deliberately *without* a `--root ` prefix, and matched against
     // `TuiSession::popup_body_text` rather than the raw `screen_text()` grid
@@ -1975,16 +2680,15 @@ async fn launcher_shows_serving(world: &mut E2eWorld) {
         .to_string();
     let tui = session(world);
     // The front door's status strip renders "Serving <model>" for a live
-    // registry instance; wait on the model name to synchronise with the first
-    // paint before inspecting the whole screen.
-    tui.wait_for_screen(&model, default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the launcher never showed the serving model: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Serving"),
-        "launcher did not show the model as serving:\n{screen}"
-    );
+    // registry instance, or "Idle — nothing serving" on the same row when none
+    // is running. Wait for the model name and "Serving" together; the idle check
+    // below then names that failure mode if the strip regresses to idle.
+    let screen = wait_for_all_markers(
+        tui,
+        "the launcher's status strip",
+        &[model.as_str(), "Serving"],
+    )
+    .await;
     assert!(
         !screen.contains("Idle — nothing serving"),
         "launcher still reported idle despite a live registry instance:\n{screen}"
@@ -2128,19 +2832,27 @@ fn write_dash_clock(path: &std::path::Path, directive: &str) {
     std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
 }
 
-/// The TTFT cell `model`'s row is currently rendering, or `None` while that row
-/// is not on screen at all.
+/// The count on the header's `⚠ N` warnings badge, or 0 while no badge is drawn.
 ///
-/// Cells are whitespace-separated and a model id carries no spaces, so counting
-/// fields from the id yields one field per column — including the `—`
-/// placeholder a cleared cell renders, which keeps the columns aligned.
-fn scripted_ttft_cell<'a>(screen: &'a str, model: &str) -> Option<&'a str> {
+/// The badge counts the daemon's current warnings, and a failed `/metrics`
+/// scrape adds a `vllm scrape: N failed` warning to the snapshot it publishes.
+/// A TTFT or throughput cell cannot serve as proof that a failure reached the
+/// screen: those values are deliberately *held* through a failed scrape (and,
+/// with the clock held, stay marked fresh), so the badge growing is the
+/// visible evidence that a frame assembled after the failure is on display.
+fn warning_badge_count(screen: &str) -> usize {
     screen
-        .lines()
-        .find(|line| line.contains(model))?
-        .split_whitespace()
-        .skip_while(|field| *field != model)
-        .nth(TTFT_COLUMN)
+        .split('⚠')
+        .nth(1)
+        .map(|after| {
+            after
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
@@ -2184,12 +2896,17 @@ async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
 
 /// Switch the scripted mock to Failure mode and wait for the failure to reach
 /// the screen: first the mock's own counter proves the daemon was served a 503,
-/// then the cleared TTFT cell proves the frame on display is one the daemon
-/// assembled after that scrape. Both waits are synchronizations on observed
-/// events, not fixed sleeps, and — the clock being held — neither can consume
-/// the validity window they precede.
+/// then the header warnings badge growing proves the frame on display is one
+/// the daemon assembled after that scrape. Both waits are synchronizations on
+/// observed events, not fixed sleeps, and — the clock being held — neither can
+/// consume the validity window they precede.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+    // Read the badge before the failure is injected: the count that matters is
+    // the one this failure adds, and other warnings (e.g. no amd-smi on a
+    // GPU-less runner) are already present and constant.
+    let before = warning_badge_count(&session(world).screen_text());
+
     let mock = world.mock.as_ref().expect("no mock server running");
     mock.set_metrics_mode(MetricsMode::Failure);
 
@@ -2209,16 +2926,10 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let model = world
-        .model_name
-        .clone()
-        .expect("the scripted-metrics Given records the model this row belongs to");
     session(world)
         .wait_for_screen_where(
-            &format!("the scripted instance's TTFT cell leaves {SCRIPTED_TTFT_CELL:?}"),
-            |screen| {
-                scripted_ttft_cell(screen, &model).is_some_and(|cell| cell != SCRIPTED_TTFT_CELL)
-            },
+            &format!("the header warnings badge grows past {before}"),
+            |screen| warning_badge_count(screen) > before,
             default_timeout(),
         )
         .await
@@ -2230,10 +2941,169 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         });
 }
 
+/// Create `path` as a symbolic link to itself, so opening it fails with a loop
+/// error. The scenario that uses it is `@requires-os:linux`.
+#[cfg(unix)]
+fn make_unreadable_record(path: &std::path::Path) {
+    std::os::unix::fs::symlink(path, path).expect("failed to plant the unreadable record");
+}
+
+#[cfg(not(unix))]
+fn make_unreadable_record(_path: &std::path::Path) {
+    panic!("the unreadable-registry scenario is Linux-only (@requires-os:linux)");
+}
+
+/// Make the managed-service registry unreadable and wait for the failure to
+/// reach the screen. The registry is made unreadable by adding one record file
+/// that cannot be opened: a symbolic link to itself, which fails with a loop
+/// error rather than "not found" (a dangling link would read as a record that
+/// was removed on purpose, and be skipped). That is a single atomic step that
+/// leaves the existing record and the directory in place, and it works for a
+/// privileged user, which a permission change does not. The dashboard process
+/// polls the registry on its own schedule, so the step must never expose a
+/// registry with the records gone: deleting the directory before putting
+/// something in its place would let a poll in between read an absent registry,
+/// which is a confirmed-empty one, and retire the model the scenario expects to
+/// survive. The header warnings badge growing is the evidence that a frame the
+/// daemon assembled after the failed pass is on display (the daemon adds a
+/// warning for as long as the registry cannot be read); the count is read before
+/// the change because other warnings, such as no amd-smi on a GPU-less runner,
+/// are already present and constant.
+#[when("the managed-service registry becomes unreadable")]
+async fn managed_registry_becomes_unreadable(world: &mut E2eWorld) {
+    let before = warning_badge_count(&session(world).screen_text());
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let looping = services_dir.join("unreadable.json");
+    make_unreadable_record(&looping);
+
+    session(world)
+        .wait_for_screen_where(
+            &format!("the header warnings badge grows past {before}"),
+            |screen| warning_badge_count(screen) > before,
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the unreadable registry never reached the header warnings badge, so no \
+                 frame here is known to postdate the failed read: {e}"
+            )
+        });
+}
+
+/// The badge growing is what the `When` step waited for; this reads it back so
+/// the scenario states the expectation, and a failure here names the half that
+/// broke: the registry failure went unreported, rather than the model dropped.
+#[then("the header warns that the registry is not being read")]
+async fn header_warns_registry_unread(world: &mut E2eWorld) {
+    assert!(
+        warning_badge_count(&session(world).screen_text()) > 0,
+        "the header shows no warning after the registry became unreadable"
+    );
+}
+
+/// The model must be on screen in the frame that carries the warning and stay
+/// on every frame for a few seconds after it. A daemon that retired the model
+/// on a failed read would drop it in the same frame as the warning appears, so
+/// the first sample already catches it; the dwell covers a retirement that
+/// trails by a discovery tick.
+#[then("the managed model stays displayed")]
+async fn managed_model_stays_displayed(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let screen = session(world).screen_text();
+        assert!(
+            screen.contains(&model),
+            "the managed model left the screen while its registry could not be read:\n{screen}"
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The model `another managed model is served` adds beside the first one.
+const OTHER_MODEL: &str = "TestModel/E2E-2B";
+
+/// Serve a second model: write a record for it into the registry, as `rocm serve`
+/// does, by copying the first model's record under another service id and name.
+/// It is written to a temporary name and renamed into place, so a poll of the
+/// registry never reads half a record (which would read as a malformed one, not
+/// as the new service).
+///
+/// The record points at a disposable `sleep` child, not at the harness, for the
+/// reason `managed_model_record_points_at_disposable_process` gives: the World's
+/// teardown runs `rocm services stop <id> --yes` for every record but the first
+/// model's, and that signals whatever process the record names. The child is kept
+/// in `recorded_process`, which teardown reaps.
+#[when("another managed model is served")]
+async fn another_managed_model_is_served(world: &mut E2eWorld) {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("failed to spawn the disposable process for the second model");
+    let pid = child.id();
+    let start_ticks = rocm_core::process_start_ticks(pid);
+    world.recorded_process = Some(child);
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let first = std::fs::read(services_dir.join("e2e-mock.json"))
+        .expect("the first model's record should be in the registry");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&first).expect("the first model's record should be JSON");
+    record["service_id"] = "e2e-second".into();
+    record["model_ref"] = OTHER_MODEL.into();
+    record["canonical_model_id"] = OTHER_MODEL.into();
+    record["supervisor_pid"] = pid.into();
+    record["engine_pid"] = pid.into();
+    record["supervisor_start_ticks"] = serde_json::to_value(start_ticks).unwrap();
+    let staged = services_dir.join("e2e-second.json.tmp");
+    std::fs::write(
+        &staged,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize the second record"),
+    )
+    .expect("failed to stage the second record");
+    std::fs::rename(&staged, services_dir.join("e2e-second.json"))
+        .expect("failed to publish the second record");
+}
+
+/// The second model is on screen although the registry still holds a record that
+/// cannot be opened. The step before it left the header warning in place, so the
+/// registry is known to be failing while this waits.
+#[then("the other managed model is displayed")]
+async fn other_managed_model_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(OTHER_MODEL, default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the newly served model never appeared while one registry record could not \
+                 be read: {e}"
+            )
+        });
+}
+
 /// EAI-7960 principal regression assertion.
 ///
-/// The frame under assertion is provably post-failure (the TTFT cell it used to
-/// show is gone) and the logical clock is held, so the only way "tok/s" can be
+/// The frame under assertion is provably post-failure (the header warnings
+/// badge has grown past its pre-failure count) and the logical clock is held, so the only way "tok/s" can be
 /// missing here is the regression itself: the daemon clearing a held rate on a
 /// failed scrape instead of keeping it for the validity window.
 #[then("generation throughput remains visible within the validity window")]
@@ -2330,4 +3200,207 @@ async fn gpu_section_reports_binary_units(world: &mut E2eWorld) {
         "#673 REGRESSION: GPU VRAM is labeled in decimal-looking GB units \
          instead of binary GiB, got:\n{gpu_row}"
     );
+}
+
+// ── Doctor report ──────────────────────────────────────────────────
+
+/// The Diagnose screen's own panel title, drawn by `draw_examine_manager`. It is
+/// on screen exactly while the screen is open, so it proves the screen opened
+/// and, as an absence, that it closed.
+const DIAGNOSE_SCREEN_TITLE: &str = "Examine — environment check";
+
+#[when("the user opens the Diagnose screen")]
+async fn open_diagnose_screen(world: &mut E2eWorld) {
+    // `d` opens it from the Observe tab (`KeyAction::OpenExamine`). Resent until
+    // it takes, for the same reason `open_observe_view` resends: nothing before
+    // this proves the event loop is reading input yet.
+    session(world)
+        .send_until("d", DIAGNOSE_SCREEN_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open the Diagnose screen: {e}"));
+}
+
+#[when("the user prepares a Doctor report")]
+async fn prepare_doctor_report(world: &mut E2eWorld) {
+    session(world)
+        .send("p")
+        .unwrap_or_else(|e| panic!("failed to ask for a Doctor report: {e}"));
+}
+
+#[then("the report is displayed for review")]
+async fn report_displayed_for_review(world: &mut E2eWorld) {
+    // Whichever way this machine goes, the command prints one JSON object that
+    // carries a `schema`: the report, or the refusal envelope. The console's
+    // dismiss hint appears only once the job has finished, so the key that
+    // follows cannot land on a job still running. Both are waited for together
+    // so the answer below is read from the frame that ended the wait, not from a
+    // later read of a screen that can still be changing.
+    let frame = wait_for_all_markers(
+        session(world),
+        "the report preview, finished",
+        &["\"schema\"", "Enter/Esc dismiss"],
+    )
+    .await;
+    // What the CLI said, read from its own output on the console: the refusal
+    // envelope is the one with a `refused` key. The card is checked against it
+    // after the console is left.
+    world.dash_report_refused = Some(frame.contains("\"refused\""));
+}
+
+#[when("the user leaves the report review")]
+async fn leave_report_review(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to leave the report review: {e}"));
+    tui.wait_for_screen("Prepare a Doctor report", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the Diagnose screen did not come back: {e}"));
+}
+
+#[then("the dashboard offers to send a report only if the CLI prepared one")]
+async fn dashboard_offers_send_only_if_the_cli_prepared_one(world: &mut E2eWorld) {
+    let refused = world
+        .dash_report_refused
+        .expect("the preview step records whether the CLI refused");
+    let screen = session(world).screen_text();
+    let ready = screen.contains("A report is ready");
+    let offers_send = screen.contains("· s review & send");
+    // The CLI decides. A report is ready exactly when the CLI printed one, and
+    // the dashboard may offer to send exactly then.
+    assert_eq!(
+        ready, !refused,
+        "the card must say a report is ready exactly when the CLI did not refuse \
+         (CLI refused: {refused}, card ready: {ready}):\n{screen}"
+    );
+    assert_eq!(
+        offers_send, !refused,
+        "send must be offered exactly when the CLI did not refuse \
+         (CLI refused: {refused}, send offered: {offers_send}):\n{screen}"
+    );
+    // A refusal reaches the card as the CLI's own explanation, not as the
+    // dashboard's "could not be read". Every refusal the CLI gives says that no
+    // report was prepared. The card puts the outcome first, so a short terminal
+    // does not cut it off.
+    if refused {
+        assert!(
+            screen.contains("prepared"),
+            "the CLI's explanation did not reach the card:\n{screen}"
+        );
+        assert!(
+            !screen.contains("could not be read"),
+            "a refusal was shown as unreadable output:\n{screen}"
+        );
+    }
+}
+
+/// Title of the send approval the `s` key opens.
+const SEND_REVIEW_TITLE: &str = "Report this diagnosis";
+
+/// The part of the dashboard's sender notice this suite matches on, mirrored
+/// from `REPORT_SENDER_NOTICE` in `crates/rocm-dash-tui/src/ui/examine_manager.rs`
+/// (this crate runs the built binary and links neither).
+const SENDER_NOTICE_FRAGMENT: &str = "it goes from your own mail account and carries your address";
+
+/// The send review's title as the shared approval popup stamps it, which is
+/// what `TuiSession::wait_for_popup_body_where` finds the popup by.
+const SEND_REVIEW_TITLE_BAR: &str = "Review: Report this diagnosis";
+
+#[when("the user asks to review the report for sending")]
+async fn ask_to_review_for_sending(world: &mut E2eWorld) {
+    // `s` only opens the review. Nothing is sent before an approve, and this
+    // scenario never approves.
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to ask to review the report for sending: {e}"));
+}
+
+#[then("the review says the mail carries the user's own address before showing the report")]
+async fn review_states_the_sender_notice_first(world: &mut E2eWorld) {
+    let refused = world
+        .dash_report_refused
+        .expect("the preview step records whether the CLI refused");
+    let tui = session(world);
+    if refused {
+        // Nothing to send, so no review may open. Give a stray dialog the
+        // time it would take to draw before looking.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let screen = tui.screen_text();
+        assert!(
+            !screen.contains(SEND_REVIEW_TITLE),
+            "a refusal opened a send review:\n{screen}"
+        );
+        return;
+    }
+    // Read the popup's own body, not the whole screen. The review is drawn
+    // over the Diagnose screen and the Observe panels, which share its rows,
+    // so the whole screen joined into one line puts their text (a panel's
+    // "MODEL" heading, say) into the middle of any sentence the review
+    // wrapped. `wait_for_popup_body_where` slices each row to the popup's own
+    // columns and undoes the wrap. It waits for the report's first key so the
+    // body is read once the review has drawn the report.
+    //
+    // Both sides are then compared with all whitespace removed. A wrap that
+    // ends flush with the popup's right border cannot be told apart from a
+    // word split mid-word, so the rejoined body can read "carriesyour" there
+    // (see `popup_body_text`). Without whitespace the fragment still occurs
+    // only in the notice.
+    let mut body = String::new();
+    tui.wait_for_popup_body_where(
+        "the send review shows the report",
+        SEND_REVIEW_TITLE_BAR,
+        |text| {
+            text.clone_into(&mut body);
+            text.contains("\"schema\"")
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the send review did not open with the report: {e}"));
+    let screen = tui.screen_text();
+    let unspaced = |text: &str| text.split_whitespace().collect::<String>();
+    let compact = unspaced(&body);
+    let notice = compact.find(&unspaced(SENDER_NOTICE_FRAGMENT));
+    let report = compact.find("\"schema\"");
+    assert!(
+        notice.is_some(),
+        "the send review does not say the mail carries the user's address:\n{body}\n{screen}"
+    );
+    // On the first screen of the review, above the report: the body scrolls
+    // and Approve does not, so a notice below the report could be approved
+    // past without ever being seen. The report's first key, `"schema"`, is on
+    // that first screen too; requiring it keeps the order check from passing
+    // only because the report was missing.
+    assert!(
+        report.is_some(),
+        "the review's first screen does not show the report it asks about:\n{screen}"
+    );
+    assert!(
+        notice < report,
+        "the notice must come before the report in the review:\n{screen}"
+    );
+}
+
+#[when("the user declines the send")]
+async fn decline_the_send(world: &mut E2eWorld) {
+    if world.dash_report_refused == Some(true) {
+        return;
+    }
+    let tui = session(world);
+    tui.send("n")
+        .unwrap_or_else(|e| panic!("failed to decline the send: {e}"));
+    tui.wait_until_gone(SEND_REVIEW_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the send review is still open after declining: {e}"));
+}
+
+#[when("the user closes the Diagnose screen")]
+async fn close_diagnose_screen(world: &mut E2eWorld) {
+    // An open overlay eats the quit key, so a scenario that opened one closes it
+    // before the quit step.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close the Diagnose screen: {e}"));
+    tui.wait_until_gone(DIAGNOSE_SCREEN_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the Diagnose screen is still open after Escape: {e}"));
 }

@@ -18,9 +18,19 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod archive_cache;
+mod archive_extract;
+/// Shared archive generator and filesystem oracle for the extraction property
+/// tests in `archive_extract` and `install`.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
 mod backend_alignment;
+mod device_policy;
 mod direct_llama;
+mod footprint;
 mod install;
+mod llamacpp_backend;
 mod process;
 mod runtime_dir;
 mod state;
@@ -32,6 +42,12 @@ mod test_support;
 // the crate root before the split, and `apps/rocm` depends on this crate's
 // lib target.
 pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
+// The read-only view of Lemonade's install trees and record that `apps/rocm`
+// needs for `rocm storage` and `rocm runtimes uninstall`; see `footprint`.
+pub use footprint::{
+    InstallRecord, RecordCleanup, forget_install_record_inside, install_record, install_tree_dirs,
+    install_tree_root, recorded_runtime_dir,
+};
 
 pub(crate) const ENGINE_NAME: &str = "lemonade";
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
@@ -164,12 +180,12 @@ pub fn run_cli() -> Result<()> {
             model_ref,
             host,
             port,
-            device_policy: Some(crate::state::parse_device_policy_arg(
+            device_policy: Some(crate::device_policy::parse_device_policy_arg(
                 device_policy.as_deref(),
             )?),
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
-            gpu_selection: crate::state::parse_gpu_selection_arg(gpu.as_deref())?,
+            gpu_selection: crate::device_policy::parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
             let envelope = read_request()?;
@@ -192,8 +208,8 @@ pub fn run_cli() -> Result<()> {
             model_ref,
             host,
             port,
-            device_policy: crate::state::parse_device_policy_arg(device_policy.as_deref())?,
-            gpu_indices: crate::state::parse_gpu_indices_arg(gpu.as_deref())?,
+            device_policy: crate::device_policy::parse_device_policy_arg(device_policy.as_deref())?,
+            gpu_indices: crate::device_policy::parse_gpu_indices_arg(gpu.as_deref())?,
             runtime_id,
             env_id,
             state_path,
@@ -310,7 +326,7 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn detect_response() -> DetectResponse {
-    let runtime = crate::backend_alignment::resolve_runtime().ok();
+    let runtime = crate::install::resolve_runtime().ok();
     let mut notes = Vec::new();
     if let Some(runtime) = runtime.as_ref() {
         notes.push(format!(
@@ -341,10 +357,41 @@ fn detect_response() -> DetectResponse {
         python_version: None,
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![crate::state::gpu_availability_device(runtime.is_some())],
+        available_devices: vec![crate::device_policy::gpu_availability_device(
+            runtime.is_some(),
+        )],
         capabilities: capabilities(),
         notes,
     }
+}
+
+/// The install proper: extract the embeddable, pick and align the llama.cpp
+/// backend, then write the install record, replacing whatever was there.
+///
+/// The record is written, never read, on this path: a corrupt record is
+/// overwritten by the next plain install and the current tree is kept, which is
+/// why that is what the CLI advises when it cannot read the record. The two
+/// steps are parameters so a test can run this real sequence without
+/// downloading anything or running `lemonade`.
+fn install_and_record(
+    paths: &AppPaths,
+    env_root: Option<&std::path::Path>,
+    reinstall: bool,
+    prepare_embeddable: impl FnOnce(
+        &AppPaths,
+        Option<&std::path::Path>,
+        bool,
+    ) -> Result<crate::install::LemonadeInstallManifest>,
+    prepare_backend: impl FnOnce(
+        &AppPaths,
+        &mut crate::install::LemonadeInstallManifest,
+    ) -> Result<Option<String>>,
+) -> Result<(crate::install::LemonadeInstallManifest, Option<String>)> {
+    let mut manifest = prepare_embeddable(paths, env_root, reinstall)?;
+    eprintln!("Detecting best supported Lemonade llama.cpp backend...");
+    let aligned_version = prepare_backend(paths, &mut manifest)?;
+    crate::install::write_manifest(paths, &manifest)?;
+    Ok((manifest, aligned_version))
 }
 
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
@@ -356,24 +403,42 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     // and exercising it must not download or alter a runtime on the test host.
     #[cfg(feature = "e2e-test-hooks")]
     if std::env::var_os(BACKEND_INSTALL_FAILURE_TEST_ENV).is_some() {
-        crate::backend_alignment::install_llamacpp_backend_with_retry(|| {
+        crate::llamacpp_backend::install_llamacpp_backend_with_retry(|| {
             bail!("scripted Lemonade backend install failure")
         })?;
+    }
+    let env_root = request
+        .env_root
+        .as_deref()
+        .map(normalize_runtime_path_for_host);
+    // Announced and space-checked before anything is downloaded: a fresh tree
+    // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
+    if let Some(preflight) = crate::footprint::plan_install_preflight(
+        &paths,
+        env_root.as_deref(),
+        request.reinstall,
+        crate::footprint::available_space_for_install,
+    ) {
+        for line in preflight.notice_lines() {
+            eprintln!("{line}");
+        }
+        match preflight.space_verdict() {
+            crate::footprint::SpaceVerdict::Fits => {}
+            crate::footprint::SpaceVerdict::Tight(warning) => eprintln!("{warning}"),
+            crate::footprint::SpaceVerdict::Refuse(message) => bail!(message),
+        }
     }
     eprintln!(
         "Preparing Lemonade embeddable {}...",
         rocm_deps::LEMONADE_VERSION
     );
-    let env_root = request
-        .env_root
-        .as_deref()
-        .map(normalize_runtime_path_for_host);
-    let mut manifest =
-        crate::install::prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
-    eprintln!("Detecting best supported Lemonade llama.cpp backend...");
-    let aligned_version =
-        crate::backend_alignment::prepare_llamacpp_backend_for_active_rocm(&paths, &mut manifest)?;
-    crate::install::write_manifest(&paths, &manifest)?;
+    let (manifest, aligned_version) = install_and_record(
+        &paths,
+        env_root.as_deref(),
+        request.reinstall,
+        crate::install::prepare_embeddable,
+        crate::backend_alignment::prepare_llamacpp_backend_for_active_rocm,
+    )?;
     let mut warnings = vec![
         "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
         format!(
@@ -407,11 +472,12 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
-    let device_policy = crate::state::normalize_device_policy(request.device_policy)?;
+    let device_policy = crate::device_policy::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
     Ok(ResolveModelResponse {
         canonical_model_id,
+        served_model_id: None,
         task: "chat-completions".to_owned(),
         source: "lemonade".to_owned(),
         revision: "main".to_owned(),
@@ -436,11 +502,11 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
 fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     rocm_core::require_nonempty(&request.service_id, "service_id")?;
     rocm_core::require_nonempty(&request.model_ref, "model_ref")?;
-    request.device_policy = Some(crate::state::normalize_device_policy(
+    request.device_policy = Some(crate::device_policy::normalize_device_policy(
         request.device_policy.clone(),
     )?);
     request.engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
-    let runtime = crate::backend_alignment::resolve_runtime()?;
+    let runtime = crate::install::resolve_runtime()?;
     let paths = AppPaths::discover()?;
     paths.ensure()?;
     std::fs::create_dir_all(paths.engine_logs_dir(ENGINE_NAME))?;
@@ -470,7 +536,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     };
     let current_exe =
         std::env::current_exe().context("failed to discover current Lemonade engine binary")?;
-    let args = crate::state::serve_http_command_args(&serve_request);
+    let args = crate::process::serve_http_command_args(&serve_request);
     crate::state::write_running_state(
         &serve_request,
         &runtime,
@@ -478,7 +544,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
         None,
         "starting",
     )?;
-    let wrapper_pid = crate::state::spawn_serve_http_background(&current_exe, &args)?;
+    let wrapper_pid = crate::process::spawn_serve_http_background(&current_exe, &args)?;
     crate::state::merge_json_state(
         &state_path,
         &json!({
@@ -499,13 +565,13 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
 }
 
 fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
-    crate::state::require_gpu_required(&request.device_policy)?;
+    crate::device_policy::require_gpu_required(&request.device_policy)?;
     // Verify a real GPU is available before launching anything: zero usable
     // devices fails fast, `auto` resolves to the first present device (never an
     // assumed device 0), and an explicit `--gpu` index is rejected when it is not
     // actually present. This runs before any server process is spawned.
-    request.gpu_indices = crate::state::resolve_serve_gpu_indices(&request.gpu_indices)?;
-    let mut runtime = crate::backend_alignment::resolve_runtime()?;
+    request.gpu_indices = crate::device_policy::resolve_serve_gpu_indices(&request.gpu_indices)?;
+    let mut runtime = crate::install::resolve_runtime()?;
     let mut process_env = crate::process::lemonade_process_environment()?;
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
@@ -533,7 +599,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
             log_path,
         )?;
         let backend = crate::direct_llama::llama_server_backend_label(&server);
-        return crate::process::serve_direct_llama_server(
+        return crate::direct_llama::serve_direct_llama_server(
             &request,
             &runtime,
             &process_env,
@@ -565,7 +631,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         &process_env,
     )
     .context("Lemonade server did not become ready")?;
-    let backend = crate::backend_alignment::ensure_best_llamacpp_backend(
+    let backend = crate::llamacpp_backend::ensure_best_llamacpp_backend(
         &mut runtime.manifest,
         &request.host,
         request.port,
@@ -603,7 +669,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         {
             let _ = crate::state::terminate_pid(child.id(), true);
             let _ = child.wait();
-            return crate::process::serve_direct_llama_server(
+            return crate::direct_llama::serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
@@ -629,7 +695,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         {
             let _ = crate::state::terminate_pid(child.id(), true);
             let _ = child.wait();
-            return crate::process::serve_direct_llama_server(
+            return crate::direct_llama::serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
@@ -723,7 +789,7 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
             )
         });
     let device = if ready {
-        crate::state::reported_device(state.as_ref(), &backend)
+        crate::device_policy::reported_device(state.as_ref(), &backend)
     } else {
         "unknown".to_owned()
     };

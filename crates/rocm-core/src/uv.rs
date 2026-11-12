@@ -422,6 +422,38 @@ pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
     )
 }
 
+/// A `uv` that is already available, without acquiring one: the binary named by
+/// [`UV_BINARY_ENV`], or else the managed copy a previous install left behind.
+///
+/// This is [`ensure_uv_binary`] stopped short of its download. It never downloads,
+/// takes a lock, or creates a folder (not even the managed tools folder), and `None`
+/// is the answer when `ensure_uv_binary` would have had to fetch one. A caller that
+/// must leave the machine untouched (a preview) asks this instead and goes without
+/// `uv` on `None`. A managed copy is only reported once it runs, which is the same
+/// test `ensure_uv_binary` applies before it reuses one.
+pub fn find_uv_binary(paths: &AppPaths) -> Option<PathBuf> {
+    if let Some(path) = uv_binary_override() {
+        return Some(path);
+    }
+    find_managed_uv(paths, &uv_version())
+}
+
+/// The installed managed `uv` of `version`, when it runs. Looks and creates nothing.
+fn find_managed_uv(paths: &AppPaths, version: &str) -> Option<PathBuf> {
+    usable_uv_in(&managed_uv_install_dir(paths, version), uv_binary_name())
+}
+
+/// Where the managed `uv` of `version` is installed: `tools/uv/<version>` under the
+/// data folder. Shared by the install and by [`find_uv_binary`] so that a copy one
+/// installs is the copy the other finds.
+fn managed_uv_install_dir(paths: &AppPaths, version: &str) -> PathBuf {
+    managed_uv_root(paths).join(slug(version))
+}
+
+fn managed_uv_root(paths: &AppPaths) -> PathBuf {
+    managed_tools_dir(&paths.data_dir).join("uv")
+}
+
 /// Which `uv` release to install, resolved from the environment by
 /// [`ensure_uv_binary`] so the install itself never reads it.
 struct ManagedUvRelease {
@@ -444,9 +476,9 @@ struct ManagedUvRelease {
 /// The lock is a leaf: nothing below acquires another lock, so it cannot take part in
 /// a lock-order inversion with the managed-launch or daemon-autostart locks.
 fn install_managed_uv(paths: &AppPaths, release: &ManagedUvRelease) -> Result<PathBuf> {
-    let uv_root = managed_tools_dir(&paths.data_dir).join("uv");
+    let uv_root = managed_uv_root(paths);
     let version_slug = slug(&release.version);
-    let install_dir = uv_root.join(&version_slug);
+    let install_dir = managed_uv_install_dir(paths, &release.version);
     let binary_name = uv_binary_name();
 
     if let Some(existing) = usable_uv_in(&install_dir, binary_name) {
@@ -1216,6 +1248,76 @@ All installed packages are compatible
         Ok(std::fs::read(&archive)?)
     }
 
+    /// Plants `script` as the managed `uv` of `version`, where an install would have
+    /// left it.
+    #[cfg(unix)]
+    fn plant_managed_uv(paths: &AppPaths, version: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = managed_uv_install_dir(paths, version);
+        std::fs::create_dir_all(&dir).expect("create the managed uv folder");
+        let binary = dir.join(uv_binary_name());
+        std::fs::write(&binary, script).expect("write the stand-in uv");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in uv executable");
+        binary
+    }
+
+    // The preview's question, answered on every platform: on a clean data folder
+    // there is no managed `uv`, and asking leaves no trace. `ensure_uv_binary` would
+    // have created `tools/uv` (for its lock) before it downloaded anything, which is
+    // the state this pins as untouched.
+    #[test]
+    fn looking_for_a_managed_uv_on_a_clean_host_finds_none_and_creates_nothing() {
+        let (root, paths) = crate::test_support::temp_app_paths("uv-find-clean");
+        assert_eq!(find_managed_uv(&paths, "latest"), None);
+        assert!(
+            !managed_tools_dir(&paths.data_dir).exists(),
+            "looking for uv must not create the managed tools folder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Unix-only: the stand-in `uv` is a shell script, and Windows can only run a real
+    // executable as `uv.exe`.
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_managed_uv_is_found_where_the_install_puts_it() {
+        let (root, paths) = crate::test_support::temp_app_paths("uv-find-installed");
+        let planted = plant_managed_uv(&paths, "latest", "#!/bin/sh\nexit 0\n");
+        assert_eq!(find_managed_uv(&paths, "latest"), Some(planted.clone()));
+        // The install reuses the same copy rather than downloading: the lookup and the
+        // install agree on the location, so a copy one leaves is the copy the other
+        // finds. The release names a URL nothing listens on, so reaching for it would
+        // fail the call.
+        let reused = install_managed_uv(
+            &paths,
+            &ManagedUvRelease {
+                version: "latest".to_owned(),
+                asset: "uv-test.tar.gz".to_owned(),
+                url: "http://127.0.0.1:9/uv-test.tar.gz".to_owned(),
+            },
+        )
+        .expect("an installed uv is reused without a download");
+        assert_eq!(reused, planted);
+        // Another version is a different copy.
+        assert_eq!(find_managed_uv(&paths, "0.0.1"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_uv_that_does_not_run_is_not_reported() {
+        let (root, paths) = crate::test_support::temp_app_paths("uv-find-broken");
+        plant_managed_uv(&paths, "latest", "#!/bin/sh\nexit 1\n");
+        assert_eq!(
+            find_managed_uv(&paths, "latest"),
+            None,
+            "a copy `ensure_uv_binary` would replace is not one a preview can use"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // Unix-only: the fake `uv` is a shell script, and Windows can only run a real
     // executable as `uv.exe`. The lock and the re-check under test are
     // platform-independent.
@@ -1407,7 +1509,7 @@ mod archive_properties {
     /// recreates the symlink as archived, so nothing upstream of the lookup
     /// stops it.
     #[test]
-    #[ignore = "known defect: uv binary lookup follows symlinks out of the staging dir (#522)"]
+    #[ignore = "known gap: uv binary lookup follows symlinks out of the staging dir (#522)"]
     fn uv_binary_lookup_never_chmods_a_file_outside_staging() {
         use std::os::unix::fs::PermissionsExt as _;
         let layout = Layout::new();
@@ -1433,7 +1535,7 @@ mod archive_properties {
     /// whole host filesystem.) This runs the lookup on a worker thread and
     /// fails if it has not returned in 20 s; the thread is leaked on failure.
     #[test]
-    #[ignore = "known defect: uv binary lookup does not terminate on a symlink loop (#522)"]
+    #[ignore = "known gap: uv binary lookup does not terminate on a symlink loop (#522)"]
     fn uv_binary_lookup_terminates_on_a_symlink_loop() {
         let layout = Layout::new();
         let entries = [

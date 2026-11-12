@@ -6,10 +6,21 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
+  RUSTFLAGS: -D warnings
+  # aws-lc-sys 0.46 and later auto-detect an AWS-LC already installed on the
+  # build host and link it when found. Nightly binaries must not depend on
+  # what the runner or build container happens to have, so always build the
+  # vendored copy.
+  AWS_LC_SYS_USE_SYSTEM: "0"
   # REQUIRED, not dormant: every readiness step below runs --require-signatures,
   # which now means signatures must actually verify, so this is the public key
   # the nightly is verified against. Removing or blanking the secret fails every
@@ -31,8 +42,11 @@ env:
 
 jobs:
   nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build Linux nightly assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
       skip: ${{ steps.check.outputs.skip }}
       date: ${{ steps.meta.outputs.date }}
@@ -45,8 +59,14 @@ jobs:
       ref: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -115,7 +135,8 @@ jobs:
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
-            -e ROCM_CLI_RELEASE_REF="${{ github.ref_name }}" \
+            -e ROCM_CLI_RELEASE_REF="${GITHUB_REF_NAME}" \
+            -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -141,9 +162,11 @@ jobs:
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          STEPS_META_OUTPUTS_DATE: ${{ steps.meta.outputs.date }}
+          STEPS_META_OUTPUTS_SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
-          DATE="${{ steps.meta.outputs.date }}"
-          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          DATE="${STEPS_META_OUTPUTS_DATE}"
+          SHORT_SHA="${STEPS_META_OUTPUTS_SHORT_SHA}"
           DIST="rocm-cli-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
           chmod +x install.sh
@@ -174,6 +197,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          STEPS_CHECK_OUTPUTS_COMMITS: ${{ steps.check.outputs.commits }}
         run: |
           STAGING_TAG="nightly-staging-${DATE}-${SHORT_SHA}"
           gh release delete "${STAGING_TAG}" --yes --cleanup-tag 2>/dev/null || true
@@ -186,7 +210,7 @@ jobs:
 
           Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))
 
-          ${{ steps.check.outputs.commits }} commit(s) since the previous nightly.
+          ${STEPS_CHECK_OUTPUTS_COMMITS} commit(s) since the previous nightly.
 
           Install the latest nightly on Linux x86_64:
 
@@ -207,14 +231,19 @@ jobs:
           echo "tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
 
   windows-nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build and upload Windows nightly
     runs-on: windows-latest
     needs: nightly
     if: needs.nightly.outputs.skip != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
 
       - name: Verify pinned keys match the signing key
         shell: pwsh
@@ -236,9 +265,11 @@ jobs:
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          NEEDS_NIGHTLY_OUTPUTS_DATE: ${{ needs.nightly.outputs.date }}
+          NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA: ${{ needs.nightly.outputs.short_sha }}
         run: |
-          $date = "${{ needs.nightly.outputs.date }}"
-          $shortSha = "${{ needs.nightly.outputs.short_sha }}"
+          $date = "$env:NEEDS_NIGHTLY_OUTPUTS_DATE"
+          $shortSha = "$env:NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA"
           $dist = "rocm-cli-nightly-$date-$shortSha-windows-amd64"
           cargo xtask package $dist
           Copy-Item "dist\$dist.zip" "dist\rocm-cli-nightly-windows-amd64.zip"
@@ -261,8 +292,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG: ${{ needs.nightly.outputs.staging_tag }}
         run: |
-          $stagingTag = "${{ needs.nightly.outputs.staging_tag }}"
+          $stagingTag = "$env:NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG"
           if (-not $stagingTag) {
             throw "nightly staging release tag was not produced"
           }
@@ -273,23 +305,31 @@ jobs:
           gh release upload $stagingTag @assets --clobber
 
   publish-nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Publish nightly
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: publishing only
     needs:
       - nightly
       - windows-nightly
     if: needs.nightly.outputs.skip != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Publish staged nightly
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG: ${{ needs.nightly.outputs.staging_tag }}
+          NEEDS_NIGHTLY_OUTPUTS_DATE: ${{ needs.nightly.outputs.date }}
+          NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA: ${{ needs.nightly.outputs.short_sha }}
         run: |
-          STAGING_TAG="${{ needs.nightly.outputs.staging_tag }}"
-          DATE="${{ needs.nightly.outputs.date }}"
-          SHORT_SHA="${{ needs.nightly.outputs.short_sha }}"
+          STAGING_TAG="${NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG}"
+          DATE="${NEEDS_NIGHTLY_OUTPUTS_DATE}"
+          SHORT_SHA="${NEEDS_NIGHTLY_OUTPUTS_SHORT_SHA}"
           ASSET_DIR="$(mktemp -d)"
           if [ -z "${STAGING_TAG}" ]; then
             echo "nightly staging release tag was not produced" >&2
@@ -342,8 +382,11 @@ jobs:
           gh release delete "${STAGING_TAG}" --yes 2>/dev/null || true
 
   cleanup-staging-nightly:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Clean failed nightly staging release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: release cleanup only
     needs:
       - nightly
       - windows-nightly
@@ -353,7 +396,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
+          NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG: ${{ needs.nightly.outputs.staging_tag }}
+        run: gh release delete "${NEEDS_NIGHTLY_OUTPUTS_STAGING_TAG}" --yes --cleanup-tag 2>/dev/null || true
 
   # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
   # large-model serve), which the per-PR e2e-selfhosted.yml `e2e-gpu` job skips
@@ -379,6 +423,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -406,7 +452,7 @@ jobs:
 
       # cache: false — this self-hosted runner persists the build cache itself via
       # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -431,7 +477,8 @@ jobs:
 
           # Build both binaries once; reuse them for pre-warm + suite.
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -454,7 +501,7 @@ jobs:
       # sync with the values the descriptor parser strips.
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -478,6 +525,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -502,7 +551,7 @@ jobs:
         run: |
           bash .github/scripts/gpu-preflight.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -521,7 +570,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -537,7 +587,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-rad3-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -556,6 +606,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -578,7 +630,7 @@ jobs:
         run: |
           bash .github/scripts/gpu-preflight.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -597,7 +649,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -613,7 +666,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-mi350p-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -636,6 +689,8 @@ jobs:
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -660,7 +715,7 @@ jobs:
         run: |
           bash .github/scripts/gpu-preflight.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -679,7 +734,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -695,7 +751,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-w7900-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -706,7 +762,12 @@ jobs:
   # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
-    timeout-minutes: 90
+    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits when
+    # this host has Docker; on a host without it they skip and cost nothing.
+    # Whether it has Docker is unconfirmed: nothing in this job installs or checks
+    # it, so the "Report whether Docker is reachable" step logs the answer. If it
+    # does not, no nightly lane runs AIM serve and a pool-based one is needed.
+    timeout-minutes: 120
     # `native` disambiguates this runner from any host that might carry a bare
     # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
     # before the WSL lanes moved to the ephemeral pool) -- the paths below
@@ -729,6 +790,8 @@ jobs:
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
         run: |
@@ -758,6 +821,16 @@ jobs:
           fi
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
+      # serve-26/27 (AIM) need Docker reachable on this host; without it they skip
+      # silently. Say which it is, so a nightly that never ran them is visible.
+      - name: Report whether Docker is reachable (AIM serve scenarios need it)
+        run: |
+          if docker info >/dev/null 2>&1; then
+            echo "docker reachable: serve-26/27 (AIM) can run on this host"
+          else
+            echo "::warning::docker is not reachable on this host: serve-26/27 (AIM) will skip"
+          fi
+
       - name: Run E2E tests on Strix Halo (incl. nightly-only)
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
@@ -766,7 +839,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -780,7 +854,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -806,6 +880,8 @@ jobs:
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Reclaim GPU from stray E2E processes
         shell: powershell
@@ -1023,7 +1099,8 @@ jobs:
           $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
@@ -1040,7 +1117,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-strix-windows-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -1085,6 +1162,8 @@ jobs:
       ROCM_CLI_RELEASE_REF: "${{ github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # See e2e-wsl in e2e-selfhosted.yml for the full rationale behind each
       # of these steps — this job mirrors it exactly, minus the scoped
@@ -1451,7 +1530,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -1489,7 +1569,7 @@ jobs:
 
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-strix-wsl-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
@@ -1513,11 +1593,10 @@ jobs:
   # already does (e2e-selfhosted.yml), against the nightly artifacts.
   e2e-report-nightly:
     name: E2E consolidated report (nightly)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
     timeout-minutes: 15
-    # Narrower than the workflow-level `contents: write`, which exists for the
-    # release-publishing jobs. This one checks out, downloads artifacts, runs an
-    # xtask and uploads; it has no business being able to write to the repo.
+    # This one checks out, downloads artifacts, runs an xtask and uploads; it
+    # has no business being able to write to the repo.
     # `actions: read` lets the missing-report check list this run's artifacts.
     permissions:
       contents: read
@@ -1537,8 +1616,14 @@ jobs:
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # `*-report` matches the artifacts above, and will pick up any
       # nightly platform added later without a change here — provided it is
@@ -1549,7 +1634,7 @@ jobs:
       # `discover()` handles both, labeling a root-level report from its
       # platform.json slug.
       - name: Download all nightly E2E reports
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: '*-report'
           path: e2e-artifacts
@@ -1572,9 +1657,11 @@ jobs:
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
       # pass on the first attempt's report: this can miss a lane, but never
-      # flags one that did upload. Every lane carries a `matrix.channel` axis and is
-      # checked through its `release` leg (the matrix context does not exist in
-      # this job), which stands for the whole lane. LANE_REPORTS, and this script's behaviour,
+      # flags one that did upload. Every lane carries a `matrix.channel` axis;
+      # its `release` and `nightly` legs upload separate artifacts and either
+      # can independently die before writing its own, so both are listed and
+      # checked explicitly, comma-separated, rather than reading one leg as a
+      # stand-in for the whole lane. LANE_REPORTS, and this script's behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
       # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
       # `success` even though the lane failed, so the absent artifact is the
@@ -1586,13 +1673,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu-nightly=e2e-gpu-release-report
-            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report
-            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report
-            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report
-            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report
-            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report
-            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report
+            e2e-gpu-nightly=e2e-gpu-release-report,e2e-gpu-nightly-report
+            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report,e2e-gpu-rad3-nightly-report
+            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report,e2e-gpu-mi350p-nightly-report
+            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report,e2e-gpu-w7900-nightly-report
+            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
+            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report,e2e-gpu-strix-windows-nightly-report
+            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report,e2e-gpu-strix-wsl-nightly-report
         run: |
           uploaded=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
@@ -1601,21 +1688,24 @@ jobs:
             exit 1
           }
           missing=0
-          while IFS='=' read -r job artifact; do
+          while IFS='=' read -r job artifacts; do
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
-            if ! grep -qxF "$artifact" <<<"$uploaded"; then
-              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
-              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
-              missing=1
-            fi
+            IFS=',' read -ra wanted <<<"$artifacts"
+            for artifact in "${wanted[@]}"; do
+              if ! grep -qxF "$artifact" <<<"$uploaded"; then
+                echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+                echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+                missing=1
+              fi
+            done
           done <<<"$LANE_REPORTS"
           exit "$missing"
 
       - name: Upload consolidated report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-consolidated-report-nightly
           path: consolidated/
@@ -1627,7 +1717,7 @@ jobs:
   # branch cannot overwrite the page, and never from an empty or cancelled run.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: publishing only
     timeout-minutes: 10
     permissions:
       contents: write
@@ -1638,7 +1728,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Download consolidated nightly report
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: e2e-consolidated-report-nightly
           path: consolidated
@@ -1684,4 +1774,280 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$page"
           git commit -m "Update E2E support matrix from nightly run ${GITHUB_RUN_NUMBER}"
+          git push origin HEAD
+
+  # Computes a mechanical GO/NO-GO release-readiness verdict and status table
+  # from this run's own build/E2E results and the commits/known issues since
+  # the last release tag (`cargo xtask release-readiness`). The verdict and
+  # table never depend on the narrative job below, so a failed or skipped
+  # narrative still gets a correct, if less readable, page published.
+  release-readiness-nightly:
+    name: Release readiness (facts + table)
+    runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    needs:
+      - nightly
+      - windows-nightly
+      - e2e-report-nightly
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `git describe --tags` and the commit range since the last release
+          # tag both need the full history, not the default shallow clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
+
+      - name: Download consolidated nightly report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-consolidated-report-nightly
+          path: consolidated
+
+      - name: Compute release-readiness facts + table
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-readiness
+          since_tag=$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-*')
+          cargo xtask release-readiness \
+            --since-tag "$since_tag" \
+            --e2e-report consolidated/support-matrix.md \
+            --nightly-result "${{ needs.nightly.result }}" \
+            --windows-result "${{ needs.windows-nightly.result }}" \
+            --e2e-report-job-result "${{ needs.e2e-report-nightly.result }}" \
+            --out release-readiness/facts.json \
+            --table-out release-readiness/table.md
+          cat release-readiness/table.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release-readiness facts + table
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-readiness-nightly
+          path: release-readiness/
+
+  # Drafts prose (feature/fix summaries, a "Considerations for Next Release"
+  # paragraph) from the facts computed above; never counts, PR numbers, or the
+  # verdict, which stay 100% mechanical. Allowed to fail without blocking the
+  # table from publishing — the next job tolerates a missing narrative.md.
+  #
+  # Needs a Copilot-licensed PAT in the `COPILOT_PAT` secret: the Copilot CLI
+  # that actions/ai-inference shells out to does not accept a bare
+  # `GITHUB_TOKEN`. See .github/prompts/release-readiness-narrative.txt for
+  # the system prompt.
+  release-readiness-narrative:
+    name: Release readiness (narrative)
+    runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    needs: release-readiness-nightly
+    if: ${{ !cancelled() && needs.release-readiness-nightly.result == 'success' }}
+    steps:
+      # Needed because the prompt below is read from the repo
+      # (system-prompt-file), not just the downloaded facts artifact.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download release-readiness facts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-readiness-nightly
+          path: release-readiness
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install GitHub Copilot CLI
+        run: npm install -g @github/copilot@1.0.97
+
+      # `{{var}}`/`file_input` templating only applies to a structured
+      # `.prompt.yml` loaded via `prompt-file` — it is silently ignored for
+      # an inline `prompt:` string, which is what this job uses. Inline the
+      # facts JSON into a step output instead (random delimiter since
+      # facts.json embeds untrusted GitHub issue titles).
+      - name: Read facts for prompt
+        id: facts
+        run: |
+          delimiter="$(openssl rand -hex 8)"
+          {
+            echo "json<<${delimiter}"
+            # The model never needs the mechanical verdict, and must not be
+            # handed one it could echo back as a forged heading. Issues are
+            # already reaction-ranked; the cap keeps the prompt, which reaches
+            # the CLI as one argument, far under Linux's 128 KiB limit.
+            jq 'del(.verdict) | .known_issues |= .[:100]' release-readiness/facts.json
+            echo
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Draft narrative
+        id: draft
+        # v3 is a floating major alias with no semver tag yet (only v1.x/
+        # v2.x have one); pinned to v2.1.1 instead per AGENTS.md's
+        # pin-to-full-commit-SHA policy. v2.1.1's default provider is
+        # `github-models`, not `copilot` (v3 flipped the default), so
+        # `provider: copilot` below is required here, not just
+        # documentation.
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          provider: copilot
+          # Copilot CLI's --model slugs use dots, not the Anthropic API's
+          # hyphenated IDs. claude-sonnet-4.5 was retired when Claude Sonnet
+          # 5.5 went GA; claude-sonnet-5.5 is the current slug.
+          model: claude-sonnet-5.5
+          system-prompt-file: .github/prompts/release-readiness-narrative.txt
+          prompt: ${{ steps.facts.outputs.json }}
+
+      # `response-file` is an *output* of ai-inference (a path it already
+      # wrote the response to), not an input — write it to the path the next
+      # job expects instead of guessing the action picked that path itself.
+      - name: Save narrative
+        if: always() && steps.draft.outputs.response
+        run: printf '%s\n' "$NARRATIVE" > release-readiness/narrative.md
+        env:
+          NARRATIVE: ${{ steps.draft.outputs.response }}
+
+      - name: Upload narrative
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-readiness-narrative
+          path: release-readiness/narrative.md
+          if-no-files-found: ignore
+
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
+  # but unlike that job this one also runs (and publishes an explicit
+  # "evidence unavailable" notice) when release-readiness-nightly fails
+  # outright, rather than just skipping and leaving the wiki showing
+  # whatever verdict the last successful run left there.
+  publish-release-readiness-wiki:
+    name: Publish release readiness to wiki
+    runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    needs:
+      - release-readiness-nightly
+      - release-readiness-narrative
+    if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: publish-release-readiness-wiki
+      cancel-in-progress: false
+    steps:
+      - name: Download release-readiness table
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        # release-readiness-nightly may have failed before writing or
+        # uploading anything (bad `git describe`, `gh issue list` auth
+        # failure, xtask crash); the script below handles a missing
+        # table.md explicitly instead of failing this job on a missing
+        # artifact.
+        continue-on-error: true
+        with:
+          name: release-readiness-nightly
+          path: release-readiness
+
+      - name: Download narrative (if the narrative job produced one)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: release-readiness-narrative
+          path: release-readiness
+
+      - name: Push page to the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          page=Release-Readiness.md
+          if [ ! -f release-readiness/table.md ]; then
+            # release-readiness-nightly failed before writing a table at all
+            # (bad `git describe`, `gh issue list` auth failure, xtask
+            # crash). Publishing nothing here would leave the wiki showing
+            # whatever verdict the last successful run left behind --
+            # possibly a stale GO -- with no indication it's stale.
+            echo "::warning::release-readiness-nightly produced no table this run; publishing a stale-evidence notice instead."
+            {
+              echo "# Release readiness (latest nightly)"
+              echo
+              echo "## Release Readiness — ⚠️ EVIDENCE UNAVAILABLE"
+              echo
+              echo "release-readiness-nightly failed before it could compute a verdict for run [${GITHUB_RUN_NUMBER}](${RUN_URL}), commit [\`${GITHUB_SHA::12}\`](${COMMIT_URL})."
+              echo
+              echo "_No verdict was computed for this run._"
+            } > "/tmp/${page}"
+          elif ! grep -q '^| Area | Evidence | Status |' release-readiness/table.md; then
+            # Same reasoning as publish-e2e-wiki: publish only when the status
+            # table is present, so any degenerate output leaves the last good
+            # page in place.
+            echo "::warning::No status table in the release-readiness output; leaving the wiki page unchanged."
+            exit 0
+          else
+            {
+              echo "# Release readiness (latest nightly)"
+              echo
+              echo "_Overwritten by the nightly workflow; do not edit by hand._"
+              echo
+              echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
+              echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
+              echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
+              echo
+              cat release-readiness/table.md
+              echo
+              if [ -f release-readiness/narrative.md ]; then
+                echo "## Narrative (drafted by an LLM from public issue and commit text; not the verdict)"
+                echo
+                # The narrative is LLM-drafted from untrusted issue/commit text,
+                # so it may contain copied markdown links/images, reference-style
+                # links, or raw HTML (e.g. an <img> tag). Escaping every `[`/`]`
+                # and `<`/`>` renders all of that as inert text instead of live
+                # markup: unlike a link-stripping regex, this has no nesting
+                # problem, because an escaped bracket can no longer be parsed as
+                # link/image syntax in the first place, however it's nested.
+                # The backslash itself is doubled first, so a narrative
+                # containing a literal `\[` can't smuggle a live link past the
+                # bracket-escaping step by pre-escaping its own brackets.
+                # This does not stop GitHub's bare-URL autolinking (a visible
+                # plain URL, not a disguised link) — an accepted residual gap.
+                # The final expression quotes every line so line-leading `#`,
+                # `|`, `*` and `_` can't forge a top-level verdict heading,
+                # status table, or bold "all gates passed" line.
+                sed -e 's/\\/\\\\/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/^/> /' release-readiness/narrative.md
+              else
+                echo "_Narrative generation did not complete this run; see the mechanical table above._"
+              fi
+            } > "/tmp/${page}"
+          fi
+
+          wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          # GitHub creates the wiki's git repo only when the first page is
+          # saved in the web UI, so a never-used wiki cannot be cloned or
+          # pushed to. Fail with the prerequisite rather than a bare 128.
+          if ! git clone --depth 1 "$wiki" wiki; then
+            echo "::error::Cannot clone the wiki. If this is the first run, enable the wiki in repo settings and create its first page once in the web UI (GitHub does not create the wiki git repo until then); otherwise it may be a transient network failure, so re-run the job."
+            exit 1
+          fi
+          cp "/tmp/${page}" "wiki/${page}"
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$page"
+          git commit -m "Update release readiness from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD

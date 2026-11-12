@@ -13,8 +13,12 @@ The adapter does not install vLLM automatically and does not run CPU mode.
 Install or build vLLM in a ROCm-capable Python environment first, then make the
 `vllm` command visible to ROCm CLI.
 
-Native Windows vLLM serving is skipped in this adapter. Use WSL or Linux for vLLM
-ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
+Native Windows vLLM serving is skipped in this adapter. On native Windows,
+`rocm serve --engine vllm`, `rocm engines install vllm` and
+`rocm engines shell vllm` refuse up front with a non-zero exit, before any
+runtime check, download, or launch; `rocm engines list` shows the same decision
+as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
+serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
@@ -55,6 +59,27 @@ would have installed and the one it kept. The device check still runs, so an
 opt-out that leaves the runtime unable to serve says so instead of failing later
 during serving.
 
+The opt-out covers the packages the SDK installs together with torch
+(torchvision, torchaudio and triton) as well. vLLM pins an exact build of each.
+The install check spares them when it settled on a torch divergence, and the
+engine's built-in repair spares them whenever the opt-out is set; in both cases
+they are reported as expected divergences rather than violations, and vLLM is
+not reinstalled over them, because that reinstall would put the engine's own
+torch back. The trade-off: under the opt-out a genuinely broken torchvision,
+torchaudio or triton (including one that is not installed at all) is neither
+reported as a violation nor repaired.
+
+The opt-out also applies to `rocm install sdk` run over a runtime that already
+holds torch. That command normally hands `uv` the SDK's `torch`, `torchvision`
+and `torchaudio` along with `rocm`, which replaces the stack the engine or you
+installed (and `triton` with it). With the variable set it asks for the ROCm
+packages alone and leaves the torch stack where it is: the plan prints a
+`torch_kept:` line naming the torch it found, and `rocm install sdk --dry-run`
+shows the same reduced `command:`. A runtime with no torch yet, or an
+environment recreated for another Python, still gets the full stack, since
+there is nothing to keep. The runtime's recorded composition (and so its
+runtime key and `rocm update` comparison) is unchanged.
+
 Use it when you are deliberately running a torch that the alignment would
 replace, such as a locally built wheel, a version under test, or a stack pinned
 for a reproduction. It is an escape hatch, not a supported configuration: the
@@ -74,9 +99,15 @@ so there is no fixed filename to pin in the adapter.
 The wheel's own tag shows the other thing that changes on this route: ROCm
 10.x's vLLM, flash-attn, and amd-aiter are published for **`cp314` only**, unlike
 every earlier ROCm SDK version's `cp312` wheels. ROCm CLI provisions a matching
-interpreter for a 10.x install automatically. A Python already on `PATH`, or
-already installed as ROCm CLI's managed Python, is rejected if it is not
-`cp314`, with a message naming the required tag.
+interpreter for a 10.x install automatically. By default, a Python already on
+`PATH`, or already installed as ROCm CLI's managed Python, is rejected if it is
+not `cp314`, with a message naming the required tag; with `--python-version`
+(below) the tag it names is the one you chose.
+That 3.14 is the default for a ROCm 10.x SDK install, not a limit of the SDK: the
+SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
+--python-version` picks one of them for an install that does not need vLLM. The
+vLLM install then refuses that runtime; re-running the install with
+`--python-version 3.14` moves it back.
 
 This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
 through *different* rows: they pin different vLLM minors and read vLLM from
@@ -108,6 +139,28 @@ installing, so an index that happens to serve more than one ROCm line at once
 cannot silently install the wrong line's wheel onto this SDK. If AMD's index
 has no compatible build for a package, the resolver fails and the install
 fails instead of falling back to an unpinned or CPU install.
+
+`flash-attn` and `amd-aiter` are the exception to the per-package series match
+above. The vLLM wheel declares the exact builds of both that it was built
+against, and the index keeps publishing newer ones it does not accept (for
+example `amd-aiter 0.1.24.post1` beside a vLLM that depends on a `0.1.22` dev
+build), so pinning each package's newest release can name a combination the
+vLLM wheel itself rules out. After the vLLM pin is discovered, the install
+resolves that exact vLLM with `uv pip install --dry-run` and takes the
+`flash-attn` and `amd-aiter` versions the resolver reports, but only when the
+vLLM index serves that exact version on its own (a dependency vLLM leaves
+unpinned can resolve to a PyPI build instead, and is never used as the pin).
+Otherwise the series match above decides, as before.
+
+The resolve probe and the confirmation only improve on the series match, so
+neither can make an install fail that would have worked without them. If the
+probe fails, or the vLLM index does not confirm a build the probe named,
+`flash-attn` and `amd-aiter` fall back to the series match, and the reason is
+reported in the install warnings. The confirmation is tried twice, so one
+transient network error is not enough to fall back. If the install then fails
+with those fallback pins, the same reasons are appended to the error after the
+install's own failure, because the series match is the combination this step
+exists to avoid.
 
 The final install of vllm, flash-attn, and amd-aiter also resolves vLLM's own
 plain-PyPI transitive dependencies (for example, `lm-format-enforcer`), which
@@ -268,14 +321,39 @@ a tiny model. ROCm CLI helps in three ways:
   mode. For vLLM, the note also points at `--gpu-memory-utilization` as the fix.
 - **OOM failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
-  reservation, such as `--gpu-memory-utilization 0.5`, or targeting a less busy
-  GPU with `--gpu <index>`. It also points at
-  `rocm diagnose --symptom '<the error>'` for the full conditional remediation
-  (busy GPU versus a model that does not fit). The printed command quotes your
-  actual failing line when it can be rendered as one intact single-quoted
-  argument. A line carrying an apostrophe or terminal control bytes falls back to
-  the canonical symptom below instead of handing you a command whose quoting the
-  log text broke.
+  reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
+  with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
+  for the full conditional remediation (busy GPU vs. a model that does not fit).
+  "Shows an out-of-memory error" means a line carrying an allocator-shaped
+  signature — `HIP out of memory`, `CUDA out of memory`, `hipErrorOutOfMemory`,
+  or a `torch.OutOfMemoryError` corroborated by an allocator message. A bare
+  `HIP error: out of memory`, a kernel OOM-killer line, or vLLM's generic
+  `EngineCore` wrapper deliberately gets no memory hint: each of those also
+  appears for failures that have nothing to do with memory, and the same
+  threshold governs `rocm diagnose`, so hinting here would contradict the
+  diagnosis there.
+
+  The printed command quotes your actual failing line when it can be rendered as
+  one intact single-quoted argument; a line carrying an apostrophe or terminal
+  control bytes falls back to the canonical symptom below rather than handing you
+  a command whose quoting the log text broke. The `rocm serve` summary's
+  out-of-memory note applies that same guard, from the same shared helper, to the
+  same engine log — so neither surface can hand you a half-quoted command the
+  other would reject.
+
+  Sharing the guard is not the same as the two always printing the *same*
+  command, and for a **colourised** line they do not. The engine reads the log
+  first, refuses the raw escape-bearing line, and prints the canonical symptom.
+  Its failure message then echoes the log tail back into that same shared file as
+  the rows a terminal would have drawn, and the serve summary reads afterwards —
+  so the note quotes that rendered row instead. Both arguments are sound: the row
+  is text the terminal really printed, it carries no control bytes, and anything
+  the guard accepts is diagnosable. They are two reads of a file that changed in
+  between, not a disagreement about the rule. Lines rocm-cli wrote into that log
+  itself are skipped when picking the line, so the note quotes *your* error
+  rather than the hint printed above it: the supervisor and the engine share one
+  log file, and the engine's failure — hint included — is appended to it after
+  the error that caused it.
 
 Explicitly, the workaround for an OOM on a shared card is:
 

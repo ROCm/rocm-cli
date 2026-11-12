@@ -5,9 +5,9 @@ Feature: Native HTTP networking
   # run under `powershell.exe -ExecutionPolicy Bypass` on Windows. These
   # scenarios drive the real `rocm` binary end-to-end against the mock server so a
   # GET/round-trip reaches a local endpoint over the native stack. All but
-  # networking-04 run on the mock (no GPU) on every platform the suite runs on, so
+  # networking-05 run on the mock (no GPU) on every platform the suite runs on, so
   # a regression back to a shell-out networking backend surfaces here rather than
-  # only in the field. networking-04 is a GPU serve scenario: it starts a real
+  # only in the field. networking-05 is a GPU serve scenario: it starts a real
   # engine on a public bind and checks key enforcement from the harness's own
   # HTTP client, not through the CLI.
 
@@ -43,6 +43,19 @@ Feature: Native HTTP networking
     Then serving is refused before any engine starts
     And the user is told to allow public binding first
 
+  # Collision-safe ports (serve-port rewrite). Automatic port selection proves a
+  # port is free by probing it on loopback before the engine starts; that proof
+  # only applies to the canonical default host (127.0.0.1), so any other host
+  # name (even a loopback alias like `localhost` that needs no public-bind
+  # opt-in) must come with an explicit `--port`. This check runs in
+  # `validate_port_request`, before any engine or GPU work, so it needs no GPU
+  # and runs on the mock lane every PR.
+  @id:networking-custom-host-needs-explicit-port
+  Scenario: networking-04 - A non-canonical host without an explicit port is refused up front
+    When the user serves a model bound to a non-canonical host without an explicit port
+    Then serving is refused before any engine starts
+    And the user is told to pass an explicit port for that host
+
   # The other half of the EAI-7409 contract, and the security property the ticket
   # calls out first: opting in to a public bind must not produce an open endpoint.
   # The CLI issues an API key, shows it exactly once, and hands the serving engine
@@ -64,7 +77,7 @@ Feature: Native HTTP networking
   # designed-in behaviour, not a bug, so it wants a tag rather than an xfail row. It
   # also keeps this cold serve off the time-capped Strix lanes entirely.
   @id:networking-public-bind-endpoint-enforces-key @requires-gpu @requires-engine:vllm
-  Scenario: networking-04 - A public endpoint issues a key once and then enforces it
+  Scenario: networking-05 - A public endpoint issues a key once and then enforces it
     Given a managed runtime is active
     When the user serves a model on a public interface with public binding allowed
     Then the CLI shows the endpoint key once and how to send it

@@ -8,22 +8,17 @@ use rocm_core::{
     http_get_text_with_auth, prepend_runtime_paths, runtime_is_linux, runtime_is_windows,
 };
 use rocm_engine_protocol::EngineRecipeHint;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::backend_alignment::LemonadeRuntime;
-use crate::direct_llama::{direct_llama_model_path, llama_server_backend_label};
+use crate::device_policy::device_policy_name;
 use crate::install::LemonadeInstallManifest;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
-use crate::state::{
-    MAX_TAIL_READ, mark_json_status, merge_json_state, parse_http_endpoint,
-    resolve_lemonade_model_ref, terminate_pid, write_running_state,
-};
+use crate::state::{MAX_TAIL_READ, parse_http_endpoint, resolve_lemonade_model_ref};
 use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
@@ -31,8 +26,8 @@ const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LemonadeProcessEnvironment {
     rocm_root: Option<PathBuf>,
-    path_entries: Vec<PathBuf>,
-    library_entries: Vec<PathBuf>,
+    pub(crate) path_entries: Vec<PathBuf>,
+    pub(crate) library_entries: Vec<PathBuf>,
     pub(crate) gpu_indices: Vec<u32>,
 }
 
@@ -164,6 +159,40 @@ pub(crate) fn hide_child_console_window(command: &mut ProcessCommand) {
 #[cfg(not(windows))]
 pub(crate) const fn hide_child_console_window(_command: &mut ProcessCommand) {}
 
+/// Which of this process's standard output streams are a console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputConsoles {
+    pub(crate) stdout: bool,
+    pub(crate) stderr: bool,
+}
+
+impl OutputConsoles {
+    pub(crate) fn detect() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            stdout: std::io::stdout().is_terminal(),
+            stderr: std::io::stderr().is_terminal(),
+        }
+    }
+
+    /// Whether a child that inherits both streams may be started without a
+    /// console window.
+    ///
+    /// `CREATE_NO_WINDOW` starts the child with no console at all, and a child
+    /// with no console writes nothing to a console handle it inherited: run
+    /// from a real Windows console, `cmd /c echo`, a Python child and
+    /// `lemonade.exe --version` all printed their output without the flag and
+    /// printed nothing with it. That is how `lemonade backends install`'s
+    /// progress for a multi-gigabyte download disappeared from an interactive
+    /// `rocm serve` while still showing up in a redirected log. When either
+    /// stream is a console this process has one, so the child shares it and no
+    /// window opens; when neither is (a pipe, a file, or no console at all) the
+    /// flag is still applied, so a console-less parent never flashes a window.
+    pub(crate) const fn child_may_hide_its_console(self) -> bool {
+        !(self.stdout || self.stderr)
+    }
+}
+
 fn child_process_path(path: &Path) -> String {
     if runtime_is_windows() {
         windows_child_path(path)
@@ -242,13 +271,6 @@ pub(crate) fn lemonade_process_environment_vars(
     Ok(vars)
 }
 
-fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !path.exists() || paths.iter().any(|existing| existing == &path) {
-        return;
-    }
-    paths.push(path);
-}
-
 pub(crate) fn wait_for_lemonade_cli_status(
     manifest: &LemonadeInstallManifest,
     host: &str,
@@ -321,6 +343,39 @@ pub(crate) fn run_lemonade_backend_install(
     backend: &str,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
+    let mut command = backend_install_command(
+        manifest,
+        host,
+        port,
+        backend,
+        process_env,
+        OutputConsoles::detect(),
+        hide_child_console_window,
+    )?;
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
+    if !status.success() {
+        bail!("Lemonade backend install failed with status {status}");
+    }
+    Ok(())
+}
+
+/// The `lemonade backends install` command, ready to run.
+///
+/// It inherits stdout and stderr: the backend download's progress is the child's
+/// own output. `consoles` and `hide_window` are parameters so a test can assert
+/// whether the window is hidden for each console state; the one production
+/// caller passes the real streams and [`hide_child_console_window`].
+fn backend_install_command(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    backend: &str,
+    process_env: &LemonadeProcessEnvironment,
+    consoles: OutputConsoles,
+    hide_window: impl FnOnce(&mut ProcessCommand),
+) -> Result<ProcessCommand> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
         .arg("--host")
@@ -334,14 +389,10 @@ pub(crate) fn run_lemonade_backend_install(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     apply_lemonade_process_environment(&mut command, process_env)?;
-    hide_child_console_window(&mut command);
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
-    if !status.success() {
-        bail!("Lemonade backend install failed with status {status}");
+    if consoles.child_may_hide_its_console() {
+        hide_window(&mut command);
     }
-    Ok(())
+    Ok(command)
 }
 
 fn lemonade_pull_args(host: &str, port: u16, checkpoint_ref: &str) -> Vec<String> {
@@ -434,211 +485,6 @@ pub(crate) fn run_lemonade_model_load(
         bail!("Lemonade model load failed with status {status}");
     }
     Ok(())
-}
-
-/// Run one of Lemonade's packaged `llama-server` binaries (`server`) directly on a
-/// GGUF file, exposing the model under `request.model_ref` via `--alias`. This is how
-/// a canonical Hugging Face name is served under exactly that name — Lemonade's router
-/// renames registered models, but an llama-server alias is a free-form string.
-pub(crate) fn serve_direct_llama_server(
-    request: &ServeHttpRequest,
-    runtime: &LemonadeRuntime,
-    process_env: &LemonadeProcessEnvironment,
-    server: &Path,
-    log_path: Option<&Path>,
-    reason: &anyhow::Error,
-) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
-        format!(
-            "Lemonade downloaded model `{}` was not found for direct serving",
-            request.model_ref
-        )
-    })?;
-    if !server.is_file() {
-        bail!("Lemonade llama-server is missing at {}", server.display());
-    }
-    let backend = llama_server_backend_label(server);
-
-    if let Some(log_path) = log_path
-        && let Some(parent) = log_path.parent()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(log_path) = log_path {
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        writeln!(
-            log,
-            "\nLaunching Lemonade packaged {backend} llama-server directly: {reason:#}"
-        )
-        .ok();
-    }
-
-    let mut direct_env = process_env.clone();
-    if let Some(server_dir) = server.parent() {
-        push_existing_path(&mut direct_env.path_entries, server_dir.to_path_buf());
-        push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
-    }
-
-    let mut command = ProcessCommand::new(server);
-    command
-        .arg("-m")
-        .arg(&model_path)
-        .arg("--host")
-        .arg(&request.host)
-        .arg("--port")
-        .arg(request.port.to_string())
-        .arg("--n-gpu-layers")
-        .arg("999")
-        .arg("--alias")
-        .arg(&request.model_ref)
-        .stdin(Stdio::null());
-    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
-        command.args(&engine_recipe.required_flags);
-    }
-    // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
-    // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
-    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
-    // secret never lands in the process table). Reusing the managed file rather than
-    // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
-    // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
-    if let Some(key_file) = rocm_engine_protocol::resolve_endpoint_api_key_file() {
-        command.arg("--api-key-file").arg(&key_file);
-    }
-    if let Some(log_path) = log_path {
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        command.stdout(Stdio::from(log.try_clone()?));
-        command.stderr(Stdio::from(log));
-    } else {
-        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    }
-    apply_lemonade_process_environment(&mut command, &direct_env)?;
-    hide_child_console_window(&mut command);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start {}", server.display()))?;
-    write_running_state(
-        request,
-        runtime,
-        std::process::id(),
-        Some(child.id()),
-        "running",
-    )?;
-    // If the server never becomes ready (or fails the smoke test), don't leak the child
-    // or leave the state stuck at `running`: kill it and mark the service failed.
-    let readiness = (|| -> Result<()> {
-        wait_for_openai_models_ready(
-            &request.host,
-            request.port,
-            &request.model_ref,
-            Duration::from_mins(2),
-        )?;
-        if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
-            bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
-        }
-        Ok(())
-    })();
-    if let Err(error) = readiness {
-        let _ = terminate_pid(child.id(), true);
-        let _ = child.wait();
-        let _ = mark_json_status(&request.state_path, "failed");
-        return Err(error);
-    }
-    merge_json_state(
-        &request.state_path,
-        &json!({
-            "status": "ready",
-            "server_pid": child.id(),
-            // Identity token for the server PID, captured while the child is alive.
-            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
-            "backend_state": "ready",
-            "backend_requested": backend,
-            "backend_mode": "lemonade-packaged-llama-server",
-            "load_response": {
-                "status": "loaded",
-                "method": "lemonade-packaged-llama-server",
-                "model_name": request.model_ref,
-                "model_path": model_path,
-                "llamacpp_backend": backend
-            },
-        }),
-    )?;
-    let status = child
-        .wait()
-        .context("failed waiting for Lemonade packaged llama-server")?;
-    mark_json_status(
-        &request.state_path,
-        if status.success() {
-            "stopped"
-        } else {
-            "failed"
-        },
-    )?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("Lemonade packaged llama-server exited with status {status}")
-    }
-}
-
-fn wait_for_openai_models_ready(
-    host: &str,
-    port: u16,
-    model_ref: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let endpoint = format_http_base_url(host, port);
-    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
-    let start = std::time::Instant::now();
-    let mut last_error = None;
-    while start.elapsed() < timeout {
-        match http_get_text_with_auth(
-            &endpoint,
-            "/v1/models",
-            endpoint_api_key.as_deref(),
-            Duration::from_secs(3),
-        )
-        .and_then(|body| parse_models_ready(&body, model_ref))
-        {
-            Ok(true) => return Ok(()),
-            Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    bail!(
-        "Lemonade packaged llama-server did not become ready: {}",
-        last_error.unwrap_or_else(|| "not checked".to_owned())
-    )
-}
-
-fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
-    let value = serde_json::from_str::<Value>(body.trim())
-        .context("failed to parse /v1/models response")?;
-    Ok(models_payload_has_loaded_model(&value, model_ref))
-}
-
-fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
-    value
-        .get("data")
-        .or_else(|| value.get("models"))
-        .and_then(Value::as_array)
-        .is_some_and(|models| {
-            models.iter().any(|model| {
-                ["id", "model", "name"]
-                    .into_iter()
-                    .filter_map(|field| model.get(field).and_then(Value::as_str))
-                    .any(|loaded| model_names_match(loaded, model_ref))
-            })
-        })
 }
 
 /// Whether `/v1/models` advertises `model_ref` as ready to serve on GPU. A stock
@@ -783,7 +629,7 @@ fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bo
         })
 }
 
-fn model_names_match(left: &str, right: &str) -> bool {
+pub(crate) fn model_names_match(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
         || resolve_lemonade_model_ref(left).eq_ignore_ascii_case(&resolve_lemonade_model_ref(right))
 }
@@ -795,10 +641,140 @@ fn lemonade_backend_matches(value: &str, backend: &str) -> bool {
         .starts_with(&backend.to_ascii_lowercase())
 }
 
+pub(crate) fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String> {
+    let mut args = vec![
+        "serve-http".to_owned(),
+        request.service_id.clone(),
+        request.model_ref.clone(),
+        "--host".to_owned(),
+        request.host.clone(),
+        "--port".to_owned(),
+        request.port.to_string(),
+        "--device-policy".to_owned(),
+        device_policy_name(&request.device_policy).to_owned(),
+        "--state-path".to_owned(),
+        request.state_path.display().to_string(),
+    ];
+    if let Some(runtime_id) = request.runtime_id.as_deref() {
+        args.extend(["--runtime-id".to_owned(), runtime_id.to_owned()]);
+    }
+    if let Some(env_id) = request.env_id.as_deref() {
+        args.extend(["--env-id".to_owned(), env_id.to_owned()]);
+    }
+    if let Some(log_path) = request.log_path.as_ref() {
+        args.extend(["--log-path".to_owned(), log_path.display().to_string()]);
+    }
+    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&request.gpu_indices) {
+        args.extend(["--gpu".to_owned(), csv]);
+    }
+    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
+        args.extend([
+            "--engine-recipe-json".to_owned(),
+            serde_json::to_string(engine_recipe).expect("engine recipe serializes"),
+        ]);
+    }
+    args
+}
+
+#[cfg(windows)]
+pub(crate) fn spawn_serve_http_background(
+    current_exe: &Path,
+    serve_args: &[String],
+) -> Result<u32> {
+    rocm_core::spawn_detached_no_inherit(current_exe, serve_args, &[])
+        .context("failed to launch Lemonade serve-http background process")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn spawn_serve_http_background(
+    current_exe: &Path,
+    serve_args: &[String],
+) -> Result<u32> {
+    let child = ProcessCommand::new(current_exe)
+        .args(serve_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to launch Lemonade serve-http background process")?;
+    Ok(child.id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::DEFAULT_MODEL;
+    use rocm_engine_protocol::DevicePolicy;
+    use serde_json::json;
+
+    fn test_manifest() -> LemonadeInstallManifest {
+        LemonadeInstallManifest {
+            env_id: "lemonade-embeddable-test".to_owned(),
+            version: "test".to_owned(),
+            runtime_dir: PathBuf::from("rt"),
+            lemond: PathBuf::from("rt").join("lemond"),
+            lemonade: PathBuf::from("rt").join("lemonade"),
+            backend_recipe: "llamacpp".to_owned(),
+            backend_name: "rocm".to_owned(),
+            installed_at_unix_ms: 0,
+        }
+    }
+
+    /// Build the real backend-install command for a console state and report
+    /// whether the window was hidden, along with the command itself.
+    fn backend_install_for(consoles: OutputConsoles) -> (ProcessCommand, bool) {
+        let mut hidden = false;
+        let command = backend_install_command(
+            &test_manifest(),
+            "127.0.0.1",
+            8123,
+            "rocm",
+            &LemonadeProcessEnvironment::default(),
+            consoles,
+            |_| hidden = true,
+        )
+        .expect("the command builds");
+        (command, hidden)
+    }
+
+    /// The backend install's progress is the child's own output. Hiding its
+    /// console while that output is a console discards it (see
+    /// `OutputConsoles::child_may_hide_its_console`), so the window is hidden
+    /// only when neither stream is one. The command is the real one: a dropped
+    /// call to the hide step, a hide step run unconditionally, or a console
+    /// check that ignores one of the streams each turn a case below red.
+    #[test]
+    fn the_backend_install_hides_its_window_only_when_no_output_is_a_console() {
+        for (stdout, stderr, expect_hidden) in [
+            (true, true, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let (command, hidden) = backend_install_for(OutputConsoles { stdout, stderr });
+            assert_eq!(
+                hidden, expect_hidden,
+                "stdout console={stdout}, stderr console={stderr}"
+            );
+            assert_eq!(command.get_program(), PathBuf::from("rt").join("lemonade"));
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                args,
+                [
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "8123",
+                    "backends",
+                    "install",
+                    "llamacpp:rocm"
+                ]
+            );
+        }
+    }
 
     #[test]
     fn models_ready_accepts_direct_serve_and_gates_router_backend() {
@@ -920,5 +896,28 @@ mod tests {
         });
         assert!(health_has_loaded_model(&loaded, "lemonade-qwen", "vulkan"));
         assert!(!health_has_loaded_model(&loaded, "lemonade-qwen", "rocm"));
+    }
+
+    #[test]
+    fn serve_http_args_preserve_runtime_selection() {
+        let request = ServeHttpRequest {
+            service_id: "svc".to_owned(),
+            model_ref: DEFAULT_MODEL.to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: Some("runtime".to_owned()),
+            env_id: Some("env".to_owned()),
+            state_path: PathBuf::from("state.json"),
+            log_path: Some(PathBuf::from("service.log")),
+            engine_recipe: None,
+        };
+        let args = serve_http_command_args(&request);
+        assert!(args.contains(&"--runtime-id".to_owned()));
+        assert!(args.contains(&"runtime".to_owned()));
+        assert!(args.contains(&"--env-id".to_owned()));
+        assert!(args.contains(&"env".to_owned()));
+        assert!(!args.iter().any(|arg| arg == "cpu"));
     }
 }

@@ -60,6 +60,12 @@ pub struct LifecycleState {
     /// A shell profile the installer is pointed at through
     /// `ROCM_CLI_SHELL_PROFILE`; `None` means the default `~/.bashrc`.
     custom_profile: Option<PathBuf>,
+    /// The login shell (`$SHELL`) the installer is run under; `None` leaves the
+    /// runner's own.
+    login_shell: Option<String>,
+    /// The fish config seeded before install, which uninstall must restore
+    /// exactly.
+    fish_config_before_install: Option<String>,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -235,6 +241,9 @@ fn run_installer_command(
     // Isolate the installer's HOME so shell-profile writes and the seeded
     // ~/.rocm/config.json land in the scenario's tree, never the real home.
     cmd.env("HOME", &st.home_dir);
+    // fish's config lives under $XDG_CONFIG_HOME when that is set, which would
+    // point the installer's fish setup at the runner's real config.
+    cmd.env_remove("XDG_CONFIG_HOME");
     for (key, value) in public_key_env {
         cmd.env(key, value);
     }
@@ -534,6 +543,8 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_cache: None,
         profile_before_install: None,
         custom_profile: None,
+        login_shell: None,
+        fish_config_before_install: None,
     });
 }
 
@@ -588,6 +599,37 @@ async fn given_profile_user_settings(world: &mut E2eWorld) {
     let contents = "# the user's own settings\nexport ROCM_E2E_USER_SETTING=1\n".to_owned();
     std::fs::write(&profile, &contents).expect("failed to seed the shell profile");
     state_mut(world).profile_before_install = Some(contents);
+}
+
+/// The fish config the installer writes its PATH block to in this scenario.
+fn fish_config(st: &LifecycleState) -> PathBuf {
+    st.home_dir.join(".config").join("fish").join("config.fish")
+}
+
+/// The completion file the installer writes for fish in this scenario.
+fn fish_completions(st: &LifecycleState) -> PathBuf {
+    st.home_dir
+        .join(".config")
+        .join("fish")
+        .join("completions")
+        .join("rocm.fish")
+}
+
+#[given("fish is set up with its own settings")]
+async fn given_fish_configured(world: &mut E2eWorld) {
+    // A config directory is enough for the installer to treat fish as installed,
+    // so the scenario does not depend on the runner having the fish binary.
+    let config = fish_config(state(world));
+    std::fs::create_dir_all(config.parent().expect("fish config has a folder"))
+        .expect("failed to create the fish config folder");
+    let contents = "# the user's own fish settings\nset -gx ROCM_E2E_USER_SETTING 1\n".to_owned();
+    std::fs::write(&config, &contents).expect("failed to seed the fish config");
+    state_mut(world).fish_config_before_install = Some(contents);
+}
+
+#[given("the login shell is bash")]
+async fn given_login_shell_bash(world: &mut E2eWorld) {
+    state_mut(world).login_shell = Some("/bin/bash".to_owned());
 }
 
 #[given("a signed bundle installed updating the user PATH")]
@@ -779,6 +821,9 @@ async fn install_with_key_file_shell_profile(world: &mut E2eWorld) {
         st.public_key.to_string_lossy().into_owned(),
     )];
     let mut shell_on = vec![("ROCM_CLI_UPDATE_SHELL_PATH", "1".to_string())];
+    if let Some(shell) = &st.login_shell {
+        shell_on.push(("SHELL", shell.clone()));
+    }
     if let Some(profile) = &st.custom_profile {
         shell_on.push((
             "ROCM_CLI_SHELL_PROFILE",
@@ -786,6 +831,23 @@ async fn install_with_key_file_shell_profile(world: &mut E2eWorld) {
         ));
     }
     let (out, _ok) = run_installer(world, &install_dir, &download_base, &key_env, &shell_on);
+    state_mut(world).last_output = out;
+}
+
+#[when("the signed bundle is installed with the public key file and NO_COLOR set")]
+async fn when_install_key_file_no_color(world: &mut E2eWorld) {
+    let st = state(world);
+    let install_dir = st.install_dir.clone();
+    let download_base = st.download_base.clone();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        st.public_key.to_string_lossy().into_owned(),
+    )];
+    let extra = [
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("NO_COLOR", "1".to_string()),
+    ];
+    let (out, _ok) = run_installer(world, &install_dir, &download_base, &key_env, &extra);
     state_mut(world).last_output = out;
 }
 
@@ -1176,6 +1238,76 @@ async fn then_signature_verified(world: &mut E2eWorld) {
     );
 }
 
+#[then("the installer prints the get-started block")]
+async fn then_get_started_block(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    for needle in ["Get started:", "install sdk", "serve qwen", "examine"] {
+        assert!(
+            out.contains(needle),
+            "installer output is missing {needle:?}:\n{out}"
+        );
+    }
+}
+
+#[then("the installer next-step hint names the installed rocm binary")]
+async fn then_hint_names_binary(world: &mut E2eWorld) {
+    // ROCM_CLI_UPDATE_SHELL_PATH=0 and the install dir is not on the caller's
+    // PATH, so bare `rocm` would not work: the hint and every example must
+    // name the binary by path. PowerShell invokes a quoted path with `&`.
+    let st = state(world);
+    let rocm = installed_binary(&st.install_dir, "rocm")
+        .display()
+        .to_string();
+    let cmd = if cfg!(windows) {
+        format!("& \"{rocm}\"")
+    } else {
+        rocm
+    };
+    let lines: Vec<&str> = st.last_output.lines().map(str::trim).collect();
+    let hint = format!("Run: {cmd} examine");
+    assert_eq!(
+        lines.iter().rev().find(|l| !l.is_empty()),
+        Some(&hint.as_str()),
+        "installer's last line is not the next-step hint:\n{}",
+        st.last_output
+    );
+    for example in ["install sdk", "serve qwen"] {
+        let want = format!("{cmd} {example}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&want)),
+            "no get-started example starts with {want:?}:\n{}",
+            st.last_output
+        );
+    }
+}
+
+#[then("the installer output has no banner art")]
+async fn then_no_banner_art(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        !out.contains('\u{2588}'),
+        "piped installer output contains the box-drawing banner:\n{out}"
+    );
+}
+
+#[then("the installer output has no ANSI escapes")]
+async fn then_no_ansi(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        !out.contains('\u{1b}'),
+        "piped installer output contains an escape byte:\n{out:?}"
+    );
+}
+
+#[then("the installer failure line is marked with the !! prefix")]
+async fn then_failure_marker(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("!! rocm-cli installer:"),
+        "installer failure line has no !! marker:\n{out}"
+    );
+}
+
 #[then("the installer reports the user PATH updated")]
 async fn then_user_path_updated(world: &mut E2eWorld) {
     let out = &state(world).last_output;
@@ -1368,8 +1500,12 @@ async fn then_single_path_marker(world: &mut E2eWorld) {
 /// The scenario's shell profile holds the installer's marked PATH block exactly
 /// once.
 fn assert_single_path_marker(st: &LifecycleState) {
-    let profile = shell_profile(st);
-    let contents = std::fs::read_to_string(&profile).unwrap_or_default();
+    assert_single_path_marker_in(&shell_profile(st));
+}
+
+/// Assert `profile` holds exactly one rocm-cli PATH block, and return its text.
+fn assert_single_path_marker_in(profile: &Path) -> String {
+    let contents = std::fs::read_to_string(profile).unwrap_or_default();
     let count = contents.matches("# >>> rocm-cli path >>>").count();
     assert_eq!(
         count,
@@ -1377,6 +1513,7 @@ fn assert_single_path_marker(st: &LifecycleState) {
         "expected exactly one rocm-cli PATH marker in {}, found {count}:\n{contents}",
         profile.display()
     );
+    contents
 }
 
 #[then("examine reads only the isolated config, data, and cache directories")]
@@ -1457,6 +1594,270 @@ async fn then_profile_restored(world: &mut E2eWorld) {
     );
 }
 
+#[then("the fish config adds the install directory to PATH once")]
+async fn then_fish_config_has_path(world: &mut E2eWorld) {
+    let st = state(world);
+    let config = fish_config(st);
+    let contents = assert_single_path_marker_in(&config);
+    // The install folder sits outside the scenario's HOME, so the block names
+    // it literally rather than as `$HOME/...`.
+    let install_dir = st.install_dir.to_string_lossy();
+    assert!(
+        contents.contains(&format!("set -gx PATH \"{install_dir}\" $PATH")),
+        "the fish config does not put {install_dir} on PATH in fish syntax:\n{contents}"
+    );
+    assert!(
+        contents.contains("# the user's own fish settings"),
+        "the installer dropped the user's own fish settings:\n{contents}"
+    );
+    // The bash profile the login shell asked for keeps POSIX syntax, not fish's.
+    let bashrc = std::fs::read_to_string(shell_profile(st)).expect("bash profile not found");
+    assert!(
+        bashrc.contains("export PATH=") && !bashrc.contains("set -gx PATH"),
+        "the bash profile did not keep POSIX syntax:\n{bashrc}"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&config.display().to_string()),
+        "installer did not report the fish profile:\n{out}"
+    );
+}
+
+#[then("the fish completions for the installed rocm are in place")]
+async fn then_fish_completions_installed(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let contents = std::fs::read_to_string(&path).expect("fish completions not found");
+    assert!(
+        contents.contains("complete -c rocm"),
+        "{} is not a rocm completion script:\n{contents}",
+        path.display()
+    );
+    // Uninstall removes the file only when this line names its own folder.
+    let marker = format!(
+        "# rocm-cli fish completions for {}\n",
+        st.install_dir.display()
+    );
+    assert!(
+        contents.starts_with(&marker),
+        "{} does not start with the installer's marker {marker:?}:\n{contents}",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains("fish completions installed:") && out.contains(&path.display().to_string()),
+        "installer did not report the fish completions:\n{out}"
+    );
+}
+
+#[then("the fish config is back to the user's own settings")]
+async fn then_fish_config_restored(world: &mut E2eWorld) {
+    let st = state(world);
+    let before = st
+        .fish_config_before_install
+        .as_deref()
+        .expect("the fish config was not seeded");
+    let contents = std::fs::read_to_string(fish_config(st)).unwrap_or_default();
+    assert_eq!(
+        contents, before,
+        "uninstall did not restore the fish config to its pre-install contents"
+    );
+}
+
+#[then("the fish completions for the uninstalled rocm are gone")]
+async fn then_fish_completions_removed(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert!(
+        !path.exists(),
+        "uninstall left {} behind for a rocm that is gone",
+        path.display()
+    );
+    assert!(
+        path.parent().is_some_and(Path::is_dir),
+        "uninstall removed the user's fish completions folder, not just rocm's script"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!("removed shell completions {}", path.display())),
+        "uninstall did not report removing the fish completions:\n{out}"
+    );
+}
+
+/// What the user writes over the installer's fish completions in a scenario.
+const USERS_OWN_COMPLETIONS: &str = "complete -c rocm -l my-own-flag\n";
+
+#[given("the user has replaced the fish completions with their own")]
+async fn given_users_own_fish_completions(world: &mut E2eWorld) {
+    let path = fish_completions(state(world));
+    assert!(path.is_file(), "the installer wrote no {}", path.display());
+    std::fs::write(&path, USERS_OWN_COMPLETIONS).expect("failed to replace the fish completions");
+}
+
+/// Set the Unix permission bits of `path`. The scenarios that use this are
+/// `@requires-os:linux`; the stub only keeps the Windows build compiling.
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_unix_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix permission bits do not apply on this platform",
+    ))
+}
+
+#[given("the fish completions folder cannot be written to")]
+async fn given_fish_completions_folder_read_only(world: &mut E2eWorld) {
+    let dir = fish_completions(state(world))
+        .parent()
+        .expect("completions have a folder")
+        .to_path_buf();
+    set_unix_mode(&dir, 0o555).expect("failed to make the fish completions folder read-only");
+    // Root writes through folder permissions, so the scenario would not reach
+    // the failure it is about.
+    let probe = dir.join(".rocm-e2e-probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = set_unix_mode(&dir, 0o755);
+        panic!(
+            "{} is still writable after chmod 0555; this scenario needs a non-root runner",
+            dir.display()
+        );
+    }
+}
+
+#[given("the user already has their own fish completions")]
+async fn given_users_fish_completions_before_install(world: &mut E2eWorld) {
+    let path = fish_completions(state(world));
+    std::fs::create_dir_all(path.parent().expect("completions have a folder"))
+        .expect("failed to create the fish completions folder");
+    std::fs::write(&path, USERS_OWN_COMPLETIONS).expect("failed to seed the fish completions");
+}
+
+#[then("the installer leaves the user's own fish completions and says why")]
+async fn then_installer_leaves_users_fish_completions(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_COMPLETIONS,
+        "the installer changed {}, which it did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "note: fish completions not installed: {} already exists and was not written by \
+             this installer",
+            path.display()
+        )),
+        "the installer did not say it left the fish completions:\n{out}"
+    );
+    assert!(
+        !out.contains("fish completions installed:"),
+        "the installer reported installing completions it did not write:\n{out}"
+    );
+    let record = std::fs::read_to_string(st.install_dir.join(".rocm-cli-path-edit"))
+        .expect("the installer wrote no PATH-edit record");
+    assert!(
+        !record.contains("completions "),
+        "the installer recorded completions it did not write, so uninstall could remove them:\n{record}"
+    );
+}
+
+#[then("the user's own fish completions are untouched")]
+async fn then_users_fish_completions_untouched(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_COMPLETIONS,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        !out.contains("removed shell completions"),
+        "uninstall reported removing completions it should not have touched:\n{out}"
+    );
+}
+
+#[then("the fish completions are still in place")]
+async fn then_fish_completions_still_in_place(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("complete -c rocm"),
+        "{} is gone after an uninstall that keeps the binaries",
+        path.display()
+    );
+    assert!(
+        !st.last_output.contains("removed shell completions"),
+        "uninstall reported removing the fish completions it was told to keep:\n{}",
+        st.last_output
+    );
+}
+
+#[then("uninstall leaves the user's own fish completions in place and says why")]
+async fn then_users_fish_completions_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        contents,
+        USERS_OWN_COMPLETIONS,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "fish completions {} left in place: it does not start with the rocm-cli \
+             installer's marker, so the installer did not write it",
+            path.display()
+        )),
+        "uninstall did not say why it left the fish completions:\n{out}"
+    );
+    assert!(
+        !out.contains("removed shell completions"),
+        "uninstall reported removing completions it kept:\n{out}"
+    );
+}
+
+#[then("uninstall warns that the fish completions could not be removed and still finishes")]
+async fn then_fish_completions_removal_warned(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let dir = path.parent().expect("completions have a folder");
+    // Put the folder back first, so the scratch tree can be cleaned up even if
+    // an assertion below fails.
+    let _ = set_unix_mode(dir, 0o755);
+    let out = &st.last_output;
+    assert_eq!(st.last_rc, 0, "uninstall did not finish:\n{out}");
+    assert!(
+        out.contains(&format!(
+            "warning: could not remove shell completions {}",
+            path.display()
+        )) && out.contains("The uninstall went on without it"),
+        "uninstall did not warn about the fish completions:\n{out}"
+    );
+    assert!(
+        out.contains("uninstall complete"),
+        "uninstall did not report finishing:\n{out}"
+    );
+    assert!(
+        path.is_file(),
+        "{} is gone, so the warning was not true",
+        path.display()
+    );
+}
+
 #[then("the shell profile still adds the install directory to PATH")]
 async fn then_profile_kept(world: &mut E2eWorld) {
     assert_single_path_marker(state(world));
@@ -1487,10 +1888,13 @@ async fn then_xdg_kept(world: &mut E2eWorld) {
 
 #[then("uninstall reports keeping the PATH change with the binaries")]
 async fn then_reports_path_kept_with_binaries(world: &mut E2eWorld) {
+    // The message is true because lifecycle-25 also asserts the state it
+    // promises: the PATH change and the fish completions stay (see
+    // `then_fish_completions_still_in_place` and the profile step).
     let out = &state(world).last_output;
     assert!(
         out.contains("binary removal disabled by --keep-binaries")
-            && out.contains("any PATH change the installer made stays too"),
+            && out.contains("any PATH change and fish completions the installer made stay too"),
         "uninstall did not say the PATH change stays with the binaries:\n{out}"
     );
 }

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Wide-layout triptych rails (Phase 6).
+//! Wide-layout triptych rails.
 //!
 //! When the terminal is wide enough, `ui::draw` splits the body into a left GPU
 //! wall, the existing center tab body, and a persistent right dock. The right
@@ -38,21 +38,6 @@ pub const DOCK_W: u16 = 52;
 #[must_use]
 pub const fn is_wide(cols: u16, rows: u16) -> bool {
     cols >= WIDE_COLS && rows >= WIDE_ROWS
-}
-
-/// Split a body rect into (left rail, center, right dock) for the wide layout.
-/// Returns `None` when the body is too narrow to host both rails + a center.
-#[must_use]
-pub const fn triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
-    let min_center = 40u16;
-    if body.width < RAIL_W + DOCK_W + min_center {
-        return None;
-    }
-    let left = Rect::new(body.x, body.y, RAIL_W, body.height);
-    let center_w = body.width - RAIL_W - DOCK_W;
-    let center = Rect::new(body.x + RAIL_W, body.y, center_w, body.height);
-    let right = Rect::new(body.x + RAIL_W + center_w, body.y, DOCK_W, body.height);
-    Some((left, center, right))
 }
 
 /// Draw the right dock appropriate for `tab`: a live LOGS stream for the
@@ -114,14 +99,16 @@ pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .label_fg(theme.fg),
             Rect::new(inner.x, y + 1, inner.width, 1),
         );
+        // A zero total means VRAM size is unmeasured (e.g. a multi-adapter
+        // Windows host), not 0% used: show the same "—" the Home hero does.
         let vram = if g.vram_total_mb > 0 {
-            g.vram_used_mb as f64 / g.vram_total_mb as f64 * 100.0
+            format::pct((g.vram_used_mb as f64 / g.vram_total_mb as f64 * 100.0) as f32)
         } else {
-            0.0
+            "—".to_string()
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("VRAM {}", format::pct(vram as f32)),
+                format!("VRAM {vram}"),
                 Style::default().fg(theme.muted),
             ))),
             Rect::new(inner.x, y + 2, inner.width, 1),
@@ -211,11 +198,7 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         ))
     };
     let mut lines: Vec<Line> = vec![header("RUNNING SERVICES")];
-    let running: Vec<_> = state
-        .instances
-        .values()
-        .filter(|i| i.status.is_serving())
-        .collect();
+    let running = format::running_instances(state);
     if running.is_empty() {
         lines.push(Line::from(Span::styled(
             "  none",
@@ -224,16 +207,28 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     } else {
         for i in running.iter().take(4) {
             let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
+            let (glyph, color, stage) = if i.status.is_serving() {
+                ("● ", theme.ok, String::new())
+            } else {
+                (
+                    "◌ ",
+                    theme.warn,
+                    format!(" {}", format::stage_text(i.status)),
+                )
+            };
             lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme.ok)),
+                Span::styled(glyph, Style::default().fg(color)),
                 Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
-                Span::styled(port, Style::default().fg(theme.muted)),
+                Span::styled(format!("{port}{stage}"), Style::default().fg(theme.muted)),
             ]));
         }
     }
     lines.push(Line::raw(""));
     lines.push(header("GPU STATE"));
-    if let Some(s) = state.latest.as_ref() {
+    // Same rule the sparkline below uses: a snapshot with no GPUs has nothing
+    // to report, and folding over an empty list would print a measured-looking
+    // "peak util 0.0%" for a host that never reported one.
+    if let Some(s) = state.latest.as_ref().filter(|s| !s.gpus.is_empty()) {
         let util = s
             .gpus
             .iter()
@@ -272,16 +267,14 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         }
     }
     // A small live trace so the rail has motion when telemetry is present.
-    let util_hist: Vec<u64> = state
-        .history
-        .iter()
-        .map(|s| {
-            s.gpus
-                .iter()
-                .map(|g| f64::from(g.gpu_utilization_pct))
-                .fold(0.0, f64::max) as u64
-        })
-        .collect();
+    // `gpu_history` owns the GPU-less skip: without it a host with no GPU
+    // draws a flat 0% trace instead of an empty one.
+    let util_hist: Vec<u64> = crate::ui::widgets::gpu_history(state.history.iter(), |s| {
+        s.gpus
+            .iter()
+            .map(|g| f64::from(g.gpu_utilization_pct))
+            .fold(0.0, f64::max)
+    });
     let body = inner.height.saturating_sub(lines.len() as u16);
     f.render_widget(Paragraph::new(lines), inner);
     if body >= 1 && !util_hist.is_empty() {
@@ -349,16 +342,10 @@ mod tests {
     }
 
     #[test]
-    fn is_wide_and_triptych_extents() {
+    fn is_wide_extents() {
         assert!(!is_wide(160, 44));
         assert!(!is_wide(200, 40));
         assert!(is_wide(180, 45));
-        let (l, c, r) = triptych(Rect::new(0, 0, 200, 50)).unwrap();
-        assert_eq!(l.width, RAIL_W);
-        assert_eq!(r.width, DOCK_W);
-        assert_eq!(l.width + c.width + r.width, 200);
-        // A narrow body yields no triptych.
-        assert!(triptych(Rect::new(0, 0, 100, 50)).is_none());
     }
 
     #[test]
@@ -509,6 +496,69 @@ mod tests {
     }
 
     #[test]
+    fn a_gpu_less_host_reports_no_telemetry_rather_than_a_measured_zero() {
+        // Both halves of the GPU STATE section: the peak-util line and the
+        // trace under it. Folding over an empty `gpus` list yields 0, and the
+        // widget draws a baseline for every sample it is handed, so without
+        // the skip a host with no GPU reads as one idling at 0%.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot::default());
+        for _ in 0..8 {
+            s.history.push_back(Snapshot::default());
+        }
+        let backend = TestBackend::new(DOCK_W, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| context_rail(f, f.area(), &s, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(
+            out.contains("no telemetry"),
+            "a GPU-less host should report nothing: {out:?}"
+        );
+        assert!(
+            !out.contains("peak util"),
+            "a GPU-less host reported a measured peak: {out:?}"
+        );
+        // The trace under it, too: the widget draws a baseline for any sample
+        // it is handed, so an unfiltered series would paint one here.
+        assert!(
+            !out.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "a GPU-less host drew a trace: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_gpu_bearing_history_still_draws_its_trace() {
+        // The other side of the same filter: real GPU snapshots must survive
+        // it, so reverting the call site to an unfiltered fold is not the only
+        // thing this catches.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        let with_gpu = || Snapshot {
+            gpus: vec![GpuMetrics {
+                gpu_utilization_pct: 60.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        s.latest = Some(with_gpu());
+        for _ in 0..8 {
+            s.history.push_back(with_gpu());
+        }
+        let backend = TestBackend::new(DOCK_W, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| context_rail(f, f.area(), &s, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(out.contains("peak util"), "no peak util line: {out:?}");
+        assert!(
+            !out.contains("no telemetry"),
+            "a GPU-bearing host was reported as having none: {out:?}"
+        );
+    }
+
+    #[test]
     fn context_rail_shows_sections() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.instances.insert(
@@ -537,6 +587,34 @@ mod tests {
     }
 
     #[test]
+    fn context_rail_lists_starting_service_with_stage_after_serving() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        for (id, name, status) in [
+            ("a", "A-Starting", InstanceStatus::Starting { phase: None }),
+            ("b", "Z-Serving", InstanceStatus::Ready),
+        ] {
+            s.instances.insert(
+                id.into(),
+                Instance {
+                    container_id: id.into(),
+                    model_name: name.into(),
+                    status,
+                    ..Default::default()
+                },
+            );
+        }
+        let backend = TestBackend::new(DOCK_W, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| context_rail(f, f.area(), &s, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(out.contains("starting"), "stage missing: {out:?}");
+        let (serving, starting) = (out.find("Z-Serving"), out.find("A-Starting"));
+        assert!(serving < starting && serving.is_some(), "order: {out:?}");
+    }
+
+    #[test]
     fn gpu_wall_renders_or_empty() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.latest = Some(Snapshot {
@@ -555,5 +633,43 @@ mod tests {
         term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
         let out = flat(&term);
         assert!(out.contains("GPUs"), "gpu wall title missing: {out:?}");
+    }
+
+    #[test]
+    fn gpu_wall_shows_placeholder_for_unmeasured_vram() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(RAIL_W, 20)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
+        let out = flat(&term);
+        assert!(out.contains("VRAM —"), "placeholder missing: {out:?}");
+        assert!(!out.contains("VRAM 0.0%"), "fake zero shown: {out:?}");
+    }
+
+    #[test]
+    fn gpu_wall_shows_percentage_for_measured_vram() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 4_000,
+                vram_total_mb: 16_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(RAIL_W, 20)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
+        assert!(flat(&term).contains("VRAM 25.0%"));
     }
 }

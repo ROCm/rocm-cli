@@ -1,5 +1,8 @@
 Feature: GPU detection and system inspection
 
+  # A release tag `vX.Y.Z` is reported as `X.Y.Z (vX.Y.Z, <hash>)`. Any other
+  # resolved ref, including `main`, is reported as `0.0.0-dev` rather than the
+  # unpublished workspace package version. The step checks that shape.
   @id:examine-version
   Scenario: examine-01 - The CLI reports its version
     When the user asks for the version through every CLI surface
@@ -77,7 +80,10 @@ Feature: GPU detection and system inspection
   # load-bearing: every host capability the suite resolves comes from scraped
   # text, so if the two forms ever diverge again, every capability-keyed
   # expectation silently resolves against the wrong host. Since fixed; this is
-  # the guard that keeps it fixed.
+  # the guard that keeps it fixed. On WSL2 the same disagreement came from the
+  # skipped hardware probes (the machine-readable form said no GPU beside a
+  # human report naming a gfx target); `has_amd_gpu` now follows that target
+  # there, so this runs on WSL2 hosts too and is no longer an expected failure.
   @id:examine-both-forms-agree-on-gpu
   Scenario: examine-08 - Both forms of the inspection agree about the GPU
     When the user inspects the system both for reading and for scripting
@@ -119,9 +125,9 @@ Feature: GPU detection and system inspection
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
 
-  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-...}` shell
-  # placeholder on its `repo_version:` line instead of the effective version, so
-  # the preview a user reviews before approving disagreed with what the install
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-7.2.4}`
+  # shell placeholder on its `repo_version:` line instead of the effective version,
+  # so the preview a user reviews before approving disagreed with what the install
   # would actually pull. The plan is rendered on every Linux host regardless of
   # GPU (the driver is not yet installed when you preview it), so the mock lane
   # pins this without hardware.
@@ -144,7 +150,8 @@ Feature: GPU detection and system inspection
   # `rocm examine`'s own engine_inventory block prefixes the effective default
   # engine with the same `*` marker, via a renderer separate from `engines
   # list`'s (see `append_examine_engine_inventory` vs
-  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # `render_engine_inventory_text_with_paths`, both in
+  # apps/rocm/src/examine_report_text.rs) — the
   # two used to be able to drift apart. examine-13 only ever drove `engines
   # list`, leaving this second renderer's legend unexercised end-to-end.
   @id:examine-shows-default-engine-legend
@@ -269,7 +276,7 @@ Feature: GPU detection and system inspection
   # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
   # the WSL lane, where the managed runtime really does carry a `.so`. This
   # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
-  # diagnose.rs -- the same boundary, stated once there and once here.
+  # diagnose/catalog.rs -- the same boundary, stated once there and once here.
   @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
   Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
     Given a managed runtime is active
@@ -282,8 +289,10 @@ Feature: GPU detection and system inspection
   # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
   # machine other than the runner. The driver plan cannot be exercised this way:
   # `rocm install driver` builds a plan that runs against the real machine, so it
-  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
-  # parsing is covered by the unit tests in `driver_install.rs`.
+  # deliberately reads the real `/etc/os-release` (`real_os_release` in
+  # `hardware_root.rs`, whose test in `system_packages.rs` pins that it ignores
+  # a simulated host root); the plan built from it is covered by the unit tests
+  # in `driver_plan.rs`.
   #
   # The planted distributions are ones no CI runner or developer host here runs,
   # so a probe that read the real file instead would report a different one.
@@ -296,6 +305,7 @@ Feature: GPU detection and system inspection
     Given a machine whose release file quotes every value in single quotes
     When the user inspects that machine in machine-readable form
     Then the inspection reports the distribution "rhel" version "9.4" named "Red Hat Enterprise Linux 9.4 (Plow)"
+    And the inspection reports the distribution family "fedora"
     And the inspection reports no trouble reading the release file
 
   @id:examine-reads-last-os-release-assignment @requires-os:linux
@@ -367,11 +377,10 @@ Feature: GPU detection and system inspection
   # With an amd-smi that prints a snapshot's worth of JSON and only then
   # stalls, that quote is the entire payload, and the note is not a terminal
   # message: `record_gpu_metrics` copies it into the automation-event and audit
-  # JSONL files every 60s, and both append helpers rewrite the whole file each
-  # time. Unbounded, the logs grew by the payload's size every minute and each
-  # write cost more than the last. So the note must name the timeout, keep
-  # enough of the child's output to be worth reading, say that it was shortened
-  # -- and stay small.
+  # JSONL files every 60s, neither ever rotated or capped. Unbounded, the logs
+  # grew by the payload's size every minute, forever. So the note must name
+  # the timeout, keep enough of the child's output to be worth reading, say
+  # that it was shortened -- and stay small.
   #
   # Asserted here rather than only as a unit test because the note's journey is
   # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the
@@ -428,3 +437,298 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
+
+  # `examine` on Windows adds the AMD display driver's version, date and an age
+  # line. Windows only: the driver comes from the Windows adapter inventory, so
+  # no other platform has these lines. `@requires-gpu` so that a driver exists
+  # to be read. The scenario names no driver: it holds the readable form to the
+  # machine-readable one, and holds the verdict to the date, so it passes on a
+  # machine with an old driver and on one with a current driver, and fails only
+  # if the CLI calls a driver old that is not. Whether a driver dated before
+  # 27 July 2023 is reported as old needs such a machine and is not covered here.
+  @id:examine-windows-driver-version-date-and-age @requires-os:windows @requires-gpu
+  Scenario: examine-29 - On Windows the inspection reports the display driver and judges its age by its date
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then the inspection reports the display driver's version and date as the machine-readable form does
+    And the inspection calls the driver old only when its date is before 27 July 2023
+
+  # `rocm_install_method` used to report "amdgpu-install"/"tarball-or-other";
+  # renamed to "repo-native"/"runfile-or-tarball" alongside the switch away
+  # from the amdgpu-install wrapper. It also feeds fix-12's applicability
+  # score (not which remediation commands it renders -- that comes from the
+  # package family and distro, not this field), so a silent revert of the
+  # rename would misfire there without any test catching it -- this pins the
+  # JSON contract directly rather than only
+  # asserting the human-readable form (examine-06), which never named it. A
+  # whitelist rather than one pinned value keeps this hermetic: which method
+  # actually fires depends on this host's real ROCm repo markers (some
+  # developer machines and self-hosted GPU runners have them, a clean mock
+  # lane does not), not just on the install this scenario plants. No GPU
+  # needed: the install is planted by the harness (`plant_unmanaged_rocm`),
+  # same as examine-06. Linux/WSL only, like examine-12: `probe_rocm_install`
+  # only runs there, so `rocm_install_method` is empty on Windows.
+  @id:examine-reports-a-current-install-method-name @requires-os:linux
+  Scenario: examine-30 - System inspection reports a current install-method name, not the retired amdgpu-install naming
+    Given a machine with a ROCm install that was not set up by the CLI
+    When the user inspects the system in machine-readable form
+    Then the inspection reports a current install-method name
+
+  # The other side of examine-24/25/26, and the user-observable half of the
+  # `/dev/kfd` pre-flight (EAI-8457): where those three prove a healthy device
+  # still reaches amd-smi, this proves an unopenable one stops the launch from
+  # happening at all. (Declared after examine-30 rather than beside them because
+  # the scenario index is per-feature and in declaration order.) On a host in
+  # that state amd-smi can park in
+  # uninterruptible sleep, where no signal and therefore no timeout reaches it,
+  # so "declined" is the only outcome that bounds the daemon's 60s telemetry
+  # poll. The snapshot degrades; the command still succeeds.
+  #
+  # Non-vacuity is the whole difficulty here, and it is carried in two places.
+  # The stub amd-smi would answer this probe perfectly and records that it ran,
+  # so the marker's absence is what distinguishes "refused before the spawn"
+  # from "spawned and failed" -- deleting the gate makes this scenario fail
+  # rather than merely changing a message. And the note must name the device
+  # this run pointed the pre-flight at: the lane that runs this per PR has no
+  # `/dev/kfd` of its own, so a build that ignored the seam would decline for
+  # the host's own reasons and otherwise look identical.
+  #
+  # The seam is `ROCM_E2E_KFD_DEVICE`, honoured only by an `e2e-test-hooks`
+  # build (`rocm_core::preflight_kfd_device`), and it moves the device the gate
+  # opens rather than skipping the gate. `ROCM_CLI_TEST_HOST_ROOT` cannot stand
+  # in for it: the gate keeps the real node's veto on purpose, so a simulated
+  # root can only ever make it decline -- which is this branch, but leaves
+  # examine-24/25/26 unable to reach amd-smi on a GPU-less runner at all.
+  # Linux-only, like its three siblings: the stub is a shell script, and the
+  # gate is a wave-through on every other platform.
+  # `@requires-bare-metal`, not just `@requires-os:linux`: WSL2 reports an
+  # os_family of `linux`, so the Linux tag matches there — but on a WSL host
+  # with a usable GPU `kfd_readable`'s wave-through short-circuits the device
+  # open entirely, and the decline this scenario asserts never happens. The
+  # premise is a host where the `/dev/kfd` open is what decides.
+  @id:examine-telemetry-declines-an-unopenable-kfd-device @requires-os:linux @requires-bare-metal
+  Scenario: examine-31 - An unopenable KFD device stops amd-smi being launched at all
+    Given the KFD device cannot be opened
+    When the daemon gathers a bridge snapshot
+    Then the snapshot says amd-smi was never launched and names the device
+
+  # ROCDXG is found by the dynamic loader through LD_LIBRARY_PATH as well as
+  # through the linker cache, and a TheRock tarball under /opt/rocm-<version> is
+  # reachable only the first way: nothing registers it with `ldconfig`. The
+  # inspection used to require the cache entry regardless, so a working WSL GPU
+  # read `wsl_rocdxg_missing` and the CLI refused to serve on it (ROCMAI-870).
+  #
+  # The planted root supplies `/dev/dxg`, DXCore and the library under
+  # `/opt/rocm`, and a stand-in `ldconfig` on PATH answers with a cache that
+  # does not list it, so the verdict rests on LD_LIBRARY_PATH alone on every
+  # Linux lane, WSL or not. The `@id:examine-rocdxg-missing-without-loader-path`
+  # scenario below is its control: the same machine without the variable.
+  @id:examine-rocdxg-ready-from-ld-library-path @requires-os:linux
+  Scenario: examine-32 - The inspection reports ROCDXG ready when the loader reaches it through LD_LIBRARY_PATH
+    Given a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache
+    And the inspection's driver detail does not send the user to register the library with ldconfig
+
+  @id:examine-rocdxg-missing-without-loader-path @requires-os:linux
+  Scenario: examine-33 - The inspection reports ROCDXG missing when neither the linker cache nor LD_LIBRARY_PATH reaches it
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_missing"
+    And the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail says the library is missing from the linker cache
+
+  # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
+  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
+  # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
+  # control is `examine-33`, the same machine with the library alone.
+  @id:examine-rocdxg-ready-beside-runtime @requires-os:linux
+  Scenario: examine-34 - The inspection reports ROCDXG ready when the library sits beside the runtime that opens it
+    Given a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail does not send the user to register the library with ldconfig
+
+  # `rocm examine --json` asks twice whether `rocminfo` is installed on WSL: the
+  # host summary (`summary.wsl.rocminfo`) and the examination (`wsl.rocminfo`).
+  # They used to use two different PATH lookups and could disagree; they now use
+  # one, and these scenarios hold the two answers level on the cases where
+  # the old lookups differed. The planted WSL machine is the one `examine-32` uses
+  # (a simulated host root with `/dev/dxg`); the runner's own PATH entries that
+  # hold a `rocminfo` are left out, so a runner with ROCm installed cannot be the
+  # reason a tool reads as found. The stand-in `rocminfo` prints nothing, so the
+  # scenarios are about whether the tool is found, not whether it sees a GPU.
+  #
+  # The control: a `rocminfo` in a PATH directory is found by both.
+  @id:examine-rocminfo-on-path-is-found-by-both-reports @requires-os:linux
+  Scenario: examine-35 - Both reports find a rocminfo that sits in a PATH directory
+    Given a WSL machine whose rocminfo is in a PATH directory
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # An empty PATH entry is not the current directory for this lookup: a file named
+  # `rocminfo` in the directory the command runs from is not "installed". The
+  # summary's old lookup read the entry as the current directory and said it was,
+  # while the examination's said it was not. The cost is that a program the CLI
+  # starts by bare name can still resolve from the current directory through the
+  # operating system, which the lookup does not follow.
+  @id:examine-rocminfo-in-working-directory-is-not-installed @requires-os:linux
+  Scenario: examine-36 - Neither report reads an empty PATH entry as the working directory
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is not installed
+
+  # A PATH that is not valid Unicode is searched. The examination's old lookup read
+  # PATH as a `String`, which fails on it, and so found no tool at all while the
+  # summary's old lookup still searched it.
+  @id:examine-rocminfo-on-a-path-that-is-not-unicode-is-found @requires-os:linux
+  Scenario: examine-37 - Both reports search a PATH that is not valid Unicode
+    Given a WSL machine whose rocminfo sits in a PATH directory with a name that is not valid Unicode
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # The control for `examine-36`: the same machine, with `.` as the first PATH
+  # entry instead of an empty one. A `.` entry is an ordinary directory, so the
+  # lookup finds the stand-in in the working directory. That only happens if the
+  # `rocm` child really runs from it, so this scenario fails when the harness does
+  # not apply the working directory, and `examine-36`'s "not installed" is then
+  # meaningful: the two differ in nothing but the entry.
+  @id:examine-rocminfo-in-working-directory-named-on-path-is-found @requires-os:linux
+  Scenario: examine-38 - Both reports find a rocminfo in the working directory when PATH names it
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # kfd is linked into `amdgpu` (`HSA_AMD` is a `bool` Kconfig option), so a
+  # healthy machine never lists an `amdkfd` module. The report used to read
+  # that as "kfd missing". Each scenario plants a module list naming `amdgpu`
+  # only, so the answer can come only from the kernel's kfd interfaces.
+  @id:examine-reports-kfd-built-into-the-kernel @requires-os:linux
+  Scenario: examine-39 - The inspection reports kfd on a machine whose module list has no amdkfd
+    Given a machine whose kernel exposes kfd but lists no amdkfd module
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as loaded
+
+  # A negative control for examine-39, not proof of the fix: it passes with
+  # the fix reverted too, and fails if the kfd check reports true regardless.
+  @id:examine-reports-kfd-absent-without-kfd-interfaces @requires-os:linux
+  Scenario: examine-40 - The inspection reports kfd as not loaded on a machine without it
+    Given a machine whose kernel has no kfd and lists no amdkfd module
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as not loaded
+
+  # amdgpu built into the kernel is absent from `lsmod` too, so it was read as
+  # "module not loaded" and `rocm diagnose` scored that, plus a DKMS failure
+  # and Secure Boot, as evidence. `/sys/bus/pci/drivers/amdgpu` exists for a loaded
+  # module and a built-in driver alike. The machine also has a ROCm install
+  # and Secure Boot enabled, so the evidence lines are reachable if the flag
+  # regresses.
+  @id:examine-reports-amdgpu-built-into-the-kernel @requires-os:linux
+  Scenario: examine-41 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
+    Given a machine whose kernel has amdgpu built in and lists no amdgpu module
+    When the user inspects and diagnoses that machine
+    Then the inspection reports amdgpu as loaded
+    And the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence
+
+  # With no module list at all (`lsmod` fails and `/proc/modules` is empty),
+  # the kernel's kfd interfaces still answer: kfd is linked into amdgpu, so
+  # `/dev/kfd` reports both drivers as loaded rather than leaving them unknown.
+  @id:examine-reports-drivers-from-kfd-without-a-module-list @requires-os:linux
+  Scenario: examine-42 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
+    Given a machine whose kernel exposes kfd but whose module list cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as loaded
+    And the inspection reports amdgpu as loaded
+
+  # `rocm examine --json` reads the kernel release twice: the host summary
+  # (`summary.kernel`, which the text form prints as `kernel:`) and the examination
+  # (`kernel_release`, which the WSL version check and the kernel-dependent
+  # diagnoses read). They used to run `uname -r` separately, with different limits
+  # and different rules for a failed or malformed answer, and could disagree. They
+  # share one read now, so one `--json` run holds the two level on a specific
+  # value, not only on both being filled, and the stand-in counts its calls to show
+  # that the run asked for the release once: the summary takes the examination's
+  # read, so a transient failure cannot make the two fields disagree and a hung
+  # `uname` costs one timeout.
+  #
+  # The stand-in `uname` is planted first on PATH, so the scenario describes a
+  # kernel no runner has. It runs on every Linux lane, native or WSL, because both
+  # stacks read `uname -r` on both; Windows is out of scope, where the examination
+  # leaves `kernel_release` empty and the summary reads `cmd /C ver`.
+  @id:examine-reports-one-kernel-release-in-both-forms @requires-os:linux
+  Scenario: examine-43 - The summary and the examination report the same kernel release
+    Given a machine whose uname reports a kernel release
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that kernel release
+    And that run asked uname for the kernel release once
+
+  # A `uname` that fails is not trusted for what it printed first: the examination
+  # used to keep that release while the summary dropped it. Neither reports a
+  # kernel now, and a failed read is not a probe failure, so a host without a
+  # usable `uname` does not read as degraded.
+  @id:examine-reports-no-kernel-release-from-a-failing-uname @requires-os:linux
+  Scenario: examine-44 - Neither report keeps a kernel release from a uname that failed
+    Given a machine whose uname prints a kernel release and then fails
+    When the user inspects that machine in machine-readable form
+    Then neither the summary nor the examination reports a kernel release, and neither calls it a failure
+
+  # `rocm examine --json` reads the CPU twice: the host summary (`summary.cpu`,
+  # which the text form prints as `cpu:`) and the examination (`cpu_model` and
+  # `cpu_vendor`). They used to read `/proc/cpuinfo` separately and spelled the
+  # same model differently; they share one reader now, so one `--json` run holds
+  # the two level on a specific value, not only on both being filled.
+  #
+  # The planted machine is a simulated host root holding only a `/proc/cpuinfo`,
+  # so the scenario describes a CPU no runner has, and it is not WSL whatever the
+  # runner is: the comparison is scoped to hosts where `is_wsl` is false, because
+  # on WSL the examination does not read the CPU at all (`examine-47`). The model
+  # in `/proc/cpuinfo` has repeated spaces, which the examination used to keep and
+  # the summary to collapse. Native Windows reads the same CPU through the system
+  # inventory and cannot run on this lane; the unit tests in
+  # `crates/rocm-core/src/host_gpu/os_facts.rs` cover it.
+  @id:examine-reports-one-cpu-in-both-forms @requires-os:linux
+  Scenario: examine-45 - The summary and the examination report the same CPU model and its vendor
+    Given a machine that is not WSL whose cpuinfo names an AMD CPU with repeated spaces in its model
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that CPU model, and the examination reports its vendor as amd
+
+  # A board whose cpuinfo has a `Hardware` line and no `model name` (an Arm board)
+  # showed a CPU in the summary and none in the examination. Both read the
+  # `Hardware` line now, and the vendor stays unknown because such a file names
+  # none.
+  @id:examine-reports-a-hardware-line-cpu-in-both-forms @requires-os:linux
+  Scenario: examine-46 - Both reports name a CPU that cpuinfo gives only as Hardware
+    Given a machine that is not WSL whose cpuinfo has a Hardware line and no model name
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that CPU model, and the examination reports its vendor as unknown
+
+  # The difference this change leaves as it is: on WSL the examination returns
+  # before it reads the CPU, so `cpu_model` is empty and `cpu_vendor` is
+  # `unknown` while the summary shows the CPU. Pinned so that collecting CPU
+  # facts on WSL is a visible change of its own, which would turn this scenario.
+  # The other two scenarios compare the two reports on hosts that are not WSL.
+  @id:examine-reports-no-cpu-model-on-wsl-where-the-summary-has-one @requires-os:linux
+  Scenario: examine-47 - On WSL the summary reports the CPU and the examination does not
+    Given a WSL machine whose cpuinfo names an AMD CPU
+    When the user inspects that machine in machine-readable form
+    Then the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor
+
+  # The host probes' subprocess helpers used to read a tool's output until every
+  # holder of the pipe had closed it, so a tool that left a background process
+  # behind (a helper the tool starts and does not wait for) held the whole
+  # inspection until that process exited, however quickly the tool itself did.
+  # They now stop reading shortly after the tool exits, and the inspection keeps
+  # what the tool printed before that. The stand-in `lspci` prints one AMD GPU,
+  # exits 0 and leaves a `sleep` holding its output for 30 seconds; the
+  # inspection must finish well inside that and still list the GPU, so what the
+  # tool printed before it exited is still collected. It does not pin the length
+  # of the grace: that is the unit tests' (`subprocess_runners_pair`).
+  @id:examine-lspci-leaving-a-background-process-does-not-hold-up-the-inspection @requires-os:linux
+  Scenario: examine-48 - A PCI listing tool that leaves a background process behind does not hold up the inspection
+    Given a machine whose lspci prints a GPU and leaves a background process holding its output open
+    When the user inspects that machine in machine-readable form and the time it takes is measured
+    Then the inspection finishes long before the background process does
+    And the inspection lists the GPU that lspci printed

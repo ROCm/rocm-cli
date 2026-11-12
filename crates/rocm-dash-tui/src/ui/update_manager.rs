@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Update overlay (Phase 3 Wave 2).
+//! Update overlay.
 //!
 //! Wraps `rocm update`: a read-only check (and a `--apply --dry-run` preview)
 //! that run straight through the job-bridge, plus the mutating `--apply` /
@@ -292,11 +292,8 @@ pub fn draw_update_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn check_is_read_only_and_spawns_without_approval() {

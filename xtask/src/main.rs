@@ -11,22 +11,38 @@
 //! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod amd_smi_launch_contract;
+mod architecture_doc;
 mod ascii_output_contract;
 mod catalog;
+mod chat_import_contract;
 mod coverage;
 mod crate_edges;
+mod dash_text_edit_contract;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
+mod engine_stdio_client_contract;
 mod env_mutation_contract;
+mod eval_fixtures;
 mod lychee;
 mod manifest;
+mod module_size;
 mod package;
 mod paths;
 mod powershell;
+mod prepush;
+mod prepush_stamp;
+mod proptest_regressions_contract;
+mod release_readiness;
+mod report_mailbox;
+mod report_rollup;
 mod rocm_releases;
+#[cfg(test)]
+mod rust_source;
 mod signing;
+mod smoke;
 mod tpn;
 mod verify_commits;
 mod verify_pinned_keys;
@@ -35,7 +51,7 @@ mod workflow_contract;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -82,9 +98,11 @@ pub(crate) enum Command {
         signature: PathBuf,
     },
     /// Assert the release/metadata public keys pinned in the installers and
-    /// `apps/rocm/src/therock.rs` match the canonical published keys under
+    /// `apps/rocm/src/therock/fetch.rs` match the canonical published keys under
     /// `docs/keys/`, and that any configured CI signing key matches the pinned
-    /// current release key. A no-op while no canonical keys are published.
+    /// current release key. Each slot must be assigned exactly once (install.sh
+    /// must also mark it `readonly`), and a slot whose canonical key is not
+    /// published yet must be empty.
     VerifyPinnedKeys,
     /// Print the workspace crates affected by a git range (changed crates plus
     /// their transitive dependents) as `cargo` package-selection flags, so CI
@@ -102,14 +120,62 @@ pub(crate) enum Command {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Run one cargo step of the pre-push hook over only the crates the push
+    /// affects: the changed crates plus their transitive dependents, selected
+    /// as `cargo xtask affected` does, from the range prek exports to the hook
+    /// (`PRE_COMMIT_FROM_REF`..`PRE_COMMIT_TO_REF`).
+    ///
+    /// The step runs over the whole workspace whenever the affected crates
+    /// cannot be determined, and prints why. It is skipped only when the
+    /// selection is known and has nothing for the step to check. CI always
+    /// checks the whole workspace.
+    ///
+    /// A step that already passed on this exact tree (same cargo command,
+    /// toolchain and environment, clean working tree) is skipped, and a pass is
+    /// recorded after a green run; see `xtask/src/prepush_stamp.rs`.
+    PrePushCheck {
+        /// Which step to run.
+        #[arg(value_enum)]
+        check: prepush::Check,
+        /// Base ref for the `<base>...HEAD` range, instead of the ref prek
+        /// provides. Without either it defaults to `origin/main`.
+        #[arg(long)]
+        base: Option<String>,
+        /// Print the scope and the cargo command without running it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Run the step even when this tree already passed it, and record the
+        /// new result. `ROCM_PRE_PUSH_RERUN=1` does the same, for the hook.
+        #[arg(long)]
+        rerun: bool,
+    },
     /// Fail if any first-party crate has gained a normal/build dependency
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
+    /// Fail if any source file has more than 1,500 production lines, naming
+    /// each offender with its count. Production lines exclude test-gated items
+    /// (inline `#[cfg(test)]` modules and the like) and test-only files. There
+    /// is one limit for every file and no way to exempt one; the definition is
+    /// in `xtask/src/module_size.rs`.
+    CheckModuleSize,
+    /// Fail if a production source file (a `.rs` file under `apps/*/src`,
+    /// `crates/*/src` or `engines/*/src`), or a `.rs` file under `xtask/src`,
+    /// `tests/e2e-cucumber/src` or `tests/e2e-cucumber/tests`, has no entry in
+    /// `docs/architecture.md`.
+    CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
         /// non-zero if it would change.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Regenerate the recorded `rocm` output the rocm-doctor skill evals replay
+    /// from the compiled catalog (skills/rocm-doctor/evals/fixtures/).
+    EvalFixtures {
+        /// Verify the committed recordings are current without writing; exit
+        /// non-zero if any is missing, stale, or unexpected.
         #[arg(long)]
         check: bool,
     },
@@ -265,6 +331,79 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Count received Doctor reports from an export of the report mailbox.
+    ///
+    /// Reads `.eml` files (one message each) and raw `.json` report bodies,
+    /// and prints how many reports describe each problem, at every level of
+    /// the group key, with refused and unreadable reports counted apart.
+    ///
+    /// Also prints the weekly trend, by the week each mail was sent in (only
+    /// the week is kept from its `Date`), and names any week in which a known
+    /// problem rose sharply against its recent average. The first and the
+    /// latest week of the export may be partial: the first is never part of a
+    /// baseline, and a rise in the latest is a lower bound. Sends and files
+    /// nothing. Counts are reports, not people.
+    ReportRollup(report_rollup::Args),
+    /// Compute a mechanical GO/NO-GO release-readiness verdict and status
+    /// table from the nightly build/E2E results and commits since the last
+    /// release tag, plus the categorized facts an LLM narrative step drafts
+    /// prose from (the verdict and table never depend on that step).
+    ReleaseReadiness {
+        /// Baseline tag for `git log <tag>..HEAD` (e.g. the last published
+        /// release tag, resolved by the caller via `git describe --tags
+        /// --abbrev=0 --match 'v*' --exclude 'v*-*'`).
+        #[arg(long)]
+        since_tag: String,
+        /// Path to the consolidated E2E `support-matrix.md` produced by
+        /// `cargo xtask e2e-report` (reused as-is, not regenerated).
+        #[arg(long)]
+        e2e_report: PathBuf,
+        /// The calling workflow's own nightly Linux build job result
+        /// (`needs.nightly.result`).
+        #[arg(long)]
+        nightly_result: String,
+        /// The calling workflow's own nightly Windows build job result
+        /// (`needs.windows-nightly.result`).
+        #[arg(long)]
+        windows_result: String,
+        /// The calling workflow's `e2e-report-nightly` job result (`needs.e2e-report-nightly.result`).
+        /// That job already fails if any E2E lane that ran didn't upload its
+        /// `report.json` (preflight failure, timeout, runner loss), which would
+        /// otherwise just vanish from the consolidated E2E report's totals,
+        /// reading as zero failures. Gating on this job's result (rather than
+        /// each lane job's own `continue-on-error`-masked result, which is
+        /// always `success`) covers every lane, present and future, for free.
+        /// Caveat: a re-run can pass on an earlier attempt's artifact, so this
+        /// can miss a lane.
+        #[arg(long)]
+        e2e_report_job_result: String,
+        /// Path to write the structured facts JSON (input to the narrative step).
+        #[arg(long)]
+        out: PathBuf,
+        /// Path to write the mechanical verdict + status table markdown.
+        #[arg(long)]
+        table_out: PathBuf,
+    },
+    /// Run the local no-fallback smoke gate: build, then drive the built
+    /// `rocm`, `rocmd` and engine binaries against a throwaway state root and
+    /// assert their first-run output — chiefly that every GPU-required path
+    /// fails loudly rather than falling back to CPU.
+    Smoke {
+        /// Build profile to build and smoke. `debug` builds the whole workspace
+        /// with all targets; `release` builds only the four binaries the gate
+        /// runs.
+        #[arg(long, value_enum, default_value_t = smoke::Profile::Debug)]
+        profile: smoke::Profile,
+        /// Smoke binaries that are already built instead of building first.
+        #[arg(long)]
+        skip_build: bool,
+        /// Target directory to build into and to find the binaries in, under its
+        /// profile subdirectory. Relative paths resolve against the workspace
+        /// root. Defaults to `CARGO_TARGET_DIR`, or `target` under the workspace
+        /// root; either way the build is given the same directory explicitly.
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -300,8 +439,12 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        command @ Command::PrePushCheck { .. } => run_pre_push_check(command, prepush::run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
+        Command::CheckModuleSize => module_size::run()?,
+        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
+        Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
@@ -354,9 +497,51 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::ReportRollup(args) => report_rollup::run(&args)?,
+        Command::ReleaseReadiness {
+            since_tag,
+            e2e_report,
+            nightly_result,
+            windows_result,
+            e2e_report_job_result,
+            out,
+            table_out,
+        } => release_readiness::run(
+            &since_tag,
+            &e2e_report,
+            &nightly_result,
+            &windows_result,
+            &e2e_report_job_result,
+            &out,
+            &table_out,
+        )?,
+        Command::Smoke {
+            profile,
+            skip_build,
+            target_dir,
+        } => smoke::run(profile, skip_build, target_dir)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())
+}
+
+/// The `pre-push-check` arm of [`run`]: hand each argument to `run` as parsed.
+/// `run` is a parameter so a test sees exactly what arrives, in particular that
+/// `--rerun` is not dropped on the way to the stamp logic.
+fn run_pre_push_check(
+    command: Command,
+    run: impl FnOnce(prepush::Check, Option<String>, bool, bool) -> Result<()>,
+) -> Result<()> {
+    let Command::PrePushCheck {
+        check,
+        base,
+        dry_run,
+        rerun,
+    } = command
+    else {
+        bail!("not a pre-push-check command");
+    };
+    run(check, base, dry_run, rerun)
 }
 
 fn main() -> ExitCode {
@@ -366,5 +551,69 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    fn rerun(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        let Command::PrePushCheck { rerun, .. } = cli.command else {
+            panic!("expected pre-push-check");
+        };
+        rerun
+    }
+
+    /// What the dispatch hands to `prepush::run` for these arguments: the real
+    /// clap parse, then the `pre-push-check` arm, with `run` recording its input.
+    fn handed_to_run(args: &[&str]) -> (String, Option<String>, bool, bool) {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        let mut seen = None;
+        super::run_pre_push_check(cli.command, |check, base, dry_run, rerun| {
+            seen = Some((format!("{check:?}"), base, dry_run, rerun));
+            Ok(())
+        })
+        .expect("the dispatch succeeds");
+        seen.expect("the arm calls run")
+    }
+
+    #[test]
+    fn the_dispatch_hands_every_flag_to_run_unchanged() {
+        assert_eq!(
+            handed_to_run(&["xtask", "pre-push-check", "test"]),
+            ("Test".to_string(), None, false, false)
+        );
+        assert_eq!(
+            handed_to_run(&[
+                "xtask",
+                "pre-push-check",
+                "clippy",
+                "--base",
+                "origin/main",
+                "--dry-run",
+                "--rerun",
+            ]),
+            (
+                "Clippy".to_string(),
+                Some("origin/main".to_string()),
+                true,
+                true
+            )
+        );
+        // `--rerun` alone, and `--dry-run` alone, are not mixed up with each other.
+        assert!(handed_to_run(&["xtask", "pre-push-check", "test", "--rerun"]).3);
+        assert!(!handed_to_run(&["xtask", "pre-push-check", "test", "--rerun"]).2);
+        assert!(handed_to_run(&["xtask", "pre-push-check", "test", "--dry-run"]).2);
+        assert!(!handed_to_run(&["xtask", "pre-push-check", "test", "--dry-run"]).3);
+    }
+
+    #[test]
+    fn pre_push_check_takes_rerun_and_defaults_to_off() {
+        assert!(rerun(&["xtask", "pre-push-check", "test", "--rerun"]));
+        assert!(!rerun(&["xtask", "pre-push-check", "test"]));
     }
 }

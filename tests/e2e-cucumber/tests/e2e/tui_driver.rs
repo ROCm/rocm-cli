@@ -22,6 +22,7 @@
 //! output, importing nothing from the product crates.
 
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,7 @@ use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::quit_and_wait::{ExitPoll, QuitError, quit_and_wait as retry_quit_and_wait};
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
+use e2e_cucumber::terminal_size::resize_screen_then_pty;
 
 use crate::E2eWorld;
 
@@ -60,6 +62,18 @@ const OVERFLOW_COLS: u16 = 90;
 /// dock switches its GPU panel into the wide layout at.
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
+
+/// The initial geometry as `vt100` wants it (`NonZeroU16`); the constants above
+/// stay `u16` because `PtySize` takes that. A zero here fails the build.
+const VT_ROWS: NonZeroU16 = NonZeroU16::new(ROWS).expect("ROWS must be non-zero");
+const VT_COLS: NonZeroU16 = NonZeroU16::new(COLS).expect("COLS must be non-zero");
+
+/// `(rows, cols)` of `screen` as plain `u16`s. Read the size through this, not
+/// `Screen::size`, which returns `NonZeroU16`s.
+fn screen_size(screen: &vt100::Screen) -> (u16, u16) {
+    let (rows, cols) = screen.size();
+    (rows.get(), cols.get())
+}
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -185,11 +199,22 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
-    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
-    /// scenario's isolation environment — for a step whose `Given` planted
-    /// scenario-owned state (e.g. a shell rc file) that only the piped
-    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
-    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
+    ///
+    /// A step needs this when a `Given` has planted scenario-owned state that
+    /// only the piped `run_rocm_with_env` path would otherwise pick up, since
+    /// [`pty_env`]'s `HOME`/lack of `SHELL` are the PTY's own isolation rather
+    /// than that state. The sole caller today is the `fix`-prompt step in
+    /// `diagnose_steps.rs`, which overrides `HOME`/`SHELL` so the fix resolves
+    /// to the shell rc file its `Given` wrote.
+    ///
+    /// Not the route a test-only CLI switch takes: `ROCM_E2E_SIMULATE_OOM_LAUNCH`
+    /// and friends go onto `world.command_env`, which plain [`spawn`](Self::spawn)
+    /// already applies, so they need no overlay here.
+    ///
+    /// The vars are applied per-child on the `CommandBuilder`, never via the
+    /// shared process environment, so concurrent scenarios on the no-GPU lane
+    /// cannot observe each other's overrides.
     pub fn spawn_with_env(
         world: &E2eWorld,
         args: &[&str],
@@ -230,6 +255,9 @@ impl TuiSession {
         Self::spawn_binary_with_env(world, binary, args, &[], None)
     }
 
+    /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
+    /// `binary <args>` under a PTY with the isolated environment, then overlay
+    /// `extra_env` on the child.
     fn spawn_binary_with_env(
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
@@ -276,7 +304,10 @@ impl TuiSession {
             cmd.env(key, value);
         }
         // Caller-supplied overrides win over the scenario's own isolation
-        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself), but
+        // deliberately stay *above* the provider-credential strip below, so no
+        // `extra_env` entry can reinstate a credential and select a cloud
+        // backend for a journey that is meant to be deterministic local chat.
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -322,7 +353,7 @@ impl TuiSession {
             .take_writer()
             .map_err(|e| reap_orphan(format!("failed to take pty writer: {e}")))?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(VT_ROWS, VT_COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_failure = Arc::new(ReaderFailure::default());
         let reader = spawn_reader(
@@ -397,6 +428,38 @@ impl TuiSession {
         cell.bgcolor() == WASH
     }
 
+    /// The foreground color of `needle` on every screen row that contains both
+    /// `anchor` and `needle`, in row order; empty if there is no such row. A row
+    /// that carries the anchor but not the needle is never read, so the result
+    /// does not depend on which panel draws the anchor first. Matches cell by
+    /// cell, so a wide glyph earlier in the row cannot shift the column.
+    /// Style-aware, unlike `screen_text`.
+    pub fn foregrounds_in_rows_with(&self, anchor: &str, needle: &str) -> Vec<vt100::Color> {
+        let wanted: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = p.screen();
+        let (_, cols) = screen_size(screen);
+        screen
+            .rows(0, cols)
+            .enumerate()
+            .filter(|(_, text)| text.contains(anchor) && text.contains(needle))
+            .filter_map(|(row, _)| {
+                let row = row as u16;
+                (0..cols).find_map(|col| {
+                    let matches = wanted.iter().enumerate().all(|(i, ch)| {
+                        screen
+                            .cell(row, col + i as u16)
+                            .is_some_and(|cell| cell.contents() == *ch)
+                    });
+                    matches.then(|| screen.cell(row, col).map(vt100::Cell::fgcolor))?
+                })
+            })
+            .collect()
+    }
+
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
         // Recover a poisoned lock rather than defaulting to a blank screen: the
         // parser's data is still valid even if some other thread panicked while
@@ -408,7 +471,7 @@ impl TuiSession {
             .parser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (p.screen().contents(), p.screen().size())
+        (p.screen().contents(), screen_size(p.screen()))
     }
 
     fn framed_screen(&self) -> String {
@@ -582,25 +645,24 @@ impl TuiSession {
     /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
+    ///
+    /// The emulated screen is resized first and the PTY second, through
+    /// [`resize_screen_then_pty`]: the other order lets the application's
+    /// redraw for the new size be parsed by the old, narrower screen whenever
+    /// this thread is descheduled between the two calls, which corrupts the
+    /// screen for good (see that function).
     fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        self.master
-            .resize(size)
-            .map_err(|e| format!("failed to resize pty: {e}"))?;
-        // As in `screen_snapshot`, recover rather than fail on a poisoned lock —
-        // resizing is still meaningful even if some earlier operation panicked
-        // while holding it.
-        self.parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .screen_mut()
-            .set_size(rows, cols);
-        Ok(())
+        let master = &self.master;
+        resize_screen_then_pty(&self.parser, rows, cols, || {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| format!("failed to resize pty: {e}"))
+        })
     }
 
     /// Enlarge to [`DETAIL_ROWS`]x[`DETAIL_COLS`], for journeys that assert

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rocm_core::{
     AppPaths, RocmCliConfig, active_managed_therock_version, runtime_is_linux, runtime_is_windows,
 };
@@ -11,41 +11,29 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::direct_llama::find_llama_server_binary_for_backend;
-use crate::install::{LemonadeInstallManifest, read_manifest};
+use crate::ROCM_BACKEND_NAME;
+use crate::install::{LemonadeInstallManifest, PinFileBackup};
+use crate::llamacpp_backend::{
+    ROCM_LLAMACPP_BACKEND_DIRS, best_llamacpp_backend_for_host,
+    find_llama_server_binary_for_backend, install_best_llamacpp_backend,
+};
+#[cfg(target_os = "linux")]
+use crate::process::apply_lemonade_process_environment;
 #[cfg(target_os = "windows")]
 use crate::process::lemonade_process_environment_vars;
-use crate::process::{
-    LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
-    lemonade_process_environment, run_lemonade_backend_install, spawn_lemond,
-    wait_for_lemonade_cli_status,
-};
+use crate::process::{LemonadeProcessEnvironment, lemonade_process_environment};
 #[cfg(target_os = "windows")]
 use crate::runtime_dir::ParentRuntimeEnvironment;
-use crate::state::{free_local_port, terminate_pid};
-use crate::{DEFAULT_HOST, LLAMACPP_RECIPE, ROCM_BACKEND_NAME};
 
 /// Resource file inside the extracted Lemonade embeddable pinning which
 /// llama.cpp build (and paired ROCm version) `llamacpp:rocm` downloads. Its own
 /// header comment invites hand-editing: "You can modify these values to pin
 /// specific versions without rebuilding the application."
 const BACKEND_VERSIONS_RESOURCE: &str = "resources/backend_versions.json";
-
-/// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
-/// we pick the highest-priority backend it considers supported on this host.
-/// GPU backends only — `cpu` is intentionally excluded so the router path never
-/// selects CPU under the GPU-required policy (AGENTS.md §6, matching
-/// `DIRECT_LLAMA_SERVER_BACKENDS`). When only CPU is usable, selection returns
-/// `None` and the caller fails with actionable guidance.
-const LLAMACPP_BACKEND_PRIORITY: [&str; 2] = ["rocm", "vulkan"];
-
-#[derive(Debug, Clone)]
-pub(crate) struct LemonadeRuntime {
-    pub(crate) manifest: LemonadeInstallManifest,
-}
 
 /// The variable that opts a machine out of rocm-cli aligning Lemonade's
 /// `llamacpp:rocm` backend to the active ROCm SDK.
@@ -69,12 +57,17 @@ fn lemonade_backend_alignment_disabled() -> bool {
 /// installed and active, instead of Lemonade's hardcoded pin (which does not track
 /// whatever the user separately installed via `rocm install sdk`).
 ///
-/// Best-effort and defensive at every step: if there is no managed rocm-cli SDK, the
-/// pinned version already matches, or an aligned attempt cannot be verified to actually
-/// resolve its GPU library, this falls back to (or reverts to) today's unmodified
-/// pinned-version install — never a regression, and never a silent CPU fallback
-/// (AGENTS.md §6): an aligned backend is only kept once [`rocm_backend_resolves`]
-/// confirms it.
+/// Best-effort and defensive at every step: if there is no managed rocm-cli SDK, or an
+/// aligned attempt cannot be verified to actually resolve its GPU library, this falls
+/// back to (or reverts to) today's unmodified pinned-version install — never a
+/// regression, and never a silent CPU fallback (AGENTS.md §6): an aligned backend is
+/// only kept once [`rocm_backend_resolves`] confirms it.
+///
+/// When the pinned version already matches there is nothing to align, but the pin may be
+/// one an earlier alignment kept and that can no longer be installed. If installing it
+/// fails, [`install_pinned_backend_or_restore_packaged_pins`] restores the pins
+/// Lemonade ships and installs once more (a forced reinstall), so that branch can
+/// rewrite `backend_versions.json` and replace the selected backend.
 ///
 /// Returns the aligned version string when one was applied and verified, so the caller
 /// can surface it in the install response.
@@ -90,6 +83,9 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
         read_backend_versions_therock_version,
         best_llamacpp_backend_for_host,
         install_best_llamacpp_backend,
+        |manifest| {
+            crate::install::restore_packaged_backend_versions(manifest, BACKEND_VERSIONS_RESOURCE)
+        },
         |manifest, backend_versions_path, target_version, pinned_version, disabled| {
             align_llamacpp_backend_to_version(
                 manifest,
@@ -136,6 +132,7 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
     mut pinned_version_lookup: impl FnMut(&Path) -> Option<String>,
     mut selected_backend_lookup: impl FnMut(&LemonadeInstallManifest) -> Result<Option<String>>,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
+    restore_packaged_pins: impl FnMut(&LemonadeInstallManifest) -> Result<Option<PinFileBackup>>,
     mut align: impl FnMut(
         &mut LemonadeInstallManifest,
         &Path,
@@ -188,8 +185,17 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
         return Ok(None);
     };
     if pinned_version == target_version {
-        fallback_install(manifest, false)?;
-        return Ok(None);
+        // Either Lemonade's own pin already is the active ROCm version, or an
+        // earlier run aligned the pin and it was kept. The second case can go
+        // stale: the build the pin names may since have been withdrawn, and
+        // this branch never revisits the pin, so the install fails on every
+        // run until something restores it.
+        return install_pinned_backend_or_restore_packaged_pins(
+            manifest,
+            &mut fallback_install,
+            restore_packaged_pins,
+            &mut |message| eprintln!("Warning: {message}"),
+        );
     }
 
     // Verification below requires the backend Lemonade selects to be `rocm`
@@ -223,6 +229,114 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
         &pinned_version,
         disabled,
     )
+}
+
+/// Install the backend `backend_versions.json` already pins. When that fails,
+/// put the pin file back to what the embeddable ships and install once more
+/// against it.
+///
+/// This is the recovery for a pin an earlier alignment kept and that can no
+/// longer be installed. It is deliberately a no-op when the file already holds
+/// the packaged values (the pin is genuinely Lemonade's own, so a second
+/// attempt would fail the same way and only hide the first error behind a
+/// retry).
+///
+/// The retry is a forced reinstall into the shared tree, so it is wrapped the way
+/// alignment's own revert is: the existing ROCm backend directories are set aside
+/// first and put back if the retry fails, so a failed retry does not leave the host
+/// without a ROCm backend, and a retry that succeeds does not leave two builds side
+/// by side for `find_binary_in` to choose between.
+///
+/// The ROCm backend entries are listed before the first attempt, not set aside
+/// before it (that would move a working backend on every plain install). The
+/// first attempt can itself leave a partial build directory, and the set-aside
+/// that follows it would carry that partial along and put it "back" if the retry
+/// fails too. So after a failed retry, once the directories are put back, every
+/// ROCm entry that was not in the listing is removed.
+///
+/// Known limitation, shared with alignment's own revert: between the set-aside
+/// and the put-back the working backend lives only under a `.pre-alignment`
+/// name, and a process killed in that window leaves it there. Nothing recovers it
+/// automatically, because the runtime tree is shared between processes and a
+/// leftover aside cannot be told from another process's install in progress.
+///
+/// The previous pin file is held in memory only, so a process killed during the
+/// forced retry leaves the restored (packaged) pins on disk and the previous bytes
+/// are lost. That is accepted: the two pins are Lemonade's own defaults, the next
+/// install re-runs alignment against them, and persisting the backup to a file in
+/// the shared tree would reintroduce the orphan problem above.
+///
+/// Scope: only the branch where the kept pin equals the active ROCm version calls
+/// this. Other `fallback_install` call sites (no active SDK, an unreadable pin, a
+/// failed backend probe) install what the file pins and do not restore.
+///
+/// What is reported when it does not recover:
+/// - a failed restore reports the original install error, which is the one the
+///   user can act on;
+/// - a failed retry reports the retry's error (the first error was already
+///   printed in the warning), puts the backend directories back, and puts the
+///   previous pin file back. Any install failure starts a restore, including a
+///   transient network or disk error, so a pin that was fine must not stay
+///   discarded by a retry that failed for another reason.
+///
+/// `warn` receives each message printed to the user, so the message and the
+/// resulting pin-file state are asserted together in the tests.
+fn install_pinned_backend_or_restore_packaged_pins(
+    manifest: &mut LemonadeInstallManifest,
+    fallback_install: &mut impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
+    mut restore_packaged_pins: impl FnMut(&LemonadeInstallManifest) -> Result<Option<PinFileBackup>>,
+    warn: &mut impl FnMut(String),
+) -> Result<Option<String>> {
+    let entries_before = list_rocm_llamacpp_backend_entries(manifest);
+    let Err(install_error) = fallback_install(manifest, false) else {
+        return Ok(None);
+    };
+    match restore_packaged_pins(manifest) {
+        Ok(Some(backup)) => {
+            // The root cause, not the whole chain: the chain carries the advice to
+            // run `--reinstall` and retry, which this step is about to do itself.
+            warn(format!(
+                "the llama.cpp backend pinned in {BACKEND_VERSIONS_RESOURCE} could not be \
+                 installed ({}); restored the pins Lemonade ships and trying again.",
+                install_error.root_cause()
+            ));
+            // Forced: the failed attempt may have left a half-installed backend
+            // for the withdrawn pin.
+            let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(manifest);
+            match fallback_install(manifest, true) {
+                Ok(()) => {
+                    resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, true);
+                    Ok(None)
+                }
+                Err(retry_error) => {
+                    resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, false);
+                    // What the put-back restored includes whatever the first
+                    // attempt left behind; only what existed before it is kept.
+                    prune_rocm_llamacpp_backend_entries_not_in(manifest, &entries_before);
+                    match backup.put_back() {
+                        Ok(()) => warn(format!(
+                            "the pins Lemonade ships could not be installed either; put the \
+                             previous {BACKEND_VERSIONS_RESOURCE} back."
+                        )),
+                        Err(put_back_error) => warn(format!(
+                            "the pins Lemonade ships could not be installed either, and the \
+                             previous {BACKEND_VERSIONS_RESOURCE} could not be put back: \
+                             {put_back_error:#}"
+                        )),
+                    }
+                    Err(retry_error)
+                }
+            }
+        }
+        Ok(None) => Err(install_error),
+        Err(restore_error) => {
+            warn(format!(
+                "could not restore the pins Lemonade ships in {BACKEND_VERSIONS_RESOURCE}: \
+                 {restore_error:#}"
+            ));
+            Err(install_error)
+        }
+    }
 }
 
 /// The Tier 1 / Tier 2 / revert state machine, isolated from the config and active-SDK
@@ -735,32 +849,6 @@ fn ldd_output_resolves_all(output: &str, required: &[&str]) -> bool {
     })
 }
 
-fn install_best_llamacpp_backend(
-    manifest: &mut LemonadeInstallManifest,
-    force_reinstall: bool,
-) -> Result<()> {
-    let port = free_local_port()?;
-    let log_path_buf = manifest.runtime_dir.join("install-lemond.log");
-    let log_path = Some(log_path_buf.as_path());
-    let process_env = lemonade_process_environment()?;
-    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, log_path, &process_env)?;
-    let result = (|| -> Result<String> {
-        wait_for_lemonade_cli_status(
-            manifest,
-            DEFAULT_HOST,
-            port,
-            Duration::from_secs(30),
-            log_path,
-            &process_env,
-        )?;
-        ensure_best_llamacpp_backend(manifest, DEFAULT_HOST, port, &process_env, force_reinstall)
-    })();
-    let _ = terminate_pid(child.id(), true);
-    let _ = child.wait();
-    manifest.backend_name = result?;
-    Ok(())
-}
-
 /// Whether the vulkan-gate probe's result means alignment could possibly succeed --
 /// only when the host would select Lemonade's `rocm` backend by itself. Any other
 /// selection (including the probe itself failing to determine one) means every
@@ -774,206 +862,6 @@ fn install_best_llamacpp_backend(
 fn should_attempt_llamacpp_backend_alignment(selected_backend: Option<&str>) -> bool {
     selected_backend == Some(ROCM_BACKEND_NAME)
 }
-
-/// Which llama.cpp backend Lemonade would select on this host
-/// (`LLAMACPP_BACKEND_PRIORITY`), without installing anything -- mirrors
-/// [`install_best_llamacpp_backend`]'s spawn/query steps but stops short of the
-/// install, so the ROCm backend alignment dance can check whether it is even
-/// reachable before patching `backend_versions.json` or forcing a single reinstall.
-fn best_llamacpp_backend_for_host(manifest: &LemonadeInstallManifest) -> Result<Option<String>> {
-    let port = free_local_port()?;
-    let log_path_buf = manifest.runtime_dir.join("install-lemond.log");
-    let log_path = Some(log_path_buf.as_path());
-    let process_env = lemonade_process_environment()?;
-    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, log_path, &process_env)?;
-    let result = (|| -> Result<Option<String>> {
-        wait_for_lemonade_cli_status(
-            manifest,
-            DEFAULT_HOST,
-            port,
-            Duration::from_secs(30),
-            log_path,
-            &process_env,
-        )?;
-        let listing = run_lemonade_backends_list(manifest, &process_env)?;
-        let backends = parse_llamacpp_backend_statuses(&listing);
-        Ok(select_best_llamacpp_backend(&backends).map(|(name, _)| name))
-    })();
-    let _ = terminate_pid(child.id(), true);
-    let _ = child.wait();
-    result
-}
-
-/// Ask Lemonade which llama.cpp backends it supports on this GPU, choose the best
-/// one (`LLAMACPP_BACKEND_PRIORITY`), install it if necessary, and return its name.
-/// Retry the backend install itself once, rather than the whole Lemonade runtime
-/// preparation. The embeddable download already has bounded transport retries;
-/// repeating that outer operation would redo deterministic failures and may
-/// re-extract a healthy runtime. A backend subprocess can instead fail after a
-/// completed download when its connection to lemond is interrupted, and a second
-/// call can reuse the backend cache immediately without a delay.
-pub(crate) fn install_llamacpp_backend_with_retry(
-    mut install: impl FnMut() -> Result<()>,
-) -> Result<()> {
-    match install() {
-        Ok(()) => Ok(()),
-        Err(first_error) => {
-            eprintln!("Lemonade backend installation failed; retrying once: {first_error:#}");
-            install().with_context(|| {
-                "Lemonade backend installation failed again; run `rocm engines install \
-                 lemonade --reinstall` and then retry `rocm serve`"
-            })
-        }
-    }
-}
-
-pub(crate) fn ensure_best_llamacpp_backend(
-    manifest: &mut LemonadeInstallManifest,
-    host: &str,
-    port: u16,
-    process_env: &LemonadeProcessEnvironment,
-    force_reinstall: bool,
-) -> Result<String> {
-    let listing = run_lemonade_backends_list(manifest, process_env)?;
-    let backends = parse_llamacpp_backend_statuses(&listing);
-    let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
-        bail!(
-            "Lemonade reports no supported GPU llama.cpp backend for this host (status: {}). \
-             The GPU-required policy does not fall back to CPU; install a ROCm or Vulkan \
-             backend (e.g. `rocm engines install lemonade`) or verify the GPU driver with \
-             `rocm examine`.",
-            describe_llamacpp_backends(&backends)
-        );
-    };
-    // Record the attempted backend before the fallible install step below, so a caller
-    // verifying the result can scope its check to this backend even when the install
-    // itself errors out.
-    manifest.backend_name = backend.clone();
-    if already_installed && !force_reinstall {
-        eprintln!("Using installed Lemonade {LLAMACPP_RECIPE}:{backend} backend.");
-    } else {
-        eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
-        install_llamacpp_backend_with_retry(|| {
-            run_lemonade_backend_install(manifest, host, port, &backend, process_env)
-        })?;
-    }
-    Ok(backend)
-}
-
-/// Parse `lemonade backends` table output into `(backend, status)` pairs for the
-/// `llamacpp` recipe only. Status is one of `installed`/`installable`/`unsupported`.
-fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
-    const RECIPES: [&str; 8] = [
-        "flm",
-        "kokoro",
-        "llamacpp",
-        "ryzenai-llm",
-        "sd-cpp",
-        "vllm",
-        "whispercpp",
-        "embeddings",
-    ];
-    const STATUSES: [&str; 3] = ["installed", "installable", "unsupported"];
-    let mut current_recipe = "";
-    let mut result = Vec::new();
-    for line in output.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = tokens.first() else {
-            continue;
-        };
-        if first == "Recipe" || first.starts_with("---") {
-            continue;
-        }
-        // A row either starts with a recipe name (recipe + its first backend) or,
-        // for grouped recipes, with a backend name continuing the previous recipe.
-        let (backend, rest) = if RECIPES.contains(&first) {
-            current_recipe = match RECIPES.iter().find(|r| **r == first) {
-                Some(r) => r,
-                None => current_recipe,
-            };
-            match tokens.get(1) {
-                Some(backend) => (*backend, &tokens[2..]),
-                None => continue,
-            }
-        } else {
-            (first, &tokens[1..])
-        };
-        if current_recipe != LLAMACPP_RECIPE {
-            continue;
-        }
-        if let Some(status) = rest.iter().find(|t| STATUSES.contains(t)) {
-            result.push((backend.to_owned(), (*status).to_owned()));
-        }
-    }
-    result
-}
-
-/// Choose the highest-priority backend Lemonade considers usable (installed or
-/// installable). Returns `(backend, already_installed)`.
-fn select_best_llamacpp_backend(backends: &[(String, String)]) -> Option<(String, bool)> {
-    for candidate in LLAMACPP_BACKEND_PRIORITY {
-        if let Some((name, status)) = backends
-            .iter()
-            .find(|(b, s)| b == candidate && (s == "installed" || s == "installable"))
-        {
-            return Some((name.clone(), status == "installed"));
-        }
-    }
-    None
-}
-
-fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
-    if backends.is_empty() {
-        return "none reported".to_owned();
-    }
-    backends
-        .iter()
-        .map(|(b, s)| format!("{b}={s}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn run_lemonade_backends_list(
-    manifest: &LemonadeInstallManifest,
-    process_env: &LemonadeProcessEnvironment,
-) -> Result<String> {
-    let mut command = ProcessCommand::new(&manifest.lemonade);
-    command
-        .arg("backends")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_lemonade_process_environment(&mut command, process_env)?;
-    hide_child_console_window(&mut command);
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run {}", manifest.lemonade.display()))?;
-    if !output.status.success() {
-        bail!(
-            "Lemonade backends query failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-pub(crate) fn resolve_runtime() -> Result<LemonadeRuntime> {
-    let paths = AppPaths::discover()?;
-    let manifest = read_manifest(&paths)?;
-    if !manifest.lemond.is_file() {
-        bail!(
-            "Lemonade runtime is missing {}; run `rocm engines install lemonade`",
-            manifest.lemond.display()
-        );
-    }
-    Ok(LemonadeRuntime { manifest })
-}
-
-/// The ROCm-family llama.cpp backend directory names under `bin/llamacpp/`. Lemonade's
-/// installer extracts each build into its own build-numbered subdirectory rather than
-/// replacing one in place, so all three names can accumulate across attempts.
-pub(crate) const ROCM_LLAMACPP_BACKEND_DIRS: [&str; 3] = ["rocm-stable", "rocm-nightly", "rocm"];
 
 /// Suffix appended to a ROCm-family backend directory moved aside by
 /// [`set_aside_rocm_llamacpp_backend_dirs`].
@@ -1051,73 +939,64 @@ fn resolve_rocm_llamacpp_backend_dirs_aside(
     }
 }
 
+/// The ROCm-family backend directories under `bin/llamacpp/` and the entries
+/// directly inside each (Lemonade extracts every build into its own
+/// build-numbered subdirectory), as they are right now.
+fn list_rocm_llamacpp_backend_entries(
+    manifest: &LemonadeInstallManifest,
+) -> std::collections::BTreeSet<PathBuf> {
+    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
+    let mut entries = std::collections::BTreeSet::new();
+    for backend in ROCM_LLAMACPP_BACKEND_DIRS {
+        let dir = llamacpp_dir.join(backend);
+        if !dir.exists() {
+            continue;
+        }
+        entries.insert(dir.clone());
+        if let Ok(children) = fs::read_dir(&dir) {
+            entries.extend(children.filter_map(Result::ok).map(|child| child.path()));
+        }
+    }
+    entries
+}
+
+/// Remove every ROCm-family backend directory, and every entry directly inside
+/// one, that is not in `keep` (from [`list_rocm_llamacpp_backend_entries`]).
+/// Best-effort, like [`resolve_rocm_llamacpp_backend_dirs_aside`].
+fn prune_rocm_llamacpp_backend_entries_not_in(
+    manifest: &LemonadeInstallManifest,
+    keep: &std::collections::BTreeSet<PathBuf>,
+) {
+    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
+    for backend in ROCM_LLAMACPP_BACKEND_DIRS {
+        let dir = llamacpp_dir.join(backend);
+        if !dir.exists() {
+            continue;
+        }
+        if !keep.contains(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            continue;
+        }
+        let Ok(children) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for child in children.filter_map(Result::ok).map(|child| child.path()) {
+            if !keep.contains(&child) {
+                let _ = fs::remove_dir_all(&child).or_else(|_| fs::remove_file(&child));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LLAMACPP_RECIPE;
     use crate::install::platform_binary_name;
     use crate::test_support::scratch_dir;
-    use anyhow::anyhow;
+    use anyhow::{anyhow, bail};
     use serde_json::json;
     use std::fs;
-
-    #[test]
-    fn backend_install_succeeds_without_retry() {
-        let mut attempts = 0;
-
-        install_llamacpp_backend_with_retry(|| {
-            attempts += 1;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(attempts, 1);
-    }
-
-    #[test]
-    fn backend_install_recovers_on_the_second_attempt() {
-        let mut attempts = 0;
-
-        install_llamacpp_backend_with_retry(|| {
-            attempts += 1;
-            if attempts == 1 {
-                bail!("first backend connection was interrupted");
-            }
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(attempts, 2);
-    }
-
-    #[test]
-    fn backend_install_stops_after_one_retry_with_reinstall_guidance() {
-        let mut attempts = 0;
-
-        let error = install_llamacpp_backend_with_retry(|| {
-            attempts += 1;
-            if attempts == 1 {
-                bail!("first backend connection was interrupted");
-            }
-            bail!("second backend connection was interrupted");
-        })
-        .unwrap_err();
-        let rendered = format!("{error:#}");
-
-        assert_eq!(attempts, 2);
-        assert!(
-            rendered.contains("second backend connection was interrupted"),
-            "{rendered}"
-        );
-        assert!(
-            !rendered.contains("first backend connection was interrupted"),
-            "the terminal error must be the retry's failure: {rendered}"
-        );
-        assert!(
-            rendered.contains("rocm engines install lemonade --reinstall"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("retry `rocm serve`"), "{rendered}");
-    }
 
     fn test_manifest(runtime_dir: PathBuf) -> LemonadeInstallManifest {
         LemonadeInstallManifest {
@@ -1476,6 +1355,7 @@ mod tests {
                 );
                 Ok(())
             },
+            |_manifest| panic!("this path never restores the packaged pins"),
             |_manifest, _path, _target, _pinned, _disabled| {
                 panic!("disabled means align must never be reached")
             },
@@ -1509,6 +1389,7 @@ mod tests {
                 );
                 Ok(())
             },
+            |_manifest| panic!("this path never restores the packaged pins"),
             |_manifest, _path, _target, _pinned, _disabled| {
                 panic!("unsupported platform means align must never be reached")
             },
@@ -1540,12 +1421,473 @@ mod tests {
                 );
                 Ok(())
             },
+            |_manifest| panic!("this path never restores the packaged pins"),
             |_manifest, _path, _target, _pinned, _disabled| {
                 panic!("a probe error must skip align entirely")
             },
         );
 
         assert_eq!(result.unwrap(), None);
+    }
+
+    /// Runs the pin-equals-target branch of
+    /// `prepare_llamacpp_backend_for_active_rocm_impl` with scripted install and
+    /// restore steps, returning the result and the `force_reinstall` flag of every
+    /// install attempt in order.
+    fn prepare_with_equal_pin(
+        mut installs: Vec<Result<()>>,
+        restore: Result<bool>,
+    ) -> (Result<Option<String>>, Vec<bool>, usize) {
+        installs.reverse();
+        let mut attempts = Vec::new();
+        let mut restores = 0;
+        let mut restore = Some(restore);
+        let mut manifest = test_manifest(PathBuf::from("unused-runtime-dir"));
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            false,
+            false,
+            || Ok(Some("7.14.1".to_owned())),
+            |_path| Some("7.14.1".to_owned()),
+            |_manifest| panic!("an equal pin never reaches the backend probe"),
+            |_manifest, force_reinstall| {
+                attempts.push(force_reinstall);
+                installs.pop().expect("more install attempts than scripted")
+            },
+            |_manifest| {
+                restores += 1;
+                restore
+                    .take()
+                    .expect("restore ran more than once")
+                    .map(|changed| {
+                        changed.then(|| {
+                            PinFileBackup::new(PathBuf::from("unused-pin-file-backup"), None)
+                        })
+                    })
+            },
+            |_manifest, _path, _target, _pinned, _disabled| {
+                panic!("an equal pin never reaches align")
+            },
+        );
+        (result, attempts, restores)
+    }
+
+    #[test]
+    fn equal_pin_that_installs_never_touches_the_pin_file() {
+        let (result, attempts, restores) =
+            prepare_with_equal_pin(vec![Ok(())], Err(anyhow!("must not restore")));
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(attempts, [false]);
+        assert_eq!(restores, 0);
+    }
+
+    #[test]
+    fn equal_pin_kept_from_an_earlier_alignment_is_restored_when_it_no_longer_installs() {
+        // The CI failure this pins: a runner's shared Lemonade tree kept
+        // `therock.version` = the active ROCm version plus a newer llama.cpp tag
+        // from an alignment run days earlier. The ROCm tarball that pin names has
+        // since been withdrawn, so every install failed outright -- and the pin
+        // equals the target, so alignment, whose revert is the only other thing
+        // that rewrites the pin, was never reached.
+        let (result, attempts, restores) = prepare_with_equal_pin(
+            vec![
+                Err(anyhow!("HTTP error 403 for the pinned tarball")),
+                Ok(()),
+            ],
+            Ok(true),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(restores, 1);
+        assert_eq!(
+            attempts,
+            [false, true],
+            "the retry after restoring the pins must force a fresh install"
+        );
+    }
+
+    #[test]
+    fn equal_pin_that_is_already_the_packaged_pin_reports_the_original_failure() {
+        // Nothing to restore means a second attempt would fail identically.
+        let (result, attempts, restores) = prepare_with_equal_pin(
+            vec![Err(anyhow!("HTTP error 403 for the pinned tarball"))],
+            Ok(false),
+        );
+
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("HTTP error 403"));
+        assert_eq!(attempts, [false]);
+        assert_eq!(restores, 1);
+    }
+
+    #[test]
+    fn equal_pin_whose_restore_fails_reports_the_original_failure() {
+        let (result, attempts, restores) = prepare_with_equal_pin(
+            vec![Err(anyhow!("HTTP error 403 for the pinned tarball"))],
+            Err(anyhow!("archive digest mismatch")),
+        );
+
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("HTTP error 403"));
+        assert!(!format!("{error:#}").contains("digest mismatch"));
+        assert_eq!(attempts, [false]);
+        assert_eq!(restores, 1, "the restore must have been attempted");
+    }
+
+    /// Drives the restore flow against a real pin file: the restore step
+    /// writes the packaged pins and hands back a backup of what it replaced.
+    /// Returns the result, every message shown to the user, the `force`
+    /// flag of each install attempt, and the pin file's final content.
+    fn restore_flow_with_real_pin_file(
+        installs: Vec<Result<()>>,
+    ) -> (Result<Option<String>>, Vec<String>, Vec<bool>, String) {
+        let dir = scratch_dir("restore-flow-real-pin-file");
+        let pin_file = dir.join("backend_versions.json");
+        fs::write(&pin_file, "KEPT").unwrap();
+        let mut installs = installs;
+        installs.reverse();
+        let mut attempts = Vec::new();
+        let mut warnings = Vec::new();
+        let mut manifest = test_manifest(dir.clone());
+        let result = install_pinned_backend_or_restore_packaged_pins(
+            &mut manifest,
+            &mut |_manifest, force| {
+                attempts.push(force);
+                installs.pop().expect("more install attempts than scripted")
+            },
+            |_manifest| {
+                let previous = fs::read(&pin_file).unwrap();
+                fs::write(&pin_file, "PACKAGED").unwrap();
+                Ok(Some(PinFileBackup::new(pin_file.clone(), Some(previous))))
+            },
+            &mut |message| warnings.push(message),
+        );
+        let content = fs::read_to_string(&pin_file).unwrap();
+        fs::remove_dir_all(&dir).ok();
+        (result, warnings, attempts, content)
+    }
+
+    #[test]
+    fn the_restored_message_is_true_of_the_pin_file_when_the_retry_succeeds() {
+        let (result, warnings, attempts, content) = restore_flow_with_real_pin_file(vec![
+            Err(anyhow!("HTTP error 403 for the pinned tarball")),
+            Ok(()),
+        ]);
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(attempts, [false, true]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("restored the pins Lemonade ships")
+                && warnings[0].contains("HTTP error 403"),
+            "{warnings:?}"
+        );
+        assert_eq!(content, "PACKAGED", "the message says restored, so it is");
+    }
+
+    #[test]
+    fn a_failed_retry_puts_the_previous_pin_file_back_and_says_so() {
+        // The first failure may have been transient, so a pin that was fine must
+        // not stay discarded by a retry that failed for another reason.
+        let (result, warnings, attempts, content) = restore_flow_with_real_pin_file(vec![
+            Err(anyhow!("connection reset")),
+            Err(anyhow!("HTTP 404 for the packaged tarball")),
+        ]);
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("HTTP 404 for the packaged tarball"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("connection reset"),
+            "the retry's error is reported; the first was printed in the warning: {error}"
+        );
+        assert_eq!(attempts, [false, true]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("connection reset"), "{warnings:?}");
+        assert!(warnings[1].contains("put the previous"), "{warnings:?}");
+        assert_eq!(content, "KEPT", "the message says put back, so it is");
+    }
+
+    /// What `restore_flow` observed.
+    struct RestoreFlow {
+        result: Result<Option<String>>,
+        warnings: Vec<String>,
+        attempts: Vec<bool>,
+        pin_file: String,
+        /// During the forced retry, the existing ROCm backend directory was
+        /// moved aside and nothing stood in its place yet.
+        aside_during_retry: bool,
+        dir: PathBuf,
+    }
+
+    /// Drives `install_pinned_backend_or_restore_packaged_pins` against a real
+    /// pin file (holding `KEPT`) and a real ROCm backend directory
+    /// (`bin/llamacpp/rocm-stable/old-build`). The restore step is supplied by
+    /// the test; a forced retry that succeeds installs `rocm-stable/new-build`,
+    /// and one that fails leaves a stray `rocm-nightly/stray`, the way a failed
+    /// install can land its output under a different ROCm-family name.
+    fn restore_flow(
+        installs: Vec<Result<()>>,
+        restore: impl FnOnce(&Path, &Path) -> Result<Option<PinFileBackup>>,
+    ) -> RestoreFlow {
+        restore_flow_with_partial(false, installs, restore)
+    }
+
+    /// [`restore_flow`], where the first attempt can also leave a half-installed
+    /// build behind: `rocm-stable/partial-build` next to the existing build and a
+    /// whole `rocm/partial` directory, before it fails.
+    fn restore_flow_with_partial(
+        first_attempt_leaves_partial: bool,
+        installs: Vec<Result<()>>,
+        restore: impl FnOnce(&Path, &Path) -> Result<Option<PinFileBackup>>,
+    ) -> RestoreFlow {
+        let dir = scratch_dir("restore-flow");
+        let pin_file = dir.join("backend_versions.json");
+        fs::write(&pin_file, "KEPT").unwrap();
+        let llamacpp = dir.join("bin").join("llamacpp");
+        fs::create_dir_all(llamacpp.join("rocm-stable")).unwrap();
+        fs::write(llamacpp.join("rocm-stable").join("old-build"), "old").unwrap();
+        let mut installs = installs;
+        installs.reverse();
+        let mut attempts = Vec::new();
+        let mut warnings = Vec::new();
+        let mut aside_during_retry = false;
+        let mut restore = Some(restore);
+        let mut manifest = test_manifest(dir.clone());
+        let result = install_pinned_backend_or_restore_packaged_pins(
+            &mut manifest,
+            &mut |_manifest, force| {
+                attempts.push(force);
+                let outcome = installs.pop().expect("more install attempts than scripted");
+                if !force && first_attempt_leaves_partial {
+                    fs::create_dir_all(llamacpp.join("rocm-stable").join("partial-build")).unwrap();
+                    fs::write(
+                        llamacpp
+                            .join("rocm-stable")
+                            .join("partial-build")
+                            .join("half"),
+                        "half",
+                    )
+                    .unwrap();
+                    fs::create_dir_all(llamacpp.join("rocm")).unwrap();
+                    fs::write(llamacpp.join("rocm").join("partial"), "half").unwrap();
+                }
+                if force {
+                    aside_during_retry = !llamacpp.join("rocm-stable").exists()
+                        && llamacpp.join("rocm-stable.pre-alignment").exists();
+                    if outcome.is_ok() {
+                        fs::create_dir_all(llamacpp.join("rocm-stable")).unwrap();
+                        fs::write(llamacpp.join("rocm-stable").join("new-build"), "new").unwrap();
+                    } else {
+                        fs::create_dir_all(llamacpp.join("rocm-nightly")).unwrap();
+                        fs::write(llamacpp.join("rocm-nightly").join("stray"), "stray").unwrap();
+                    }
+                }
+                outcome
+            },
+            |_manifest| restore.take().expect("restore ran once")(&pin_file, &dir),
+            &mut |message| warnings.push(message),
+        );
+        let pin_file_content = fs::read_to_string(&pin_file).unwrap();
+        RestoreFlow {
+            result,
+            warnings,
+            attempts,
+            pin_file: pin_file_content,
+            aside_during_retry,
+            dir,
+        }
+    }
+
+    /// A restore step that behaves like the real one: writes the packaged
+    /// pins and hands back a backup of what it replaced.
+    fn restore_writing_packaged(pin_file: &Path, _dir: &Path) -> Result<Option<PinFileBackup>> {
+        let previous = fs::read(pin_file).unwrap();
+        fs::write(pin_file, "PACKAGED").unwrap();
+        Ok(Some(PinFileBackup::new(
+            pin_file.to_path_buf(),
+            Some(previous),
+        )))
+    }
+
+    #[test]
+    fn a_failed_restore_says_so_reports_the_original_error_and_changes_nothing() {
+        let flow = restore_flow(
+            vec![Err(anyhow!("HTTP error 403 for the pinned tarball"))],
+            |_pin_file, _dir| Err(anyhow!("archive digest mismatch")),
+        );
+
+        let error = format!("{:#}", flow.result.unwrap_err());
+        assert!(error.contains("HTTP error 403"), "{error}");
+        assert!(!error.contains("digest mismatch"), "{error}");
+        assert_eq!(flow.warnings.len(), 1, "{:?}", flow.warnings);
+        assert!(
+            flow.warnings[0].contains("could not restore the pins Lemonade ships")
+                && flow.warnings[0].contains("archive digest mismatch"),
+            "{:?}",
+            flow.warnings
+        );
+        assert_eq!(flow.attempts, [false], "no retry after a failed restore");
+        // The message claims nothing was restored: the pin file and the backend
+        // directory are as they were.
+        assert_eq!(flow.pin_file, "KEPT");
+        assert!(flow.dir.join("bin/llamacpp/rocm-stable/old-build").exists());
+        fs::remove_dir_all(&flow.dir).ok();
+    }
+
+    #[test]
+    fn a_failed_put_back_says_so_and_leaves_the_restored_pins_in_place() {
+        // The backup points at a directory that does not exist, so writing the
+        // previous bytes back fails.
+        let flow = restore_flow(
+            vec![
+                Err(anyhow!("connection reset")),
+                Err(anyhow!("HTTP 404 for the packaged tarball")),
+            ],
+            |pin_file, dir| {
+                let previous = fs::read(pin_file).unwrap();
+                fs::write(pin_file, "PACKAGED").unwrap();
+                Ok(Some(PinFileBackup::new(
+                    dir.join("no-such-dir").join("backend_versions.json"),
+                    Some(previous),
+                )))
+            },
+        );
+
+        assert!(
+            format!("{:#}", flow.result.unwrap_err()).contains("HTTP 404"),
+            "the retry's error is the one reported"
+        );
+        assert_eq!(flow.warnings.len(), 2, "{:?}", flow.warnings);
+        assert!(
+            flow.warnings[1].contains("could not be put back"),
+            "{:?}",
+            flow.warnings
+        );
+        // The message says the previous file could not be put back, and it was
+        // not: the restored pins are still what is on disk.
+        assert_eq!(flow.pin_file, "PACKAGED");
+        fs::remove_dir_all(&flow.dir).ok();
+    }
+
+    #[test]
+    fn the_retry_sets_the_backend_directories_aside_and_a_success_discards_them() {
+        let flow = restore_flow(
+            vec![Err(anyhow!("HTTP error 403")), Ok(())],
+            restore_writing_packaged,
+        );
+
+        assert!(flow.result.is_ok());
+        assert_eq!(flow.attempts, [false, true]);
+        assert!(
+            flow.aside_during_retry,
+            "the existing ROCm backend must be moved aside before the forced reinstall"
+        );
+        let llamacpp = flow.dir.join("bin").join("llamacpp");
+        assert!(llamacpp.join("rocm-stable").join("new-build").exists());
+        assert!(
+            !llamacpp.join("rocm-stable").join("old-build").exists(),
+            "two builds must not be left side by side"
+        );
+        assert!(!llamacpp.join("rocm-stable.pre-alignment").exists());
+        fs::remove_dir_all(&flow.dir).ok();
+    }
+
+    #[test]
+    fn a_failed_retry_puts_the_backend_directories_back() {
+        let flow = restore_flow(
+            vec![
+                Err(anyhow!("connection reset")),
+                Err(anyhow!("HTTP 404 for the packaged tarball")),
+            ],
+            restore_writing_packaged,
+        );
+
+        assert!(flow.result.is_err());
+        assert!(flow.aside_during_retry);
+        let llamacpp = flow.dir.join("bin").join("llamacpp");
+        assert!(
+            llamacpp.join("rocm-stable").join("old-build").exists(),
+            "a failed retry must not leave the host without its ROCm backend"
+        );
+        assert!(
+            !llamacpp.join("rocm-nightly").exists(),
+            "a stray directory from the failed install must not shadow the restored build"
+        );
+        assert!(!llamacpp.join("rocm-stable.pre-alignment").exists());
+        assert_eq!(flow.pin_file, "KEPT", "the previous pins are back too");
+        fs::remove_dir_all(&flow.dir).ok();
+    }
+
+    #[test]
+    fn a_failed_retry_does_not_put_back_what_the_first_attempt_left_half_installed() {
+        let flow = restore_flow_with_partial(
+            true,
+            vec![
+                Err(anyhow!("connection reset")),
+                Err(anyhow!("HTTP 404 for the packaged tarball")),
+            ],
+            restore_writing_packaged,
+        );
+
+        assert!(flow.result.is_err());
+        let llamacpp = flow.dir.join("bin").join("llamacpp");
+        assert!(
+            llamacpp.join("rocm-stable").join("old-build").exists(),
+            "the build that was there before the first attempt is back"
+        );
+        assert!(
+            !llamacpp.join("rocm-stable").join("partial-build").exists(),
+            "a partial build from the first attempt must not be put back"
+        );
+        assert!(
+            !llamacpp.join("rocm").exists() && !llamacpp.join("rocm-nightly").exists(),
+            "neither a directory the first attempt created nor the retry's stray may stay"
+        );
+        assert!(!llamacpp.join("rocm-stable.pre-alignment").exists());
+        assert_eq!(flow.pin_file, "KEPT");
+        fs::remove_dir_all(&flow.dir).ok();
+    }
+
+    #[test]
+    fn the_restored_warning_names_the_root_cause_not_the_reinstall_advice() {
+        // The install path wraps its error in advice to run `--reinstall`; the
+        // warning says the CLI is already doing the equivalent, so it must not
+        // repeat that advice.
+        let first = anyhow!("HTTP error 403 for the pinned tarball")
+            .context("run `rocm engines install lemonade --reinstall` and then retry `rocm serve`");
+        let flow = restore_flow(vec![Err(first), Ok(())], restore_writing_packaged);
+
+        assert!(flow.result.is_ok());
+        assert_eq!(flow.warnings.len(), 1, "{:?}", flow.warnings);
+        assert!(
+            flow.warnings[0].contains("HTTP error 403"),
+            "{:?}",
+            flow.warnings
+        );
+        assert!(
+            !flow.warnings[0].contains("--reinstall"),
+            "{:?}",
+            flow.warnings
+        );
+        fs::remove_dir_all(&flow.dir).ok();
+    }
+
+    #[test]
+    fn equal_pin_still_failing_after_the_restore_reports_the_retry_failure() {
+        let (result, attempts, _restores) = prepare_with_equal_pin(
+            vec![
+                Err(anyhow!("first failure")),
+                Err(anyhow!("failure against the packaged pins")),
+            ],
+            Ok(true),
+        );
+
+        assert!(format!("{:#}", result.unwrap_err()).contains("packaged pins"));
+        assert_eq!(attempts, [false, true]);
     }
 
     #[test]
@@ -1943,74 +2285,5 @@ mod tests {
 
         fs::remove_file(path_dir.join("hipblas.dll")).unwrap();
         assert!(!windows_backend_resolves(&backend_dir, &search_dirs));
-    }
-
-    #[test]
-    fn parses_llamacpp_backends_from_table() {
-        let output = "\
-Recipe              Backend     Status          Message/Version                               Action
-----------------------------------------------------------------------------------------------------
-kokoro              cpu         installable     Backend is supported but not installed.       lemonade backends install kokoro:cpu
-                    metal       unsupported     Requires macOS                                -
-llamacpp            cpu         installable     Backend is supported but not installed.       lemonade backends install llamacpp:cpu
-                    metal       unsupported     Requires macOS                                -
-                    rocm        unsupported     Unsupported GPU                               -
-                    system      unsupported     Requires Linux                               -
-                    vulkan      installable     Backend is supported but not installed.       lemonade backends install llamacpp:vulkan
-vllm                rocm        unsupported     Requires Linux                               -
-";
-        let backends = parse_llamacpp_backend_statuses(output);
-        assert_eq!(
-            backends,
-            vec![
-                ("cpu".to_owned(), "installable".to_owned()),
-                ("metal".to_owned(), "unsupported".to_owned()),
-                ("rocm".to_owned(), "unsupported".to_owned()),
-                ("system".to_owned(), "unsupported".to_owned()),
-                ("vulkan".to_owned(), "installable".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn selects_vulkan_when_rocm_unsupported() {
-        let backends = vec![
-            ("cpu".to_owned(), "installable".to_owned()),
-            ("rocm".to_owned(), "unsupported".to_owned()),
-            ("vulkan".to_owned(), "installable".to_owned()),
-        ];
-        assert_eq!(
-            select_best_llamacpp_backend(&backends),
-            Some(("vulkan".to_owned(), false))
-        );
-    }
-
-    #[test]
-    fn prefers_installed_rocm_when_supported() {
-        let backends = vec![
-            ("rocm".to_owned(), "installed".to_owned()),
-            ("vulkan".to_owned(), "installable".to_owned()),
-        ];
-        assert_eq!(
-            select_best_llamacpp_backend(&backends),
-            Some(("rocm".to_owned(), true))
-        );
-    }
-
-    #[test]
-    fn never_selects_cpu_when_no_gpu_backend() {
-        // Under the GPU-required policy there is no silent CPU fallback: when only
-        // a CPU backend is usable, selection returns nothing and the caller fails.
-        let backends = vec![
-            ("rocm".to_owned(), "unsupported".to_owned()),
-            ("cpu".to_owned(), "installable".to_owned()),
-        ];
-        assert_eq!(select_best_llamacpp_backend(&backends), None);
-    }
-
-    #[test]
-    fn selects_nothing_when_all_unsupported() {
-        let backends = vec![("rocm".to_owned(), "unsupported".to_owned())];
-        assert_eq!(select_best_llamacpp_backend(&backends), None);
     }
 }

@@ -2,21 +2,24 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::common::{self, CommandCapture};
+use crate::common;
+use crate::host_snapshot;
+use crate::mcp_argv::{
+    build_install_engine_args, build_install_sdk_args, build_launch_server_args,
+    build_watcher_enable_args, ensure_rocm_command_is_read_only, normalized_rocm_command_args,
+};
 use crate::persistence;
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use rocm_core::unix_time_millis;
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, RocmCliConfig,
-    load_recent_automation_events,
+    AppPaths, AutomationRuntimeState, CommandCapture, ExamineSummary, RocmCliConfig,
+    command_capture_text, load_recent_automation_events,
 };
-use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
-use std::collections::VecDeque;
-use std::fs;
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 pub(crate) fn run_mcp_server(paths: &AppPaths) -> Result<()> {
     let stdin = io::stdin();
@@ -175,14 +178,6 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
     writer.write_all(serde_json::to_string(value)?.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
-    Ok(())
-}
-
-pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).context("failed to serialize json output")?
-    );
     Ok(())
 }
 
@@ -445,7 +440,8 @@ pub(crate) fn rocm_mcp_tools() -> Vec<Value> {
                     "port": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 65535
+                        "maximum": 65535,
+                        "description": "Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)."
                     },
                     "allow_public_bind": {
                         "type": "boolean"
@@ -567,7 +563,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
     match name {
         "examine" => {
             let examine = ExamineSummary::gather()?;
-            let output = common::run_rocm_capture(&["examine"])?;
+            let output = run_rocm_capture(&["examine"])?;
             let text = command_capture_text(&output);
             if output.exit_status == 0 {
                 Ok(tool_success(text, json!(examine)))
@@ -584,7 +580,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             }
         }
         "bridge_snapshot" => {
-            let snapshot = common::build_bridge_snapshot(paths)?;
+            let snapshot = host_snapshot::build_bridge_snapshot(paths)?;
             Ok(tool_success(
                 format!(
                     "Captured bridge snapshot for {} / {} with default engine `{}`.",
@@ -595,7 +591,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         }
         "gpu_snapshot" => {
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let gpu = common::gather_gpu_snapshot_for_config(&config);
+            let gpu = host_snapshot::gather_gpu_snapshot_for_config(&config);
             let status = if !config.telemetry.local_inspection_enabled() {
                 "GPU telemetry is disabled by rocm-cli config."
             } else if gpu.amd_smi_available {
@@ -606,7 +602,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             Ok(tool_success(status.to_owned(), json!(gpu)))
         }
         "engines" => {
-            let engines = common::bridge_engine_inventory();
+            let engines = host_snapshot::bridge_engine_inventory();
             Ok(tool_success(
                 format!("Found {} engine entries.", engines.len()),
                 json!({ "engines": engines }),
@@ -633,16 +629,15 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .into_iter()
                 .find(|service| service.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
-            let tail = read_tail_lines(&record.log_path, lines)?;
+            let log_tail = read_log_tail(&record.log_path, lines)?;
             Ok(tool_success(
-                format!(
-                    "Read the last {} line(s) from service `{}`.",
-                    lines, record.service_id
-                ),
+                rocm_core::service_log_tool_summary(&record.service_id, &log_tail),
                 json!({
                     "service": record,
-                    "lines": lines,
-                    "tail": tail,
+                    "lines": log_tail.lines.len(),
+                    "lines_requested": lines,
+                    "newest_line_exceeds_read_bound": log_tail.newest_line_exceeds_the_read_bound(),
+                    "tail": log_tail.lines.join("\n"),
                 }),
             ))
         }
@@ -670,7 +665,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .get("request")
                 .and_then(Value::as_str)
                 .context("natural_language_plan requires `request`")?;
-            let output = common::run_rocm_capture(&[request])?;
+            let output = run_rocm_capture(&[request])?;
             Ok(tool_result_from_command(
                 "Ran natural-language planning through `rocm`.",
                 output,
@@ -681,7 +676,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             let argv = normalized_rocm_command_args(&arguments)?;
             ensure_rocm_command_is_read_only(&argv)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran read-only `rocm` command.",
                 output,
@@ -689,7 +684,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             ))
         }
         "update_check" => {
-            let output = common::run_rocm_capture(&["update"])?;
+            let output = run_rocm_capture(&["update"])?;
             Ok(tool_result_from_command(
                 "Ran `rocm update`.",
                 output,
@@ -699,7 +694,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "install_sdk_dry_run" => {
             let argv = build_install_sdk_args(&arguments, true)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
                 output,
@@ -709,7 +704,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "install_sdk" => {
             let argv = build_install_sdk_args(&arguments, false)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk`.",
                 output,
@@ -719,7 +714,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "install_engine" => {
             let argv = build_install_engine_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm engines install`.",
                 output,
@@ -729,7 +724,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "launch_server" => {
             let argv = build_launch_server_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm serve --managed`.",
                 output,
@@ -747,7 +742,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "watcher_enable" => {
             let argv = build_watcher_enable_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations enable`.",
                 output,
@@ -765,7 +760,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 watcher.to_owned(),
             ];
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations disable`.",
                 output,
@@ -777,6 +772,11 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             json!({ "tool": other }),
         )),
     }
+}
+
+fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
+    let paths = AppPaths::discover()?;
+    common::run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
 fn tool_success(text: String, structured: Value) -> Value {
@@ -798,12 +798,12 @@ fn mcp_stop_server_reply(service_id: &str, stopped: Value) -> Value {
         tool_success(format!("Stopped managed service `{service_id}`."), stopped)
     } else {
         // Not a success: a recorded process may still be running and holding
-        // the device. `stop_managed_service` keeps the record's PIDs and the
+        // the device. `stop_managed_service` keeps the record's PIDs and any
         // endpoint key for exactly that case, and `pid_outcomes` in the
         // structured result names the PID that could not be confirmed.
         tool_error(
             format!(
-                "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its recorded PIDs and any endpoint key were kept so a later stop can still reach it; see `pid_outcomes`."
+                "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its record, which names the processes it last recorded, and any endpoint key, which the server may still be enforcing, were kept; see `pid_outcomes`."
             ),
             stopped,
         )
@@ -842,327 +842,34 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
     })
 }
 
-fn command_capture_text(output: &CommandCapture) -> String {
-    if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else if output.stdout.trim().is_empty() {
-        format!("stderr:\n{}", output.stderr.trim())
-    } else {
-        format!(
-            "stdout:\n{}\n\nstderr:\n{}",
-            output.stdout.trim(),
-            output.stderr.trim()
-        )
-    }
-}
-
-fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut lines = VecDeque::with_capacity(limit);
-    for line in content.lines() {
-        if lines.len() == limit {
-            lines.pop_front();
-        }
-        lines.push_back(line.to_owned());
-    }
-    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
-}
-
-fn normalized_rocm_command_args(arguments: &serde_json::Map<String, Value>) -> Result<Vec<String>> {
-    let values = arguments
-        .get("args")
-        .and_then(Value::as_array)
-        .context("rocm_command requires `args`")?;
-    if values.is_empty() || values.len() > 64 {
-        bail!("rocm_command `args` must contain 1 to 64 strings");
-    }
-    let mut args = Vec::with_capacity(values.len());
-    for value in values {
-        let arg = value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("rocm_command `args` entries must be non-empty strings")?;
-        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
-            bail!("rocm_command arguments must not contain control characters");
-        }
-        if arg.len() > 512 {
-            bail!("rocm_command argument is too long");
-        }
-        args.push(arg.to_owned());
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("rocm"))
-    {
-        args.remove(0);
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("comfy"))
-    {
-        args[0] = "comfyui".to_owned();
-    }
-    if args.is_empty() {
-        bail!("rocm_command args should omit the leading `rocm` program name");
-    }
-    Ok(args)
-}
-
-fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
-    let first = args.first().map(|value| value.to_ascii_lowercase());
-    let second = args.get(1).map(|value| value.to_ascii_lowercase());
-    let read_only = match first.as_deref() {
-        Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => true,
-        Some("update") => !args.iter().any(|arg| arg == "--apply"),
-        Some("runtimes") => {
-            second.as_deref().is_none_or(|value| value == "list")
-                || (second
-                    .as_deref()
-                    .is_some_and(|value| value == "uninstall" || value == "remove")
-                    && args.iter().any(|arg| arg == "--dry-run"))
-        }
-        Some("engines") => second.as_deref().is_some_and(|value| value == "list"),
-        Some("services") => second
-            .as_deref()
-            .is_none_or(|value| matches!(value, "list" | "logs")),
-        Some("automations") => second.as_deref().is_none_or(|value| value == "list"),
-        Some("config") => second.as_deref() == Some("show"),
-        Some("comfyui") => second
-            .as_deref()
-            .is_none_or(|value| matches!(value, "status" | "logs" | "log")),
-        Some("uninstall") => args.iter().any(|arg| arg == "--dry-run"),
-        // `storage report` (the default subcommand) only measures folders. The
-        // two `remove-*` verbs delete, so they stay off the read-only list.
-        Some("storage") => second.as_deref().is_none_or(|value| value == "report"),
-        // `setup status` reports first-time setup state (read-only); `setup reset`
-        // clears the completion/dismissal state and is mutating (it does not by
-        // itself reopen onboarding). Mirrors the bin's rocm_command classifier so
-        // the read-only allowlist is consistent across binaries.
-        Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
-        // `remote targets` reads the local tailnet, `doctor` fetches another
-        // machine's state and scores it here, `status` probes sessions that
-        // already exist. None of them change anything on either machine.
-        // `serve`, `attach` and `stop` start, publish or tear down, so they stay
-        // off the list and go through the approval UI like any other mutation.
-        Some("remote") => second
-            .as_deref()
-            .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")),
-        _ => false,
-    };
-    if read_only {
-        return Ok(());
-    }
-    bail!(
-        "rocm_command changes local ROCm state or is unsupported here; request it through the ROCm CLI approval UI instead"
+/// The last `limit` lines of a service log, read through the shared bounded
+/// tail routine, with what the byte budget left unread.
+fn read_log_tail(path: &std::path::Path, limit: usize) -> Result<rocm_core::LogTail> {
+    rocm_core::tail_log_decoded(
+        path,
+        limit,
+        rocm_core::LOG_VIEW_MAX_TAIL_READ,
+        rocm_core::LogDecode::PLAIN,
     )
-}
-
-fn build_install_sdk_args(
-    arguments: &serde_json::Map<String, Value>,
-    dry_run: bool,
-) -> Result<Vec<String>> {
-    let channel = arguments
-        .get("channel")
-        .and_then(Value::as_str)
-        .unwrap_or("release");
-    let format = arguments
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("wheel");
-    let prefix = arguments.get("prefix").and_then(Value::as_str);
-    let version = arguments.get("version").and_then(Value::as_str);
-    let build_date = arguments.get("build_date").and_then(Value::as_str);
-    let allow_system_prefix = arguments
-        .get("allow_system_prefix")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if version.is_some() && build_date.is_some() {
-        bail!("install_sdk accepts either `version` or `build_date`, not both");
-    }
-
-    let mut argv = vec![
-        "install".to_owned(),
-        "sdk".to_owned(),
-        "--channel".to_owned(),
-        channel.to_owned(),
-        "--format".to_owned(),
-        format.to_owned(),
-    ];
-    if let Some(prefix) = prefix {
-        let prefix_path = std::path::Path::new(prefix);
-        if system_prefix_requires_ack(prefix_path) && !allow_system_prefix {
-            bail!(
-                "install_sdk prefix `{}` is outside the user home; require `allow_system_prefix=true` before using system paths",
-                prefix_path.display()
-            );
-        }
-        argv.push("--prefix".to_owned());
-        argv.push(prefix.to_owned());
-    }
-    if let Some(version) = version {
-        if version.trim().is_empty() {
-            bail!("install_sdk `version` cannot be empty");
-        }
-        argv.push("--version".to_owned());
-        argv.push(version.to_owned());
-    }
-    if let Some(build_date) = build_date {
-        if build_date.trim().is_empty() {
-            bail!("install_sdk `build_date` cannot be empty");
-        }
-        argv.push("--build-date".to_owned());
-        argv.push(build_date.to_owned());
-    }
-    if dry_run {
-        argv.push("--dry-run".to_owned());
-    } else {
-        // `run_rocm_capture_for_paths` spawns `rocm` with null stdin, so
-        // `interactive_terminal()` is false in the child and an active default
-        // managed runtime would make the approval gate refuse with "re-run with
-        // `--approve-replacing-active-default`" — a flag no MCP caller of this
-        // tool can supply.
-        //
-        // Not `--yes` itself: that flag carries a second, unrelated consent —
-        // approving required system-package installs, which run `sudo`. This
-        // spawn has no terminal, so it could never answer a sudo password
-        // prompt; granting that consent would make the vLLM/OpenMPI step attempt
-        // an install it cannot complete and abort the engine auto-install that
-        // previously warned and continued. `--approve-replacing-active-default`
-        // grants only the runtime-displacement consent the gate asks for.
-        //
-        // Consent is not bypassed: `install_sdk` is in
-        // `mcp_tool_requires_direct_approval`, so a direct `rocmd mcp-call`
-        // needs `--allow-mutation` after an explicit user approval, and over the
-        // MCP protocol the tool is annotated `destructiveHint` for the client's
-        // approval UI. Mirrors the chat/MCP arm in `apps/rocm`. The dry-run
-        // branch never reaches the gate (it returns earlier), so it stays bare.
-        argv.push("--approve-replacing-active-default".to_owned());
-    }
-    Ok(argv)
-}
-
-fn build_install_engine_args(arguments: &serde_json::Map<String, Value>) -> Result<Vec<String>> {
-    let engine = arguments
-        .get("engine")
-        .and_then(Value::as_str)
-        .context("install_engine requires `engine`")?;
-    let runtime_id = arguments
-        .get("runtime_id")
-        .and_then(Value::as_str)
-        .unwrap_or("therock-release");
-    let python_version = arguments.get("python_version").and_then(Value::as_str);
-    let reinstall = arguments
-        .get("reinstall")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let mut argv = vec![
-        "engines".to_owned(),
-        "install".to_owned(),
-        engine.to_owned(),
-        "--runtime-id".to_owned(),
-        runtime_id.to_owned(),
-    ];
-    if let Some(python_version) = python_version {
-        argv.push("--python-version".to_owned());
-        argv.push(python_version.to_owned());
-    }
-    if reinstall {
-        argv.push("--reinstall".to_owned());
-    }
-    Ok(argv)
-}
-
-fn build_launch_server_args(arguments: &serde_json::Map<String, Value>) -> Result<Vec<String>> {
-    let model = arguments
-        .get("model")
-        .and_then(Value::as_str)
-        .context("launch_server requires `model`")?;
-    let host = arguments
-        .get("host")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_LOCAL_HOST);
-    let allow_public_bind = arguments
-        .get("allow_public_bind")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !is_loopback_host(host) && !allow_public_bind {
-        bail!(
-            "launch_server host `{host}` is not loopback; require `allow_public_bind=true` before binding a non-local interface"
-        );
-    }
-
-    let mut argv = vec!["serve".to_owned(), model.to_owned(), "--managed".to_owned()];
-    if let Some(engine) = arguments.get("engine").and_then(Value::as_str) {
-        argv.push("--engine".to_owned());
-        argv.push(engine.to_owned());
-    }
-    if let Some(device) = arguments.get("device").and_then(Value::as_str) {
-        argv.push("--device".to_owned());
-        argv.push(device.to_owned());
-    }
-    if let Some(runtime_id) = arguments.get("runtime_id").and_then(Value::as_str) {
-        argv.push("--runtime-id".to_owned());
-        argv.push(runtime_id.to_owned());
-    }
-    if let Some(env_id) = arguments.get("env_id").and_then(Value::as_str) {
-        argv.push("--env-id".to_owned());
-        argv.push(env_id.to_owned());
-    }
-    argv.push("--host".to_owned());
-    argv.push(host.to_owned());
-    if allow_public_bind {
-        argv.push("--allow-public-bind".to_owned());
-    }
-    if let Some(port) = arguments.get("port").and_then(Value::as_u64) {
-        argv.push("--port".to_owned());
-        argv.push(port.to_string());
-    }
-    Ok(argv)
-}
-
-fn build_watcher_enable_args(arguments: &serde_json::Map<String, Value>) -> Result<Vec<String>> {
-    let watcher = arguments
-        .get("watcher")
-        .and_then(Value::as_str)
-        .context("watcher_enable requires `watcher`")?;
-    let mut argv = vec![
-        "automations".to_owned(),
-        "enable".to_owned(),
-        watcher.to_owned(),
-    ];
-    if let Some(mode) = arguments.get("mode").and_then(Value::as_str) {
-        argv.push("--mode".to_owned());
-        argv.push(mode.to_owned());
-    }
-    Ok(argv)
-}
-
-/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
-/// policy so `rocm` and `rocmd` never classify the same host differently.
-fn is_loopback_host(host: &str) -> bool {
-    !rocm_engine_protocol::is_public_bind_host(host)
-}
-
-fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
-    match rocm_core::runtime_home_dir() {
-        Some(home) => !rocm_core::runtime_path_is_same_or_inside(prefix, &home),
-        None => true,
-    }
+    .with_context(|| format!("failed to read {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::load_service_record;
     use crate::test_support::{
         assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
         temp_app_paths, workspace_test_artifact_dir,
     };
-    use crate::watchers::load_service_record;
     use std::fs;
     use std::path::PathBuf;
+
+    /// [`read_log_tail`], joined with newlines, for the tests that only look
+    /// at the text.
+    fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
+        Ok(read_log_tail(path, limit)?.lines.join("\n"))
+    }
 
     fn unique_test_path(label: &str) -> PathBuf {
         let root = workspace_test_artifact_dir();
@@ -1170,35 +877,6 @@ mod tests {
         root.join(label)
     }
 
-    #[test]
-    fn remote_read_only_verbs_are_allowed_and_mutating_ones_are_not() {
-        let allow = |args: &[&str]| {
-            let owned = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
-            super::ensure_rocm_command_is_read_only(&owned)
-        };
-
-        // These read: the local tailnet, another machine's state, sessions that
-        // already exist. Rejecting them made the whole family unusable here even
-        // though none of them change anything.
-        for args in [
-            &["remote", "targets"][..],
-            &["remote", "targets", "--tag", "gpu"][..],
-            &["remote", "doctor", "gpu-box"][..],
-            &["remote", "status"][..],
-        ] {
-            allow(args).unwrap_or_else(|error| panic!("{args:?} should be read-only: {error:#}"));
-        }
-
-        // These start, publish or tear down, so they go through approval.
-        for args in [
-            &["remote", "serve", "gpu-box", "a-model"][..],
-            &["remote", "attach", "sess"][..],
-            &["remote", "stop", "sess"][..],
-            &["remote"][..],
-        ] {
-            assert!(allow(args).is_err(), "{args:?} must not be read-only");
-        }
-    }
     #[test]
     fn rocm_mcp_tools_include_bridge_gaps() {
         let tools = rocm_mcp_tools();
@@ -1261,130 +939,149 @@ mod tests {
             .expect("explicitly approved direct MCP mutation should pass the helper guard");
     }
 
+    /// Call the `service_logs` tool for a service whose log holds `log` (no log
+    /// file at all for `None`), and return the tool's reply with the log's size
+    /// on disk, so a claim the reply makes can be checked against the file.
+    fn service_logs_reply(label: &str, log: Option<&[u8]>) -> Result<(Value, Option<u64>)> {
+        service_logs_reply_for(label, log, None)
+    }
+
+    /// [`service_logs_reply`], asking for `lines` lines when given.
+    fn service_logs_reply_for(
+        label: &str,
+        log: Option<&[u8]>,
+        lines: Option<u64>,
+    ) -> Result<(Value, Option<u64>)> {
+        let (root, paths) = temp_app_paths(label);
+        paths.ensure()?;
+        let service_id = format!("svc-{label}");
+        let record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            &service_id,
+            "llamacpp",
+            "a-model",
+            "a-model",
+            "127.0.0.1",
+            18080,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+        let size = match log {
+            Some(bytes) => {
+                fs::write(&record.log_path, bytes)?;
+                Some(fs::metadata(&record.log_path)?.len())
+            }
+            None => None,
+        };
+        let mut arguments = json!({ "service_id": service_id });
+        if let Some(lines) = lines {
+            arguments["lines"] = json!(lines);
+        }
+        let reply = handle_mcp_tool_call(
+            &paths,
+            &json!({"name": "service_logs", "arguments": arguments}),
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok((reply?, size))
+    }
+
     #[test]
-    fn rocm_command_helper_allows_only_read_only_rocm_commands() -> Result<()> {
-        let status_args = normalized_rocm_command_args(
-            serde_json::json!({
-                "args": ["rocm", "comfy", "status"]
-            })
-            .as_object()
-            .expect("json object"),
-        )?;
-        assert_eq!(status_args, vec!["comfyui".to_owned(), "status".to_owned()]);
-        ensure_rocm_command_is_read_only(&status_args).expect("ComfyUI status should be read-only");
+    fn service_logs_tell_an_empty_log_from_one_whose_newest_line_exceeds_the_read_bound()
+    -> Result<()> {
+        let bound = usize::try_from(rocm_core::LOG_VIEW_MAX_TAIL_READ)?;
+        let notice = "the newest line is longer than the 4 MiB a log view reads";
+        assert_eq!(
+            rocm_core::LOG_VIEW_MAX_TAIL_READ,
+            4 * 1024 * 1024,
+            "the notice asserted below names this many MiB"
+        );
 
-        let log_args = normalized_rocm_command_args(
-            serde_json::json!({
-                "args": ["comfyui", "logs"]
-            })
-            .as_object()
-            .expect("json object"),
-        )?;
-        ensure_rocm_command_is_read_only(&log_args).expect("ComfyUI logs should be read-only");
+        // An empty log: nothing was written, and the reply says so.
+        let (reply, size) = service_logs_reply("service-logs-empty", Some(b""))?;
+        assert_eq!(size, Some(0));
+        let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            text, "Service `svc-service-logs-empty` has no log output yet.",
+            "{reply}"
+        );
+        assert_eq!(reply["structuredContent"]["tail"], "");
+        assert_eq!(
+            reply["structuredContent"]["newest_line_exceeds_read_bound"],
+            false
+        );
 
-        let install_args = normalized_rocm_command_args(
-            serde_json::json!({
-                "args": ["comfyui", "install"]
-            })
-            .as_object()
-            .expect("json object"),
-        )?;
-        let error = ensure_rocm_command_is_read_only(&install_args)
-            .expect_err("ComfyUI install must go through approval");
-        assert!(error.to_string().contains("approval UI"));
+        // One line longer than the bound, with and without a final newline: the
+        // file has content, so "no output" or "Read the last 0 line(s)" would be
+        // false, and the structured reply carries the same distinction.
+        let one_line = vec![b'x'; bound + 1024];
+        let mut with_newline = one_line.clone();
+        with_newline.push(b'\n');
+        for (name, bytes) in [
+            ("service-logs-long", one_line),
+            ("service-logs-long-nl", with_newline),
+        ] {
+            let (reply, size) = service_logs_reply(name, Some(&bytes))?;
+            assert!(
+                size.is_some_and(|size| size > rocm_core::LOG_VIEW_MAX_TAIL_READ),
+                "{name}: {size:?}"
+            );
+            let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+            assert_eq!(
+                text,
+                format!("Service `svc-{name}` has log output, but none is shown: {notice}."),
+                "{name}: {reply}"
+            );
+            assert_eq!(reply["structuredContent"]["tail"], "", "{name}");
+            assert_eq!(
+                reply["structuredContent"]["newest_line_exceeds_read_bound"], true,
+                "{name}"
+            );
+            assert_eq!(reply["isError"], false, "{name}");
+        }
 
-        let shell_args = normalized_rocm_command_args(
-            serde_json::json!({
-                "args": ["powershell", "-Command", "whoami"]
-            })
-            .as_object()
-            .expect("json object"),
-        )?;
-        let error = ensure_rocm_command_is_read_only(&shell_args)
-            .expect_err("non-rocm shell commands should be rejected");
-        assert!(error.to_string().contains("approval UI"));
+        // Short lines are read, and the count is the number returned.
+        let (reply, _) = service_logs_reply("service-logs-two", Some(b"a\nb\n"))?;
+        let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            text,
+            "Read the last 2 line(s) from service `svc-service-logs-two`."
+        );
+        assert_eq!(reply["structuredContent"]["tail"], "a\nb");
+        assert_eq!(
+            reply["structuredContent"]["newest_line_exceeds_read_bound"],
+            false
+        );
+
+        // No log file is an error, not an empty tail.
+        let error = service_logs_reply("service-logs-absent", None)
+            .expect_err("a missing log must not read as empty");
+        assert!(format!("{error:#}").contains("failed to read"), "{error:#}");
         Ok(())
     }
 
     #[test]
-    fn rocm_command_helper_treats_setup_status_as_read_only_and_reset_as_mutating() -> Result<()> {
-        // Mirrors the bin's rocm_command classifier so `setup status` is read-only
-        // on every binary's tool surface while `setup reset` stays approval-gated.
-        let bare_args = normalized_rocm_command_args(
-            serde_json::json!({ "args": ["setup"] })
-                .as_object()
-                .expect("json object"),
-        )?;
-        ensure_rocm_command_is_read_only(&bare_args).expect("bare setup should be read-only");
-
-        let status_args = normalized_rocm_command_args(
-            serde_json::json!({ "args": ["setup", "status"] })
-                .as_object()
-                .expect("json object"),
-        )?;
-        ensure_rocm_command_is_read_only(&status_args).expect("setup status should be read-only");
-
-        let reset_args = normalized_rocm_command_args(
-            serde_json::json!({ "args": ["setup", "reset"] })
-                .as_object()
-                .expect("json object"),
-        )?;
-        let error = ensure_rocm_command_is_read_only(&reset_args)
-            .expect_err("setup reset must go through approval");
-        assert!(error.to_string().contains("approval UI"));
-        Ok(())
-    }
-
-    #[test]
-    fn rocm_command_helper_treats_runtimes_uninstall_dry_run_as_read_only() -> Result<()> {
-        // Mirrors the bin's chat_rocm_command_action_from_args classifier so a
-        // dry-run preview stays read-only on every binary's tool surface while
-        // an actual uninstall/remove still requires approval.
-        for verb in ["uninstall", "remove"] {
-            let dry_run_args = normalized_rocm_command_args(
-                serde_json::json!({ "args": ["runtimes", verb, "--dry-run"] })
-                    .as_object()
-                    .expect("json object"),
-            )?;
-            ensure_rocm_command_is_read_only(&dry_run_args)
-                .unwrap_or_else(|_| panic!("runtimes {verb} --dry-run should be read-only"));
-
-            let mutating_args = normalized_rocm_command_args(
-                serde_json::json!({ "args": ["runtimes", verb] })
-                    .as_object()
-                    .expect("json object"),
-            )?;
-            let error = match ensure_rocm_command_is_read_only(&mutating_args) {
-                Ok(()) => panic!("runtimes {verb} without --dry-run must go through approval"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("approval UI"));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn storage_report_is_read_only_but_removal_is_not() -> Result<()> {
-        for args in [vec!["storage"], vec!["storage", "report"]] {
-            let normalized = normalized_rocm_command_args(
-                serde_json::json!({ "args": args })
-                    .as_object()
-                    .expect("json object"),
-            )?;
-            ensure_rocm_command_is_read_only(&normalized)
-                .unwrap_or_else(|_| panic!("storage {args:?} only measures folders"));
-        }
-
-        for verb in ["remove-old-installs", "remove-downloads"] {
-            let normalized = normalized_rocm_command_args(
-                serde_json::json!({ "args": ["storage", verb] })
-                    .as_object()
-                    .expect("json object"),
-            )?;
-            let error = ensure_rocm_command_is_read_only(&normalized)
-                .expect_err("storage removal must go through approval");
-            assert!(error.to_string().contains("approval UI"));
-        }
+    fn service_logs_report_the_lines_returned_and_the_lines_asked_for_apart() -> Result<()> {
+        // Asking for 50 lines of a four-line log returns four, and says so in
+        // the structured reply as well as in the summary.
+        let (reply, _) =
+            service_logs_reply_for("service-logs-count", Some(b"a\nb\nc\nd\n"), Some(50))?;
+        let content = &reply["structuredContent"];
+        assert_eq!(content["lines"], 4, "{reply}");
+        assert_eq!(content["lines_requested"], 50, "{reply}");
+        assert_eq!(content["tail"], "a\nb\nc\nd", "{reply}");
+        // A log with more lines than asked for returns exactly what was asked.
+        let (reply, _) =
+            service_logs_reply_for("service-logs-count-cut", Some(b"a\nb\nc\nd\n"), Some(2))?;
+        assert_eq!(reply["structuredContent"]["lines"], 2, "{reply}");
+        assert_eq!(reply["structuredContent"]["lines_requested"], 2, "{reply}");
+        // An empty log returned none, whatever was asked for.
+        let (reply, _) = service_logs_reply_for("service-logs-count-empty", Some(b""), Some(50))?;
+        assert_eq!(reply["structuredContent"]["lines"], 0, "{reply}");
+        assert_eq!(reply["structuredContent"]["lines_requested"], 50, "{reply}");
         Ok(())
     }
 
@@ -1402,167 +1099,148 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn launch_server_rejects_public_bind_without_ack() {
-        let arguments = serde_json::Map::from_iter([
-            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
-            ("host".to_owned(), Value::String("0.0.0.0".to_owned())),
-        ]);
-        let error = build_launch_server_args(&arguments).unwrap_err();
-        assert!(
-            error.to_string().contains("allow_public_bind=true"),
-            "{error:#}"
-        );
+    fn tail_fixture(label: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = unique_test_path(&format!(
+            "rocmd-tail-{label}-{}.log",
+            crate::test_support::unique_suffix()
+        ));
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
     }
 
     #[test]
-    fn launch_server_forwards_public_bind_ack() -> Result<()> {
-        let arguments = serde_json::Map::from_iter([
-            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
-            ("host".to_owned(), Value::String("0.0.0.0".to_owned())),
-            ("allow_public_bind".to_owned(), Value::Bool(true)),
-        ]);
-        let args = build_launch_server_args(&arguments)?;
-        assert!(args.contains(&"--allow-public-bind".to_owned()));
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not read whole into one string.
+        let path = tail_fixture("large", &large_log_with_head_marker())?;
+
+        let tail = read_tail_lines(&path, 10_000)?;
+        fs::remove_file(&path)?;
+
+        assert!(!tail.lines().any(|line| line == "HEAD-MARKER"));
+        assert!(tail.ends_with("\nTAIL-MARKER"));
+        assert!(tail.lines().count() < 5122);
+        assert!(tail.lines().count() > 3500, "the window holds about 4 MiB");
         Ok(())
     }
 
     #[test]
-    fn install_sdk_rejects_system_prefix_without_ack() {
-        let arguments = serde_json::Map::from_iter([(
-            "prefix".to_owned(),
-            Value::String("/opt/rocm".to_owned()),
-        )]);
-        let error = build_install_sdk_args(&arguments, false).unwrap_err();
-        assert!(
-            error.to_string().contains("allow_system_prefix=true"),
-            "{error:#}"
-        );
-    }
+    fn read_tail_lines_shows_a_sixteen_bit_log_as_lossy_text_instead_of_failing() -> Result<()> {
+        // The tool reads the child's own bytes as UTF-8; a UTF-16 log is not
+        // detected here (only the ComfyUI log view does that), but it no
+        // longer fails the whole tool call.
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "[INFO] one\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let path = tail_fixture("utf16", &bytes)?;
 
-    /// The test above only ever hands `system_prefix_requires_ack` an
-    /// already-canonical path, so it cannot catch the bug this crate's fix
-    /// addresses: a `..`-respelled prefix that escapes `$HOME` used to compare
-    /// equal to a path still inside it (`Path::ancestors()` treats `..` as an
-    /// ordinary component), so acknowledgement was never required. Drive the
-    /// same check with a prefix built by walking `..` out of the real home
-    /// directory, which is exactly the shape the original bug let through.
-    #[test]
-    #[cfg(unix)]
-    fn install_sdk_rejects_system_prefix_reached_by_escaping_home() {
-        let home = rocm_core::runtime_home_dir().expect("a home directory");
-        let escaped_prefix = format!("{}/../../usr", home.display());
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
 
-        let arguments =
-            serde_json::Map::from_iter([("prefix".to_owned(), Value::String(escaped_prefix))]);
-        let error = build_install_sdk_args(&arguments, false).unwrap_err();
         assert!(
-            error.to_string().contains("allow_system_prefix=true"),
-            "{error:#}"
-        );
-    }
-
-    /// The `install_sdk` MCP tool spawns `rocm` with null stdin, so a real
-    /// install over an active default managed runtime would hit the approval
-    /// gate's non-interactive refusal and bail asking for a flag no MCP caller
-    /// can pass. The real-install argv must therefore carry the consent flag;
-    /// the dry-run argv must not, because a dry run never reaches the gate and
-    /// the flag there would claim an approval the caller did not give.
-    ///
-    /// It must be `--approve-replacing-active-default` and never `--yes`:
-    /// `--yes` additionally approves running `sudo` for required system
-    /// packages, and a null-stdin spawn has no terminal on which that password
-    /// prompt could be answered.
-    #[test]
-    fn install_sdk_real_install_args_approve_only_the_runtime_replacement() -> Result<()> {
-        let arguments = serde_json::Map::new();
-
-        let real = build_install_sdk_args(&arguments, false)?;
-        assert!(
-            real.contains(&"--approve-replacing-active-default".to_owned()),
-            "real install argv must approve the replacement for the null-stdin spawn: {real:?}"
-        );
-        assert!(
-            !real.contains(&"--yes".to_owned()),
-            "real install argv must not grant the system-package consent it cannot answer: {real:?}"
-        );
-        assert!(
-            !real.contains(&"--dry-run".to_owned()),
-            "real install argv must not be a dry run: {real:?}"
-        );
-
-        let dry = build_install_sdk_args(&arguments, true)?;
-        assert!(
-            !dry.contains(&"--approve-replacing-active-default".to_owned())
-                && !dry.contains(&"--yes".to_owned()),
-            "dry-run argv must not carry a consent flag: {dry:?}"
-        );
-        assert!(
-            dry.contains(&"--dry-run".to_owned()),
-            "dry-run argv must carry --dry-run: {dry:?}"
+            tail.starts_with("\u{FFFD}\u{FFFD}["),
+            "the byte order mark is replaced, the rest kept: {tail:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn install_sdk_forwards_requested_build_date_and_rejects_conflict() -> Result<()> {
-        let arguments = serde_json::Map::from_iter([(
-            "build_date".to_owned(),
-            Value::String("2026-06-05".to_owned()),
-        )]);
-        let argv = build_install_sdk_args(&arguments, true)?;
+    fn read_tail_lines_keeps_ansi_colour_codes() -> Result<()> {
+        let path = tail_fixture("ansi", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "\u{1b}[32mgreen\u{1b}[0m done");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
+        let path = tail_fixture("invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "ok\nbad\u{FFFD}byte\nlast");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_labelled_read_error() {
+        let path = unique_test_path(&format!(
+            "rocmd-tail-missing-{}.log",
+            crate::test_support::unique_suffix()
+        ));
+
+        let error = read_tail_lines(&path, 5).expect_err("a missing log must not read");
+
         assert_eq!(
-            argv,
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-                "--build-date".to_owned(),
-                "2026-06-05".to_owned(),
-                "--dry-run".to_owned(),
-            ]
+            error.to_string(),
+            format!("failed to read {}", path.display())
         );
+        assert!(
+            format!("{error:#}").contains(&format!("failed to open {}", path.display())),
+            "the cause names the failing step: {error:#}"
+        );
+    }
 
-        let conflicting = serde_json::Map::from_iter([
-            (
-                "version".to_owned(),
-                Value::String("7.13.0a20260605".to_owned()),
-            ),
-            (
-                "build_date".to_owned(),
-                Value::String("2026-06-05".to_owned()),
-            ),
-        ]);
-        let error = build_install_sdk_args(&conflicting, false)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("either `version` or `build_date`"));
+    #[test]
+    fn read_tail_lines_limit_zero_returns_nothing() -> Result<()> {
+        // With limit 0 the old reader never evicted and returned the whole
+        // file. The tool handler clamps the limit to 1..=500, so only a
+        // direct call could see it.
+        let path = tail_fixture("zero", b"a\nb\nc\n")?;
+
+        let tail = read_tail_lines(&path, 0)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "");
         Ok(())
     }
 
     #[test]
-    fn watcher_enable_builds_mode_args() -> Result<()> {
-        let arguments = serde_json::Map::from_iter([
-            (
-                "watcher".to_owned(),
-                Value::String("server-recover".to_owned()),
-            ),
-            ("mode".to_owned(), Value::String("contained".to_owned())),
-        ]);
-        let argv = build_watcher_enable_args(&arguments)?;
-        assert_eq!(
-            argv,
-            vec![
-                "automations".to_owned(),
-                "enable".to_owned(),
-                "server-recover".to_owned(),
-                "--mode".to_owned(),
-                "contained".to_owned()
-            ]
-        );
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let path = tail_fixture("few", b"a\nb\n")?;
+
+        let tail = read_tail_lines(&path, 50)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let path = tail_fixture("no-newline", b"a\nb\nc")?;
+
+        let tail = read_tail_lines(&path, 2)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "b\nc");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let path = tail_fixture("crlf", b"a\r\nb\r\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb");
         Ok(())
     }
 

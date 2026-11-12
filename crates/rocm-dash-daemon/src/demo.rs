@@ -6,13 +6,14 @@
 //!
 //! Simulates a single 8× AMD Instinct MI355X node serving inference traffic
 //! through three vLLM containers. Output is the same `PersistedEntry` NDJSON
-//! the daemon writes when `--persist-dir` is set, so `rocm replay` (and
-//! `rocm demo`) play it back unmodified.
+//! the daemon's session writer produces, so `rocm dash --replay` plays it back
+//! unmodified.
 //!
 //! Deterministic: the same [`DemoOptions`] always produce byte-identical
 //! output (seeded xorshift jitter + a fixed wallclock anchor), which the
-//! tests below pin as a hard invariant. `rocm gen-demo`, `rocm demo`, and the
-//! marketing screenshot/cast examples all consume this one generator.
+//! tests below pin as a hard invariant. `rocm dash --demo` is the consumer: it
+//! writes a session to a private file under the user data directory with
+//! [`generate_file`] and replays it.
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
@@ -186,7 +187,8 @@ struct ContainerSpec {
     tp: u32,
     port: u16,
     /// Phase of the activity sinusoid in seconds — staggers the three
-    /// instances so the heatmap and per-GPU sparklines aren't synchronised.
+    /// instances so their curves in the Observe table (throughput, queue,
+    /// kv-cache) and the per-GPU utilization sparklines aren't synchronised.
     phase_s: f64,
     /// Mean kv-cache utilization (0..100) around which it oscillates.
     kv_mean: f32,
@@ -199,7 +201,7 @@ struct ContainerSpec {
     req_mean: u32,
     /// Quantization label shown in the detail modal.
     quantization: Option<&'static str>,
-    /// Launch args excerpt rendered in the instance card / detail modal.
+    /// Launch args excerpt rendered in the instance detail modal.
     launch_args: &'static [&'static str],
 }
 
@@ -539,6 +541,8 @@ fn build_gpu(idx: usize, t_s: f64, seed: &mut u64) -> GpuMetrics {
         gpu_utilization_pct: util,
         temperature_c: temp,
         power_w: power,
+        // MI355X-class board power cap.
+        power_limit_w: Some(750.0),
         clock_mhz: Some((jitter(seed) - 0.5).mul_add(80.0, 1850.0)),
     }
 }
@@ -627,8 +631,11 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 gen_tps: Some(gen_tps),
                 gen_tps_observation: None,
                 tokens_per_watt: None,
+                power_w: None,
                 ttft_ms,
+                ttft_observation: None,
                 tpot_ms,
+                tpot_observation: None,
                 launch_args: c.launch_args.iter().map(|s| (*s).to_string()).collect(),
                 env_vars,
                 log_file: Some(format!("/var/log/vllm/{}.log", c.container_name)),
@@ -643,9 +650,14 @@ fn build_snapshot(t_s: f64, base_secs: i64, seed: &mut u64) -> Snapshot {
     let mut instances = build_instances(t_s, seed);
     // Mirror the runner: derive tokens_per_watt once both throughput and GPU
     // power are in hand, exercising the same id-normalizing join.
-    for inst in &mut instances {
-        inst.tokens_per_watt =
-            rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, &inst.gpu_ids, &gpus);
+    let attributed = rocm_dash_core::efficiency::attribute_power_w(
+        &instances,
+        &gpus,
+        &std::collections::HashMap::new(),
+    );
+    for (inst, power_w) in instances.iter_mut().zip(attributed) {
+        inst.power_w = power_w;
+        inst.tokens_per_watt = rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, power_w);
     }
     Snapshot {
         timestamp,

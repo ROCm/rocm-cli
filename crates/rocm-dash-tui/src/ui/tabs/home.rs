@@ -11,9 +11,7 @@
 //! with a hint at the tab/key that would produce something, so no tile is a
 //! dead end.
 //!
-//! ponytail: Home is added behind the existing default this phase (P2). It is
-//! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
-//! the default and folds the telemetry tabs into Observe.
+//! Home is the default tab (`ActiveTab::Home`) and is reachable by Tab / digit `1`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -23,23 +21,39 @@ use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::state::JobStatus;
 
-use crate::app::{AppState, UpdateStatus};
+use crate::app::{AppState, ConnState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 
+/// Summed VRAM used / summed VRAM total across all GPUs, as a percentage.
+/// `total == 0` is a legitimate state (e.g. the Windows collector can't
+/// correlate a multi-adapter host to specific VRAM sizes) — must read as
+/// `0.0`, not `used / 1 * 100`.
+fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
+    // Only GPUs with a known total count, on both sides of the ratio: an
+    // unknown-total GPU's used VRAM must not inflate the others' percentage.
+    let known = || snap.gpus.iter().filter(|g| g.vram_total_mb > 0);
+    let used: u64 = known().map(|g| g.vram_used_mb).sum();
+    let total: u64 = known().map(|g| g.vram_total_mb).sum();
+    if total > 0 {
+        used as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// History series helper: map each snapshot to a 0..=100 magnitude via `pick`.
+///
+/// Delegates the GPU-less skip to [`crate::ui::widgets::gpu_history`], which
+/// owns that rule for every panel that draws a GPU series.
 fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
     state: &AppState,
     pick: F,
 ) -> Vec<u64> {
-    state
-        .history
-        .iter()
-        .map(|s| pick(s).clamp(0.0, 100.0) as u64)
-        .collect()
+    crate::ui::widgets::gpu_history(state.history.iter(), pick)
 }
 
 /// Label for the node-load sparkline: no data → `—`; simulated telemetry is
@@ -54,12 +68,56 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
     }
 }
 
+/// True until the first snapshot has arrived at all. Drives only the hero
+/// title's "Detecting GPU…" placeholder — a snapshot that arrived but
+/// carries no GPUs (or a legitimately-zero field) is a known state, not a
+/// still-loading one, and reads "Unknown GPU" instead (see
+/// `node_throughput_title`). Uses the sticky `has_received_gpu_snapshot`
+/// rather than `latest`: `latest` is wiped on disconnect, replay end, and
+/// seek, none of which mean detection restarted. `Connected` arrives before
+/// the first snapshot, so it still reads pending, but a `Disconnected`
+/// before any snapshot is a failed connection (the reconnect loop never
+/// delivers one), not a loading window, and reads "Unknown GPU". For the
+/// numeric "—" placeholders, see `gpu_data_unavailable`.
+const fn gpu_telemetry_pending(state: &AppState) -> bool {
+    !state.has_received_gpu_snapshot
+        && state.latest.is_none()
+        && !matches!(state.conn, ConnState::Disconnected { .. })
+}
+
+/// True when there's no usable per-GPU data to show a number for: either no
+/// snapshot has arrived yet, or one arrived but carries no GPUs at all.
+/// Drives the headline util/vram/temp/power "—" placeholders — distinct
+/// from `gpu_telemetry_pending`, which only gates the hero title.
+fn gpu_data_unavailable(state: &AppState) -> bool {
+    state.latest.as_ref().is_none_or(|s| s.gpus.is_empty())
+}
+
 /// Peak GPU utilization across the GPUs in a snapshot (the headline metric).
 fn snap_util(s: &rocm_dash_core::metrics::Snapshot) -> f64 {
     s.gpus
         .iter()
         .map(|g| f64::from(g.gpu_utilization_pct))
         .fold(0.0, f64::max)
+}
+
+/// Sums the finite values `pick` yields across instances, or `None` when no
+/// instance contributed one. The `Option` is the point: "nothing reported a
+/// value" has to stay distinct from "every reporter measured zero", which a
+/// bare sum cannot express. A single NaN/Infinity sample is dropped rather
+/// than allowed to poison the total, as `gen_tps_cell` does per instance.
+/// `Iterator::sum` is deliberately avoided — its `f64` identity is `-0.0`, so
+/// an empty iterator sums to `-0.0` and renders as `"-0"`.
+fn instance_aggregate<F>(state: &AppState, pick: F) -> Option<f64>
+where
+    F: Fn(&rocm_dash_core::metrics::Instance) -> Option<f64>,
+{
+    state
+        .instances
+        .values()
+        .filter_map(pick)
+        .filter(|v| v.is_finite())
+        .fold(None, |acc, v| Some(acc.unwrap_or(0.0) + v))
 }
 
 /// A labeled one-row instrument: `LABEL ▁▂▃▅▆▇  value`. Port of the mock's
@@ -108,9 +166,14 @@ fn mini_spark(
 }
 
 /// Hero card title in the mock's form: `Node throughput · N × MODEL · ROCm V`.
-/// Falls back to `Unknown GPU` when no GPU model is detected, and drops the
-/// count/ROCm segments that aren't known rather than inventing them.
+/// Falls back to `Detecting GPU…` while no telemetry has arrived at all yet
+/// (see `gpu_telemetry_pending`), or to `Unknown GPU` when telemetry arrived
+/// but didn't carry a model name — and drops the count/ROCm segments that
+/// aren't known rather than inventing them.
 fn node_throughput_title(state: &AppState) -> String {
+    if gpu_telemetry_pending(state) {
+        return "Node throughput · Detecting GPU…".to_string();
+    }
     let info = state
         .latest
         .as_ref()
@@ -182,18 +245,27 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let feed = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
     let mut lines: Vec<Line> = Vec::new();
     // Running services first (most relevant "what's live now").
-    for inst in state
-        .instances
-        .values()
-        .filter(|i| i.status.is_serving())
+    for inst in format::running_instances(state)
+        .into_iter()
         .take(feed.height as usize)
     {
         let port = inst.port.map_or_else(String::new, |p| format!(" on :{p}"));
-        lines.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(theme.ok)),
-            Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
-            Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
-        ]));
+        if inst.status.is_serving() {
+            lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(theme.ok)),
+                Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
+                Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("◌ ", Style::default().fg(theme.warn)),
+                Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
+                Span::styled(
+                    format!("{port} {}", format::stage_text(inst.status)),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
     }
     // Then recent jobs (tools run), newest-relevant first. The Home tab's own
     // update-check job is plumbing, not user activity — never show it here.
@@ -237,7 +309,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let title = node_throughput_title(state);
     let hero = card(f, area, &title, BoxRole::Secondary, theme);
-    if hero.width >= 8 && hero.height >= 6 {
+    if hero.width >= 8 && hero.height >= 1 {
         let hcols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -248,11 +320,22 @@ fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 }
 
+/// One-row slots for a hero column, top to bottom. Slots past the column's
+/// height come back zero-height, so a short terminal drops the bottom rows
+/// (the legends first) rather than the whole hero.
+fn hero_rows(area: Rect) -> [Rect; 6] {
+    std::array::from_fn(|i| {
+        let i = u16::try_from(i).unwrap_or(u16::MAX);
+        if i < area.height {
+            Rect::new(area.x, area.y + i, area.width, 1)
+        } else {
+            Rect::new(area.x, area.y, area.width, 0)
+        }
+    })
+}
+
 fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let lh = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 6])
-        .split(area);
+    let lh = hero_rows(area);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "GPU UTILIZATION",
@@ -261,7 +344,11 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[0],
     );
     let util = state.latest.as_ref().map_or(0.0, snap_util);
-    let util_label = format::pct(util as f32);
+    let util_label = if gpu_data_unavailable(state) {
+        "—".to_string()
+    } else {
+        format::pct(util as f32)
+    };
     let g = GradientGauge::new(util / 100.0)
         .stops(theme.ok, theme.warn, theme.err)
         .track_bg(theme.surface_2)
@@ -279,31 +366,27 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Tokens/watt: summed across running instances when available.
     // Mark held if any contributing instance has a held gen_tps observation
     // (tok/W derives from gen_tps; aggregate inherits held status).
-    // A single NaN/Infinity instance would otherwise poison the whole sum
-    // (and, for `any_tpw_held`, count as held without ever being displayed) —
-    // filtered out the same way `tokens_per_watt` is guarded per-instance
-    // elsewhere in this tab.
-    let tpw: f64 = state
-        .instances
-        .values()
-        .filter_map(|i| i.tokens_per_watt)
-        .filter(|v| v.is_finite())
-        .sum();
+    let tpw = instance_aggregate(state, |i| i.tokens_per_watt);
     let any_tpw_held = state.instances.values().any(|i| {
         i.tokens_per_watt.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
     });
-    let tpw_label = if tpw > 0.0 {
-        let marker = if any_tpw_held {
-            crate::ui::format::HELD_MARKER
-        } else {
-            ""
-        };
-        format!("⎓ {tpw:.1} tokens / watt{marker}")
-    } else {
-        "⎓ tokens / watt —".to_string()
+    // The marker and the legend that explains it share fate: the legend row
+    // is the first thing a short hero drops, and a bare "*" with nothing on
+    // screen to define it is worse than an unannotated prior-window value.
+    let legend_fits = lh[5].height > 0;
+    let tpw_label = match tpw {
+        None => "⎓ tokens / watt —".to_string(),
+        Some(v) => {
+            let marker = if any_tpw_held && legend_fits {
+                crate::ui::format::HELD_MARKER
+            } else {
+                ""
+            };
+            format!("⎓ {v:.1} tokens / watt{marker}")
+        }
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -315,10 +398,15 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[4],
     );
     // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
-    // held AND rendered with a marker — `tpw > 0.0` mirrors the gate on
-    // `tpw_label` above so a zero-throughput aggregate (which prints
-    // "tokens / watt —" with no marker) never shows an unexplained legend.
-    if tpw > 0.0 && any_tpw_held {
+    // held, so an unmeasured aggregate (which prints "tokens / watt —" with no
+    // marker) never shows an unexplained legend.
+    //
+    // `any_tpw_held` already implies `tpw.is_some()`: it requires some instance
+    // with a finite `tokens_per_watt`, and `instance_aggregate` folds exactly
+    // those into `Some` over the same `state.instances` set. The extra
+    // `tpw.is_some() &&` term was unreachable-false, so it is gone rather than
+    // left to read as a real second condition.
+    if any_tpw_held {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format::HELD_LEGEND,
@@ -330,10 +418,7 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rh = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 6])
-        .split(area);
+    let rh = hero_rows(area);
     // In demo/replay this is not a live feed — say so rather than "LIVE".
     let (feed_label, feed_color) = if state.simulated {
         ("SIMULATED · last 60s", theme.warn)
@@ -348,11 +433,9 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[0],
     );
     let latest = state.latest.as_ref();
-    let vram = latest.map_or(0.0, |s| {
-        let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-        let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum::<u64>().max(1);
-        used as f64 / total as f64 * 100.0
-    });
+    let unavailable = gpu_data_unavailable(state);
+    let vram = latest.map_or(0.0, vram_used_pct);
+    let vram_total: u64 = latest.map_or(0, |s| s.gpus.iter().map(|g| g.vram_total_mb).sum());
     let temp = latest.map_or(0.0, |s| {
         s.gpus
             .iter()
@@ -362,16 +445,35 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let power: f64 = latest.map_or(0.0, |s| {
         s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>()
     });
+    // While there's no GPU telemetry at all, show "—" rather than 0%/0°C/0W
+    // — those look like real (broken) readings rather than a loading/unknown
+    // state. The same applies per-metric once data has arrived but a given
+    // metric reads exactly zero: a multi-adapter Windows host can't
+    // correlate VRAM totals per-device (`vram_total_mb == 0`, see
+    // `vram_used_pct`), and temp/power read 0.0 with no ADLX reading — a
+    // real GPU is never actually at 0°C/0W, so an exact zero there means
+    // "not measured", not "measured as zero".
+    let vram_label = if unavailable || vram_total == 0 {
+        "—".to_string()
+    } else {
+        format::pct(vram as f32)
+    };
+    let temp_label = if unavailable || temp == 0.0 {
+        "—".to_string()
+    } else {
+        format::celsius(temp as f32)
+    };
+    let power_label = if unavailable || power == 0.0 {
+        "—".to_string()
+    } else {
+        format::watts(power as f32)
+    };
     mini_spark(
         f,
         rh[1],
         "VRAM ",
-        &format::pct(vram as f32),
-        &history(state, |s| {
-            let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-            let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum::<u64>().max(1);
-            used as f64 / total as f64 * 100.0
-        }),
+        &vram_label,
+        &history(state, vram_used_pct),
         false,
         theme,
     );
@@ -379,7 +481,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         rh[2],
         "TEMP ",
-        &format::celsius(temp as f32),
+        &temp_label,
         &history(state, |s| {
             s.gpus
                 .iter()
@@ -393,7 +495,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         rh[3],
         "POWER",
-        &format::watts(power as f32),
+        &power_label,
         // Power can exceed 100; scale to a nominal 1kW ceiling for the trace.
         &history(state, |s| {
             s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>() / 10.0
@@ -401,26 +503,22 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         false,
         theme,
     );
-    // A single NaN/Infinity instance would otherwise poison the whole sum
-    // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
-    // without ever contributing a displayed value — guarded the same way
-    // `gen_tps_cell` guards a single instance's value.
-    let tps: f64 = state
-        .instances
-        .values()
-        .filter_map(|i| i.gen_tps)
-        .filter(|v| v.is_finite())
-        .sum();
+    let tps = instance_aggregate(state, |i| i.gen_tps);
     let any_tps_held = state.instances.values().any(|i| {
         i.gen_tps.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
     });
-    let tps_str = if any_tps_held {
-        format!("{:.0}{}", tps, crate::ui::format::HELD_MARKER)
-    } else {
-        format!("{tps:.0}")
+    // The held marker is suppressed with the legend row that explains it, as
+    // in `draw_hero_left`.
+    let legend_fits = rh[5].height > 0;
+    let tps_str = match tps {
+        None => "—".to_string(),
+        Some(v) if any_tps_held && legend_fits => {
+            format!("{:.0}{}", v, crate::ui::format::HELD_MARKER)
+        }
+        Some(v) => format!("{v:.0}"),
     };
     mini_spark(f, rh[4], "T/S  ", &tps_str, &[], true, theme);
     // Show the shared HELD_LEGEND only when the tok/s aggregate is actually
@@ -446,47 +544,59 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ])
         .split(area);
 
-    let n_running = state
-        .instances
-        .values()
-        .filter(|i| i.status.is_serving())
-        .count();
+    // Starting services count too: until the readiness probe passes they are
+    // the only sign the serve command did something.
+    let live = format::running_instances(state);
     let running = card(
         f,
         mid[0],
-        &format!("Running · {n_running}"),
+        &format!("Running · {}", live.len()),
         BoxRole::Success,
         theme,
     );
     if running.height > 0 {
-        let lines = state
-            .instances
-            .values()
-            .find(|i| i.status.is_serving())
-            .map_or_else(
-                || {
-                    let mut lines = vec![Line::from(Span::styled(
-                        "Nothing running",
-                        Style::default().fg(theme.muted),
-                    ))];
-                    if running.height > 1 {
-                        lines.push(Line::from(Span::styled(
-                            "Press 3 → Serving to launch a model",
-                            Style::default().fg(theme.muted),
-                        )));
+        let lines = if live.is_empty() {
+            let mut lines = vec![Line::from(Span::styled(
+                "Nothing running",
+                Style::default().fg(theme.muted),
+            ))];
+            if running.height > 1 {
+                lines.push(Line::from(Span::styled(
+                    "Press 3 → Serving to launch a model",
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            lines
+        } else {
+            live.iter()
+                .take(running.height as usize)
+                .map(|i| {
+                    if i.status.is_serving() {
+                        Line::from(vec![
+                            Span::styled("● ", Style::default().fg(theme.ok)),
+                            Span::styled(
+                                i.model_name.clone(),
+                                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                            ),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::styled("◌ ", Style::default().fg(theme.warn)),
+                            // Stage first so a long model id cannot push it off
+                            // a narrow tile.
+                            Span::styled(
+                                format!("{} ", format::stage_text(i.status)),
+                                Style::default().fg(theme.muted),
+                            ),
+                            Span::styled(
+                                i.model_name.clone(),
+                                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                            ),
+                        ])
                     }
-                    lines
-                },
-                |i| {
-                    vec![Line::from(vec![
-                        Span::styled("● ", Style::default().fg(theme.ok)),
-                        Span::styled(
-                            i.model_name.clone(),
-                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                        ),
-                    ])]
-                },
-            );
+                })
+                .collect()
+        };
         f.render_widget(Paragraph::new(lines), running);
     }
 
@@ -635,6 +745,7 @@ mod tests {
                 gpu_utilization_pct: 62.0,
                 temperature_c: 51.0,
                 power_w: 420.0,
+                power_limit_w: None,
                 clock_mhz: Some(2100.0),
             }],
             gpu_system_info: Some(GpuSystemInfo {
@@ -675,10 +786,249 @@ mod tests {
         assert!(t.starts_with("Node throughput · "), "prefix: {t}");
         assert!(t.contains("Instinct MI355X"), "model: {t}");
         assert!(t.contains("ROCm 6.2"), "rocm version: {t}");
-        // No telemetry → Unknown GPU, no fabricated count/version.
+        // No telemetry at all yet → "detecting", not a bogus "Unknown GPU".
         let empty = AppState::new("t".into(), "default-dark".into());
         let t2 = node_throughput_title(&empty);
-        assert_eq!(t2, "Node throughput · Unknown GPU");
+        assert_eq!(t2, "Node throughput · Detecting GPU…");
+    }
+
+    #[test]
+    fn node_throughput_title_unknown_gpu_only_when_telemetry_present_but_unnamed() {
+        // Telemetry arrived (a GPU is present) but carried no model name —
+        // distinct from "nothing has arrived yet" and must still read
+        // "Unknown GPU", not the pending/detecting placeholder.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 0.0,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                power_limit_w: None,
+                clock_mhz: None,
+            }],
+            gpu_system_info: None,
+            ..Default::default()
+        });
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_only_tracks_whether_anything_arrived() {
+        // Nothing has arrived yet → pending (drives the hero title).
+        let empty = AppState::new("t".into(), "default-dark".into());
+        assert!(gpu_telemetry_pending(&empty));
+        // A snapshot with no GPUs at all is a known state, not "still
+        // loading" — the title falls back to "Unknown GPU", not "Detecting".
+        let mut no_gpus = AppState::new("t".into(), "default-dark".into());
+        no_gpus.latest = Some(Snapshot::default());
+        assert!(!gpu_telemetry_pending(&no_gpus));
+        assert!(!gpu_telemetry_pending(&state_with_gpu()));
+    }
+
+    #[test]
+    fn gpu_data_unavailable_distinguishes_no_data_from_legitimate_zero() {
+        // Nothing has arrived yet → unavailable.
+        let empty = AppState::new("t".into(), "default-dark".into());
+        assert!(gpu_data_unavailable(&empty));
+        // A snapshot with no GPUs at all → still unavailable (no number to show).
+        let mut no_gpus = AppState::new("t".into(), "default-dark".into());
+        no_gpus.latest = Some(Snapshot::default());
+        assert!(gpu_data_unavailable(&no_gpus));
+        // A real GPU present (even with legitimately-zero fields) → available.
+        assert!(!gpu_data_unavailable(&state_with_gpu()));
+    }
+
+    #[test]
+    fn hero_shows_dash_placeholders_not_fake_zeros_when_metrics_are_unmeasured() {
+        // A real GPU is present (so the title isn't "Detecting GPU…"), but
+        // vram_total/temp/power all read exactly zero — e.g. a Windows
+        // multi-adapter host that can't correlate per-device VRAM totals,
+        // or no ADLX reading for temp/power. Each must show "—", not a
+        // fake-looking "0%"/"0°C"/"0W".
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 12.0,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                power_limit_w: None,
+                clock_mhz: None,
+            }],
+            gpu_system_info: Some(GpuSystemInfo {
+                gpu_model: "Some GPU".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let out = render(&s, 160, 30);
+        // The buffer is row-major with no row separators, so bound each
+        // check to the segment between consecutive labels — otherwise an
+        // unrelated "0%"-shaped substring earlier in the row (e.g. the
+        // "12.0%" utilization gauge) would false-positive the negative
+        // assertions below.
+        let vram_segment = out
+            .split("VRAM")
+            .nth(1)
+            .and_then(|s| s.split("TEMP").next());
+        let temp_segment = out
+            .split("TEMP")
+            .nth(1)
+            .and_then(|s| s.split("POWER").next());
+        let power_segment = out
+            .split("POWER")
+            .nth(1)
+            .and_then(|s| s.split("T/S").next());
+        let vram_segment = vram_segment.unwrap_or_else(|| panic!("vram row missing: {out:?}"));
+        let temp_segment = temp_segment.unwrap_or_else(|| panic!("temp row missing: {out:?}"));
+        let power_segment = power_segment.unwrap_or_else(|| panic!("power row missing: {out:?}"));
+        assert!(
+            vram_segment.contains('—'),
+            "vram should read —: {vram_segment:?}"
+        );
+        assert!(
+            !vram_segment.contains('%'),
+            "vram should not show a fake 0%: {vram_segment:?}"
+        );
+        assert!(
+            temp_segment.contains('—'),
+            "temp should read —: {temp_segment:?}"
+        );
+        assert!(
+            !temp_segment.contains('°'),
+            "temp should not show a fake 0°C: {temp_segment:?}"
+        );
+        assert!(
+            power_segment.contains('—'),
+            "power should read —: {power_segment:?}"
+        );
+        assert!(
+            !power_segment.contains('W'),
+            "power should not show a fake 0W: {power_segment:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_utilization_gauge_shows_dash_not_a_fake_zero_percent_when_no_gpus_are_reported() {
+        // A snapshot arrived but carries no GPUs at all (`gpu_data_unavailable`
+        // true) — the gauge label must read "—", not a fake "0.0%"
+        // (draw_hero_left's `gpu_data_unavailable` branch).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot::default());
+        let out = render(&s, 160, 30);
+        let segment = out
+            .split("GPU UTILIZATION")
+            .nth(1)
+            .and_then(|s| s.split("tokens / watt").next())
+            .unwrap_or_else(|| panic!("gpu utilization row missing: {out:?}"));
+        assert!(
+            segment.contains('—'),
+            "gpu utilization should read —, not a fake 0.0%: {segment:?}"
+        );
+        assert!(
+            !segment.contains("0.0%"),
+            "gpu utilization should not show a fake 0.0%: {segment:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_while_connected_but_no_snapshot_yet() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Connected {
+            host: "x".into(),
+            version: "1".into(),
+        };
+        assert!(gpu_telemetry_pending(&s));
+        assert_eq!(
+            node_throughput_title(&s),
+            "Node throughput · Detecting GPU…"
+        );
+    }
+
+    #[test]
+    fn gpu_telemetry_not_pending_when_disconnected_before_any_snapshot() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Disconnected {
+            reason: "connection refused".into(),
+        };
+        assert!(!gpu_telemetry_pending(&s));
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_does_not_resume_after_a_disconnect_or_replay_end() {
+        // Once connected, losing the connection (end of `--replay`, a daemon
+        // drop, ClientMsg::Disconnected) wipes `latest` but must not look
+        // like detection restarted — the title should stay on "Unknown GPU",
+        // never flip back to "Detecting GPU…".
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Connected {
+            host: "x".into(),
+            version: "1".into(),
+        };
+        s.latest = Some(Snapshot::default());
+        s.conn = ConnState::Disconnected {
+            reason: "end of recording".into(),
+        };
+        s.push_host_gpu_snapshot(Snapshot::default());
+        s.latest = None;
+        assert!(!gpu_telemetry_pending(&s));
+        s.conn = ConnState::Connecting;
+        assert!(!gpu_telemetry_pending(&s), "reconnect must not revert");
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn vram_used_pct_is_zero_not_garbage_when_total_is_unknown() {
+        // vram_total_mb == 0 is a legitimate state (e.g. the Windows
+        // collector can't correlate a multi-adapter host to specific VRAM
+        // sizes) — must read as 0.0, not `used / 1 * 100` (would be 80800.0).
+        let snap = Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 808,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 0.5,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                power_limit_w: None,
+                clock_mhz: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(vram_used_pct(&snap), 0.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn vram_used_pct_ignores_gpus_with_unknown_total() {
+        let gpu = |used, total| GpuMetrics {
+            device_id: "GPU".into(),
+            vram_used_mb: used,
+            vram_total_mb: total,
+            gpu_utilization_pct: 0.0,
+            temperature_c: 0.0,
+            power_w: 0.0,
+            power_limit_w: None,
+            clock_mhz: None,
+        };
+        let snap = Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![gpu(96000, 192_000), gpu(8000, 0)],
+            ..Default::default()
+        };
+        assert_eq!(vram_used_pct(&snap), 50.0);
     }
 
     #[test]
@@ -690,10 +1040,171 @@ mod tests {
     }
 
     #[test]
+    fn running_tile_counts_and_lists_starting_service_with_stage() {
+        use rocm_dash_core::metrics::StartupPhase;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Loading-Model".into(),
+                status: InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading),
+                },
+                ..Default::default()
+            },
+        );
+        s.instances.insert(
+            "b".into(),
+            Instance {
+                container_id: "b".into(),
+                model_name: "Dead-Model".into(),
+                status: InstanceStatus::Stopped,
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 30);
+        assert!(out.contains("Running · 1"), "{out:?}");
+        assert!(out.contains("Loading-Model"), "{out:?}");
+        assert!(out.contains("loading"), "{out:?}");
+        assert!(!out.contains("Nothing running"), "{out:?}");
+        assert!(!out.contains("Dead-Model"), "{out:?}");
+    }
+
+    #[test]
+    fn running_tile_starting_without_phase_says_starting() {
+        use rocm_dash_core::metrics::Instance;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Docker-Model".into(),
+                status: InstanceStatus::Starting { phase: None },
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 30);
+        assert!(out.contains("Running · 1"), "{out:?}");
+        assert!(out.contains("starting"), "{out:?}");
+        assert!(out.contains("Docker-Model"), "{out:?}");
+    }
+
+    #[test]
+    fn running_tile_starting_in_warmup_says_warmup() {
+        use rocm_dash_core::metrics::{Instance, StartupPhase};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Warm-Model".into(),
+                status: InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Warmup),
+                },
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 30);
+        assert!(out.contains("warmup"), "{out:?}");
+    }
+
+    #[test]
+    fn running_tile_lists_serving_before_starting() {
+        use rocm_dash_core::metrics::Instance;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        // Names chosen so alphabetical order would put the starting one first.
+        for (id, name, status) in [
+            ("a", "A-Starting", InstanceStatus::Starting { phase: None }),
+            ("b", "Z-Serving", InstanceStatus::Ready),
+        ] {
+            s.instances.insert(
+                id.into(),
+                Instance {
+                    container_id: id.into(),
+                    model_name: name.into(),
+                    status,
+                    ..Default::default()
+                },
+            );
+        }
+        let out = render(&s, 160, 30);
+        assert!(out.contains("Running · 2"), "{out:?}");
+        let serving = out.find("Z-Serving").expect("serving row");
+        let starting = out.find("A-Starting").expect("starting row");
+        assert!(serving < starting, "serving must precede starting: {out:?}");
+    }
+
+    #[test]
+    fn activity_feed_lists_starting_service_with_stage() {
+        use rocm_dash_core::metrics::{Instance, StartupPhase};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Feed-Model".into(),
+                port: Some(8123),
+                status: InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading),
+                },
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 40);
+        assert!(
+            out.contains("on :8123 loading"),
+            "feed row missing stage: {out:?}"
+        );
+        assert!(!out.contains("no recent activity"), "{out:?}");
+    }
+
+    #[test]
     fn home_does_not_panic_when_squeezed() {
         let s = state_with_gpu();
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
+        }
+    }
+
+    #[test]
+    fn hero_drops_only_its_lowest_rows_in_a_short_terminal() {
+        // A ~22-row terminal leaves the Home tab fewer rows than the six the
+        // hero's columns ask for. The readings must still draw, and they must
+        // go bottom-first: at every height the visible rows form a prefix of
+        // this list, so one is missing only when all below it are too. That is
+        // the promise docs/manual-testing.md 4c makes, pinned without naming
+        // the height each row happens to appear at (POWER at 13, T/S at 15 —
+        // thresholds that would otherwise drift silently).
+        let s = state_with_gpu();
+        let top_down = ["VRAM", "TEMP", "POWER", "T/S"];
+        for h in 8u16..=24 {
+            let out = render(&s, 160, h);
+            assert!(
+                out.contains("GPU UTILIZATION"),
+                "the hero must never render as an empty card, at height {h}:\n{out}"
+            );
+            let present: Vec<bool> = top_down.iter().map(|l| out.contains(l)).collect();
+            let kept = present.iter().take_while(|p| **p).count();
+            assert!(
+                present[kept..].iter().all(|p| !*p),
+                "the hero dropped {} but kept a row below it, at height {h}:\n{out}",
+                top_down[kept]
+            );
+        }
+        // Without this the prefix check above would pass on a hero that
+        // renders none of these rows at any height.
+        let roomy = render(&s, 160, 24);
+        for label in top_down {
+            assert!(
+                roomy.contains(label),
+                "{label} missing from a hero with room for it:\n{roomy}"
+            );
         }
     }
 
@@ -731,6 +1242,35 @@ mod tests {
         s
     }
 
+    /// The hero's T/S value, i.e. the text after the "T/S" label up to the
+    /// panel border on that row.
+    fn hero_tps_value(out: &str) -> &str {
+        out.split("T/S")
+            .nth(1)
+            .and_then(|s| s.split('│').next())
+            .unwrap_or_else(|| panic!("T/S row missing: {out:?}"))
+            .trim()
+    }
+
+    #[test]
+    fn hero_tps_shows_dash_not_negative_zero_when_nothing_reports_throughput() {
+        // A GPU is reported but no instance is serving: the Windows in-process
+        // collectors never send instances, and a Linux host with nothing
+        // running is in the same state.
+        let out = render(&state_with_gpu(), 160, 30);
+        assert_eq!(hero_tps_value(&out), "—", "got:\n{out}");
+    }
+
+    #[test]
+    fn hero_tps_shows_zero_when_an_instance_reports_zero_throughput() {
+        let out = render(
+            &state_with_instance(instance_with_obs(0.0, Some(fresh_obs()))),
+            160,
+            30,
+        );
+        assert_eq!(hero_tps_value(&out), "0", "got:\n{out}");
+    }
+
     #[test]
     fn home_held_legend_visible_when_tpw_and_tps_held() {
         let out = render(
@@ -752,6 +1292,37 @@ mod tests {
         assert!(
             out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must appear when instance data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn hero_never_shows_a_held_marker_without_its_legend() {
+        // Squeezing the hero drops the legend row before the value rows, so
+        // every height has to be checked, not just the roomy one.
+        let s = state_with_instance(instance_with_obs(300.0, Some(held_obs())));
+        let marked_tps = format!("{:.0}{}", 300.0, format::HELD_MARKER);
+        let marked_tpw = format!("{:.1} tokens / watt{}", 1.0, format::HELD_MARKER);
+        let mut saw_unmarked_value = false;
+        for h in 8u16..=30 {
+            let out = render(&s, 160, h);
+            if out.contains(&marked_tps) || out.contains(&marked_tpw) {
+                assert!(
+                    out.contains(format::HELD_LEGEND),
+                    "held marker with no legend to explain it at height {h}:\n{out}"
+                );
+            }
+            // The reading itself must survive the legend being dropped.
+            if out.contains("T/S") && !out.contains(format::HELD_LEGEND) {
+                assert!(
+                    out.contains("300"),
+                    "the T/S reading must stay once the marker is dropped, at height {h}:\n{out}"
+                );
+                saw_unmarked_value = true;
+            }
+        }
+        assert!(
+            saw_unmarked_value,
+            "no height rendered T/S without the legend — the squeeze this guards never happened"
         );
     }
 
@@ -781,27 +1352,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn home_tpw_legend_absent_when_aggregate_is_zero_even_if_held() {
-        // tokens_per_watt sums to 0.0 (the "tokens / watt —" branch, no marker
-        // rendered) while gen_tps is absent (so the tok/s side never fires
-        // either). Held metadata alone must not add an unexplained legend.
-        let inst = Instance {
+    /// An instance whose only reading is `tokens_per_watt`, held.
+    fn tpw_only_instance(tokens_per_watt: Option<f64>) -> Instance {
+        Instance {
             container_id: "m".into(),
             container_name: "m".into(),
             status: InstanceStatus::Running,
             model_name: "m".into(),
             gpu_ids: vec!["0".into()],
             gen_tps: None,
-            tokens_per_watt: Some(0.0),
+            tokens_per_watt,
             gen_tps_observation: Some(held_obs()),
             ..Default::default()
-        };
-        let out = render(&state_with_instance(inst), 160, 30);
+        }
+    }
+
+    #[test]
+    fn home_tpw_shows_a_measured_zero_rather_than_a_dash() {
+        // An instance that reports 0.0 tok/W measured it; only "no instance
+        // reported one at all" is unmeasured. Mirrors the tok/s side, which
+        // renders a reported 0 as "0" and reserves "—" for nothing reporting.
+        let out = render(&state_with_instance(tpw_only_instance(Some(0.0))), 160, 30);
         assert!(
-            !out.contains(format::HELD_LEGEND),
-            "HELD_LEGEND must not appear when the tok/W aggregate is zero; got:\n{out}"
+            out.contains(&format!("0.0 tokens / watt{}", format::HELD_MARKER)),
+            "a measured zero tok/W must render as 0.0, not —; got:\n{out}"
         );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the marked zero aggregate must still be explained; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_legend_absent_when_no_instance_reports_a_finite_value() {
+        // The invariant the aggregate change must not break: held metadata
+        // alone, with nothing finite to mark, must not conjure a legend.
+        for tpw in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            let out = render(&state_with_instance(tpw_only_instance(tpw)), 160, 30);
+            assert!(
+                out.contains("tokens / watt —"),
+                "unmeasured tok/W must read —; got for {tpw:?}:\n{out}"
+            );
+            assert!(
+                !out.contains(format::HELD_LEGEND),
+                "HELD_LEGEND must not appear with nothing marked; got for {tpw:?}:\n{out}"
+            );
+        }
     }
 
     #[test]
@@ -1253,5 +1849,28 @@ mod tests {
             glyph_color_for("running-job", &JobStatus::Running),
             theme.accent
         );
+    }
+
+    #[test]
+    fn history_skips_snapshots_with_no_gpus() {
+        // Every `pick` folds or sums over `gpus`, so a GPU-less snapshot comes
+        // out as 0. Since the widget now draws a baseline for every sample it
+        // is handed, letting those through would paint a host with no GPU as
+        // one idling at 0 °C and 0 W.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.history.push_back(Snapshot::default());
+        s.history.push_back(Snapshot::default());
+        assert!(
+            history(&s, snap_util).is_empty(),
+            "a GPU-less snapshot reached the series"
+        );
+
+        let mut with_gpu = Snapshot::default();
+        with_gpu.gpus.push(GpuMetrics {
+            gpu_utilization_pct: 50.0,
+            ..Default::default()
+        });
+        s.history.push_back(with_gpu);
+        assert_eq!(history(&s, snap_util), vec![50]);
     }
 }

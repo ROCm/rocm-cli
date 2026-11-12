@@ -2,25 +2,37 @@
 //
 // SPDX-License-Identifier: MIT
 
+pub mod binary_path;
 pub mod capability;
 pub mod chat_request;
+pub mod device_memory;
 pub mod expectation;
 pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
+pub mod lemonade_diagnostics;
 pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;
 pub mod monotonic_clock;
 pub mod paced_download;
+pub mod palette_rows;
 pub mod panic_capture;
+pub mod planted_path;
 pub mod polled_deadline;
+pub mod powershell_text_rule;
 pub mod quit_and_wait;
 pub mod reader_failure;
+pub mod runtime_root;
 pub mod send_until;
 pub mod serve_log;
+pub mod serve_plan;
 pub mod shared_runtime;
+pub mod stand_in_uname;
+pub mod stray_process;
+pub mod tasklist;
+pub mod terminal_size;
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +44,23 @@ use std::path::{Path, PathBuf};
 #[must_use]
 pub fn is_catalog_id(id: &str) -> bool {
     id.starts_with("fix-") || id.starts_with("info-")
+}
+
+/// The whole number that follows `phrase` in a markdown document, and the text
+/// after that number.
+///
+/// Both are read from the document with its whitespace collapsed first, because
+/// the sentences these fixtures sit in are hard-wrapped and the number can land
+/// on either side of a line break. `None` when the phrase is absent or is not
+/// followed by a digit. Shared by the two places that read a number out of
+/// `SKILL.md` prose, so the wrap handling lives in one function.
+#[must_use]
+pub fn number_after_phrase(md: &str, phrase: &str) -> Option<(u64, String)> {
+    let flat = md.split_whitespace().collect::<Vec<_>>().join(" ");
+    let after = flat.split(phrase).nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let number = digits.parse().ok()?;
+    Some((number, after[digits.len()..].to_owned()))
 }
 
 /// Select the single binary directory consumed by lifecycle packaging.
@@ -104,6 +133,33 @@ pub fn cli_failure_report(args: &[&str], rc: i32, stdout: &str, stderr: &str) ->
     )
 }
 
+/// One line summing up a failed `rocm services stop`.
+///
+/// That is its `Error:` line, which is the report's header (`Local server stop
+/// not confirmed`) for an unconfirmed stop, rather than the report's last detail
+/// line; otherwise the last non-blank line.
+pub fn stop_failure_summary(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("Error:"))
+        .map_or_else(|| last_line(stderr), last_line)
+}
+
+/// The last non-blank line of `text`, clipped, for a one-line failure summary.
+fn last_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > 200 {
+        format!("{}…", line.chars().take(200).collect::<String>())
+    } else {
+        line.to_owned()
+    }
+}
+
 pub fn chat_response_is_successful(response: &serde_json::Value) -> bool {
     response
         .get("choices")
@@ -158,10 +214,40 @@ pub use e2e_report as report;
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_response_is_successful, cli_failure_report, lifecycle_binary_dir,
-        user_path_write_region,
+        chat_response_is_successful, cli_failure_report, lifecycle_binary_dir, number_after_phrase,
+        stop_failure_summary, user_path_write_region,
     };
     use std::path::Path;
+
+    #[test]
+    fn stop_failure_summary_prefers_the_error_line_over_the_last_line() {
+        let stderr = "Error: Local server stop not confirmed\n  \
+                      kept: the server record\n  check: `ps -p 4242`\n\n";
+        assert_eq!(
+            stop_failure_summary(stderr),
+            "Error: Local server stop not confirmed"
+        );
+    }
+
+    #[test]
+    fn stop_failure_summary_falls_back_to_the_last_non_blank_line() {
+        let stderr = "warning: something earlier\nthread panicked at main.rs\n  \n";
+        assert_eq!(stop_failure_summary(stderr), "thread panicked at main.rs");
+        assert_eq!(stop_failure_summary(""), "");
+        assert_eq!(
+            stop_failure_summary("warning\n  indented detail  \n"),
+            "indented detail",
+            "the chosen line is trimmed"
+        );
+        let long = format!("Error: {}", "x".repeat(300));
+        let summary = stop_failure_summary(&long);
+        assert_eq!(
+            summary.chars().count(),
+            201,
+            "clipped to 200 plus an ellipsis"
+        );
+        assert!(summary.ends_with('…'), "{summary}");
+    }
 
     /// What `rocm fix fix-6-path --yes` prints *before* it does anything: the
     /// catalog recipe, reproduced here as `print_recipe` lays it out. The
@@ -181,7 +267,8 @@ mod tests {
         "Flags:      rocm fix can run it\n",
         "Note:       Windows: the PowerShell line reads and rewrites the User scope only. Do not substitute `setx PATH \"%PATH%;...\"`: setx silently truncates the value at 1024 characters.\n",
         "Note:       Windows: a PATH change only takes effect in NEW shells.\n",
-        "Verify:     rocminfo | head -n 5 && hipcc --version\n",
+        "Verify:     hipcc --version\n",
+        "Verify (Linux, WSL): rocminfo | head -n 5\n",
         "\n",
     );
 
@@ -206,6 +293,25 @@ mod tests {
     /// whole-output `!contains("setx ")` — what diagnose-38 asserted before —
     /// fails on this output even though the CLI did exactly the right thing,
     /// which is what left `main`'s Windows E2E lane permanently red.
+    #[test]
+    fn number_after_phrase_reads_across_a_hard_wrap() {
+        let md = "This skill requires `contract_version`
+   12 or higher, and
+more.";
+        assert_eq!(
+            number_after_phrase(md, "requires `contract_version` "),
+            Some((12, " or higher, and more.".to_owned()))
+        );
+        assert_eq!(number_after_phrase(md, "no such phrase"), None);
+        assert_eq!(
+            number_after_phrase(
+                "requires `contract_version` many",
+                "requires `contract_version` "
+            ),
+            None
+        );
+    }
+
     #[test]
     fn the_write_region_excludes_the_catalog_prose_that_merely_names_setx() {
         let output = format!("{PATH_FIX_CATALOG_BLOCK}{PATH_WRITE_THROUGH_POWERSHELL}");

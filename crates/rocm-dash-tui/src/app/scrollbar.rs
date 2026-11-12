@@ -124,6 +124,16 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         {
             return KeyAction::SwitchTab(tab);
         }
+        // Header warning badge: a click opens the warnings, as `!` does, and is
+        // gated on `global_hotkeys_reachable` like the key. A pending approval or
+        // quit prompt was already swallowed above; this gate is what keeps the
+        // click out of an open modal, a manager overlay and focused chat input.
+        if let Some(badge) = state.last_header_badge
+            && state.global_hotkeys_reachable()
+            && badge.contains((me.column, me.row).into())
+        {
+            return KeyAction::OpenWarnings;
+        }
         // Footer legend: a click on a key chip acts exactly like the key press.
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
             return chip;
@@ -137,7 +147,7 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // the time this check runs it has reduced to `has_open_overlay()`;
         // written via `overlay_or_approval()` anyway so this can't silently
         // drift from the manager-overlay swallow it mirrors (see the
-        // analogous check in ui/mod.rs's footer-chip gating).
+        // analogous check in ui/footer.rs's footer-chip gating).
         if state.overlay_or_approval() {
             return KeyAction::Nothing;
         }
@@ -432,6 +442,91 @@ mod tests {
         // Manager open → the body click is swallowed (no click-through).
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
         assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    fn click_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_the_header_badge_acts_like_the_bang_key() {
+        let mut s = st();
+        s.last_header_badge = Some(Rect::new(20, 1, 9, 1));
+        assert_eq!(resolve_mouse(click_at(20, 1), &s), KeyAction::OpenWarnings);
+        assert_eq!(resolve_mouse(click_at(28, 1), &s), KeyAction::OpenWarnings);
+        // Just outside the badge on either side, and on the row below it.
+        for (x, y) in [(19, 1), (29, 1), (22, 2)] {
+            assert_ne!(
+                resolve_mouse(click_at(x, y), &s),
+                KeyAction::OpenWarnings,
+                "({x}, {y})"
+            );
+        }
+        s.last_header_badge = None;
+        assert_ne!(
+            resolve_mouse(click_at(22, 1), &s),
+            KeyAction::OpenWarnings,
+            "no badge drawn, nothing to click"
+        );
+    }
+
+    /// Own the screen with `own`, then click the header badge.
+    fn assert_badge_click_blocked_while(what: &str, own: impl FnOnce(&mut AppState)) {
+        let mut s = st();
+        s.last_header_badge = Some(Rect::new(20, 1, 9, 1));
+        own(&mut s);
+        assert_ne!(
+            resolve_mouse(click_at(22, 1), &s),
+            KeyAction::OpenWarnings,
+            "badge click must not fire while {what} owns the screen"
+        );
+    }
+
+    // The click must be refused wherever the `!` key itself would not fire, or
+    // the popup would open underneath whatever owns the screen. A pending
+    // approval and the quit prompt are already swallowed earlier in
+    // `resolve_mouse`, so those two tests do not exercise the badge gate; the
+    // plain-modal, manager-overlay and chat-input cases are what it exists for.
+    #[test]
+    fn the_header_badge_is_not_clickable_while_a_plain_modal_is_open() {
+        assert_badge_click_blocked_while("a plain modal", |s| s.modal = Modal::Help);
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_a_manager_overlay_is_open() {
+        assert_badge_click_blocked_while("a manager overlay", |s| {
+            s.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        });
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_an_approval_is_pending() {
+        assert_badge_click_blocked_while("a pending approval", |s| {
+            s.open_approval(crate::tool_exec::ApprovalIntent {
+                title: "run a command".into(),
+                body: vec!["echo hi".into()],
+                name: "shell".into(),
+                arguments: serde_json::Value::Null,
+            });
+        });
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_quit_is_being_confirmed() {
+        assert_badge_click_blocked_while("the quit-confirm prompt", AppState::open_quit_confirm);
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_typing_in_chat() {
+        assert_badge_click_blocked_while("focused chat text entry", |s| {
+            s.active_tab = ActiveTab::Chat;
+            s.chat_focused = true;
+        });
     }
 
     #[test]
@@ -905,7 +1000,7 @@ mod tests {
     #[test]
     fn instance_detail_scrollbar_click_grabs_drag_scrolls_then_releases() {
         // Mirrors `scrollbar_click_grabs_drag_scrolls_then_releases` for the
-        // instance Detail modal's scrollbar (`instances.rs::render_body`
+        // instance Detail modal's scrollbar (`instance_detail.rs::render_body`
         // registers one for each of its two panes) — proves the
         // `ScrollTarget::InstanceDetail` wiring added for mouse-drag support
         // actually moves `instance_detail_scroll`, not just that the bar

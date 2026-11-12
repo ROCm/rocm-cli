@@ -358,7 +358,7 @@ pub(crate) fn render_targets(status: &TailnetStatus, tag: Option<&str>) -> Strin
         let _ = writeln!(
             output,
             "  check: rocm remote doctor {}",
-            super::shell_quote(&peer.host)
+            rocm_core::posix_shell_quote(&peer.host)
         );
     }
 

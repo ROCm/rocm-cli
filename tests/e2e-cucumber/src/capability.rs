@@ -34,6 +34,30 @@ fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
+/// Whether a container runtime is usable here.
+///
+/// Probed rather than assumed: a developer machine may have the client without
+/// a running daemon.
+///
+/// Necessary but not sufficient for `@requires-docker` — see the
+/// `requires_docker` gate in `expectation.rs`, which also wants an explicit
+/// opt-in. A daemon answering does not mean the fixture image can be built: a
+/// self-hosted runner behind a restricted network has both a working daemon
+/// and no route to the package mirror the image installs from.
+///
+/// Also used by [`HostCapability::engine_available`] for `"aim"`: unlike
+/// lemonade/vllm, the AIM adapter is always present in the binary's inventory
+/// (a static description, not a liveness probe — see `rocm engines list`), so
+/// "can this engine start" must check for a reachable Docker daemon itself.
+pub(crate) fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// What `rocm serve <model>` would pick with no `--engine`, from GPU family + OS.
 ///
 /// Mirrors the product precedence in `preferred_serve_engine_for_host_gpu_summary`
@@ -123,11 +147,31 @@ pub struct HostCapability {
     /// Stable platform identity derived from hardware, not from an artifact name:
     /// "mock" (no AMD GPU), else the family/target (e.g. "mi300x", "strix-halo").
     pub platform_slug: String,
+    /// Whether the `rocm` binary under test carries the test-only
+    /// `e2e-oom-fault-injection` hook, so `@requires-oom-fault-injection`
+    /// scenarios can simulate a GPU-less OOM launch. It is compiled out of the
+    /// shipping binary, and the harness cannot probe for it (no product command
+    /// exposes it), so `xtask e2e` reports it via the [`OOM_FAULT_INJECTION_ENV`]
+    /// environment variable — set only when xtask built the binary itself with
+    /// the feature, and absent for a prebuilt `ROCM_CLI_BINARY` (the self-hosted
+    /// lanes' shipping release build). See [`probe_host_capability`].
+    pub oom_fault_injection: bool,
     /// Whether two file names differing only in letter case are two files under
     /// the temp root the scenarios' isolated roots are created in. Gates
     /// `@requires-case-sensitive-fs`; see [`probe_case_sensitive_fs`].
     pub case_sensitive_fs: bool,
+    /// Whether a directory made read-only refuses new files to the user
+    /// running the suite. Gates `@requires-dir-permissions`; see
+    /// [`probe_dir_permissions_bind`].
+    pub dir_permissions_bind: bool,
 }
+
+/// Environment variable `xtask e2e` sets to `1` when it compiled the binary
+/// under test with the `rocm/e2e-oom-fault-injection` feature.
+///
+/// Re-exported from `e2e-report` — the single source of truth shared with the
+/// producer (`xtask::e2e`) — so the two sides cannot drift out of sync.
+pub use e2e_report::OOM_FAULT_INJECTION_ENV;
 
 impl HostCapability {
     /// Whether a given engine can actually START on this host. Distinct from
@@ -139,6 +183,19 @@ impl HostCapability {
             "vllm" => {
                 !self.os_family.eq_ignore_ascii_case("windows")
                     && family_prefers_vllm(self.gfx_target.as_deref())
+            }
+            "aim" => {
+                self.available_engines.iter().any(|e| e == engine)
+                    && docker_available()
+                    // aim's verified hardware is Radeon (gfx110X/120X) and
+                    // Strix Halo (gfx1151) — exactly the families
+                    // `family_prefers_vllm` excludes. Without this, a
+                    // Docker-equipped Instinct lane would run the Radeon aim
+                    // image with a W7900 profile. Strix Halo is verified for the
+                    // raw image reference serve-26 uses; the catalog entry
+                    // itself is refused on gfx1151 (no profile for it), so
+                    // this is not a statement about the catalog.
+                    && !family_prefers_vllm(self.gfx_target.as_deref())
             }
             _ => self.available_engines.iter().any(|e| e == engine),
         }
@@ -174,6 +231,17 @@ pub struct PlatformVersions {
     /// a mislabeled `--channel` flag can't misreport what's actually installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// Exact GFX target the active runtime was installed for, e.g. "gfx1100",
+    /// from its recorded wheel composition. `None` for a runtime that records
+    /// none (a tarball or legacy install).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gfx_target: Option<String>,
+    /// Where the active runtime's packages came from, as recorded in its
+    /// registry record: the index URL and, in parentheses, the source layout
+    /// generation, e.g. "https://repo.amd.com/rocm/whl-multi-arch (multi-arch-v2)".
+    /// Read from the runtime, never from a workflow-passed label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Collect component versions for the report from the installed managed runtime.
@@ -201,20 +269,33 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // ROCm/vLLM/lemonade versions come from the installed managed runtime. Only
     // available when CI provides a persistent runtimes dir (E2E_SHARED_RUNTIMES_DIR)
     // — mock has no runtime, and per-scenario isolated installs are gone by now.
-    if let Some((rocm, channel, root)) = runtimes_dir.and_then(active_runtime_install_root) {
-        v.rocm = Some(rocm);
-        v.channel = channel;
+    if let Some(runtime) = runtimes_dir.and_then(active_runtime_install_root) {
+        v.rocm = Some(runtime.version);
+        v.channel = runtime.channel;
+        v.gfx_target = runtime.gfx_target;
+        v.source = runtime.source;
         // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
-        v.vllm = vllm_version_from_venv(&root);
+        v.vllm = vllm_version_from_venv(&runtime.root);
         // lemonade: `<root>/engines/lemonade/runtime/lemond --version`.
-        v.lemonade = lemonade_version(&root);
+        v.lemonade = lemonade_version(&runtime.root);
     }
 
     v
 }
 
-/// Read the active managed runtime's `(version, channel, install_root)` from the
-/// runtimes registry. Returns `None` when the tree names no single runtime.
+/// What the report reads from the active managed runtime's registry record.
+#[derive(Debug)]
+struct ActiveRuntime {
+    version: String,
+    channel: Option<String>,
+    root: std::path::PathBuf,
+    gfx_target: Option<String>,
+    source: Option<String>,
+}
+
+/// Read the active managed runtime's version, channel, install root, exact GFX
+/// target and package source from the runtimes registry. Returns `None` when
+/// the tree names no single runtime.
 /// `channel` is `None` for a registry record predating the field.
 ///
 /// Which runtime that is comes from [`crate::shared_runtime::runtime_key_to_activate`],
@@ -244,9 +325,7 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 /// fallback yields an in-tree path or nothing. Where every entry is such a
 /// corpse this returns `None` and the report simply omits the version — absent
 /// reads as unknown, which is the honest outcome; a wrong version reads as fact.
-fn active_runtime_install_root(
-    runtimes_dir: &std::path::Path,
-) -> Option<(String, Option<String>, std::path::PathBuf)> {
+fn active_runtime_install_root(runtimes_dir: &std::path::Path) -> Option<ActiveRuntime> {
     let key = crate::shared_runtime::runtime_key_to_activate(runtimes_dir)?;
     let manifest = runtimes_dir.join("registry").join(format!("{key}.json"));
     let json: serde_json::Value =
@@ -264,7 +343,51 @@ fn active_runtime_install_root(
     } else {
         std::path::PathBuf::from(json.get("install_root")?.as_str()?)
     };
-    Some((version, channel, root))
+    // Mirrors the CLI's `wheel_composition_device_target`
+    // (`apps/rocm/src/runtime_registry.rs`): a runtime installed with a family
+    // label records no `rocm_sdk_target`, only the `device-<target>` extra in its
+    // package specs.
+    let gfx_target = json
+        .pointer("/wheel_composition/rocm_sdk_target")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            json.pointer("/wheel_composition/package_specs")?
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find_map(|spec| {
+                    let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+                    extras
+                        .split(',')
+                        .map(str::trim)
+                        .find_map(|extra| extra.strip_prefix("device-"))
+                })
+                .map(str::to_owned)
+        });
+    let source = json
+        .get("index_url")
+        .and_then(serde_json::Value::as_str)
+        .map(|url| {
+            // Same two-level fallback as the CLI's `manifest_source_layout`: a
+            // manifest older than the top-level field carries the generation on
+            // its wheel composition.
+            match json
+                .get("source_layout_generation")
+                .or_else(|| json.pointer("/wheel_composition/source_layout_generation"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(generation) => format!("{url} ({generation})"),
+                None => url.to_owned(),
+            }
+        });
+    Some(ActiveRuntime {
+        version,
+        channel,
+        root,
+        gfx_target,
+        source,
+    })
 }
 
 /// Select the canonical aggregate wheel runtime from `rocm runtimes list` output.
@@ -376,7 +499,10 @@ fn probe_host_capability() -> HostCapability {
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
         derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
+    let oom_fault_injection =
+        oom_fault_injection_from_env(std::env::var_os(OOM_FAULT_INJECTION_ENV).as_deref());
     let case_sensitive_fs = probe_case_sensitive_fs(root);
+    let dir_permissions_bind = probe_dir_permissions_bind(root);
 
     HostCapability {
         os_family,
@@ -387,8 +513,47 @@ fn probe_host_capability() -> HostCapability {
         available_engines,
         effective_serve_engine,
         platform_slug,
+        oom_fault_injection,
         case_sensitive_fs,
+        dir_permissions_bind,
     }
+}
+
+/// Whether a directory with its write bits cleared refuses to create a file for
+/// the user running the suite.
+///
+/// Probed rather than inferred from the OS: root is not bound by directory
+/// permissions, and the self-hosted WSL2 guest runs the suite as root even
+/// though it is `os_family` `linux`. A scenario whose fault is "this directory
+/// takes no new files" would then pass without exercising anything, so it is
+/// skipped where this answers `false`.
+///
+/// The probe's directory is created under `dir`, the temp root the scenarios'
+/// isolated roots follow, so it answers for the filesystem they write to, and
+/// its permissions are restored before it returns so the temp root can be
+/// removed. Any I/O error answers `false`: the premise has not been shown to
+/// hold. Always `false` where there are no Unix permission bits to clear.
+#[cfg(unix)]
+fn probe_dir_permissions_bind(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = || -> std::io::Result<bool> {
+        let probe_dir = dir.join("permission-probe");
+        std::fs::create_dir_all(&probe_dir)?;
+        std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o555))?;
+        let created = std::fs::File::create(probe_dir.join("probe-file"));
+        std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o755))?;
+        Ok(created.is_err())
+    };
+    probe().unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+// Platform stub. The Unix arm does I/O and cannot be `const`, so making only
+// this arm `const` would give the two platforms different signatures.
+#[allow(clippy::missing_const_for_fn)]
+fn probe_dir_permissions_bind(_dir: &std::path::Path) -> bool {
+    false
 }
 
 /// Whether `dir`'s filesystem keeps two names that differ only in letter case
@@ -442,8 +607,9 @@ struct ExamineFacts {
 
 /// `driver_status` value meaning ROCm's WSL passthrough path is complete.
 ///
-/// The CLI sets this only when `/dev/dxg`, dxcore, `librocdxg.so` and its
-/// ldconfig entry are all present; the other WSL states (`wsl_rocdxg_missing`,
+/// The CLI sets this only when `/dev/dxg`, dxcore and `librocdxg.so` are
+/// present and the loader can find the library (an ldconfig entry, or a
+/// directory on `LD_LIBRARY_PATH`); the other WSL states (`wsl_rocdxg_missing`,
 /// `wsl_gpu_plumbing_missing`) mean the runtime cannot reach the GPU.
 const WSL_DRIVER_READY: &str = "wsl_rocdxg_ready";
 
@@ -499,6 +665,28 @@ fn host_has_usable_gpu(gfx_target: Option<&str>, is_wsl: bool, driver_status: &s
         driver_status,
         selected_visibility_mask(hip.as_deref(), rocr.as_deref()),
     )
+}
+
+/// Whether [`OOM_FAULT_INJECTION_ENV`] says the binary under test carries the
+/// `e2e-oom-fault-injection` hook.
+///
+/// The hook is a compile-time feature the harness cannot probe for, so this
+/// trusts the signal `xtask e2e` sets — and only when it built the binary itself.
+/// A prebuilt `ROCM_CLI_BINARY` (the shipping release build) leaves it unset, so
+/// those lanes skip `@requires-oom-fault-injection` rather than running a
+/// scenario the binary cannot satisfy.
+///
+/// Factored out and tested directly, like every other non-trivial capability
+/// field, because the compared *value* is the second half of a
+/// two-independently-maintained-literals coupling: `xtask/src/e2e.rs` sets `"1"`,
+/// this reads `"1"`, and changing one side alone (`"1"` → `"true"`) would turn
+/// the tag into a permanent skip on every lane with nothing red anywhere — the
+/// exact failure mode `OOM_FAULT_INJECTION_ENV`'s own doc comment warns about for
+/// the variable's *name*. Only the exact string `1` counts: an unset variable, an
+/// empty one, `0` and `true` all mean "no hook", so an operator who exports the
+/// variable loosely does not fake coverage.
+pub(crate) fn oom_fault_injection_from_env(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 /// Match the product's visibility-mask precedence: HIP wins when present,
@@ -647,7 +835,7 @@ fn parse_engines_list(text: &str) -> Vec<String> {
             continue;
         }
         let first = trimmed.split_whitespace().next().unwrap_or("");
-        if matches!(first, "lemonade" | "vllm") && !engines.iter().any(|e| e == first) {
+        if matches!(first, "lemonade" | "vllm" | "aim") && !engines.iter().any(|e| e == first) {
             engines.push(first.to_owned());
         }
     }
@@ -801,7 +989,9 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
+            oom_fault_injection: false,
             case_sensitive_fs: false,
+            dir_permissions_bind: true,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -816,7 +1006,9 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
+            oom_fault_injection: false,
             case_sensitive_fs: true,
+            dir_permissions_bind: true,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -1084,13 +1276,123 @@ Local model engines
         )
         .expect("write marker");
 
-        let (version, channel, root) =
-            active_runtime_install_root(dir).expect("a runtime is named");
-        assert_eq!(version, "7.14.0");
-        assert_eq!(channel.as_deref(), Some("nightly"));
+        let runtime = active_runtime_install_root(dir).expect("a runtime is named");
+        assert_eq!(runtime.version, "7.14.0");
+        assert_eq!(runtime.channel.as_deref(), Some("nightly"));
         assert_eq!(
-            root,
+            runtime.root,
             dir.join("wheel").join("release-wheel-multi-arch-7-14-0")
+        );
+    }
+
+    /// The matrix names the exact target and package source the run served on,
+    /// read from the runtime's own record. A record that predates either field
+    /// reports none: absent reads as unknown, a guess reads as fact.
+    #[test]
+    fn reports_the_active_runtimes_target_and_source_from_its_record() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        let key = "nightly-wheel-multi-arch-7-14-0a20260601-0123456789abcdef";
+        let registry = dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": "7.14.0a20260601",
+                "install_root": install_root,
+                "channel": "nightly",
+                "index_url": "https://rocm.nightlies.amd.com/whl-multi-arch",
+                "source_layout_generation": "multi-arch-v2",
+                "wheel_composition": {
+                    "source_layout_generation": "multi-arch-v2",
+                    "package_specs": [],
+                    "rocm_sdk_target": "gfx1100"
+                },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let runtime = active_runtime_install_root(dir).expect("one runtime");
+        assert_eq!(runtime.gfx_target.as_deref(), Some("gfx1100"));
+        assert_eq!(
+            runtime.source.as_deref(),
+            Some("https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)")
+        );
+
+        let legacy_dir = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        write_manifest(
+            legacy_dir.path(),
+            "release-wheel-gfx94x-dcgpu-7-13-0",
+            "7.13.0",
+        );
+        let legacy = active_runtime_install_root(legacy_dir.path()).expect("one runtime");
+        assert_eq!(legacy.gfx_target, None);
+        assert_eq!(legacy.source, None);
+    }
+
+    /// A runtime installed with a family label records no `rocm_sdk_target`; the
+    /// target is the `device-<target>` extra in its package specs, as the CLI's
+    /// `wheel_composition_device_target` reads it.
+    #[test]
+    fn gfx_target_falls_back_to_the_device_extra_in_package_specs() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        let key = "release-wheel-gfx110x-all-7-14-0";
+        let registry = dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": "7.14.0",
+                "install_root": install_root,
+                "wheel_composition": {
+                    "package_specs": ["rocm[libraries,device-gfx1100]==7.14.0"],
+                },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let runtime = active_runtime_install_root(dir).expect("one runtime");
+        assert_eq!(runtime.gfx_target.as_deref(), Some("gfx1100"));
+    }
+
+    /// A manifest older than the top-level `source_layout_generation` carries it
+    /// on its wheel composition; the source still names the generation, as the
+    /// CLI's `manifest_source_layout` does.
+    #[test]
+    fn source_generation_falls_back_to_the_wheel_composition() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        let key = "release-wheel-multi-arch-7-14-0";
+        let registry = dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": "7.14.0",
+                "install_root": install_root,
+                "index_url": "https://example.test/whl",
+                "wheel_composition": { "source_layout_generation": "multi-arch-v2" },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let runtime = active_runtime_install_root(dir).expect("one runtime");
+        assert_eq!(
+            runtime.source.as_deref(),
+            Some("https://example.test/whl (multi-arch-v2)")
         );
     }
 
@@ -1133,5 +1435,72 @@ Local model engines
         let not_a_dir = tmp.path().join("plain-file");
         std::fs::write(&not_a_dir, "").expect("write file");
         assert!(!probe_case_sensitive_fs(&not_a_dir));
+    }
+
+    /// The value half of the `@requires-oom-fault-injection` contract.
+    ///
+    /// `expectation.rs`'s `requires_oom_fault_injection_runs_only_when_the_hook_is_built_in`
+    /// builds `HostCapability { oom_fault_injection: .. }` by hand and so never
+    /// reaches this comparison; without this test, editing the literal on one
+    /// side of the producer/consumer pair would make serve-41 a permanent skip
+    /// with nothing red. The `"1"` asserted here is the same literal
+    /// `xtask::e2e`'s `command.env(OOM_FAULT_INJECTION_ENV, "1")` writes, pinned
+    /// by `release_build_resolves_and_exports_both_cli_binaries` on that side.
+    #[test]
+    fn only_the_exact_value_the_producer_writes_arms_the_hook() {
+        use std::ffi::OsStr;
+        assert!(oom_fault_injection_from_env(Some(OsStr::new("1"))));
+        // Everything else means "no hook". `"true"` and `"0"` in particular: a
+        // one-sided edit to either literal must turn the tag off loudly here,
+        // not silently on every lane.
+        assert!(!oom_fault_injection_from_env(None));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new(""))));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new("0"))));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new("true"))));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new(" 1"))));
+    }
+
+    /// A probe that cannot even make its directory has not shown the premise
+    /// holds, so the gate must skip rather than let the scenario fail.
+    #[test]
+    fn permission_probe_answers_false_when_it_cannot_write() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let not_a_dir = tmp.path().join("plain-file");
+        std::fs::write(&not_a_dir, "").expect("write file");
+        assert!(!probe_dir_permissions_bind(&not_a_dir));
+    }
+
+    /// The probe's directory is read-only while it probes; it must be given
+    /// back, or the temp root it lives in could not be removed.
+    #[cfg(unix)]
+    #[test]
+    fn permission_probe_leaves_its_directory_removable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        probe_dir_permissions_bind(tmp.path());
+        let mode = std::fs::metadata(tmp.path().join("permission-probe"))
+            .expect("probe dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o200, 0o200, "owner write bit was not restored");
+    }
+
+    /// The answer the gated scenario relies on: where the suite runs as an
+    /// ordinary user, a read-only directory refuses new files. Skipped as root,
+    /// for whom the probe is rightly `false`.
+    #[cfg(unix)]
+    #[test]
+    fn permission_probe_agrees_with_a_direct_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let direct = tmp.path().join("direct");
+        std::fs::create_dir(&direct).expect("create dir");
+        std::fs::set_permissions(&direct, std::fs::Permissions::from_mode(0o555))
+            .expect("make read-only");
+        let refused = std::fs::File::create(direct.join("file")).is_err();
+        std::fs::set_permissions(&direct, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        assert_eq!(probe_dir_permissions_bind(tmp.path()), refused);
     }
 }

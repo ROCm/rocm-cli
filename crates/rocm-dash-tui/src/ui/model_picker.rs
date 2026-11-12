@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Model picker (Phase 3 Wave 1).
+//! Model picker.
 //!
 //! A reusable, filterable list of model recipes — the sub-step the serve wizard
 //! opens from its Model field so the user can pick a built-in recipe instead of
-//! typing a model name. Selecting a recipe fills the model id and (when known)
-//! pre-selects the recipe's preferred engine.
+//! typing a model name. Selecting a recipe returns its summary; the serve
+//! wizard keeps only the id and fills the Model field with it. The recipe's
+//! preferred engine is shown in the list but never applied.
 //!
 //! Recipes are passed in as plain TUI-local [`ModelRecipeSummary`] values — the
 //! bin (`apps/rocm`, which has `rocm-core`) adapts the full `ModelRecipeRecord`
@@ -21,8 +22,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// A flattened model-recipe entry for the picker. Mirrors the fields of
 /// `rocm-core::ModelRecipeRecord` the picker needs, with no core dependency.
@@ -92,17 +94,12 @@ impl ModelPicker {
                 .filtered(recipes)
                 .get(self.selected)
                 .map_or(PickerOutcome::None, |r| PickerOutcome::Chosen((*r).clone())),
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.selected = 0;
+            code => {
+                if apply_char_key(&mut self.query, code) {
+                    self.selected = 0;
+                }
                 PickerOutcome::None
             }
-            KeyCode::Char(c) => {
-                self.query.push(c);
-                self.selected = 0;
-                PickerOutcome::None
-            }
-            _ => PickerOutcome::None,
         }
     }
 }
@@ -259,6 +256,29 @@ mod tests {
         assert_eq!(out, PickerOutcome::None);
         assert_eq!(p.query, "g");
         assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn backspace_resets_cursor_even_when_the_query_is_empty() {
+        let mut p = ModelPicker {
+            selected: 2,
+            ..Default::default()
+        };
+        let out = p.on_key(KeyCode::Backspace, &recipes());
+        assert_eq!(out, PickerOutcome::None);
+        assert_eq!(p.query, "");
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn a_non_edit_key_leaves_the_cursor_alone() {
+        let mut p = ModelPicker {
+            selected: 2,
+            ..Default::default()
+        };
+        let out = p.on_key(KeyCode::Tab, &recipes());
+        assert_eq!(out, PickerOutcome::None);
+        assert_eq!(p.selected, 2);
     }
 
     #[test]

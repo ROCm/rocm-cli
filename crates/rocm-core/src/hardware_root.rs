@@ -9,8 +9,10 @@
 //! directly. That is every one of these reads, and only these:
 //!
 //! - device nodes: `/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`;
-//! - `sysfs`: the KFD topology under `/sys/class/kfd/kfd/topology/nodes`, the
-//!   DRM cards under `/sys/class/drm`, `/sys/module/amdgpu` and
+//! - `sysfs`: the `/sys/class/kfd/kfd` class device and the KFD topology under
+//!   `/sys/class/kfd/kfd/topology/nodes`, the
+//!   DRM cards under `/sys/class/drm`, `/sys/bus/pci/drivers/amdgpu`,
+//!   `/sys/module/amdgpu` and
 //!   `/sys/module/amdgpu/version`;
 //! - `procfs`: `/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`,
 //!   `/proc/cmdline`, `/proc/modules` (the fallback when `lsmod` cannot run)
@@ -23,7 +25,8 @@
 //! - the WSL plumbing: the `/usr/lib/wsl/lib` directory check and
 //!   `/usr/lib/wsl/lib/libdxcore.so`;
 //! - the WSL ROCDXG check: `lib/librocdxg.so` and `share/rocdxg/dids.conf`,
-//!   looked for under `/opt/rocm` and under each discovered ROCm install;
+//!   looked for under `/opt/rocm` and under each discovered ROCm install,
+//!   and `lib/librocdxg.so` again in each directory on `LD_LIBRARY_PATH`;
 //! - the container markers `/.dockerenv` and `/run/.containerenv`.
 //!
 //! Deliberately NOT routed: anything a real process acts on rather than reads
@@ -42,14 +45,26 @@
 //! machine. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are
 //! about this process's environment, not the hardware.
 //!
-//! Routed, but with the real device keeping a veto: the `rocm dash` `amd-smi`
-//! pre-flight. It decides whether a real `amd-smi` process may start, so
-//! `apps/rocm/src/dash.rs` passes `host_path("/dev/kfd")` to the dash daemon
-//! and the collector requires both that path and the real `/dev/kfd` to be
-//! readable. A simulated root can hide the GPU from the dashboard but cannot
-//! start `amd-smi` on a machine without one. The WSL reachability verdict
-//! still substitutes for the whole device check, as it always has, so the veto
-//! does not cover it.
+//! Routed, but with the real device keeping a veto: the two `amd-smi`
+//! pre-flights. Each decides whether a real `amd-smi` process may start, so
+//! each requires `host_path("/dev/kfd")` *and* the real `/dev/kfd` to be
+//! readable. A simulated root can hide the GPU from them, but cannot start
+//! `amd-smi` on a machine without one. They are:
+//!
+//! - the `rocm dash` collector's, where `apps/rocm/src/dash.rs` passes the
+//!   re-rooted path down to the dash daemon. `rocm-dash-collectors` does depend
+//!   on this crate (EAI-8457) and shares [`crate::device_readable_bounded`], but
+//!   it is still *handed* the re-rooted path rather than calling [`host_path`]
+//!   itself: the path has to come from the same resolution `apps/rocm` used for
+//!   its own probes, and the daemon that carries it in between
+//!   (`rocm-dash-daemon`) has no dependency on this crate to resolve it with.
+//!   The presentation layer, `rocm-dash-tui`, has no edge to this crate at all
+//!   and is the one the `crate_edges.rs` allowlist still forbids;
+//! - the synchronous one behind `crate::amd_smi_json`, which `rocm serve` and
+//!   `rocmd` reach and which calls [`host_path`] itself.
+//!
+//! The WSL reachability verdict still substitutes for the whole device check in
+//! both, as it always has, so the veto does not cover it.
 //!
 //! In a normal build [`host_path`] is the identity: the path is returned as
 //! written and the probes read the real host. Only a build compiled with the
@@ -90,18 +105,32 @@ pub fn host_path_for_str(path: &str) -> PathBuf {
     host_path(path)
 }
 
-/// [`read_os_release`]'s `resolve` parameter for a caller that must always
-/// read the real machine.
+/// [`read_os_release`]'s `resolve` parameter for the real machine: the path
+/// as written. A bare `PathBuf::from` closure is rejected the same way a bare
+/// `host_path` is (see [`host_path_for_str`]), hence a named function.
 ///
-/// Never routed through [`host_path`], because it builds a package-manager
-/// plan or install hint that runs against the real host, so a simulated
-/// host root must not choose its distro (see each caller's own doc comment
-/// for why). A bare `PathBuf::from` is rejected the same way a bare
-/// `host_path` is (see [`host_path_for_str`]), so every such caller passes
-/// this instead of `|p| PathBuf::from(p)`.
-#[must_use]
-pub fn identity_path_for_str(path: &str) -> PathBuf {
+/// Private: the only reader that must always see the real machine is
+/// [`real_os_release`], and having one place that names this resolver is what
+/// keeps a second, diverging copy of that reader from appearing elsewhere.
+fn identity_path_for_str(path: &str) -> PathBuf {
     PathBuf::from(path)
+}
+
+/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
+/// when the former is absent (per `os-release(5)`).
+///
+/// The one reader for every caller that builds a package-manager plan or an
+/// install hint (`apt`, `dnf`, `zypper`, ...): those commands run against the
+/// real machine, so a simulated host root (see [`host_path`]) must not choose
+/// the distro they are written for. Deliberately not routed through
+/// [`host_path`] for that reason. The descriptive distro name and id that
+/// `examine` reports come from [`read_os_release`] with [`host_path_for_str`]
+/// instead, and do follow a simulated root.
+///
+/// Reads the same files on every platform; off Linux they are simply absent.
+#[must_use]
+pub fn real_os_release() -> OsRelease {
+    read_os_release(identity_path_for_str)
 }
 
 #[cfg(feature = "e2e-test-hooks")]

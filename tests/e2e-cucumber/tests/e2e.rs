@@ -32,13 +32,18 @@ mod e2e {
     pub mod endpoint_auth_steps;
     pub mod engines_steps;
     pub mod examine_steps;
+    pub mod host_guard;
+    pub mod lemonade_install_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
+    pub mod model_catalog_steps;
+    pub mod planner_steps;
     pub mod remote_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod service_stop_steps;
+    pub mod service_unknown_id_steps;
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
@@ -64,6 +69,13 @@ pub struct E2eWorld {
     /// so the port keeps answering, as a started ComfyUI's does, for the rest
     /// of the scenario.
     pub comfyui_port_listener: Option<std::net::TcpListener>,
+    /// Listener that deliberately occupies the default serve port while a real
+    /// `rocm serve` invocation proves automatic allocation advances past it.
+    pub automatic_port_guard: Option<std::net::TcpListener>,
+    /// How many requests a stand-in Hugging Face endpoint has answered, for
+    /// scenarios that must show the CLI did or did not reach out.
+    /// The serving thread stops once the World drops its handle.
+    pub hub_requests: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -74,18 +86,37 @@ pub struct E2eWorld {
     pub endpoint_api_key: Option<String>,
     pub model_name: Option<String>,
     pub chat_response: Option<serde_json::Value>,
+    /// The reply to a request sent to the served model's Anthropic-compatible
+    /// `/v1/messages` endpoint.
+    pub anthropic_response: Option<serde_json::Value>,
+    /// The raw server-sent-event body of a streaming request sent to the same
+    /// endpoint.
+    pub anthropic_stream: Option<String>,
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// One entry per `rocm serve` run a scenario made, with the stderr and exit
+    /// code `cli_outputs` has no room for (see `e2e_cucumber::serve_plan`).
+    pub serve_runs: Option<Vec<e2e_cucumber::serve_plan::ServeRun>>,
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
-    /// lock was still held cannot have waited for it. It is a one-sided bound:
-    /// the measurement brackets the whole child process, so a long elapsed time
-    /// does not establish that the prune blocked. Set by the When step that
-    /// measures it; `None` everywhere else.
+    /// lock was still held cannot have waited for it, and `examine-48`, where an
+    /// inspection that finished long before a probe tool's background process
+    /// did cannot have waited for it. Both assert the short side of a one-sided
+    /// bound: the measurement brackets the whole child process, so a long elapsed
+    /// time does not establish that the command blocked. Set by the When step
+    /// that measures it; `None` everywhere else.
     pub cli_elapsed: Option<std::time::Duration>,
+    /// The `ROCM_CLI_DATA_DIR` value a refusal told the user to set, read from
+    /// its stderr by the first step that follows that advice, so later steps
+    /// can follow it again after other commands have replaced `cli_stderr`.
+    pub suggested_data_dir: Option<String>,
+    /// The file a refusal told the user to rename and the name to give it,
+    /// read from its stderr by the step that checks the refusal, for the step
+    /// that follows that advice after other commands have replaced `cli_stderr`.
+    pub suggested_settings_rename: Option<(String, String)>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
@@ -139,6 +170,11 @@ pub struct E2eWorld {
     /// records a behavioral precondition here; the When step remains a plain user
     /// action and consumes the fixture without exposing its mechanism in Gherkin.
     pub command_env: Vec<(&'static str, std::ffi::OsString)>,
+    /// The working directory for this scenario's next `rocm` invocation, for a
+    /// scenario whose subject is what the CLI finds in the directory it is run
+    /// from. Consumed by [`run_rocm_with_scenario_env`] like `command_env`; `None`
+    /// leaves the harness's own working directory.
+    pub command_dir: Option<PathBuf>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -148,6 +184,17 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// The managed runtime's torch/torchvision/torchaudio versions captured BEFORE a
+    /// ComfyUI install (EAI-8051), so the post-install step can require them to be
+    /// unchanged. Comparing exact versions catches a swap to any other build, labelled
+    /// or not (e.g. stock PyPI `2.13.0`, which is CUDA yet carries no `+cu` label).
+    pub comfyui_baseline_torch_stack: Option<String>,
+    /// The managed runtime's installed distribution names captured BEFORE a ComfyUI
+    /// install (EAI-8051), so the post-install step can require the set to have
+    /// grown. Without it a run that installs nothing — `comfyui::install` skips the
+    /// whole `uv` step on an empty requirement list and still exits 0 — would pass
+    /// every runtime-preservation assertion having exercised nothing.
+    pub comfyui_baseline_distributions: Option<Vec<String>>,
     /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
@@ -160,6 +207,10 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The background helper (`rocm daemon`) a scenario saw running, captured
+    /// while it was known live, so `Drop` can stop it by a verified identity if
+    /// an earlier step failed before the scenario disabled the watcher.
+    pub helper_identity: Option<rocm_core::ProcessIdentity>,
     /// A live process a scenario recorded as a managed server's own, so a stop
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
@@ -172,6 +223,19 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// The identity of a process the recorded one started (`service-stop-07`'s
+    /// `ping`). Teardown ends it on its own account, because a stop that fails
+    /// to take it down leaves it running with a dead parent, where nothing else
+    /// can find it.
+    pub recorded_descendant: Option<rocm_core::ProcessIdentity>,
+    /// Whether the Doctor report preview in the dashboard console was the CLI's
+    /// refusal envelope (it carries a `refused` key). Recorded when the preview
+    /// is read, so a later step can check the card against what the CLI said.
+    pub dash_report_refused: Option<bool>,
+    /// The `rocmd run` a daemon-driven automations scenario started, with the
+    /// local webhook it listens on. Held here so `Drop` can kill and reap it
+    /// whatever the scenario's outcome.
+    pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -299,16 +363,23 @@ impl Default for E2eWorld {
             artifact_server: None,
             paced_download_server: None,
             comfyui_port_listener: None,
+            automatic_port_guard: None,
+            hub_requests: None,
             artifact_marker_path: None,
             endpoint: None,
             endpoint_api_key: None,
             model_name: None,
             chat_response: None,
+            anthropic_response: None,
+            anthropic_stream: None,
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            serve_runs: None,
             cli_elapsed: None,
+            suggested_data_dir: None,
+            suggested_settings_rename: None,
             remote_env: Vec::new(),
             launch_release: None,
             launch_stage: None,
@@ -319,12 +390,19 @@ impl Default for E2eWorld {
             serve_timeout_override: None,
             expect_xfail: false,
             command_env: Vec::new(),
+            command_dir: None,
             tui: None,
             chat_use_mock: false,
+            comfyui_baseline_torch_stack: None,
+            comfyui_baseline_distributions: None,
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            helper_identity: None,
             recorded_process: None,
+            recorded_descendant: None,
+            dash_report_refused: None,
+            automation_daemon: None,
         }
     }
 }
@@ -404,14 +482,18 @@ impl E2eWorld {
         }
         // When a scenario declares a longer serve-readiness window (via a
         // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
-        // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
-        // EAI-7393), which a large model's cold load legitimately exceeds — so
-        // extending only the harness's poll (`model_is_ready`) isn't enough; the CLI
-        // would kill the server first. Keeping the two in lockstep makes the
-        // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
+        // CLI's OWN per-engine readiness cap(s) to match. `rocm serve --managed`
+        // otherwise kills/fails a server that isn't ready within its default (5
+        // min, EAI-7393), which a large model's cold load legitimately exceeds —
+        // so extending only the harness's poll (`model_is_ready`) isn't enough;
+        // the CLI would terminate the server first. Keeping them in lockstep
+        // makes the big-model serve actually reach ready (vLLM verified on
+        // MI300X with Qwen3.6-27B; AIM verified on Strix Halo with a 9B model's
+        // cold-start HF download). Setting both vars unconditionally is harmless
+        // — the unused one is a no-op for whichever engine isn't in play.
         if let Some(secs) = self.serve_timeout_override {
             env.push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string().into()));
+            env.push(("ROCM_CLI_AIM_READY_TIMEOUT_SECS", secs.to_string().into()));
         }
         env
     }
@@ -583,10 +665,17 @@ impl E2eWorld {
     /// on every platform, instead of depending on an ambient system `/opt/rocm`
     /// that exists on the MI300X box but not on the Strix Windows runner.
     pub fn plant_unmanaged_rocm(&mut self) {
+        self.plant_unmanaged_rocm_reporting("6.0.0");
+    }
+
+    /// [`Self::plant_unmanaged_rocm`], with the version its `.info/version`
+    /// reports chosen by the scenario — for the install preview's note about a
+    /// host ROCm newer than the SDK it selects.
+    pub fn plant_unmanaged_rocm_reporting(&mut self, version: &str) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let rocm = root.path().join("legacy-rocm");
         std::fs::create_dir_all(rocm.join(".info")).expect("failed to create legacy rocm dir");
-        std::fs::write(rocm.join(".info").join("version"), "6.0.0\n")
+        std::fs::write(rocm.join(".info").join("version"), format!("{version}\n"))
             .expect("failed to write legacy rocm marker");
         self.legacy_rocm_path = Some(rocm);
     }
@@ -639,6 +728,11 @@ impl Drop for E2eWorld {
         if let Some(tui) = self.tui.take() {
             drop(tui);
         }
+        // Stop the automation daemon before the isolated directory it writes its
+        // state and logs into is removed, so it never outlives the scenario.
+        if let Some(daemon) = self.automation_daemon.take() {
+            drop(daemon);
+        }
         // Let `service-cleanup-07`'s staged launch finish and join it, so its last
         // write lands while the isolated root still exists rather than panicking
         // in a detached thread after the TempDir below is gone. Dropping the
@@ -654,6 +748,31 @@ impl Drop for E2eWorld {
         if let Some(mut process) = self.recorded_process.take() {
             let _ = process.kill();
             let _ = process.wait();
+        }
+        // The process the recorded one started: ended too when it is still the
+        // process that was recorded, so a failed scenario does not leave it
+        // running until its own timeout.
+        if let Some(descendant) = self.recorded_descendant.take() {
+            use e2e_cucumber::stray_process::{Leftover, RecordedState, leftover_action};
+            let state = match rocm_core::identity_state(&descendant) {
+                rocm_core::IdentityState::Matches => RecordedState::Same,
+                rocm_core::IdentityState::Gone => RecordedState::Gone,
+                rocm_core::IdentityState::Recycled => RecordedState::Reused,
+                rocm_core::IdentityState::Indeterminate => RecordedState::Unconfirmed,
+            };
+            if leftover_action(state) == Leftover::Terminate {
+                let _ = rocm_core::terminate_recorded_pid(&descendant);
+            }
+        }
+        // A scenario that enabled a watcher started a real detached `rocm daemon`,
+        // which only exits once the watcher is disabled. If a step failed first,
+        // nothing else would stop it, and it would keep polling a config dir
+        // that is about to be deleted.
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::stop_leftover_helper(
+                &self.app_paths(),
+                self.helper_identity.take(),
+            );
         }
         if let Some(mock) = self.mock.take() {
             mock.stop();
@@ -671,6 +790,12 @@ impl Drop for E2eWorld {
         // failed stop changes the next attempt's meaning, does read it.
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path());
+        }
+        // A scenario that made the audit directory read-only must give it back
+        // before the TempDir below tries to remove it, even if a step panicked.
+        #[cfg(unix)]
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -727,7 +852,7 @@ fn stop_managed_services(root: &std::path::Path) -> String {
             Ok(out) => format!(
                 "{service_id}: STOP FAILED (rc={}) {}",
                 out.status.code().unwrap_or(-1),
-                last_line(&String::from_utf8_lossy(&out.stderr))
+                e2e_cucumber::stop_failure_summary(&String::from_utf8_lossy(&out.stderr))
             ),
             Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
         });
@@ -736,21 +861,6 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         return format!("no services recorded in {}", services_dir.display());
     }
     outcomes.join("; ")
-}
-
-/// The last non-blank line of `text`, clipped, for a one-line failure summary.
-fn last_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.chars().count() > 200 {
-        format!("{}…", line.chars().take(200).collect::<String>())
-    } else {
-        line.to_owned()
-    }
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────
@@ -920,13 +1030,68 @@ pub fn run_rocm_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (String, String, i32) {
+    run_rocm_with_env_and_unset(world, args, envs, &[])
+}
+
+/// Like [`run_rocm_with_env`], but first removes each of `unset` from the env.
+///
+/// For a scenario about what the CLI resolves when one of the
+/// `ROCM_CLI_*_DIR` settings is left out. Everything the scenario keeps set
+/// still points inside its isolated root.
+pub fn run_rocm_with_env_and_unset(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    unset: &[&str],
+) -> (String, String, i32) {
     let binary = rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    for key in unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Like [`run_rocm`], but without `ROCM_CLI_DATA_DIR`, so the CLI has to work
+/// out its data folder from its own settings file as it does for a user who
+/// never set it.
+///
+/// The home directory is pointed inside the scenario's sandbox as well, so the
+/// default data folder the CLI falls back to (`~/.rocm`) is never the real
+/// one on the runner.
+pub fn run_rocm_without_data_dir_override(
+    world: &E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let home = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has an isolated root")
+        .path()
+        .join("home");
+    std::fs::create_dir_all(&home).expect("failed to create sandbox home");
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.env_remove("ROCM_CLI_DATA_DIR");
+    cmd.env("HOME", &home);
+    cmd.env("USERPROFILE", &home);
     let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
@@ -944,11 +1109,25 @@ pub fn run_rocm_with_env(
 /// consume it so it cannot leak into a later action in the same scenario.
 pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
     let binary = rocm_binary();
-    let mut cmd = std::process::Command::new(&binary);
+    // A binary given as a relative path was meant relative to this process's
+    // directory, not to the scenario's, so it is made absolute before the child
+    // moves. A bare name (`rocm`, found on `PATH`) stays as it is, even if the
+    // harness's directory happens to hold a file of that name.
+    let program = if world.command_dir.is_some() {
+        e2e_cucumber::binary_path::program_for_moved_child(&binary, |path| {
+            std::fs::canonicalize(path)
+        })
+    } else {
+        PathBuf::from(&binary)
+    };
+    let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
     for (key, value) in std::mem::take(&mut world.command_env) {
         cmd.env(key, value);
+    }
+    if let Some(dir) = world.command_dir.take() {
+        cmd.current_dir(dir);
     }
     let output = cmd
         .output()
@@ -1165,14 +1344,43 @@ fn load_expectations() -> e2e_cucumber::expectation::Expectations {
         .unwrap_or_else(|e| panic!("failed to parse expectations.toml: {e}"))
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack for the thread that drives the whole suite.
+///
+/// The cucumber run is one future polled by `block_on` on the calling thread, so
+/// every step future, and the evidence-gathering futures a failing serve step
+/// awaits, is held on that thread's stack. Windows gives a main thread 1 MiB
+/// against 8 MiB on Linux, and a stalled serve-06 overflowed it (#1003) instead
+/// of reporting a failure. A spawned thread's stack is whatever is asked for here.
+const SUITE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() {
+    let suite = std::thread::Builder::new()
+        .name("e2e-suite".to_owned())
+        .stack_size(SUITE_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build the tokio runtime")
+                .block_on(run_suite());
+        })
+        .expect("failed to spawn the e2e suite thread");
+    if let Err(payload) = suite.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+// `block_on` needs no `Send`, and the cucumber writers held across awaits are not.
+#[allow(clippy::future_not_send)]
+async fn run_suite() {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
-    use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
+    use e2e_cucumber::expectation::{
+        Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
+    };
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1211,6 +1419,19 @@ async fn main() {
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
+    // A `E2E_ONLY_LIFECYCLE` lane can fold in specific non-`@lifecycle`
+    // scenarios by `@id` (comma-separated) instead of running the full suite —
+    // e.g. the Windows lane adding the hermetic comfyui scenarios so they get
+    // required-CI coverage there without being tagged `@lifecycle`, which would
+    // also pull them out of `nightly.yml` and `e2e-selfhosted.yml` (neither sets
+    // `E2E_INCLUDE_LIFECYCLE`, so a `@lifecycle` tag would drop them from both).
+    let also_run_ids: Vec<String> = std::env::var("E2E_ALSO_RUN_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
     // per-engine canary covers them on the PR fast path); set by
     // e2e-selfhosted.yml on the `merge_group` event.
@@ -1250,7 +1471,7 @@ async fn main() {
     // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
     // at one persistent dir (see `isolate_env`): readers extracting an archive
     // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
-    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // runtime tree after another scenario's extract (`uv.rs`, `therock/process.rs`,
     // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
     // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
     // lane actually exports (e.g. a missing GPU driver reads `false` while a
@@ -1287,9 +1508,7 @@ async fn main() {
                 // genuinely slow serve, e.g. a large model) takes precedence;
                 // otherwise fall back to any xfail matrix override (fail-fast for
                 // a known-bug serve). Absent both → the step default.
-                world.serve_timeout_override = decl
-                    .serve_timeout_secs
-                    .or_else(|| matrix.serve_timeout_for(id, cap, engine));
+                world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
             Box::pin(async {})
@@ -1316,6 +1535,10 @@ async fn main() {
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
+            // Cloned so the outer `also_run_ids` survives this `move` closure —
+            // it is checked against every recorded scenario id after the run,
+            // to catch a listed id that matched nothing.
+            let also_run_ids = also_run_ids.clone();
             move |feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
                 let expectation = resolve(
@@ -1329,7 +1552,7 @@ async fn main() {
                         merge_queue: include_merge_queue,
                     },
                 );
-                let run = (!only_lifecycle || decl.lifecycle)
+                let run = (!only_lifecycle || lifecycle_lane_includes(&decl, &also_run_ids))
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
@@ -1379,6 +1602,17 @@ async fn main() {
     let actual = e2e_cucumber::report::scenario_results_by_id(&dir.join("report.json"))
         .expect("failed to read scenario results");
     let resolutions = resolutions.lock().expect("resolutions poisoned");
+
+    // Every scenario's id was recorded above regardless of whether it ran, so
+    // an `E2E_ALSO_RUN_IDS` entry missing from `resolutions` means no scenario
+    // in the suite carries that `@id` — a rename or typo that would otherwise
+    // silently drop the scenario from this lane while CI stayed green.
+    let known_ids: Vec<String> = resolutions.keys().cloned().collect();
+    let unmatched = unmatched_also_run_ids(&also_run_ids, &known_ids);
+    assert!(
+        unmatched.is_empty(),
+        "E2E_ALSO_RUN_IDS listed id(s) that no scenario carries (rename or typo?): {unmatched:?}"
+    );
 
     // Collect component versions (OS/ROCm/vLLM/lemonade) for the report heading.
     // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come

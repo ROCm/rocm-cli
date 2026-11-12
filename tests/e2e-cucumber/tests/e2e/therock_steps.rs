@@ -87,8 +87,33 @@ const NEXT_REAL_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.0.0.tar.gz";
 /// The non-release sibling the live catalog publishes beside the real archive.
 const NEXT_TESTS_TARBALL: &str = "therock-dist-linux-gfx120X-all-tests-10.0.0.tar.gz";
 const CURRENT_TARBALL: &str = "therock-dist-linux-gfx120X-all-7.10.0.tar.gz";
+/// The ROCm version `NEXT_REAL_TARBALL` carries, as the preview reports it.
+const NEXT_TARBALL_VERSION: &str = "10.0.0";
 
-/// How many leading bytes of `"Downloading {CURRENT_TARBALL}"` to check for in
+/// A host ROCm newer than `NEXT_TARBALL_VERSION`, reported with a packaging
+/// build number the way a system install's `.info/version` reports one.
+const HOST_ROCM_NEWER_WITH_BUILD_NUMBER: &str = "10.5.1-33";
+/// The same host version with a suffix that is neither a build number nor a
+/// PEP 440 stage. Dropping the whole suffix would read it as `10.5.1`, newer
+/// than `NEXT_TARBALL_VERSION`; it must be read as "can't tell" instead.
+const HOST_ROCM_WITH_UNREADABLE_SUFFIX: &str = "10.5.1-33rc1";
+
+/// The nightly fixtures. The earlier nightly stream's last build is
+/// 2026-08-22 and the newest layout's first is 2026-08-23, so the earlier build
+/// can only be read from the earlier stream and the others only from the newest
+/// layout's. `UNBUILT` is a `rocm` build published without its PyTorch wheels,
+/// as a nightly `rocm` build is for a while after it lands.
+const EARLIER_NIGHTLY_ROCM_VERSION: &str = "10.1.0a20260822";
+const EARLIER_NIGHTLY_TORCH_VERSION: &str = "2.11.0+rocm10.1.0a20260822";
+const EARLIER_NIGHTLY_TORCHVISION_VERSION: &str = "0.26.0+rocm10.1.0a20260822";
+const EARLIER_NIGHTLY_TORCHAUDIO_VERSION: &str = "2.11.0+rocm10.1.0a20260822";
+const NEXT_NIGHTLY_ROCM_VERSION: &str = "10.3.0a20261110";
+const NEXT_NIGHTLY_TORCH_VERSION: &str = "2.15.0+rocm10.3.0a20261110";
+const NEXT_NIGHTLY_TORCHVISION_VERSION: &str = "0.29.2+rocm10.3.0a20261110";
+const NEXT_NIGHTLY_TORCHAUDIO_VERSION: &str = "2.11.1+rocm10.3.0a20261110";
+const NEXT_NIGHTLY_UNBUILT_ROCM_VERSION: &str = "10.3.0a20261111";
+
+/// How many leading bytes of `"Downloading {NEXT_REAL_TARBALL}"` to check for in
 /// [`assert_spinner_lines_cleared`] below. Comfortably under the ~48-column
 /// label budget `assemble_status_line` leaves on an 80-column terminal even at
 /// the widest realistic progress suffix (see that assertion's comment) — the
@@ -223,6 +248,104 @@ fn allow_base_overrides(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", "1".into()));
 }
 
+/// Only the canonical release index, for a scenario that never pins ROCm 10 and
+/// so never reaches the next layout.
+#[given("a canonical release pip index fixture")]
+async fn canonical_pip_index_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
+    write_pip_index(
+        &served.join("current"),
+        [
+            ("rocm", CURRENT_ROCM_VERSION),
+            ("torch", CURRENT_TORCH_VERSION),
+            ("torchvision", CURRENT_TORCHVISION_VERSION),
+            ("torchaudio", CURRENT_TORCHAUDIO_VERSION),
+        ],
+    );
+    serve_pip_fixtures(world);
+}
+
+/// File the recording `uv` appends to, one line per invocation.
+const UV_INVOCATION_LOG: &str = "uv-invocations.log";
+
+/// The per-scenario cache folder, under the scenario root.
+const SCRATCH_CACHE_DIR: &str = "scratch-cache";
+
+/// A host where the CLI can find no Python: `PATH` is one empty folder, so the
+/// search comes up empty and no managed Python has been saved. `uv` is a
+/// recording stand-in named through `ROCM_CLI_UV_BINARY`, so a CLI that goes on
+/// to prepare a managed Python reaches it, instead of downloading the real one,
+/// and leaves a line behind.
+///
+/// Relies on the ambient environment not naming a Python: a set
+/// `ROCM_CLI_PYTHON` would answer the search before it looks at `PATH`, and a
+/// set `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP` would turn the case this
+/// scenario is about into an error. Either would make the scenario pass or fail
+/// for a reason it does not name, so they are refused up front.
+#[given("a host with no usable Python and a recording uv")]
+async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
+    let scenario_root = host_without_python(world);
+    let uv = scenario_root
+        .join("recording-uv-bin")
+        .join(e2e_cucumber::fixture_binary::fixture_target_name("uv"));
+    crate::install_fixture_binary("fake-uv", &uv);
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+    world.command_env.push((
+        "FAKE_UV_LOG",
+        scenario_root.join(UV_INVOCATION_LOG).into_os_string(),
+    ));
+}
+
+/// The same host with no `uv` anywhere: none named by `ROCM_CLI_UV_BINARY` and no
+/// managed copy under the scenario's data folder, so a CLI that needs one would
+/// have to download it. Nothing here can observe a `uv` run, since there is none to
+/// run; what it can observe is the state a download leaves, which is why the
+/// scenario's data and cache folders are the evidence.
+#[given("a host with no uv and no usable Python")]
+async fn host_with_no_uv_and_no_python(world: &mut E2eWorld) {
+    assert!(
+        std::env::var_os(rocm_core::uv::UV_BINARY_ENV).is_none(),
+        "{} is set in the environment running the suite, which would put a uv on this host; \
+         unset it",
+        rocm_core::uv::UV_BINARY_ENV
+    );
+    host_without_python(world);
+}
+
+/// What the hosts these steps build share: `PATH` is one empty folder, so no Python is found
+/// and none has been saved, and the CLI has a cache folder of its own. Returns
+/// the scenario root.
+fn host_without_python(world: &mut E2eWorld) -> std::path::PathBuf {
+    for var in [
+        "ROCM_CLI_PYTHON",
+        "ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP",
+    ] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set in the environment running the suite, which would change what this \
+             scenario exercises; unset it"
+        );
+    }
+    let scenario_root = root(world).to_path_buf();
+    let empty_path = scenario_root.join("no-python-on-path");
+    std::fs::create_dir_all(&empty_path).expect("failed to create the empty PATH folder");
+    world
+        .command_env
+        .push(("PATH", empty_path.into_os_string()));
+    // A cache folder of this scenario's own. The harness otherwise points the
+    // CLI at a cache shared across scenarios and, on CI, across runs, where a
+    // tool archive an earlier run left would trip the backstop check for one in
+    // the cache. Overrides the shared one for this scenario only.
+    let scratch_cache = scenario_root.join(SCRATCH_CACHE_DIR);
+    std::fs::create_dir_all(&scratch_cache).expect("failed to create the scratch cache folder");
+    world
+        .command_env
+        .push(("ROCM_CLI_CACHE_DIR", scratch_cache.into_os_string()));
+    scenario_root
+}
+
 #[given("a canonical release pip index fixture and a ROCm 10 pip index fixture")]
 async fn pip_index_fixtures(world: &mut E2eWorld) {
     let served = root(world).join("therock-pip-fixtures");
@@ -252,6 +375,14 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
 fn serve_pip_fixtures(world: &mut E2eWorld) {
     let served = root(world).join("therock-pip-fixtures");
     world.artifact_server = Some(LoopbackServer::start(&served));
+    arm_pip_fixture_env(world);
+}
+
+/// Points the next CLI call at the running pip fixtures. The scenario's
+/// environment is handed to one call and then dropped
+/// (`run_rocm_with_scenario_env`), so a scenario that runs the CLI twice has to
+/// arm it again before the second; otherwise that call reads the live index.
+fn arm_pip_fixture_env(world: &mut E2eWorld) {
     allow_base_overrides(world);
     let current = current_pip_base(world);
     let next = next_pip_base(world);
@@ -392,6 +523,113 @@ async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld)
         manifest,
     )
     .expect("failed to write runtime manifest");
+}
+
+/// Registry key for the planted canonical wheel runtime below.
+const OLDER_WHEEL_RUNTIME_KEY: &str = "release-wheel-gfx1200-7-9-0";
+
+/// Plants a canonical-layout wheel runtime older than the release index the
+/// fixture serves, whose manifest records no Python (a runtime registered before
+/// the field was written, or whose recorded interpreter is gone). The update
+/// check then has to find an interpreter for itself, which on the host the
+/// recording-uv Given builds means preparing one. No `source_layout_generation`
+/// is recorded, so the manifest reads as the canonical stream, as an old one does.
+#[given("a registered wheel runtime older than the index with no recorded Python")]
+async fn registered_older_wheel_runtime_without_python(world: &mut E2eWorld) {
+    plant_older_wheel_runtime(world, RAW_ARCH);
+}
+
+/// The same runtime of the earlier release stream, recorded with only a family
+/// label (`gfx120X-all`) and no exact arch, as an install made with a group
+/// label leaves it. Updating it reads the stream it was recorded in, which serves
+/// group labels, so it must not be asked for an exact arch.
+#[given("a registered wheel runtime of the earlier release stream with a grouped family")]
+async fn registered_older_wheel_runtime_with_grouped_family(world: &mut E2eWorld) {
+    plant_older_wheel_runtime(world, GROUP_FAMILY);
+}
+
+fn plant_older_wheel_runtime(world: &mut E2eWorld, family: &str) {
+    let install_root = root(world).join("runtime-older-wheel");
+    std::fs::create_dir_all(&install_root).expect("failed to create install root");
+    let registry = root(world).join("data").join("runtimes").join("registry");
+    std::fs::create_dir_all(&registry).expect("failed to create registry dir");
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "runtime_key": OLDER_WHEEL_RUNTIME_KEY,
+        "runtime_id": format!("therock-release:{family}"),
+        "channel": "release",
+        "format": "wheel",
+        "family": family,
+        "family_source": "manual",
+        "version": "7.9.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/rocm",
+        "read_only": false,
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    }))
+    .expect("failed to serialize runtime manifest");
+    std::fs::write(
+        registry.join(format!("{OLDER_WHEEL_RUNTIME_KEY}.json")),
+        manifest,
+    )
+    .expect("failed to write runtime manifest");
+}
+
+#[when("the user checks for updates against the pip index")]
+async fn check_updates_against_pip_index(world: &mut E2eWorld) {
+    preview_ok(world, &["update"]);
+}
+
+#[when("the user previews applying the update to that wheel runtime")]
+async fn preview_apply_update_to_older_wheel_runtime(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "update",
+            "--apply",
+            "--dry-run",
+            "--runtime",
+            OLDER_WHEEL_RUNTIME_KEY,
+        ],
+    );
+}
+
+/// The report reached a verdict (the runtime is behind the index) and says what
+/// the update would do about Python, without a path that would be a guess.
+#[then("the report offers the newer runtime and says it would prepare a managed Python")]
+async fn report_offers_update_and_names_the_python_it_would_prepare(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("runtime {OLDER_WHEEL_RUNTIME_KEY} format=wheel"),
+        "the runtime line",
+    );
+    assert_contains(world, "status=update_available", "the runtime's verdict");
+    assert_contains(
+        world,
+        &format!("latest={CURRENT_ROCM_VERSION}"),
+        "the version the index publishes",
+    );
+    assert_contains(
+        world,
+        &format!(
+            "python_note: no usable Python was found; updating would use uv to install managed \
+             Python {CANONICAL_MANAGED_PYTHON}"
+        ),
+        "the note about the Python an update would prepare",
+    );
+}
+
+/// The check says it prepared no Python, and the state it left agrees. Claim and
+/// filesystem are checked together: the note alone would pass with the bug
+/// present, and so would empty folders alone if the check had stopped before it
+/// got to Python.
+#[then("the update check prepared no Python, as it says")]
+async fn update_check_prepared_no_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "which this check did not do",
+        "the note about what the check skipped",
+    );
+    assert_no_python_prepared(world);
 }
 
 /// Makes the planted ROCm 10 runtime the active default, so a real install
@@ -564,12 +802,12 @@ const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
 /// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
 const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[given("a paced canonical release tarball fixture")]
+#[given("a paced next-layout release tarball fixture")]
 async fn paced_tarball_fixture(world: &mut E2eWorld) {
     let served = root(world).join("therock-paced-tarball-fixture");
     write_fixture(
-        &served.join("tarball").join("current").join("index.html"),
-        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+        &served.join("tarball").join("next").join("index.html"),
+        &tarball_index_html(&[(NEXT_REAL_TARBALL, 1_787_000_000.0)]),
     );
 
     // Build a real gzip tarball so `extract_tarball` (auto-detecting `-xf`) has
@@ -587,11 +825,11 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
     let payload = deterministic_payload(PACED_TARBALL_PAYLOAD_BYTES);
     std::fs::write(payload_dir.join("payload.bin"), &payload)
         .expect("failed to write tarball payload");
-    let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload").await;
+    let contents = build_gzip_tarball(&build_dir, NEXT_REAL_TARBALL, "payload").await;
 
     world.paced_download_server = Some(PacedDownloadServer::start(
         &served,
-        &format!("tarball/current/{CURRENT_TARBALL}"),
+        &format!("tarball/next/{NEXT_REAL_TARBALL}"),
         contents,
         PACED_TARBALL_CHUNK_BYTES,
         PACED_TARBALL_CHUNK_DELAY,
@@ -603,18 +841,17 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
         .expect("paced download server was just started")
         .base_url();
     world.command_env.push((
-        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
-        format!("{base}/tarball/current/").into(),
+        "ROCM_CLI_THEROCK_NEXT_TARBALL_BASE",
+        format!("{base}/tarball/next/").into(),
     ));
 }
 
-#[when("the user installs the tarball SDK for family gfx120X-all under a real terminal")]
+#[when("the user installs the tarball SDK for arch gfx1200 under a real terminal")]
 async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
-    // No `--version`: tarball installs only accept an explicit version pin for
-    // a stable ROCm 10+ selector (see `resolve_tarball_artifact_with_timeout`'s
-    // rejection message), so an unpinned request is what reaches the canonical
-    // release catalog here — which the given-step populated with exactly one
-    // candidate, `CURRENT_TARBALL`.
+    // No `--version`: an unpinned release install reads the newest layout's
+    // catalog, which the given-step populated with exactly one candidate,
+    // `NEXT_REAL_TARBALL`. That layout picks its payload by exact arch, hence
+    // `RAW_ARCH` rather than a group family.
     //
     // This scenario is testing the download spinner, not the post-install
     // torch-runtime-dependency setup — but a real SDK install completing
@@ -636,7 +873,7 @@ async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
             "--format",
             "tarball",
             "--family",
-            GROUP_FAMILY,
+            RAW_ARCH,
             "--yes",
         ],
     )
@@ -681,7 +918,10 @@ async fn assert_extraction_frame_is_shown(world: &mut E2eWorld) {
         .as_mut()
         .expect("no pty session for the tarball install");
     session
-        .wait_for_screen(&format!("Extracting {CURRENT_TARBALL}"), PTY_SCREEN_TIMEOUT)
+        .wait_for_screen(
+            &format!("Extracting {NEXT_REAL_TARBALL}"),
+            PTY_SCREEN_TIMEOUT,
+        )
         .await
         .unwrap_or_else(|e| panic!("extraction spinner frame never appeared: {e}"));
 }
@@ -707,7 +947,7 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
     // A live progress suffix (kept intact by `assemble_status_line`) can
     // truncate this label to a fraction of its length on an 80-column
     // terminal, so the download line never actually contains the full
-    // "Downloading {CURRENT_TARBALL}" string while it's showing — checking
+    // "Downloading {NEXT_REAL_TARBALL}" string while it's showing — checking
     // for that full string here would pass trivially whether or not the line
     // was cleared. Truncation always keeps the label's head intact and cuts
     // its tail, so a short prefix is present whenever the line is live and
@@ -720,7 +960,7 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
     // stops. The extraction assertion just below, and the ComfyUI scenario's
     // equivalent check (a spinner with nothing after it to overwrite its
     // row), are what actually prove `Spinner::clear` runs on `Drop`.
-    let downloading = format!("Downloading {CURRENT_TARBALL}");
+    let downloading = format!("Downloading {NEXT_REAL_TARBALL}");
     let downloading_prefix = downloading
         .get(..DOWNLOADING_PREFIX_LEN)
         .unwrap_or_else(|| {
@@ -736,7 +976,7 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
         "download spinner line was not cleared on completion:\n{screen}"
     );
     assert!(
-        !screen.contains(&format!("Extracting {CURRENT_TARBALL}")),
+        !screen.contains(&format!("Extracting {NEXT_REAL_TARBALL}")),
         "extract spinner line was not cleared on completion:\n{screen}"
     );
 }
@@ -781,6 +1021,44 @@ async fn preview_unpinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+/// A release pin below ROCm 10 is the one request that still reads the earlier
+/// (canonical) release stream, so the scenarios whose subject is that stream
+/// say so with a pin instead of leaning on a default that now reads the newest
+/// layout.
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release"
+)]
+async fn preview_earlier_release_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            CURRENT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+/// A `uv` the preview can use without fetching one. The resolution these
+/// scenarios assert on is a real `uv pip compile` against the loopback fixtures,
+/// so the stand-in `uv` of runtime-27 would not do; this installs the managed one
+/// the way a real install would have (from the network, into the scenario's own
+/// data folder, or, when `ROCM_CLI_UV_BINARY` names one, that one).
+#[given("a uv is already installed")]
+async fn a_uv_is_already_installed(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    rocm_core::ensure_uv_binary(&paths)
+        .unwrap_or_else(|error| panic!("failed to install uv for the scenario: {error:#}"));
+}
+
 #[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
     preview_ok(
@@ -799,6 +1077,84 @@ async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
             "--dry-run",
         ],
     );
+}
+
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 on Python 3.12"
+)]
+async fn preview_pinned_wheel_install_on_python_312(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--python-version",
+            "3.12",
+            "--dry-run",
+        ],
+    );
+}
+
+#[when(
+    "the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release on Python 3.13"
+)]
+async fn try_preview_earlier_release_wheel_install_on_python_313(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            CURRENT_ROCM_VERSION,
+            "--python-version",
+            "3.13",
+            "--dry-run",
+        ],
+    );
+}
+
+/// The plan names the requested interpreter and its tag. The default's tag is
+/// checked absent too: a plan that printed both would pass the first two checks.
+#[then("the preview plans Python 3.12 and its cp312 wheel tag and not the default")]
+async fn preview_plans_requested_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "would use uv to install managed Python 3.12",
+        "python note",
+    );
+    assert_contains(world, "python_wheel_tag: cp312", "python wheel tag");
+    let out = stdout(world);
+    assert!(
+        !out.contains("cp314") && !out.contains("Python 3.14"),
+        "the default Python must not appear in the plan:\n{out}"
+    );
+}
+
+#[then(
+    "the preview is refused because the layout has no wheels for that Python, and prepared none"
+)]
+async fn preview_refused_for_unpublished_python(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("--python-version applies only to ROCm 10 and newer installs")
+            && stderr.contains("this install uses Python 3.12"),
+        "expected the refusal to name the Python that is allowed:\n{stderr}"
+    );
+    assert_no_python_prepared(world);
 }
 
 #[when(
@@ -868,6 +1224,50 @@ async fn preview_pinned_wheel_install_latest_next_version(world: &mut E2eWorld) 
     );
 }
 
+#[when("the user tries to preview a wheel SDK install for family gfx120X-all with no version pin")]
+async fn try_preview_unpinned_wheel_install_with_group_family(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            GROUP_FAMILY,
+            "--dry-run",
+        ],
+    );
+}
+
+/// The refusal for a group family names pinning an earlier release as the way
+/// to still install one, so the pin it names has to work: a group family with
+/// an earlier ROCm 7 pin resolves from the earlier stream, which serves groups.
+#[when(
+    "the user previews a wheel SDK install for family gfx120X-all pinned to an earlier ROCm 7 release"
+)]
+async fn preview_earlier_release_wheel_install_with_group_family(world: &mut E2eWorld) {
+    arm_pip_fixture_env(world);
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            GROUP_FAMILY,
+            "--version",
+            CURRENT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user previews a wheel SDK install for family gfx120X-all pinned to ROCm 10.0.0")]
 async fn preview_pinned_wheel_install_with_group_family(world: &mut E2eWorld) {
     preview(
@@ -928,6 +1328,92 @@ async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews a tarball SDK install for arch gfx1200 with no version pin")]
+async fn preview_unpinned_tarball_install_for_arch(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+/// A tarball catalog resolves a pin only in the newest layout, so a pin into the
+/// earlier release stream is refused and points at the wheel install, which
+/// does resolve it.
+#[when(
+    "the user tries to preview a tarball SDK install for arch gfx1200 pinned to an earlier ROCm 7 release"
+)]
+async fn try_preview_earlier_release_tarball_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            CURRENT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the failure points to a wheel install for that earlier release")]
+async fn failure_points_to_a_wheel_install(world: &mut E2eWorld) {
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    assert!(
+        reported.contains("use `--format wheel`"),
+        "the refusal did not point to a wheel install:\n{reported}"
+    );
+    // The command it points to must itself work: the same pin as a wheel
+    // install resolves from the earlier stream.
+    arm_pip_fixture_env(world);
+    let rc = preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            CURRENT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+    assert_eq!(
+        rc,
+        0,
+        "the wheel install the refusal points to failed:\n{}",
+        stdout(world)
+    );
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {CURRENT_ROCM_VERSION}"),
+        "the earlier release the refusal points to",
+    );
+}
+
 #[when("the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn preview_pinned_tarball_install(world: &mut E2eWorld) {
     preview_ok(
@@ -968,6 +1454,56 @@ async fn preview_pinned_tarball_install_with_group_family(world: &mut E2eWorld) 
     );
 }
 
+/// The install folder therock-next-15 asks for: inside the scenario's root, with
+/// a lone `'` in its name — the shape the old dry-run quoter left bare.
+const QUOTED_FOLDER_NAME: &str = "it's-here";
+
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote"
+)]
+async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = root(world)
+        .join(QUOTED_FOLDER_NAME)
+        .to_string_lossy()
+        .into_owned();
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--prefix",
+            &prefix,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the dry-run command line names that folder as a single argument")]
+async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) {
+    let output = stdout(world);
+    let line = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("command: "))
+        .unwrap_or_else(|| panic!("no `command:` line in the dry-run preview:\n{output}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the dry-run `command:` line does not parse: `{line}`"));
+    // By file name rather than the full path: the CLI resolves the prefix
+    // through symlinks, so the folder's parent may be spelled differently from
+    // the one this step built. What must hold is that one whole word names it.
+    assert!(
+        words.iter().any(|word| {
+            Path::new(word).file_name() == Some(std::ffi::OsStr::new(QUOTED_FOLDER_NAME))
+        }),
+        "the dry-run `command:` line must name the install folder as one argument, got `{line}`"
+    );
+}
+
 fn stdout(world: &E2eWorld) -> &str {
     world.cli_output.as_deref().unwrap_or_default()
 }
@@ -978,6 +1514,303 @@ fn assert_contains(world: &E2eWorld, needle: &str, what: &str) {
         "{what}: expected {needle:?} in the preview:\n{}",
         stdout(world)
     );
+}
+
+/// The managed interpreter the canonical layout needs. Keep in step with
+/// `DEFAULT_MANAGED_PYTHON_VERSION` in `apps/rocm/src/therock/python.rs`.
+const CANONICAL_MANAGED_PYTHON: &str = "3.12";
+
+#[then("the preview says a real install would prepare a managed Python")]
+async fn preview_says_managed_python_would_be_prepared(world: &mut E2eWorld) {
+    assert_contains(world, "python_source: managed", "python source");
+    assert_contains(
+        world,
+        "python_launcher: not prepared by this preview",
+        "python launcher",
+    );
+    assert_contains(
+        world,
+        &format!("would use uv to install managed Python {CANONICAL_MANAGED_PYTHON}"),
+        "python note",
+    );
+}
+
+/// The preview says it prepared no Python, and the state it left agrees. The
+/// claim and the filesystem are checked together: the note alone would pass
+/// with the bug present, and so would the empty folders alone if the preview
+/// had simply stopped before it got to the Python.
+#[then("the preview prepared no Python, as it says")]
+async fn preview_prepared_no_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "which this preview did not do",
+        "the note about what the preview skipped",
+    );
+    assert_contains(
+        world,
+        &format!(
+            "a real install would prepare Python {CANONICAL_MANAGED_PYTHON}. This preview does not."
+        ),
+        "the progress line about what the preview skipped",
+    );
+    assert_no_python_prepared(world);
+}
+
+/// The state half of the claim: the recording `uv` was never run (the evidence
+/// that nothing was prepared), no managed tools folder, no saved configuration,
+/// and, as a backstop only, no tool archive in the scenario's cache. It holds for
+/// both layouts, because a preview never fetches `uv`: the canonical layout needs
+/// none, and the ROCm 10 layout runs one only when it is already present (see
+/// runtime-27 and runtime-28). A scenario that gives the preview a `uv` and expects
+/// it to run must not call this.
+fn assert_no_python_prepared(world: &E2eWorld) {
+    let paths = world.app_paths();
+    let scenario_root = root(world).to_path_buf();
+    let uv_log = scenario_root.join(UV_INVOCATION_LOG);
+    assert!(
+        !uv_log.exists(),
+        "the preview ran uv, which it says it did not:\n{}",
+        std::fs::read_to_string(&uv_log).unwrap_or_default()
+    );
+    let tools = rocm_core::managed_tools_dir(&paths.data_dir);
+    assert!(
+        !tools.exists(),
+        "the preview created the managed tools folder {}, which would hold a managed uv and Python",
+        tools.display()
+    );
+    // A backstop, not the detector. `ROCM_CLI_UV_BINARY` makes `ensure_uv_binary`
+    // return the recording `uv` before any download could begin, so this folder
+    // stays empty even if the preview did go on to prepare a Python; the `uv`
+    // log above is what shows that. It is the scenario's own cache folder (see
+    // the Given), not `paths.cache_dir`, which is the shared one where a run's
+    // leftovers would already be.
+    let cache_tools = scenario_root.join(SCRATCH_CACHE_DIR).join("tools");
+    assert!(
+        !cache_tools.exists(),
+        "the preview downloaded a tool archive into {}",
+        cache_tools.display()
+    );
+    let config = paths.config_path();
+    assert!(
+        !config.exists(),
+        "the preview saved a configuration at {}, which would record a managed Python: {}",
+        config.display(),
+        std::fs::read_to_string(&config).unwrap_or_default()
+    );
+}
+
+/// Plants an interpreter on the empty `PATH` folder that cannot serve the
+/// install: `fake-python` answers the wheel-tag probe with `{}`, which is not
+/// the tag the layout needs, so the search finds a Python and rejects it.
+#[given("the only Python on the host's path is not usable")]
+async fn only_unusable_python_on_path(world: &mut E2eWorld) {
+    let python = root(world).join("no-python-on-path").join("python3");
+    crate::install_fixture_binary("fake-python", &python);
+}
+
+#[given("managed Python bootstrap is disabled")]
+async fn managed_python_bootstrap_disabled(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1".into()));
+}
+
+/// The refusal is the whole story: the output states the finding about the
+/// `PATH` Python and the policy refusal, and no line says what a real install
+/// would go on to do, since it would do nothing.
+#[then("the preview is refused because managed Python is disabled, without a promise")]
+async fn preview_refused_for_disabled_bootstrap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("managed Python bootstrap is disabled"),
+        "expected the policy refusal:\n{stderr}"
+    );
+    let out = stdout(world);
+    assert!(
+        out.contains("Python from PATH is not usable for this ROCm install (cp312 is required).\n"),
+        "expected the finding about the PATH Python:\n{out}"
+    );
+    for promise in [
+        "a real install would",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
+}
+
+#[given("the managed Python version is overridden to 3.13")]
+async fn managed_python_version_overridden(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_MANAGED_PYTHON_VERSION", "3.13".into()));
+}
+
+#[when(
+    "the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release"
+)]
+async fn try_preview_earlier_release_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            CURRENT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+/// The refusal names the version and the tag rule, as a real install would
+/// meet it, and the state agrees that nothing was prepared on the way to it.
+#[then("the preview is refused because the install would refuse that Python")]
+async fn preview_refused_for_python_version(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    for needle in [
+        "would prepare managed Python 3.13",
+        "Python wheel tag cp313 is not supported",
+        "cp312 is required",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "expected {needle:?} in the refusal:\n{stderr}"
+        );
+    }
+    // The progress lines must not promise what the refusal then takes back: the
+    // output holds no "would prepare Python 3.13" and no plan.
+    let out = stdout(world);
+    assert!(
+        out.contains("Checking Python for the ROCm install.\n"),
+        "expected the neutral Python check line:\n{out}"
+    );
+    for promise in [
+        "would prepare Python 3.13",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
+}
+
+/// The four pins `uv pip compile` would print for the ROCm 10 fixture, one
+/// `name==version` per line, which the CLI reads back as the chosen stack.
+#[given("the recording uv answers uv pip compile with the ROCm 10 fixture's versions")]
+async fn recording_uv_answers_compile(world: &mut E2eWorld) {
+    let pins = [
+        ("rocm", NEXT_ROCM_VERSION),
+        ("torch", NEXT_TORCH_VERSION),
+        ("torchvision", NEXT_TORCHVISION_VERSION),
+        ("torchaudio", NEXT_TORCHAUDIO_VERSION),
+    ]
+    .map(|(name, version)| format!("{name}=={version}"))
+    .join("\n");
+    world.command_env.push(("FAKE_UV_STDOUT", pins.into()));
+    // The CLI pipes the requirements into `uv pip compile -`; see the stand-in.
+    world.command_env.push(("FAKE_UV_DRAIN_STDIN", "1".into()));
+}
+
+/// A `uv` that is present is still used: it ran `uv pip compile`, once and for
+/// nothing else, and the preview did not report the step as skipped. The log is
+/// the evidence, since the plan's versions alone could not tell a compile from a
+/// guess.
+#[then("the preview resolved the versions with the uv that was present")]
+async fn preview_resolved_with_present_uv(world: &mut E2eWorld) {
+    let log_path = root(world).join(UV_INVOCATION_LOG);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+        panic!(
+            "the recording uv has no log at {}, so the preview never ran it: {error}",
+            log_path.display()
+        )
+    });
+    let runs: Vec<&str> = log.lines().collect();
+    assert!(
+        matches!(runs.as_slice(), [run] if run.starts_with("pip compile ")),
+        "the preview should run uv once, for `uv pip compile`, and for nothing else:\n{log}"
+    );
+    let out = stdout(world);
+    for unresolved in ["resolution_note:", "not resolved by this preview"] {
+        assert!(
+            !out.contains(unresolved),
+            "the preview ran uv but reported the step as skipped ({unresolved:?}):\n{out}"
+        );
+    }
+}
+
+/// What a preview of the ROCm 10 layout says when no `uv` is there to run, and the
+/// state it left. The claim and the filesystem are checked together: the note alone
+/// would pass with a preview that also downloaded `uv`, and the empty folders alone
+/// would pass if the preview had stopped before it got to the question.
+#[then("the preview says it did not resolve the ROCm 10 package versions, as it says")]
+async fn preview_did_not_resolve_without_uv(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "No uv is installed; a real install would fetch it and resolve the torch and torchvision \
+         versions with `uv pip compile`. This preview does not.",
+        "the progress line about what the preview skipped",
+    );
+    assert_contains(
+        world,
+        "resolution_note: no uv is installed, so a real install would fetch it and run `uv pip \
+         compile` to choose the torch and torchvision versions and to check that the published \
+         packages install together, which this preview did not do",
+        "the note about what the preview skipped",
+    );
+    // Everything made from the versions `uv` would choose is marked, not guessed.
+    for key in [
+        "target",
+        "runtime_key",
+        "package_specs",
+        "command",
+        "manifest",
+    ] {
+        assert_contains(
+            world,
+            &format!("\n  {key}: not resolved by this preview\n"),
+            "a line made from the unchosen versions",
+        );
+    }
+    // What needs no `uv` is still printed, from the same decisions a real install
+    // takes: the exact device payload, the requirements `uv` would be asked about,
+    // and the pinned torchaudio.
+    assert_contains(
+        world,
+        &format!("device_target: {RAW_ARCH}"),
+        "the device target",
+    );
+    assert_version_resolution_extras(world, false);
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {NEXT_ROCM_VERSION}"),
+        "the ROCm version",
+    );
+    assert_contains(
+        world,
+        &format!("torchaudio_selection: torchaudio {NEXT_TORCHAUDIO_VERSION}, "),
+        "the torchaudio pin",
+    );
+    for chosen_by_uv in [NEXT_TORCH_VERSION, NEXT_TORCHVISION_VERSION] {
+        assert!(
+            !stdout(world).contains(chosen_by_uv),
+            "the preview named {chosen_by_uv}, which only `uv pip compile` could have chosen:\n{}",
+            stdout(world)
+        );
+    }
+    assert_no_python_prepared(world);
 }
 
 #[then("the preview resolves the canonical release pip index")]
@@ -1010,12 +1843,27 @@ async fn preview_never_mentions_next_index(world: &mut E2eWorld) {
     let next = next_pip_base(world);
     assert!(
         !stdout(world).contains(&next),
-        "an unpinned release install reached the ROCm 10 index {next}:\n{}",
+        "a release install pinned to an earlier ROCm 7 release reached the ROCm 10 index {next}:\n{}",
         stdout(world)
     );
     assert!(
         !stdout(world).contains("next-v1"),
-        "an unpinned release install selected the next source layout:\n{}",
+        "a release install pinned to an earlier ROCm 7 release selected the next source layout:\n{}",
+        stdout(world)
+    );
+}
+
+#[then("the preview never mentions the canonical release pip index")]
+async fn preview_never_mentions_canonical_index(world: &mut E2eWorld) {
+    let canonical = current_pip_base(world);
+    assert!(
+        !stdout(world).contains(&canonical),
+        "an unpinned release install read the earlier release stream {canonical}:\n{}",
+        stdout(world)
+    );
+    assert!(
+        !stdout(world).contains("multi-arch-v2"),
+        "an unpinned release install selected the earlier source layout:\n{}",
         stdout(world)
     );
 }
@@ -1284,7 +2132,7 @@ async fn failure_names_the_exact_arch_flag(world: &mut E2eWorld) {
 }
 
 /// The default (un-overridden) ROCm 10 preview pip index base. Matches
-/// `THEROCK_NEXT_RELEASE_PIP_INDEX_BASE` in `apps/rocm/src/therock.rs`.
+/// `THEROCK_NEXT_PIP_INDEX_BASE` in `apps/rocm/src/therock/source.rs`.
 const DEFAULT_NEXT_RELEASE_PIP_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
 
 /// The newest `rocm` version the live ROCm 10 preview source actually
@@ -1494,5 +2342,328 @@ async fn assert_vllm_rocm10_discovery_pins(world: &mut E2eWorld) {
     assert!(
         install_output.contains("vLLM ROCm 10.x discovery pinned:"),
         "vLLM install against a live ROCm 10.x runtime did not report discovery pins:\n{install_output}"
+    );
+}
+
+#[given("a release tarball catalog whose newest ROCm is older than the host's")]
+async fn release_tarball_catalog_only(world: &mut E2eWorld) {
+    let served = root(world).join("therock-release-tarball-fixture");
+    write_fixture(
+        &served.join("tarball").join("next").join("index.html"),
+        &tarball_index_html(&[(NEXT_REAL_TARBALL, 1_787_000_000.0)]),
+    );
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    allow_base_overrides(world);
+    let base = server_base(world);
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_NEXT_TARBALL_BASE",
+        format!("{base}/tarball/next/").into(),
+    ));
+}
+
+#[given("a machine whose own ROCm install reports a newer version with a packaging build number")]
+async fn host_rocm_newer_with_build_number(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm_reporting(HOST_ROCM_NEWER_WITH_BUILD_NUMBER);
+}
+
+#[given("a machine whose own ROCm install reports a version with an unreadable build suffix")]
+async fn host_rocm_with_unreadable_suffix(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm_reporting(HOST_ROCM_WITH_UNREADABLE_SUFFIX);
+}
+
+#[when("the user previews a tarball SDK install")]
+async fn preview_unpinned_tarball_install(world: &mut E2eWorld) {
+    // No `--version`: an unpinned release install reaches the newest layout's
+    // catalog, which the given-step populated with `NEXT_REAL_TARBALL` alone.
+    // `--family` keeps the preview off host GPU detection.
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the preview selects the newest SDK in the catalog")]
+async fn preview_selects_catalog_newest(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("tarball: {NEXT_REAL_TARBALL}"),
+        "selected artifact",
+    );
+    assert_contains(
+        world,
+        &format!("latest_version: {NEXT_TARBALL_VERSION}"),
+        "selected artifact version",
+    );
+}
+
+#[then("the preview explains that the host's newer ROCm is passed over for the selected SDK")]
+async fn preview_explains_host_newer(world: &mut E2eWorld) {
+    // The note claims the catalog's version "is selected", so assert the
+    // selection beside it: the claim and the state it describes, together.
+    preview_selects_catalog_newest(world).await;
+    assert_contains(
+        world,
+        &format!(
+            "version_note: this host reports ROCm {HOST_ROCM_NEWER_WITH_BUILD_NUMBER}, but \
+             {NEXT_TARBALL_VERSION} is the newest TheRock ROCm tarball for this GPU family, \
+             so it is selected"
+        ),
+        "host-newer version note",
+    );
+}
+
+#[then("the preview does not claim the host's ROCm is newer")]
+async fn preview_does_not_claim_host_newer(world: &mut E2eWorld) {
+    // Absence is only evidence because the sibling scenario shows the same
+    // preview printing the note when the host version is readable and newer.
+    let preview = stdout(world);
+    assert!(
+        !preview.contains("version_note:") && !preview.contains("this host reports ROCm"),
+        "the preview claimed an unreadable host ROCm version is newer:\n{preview}"
+    );
+}
+
+/// Both nightly streams on one loopback server: the earlier (canonical) one with
+/// its last build, and the newest layout's with a build that has its PyTorch
+/// wheels and a newer `rocm` build that does not yet.
+#[given(
+    "an earlier nightly pip index fixture and a newest-layout nightly pip index fixture whose newest build has no PyTorch wheels yet"
+)]
+async fn nightly_pip_index_fixtures(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
+    write_pip_index(
+        &served.join("nightly-earlier"),
+        [
+            ("rocm", EARLIER_NIGHTLY_ROCM_VERSION),
+            ("torch", EARLIER_NIGHTLY_TORCH_VERSION),
+            ("torchvision", EARLIER_NIGHTLY_TORCHVISION_VERSION),
+            ("torchaudio", EARLIER_NIGHTLY_TORCHAUDIO_VERSION),
+        ],
+    );
+    let next = served.join("nightly-next");
+    write_fixture(&next.join("index.html"), &aggregate_root_html());
+    let rocm = [
+        (NEXT_NIGHTLY_ROCM_VERSION, ANY_WHEEL_TAG, Vec::new()),
+        (NEXT_NIGHTLY_UNBUILT_ROCM_VERSION, ANY_WHEEL_TAG, Vec::new()),
+    ];
+    let torch = [(
+        NEXT_NIGHTLY_TORCH_VERSION,
+        ANY_WHEEL_TAG,
+        vec![format!("rocm=={NEXT_NIGHTLY_ROCM_VERSION}")],
+    )];
+    let torchvision = [(
+        NEXT_NIGHTLY_TORCHVISION_VERSION,
+        ANY_WHEEL_TAG,
+        vec![format!("torch=={NEXT_NIGHTLY_TORCH_VERSION}")],
+    )];
+    let torchaudio = [(NEXT_NIGHTLY_TORCHAUDIO_VERSION, ANY_WHEEL_TAG, Vec::new())];
+    write_wheel_index_builds(&next.join("rocm"), "rocm", &rocm);
+    write_wheel_index_builds(&next.join("torch"), "torch", &torch);
+    write_wheel_index_builds(&next.join("torchvision"), "torchvision", &torchvision);
+    write_wheel_index_builds(&next.join("torchaudio"), "torchaudio", &torchaudio);
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    arm_nightly_fixture_env(world);
+}
+
+/// Points the next CLI call at the running nightly fixtures; see
+/// [`arm_pip_fixture_env`] for why a second call has to arm it again.
+fn arm_nightly_fixture_env(world: &mut E2eWorld) {
+    allow_base_overrides(world);
+    let base = server_base(world);
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE",
+        format!("{base}/nightly-earlier").into(),
+    ));
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_NEXT_NIGHTLY_PIP_BASE",
+        format!("{base}/nightly-next").into(),
+    ));
+}
+
+/// A tarball catalog can be pinned only in the newest layout, so a nightly pin
+/// into the earlier stream is refused. The refusal names the wheel install as
+/// the way to still get it, so that command is run.
+#[when(
+    "the user tries to preview a nightly tarball SDK install for arch gfx1200 pinned to the earlier stream's last build date"
+)]
+async fn try_preview_earlier_nightly_tarball_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--build-date",
+            "2026-08-22",
+            "--dry-run",
+        ],
+    );
+}
+
+#[then(
+    "the failure names the first build date of the newer layout and points to a wheel install that resolves that earlier nightly"
+)]
+async fn failure_points_to_a_wheel_install_for_the_earlier_nightly(world: &mut E2eWorld) {
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    assert!(
+        reported.contains("use `--format wheel`"),
+        "the refusal did not point to a wheel install:\n{reported}"
+    );
+    assert!(
+        reported.contains("on or after 2026-08-23"),
+        "the refusal did not name the first build date of the newer layout:\n{reported}"
+    );
+    arm_nightly_fixture_env(world);
+    let rc = preview(
+        world,
+        &nightly_wheel_preview_args(&["--build-date", "2026-08-22"]),
+    );
+    assert_eq!(
+        rc,
+        0,
+        "the wheel install the refusal points to failed:\n{}",
+        stdout(world)
+    );
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {EARLIER_NIGHTLY_ROCM_VERSION}"),
+        "the earlier nightly the refusal points to",
+    );
+}
+
+fn nightly_wheel_preview_args<'a>(pin: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "install",
+        "sdk",
+        "--channel",
+        "nightly",
+        "--format",
+        "wheel",
+        "--family",
+        RAW_ARCH,
+    ];
+    args.extend_from_slice(pin);
+    args.push("--dry-run");
+    args
+}
+
+#[when("the user previews a nightly wheel SDK install for arch gfx1200 with no version pin")]
+async fn preview_unpinned_nightly_wheel_install(world: &mut E2eWorld) {
+    preview_ok(world, &nightly_wheel_preview_args(&[]));
+}
+
+#[when(
+    "the user previews a nightly wheel SDK install for arch gfx1200 pinned to the earlier stream's last build date"
+)]
+async fn preview_earlier_nightly_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &nightly_wheel_preview_args(&["--build-date", "2026-08-22"]),
+    );
+}
+
+#[when(
+    "the user previews a nightly wheel SDK install for arch gfx1200 pinned to a build date from the newest layout"
+)]
+async fn preview_next_nightly_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &nightly_wheel_preview_args(&["--build-date", "2026-11-10"]),
+    );
+}
+
+fn assert_nightly_preview(world: &E2eWorld, base: &str, version: &str, generation: &str) {
+    assert_contains(
+        world,
+        &format!("canonical_source: {base}"),
+        "nightly source",
+    );
+    assert_contains(
+        world,
+        &format!("index_url: {base}"),
+        "resolved nightly index",
+    );
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {version}"),
+        "resolved nightly version",
+    );
+    assert_contains(
+        world,
+        &format!("source_layout_generation: {generation}"),
+        "nightly layout generation",
+    );
+}
+
+#[then(
+    "the preview resolves the newest layout's nightly pip index at its newest installable build"
+)]
+async fn preview_resolves_next_nightly_index(world: &mut E2eWorld) {
+    let base = format!("{}/nightly-next", server_base(world));
+    assert_nightly_preview(world, &base, NEXT_NIGHTLY_ROCM_VERSION, "next-v1");
+    // The plan is built from the chosen build, not the newer one that has no
+    // PyTorch wheels, so it never names the build it could not install.
+    assert!(
+        !stdout(world).contains(&format!("=={NEXT_NIGHTLY_UNBUILT_ROCM_VERSION}")),
+        "the plan pins the build that has no PyTorch wheels:\n{}",
+        stdout(world)
+    );
+}
+
+#[then(
+    "the preview warns that the newest nightly build has no PyTorch wheels and installs the build before it"
+)]
+async fn preview_warns_newest_nightly_has_no_wheels(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!(
+            "warning: ROCm {NEXT_NIGHTLY_UNBUILT_ROCM_VERSION} is the newest version in this repository but has no installable PyTorch wheels"
+        ),
+        "no-wheels warning",
+    );
+}
+
+#[then("the preview resolves the earlier stream's nightly pip index")]
+async fn preview_resolves_earlier_nightly_index(world: &mut E2eWorld) {
+    let base = format!("{}/nightly-earlier", server_base(world));
+    assert_nightly_preview(world, &base, EARLIER_NIGHTLY_ROCM_VERSION, "multi-arch-v2");
+    // Both fixtures are served; the pin must not reach the newest layout's.
+    let next = format!("{}/nightly-next", server_base(world));
+    assert!(
+        !stdout(world).contains(&next) && !stdout(world).contains("next-v1"),
+        "a pin to the earlier stream's last build date reached the newest layout:\n{}",
+        stdout(world)
+    );
+}
+
+#[then("the preview resolves the newest layout's nightly pip index for that build date")]
+async fn preview_resolves_next_nightly_index_for_the_build_date(world: &mut E2eWorld) {
+    let base = format!("{}/nightly-next", server_base(world));
+    assert_nightly_preview(world, &base, NEXT_NIGHTLY_ROCM_VERSION, "next-v1");
+    // Both fixtures are served; the pin must not fall back to the earlier one.
+    let earlier = format!("{}/nightly-earlier", server_base(world));
+    assert!(
+        !stdout(world).contains(&earlier) && !stdout(world).contains("multi-arch-v2"),
+        "a pin to a newest-layout build date reached the earlier stream:\n{}",
+        stdout(world)
     );
 }

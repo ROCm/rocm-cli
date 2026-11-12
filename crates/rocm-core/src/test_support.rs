@@ -3,15 +3,57 @@
 // SPDX-License-Identifier: MIT
 
 //! Shared fixtures for building a throwaway [`AppPaths`] under a per-test,
-//! per-process directory.
+//! per-process directory, and for seeding the automation audit store that
+//! `automation.rs`'s tests drive. `jsonl_store.rs`'s tests use only the
+//! throwaway directory: the engine is generic, so they carry their own record.
 //!
 //! Used from every module split out of this crate's former `lib.rs` god file
 //! so the naming/uniqueness scheme for test artifact directories stays in one
 //! place rather than drifting across copies.
 
-use crate::{AppPaths, ManagedServiceRecord, unix_time_millis};
+use crate::{AppPaths, AuditEventRecord, ManagedServiceRecord, unix_time_millis};
+use anyhow::Result;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The volume serial number paired with the 64-bit file index: this
+/// platform's file identity, the way an inode is on Unix. Shared by every
+/// test that tells a publish-by-rename apart from a rewrite in place.
+///
+/// Read through `GetFileInformationByHandle` rather than
+/// `std::os::windows::fs::MetadataExt`, whose `volume_serial_number` and
+/// `file_index` accessors are unstable behind the `windows_by_handle`
+/// feature gate and so cannot be called on the pinned stable toolchain.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+pub(crate) fn windows_file_identity(path: &std::path::Path) -> anyhow::Result<(u32, u64)> {
+    use anyhow::{Context, bail};
+    use std::fs;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    // All-POD `repr(C)` record, fully overwritten by the call below on
+    // success and never read on failure.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let handle = file.as_raw_handle() as HANDLE;
+    if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
+        bail!(
+            "failed to read the file identity of {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
 
 pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
     let root = workspace_test_artifact_dir().join(format!("rocm-core-{name}-{}", unique_suffix()));
@@ -106,6 +148,54 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
         CALLERS,
         "two calls with one label must not share a root"
     );
+}
+
+pub(crate) fn audit_record(tag: &str) -> AuditEventRecord {
+    AuditEventRecord {
+        at_unix_ms: 1,
+        source: "test".to_owned(),
+        category: "concurrency".to_owned(),
+        actor: "writer".to_owned(),
+        level: "info".to_owned(),
+        action: "append".to_owned(),
+        message: tag.to_owned(),
+        watcher_id: None,
+        service_id: None,
+    }
+}
+
+/// Write `contents` as the audit store, creating its directory.
+pub(crate) fn seed_audit_store(paths: &AppPaths, contents: &str) -> Result<()> {
+    paths.ensure()?;
+    fs::write(paths.audit_events_path(), contents)?;
+    Ok(())
+}
+
+pub(crate) fn audit_line(tag: &str) -> String {
+    serde_json::to_string(&audit_record(tag)).expect("serialize audit record")
+}
+
+pub(crate) fn audit_messages(records: &[AuditEventRecord]) -> Vec<&str> {
+    records.iter().map(|r| r.message.as_str()).collect()
+}
+
+// The case-count rule for property tests that set their own count, shared with
+// `rocm`, the integration tests and the Lemonade engine rather than copied.
+#[path = "../tests/common/proptest_cases.rs"]
+mod proptest_cases;
+pub(crate) use proptest_cases::proptest_cases;
+
+/// The temp name the retired `write_atomic` picked for `destination` at
+/// `millis`: the full file name plus `.tmp-<millis>-<pid>`, with this
+/// process's pid. Unlike the names `atomic_write` picks, it was fixed by the
+/// clock and the pid alone, so a test can occupy it ahead of time.
+pub(crate) fn retired_temp_path(destination: &std::path::Path, millis: u128) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .expect("a destination has a file name")
+        .to_os_string();
+    name.push(format!(".tmp-{millis}-{}", std::process::id()));
+    destination.with_file_name(name)
 }
 
 #[cfg(test)]

@@ -24,9 +24,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{AppState, ConnState};
+use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
-use crate::ui::{format, widgets};
 
 /// True when we have no live daemon telemetry to show — i.e. not connected to a
 /// running daemon, or connected but no snapshot has arrived yet. The
@@ -67,7 +67,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 /// Two hero panels: Node efficiency (tok/watt + trend) and Node throughput
-/// (Σ gen_tps + total power W). Reuses `widgets::node_efficiency` and the
+/// (Σ gen_tps + total power W). Reuses `rocm_dash_core::efficiency::node_efficiency` and the
 /// braille sparkline; honest `—` when a metric is unavailable (color is never
 /// the only signal — every value carries a text label + unit).
 fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -93,22 +93,16 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
-    // Track aggregate held: an instance contributes if it has a finite gen_tps
-    // AND its observation metadata says Held. Mirrors the finite-value filter
-    // `node_efficiency` applies below, so this can't mark the aggregate held
-    // over an instance that `node_efficiency` itself excludes as NaN/Inf.
-    // Any contributing Held → whole aggregate is held.
-    let any_held = state.latest.as_ref().is_some_and(|snap| {
-        snap.instances.iter().any(|i| {
-            i.gen_tps.is_some_and(f64::is_finite)
-                && i.gen_tps_observation.as_ref().is_some_and(|m| {
-                    m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
-                })
-        })
-    });
-    let eff = state.latest.as_ref().and_then(widgets::node_efficiency);
+    // One shared implementation: the value, and whether any throughput behind it
+    // is held, come from the same function the Hardware tab and the assistant use.
+    let node = state
+        .latest
+        .as_ref()
+        .and_then(rocm_dash_core::efficiency::node_efficiency);
+    let eff = node.map(|n| n.tokens_per_watt);
+    let any_held = node.is_some_and(|n| n.held());
     let value_base = eff.map_or_else(|| "—".to_string(), |v| format!("{v:.2} tok/W"));
-    let value = if any_held && eff.is_some() {
+    let value = if any_held {
         format!("{value_base}{}", format::HELD_MARKER)
     } else {
         value_base
@@ -118,8 +112,8 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     let trend: Vec<u64> = state
         .history
         .iter()
-        .filter_map(widgets::node_efficiency)
-        .map(|v| (v * 1000.0).round().max(0.0) as u64)
+        .filter_map(rocm_dash_core::efficiency::node_efficiency)
+        .map(|n| (n.tokens_per_watt * 1000.0).round().max(0.0) as u64)
         .collect();
 
     // Layout: value | sparkline (min) | label/legend.
@@ -291,6 +285,7 @@ mod tests {
                 gpu_utilization_pct: 50.0,
                 temperature_c: 55.0,
                 power_w: 300.0,
+                power_limit_w: None,
                 clock_mhz: Some(2000.0),
             }],
             ..Default::default()
@@ -492,6 +487,12 @@ mod tests {
         assert!(
             out.contains(format::HELD_MARKER),
             "HELD_MARKER must appear in efficiency hero when any instance is held; got:\n{out}"
+        );
+        // The throughput hero prints a `*` too, so pin the efficiency one: the
+        // marker must sit right after the tok/W figure.
+        assert!(
+            out.contains(&format!("tok/W{}", format::HELD_MARKER)),
+            "efficiency figure must carry the held marker; got:\n{out}"
         );
         assert!(
             out.contains(format::HELD_LEGEND),

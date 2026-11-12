@@ -221,7 +221,7 @@ fn is_stateful_sequence(fix: &rocm_core::diagnose::Fix) -> bool {
 /// it in a second layer would only make an already-correct line unreadable, and
 /// these lines exist to be read and pasted.
 fn remote_invocation(target: &str, command: &str) -> String {
-    format!("ssh {target} -- {}", super::shell_quote(command))
+    format!("ssh {target} -- {}", rocm_core::posix_shell_quote(command))
 }
 
 /// Rewrite every backtick-quoted `rocm …` so it names the target machine.
@@ -284,6 +284,28 @@ mod tests {
         // Round-tripping the snapshot is the contract; the value itself is
         // whatever this machine happens to be.
         assert!(!examination.os_family.is_empty());
+    }
+
+    #[test]
+    fn distro_id_like_survives_the_remote_round_trip() {
+        // A remote examination is only ever seen through JSON, so if this
+        // field didn't round-trip, the ID_LIKE fallback would silently never
+        // fire for `rocm remote doctor`.
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "distro_id_like".to_owned(),
+            serde_json::json!("rhel fedora"),
+        );
+        let parsed = parse_examination(&value.to_string()).expect("examined");
+        assert_eq!(parsed.distro_id_like, "rhel fedora");
+    }
+
+    #[test]
+    fn a_remote_on_an_older_cli_without_distro_id_like_still_parses() {
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().remove("distro_id_like");
+        let parsed = parse_examination(&value.to_string()).expect("older remote must parse");
+        assert_eq!(parsed.distro_id_like, "");
     }
 
     #[test]

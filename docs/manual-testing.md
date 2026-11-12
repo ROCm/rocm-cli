@@ -111,6 +111,20 @@ Expected result:
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
+Optional: an unreadable settings file. Copy `config.json` from the config
+directory aside, cut the original off part-way through, and run `rocm version`
+without `ROCM_CLI_DATA_DIR` set. Expected result:
+
+- The command fails and names `config.json`, saying it cannot be read, and
+  explains the three ways out: repair it; set `ROCM_CLI_DATA_DIR` (it names the
+  folder if the damaged file still shows it), after which commands that change
+  settings still stop and others either stop or run on default settings; or
+  rename it to the `config.json.broken` path it names, which resets every
+  setting and leaves runtimes in a custom folder reachable only through
+  `ROCM_CLI_DATA_DIR`.
+- `config.json` is byte-for-byte what you left; nothing was saved over it.
+- Restoring the copy makes `rocm runtimes list` show the same runtimes as before.
+
 ## 2. TheRock SDK Command-Line Install
 
 This tests the command-line install path without using the TUI:
@@ -158,6 +172,76 @@ Expected result:
   asking and prints a line crediting that flag by name — not `--yes`.
 - `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
   active default is: the preview stops before the gate.
+- Which source a preview reads follows the request, and the plan's
+  `canonical_source:`, `index_url:` and `source_layout_generation:` lines say so.
+  With no pin, `--channel release --family gfx1200` reads
+  `https://stable.repo.amd.com/rocm/whl-next` (`next-v1`) and `--channel nightly
+  --family gfx1200` reads `https://nightly.repo.amd.com/rocm/whl-next`, at the
+  newest build that has its PyTorch wheels (with a `warning:` line when a newer
+  `rocm` build does not yet). Pinning an earlier release or nightly reads the
+  earlier stream instead: `--version 7.14.1` reads
+  `https://repo.amd.com/rocm/whl-multi-arch` (`multi-arch-v2`), and `--channel
+  nightly --build-date 2026-08-20` reads
+  `https://rocm.nightlies.amd.com/whl-multi-arch`, while `--build-date
+  2026-09-01` reads the newest layout's nightly index. `--format tarball` with no
+  pin reads `https://stable.repo.amd.com/rocm/core/tarball/` (or
+  `https://nightly.repo.amd.com/rocm/core/tarball/` on the nightly channel), and
+  `--format tarball --version 7.14.1` is refused, pointing to `--format wheel`.
+  No unpinned install asks for a family label: `--family gfx120X-all` with no
+  `--version` is refused naming `--family gfx1200`, while `--family gfx120X-all
+  --version 7.14.1` previews from the earlier stream.
+- On a host with no usable Python (a minimal container; run with `PATH` pointing
+  at an empty folder and no `ROCM_CLI_PYTHON`) and a clean data folder,
+  `rocm install sdk ... --dry-run` still prints a plan. Its `python_launcher:`
+  line says `not prepared by this preview`, `python_source:` says `managed`,
+  and a `python_note:` line says a real install would use `uv` to install the
+  managed Python. Afterwards the data folder has no `tools` folder and the
+  config folder has no `config.json`: the preview downloaded no `uv` or Python
+  and saved no Python path. A real install on the same host does both. The
+  plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
+  interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
+  resolves `3.12` itself and may pick a different Python 3.12 than the managed
+  one a real install prepares. This holds for every layout, and the version in
+  that line follows the install: 3.12 for a ROCm 7 pin (`--version 7.14.1`),
+  3.14 for the default and for ROCm 10 or newer. A preview of ROCm 10 or newer,
+  which is what an install with no pin gets (`--family gfx1200`, or
+  `--version 10.0.0 --family gfx1200`), needs `uv` to choose
+  the `torch` and `torchvision` versions, so on a host with no `uv` installed it
+  stops before that step: the data folder still has no `tools` folder, a
+  `resolution_note:` line says why, and `target:`, `runtime_key:`,
+  `package_specs:`, `command:` and `manifest:` read `not resolved by this
+  preview`. Run the real install (or any command that fetches `uv`), then the
+  preview again, and it prints the complete plan; so does a preview with
+  `ROCM_CLI_UV_BINARY` naming a `uv`.
+- On the same host, with a wheel runtime registered whose manifest records no
+  usable Python, `rocm update` (also `--json`, `--dry-run`, and the check the
+  CLI runs at startup) still reports. The text report gives the runtime's
+  verdict and a `python_note:` line saying an update would use `uv` to install
+  the managed Python, which the check did not do. Afterwards the data folder has
+  no `tools` folder and the config folder has no `config.json`. That holds for a
+  canonical-layout runtime; for a ROCm 10 or newer runtime the check still
+  resolves the package versions with `uv` and can fetch the managed `uv` into the
+  data folder, though never a Python. `rocm update --apply` on the same host does
+  prepare the Python, since the install needs it.
+- With `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP=1`, or a
+  `ROCM_CLI_MANAGED_PYTHON_VERSION` whose Python the layout does not accept
+  (such as `3.13` for the canonical layout), on the same host the preview fails
+  with the install's own message. Its output before the failure states only
+  what was found (for example that the `PATH` Python is not usable) and never
+  says a real install would prepare or use a managed Python.
+- `rocm install sdk --version 10.0.0 --family gfx1200 --python-version 3.12
+  --dry-run` plans Python 3.12 (`python_wheel_tag: cp312`, and a managed Python
+  3.12 in the note on a host with none), and nothing in the plan says 3.14.
+  `--python-version 3.13` on a ROCm 7 install (`--version 7.14.1`) is refused, naming
+  Python 3.12 as the one that install uses, and `--python-version 3.9` on a
+  ROCm 10 install is refused naming 3.10 to 3.14. A real ROCm 10 install on a
+  vLLM GPU family with `--python-version 3.12` skips the engine auto-install
+  with a note, while a real ROCm 7 install on that family with `--python-version
+  3.12` (the redundant, accepted value) still auto-installs vLLM.
+- On the ROCm 10 runtime installed on Python 3.12 (including an install with
+  no pin, which now resolves to ROCm 10 or newer), `rocm engines install vllm` names
+  the wheel tag it needs, and `rocm update` of that runtime builds the new one
+  on Python 3.12 again.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
@@ -190,7 +274,7 @@ Expected result:
 Developer-only deterministic override:
 
 ```powershell
-python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
+python scripts\therock_sdk_install_test.py --dry-run --family gfx1200
 ```
 
 Use `--family` only when a test needs a fixed package family. Do not use it for
@@ -254,6 +338,24 @@ fallback paired an architecture line with the wrong GPU. On that machine
 `rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
 discrete card does have ROCm support, so the whole-machine claim is false.
 
+## 2b. Bare-Metal Driver Install
+
+On a real apt/dnf/zypper Linux host:
+
+```bash
+rocm install driver --dry-run
+```
+
+Expected result: the plan names the floating `latest` amdgpu release unless
+`ROCM_CLI_AMDGPU_DRIVER_VERSION` is set, in which case it names that version
+instead. A malformed override (e.g. containing a space or `'`) is refused with
+a reason naming `ROCM_CLI_AMDGPU_DRIVER_VERSION`, not silently ignored.
+
+On Ubuntu 22.04, 24.04 and 26.04 the apt source line names the matching suite
+(`jammy`, `noble`, `resolute`). If `amdgpu-dkms` is already installed, the
+first prepare command prints a "from a previous installation" warning; confirm
+nothing is removed (`dpkg -s amdgpu-dkms` still reports installed afterwards).
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
@@ -269,6 +371,7 @@ Expected result:
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
+- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.
 
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
@@ -276,14 +379,163 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
 
+To check the recovery from a stale Lemonade backend pin (Windows or Linux with
+a managed Lemonade runtime already installed and an active managed ROCm SDK):
+the recovery only runs when the pinned `therock.version` equals the active
+SDK's version; with no active SDK, or a different version, the install takes
+other paths and simply fails or realigns. Edit
+`resources/backend_versions.json` in the Lemonade runtime tree so that
+`therock.version` is the active SDK's version and `llamacpp.rocm-stable` is a
+build tag Lemonade does not ship, add an unrelated key, remove the installed
+ROCm backend directory under `bin/llamacpp/`, and run
+`rocm engines install lemonade`. Expected result:
+
+- A warning says the pinned llama.cpp backend could not be installed and that the
+  pins Lemonade ships were restored; the command exits 0 and installs the
+  packaged backend.
+- `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
+  packaged values again, and the unrelated key is still there.
+
+To check what a Lemonade install says about its size (no download needed for
+the refusal): with a debug build, set
+`ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
+folder run `rocm engines install lemonade --yes`. Expected result:
+
+- Before anything else it prints `Installing Lemonade <version> into <folder>`
+  and a line giving the ROCm backend's download (up to about 4.4 GiB), disk use
+  (up to about 25 GiB) and the free space on that drive.
+- It then fails with `not enough free disk space to install Lemonade: ...
+  Nothing was downloaded.`, and `<folder>` has no `downloads` or `runtime`
+  subfolder.
+- With `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=2147483648` (2 GiB) instead, it
+  warns that only 2.0 GiB is free for a backend of up to about 4.4 GiB and
+  carries on: Lemonade picks the backend after this point and a smaller one may
+  fit. (Stop it before the download if you do not want one.)
+
+With room to spare, on Windows from an interactive console: install Lemonade
+with no runtime active, then `rocm install sdk`, then `rocm serve <gguf-model>`.
+Expected result:
+
+- The serve prints the install notice for the runtime's own
+  `engines\lemonade` folder, and says the data folder's copy is not reused.
+- Lemonade's own backend download progress (`[1/2] ...`, `Total: ...`) appears
+  in the console instead of a silent wait.
+- `rocm storage report` lists both copies under `Engine installs`, with the data
+  folder's one `not used right now` (and reclaimable) and the runtime's one `in use`.
+- `rocm runtimes uninstall <runtime-key>` says Lemonade's install was inside the
+  runtime and removed with it, and a following `rocm storage report` shows the
+  remaining copy as `not recorded as installed`.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
   "detached - server still running" note with the service id. Confirm the server
   is still up: `rocm services` lists it and the endpoint still answers a chat
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
-- Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
-  `rocm services` no longer lists it as running.
+- Re-run the serve command and press `Ctrl+C` instead. The server shuts down,
+  the command prints `Local server stopped` and exits 0, and `rocm services` no
+  longer lists it as running. (A stop that cannot confirm the process exited
+  prints `Local server stop not confirmed` on stderr and exits non-zero
+  instead.)
+
+### Windows `--gpu` index check
+
+On a Windows machine with one AMD GPU, pin an index the machine does not have:
+
+```powershell
+rocm serve qwen --engine lemonade --gpu 7
+rocm services
+```
+
+Expected result:
+
+- `rocm serve` exits non-zero before starting anything, and says index 7 is not
+  present and lists the usable indices (`[0]` here).
+- `rocm services` shows no new server. Repeat with `--gpu 0` to confirm a real
+  index still starts.
+- With `HIP_VISIBLE_DEVICES=0` set (an ordinal the machine has), `--gpu 7`
+  is refused as not available under that mask (it names `HIP_VISIBLE_DEVICES`
+  only) and lists `[0]`. With only `ROCR_VISIBLE_DEVICES` set, which native
+  Windows ignores, the refusal says the index is not present on this host and
+  names no mask.
+- With `HIP_VISIBLE_DEVICES=3` set (an ordinal past the one adapter, which
+  cannot be resolved; an empty value is treated the same way), `--gpu 7` is still refused: it is past the adapter count
+  whatever the mask says, and the message says the mask could not be resolved.
+  `--gpu 0` is below the count, so it is accepted with a `warning:` line saying
+  the index was checked only against the GPU count, not the mask (so this
+  starts a server; stop it afterwards).
+- On a machine with an AMD adapter the ROCm runtime does not support beside a
+  supported one, the Windows list counts both, so `--gpu 1` can still pass the
+  check; `amd-smi list`, when it works, lowers the bound.
+
+If neither the Windows adapter list nor `amd-smi` can be read, `--gpu 7` is used
+unchecked and `rocm serve` prints a `warning:` line on stderr saying the index
+was not checked. The automated scenario for the refusal is `serve-16` on the
+Windows GPU lane.
+
+Omit `--port` on the default loopback host to exercise automatic selection:
+
+```powershell
+rocm serve qwen --engine lemonade --device gpu_required --managed
+```
+
+Expected result:
+
+- The command picks the first free port in `11435`-`11535` instead of failing
+  or always landing on `11435`.
+- `rocm services` shows the launched service bound to the port it picked, and
+  the deployment summary's endpoint matches it.
+
+With that service still running, try to launch a service for a different
+model pinned to the same port. (The same model and engine would be reported as
+already running instead, since an equivalent live service is reused before any
+port check.)
+
+```powershell
+rocm serve <a-different-model> --engine lemonade --device gpu_required --managed --port <the-port-above>
+```
+
+Expected result:
+
+- The command refuses up front, naming the service already holding that port
+  and how to free it (`rocm services stop <service-id> --yes`), without
+  spawning an engine process or writing a new record.
+
+### Windows display driver check
+
+On a Windows machine with an AMD GPU, check what the CLI says about the display
+driver:
+
+```powershell
+rocm examine
+rocm diagnose
+rocm install driver
+Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate
+```
+
+Expected result:
+
+- `rocm examine` prints `driver_version` and `driver_date`. Both match the
+  `DriverVersion` and `DriverDate` that the last command prints.
+- With a driver dated before 27 July 2023 (`FIRST_HIP_SDK_FOR_WINDOWS` in
+  [windows_driver.rs](../crates/rocm-core/src/windows_driver.rs)), `driver_age` says it is older than the
+  first HIP SDK for Windows and that the minimum driver version is not
+  established. `rocm diagnose` lists `fix-22-display-driver-old` with a WEAK
+  score, and its advice is AMD's support page and a restart after the install.
+  The date is only a floor: it cannot judge newer GPUs such as gfx120X,
+  gfx1150 and gfx1151, which may need newer drivers.
+- With a newer driver, `driver_age` says it is not older, and `rocm diagnose`
+  does not list `fix-22-display-driver-old`.
+- `rocm install driver` prints the same version and date, an `outdated:` verdict,
+  and the fix id when the driver is old. Next to `outdated: no` it says the date
+  cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151. It installs nothing and prints no
+  execution commands.
+
+Automated end-to-end scenarios (`examine-29`, `diagnose-41`, `driver-install-04`
+and `driver-install-05`) cover the lines, the verdict and the "installs nothing"
+promise on the Windows GPU lane with whatever driver that machine has. Only the
+old-driver branch needs this manual check: it needs a machine whose display
+driver is dated before 27 July 2023. The logic is also covered by unit tests.
 
 ## 4. Local Server Records
 
@@ -293,6 +545,8 @@ After a managed or foreground serve attempt, inspect local server records:
 rocm services
 rocm services list --all
 rocm services logs <service-id>
+rocm services logs <service-id> --follow
+rocm serve <model> --wait   # waits past 45s and returns once the server answers or its engine gives up (also for a matching server still starting; an already-serving one returns at once)
 ```
 
 Expected result:
@@ -310,7 +564,56 @@ Expected result:
   block at all.
 - `rocm services list --all` shows saved history, including the failed or
   stopped attempts the default view hides.
+- `rocm services logs <service-id> --follow` prints the recent output, then new
+  output as it arrives (a download bar redraws on one terminal row), and returns
+  by itself with `Service <id> is <status>; stopped following.` once the server
+  stops (exit non-zero if it ended `failed`), with a `Service <id> is ready.`
+  line when it finishes starting; Ctrl-C ends the follow and the server keeps running.
+  On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>` line stays on the
+  row directly under the newest output (and under the download bar) as the log
+  grows; piped, stdout carries only the log text and the hint (once), ready and
+  stopped-following lines go to stderr. A server already `failed` when the follow
+  starts also exits non-zero.
+- `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
+  server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
+  with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero
+  with `the server exited before it became ready` and a `rocm logs --service`
+  pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
+- The log views tell an empty log from one they could not show, and each view
+  reads its own files, so check each separately. In a Linux or WSL shell,
+  `head -c 5000000 /dev/zero | tr '\0' x > <file>` makes a file that is one line
+  of more than 4 MiB without a line break:
+  - A server's log. Write that file over the log file named on the `Log file:`
+    line of `rocm services logs <service-id>` (by default `services/<service-id>.log`
+    under the data folder), then run `rocm services logs <service-id>` or
+    `rocm logs --service <service-id>`: both print `Recent output: none shown;
+    the newest line is longer than the 4 MiB a log view reads`, not `no output
+    yet`. Truncate the file to nothing and both print `Recent output: no output
+    yet` again.
+  - The `rocm logs` browser, which does not read a server's log: it lists the
+    activity log and the files under `logs/cli/` and `logs/tui/` in the data
+    folder (the `Folder:` and `Command logs:` lines of `rocm logs` name them).
+    Write that file to `logs/cli/probe.log` there, run `rocm logs`, and expect
+    `command log probe.log: <no output shown from CLI action log: the newest line
+    is longer than the 4 MiB a log view reads>` in the `Lines:` list, not `No logs
+    found yet.`. The same file written over the activity log instead gives
+    `Recent activity: none shown; the newest line is longer than the 4 MiB a log
+    view reads`, not `no activity yet`.
+  - `rocm comfyui logs`, which reads the saved ComfyUI logs: write the file under
+    `apps/comfyui/logs/` in the data folder and expect `No output shown: the
+    newest line is longer than the 4 MiB a log view reads.`; an empty file there
+    gives `The saved log is empty.`.
+  - A stray byte that is not valid text in any of these logs shows the readable
+    lines with a replacement character, not a `failed to read` line.
+- The `service_logs` tool (`rocm mcp-call service_logs --arguments-json
+  '{"service_id":"<service-id>","lines":50}'`) reads the same server log as
+  `rocm services logs` and answers with one of three summaries: `has no log
+  output yet` for an empty log, `has log output, but none is shown` with the same
+  4 MiB clause for the over-long line above, or `Read the last N line(s)`. Its
+  structured reply carries `lines` (the number returned, such as 3 for a
+  three-line log), `lines_requested` (the 50 asked for) and
+  `newest_line_exceeds_read_bound`.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the
   row's note points at `rocm services prune` to reclaim the space.
@@ -321,8 +624,80 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
+`stop` prints `Local server stopped` only once every recorded process is
+confirmed gone; otherwise it prints `Local server stop not confirmed` on stderr,
+keeps the record and any endpoint key, and exits non-zero. It names each
+process that, or a process under it, did not exit. On Windows it also names one
+that did exit while taking the processes under it down did not complete
+(`not confirmed: process <pid> (<role>) exited, but a process under it may still
+be running`), and one that was already gone when that step ran with no other
+recorded process confirmed gone (`not confirmed: process <pid> (<role>) was
+already gone when the processes under it were to be taken down`). For one it
+could not verify, it names an operating-system command to check on it. It never
+prints a `retry:` line.
+
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
+
+On Windows the stop takes the engine's process tree down with the recorded
+process (`taskkill /T /F`, which has to finish within the stop's grace period of
+10 seconds, or the stop is not confirmed), and it checks the recorded process
+against the creation time written when the server started, so a process that has
+since taken the same PID is left alone and reported as `identity_mismatch`. A
+process it cannot verify, on either platform, is not signalled and is named with
+the check the host has: `ps -p <pid> -o pid,args` on Linux and WSL, and
+`tasklist /FI "PID eq <pid>"` on Windows. There are two ways to be unverifiable:
+the recorded start-time can no longer be read back from a running process, or
+(Windows only) the PID cannot be queried at all, as for a live process the
+account may not open. The text of `rocm services stop` does not list a per-process
+outcome for the stopping process itself; the JSON answer of the sandbox
+`stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
+as stopped).
+
+#### Windows host check
+
+The Windows build-and-test job runs the workspace unit tests, which include two
+`#[cfg(windows)]` tests in `proc_lifecycle.rs` that stop a real `ping` process
+through the PID hold, the creation-time read and the System32 `taskkill`. It does
+not run any scenario, and nothing there stages the unrun parts: the end-to-end
+tree kill of a parent with a child (`service-stop-07`), a real unopenable
+process (the `OpenProcess` failure codes), and `taskkill` exiting 128 or failing
+or stalling. None of these has been run on a Windows host, and no Windows result
+is claimed. On a Windows host with a `--features rocm/e2e-test-hooks` debug
+build and `ROCM_CLI_BINARY` set, run the scenarios that apply to Windows:
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-0[178]"` (`-01`
+plants PID 0, `-07` is Windows-only, `-08` runs on every OS) and
+`cargo test -p e2e-cucumber --test e2e -- -n "service-unqueryable-01"`, and
+record the result. Do not select `service-stop-02` to `-06` or
+`service-unqueryable-02`: they are Linux-only (they need `sleep` or `/proc`),
+and `-n` bypasses the harness's OS filter, so they would fail for want of the
+platform rather than for any defect.
+
+#### A record that stays unverified
+
+If the server is gone but its recorded PID has been taken by a process this
+account cannot open, `rocm` cannot tell the two apart, and it treats that as
+possibly running, which is the safe direction: the record never reconciles to
+`stopped`, `rocm services remove` and `rocm services prune` refuse it, and
+`rocm services stop` keeps reporting `unverified`. To clear it:
+
+1. Run the check command the stop printed. If the process is this server's, end it
+   yourself (from an elevated prompt if the account may not), then run
+   `rocm services`; the record reconciles and its endpoint key is dropped.
+2. If it is an unrelated process, run `rocm services remove <service-id> --force
+   --yes`. The refusal of a plain `remove` names exactly this command. `--force`
+   applies only when a stop was requested (the stop that reported `unverified`
+   did that), no recorded process is confirmed running, and at least one could
+   not be queried; a process `rocm` can see running is never forced past. The
+   command says which process could not be queried and that, if it is still
+   running, it keeps running, and it deletes the record, its log, its engine
+   state and its endpoint key. The server can no longer be restarted afterwards.
+   `rocm services prune` has no `--force`: it leaves such a record alone and lists it
+   under `Left alone` with this exact command.
+   If the record still reads `ready` and nobody has run `rocm services stop` on it,
+   `--force` is refused and the refusal names that stop first; run it (it reports
+   the process unverified and records the request), then the forced removal. This is
+   the intended order, not a gap: `--force` never removes a record nobody tried to stop.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
@@ -359,10 +734,16 @@ rocm engines install vllm --runtime-id <runtime_key_a> --yes
 rocm engines install vllm --runtime-id <runtime_key_b> --yes
 ```
 
-`--yes` approves required system-package installs such as OpenMPI, which can
-call `sudo`. If the `install sdk` report above already printed an
-`engine auto-install` block for vLLM, that runtime has it; `--reinstall` is the
-flag that forces a reinstall when the engine already exists.
+`--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
+libnuma), which can call `sudo`. `engines install` never asks for confirmation:
+without `--yes`, a Linux host with root or passwordless `sudo` installs a
+missing package anyway, and one that would need a password prints the commands
+to run while the install continues. With `--yes`, a failed OpenMPI install is an
+error; a failed libatomic or libnuma install only warns. On Windows these
+installs are skipped. If the
+`install sdk` report above already printed an `engine auto-install` block for
+vLLM, that runtime has it; `--reinstall` is the flag that forces a reinstall
+when the engine already exists.
 
 **Start from runtime A.** Make it the active runtime and start a server on it.
 `--runtime-id` names the runtime explicitly, so the server's recorded runtime
@@ -531,14 +912,14 @@ Expected result:
 - A prompt appears naming the serving model and warning that it may
   still be running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
-  placeholder) to stop it first. From the dashboard (not the launcher) on a
-  host where its own daemon client never connects (Windows, for the whole
-  session), the prompt still shows that same stop command and the service
-  id, but not the model's name — the dashboard's own live view is where the
-  name comes from, and it never fills there. The launcher's own copy of the
-  prompt always names the model, Windows included — it reads the
-  managed-service registry directly rather than through the dashboard's
-  daemon connection.
+  placeholder) to stop it first. From the dashboard (not the launcher) on
+  Windows, where the dashboard streams live GPU/CPU/memory but never gets a
+  serving-instance snapshot (no `rocmdashd` unix socket there), the prompt
+  still shows that same stop command and the service id, but not the
+  model's name — the dashboard's own live view is where the name comes
+  from, and it never fills there. The launcher's own copy of the prompt
+  always names the model, Windows included — it reads the managed-service
+  registry directly rather than through the dashboard's daemon connection.
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
@@ -574,7 +955,263 @@ Expected result:
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
 
-## 5. ComfyUI Verification
+### 4a. Dashboard Doctor Report
+
+On a machine whose hardware `rocm diagnose --report` can describe (see
+`rocm diagnose --report --json` for what it says on yours), open the dashboard
+and go to the Observe tab, then press `d` to open the Diagnose screen:
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- The Diagnose card ends with `Prepare a Doctor report (p). It is shown first,
+  and nothing is sent.` The footer reads `Enter/r run · p report · Esc close`.
+  There is no send hint yet.
+- `p` runs the read-only preview (`rocm diagnose --report --json`) in a console
+  and prints the report. Press Enter or Esc to dismiss the console.
+- If the CLI prepared a report, the card now says `A report is ready` and the
+  footer adds `s review & send`. If the CLI refused (hardware that is not on the
+  published list, an unreadable architecture, a WSL host), the card shows the
+  CLI's own explanation, says no report was prepared, and the footer has no
+  `s review & send`. Pressing `s` then does nothing.
+- `s` does not send. It opens a review dialog titled `Report this diagnosis`
+  that shows the full report, and `Deny` is the selected button. Its second
+  line, above the report, says the mail goes from your own mail account and
+  carries your address, so that is on screen before you approve, without
+  scrolling. Check that nothing else happened: no mail client opened and no job
+  started.
+- In the dialog, PgUp and PgDn scroll one page, Home and End jump to the top and
+  the bottom. A muted `More to read` line with the row position appears only
+  while the report is longer than the dialog. Up and Down do not scroll.
+- Decline with `n`, Esc, `q`, or Enter on `Deny`. The dialog closes, no mail
+  client opens, and the report is still ready: press `s` to review it again.
+- Approve with `y` (or Tab to `Approve`, then Enter). Only now does the
+  dashboard run `rocm diagnose --report --send`, which opens a prefilled mail in
+  your mail client, or on a machine with no mail client prints the address and
+  the link. The mail is not sent until you send it from the mail client. The
+  send examines the machine again, so the mail can differ slightly from the
+  preview if the machine changed in between. In the console, the line straight
+  under the report says the mail goes from your own mail account and carries
+  your address, and that the report itself names no user, host, or file path.
+  Check that the report above it bears that out.
+
+On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
+outcome (report ready or refusal) without scrolling.
+
+### 4b. Dashboard Live GPU/CPU/Memory On Windows
+
+On a native Windows machine with an AMD GPU (no `rocmdashd` socket exists
+there, so the dashboard collects in-process):
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- Within a few seconds the Home tab shows live CPU and memory figures and a
+  GPU card with utilization and VRAM, updating about once a second. Until the
+  first reading arrives the GPU area shows a "Detecting GPU…" placeholder
+  rather than 0.0%.
+- On a host with exactly one real display adapter, VRAM total, temperature,
+  power and clock are filled in when the AMD driver's `amdadlx64.dll` is
+  present. With more than one adapter (for example a hybrid laptop) VRAM
+  total stays unmeasured and shows `—` in the Home hero and in the GPU wall
+  sidebar, never `0.0%`.
+- The hero's `T/S` row reads `—`, never `0` or `-0`: Windows has no
+  serving-instance view, so no throughput is ever measured there.
+- Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
+  back when it ends.
+- Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
+  utilization and VRAM usage working and temperature/power/clock at their
+  unmeasured values, with no crash.
+- No other output of this section needs a daemon: `rocm dash` must not report
+  a failed daemon connection.
+
+### 4c. Dashboard Hero In A Short Terminal
+
+**Any platform.** The hero's row dropping is terminal layout, not a
+Windows-specific path, so this reproduces on Linux and WSL too.
+
+Open a terminal about 22 to 24 rows tall — the VS Code panel is one — and
+run:
+
+```
+rocm dash
+```
+
+Expected result:
+
+- The hero still shows utilization, VRAM, temperature and power. It never
+  renders as an empty box with only its "Node throughput · …" title.
+- As the terminal gets shorter the hero loses rows from the bottom only: the
+  held legend first, then `T/S`. Enlarging it brings them back.
+- With a model served whose figures are a scrape window old, the `*` held
+  marker and the `* = held (prior scrape window)` legend explaining it appear
+  and disappear **together** as the terminal is resized. A `*` on a reading
+  with no legend anywhere on screen is a bug; so is the legend with nothing
+  marked.
+- The Hardware tab's GPU header has no room for a legend, so it spells the
+  same condition out: `eff 0.50 tok/W (held)`. It sits right after the GPU
+  count, so on an 80-column terminal the partition and VRAM text clips before
+  it does. A held figure that shows no `(held)` there is a bug.
+
+  Check this one by **starting tall and shrinking**, not at the 22-to-24 rows
+  above. The legend is the first row the hero drops, and the marker is gated on
+  the legend fitting — so at 22 to 24 rows neither is on screen and there is
+  nothing to compare. Start around 30 rows, confirm both are present, then
+  shrink past the drop and confirm both go at once.
+
+## 5. Reuse Is Exempt From The No-GPU Refusal
+
+**Linux or WSL only.** Unlike the rest of this file, the commands below are
+bash, not PowerShell, and they pin `--engine vllm`, which is unsupported on
+native Windows. The behaviour itself is not platform-specific; only this recipe
+for reproducing it is. On native Windows, substitute `--engine lemonade`
+throughout and set the mask with `$env:HIP_VISIBLE_DEVICES = ""` (and clear it
+with `Remove-Item Env:HIP_VISIBLE_DEVICES` afterwards).
+
+This is a change to a refusal you may be relying on, so check both halves. Mask
+every device to stand in for a host with no usable AMD GPU — the same condition
+the refusal names.
+
+1. With a GPU visible, start a server and let it become ready:
+
+   ```bash
+   rocm serve <model> --engine vllm --managed
+   ```
+
+2. Re-run the *same* command with every device masked:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= rocm serve <model> --engine vllm --managed
+   ```
+
+   Expected result: it does **not** refuse. The summary reports the service was
+   already running and hands back its endpoint. Nothing is launched and no GPU
+   is pinned.
+
+3. With the same mask, check the two terms of the pre-gate *separately*. The
+   gate (`any_live_managed_service_for_model`) tests the engine first and only
+   then the model, so one command that changes both cannot tell you which term
+   held the gate shut — a different-engine run is refused whatever the model
+   name, and would pass even if the model term had been deleted.
+
+   3a. **Same engine, different model.** This is the run that actually exercises
+   the model term. Pick a name that does **not** overlap the running one as a
+   substring — if the live service is `qwen3-8b-instruct`, do not use `qwen`:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= rocm serve <a non-overlapping model> --engine vllm --managed
+   ```
+
+   Expected result: `no usable AMD GPU detected; rocm serve requires a GPU under
+   the gpu_required policy ...`, and the refusal comes *first* — no engine
+   preparation, no download, no runtime manifest written. A live service for
+   another model must not soften the refusal or pull engine work in front of it.
+
+   The non-overlapping name matters: model matching is deliberately lenient, so
+   an overlapping name (`qwen` against a live `qwen3-8b-instruct`) *does* let
+   engine preparation run before the refusal. That is documented behaviour, not
+   a defect — see the reuse section of the README — so testing this step with an
+   overlapping name proves nothing.
+
+   3b. **Different engine.** Lemonade is the self-managing engine whose
+   preparation is user-visible, so this is where a missing refusal would show:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= rocm serve <model> --engine lemonade --managed
+   ```
+
+   Expected result: the same refusal, and still first — no
+   `Preparing lemonade for GPU serving...` line and no embeddable download. Note
+   that the model name is irrelevant here: the engine mismatch alone shuts the
+   gate, which is exactly why 3a is a separate run.
+
+4. Stop the service (`rocm services stop <service-id> --yes`) and repeat step 2.
+
+   Expected result: with nothing left to reuse, the masked run refuses with the
+   same message as step 3a.
+
+## 6. vLLM Serve Memory Guidance
+
+Needs a Linux or WSL host where the vLLM engine can start. The behaviour under
+test is described in
+[the README](../README.md#when-a-serve-runs-out-of-gpu-memory); the automated
+coverage is listed in [testing.md](testing.md#serve-oom-guidance).
+
+### 6a. The out-of-memory note
+
+Force a launch that cannot fit — either a model larger than the card, or the
+same model with the whole card reserved while another workload holds memory:
+
+```bash
+rocm serve <model too large for this GPU> --engine vllm --gpu-memory-utilization 1
+```
+
+Run it in an interactive terminal, with no `--verbose` and no redirection, so
+you get the default deployment summary.
+
+Expected result:
+
+- The summary reports the server did not become ready, and carries a `note:`
+  saying the serve attempt ran out of GPU memory.
+- The note names both knobs: `--gpu-memory-utilization` (with its `(0, 1]`
+  domain spelled out) and `--gpu <index>`.
+- It states that lowering the reservation will not help if the model simply does
+  not fit, and points at a smaller or quantized model instead.
+- It ends with a runnable `rocm diagnose --symptom '…'`. Paste that line
+  unchanged: it must run and report the vLLM out-of-memory cause, not "no known
+  cause".
+- The `--symptom` value is one balanced single-quoted argument. If your failing
+  log line carried an apostrophe, the command falls back to the canonical
+  `vllm: …` symptom rather than your line — that is correct, and your real line
+  is still in `rocm services logs <service-id>`.
+- If your failing line carried terminal **colour codes**, expect the *rendered
+  row* — the line as the terminal drew it, escapes gone — not the canonical
+  symptom. The note reads the log after the engine has echoed its tail back into
+  it as rendered rows, so that row is what it quotes. Do not mark this a failure:
+  the engine's own failure message *does* fall back to the canonical symptom for
+  the same line, so the two surfaces can print different `--symptom` arguments
+  for one failure and both are correct (see
+  [When a serve runs out of GPU memory](../README.md#when-a-serve-runs-out-of-gpu-memory)
+  in the README; pinned by
+  `the_colourised_round_trip_quotes_the_row_the_terminal_drew`).
+- If the pre-launch low-VRAM warning already printed the
+  `--gpu-memory-utilization` advice for this GPU, the OOM note does not repeat
+  that sentence, but still carries the confirmation, the model-too-large caveat,
+  and the `diagnose` command.
+
+### 6b. Where the note is deliberately absent
+
+None of these is a bug; check each so the note's scope is not mistaken for
+flakiness:
+
+```bash
+rocm serve <same model> --engine vllm --gpu-memory-utilization 1 | cat
+rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
+```
+
+- Piped or redirected: the plain machine-readable form ends at
+  `readiness: starting` and carries no *post-launch* note. It does still print
+  the pre-launch planning lines above that, so on a tight card you will see the
+  low-VRAM `note:` with the same `--gpu-memory-utilization` sentence — check
+  that what is missing is the OOM note (the "ran out of GPU memory"
+  confirmation and the `rocm diagnose --symptom` command), not every `note:`.
+- `--verbose` (or `--foreground`): the engine log streams in your terminal, so
+  you read the traceback directly instead.
+- A server that becomes ready, and one that is still loading its model while its
+  endpoint is already up, both carry no memory note.
+- A failure that is not a memory failure (serve a nonexistent model id) carries
+  no memory note either — it must not be dressed up as one.
+- Re-running `rocm serve` against an already-running service prints the
+  already-running summary with no memory note, whatever that service's own log
+  contains. Read that service's log with `rocm services logs <service-id>`.
+
+## 7. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -653,7 +1290,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 6. Optional Cloud Provider Key
+## 8. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -678,22 +1315,26 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 7. Optional Provider-Assisted Planning
+## 9. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:
 
 ```powershell
 rocm config set-planner-provider local
-rocm "start a local model"
+rocm "serve a model"
 ```
+
+Only a request the deterministic planner cannot settle is sent to the provider.
+`serve a model` names no model, so it is; `start a local model` resolves to the
+validated default model on its own and never consults the provider.
 
 Expected result:
 
 - The rendered plan says `planner: hybrid-parser-v1 + provider:local` only if
   the local provider returned a valid structured `rocm` tool call.
 - The plan still asks for review before mutating actions.
-- `rocm --yes "start a local model"` refuses to auto-run a provider-assisted
+- `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
 
 To turn provider-assisted planning back off:
@@ -702,7 +1343,7 @@ To turn provider-assisted planning back off:
 rocm config clear-planner-provider
 ```
 
-## 8. Uninstall
+## 10. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
 `cargo` build, whose binaries uninstall leaves alone):
@@ -715,13 +1356,224 @@ rocm uninstall
 Expected result:
 
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
-  as the command exits) and, under
-  `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing.
-- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+  as the command exits), on Linux the `shell completions` file
+  `completions/rocm.fish` in fish's config folder (`$XDG_CONFIG_HOME/fish`
+  when that is an absolute path, else `~/.config/fish`) when the installer
+  wrote one, and, under `PATH changes from the installer that would be
+  undone:`, each shell profile the installer wrote (Linux, including fish's
+  `config.fish` when fish was installed) or the user `PATH` entry (Windows).
+  It removes nothing, and at a
+  terminal ends with `Nothing was removed. To remove these items, run it again
+  without --dry-run.` Running the same command again without `--dry-run` asks
+  `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
+  its output piped to a file or another command, or its input redirected, it
+  lists the same items and omits that last line (scenario `uninstall-08`).
+- After confirming, the install folder holds no `rocm`/`rocmd` files, the
+  fish completion script is gone (its `completions` folder stays), and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
 - If another program lives in the install folder, the review instead says
-  `PATH change left in place` and names it, and the `PATH` change stays.
-- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
-  stays too, and it does.
+  `PATH change left in place` and names it, and the `PATH` change stays; the
+  fish completion script still goes.
+- If you already have your own `completions/rocm.fish` (or a link there) when
+  you run the installer, it prints `note: fish completions not installed: …
+  already exists and was not written by this installer`, changes nothing, and
+  a later uninstall leaves the file (scenario `lifecycle-35`).
+- If you replace `rocm.fish` with your own file before uninstalling (for
+  example `rocm completions fish > <that path>`, which writes no installer
+  marker line), the review lists it under `Left alone:` as not written by the
+  installer, and the file stays (scenario `lifecycle-33`).
+- If the `completions` folder cannot be written to (`chmod 0555` it), the
+  uninstall prints `warning: could not remove shell completions <path>`,
+  still removes everything else, and ends with `uninstall complete`
+  (scenario `lifecycle-34`).
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change and
+  fish completions stay too, and they do (scenario `lifecycle-25`).
+- On a home folder ROCm CLI never touched, the dry run says
+  `Nothing managed by rocm-cli would be removed.` and leaves the home folder
+  empty (scenario `uninstall-06`): run
+  `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
+  on that folder. It adds no line about how to remove anything (scenario
+  `uninstall-09`).
+- Passing `--force` to `rocm uninstall` is refused with a message that says it
+  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  unknown-argument error (exit 2). Neither
+  suggests `--force-dev-binaries` (scenario `uninstall-10`).
+  `rocm uninstall --help` ends with examples that start with a dry run
+  (scenario `uninstall-11`).
+- Without `--yes` and without a terminal, the command prints the same review,
+  then refuses with `uninstall requires --yes outside an interactive terminal`
+  and exit code 1, and removes nothing. On Linux or WSL, check it with no
+  terminal attached. A regression would delete real settings, data and cache,
+  so the command points `HOME` at a scratch folder itself:
+
+  ```bash
+  HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+  ```
+
+  At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
+  `maybe` and it cancels after printing `"maybe" is not yes or no; treating it
+  as no.`; an answer longer than 40 characters is shown cut to its first 40,
+  with `...` after the closing quote. Press Ctrl-D and `uninstall cancelled`
+  appears on a line of its own, not after the prompt. Nothing is removed in
+  either case. The same prompt is shared by `rocm fix` and the SDK-overwrite
+  prompt, so the same answers behave the same way there.
+
+## 11. AIM (Docker) Engine Verification
+
+Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
+succeed). The catalog entry used below has profiles for Radeon PRO W7900 and
+Radeon AI PRO R9700 (`gfx110X-all`, `gfx120X-all`) only; on a GPU of another
+family, such as Strix Halo or an Instinct card, `rocm serve` refuses it, so use
+the raw image form further down. Other boards of a supported family (for
+example an RX 7900 XTX) are not refused: the CLI prints a note that the pinned
+profile targets the W7900 / R9700 and names `--engine-env AIM_PROFILE_ID` to
+override it.
+
+```bash
+rocm serve aim-qwen3.5-9b --engine aim --managed
+rocm services list --all          # note the service id, e.g. aim-<model>-<millis>
+rocm services stop <service-id> --yes
+docker ps -a --filter name=rocm-aim-
+rocm services restart <service-id> --yes
+```
+
+A cold start downloads the model weights inside the container, which can exceed
+the engine's default 5-minute readiness wait. Raise it with
+`ROCM_CLI_AIM_READY_TIMEOUT_SECS=<seconds>` (a positive integer) in the
+environment of `rocm serve`. Stopping or failing a start removes the container
+and its downloaded weights, so a retry downloads them again.
+
+`aim-qwen3.5-9b` (canonical id `Qwen/Qwen3.5-9B`) is the catalog entry
+(`rocm model --verbose`). It supplies the pinned image and, for the detected GPU
+family, `AIM_PROFILE_ID`; on a GPU the image has no profile for (for example
+Strix Halo or an Instinct card) `rocm serve` refuses with the supported
+families. An image whose smallest profile needs several GPUs on the detected
+family is refused, because `rocm serve` gives an engine one GPU. None of these
+GPU checks run when the host's GPU family cannot be detected or with
+`--device cpu_only`. To serve a raw image
+reference instead, which skips these catalog checks, pass the profile yourself:
+
+```bash
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency
+```
+
+`--engine-env KEY=VALUE` is stored with the service record, so use it for
+non-secret values only. For a secret such as a gated model's `HF_TOKEN`, export
+it and pass the bare name (`export HF_TOKEN=...`, then `--engine-env HF_TOKEN`):
+it is forwarded from your environment and never stored. A gated model
+(`rocm model --verbose` shows the `HF_TOKEN` note) is refused before
+anything is pulled if no token was passed. `--engine-env` is
+ignored by the other engines (the command prints a note saying so).
+
+Expected result:
+
+- The command pulls/starts an AIM Docker container (first run takes longer
+  while the image is pulled) and the model is reachable on the printed port
+  once the service shows `ready`. The model name to send is the one printed as
+  the API model, which is the name the container serves, not the image
+  reference.
+- `rocm services list --all` shows the service's engine as `aim`, and the
+  service stays `ready` while the container runs.
+- Stopping the service stops and removes the container; `docker ps -a` no
+  longer lists it, and `rocm services restart` brings the same service id back
+  up.
+- Killing the container directly (`docker kill rocm-aim-<service-id>`) makes the
+  service read `failed` rather than `stopped`, so rocmd's recovery restarts it.
+- On native Windows, the same command fails explicitly instead of falling
+  back to another engine.
+
+## 11. Background Automation Helper
+
+The helper (`rocm daemon`) runs only while an automation watcher is enabled.
+Start from a fresh config (all watchers off) and use a scratch
+`ROCM_CLI_CONFIG_DIR`/`ROCM_CLI_DATA_DIR` if you do not want to touch yours.
+
+```bash
+rocm automations enable gpu-metrics --mode observe
+rocm daemon --status
+rocm automations disable gpu-metrics
+```
+
+Expected result:
+
+- Enabling prints `helper: started background automation daemon`, and a
+  `rocm daemon` process (Windows: `rocm.exe daemon`; Linux: `ps`) is running.
+  `rocm automations` reports the background service as `running`.
+- After disabling the only watcher, the process exits by itself within a few
+  seconds (the loop ticks every 5 seconds) and `rocm automations` reports it
+  `stopped`. Nothing needs to be killed.
+- With no watcher enabled (the default), `rocm serve` of a model starts no
+  `rocm daemon` process at all, and `rocm services stop <service-id> --yes`
+  prints no note about a helper.
+- With a watcher enabled, `rocm services stop <service-id> --yes` leaves the
+  helper running and says so: its `note:` line names the enabled watcher and
+  the `rocm automations disable <watcher>` command that ends it. `rocm uninstall
+  --dry-run` carries the same warning, ending `uninstall does not stop it`.
+- Re-enabling a watcher right after disabling the last one (within the few
+  seconds before the helper exits) still ends with a helper running: enable
+  waits for an exiting helper to finish, then starts a new one.
+
+## 12. Context-Size Estimate for a GGUF Model
+
+Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
+by design) and network access to Hugging Face. The point is to check the
+estimate against what a real load uses: the compute buffer and runtime reserve
+were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
+so a different GPU or build can differ. How close the estimate came on them is
+recorded in the module documentation of
+[gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs), not repeated here.
+
+```bash
+rocm diagnose --model <owner>/<repo>:Q4_K_M --context-size 8192
+```
+
+Expected result:
+
+- The first lines say the header was read and the weights were not downloaded,
+  and the header read finishes in seconds.
+- The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
+  at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
+  and the total, with this GPU's dedicated VRAM and the largest context that
+  fits.
+- Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
+  about 53% and 28% of the `f16` one.
+- Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
+  (with `-fa on` and `--n-gpu-layers 99`, and `--cache-type-k`/`--cache-type-v` if changed) and compare the total in
+  the report with the GPU memory it uses once loaded (`amd-smi metric`). The
+  estimate should be at or a little above the real figure; if it is below it, or
+  far above, report the model and both figures.
+- `llama-server` at the reported largest context should load. The one check of
+  this kind made so far was on a single MI300X, with a second process holding
+  most of the card's memory so that about 15.1-15.5 GiB could still be allocated
+  (the process's `amd-smi` baselines were 181092 and 180738 MiB used of 196592),
+  for a Llama-3.1-8B Q4_K_M with an f16 cache. The card was described to
+  `rocm diagnose` as one with 15854 MiB, for which the estimate was 79872 tokens
+  (77056 tokens for 15500 MiB). `llama-server` loaded at 80896, 83968, 84992 and
+  86016 tokens (used memory grew by 15449, 15837, 15788 and 15767 MiB) and failed
+  to allocate at 87040, 90112 and 93184, so the real limit was between 86016 and
+  87040 tokens and the estimate was about 7-8% under it (79872 is 7.1% under
+  86016 and 8.2% under 87040). The load at 86016 tokens is the calibration load
+  "made with the card almost full" in
+  [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs)'s module documentation,
+  which says how the estimate compared with it. The baseline moved
+  by 354 MiB between runs, so those used-memory figures are good to a few
+  hundred MiB at best. That is one model on one card, not a bound; a different
+  model, GPU or build can land elsewhere. At a size well above what loads, the
+  report should say `does not fit` and list what would make it fit.
+- `rocm serve` is unchanged: it takes no context-size option, and the report
+  names llama.cpp's options only as llama.cpp's.
+
+Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
+`--context-size`, says a quantization is needed; a repository that does not
+exist says it was not found; a `.gguf` path that does not exist says it could
+not be opened and does not point at the upstream tracker; and naming a vision
+model's `mmproj-*.gguf` file on Hugging Face (`owner/repo:mmproj-....gguf`) says
+it is a multimodal projector, not a model, names the model file instead, and
+does not suggest `rocm serve` for the projector. None downloads
+anything.
+
+Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
+8192` prints the report with no model section, and stderr says that `--model,
+--context-size were ignored` and nothing about the model was fetched.

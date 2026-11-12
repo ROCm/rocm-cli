@@ -219,6 +219,81 @@ pub struct Report {
 /// What a report says when the catalog recognised nothing.
 pub const UNRECOGNISED: &str = "unrecognised";
 
+/// The name of each level of [`Report::group_key`], in the same order.
+///
+/// Ordered most general first, the way a rollup reads: the cause, then the
+/// hardware, then the releases around it. A reader of the rollup learns which
+/// of these separates a group by watching where the counts split.
+pub const GROUP_AXES: [&str; 5] = ["entry", "architecture", "rocm", "os", "engine"];
+
+impl Report {
+    /// The description a grouper matches on: every published field except the
+    /// ones that describe this build rather than this machine.
+    ///
+    /// Two reports describe the same problem exactly when their keys are
+    /// equal. This is the one definition of "same problem"; a counter that
+    /// built its own would drift from the field set the report builder is
+    /// tested against.
+    ///
+    /// Left out on purpose: `schema`, `architecture_matrix`, `cli_version` and
+    /// `fix_offered` describe the CLI that wrote the report, and `os_family`
+    /// is implied by `distro`. The distribution travels with its major
+    /// version, because Ubuntu 22 and RHEL 22 would otherwise be one group.
+    /// So does the engine, except where there is none to name: an absent or
+    /// unknown engine has an absent or unknown version, so the version would
+    /// only repeat the word.
+    #[must_use]
+    pub fn group_key(&self) -> [String; 5] {
+        let engine = if self.engine == NONE || self.engine == UNKNOWN {
+            self.engine.clone()
+        } else {
+            format!("{}-{}", self.engine, self.engine_version)
+        };
+        [
+            self.entry.clone(),
+            self.architecture.clone(),
+            self.rocm.clone(),
+            format!("{}-{}", self.distro, self.os_major),
+            engine,
+        ]
+    }
+
+    /// Whether every value [`Report::group_key`] reads is one this CLI writes.
+    ///
+    /// Each check is the writer's own rule run backwards: the catalog for the
+    /// entry, the compatibility matrix for the architecture, the approved lists
+    /// and their fallback words, and the normal form `major_minor` and
+    /// `leading_digits` produce for versions. A report that fails is one no
+    /// version of this CLI that speaks this schema wrote. A reader built from an
+    /// older checkout may also fail a newer report whose catalog entry or
+    /// architecture it does not know yet, which is why rollups are run from the
+    /// current main.
+    pub(crate) fn is_in_vocabulary(&self) -> bool {
+        let release = |value: &str| {
+            value == NONE || value == UNKNOWN || (!value.is_empty() && major_minor(value) == value)
+        };
+        let entry = self.entry == UNRECOGNISED || crate::fix::is_catalog_id(&self.entry);
+        let distro = APPROVED_DISTROS.contains(&self.distro.as_str())
+            || [DISTRO_OTHER, UNKNOWN, "windows", ""].contains(&self.distro.as_str());
+        let os_major = leading_digits(&self.os_major) == self.os_major;
+        // The pair the writer decides together, so it is checked together.
+        let engine = match self.engine.as_str() {
+            NONE | UNKNOWN => self.engine_version == self.engine,
+            name => {
+                APPROVED_ENGINES.contains(&name)
+                    && self.engine_version != NONE
+                    && release(&self.engine_version)
+            }
+        };
+        entry
+            && is_rocm_supported(&self.architecture)
+            && release(&self.rocm)
+            && distro
+            && os_major
+            && engine
+    }
+}
+
 /// What a reader made of a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -255,6 +330,14 @@ pub fn is_rocm_supported(gfx_target: &str) -> bool {
 
 /// Build the report for this machine, or refuse and say which rule refused.
 ///
+/// `cli_version` is the leading version of the CLI that writes the report, the
+/// one token `rocm version` prints before its parenthetical ref and hash. It is
+/// a parameter because this crate does not know it: its own package version
+/// is the frozen workspace one, and the string `rocm version` prints is
+/// computed by the `rocm` binary's build script. Anything that is not a short
+/// version token is published as [`UNKNOWN`] instead (ASCII letters, digits,
+/// `.`, `-` and `+`, starting with a digit, at most 64 characters).
+///
 /// # Errors
 /// When the machine holds hardware that is not on the ROCm compatibility
 /// matrix, or hardware whose architecture could not be read.
@@ -262,6 +345,7 @@ pub fn prepare_report(
     examination: &Examination,
     entry: Option<&str>,
     fix_offered: bool,
+    cli_version: &str,
 ) -> Result<Report, Refusal> {
     // Every AMD GPU is checked, not just the one a finding concerns. A released
     // GPU sitting beside an unreleased one does not make the machine
@@ -293,9 +377,10 @@ pub fn prepare_report(
         return Err(Refusal::UnreleasedHardware);
     }
 
-    // `entry` is the only value here that comes from a caller rather than from
-    // the machine. Checked against the catalog so that a forged or mistaken id
-    // cannot carry caller-supplied text onto a public tracker.
+    // `entry` and `cli_version` are the only values here that come from a
+    // caller rather than from the machine. `entry` is checked against the
+    // catalog so that a forged or mistaken id cannot carry caller-supplied
+    // text onto a public tracker; `cli_version` is checked below.
     let entry_recognised = entry.is_some_and(crate::fix::is_catalog_id);
     let entry = if entry_recognised {
         entry.expect("checked Some above").to_owned()
@@ -327,9 +412,34 @@ pub fn prepare_report(
         rocm: rocm_release(examination),
         engine,
         engine_version,
-        cli_version: env!("CARGO_PKG_VERSION").to_owned(),
+        cli_version: self::cli_version(cli_version),
         fix_offered,
     })
+}
+
+/// Longest CLI version a report carries. A `vX.Y.Z` tag with a pre-release
+/// or build suffix is far shorter; anything longer is not a version.
+const CLI_VERSION_MAX_LEN: usize = 64;
+
+/// The CLI version to publish, or [`UNKNOWN`].
+///
+/// The caller passes the leading version token, never the ref and hash after
+/// it: a local branch name is free text from the machine, which is exactly
+/// what this module keeps off a public tracker. Checked here rather than
+/// trusted, because `prepare_report` is `pub` and re-exported: only ASCII
+/// letters, digits, `.`, `-` and `+` (the characters of a semantic version)
+/// are accepted, and it must start with a digit.
+fn cli_version(candidate: &str) -> String {
+    let is_version_token = candidate.len() <= CLI_VERSION_MAX_LEN
+        && candidate.starts_with(|c: char| c.is_ascii_digit())
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'));
+    if is_version_token {
+        candidate.to_owned()
+    } else {
+        UNKNOWN.to_owned()
+    }
 }
 
 /// The population-level OS major version to publish.
@@ -344,7 +454,7 @@ fn os_major(examination: &Examination) -> String {
     match examination.os_family.as_str() {
         "linux" => {
             // `distro_version` is `VERSION_ID` from `/etc/os-release`
-            // (`examine.rs::probe_os`), e.g. "22.04" -- the actual distro
+            // (`examine/host_env.rs::probe_os`), e.g. "22.04" -- the actual distro
             // release. `os_version` on Linux is `uname -v`'s kernel *build*
             // banner (e.g. "#1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC
             // 2026"): a timestamp, not a release, and reading it here is the
@@ -356,7 +466,7 @@ fn os_major(examination: &Examination) -> String {
         "windows" => {
             // Windows has no `/etc/os-release` analogue: `distro_id` /
             // `distro_version` are populated only under `runtime_is_linux()`
-            // in `examine.rs::probe_os`, and stay empty here. The only
+            // in `examine/host_env.rs::probe_os`, and stay empty here. The only
             // version-bearing field on this platform is `os_version` itself,
             // `cmd /C ver`'s banner, e.g. "Microsoft Windows [Version
             // 10.0.22631.4460]" -- extract the NT major component that
@@ -376,7 +486,7 @@ fn os_major(examination: &Examination) -> String {
 /// than published, because an unrecognised value is as likely to name a
 /// company as a distribution.
 ///
-/// Windows has no such file: `examine.rs::probe_os` populates `distro_id` only
+/// Windows has no such file: `examine/host_env.rs::probe_os` populates `distro_id` only
 /// under `runtime_is_linux()`, so the value there is a constant rather than
 /// anything read from the machine.
 fn distro(examination: &Examination) -> String {
@@ -410,7 +520,7 @@ fn distro(examination: &Examination) -> String {
 /// machine with a fully installed HIP SDK.
 ///
 /// Within each platform the path decides absence and the version decides
-/// readability, because `examine.rs` collapses both into an empty string:
+/// readability, because `examine/rocm_install_probe.rs` collapses both into an empty string:
 /// "no install was found" and "an install was found whose version could not
 /// be read" arrive identical. Those are different facts to anybody counting,
 /// in the same way [`ReadOutcome`] keeps an unreadable report apart from an
@@ -455,7 +565,7 @@ fn rocm_release(examination: &Examination) -> String {
 /// simply never touched, would be indistinguishable from that ordinary case
 /// and would also read as absent here.
 ///
-/// `"skipped"` is what `examine.rs` records when
+/// `"skipped"` is what `examine/framework.rs` records when
 /// [`crate::examine::FrameworkProbe::Skip`] was requested and the probe never
 /// ran at all. Unlike the default, that is not
 /// "looked and found nothing", so it is left to fall through the allowlist
@@ -586,7 +696,15 @@ pub fn read_report(json: &str) -> ReadOutcome {
             ReadOutcome::Unread { schema_seen }
         };
     }
+    // Checked against the vocabulary the writer uses, for the reason the refusal
+    // marker is: a report arrives at an address anyone can write to, so a value
+    // no version of this CLI could have written is a forged or corrupted body.
+    // Taking it would carry its free text, control characters included, into
+    // every count and output built from the report. It reads as unread instead:
+    // counted, so it is never lost, and grouped nowhere.
     serde_json::from_value::<Report>(envelope)
+        .ok()
+        .filter(Report::is_in_vocabulary)
         .map_or(ReadOutcome::Unread { schema_seen }, |report| {
             ReadOutcome::Understood(Box::new(report))
         })
@@ -596,6 +714,19 @@ pub fn read_report(json: &str) -> ReadOutcome {
 mod tests {
     use super::*;
     use crate::examine::Gpu;
+
+    /// What the `rocm` binary passes for a build from `main`.
+    const TEST_CLI_VERSION: &str = "0.0.0-dev";
+
+    /// [`prepare_report`] with the CLI version every test here uses unless it
+    /// is the thing under test.
+    fn prepare(
+        examination: &Examination,
+        entry: Option<&str>,
+        fix_offered: bool,
+    ) -> Result<Report, Refusal> {
+        prepare_report(examination, entry, fix_offered, TEST_CLI_VERSION)
+    }
 
     /// A machine whose every free-text field is a distinctive marker.
     ///
@@ -619,6 +750,10 @@ mod tests {
             // A real shape with a marker in the tail. The runtime version is not
             // an approved report field: it narrows toward one machine.
             msvc_redist_version: "14.29.SENTINEL-RUNTIME".to_owned(),
+            // The display driver facts are not approved report fields. A
+            // version and a date narrow toward one machine.
+            adrenalin_version: "SENTINEL-DRIVER-VERSION".to_owned(),
+            adrenalin_date: "SENTINEL-DRIVER-DATE".to_owned(),
             cpu_model: "SENTINEL-CPU".to_owned(),
             distro_id: "SENTINEL-DISTRO".to_owned(),
             rocminfo_status: "SENTINEL-ERROR-TEXT".to_owned(),
@@ -658,6 +793,8 @@ mod tests {
         "SENTINEL-ROCM-BUILD",
         "SENTINEL-ENGINE-BUILD",
         "SENTINEL-RUNTIME",
+        "SENTINEL-DRIVER-VERSION",
+        "SENTINEL-DRIVER-DATE",
     ];
 
     /// An architecture no product will ever have.
@@ -672,7 +809,7 @@ mod tests {
     /// released has to come back with a report.
     #[test]
     fn hardware_off_the_rocm_compatibility_matrix_never_produces_a_report() {
-        let released = prepare_report(&machine_of_sentinels("gfx1100"), None, false);
+        let released = prepare(&machine_of_sentinels("gfx1100"), None, false);
         assert!(
             released.is_ok(),
             "premise failed: a machine holding only released hardware must produce a report, \
@@ -680,7 +817,7 @@ mod tests {
         );
 
         assert_eq!(
-            prepare_report(&machine_of_sentinels(NOT_RELEASED), None, false),
+            prepare(&machine_of_sentinels(NOT_RELEASED), None, false),
             Err(Refusal::UnreleasedHardware),
             "{NOT_RELEASED} is on no compatibility matrix, so it must not be describable"
         );
@@ -701,7 +838,7 @@ mod tests {
             is_amd: true,
         });
         assert_eq!(
-            prepare_report(&mixed, None, false),
+            prepare(&mixed, None, false),
             Err(Refusal::UnreleasedHardware),
             "a released GPU beside an unreleased one does not make the machine reportable"
         );
@@ -711,7 +848,7 @@ mod tests {
     #[test]
     fn hardware_that_could_not_be_identified_is_refused_rather_than_assumed() {
         assert_eq!(
-            prepare_report(&machine_of_sentinels(""), None, false),
+            prepare(&machine_of_sentinels(""), None, false),
             Err(Refusal::ArchitectureUnreadable),
             "nothing confirmed this hardware is on the compatibility matrix, and default-deny \
              is the whole point"
@@ -734,7 +871,7 @@ mod tests {
         wsl.is_wsl = true;
 
         assert_eq!(
-            prepare_report(&wsl, None, false),
+            prepare(&wsl, None, false),
             Err(Refusal::PlatformNotProbed),
             "a platform this CLI never inspects must say so, rather than report a finding \
              about hardware nothing looked at"
@@ -745,7 +882,7 @@ mod tests {
         let mut bare_metal = wsl;
         bare_metal.is_wsl = false;
         assert!(
-            prepare_report(&bare_metal, None, false).is_ok(),
+            prepare(&bare_metal, None, false).is_ok(),
             "premise failed: the same machine off WSL has an approved GPU and must report"
         );
     }
@@ -758,7 +895,7 @@ mod tests {
     /// an approved field.
     #[test]
     fn no_report_carries_a_value_the_machine_did_not_agree_to_publish() {
-        let report = prepare_report(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
+        let report = prepare(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
             .expect("a released machine must produce a report");
         let serialized = serde_json::to_string(&report).expect("a report must serialize");
 
@@ -803,8 +940,8 @@ mod tests {
             machine.os_version = banner.to_owned();
             machine.distro_version = "22.04".to_owned();
 
-            let report = prepare_report(&machine, None, false)
-                .expect("a released machine must produce a report");
+            let report =
+                prepare(&machine, None, false).expect("a released machine must produce a report");
             assert_eq!(
                 report.os_major, "22",
                 "os_major must come from distro_version, not the kernel banner in os_version \
@@ -820,7 +957,7 @@ mod tests {
     }
 
     /// I6, continued — the Windows equivalent. `distro_version` is never
-    /// populated there (`examine.rs::probe_os` only sets it under
+    /// populated there (`examine/host_env.rs::probe_os` only sets it under
     /// `runtime_is_linux()`), so the NT major version has to come out of
     /// `os_version` itself, `cmd /C ver`'s banner — but only the major
     /// component, never the banner whole.
@@ -830,8 +967,8 @@ mod tests {
         machine.os_family = "windows".to_owned();
         machine.os_version = "Microsoft Windows [Version 10.0.22631.4460]".to_owned();
 
-        let report = prepare_report(&machine, None, false)
-            .expect("a released machine must produce a report");
+        let report =
+            prepare(&machine, None, false).expect("a released machine must produce a report");
         assert_eq!(
             report.os_major, "10",
             "the report groups by NT major version, so that is what it carries"
@@ -886,23 +1023,78 @@ mod tests {
         }
     }
 
-    /// The description a grouper matches on: every published field except the
-    /// ones that describe this build rather than this machine.
+    /// The description a grouper matches on, joined so a test can print it.
     fn description(report: &Report) -> String {
-        format!(
-            "{}|{}|{}-{}|{}|{}-{}",
-            report.entry,
-            report.architecture,
-            report.distro,
-            report.os_major,
-            report.rocm,
-            report.engine,
-            report.engine_version,
+        report.group_key().join("|")
+    }
+
+    /// `GROUP_AXES` names the key's levels by position, so each name has to
+    /// sit where its field lands. Changing one field must move exactly the
+    /// level named for it, and changing a field the key leaves out must move
+    /// none.
+    #[test]
+    fn every_axis_name_sits_where_its_field_lands_in_the_group_key() {
+        type Change = (&'static str, fn(&mut Report));
+        let base = prepare(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            Some("fix-6-path"),
+            false,
         )
+        .expect("a released machine reports");
+        let changes: [Change; 9] = [
+            ("entry", |r| r.entry = UNRECOGNISED.to_owned()),
+            ("architecture", |r| r.architecture = "gfx1100".to_owned()),
+            ("rocm", |r| r.rocm = "7.0".to_owned()),
+            ("os", |r| r.distro = "rhel".to_owned()),
+            ("os", |r| r.os_major = "24".to_owned()),
+            ("engine", |r| r.engine = "llama-cpp".to_owned()),
+            ("engine", |r| r.engine_version = "2.6".to_owned()),
+            ("", |r| r.cli_version = "9.9.9".to_owned()),
+            ("", |r| r.fix_offered = !r.fix_offered),
+        ];
+        for (axis, change) in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            let moved: Vec<&str> = (0..GROUP_AXES.len())
+                .filter(|&i| changed.group_key()[i] != base.group_key()[i])
+                .map(|i| GROUP_AXES[i])
+                .collect();
+            let expected: Vec<&str> = std::iter::once(axis).filter(|a| !a.is_empty()).collect();
+            assert_eq!(
+                moved, expected,
+                "a change meant for `{axis}` moved {moved:?}"
+            );
+        }
+        let mut build = base.clone();
+        build.schema += 1;
+        build.architecture_matrix = "another matrix".to_owned();
+        build.os_family = "other".to_owned();
+        assert_eq!(
+            build.group_key(),
+            base.group_key(),
+            "build-only fields must not split groups"
+        );
+    }
+
+    #[test]
+    fn the_group_key_names_an_engine_with_its_release_and_an_absent_one_once() {
+        let with = prepare(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            None,
+            false,
+        )
+        .expect("a released machine reports");
+        assert_eq!(with.group_key()[4], "pytorch-2.5");
+        assert_eq!(GROUP_AXES[4], "engine");
+
+        let mut without = with;
+        without.engine = NONE.to_owned();
+        without.engine_version = NONE.to_owned();
+        assert_eq!(without.group_key()[4], NONE);
     }
 
     fn describe(machine: &Examination, entry: Option<&str>) -> String {
-        description(&prepare_report(machine, entry, false).expect("a released machine reports"))
+        description(&prepare(machine, entry, false).expect("a released machine reports"))
     }
 
     /// Reports are grouped by exact match on their fields, so the fields have
@@ -990,7 +1182,7 @@ mod tests {
     /// the numeric head survived while the build tail did not.
     #[test]
     fn the_grouping_fields_keep_the_release_and_drop_the_build() {
-        let report = prepare_report(&machine_of_sentinels("gfx1100"), None, false)
+        let report = prepare(&machine_of_sentinels("gfx1100"), None, false)
             .expect("a released machine must produce a report");
 
         assert_eq!(
@@ -1016,7 +1208,7 @@ mod tests {
     fn a_recognised_distribution_is_named_and_an_unrecognised_one_is_not() {
         let mut known = machine_of_sentinels("gfx1100");
         known.distro_id = "Ubuntu".to_owned();
-        let report = prepare_report(&known, None, false).expect("a released machine reports");
+        let report = prepare(&known, None, false).expect("a released machine reports");
         assert_eq!(
             report.distro, "ubuntu",
             "premise failed: a distribution on the list must be named, otherwise the case below \
@@ -1027,7 +1219,7 @@ mod tests {
         // rather than a distribution.
         let mut vendor = machine_of_sentinels("gfx1100");
         vendor.distro_id = "SENTINEL-CORP-INTERNAL-IMAGE".to_owned();
-        let report = prepare_report(&vendor, None, false).expect("a released machine reports");
+        let report = prepare(&vendor, None, false).expect("a released machine reports");
         assert_eq!(report.distro, DISTRO_OTHER);
         let serialized = serde_json::to_string(&report).expect("a report must serialize");
         assert!(
@@ -1046,7 +1238,7 @@ mod tests {
     fn a_missing_os_release_reads_as_unknown_not_as_an_unrecognised_distribution() {
         let mut machine = machine_of_sentinels("gfx1100");
         machine.distro_id = String::new();
-        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+        let report = prepare(&machine, None, false).expect("a released machine reports");
         assert_eq!(
             report.distro, UNKNOWN,
             "an empty ID means the file could not be read, which is different from a file that \
@@ -1064,7 +1256,7 @@ mod tests {
     fn a_release_with_no_minor_or_an_unusual_build_separator_still_groups() {
         let mut bare_major = machine_of_sentinels("gfx1100");
         bare_major.rocm_version = "7".to_owned();
-        let report = prepare_report(&bare_major, None, false).expect("a released machine reports");
+        let report = prepare(&bare_major, None, false).expect("a released machine reports");
         assert_eq!(
             report.rocm, "7",
             "a release with no minor is still a population and must not be discarded"
@@ -1072,8 +1264,7 @@ mod tests {
 
         let mut dash_delimited = machine_of_sentinels("gfx1100");
         dash_delimited.rocm_version = "7-1-0".to_owned();
-        let report =
-            prepare_report(&dash_delimited, None, false).expect("a released machine reports");
+        let report = prepare(&dash_delimited, None, false).expect("a released machine reports");
         assert_eq!(
             report.rocm, "7.1",
             "a dash-delimited build string must yield the same release as a dot-delimited one"
@@ -1166,7 +1357,7 @@ mod tests {
     /// satisfy the test above on its own.
     #[test]
     fn recognising_refusals_did_not_stop_reports_being_read() {
-        let report = prepare_report(&machine_of_sentinels("gfx1100"), None, false)
+        let report = prepare(&machine_of_sentinels("gfx1100"), None, false)
             .expect("a released machine must produce a report");
         let serialized = serde_json::to_string(&report).expect("a report must serialize");
 
@@ -1176,9 +1367,91 @@ mod tests {
         }
     }
 
+    /// Every report the writer produces passes the reader's vocabulary check.
+    ///
+    /// The check is the writer's rules run backwards, so the two must agree on
+    /// every shape the writer can emit: each fallback word, each platform, a
+    /// recognised entry and an unrecognised one. A reader stricter than its
+    /// writer would quietly turn real reports into unread ones.
+    #[test]
+    fn every_report_the_writer_produces_reads_back() {
+        let mut machines = vec![
+            machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            machine("gfx1100", ("rhel", "9"), "7.0", ("llama-cpp", "0.9")),
+            machine("gfx90a", ("SENTINEL-DISTRO", "24"), "", ("unknown", "")),
+            machine("gfx942", ("", ""), "SENTINEL", ("skipped", "")),
+            machine_of_sentinels("gfx1100"),
+        ];
+        let mut windows = machine_of_sentinels("gfx1100");
+        windows.os_family = "windows".to_owned();
+        windows.os_version = "Microsoft Windows [Version 10.0.22631.4460]".to_owned();
+        windows.hip_sdk_version = "6.4.1".to_owned();
+        machines.push(windows);
+        let mut localized = machine_of_sentinels("gfx1100");
+        localized.os_family = "windows".to_owned();
+        localized.os_version = "Microsoft Windows [Versie 10.0]".to_owned();
+        machines.push(localized);
+
+        for (nth, machine) in machines.iter().enumerate() {
+            for entry in [None, Some("fix-1-arch")] {
+                let report =
+                    prepare(machine, entry, entry.is_some()).expect("a released machine reports");
+                let serialized = serde_json::to_string(&report).expect("a report serializes");
+                assert!(
+                    matches!(read_report(&serialized), ReadOutcome::Understood(_)),
+                    "machine {nth} with entry {entry:?} wrote a report its own reader refuses: \
+                     {serialized}"
+                );
+            }
+        }
+    }
+
+    /// A value no version of this CLI writes makes the report unread.
+    ///
+    /// Reports arrive at an address anyone can write to. A forged body that
+    /// put a name, or terminal control characters, in a grouped field would
+    /// otherwise carry that text into every count built from it.
+    #[test]
+    fn a_report_with_a_value_outside_the_vocabulary_is_not_read() {
+        let genuine = prepare(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            Some("fix-1-arch"),
+            true,
+        )
+        .expect("a released machine reports");
+        let marker = "Jane Doe \u{1b}[31m";
+        for field in [
+            "entry",
+            "architecture",
+            "rocm",
+            "distro",
+            "os_major",
+            "engine",
+            "engine_version",
+        ] {
+            let mut forged = serde_json::to_value(&genuine).expect("a report serializes");
+            forged[field] = serde_json::Value::String(marker.to_owned());
+            assert_eq!(
+                read_report(&forged.to_string()),
+                ReadOutcome::Unread {
+                    schema_seen: REPORT_SCHEMA_VERSION
+                },
+                "a forged `{field}` was read as a report"
+            );
+        }
+        // An engine and a version that do not belong together are not a pair
+        // the writer produces either.
+        let mut mismatched = serde_json::to_value(&genuine).expect("a report serializes");
+        mismatched["engine"] = serde_json::Value::String(NONE.to_owned());
+        assert!(matches!(
+            read_report(&mismatched.to_string()),
+            ReadOutcome::Unread { .. }
+        ));
+    }
+
     /// An engine name this build does not recognise is not published.
     ///
-    /// Today every value of `framework` is a literal written by `examine.rs`,
+    /// Today every value of `framework` is a literal written by `examine/framework.rs`,
     /// so this guards a future probe rather than the current one: the moment
     /// one sets that field from parsed output, an allowlist is the difference
     /// between a name and whatever the parse produced. Found by mutation --
@@ -1188,7 +1461,7 @@ mod tests {
     fn an_engine_this_build_does_not_recognise_is_not_named_in_the_report() {
         let mut machine = machine_of_sentinels("gfx1100");
         machine.framework = "SENTINEL-UNAPPROVED-ENGINE".to_owned();
-        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+        let report = prepare(&machine, None, false).expect("a released machine reports");
 
         assert_eq!(
             report.engine, UNKNOWN,
@@ -1210,15 +1483,15 @@ mod tests {
     /// `"unknown"` is `Examination::framework`'s struct default, and a
     /// completed probe leaves it there when neither engine was found -- the
     /// ordinary case for most machines. Found by mutation: the prior code
-    /// special-cased an empty string here, a value `examine.rs` never
-    /// actually writes, so every one of these tests passed against a branch
+    /// special-cased an empty string here, a value `examine/framework.rs`
+    /// never actually writes, so every one of these tests passed against a branch
     /// that could never run, while the case that does run every day fell
     /// through to [`UNKNOWN`] and mislabelled an absence as unreadable.
     #[test]
     fn no_engine_found_by_a_completed_probe_reads_as_none_not_unknown() {
         let mut machine = machine_of_sentinels("gfx1100");
         machine.framework = "unknown".to_owned();
-        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+        let report = prepare(&machine, None, false).expect("a released machine reports");
 
         assert_eq!(
             report.engine, NONE,
@@ -1241,7 +1514,7 @@ mod tests {
     fn a_skipped_probe_reads_as_unreadable_not_as_no_engine_installed() {
         let mut machine = machine_of_sentinels("gfx1100");
         machine.framework = "skipped".to_owned();
-        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+        let report = prepare(&machine, None, false).expect("a released machine reports");
 
         assert_eq!(
             report.engine, UNKNOWN,
@@ -1256,7 +1529,7 @@ mod tests {
 
     /// An absent ROCm and an unreadable one are different facts.
     ///
-    /// `examine.rs` collapses both into an empty `rocm_version`, so without
+    /// `examine/rocm_install_probe.rs` collapses both into an empty `rocm_version`, so without
     /// this the report would say "not installed" about a machine whose install
     /// merely could not be read -- turning an install problem into an absence
     /// for anybody counting.
@@ -1265,12 +1538,11 @@ mod tests {
         let mut absent = machine_of_sentinels("gfx1100");
         absent.rocm_path = String::new();
         absent.rocm_version = String::new();
-        let absent = prepare_report(&absent, None, false).expect("a released machine reports");
+        let absent = prepare(&absent, None, false).expect("a released machine reports");
 
         let mut unreadable = machine_of_sentinels("gfx1100");
         unreadable.rocm_version = String::new();
-        let unreadable =
-            prepare_report(&unreadable, None, false).expect("a released machine reports");
+        let unreadable = prepare(&unreadable, None, false).expect("a released machine reports");
 
         assert_eq!(absent.rocm, NONE);
         assert_eq!(unreadable.rocm, UNKNOWN);
@@ -1303,7 +1575,7 @@ mod tests {
         windows.rocm_path = String::new();
         windows.rocm_version = String::new();
 
-        let report = prepare_report(&windows, None, false).expect("a released machine reports");
+        let report = prepare(&windows, None, false).expect("a released machine reports");
         assert_eq!(
             report.rocm, "6.2",
             "a Windows host with an installed SDK must report its release, not an absence"
@@ -1314,15 +1586,14 @@ mod tests {
         let mut bare = windows.clone();
         bare.hip_sdk_path = String::new();
         bare.hip_sdk_version = String::new();
-        let bare = prepare_report(&bare, None, false).expect("a released machine reports");
+        let bare = prepare(&bare, None, false).expect("a released machine reports");
         assert_eq!(bare.rocm, NONE);
 
         // And an install whose version cannot be read is still distinguishable
         // from one that is not there.
         let mut unreadable = windows;
         unreadable.hip_sdk_version = String::new();
-        let unreadable =
-            prepare_report(&unreadable, None, false).expect("a released machine reports");
+        let unreadable = prepare(&unreadable, None, false).expect("a released machine reports");
         assert_eq!(unreadable.rocm, UNKNOWN);
     }
 
@@ -1335,8 +1606,8 @@ mod tests {
         let mut machine = machine_of_sentinels("gfx1100");
         machine.distro_version = "SENTINEL-UNPARSEABLE-RELEASE".to_owned();
 
-        let report = prepare_report(&machine, None, false)
-            .expect("a released machine must produce a report");
+        let report =
+            prepare(&machine, None, false).expect("a released machine must produce a report");
         assert_eq!(
             report.os_major, "",
             "a release string that does not reduce to a bare number must not pass through as \
@@ -1361,7 +1632,7 @@ mod tests {
     fn an_entry_id_the_catalog_does_not_know_is_never_published_verbatim() {
         // Non-vacuity: a real id has to reach the report, or "the forged one
         // does not" is satisfied by discarding every id.
-        let known = prepare_report(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
+        let known = prepare(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
             .expect("a released machine must produce a report");
         assert_eq!(
             known.entry, "fix-6-path",
@@ -1375,7 +1646,7 @@ mod tests {
              unconditionally"
         );
 
-        let forged = prepare_report(
+        let forged = prepare(
             &machine_of_sentinels("gfx1100"),
             Some("SENTINEL-FORGED-ENTRY"),
             true,
@@ -1410,7 +1681,7 @@ mod tests {
         );
 
         let current = serde_json::to_string(
-            &prepare_report(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
+            &prepare(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
                 .expect("a released machine must produce a report"),
         )
         .expect("a report must serialize");
@@ -1418,6 +1689,45 @@ mod tests {
             matches!(read_report(&current), ReadOutcome::Understood(_)),
             "premise failed: a report this reader does write must be one it can read, or the \
              assertion above is satisfied by a reader that understands nothing"
+        );
+    }
+
+    /// The report carries the version the caller passes, not this crate's own
+    /// package version, which is the frozen workspace one for every build.
+    #[test]
+    fn the_report_carries_the_cli_version_its_caller_passes() {
+        for version in ["0.2.1", "0.2.1-rc.1", "0.2.1+build.1", "0.0.0-dev"] {
+            let report = prepare_report(&machine_of_sentinels("gfx1100"), None, false, version)
+                .expect("a released machine must produce a report");
+            assert_eq!(report.cli_version, version);
+        }
+    }
+
+    /// The caller passes the leading version token. Anything else, such as the
+    /// whole `rocm version` string with its local branch name, is free text
+    /// from the machine and is published as `unknown` rather than repeated.
+    #[test]
+    fn a_cli_version_that_is_not_a_version_token_is_published_as_unknown() {
+        // One character over the limit, so a limit off by one is caught.
+        let too_long = format!("1.{}", "0".repeat(CLI_VERSION_MAX_LEN - 1));
+        assert_eq!(too_long.len(), CLI_VERSION_MAX_LEN + 1);
+        for candidate in [
+            "0.0.0-dev (SENTINEL-BRANCH, abcdef1)",
+            "SENTINEL-USER",
+            "v0.2.1",
+            "",
+            "0.2.1/../x",
+            too_long.as_str(),
+        ] {
+            let report = prepare_report(&machine_of_sentinels("gfx1100"), None, false, candidate)
+                .expect("a released machine must produce a report");
+            assert_eq!(report.cli_version, UNKNOWN, "{candidate:?}");
+        }
+        let longest = format!("1.{}", "0".repeat(CLI_VERSION_MAX_LEN - 2));
+        assert_eq!(
+            cli_version(&longest),
+            longest,
+            "the limit itself is a version"
         );
     }
 }
