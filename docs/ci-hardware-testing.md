@@ -403,7 +403,8 @@ has merged) when the workflow's own `changes` job's
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
-lane: they run only on the Windows Strix Halo lanes, and the only vLLM serve
+lane: they run only on the Windows Strix Halo and WSL2 lanes (both set
+`E2E_MERGE_QUEUE` for `merge_group`), and the only vLLM serve
 before a change lands is the per-PR canary (`serve-05`), which runs when the
 `serve` filter matches. **The merge queue has no native Linux GPU lane**: MI300X,
 Strix Ubuntu and W7900 all skip `merge_group`, so it runs only Windows Strix and

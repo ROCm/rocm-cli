@@ -7705,6 +7705,16 @@ jobs:
                 !gate.contains("merge_group") && !gate.contains("'pull_request'"),
                 "`{job}` must keep running in the merge queue (gate: `{gate}`)"
             );
+            // And it must opt into the heavy serves there, for merge_group only,
+            // so the docs' "Windows Strix Halo and WSL2 run the merge-queue
+            // serves" stays true of the workflow.
+            assert_eq!(
+                job_mapping(job_block(&sh, job), "env")
+                    .get("E2E_MERGE_QUEUE")
+                    .map(String::as_str),
+                Some("${{ github.event_name == 'merge_group' && '1' || '' }}"),
+                "`{job}` must set E2E_MERGE_QUEUE for merge_group events only"
+            );
         }
         // A pull request runs one Linux node (MI300X) and one Windows pool (the
         // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND

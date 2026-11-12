@@ -262,4 +262,4 @@ reason = "The Windows large-model serve crashes in the SDK's Tensile library on 
 [["serve-aim-lifecycle-parity"]]
 when = { os = "linux", is_wsl = false, therock_family = "gfx1151*", has_amd_gpu = true }
 bug = "#1058"
-reason = "Stopping the AIM service on Strix Halo Ubuntu is not confirmed."
+reason = "Stopping a running AIM service on Strix Halo Ubuntu reports `Local server stop not confirmed` (exit 1); the serve itself works."
