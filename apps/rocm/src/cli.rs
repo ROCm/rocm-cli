@@ -784,7 +784,7 @@ pub(crate) enum InstallTarget {
     /// Install TheRock ROCm wheels into a Python folder managed by ROCm CLI.
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
-rocm install sdk --channel nightly --build-date 2026-08-20\n  \
+rocm install sdk --channel nightly --build-date 2026-08-19\n  \
 rocm install sdk --family gfx1100 --dry-run\n  \
 rocm install sdk --version 7.14.1 --family gfx110X-all\n  \
 rocm install sdk --devel\n  \
