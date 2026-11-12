@@ -767,9 +767,10 @@ jobs:
     # host without Docker they skip and cost nothing. Docker is reachable on this
     # pool: a dispatch of the same lane (e2e-selfhosted.yml run 43025895270) passed
     # serve-26 on both channel legs. serve-27 fails there at stopping the AIM
-    # service (STOP FAILED rc=1) and has no xfail row yet, so expect it red in the
-    # nightly report; the job is continue-on-error. The "Report whether Docker is
-    # reachable" step still logs the answer each run.
+    # service (STOP FAILED rc=1); it is an expected failure in expectations.toml
+    # (rocm-cli#1058), so the nightly reports it as xfail, and an XPASS means the
+    # row is stale. The "Report whether Docker is reachable" step still logs the
+    # answer each run.
     timeout-minutes: 120
     # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
     # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request

@@ -370,8 +370,9 @@ Feature: Model serving
   # dispatch of the same lane (e2e-selfhosted.yml run 43025895270) passed
   # serve-26 on both channel legs, so it does not skip there. serve-27 fails
   # there at stopping the AIM service ("STOP FAILED (rc=1) ... Local server stop
-  # not confirmed"). On a host without Docker both skip (the nightly job logs
-  # whether Docker is reachable).
+  # not confirmed"; an xfail row in expectations.toml, rocm-cli#1058). On a
+  # host without Docker both skip (the nightly job logs whether Docker is
+  # reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight

@@ -1484,8 +1484,9 @@ the tagging and that they stay reachable when the opt-in is set.
 Docker is reachable on the pool the nightly Strix Halo lane runs on: an
 `include_nightly` dispatch of the same lane (`e2e-selfhosted.yml` run
 43025895270) passed `serve-26` on both channel legs. `serve-27` fails there at
-stopping the AIM service (`STOP FAILED rc=1`) and has no xfail row yet, so expect
-it red in the nightly report; the lane is `continue-on-error`. The
+stopping the AIM service (`STOP FAILED rc=1`); it is an xfail row in
+`expectations.toml` (rocm-cli#1058), so the nightly reports it as an expected
+failure and a pass is an XPASS, meaning the row is stale. The
 `e2e-gpu-nightly-strix` job still logs whether Docker is reachable ("Report
 whether Docker is reachable"), and on a host without it both scenarios skip.
 
