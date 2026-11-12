@@ -285,10 +285,11 @@ Feature: Diagnosing failures and listing fixes
   #
   # Unlike diagnose-14, this one IS OS-gated. `print_recipe` still runs before
   # the fix's own platform gate (see `apply` in fix.rs), but the Flags: line it
-  # prints comes from `class_here()`, which looks up the catalog entry for the
-  # *running* host's OS. "AUTO" only renders where `fix-4-render-group` is
+  # prints comes from the recipe's class on the *running* host's OS
+  # (`print_recipe` hands `current_os()` to the plan builder, which asks
+  # `FixRecipe::class_on_os`). "AUTO" only renders where `fix-4-render-group` is
   # actually `Auto` -- bare-metal Linux. Everywhere else (`applies_on` has no
-  # other member) `class_here()` falls back to PRINT-ONLY, the generic "this
+  # other member) that lookup falls back to PRINT-ONLY, the generic "this
   # fix does not apply here" answer diagnose-11 already covers -- not a second,
   # platform-specific behaviour worth asserting under this scenario's name.
   #

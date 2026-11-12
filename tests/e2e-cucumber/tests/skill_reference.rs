@@ -2,7 +2,9 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Drift guard for the shape of `skills/rocm-doctor/reference.md`'s catalog.
+//! Drift guard for what `skills/rocm-doctor` quotes from the CLI: the shape of
+//! `reference.md`'s catalog, the counts `SKILL.md` states about it, and the
+//! exit-code and `fix` field names it lists.
 //!
 //! The `rocm_doctor_skill.feature` scenarios compare that table against the
 //! real `rocm fix` listing, cell for cell, so a cell the table spells its own
@@ -11,12 +13,32 @@
 //! test` set, so the malformed cell is caught without one.
 //!
 //! Narrow on purpose: the CLI is authoritative for *which* fixes exist and what
-//! they are scoped to, and the feature file already checks that. All this
-//! checks is that the document uses the vocabulary the CLI prints, so the
-//! comparison there can stay a literal one.
+//! they are scoped to, and the feature file already checks that. For the
+//! catalog this checks only that the document uses the vocabulary the CLI
+//! prints, so the comparison there can stay a literal one. For `SKILL.md` it
+//! checks the print-only count against the table, and the exit-code and `fix`
+//! field lists below against what the CLI publishes.
+//!
+//! Fixture sentences in `SKILL.md`. Tests read these phrases from it, so reword
+//! them only together with the test that reads them. Each test panics naming
+//! the phrase it cannot find; whitespace and line wrapping do not matter. This
+//! list is the one place that names them all:
+//!
+//! - "requires `contract_version` N", read by `skill-07` in `skill_steps.rs`;
+//! - "The other N are **print-only**", read by
+//!   `free_standing_catalog_counts_match_the_table` below;
+//! - "by its `exit_codes` name", which starts the exit-code list read by
+//!   `exit_code_names_listed_in_the_skill_are_the_manifest_failure_exits`;
+//! - "a `fix` whose ... are the fields", the `fix` field list read by
+//!   `fix_fields_quoted_in_the_skill_exist_in_the_diagnosis_json`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// The anchors the two SKILL.md parsers below read; see the module doc.
+const EXIT_CODES_MARKER: &str = "by its `exit_codes` name";
+const FIX_FIELDS_START: &str = "a `fix` whose ";
+const FIX_FIELDS_END: &str = " are the fields";
 
 /// The platform atoms `rocm fix` prints, which it builds by joining a recipe's
 /// `applies_on` with `/` (see `FixRecipe` in `crates/rocm-core/src/fix/catalog.rs`).
@@ -41,7 +63,7 @@ fn reference_md_path() -> PathBuf {
 
 /// `(fix-id, os-scope cell, marker cell)` for every catalog row, taken the same
 /// way `skill_steps::parse_reference_catalog` takes them: a leading `|`, at
-/// least five cells, and a backticked `fix-*` id first.
+/// least five cells, and a backticked `fix-*` or `info-*` id first.
 fn catalog_rows(md: &str) -> Vec<(String, String, String)> {
     let mut rows = Vec::new();
     for line in md.lines() {
@@ -80,19 +102,14 @@ fn skill_md_path() -> PathBuf {
         .join("SKILL.md")
 }
 
-/// How many catalog rows have `yes` in the Auto-fix cell (`cells[4]`, the same
-/// column `catalog_rows` leaves unparsed since the os-scope check only needs
-/// `cells[1]`).
-/// Rows whose marker is anything other than a plain `print-only`, which is the
-/// complement of the set `SKILL.md`'s "the other N are print-only" counts.
+/// How many catalog rows have a marker (the fifth cell, `cells[4]`) other than a
+/// plain `print-only`, which is the complement of the set `SKILL.md`'s "the other
+/// N are print-only" counts.
 ///
-/// Deliberately not a count of "auto-applicable": the two docs do not agree on
-/// what that phrase covers. `reference.md` says three ids are ever
-/// auto-applicable and that `fix-9-igpu-dgpu` is not one of them, while
-/// `SKILL.md` says four -- counting `needs-arg` and the windows-only exception
-/// alongside the two plain `auto` entries. Counting the complement sidesteps
-/// that disagreement and checks the claim `SKILL.md` actually makes, so this
-/// guard does not quietly take a side in it.
+/// Deliberately not a count of "auto-applicable": that phrase is per host, and
+/// `reference.md` lists which ids it covers on each one (three ids across all
+/// hosts, `fix-9-igpu-dgpu` not among them). `SKILL.md` claims a count of
+/// print-only entries, so counting the complement checks that claim.
 fn catalog_not_print_only_count(md: &str) -> usize {
     md.lines()
         .filter(|line| {
@@ -155,7 +172,9 @@ fn free_standing_catalog_counts_match_the_table() {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", skill_md_path().display()));
     // "The other N" and "are **print-only**" sit on adjacent source lines that
     // wrap a single sentence; `number_after_phrase` joins the doc on whitespace
-    // first, so a line-scoped search cannot miss the number.
+    // first, so a line-scoped search cannot miss the number. The clause has to
+    // follow the number directly: a "print-only" somewhere later in the sentence
+    // would not say what the number counts.
     let (print_only_count, rest) = e2e_cucumber::number_after_phrase(&skill_md, "The other ")
         .unwrap_or_else(|| {
             panic!(
@@ -164,8 +183,8 @@ fn free_standing_catalog_counts_match_the_table() {
             )
         });
     assert!(
-        rest.contains("print-only"),
-        "'The other {print_only_count}' in {} is not followed by 'print-only' as expected: {:?}",
+        rest.starts_with(" are **print-only**"),
+        "'The other {print_only_count}' in {} is not followed by 'are **print-only**' as expected: {:?}",
         skill_md_path().display(),
         rest.chars().take(60).collect::<String>()
     );
@@ -265,4 +284,265 @@ fn catalog_markers_use_the_cli_vocabulary() {
             .filter(|(_, word)| retired.contains(word.as_str()))
             .count()
     );
+}
+
+/// Every backtick-delimited span of `text`, in order, with the text that
+/// follows its closing backtick.
+fn backticked_with_tail(text: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        out.push((&after[..close], &after[close + 1..]));
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+fn is_identifier(span: &str) -> bool {
+    !span.is_empty()
+        && span.starts_with(|c: char| c.is_ascii_lowercase())
+        && span
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn skill_md_text() -> String {
+    std::fs::read_to_string(skill_md_path())
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", skill_md_path().display()))
+}
+
+/// The text with every run of whitespace collapsed to one space, so a phrase
+/// matches wherever SKILL.md happens to wrap its lines.
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The part of `flat` after `marker`, or a panic naming the missing marker: a
+/// parser that silently found nothing would turn its check into a no-op.
+fn after_marker<'a>(flat: &'a str, marker: &str) -> &'a str {
+    match flat.find(marker) {
+        Some(at) => &flat[at + marker.len()..],
+        None => panic!(
+            "marker missing: {marker:?} is no longer in SKILL.md. It is a fixture phrase this \
+             test reads; reword it back, or update the test and the list in this file's \
+             module doc"
+        ),
+    }
+}
+
+/// The exit-code names SKILL.md quotes for `rocm fix`: the bullet heads of the
+/// list that follows "by its `exit_codes` name". Reads the whitespace-collapsed
+/// text, so re-wrapping SKILL.md does not matter.
+fn exit_code_names_in(skill_md: &str) -> BTreeSet<String> {
+    let flat = flatten(skill_md);
+    let mut names = BTreeSet::new();
+    // The list is the run of " - `name` — " bullets right after the marker; the
+    // first bullet that is not of that shape ends it.
+    let mut rest = after_marker(&flat, EXIT_CODES_MARKER);
+    while let Some(at) = rest.find(" - `") {
+        let head = &rest[at + 4..];
+        let Some((name, tail)) = head.split_once('`') else {
+            break;
+        };
+        if !is_identifier(name) || !tail.starts_with(" — ") {
+            break;
+        }
+        names.insert(name.to_owned());
+        rest = tail;
+    }
+    names
+}
+
+/// The manifest's non-zero exit-code names. SKILL.md lists the failures an agent
+/// can meet; `ok` is the success code and is not one of them.
+fn published_failure_exits() -> BTreeSet<String> {
+    rocm_core::catalog_manifest()
+        .exit_codes
+        .keys()
+        .filter(|name| name.as_str() != "ok")
+        .cloned()
+        .collect()
+}
+
+/// `Err` when the exit-code list in `skill_md` is not the manifest's failure
+/// exits. A list the parser reads as empty, or cuts short at a name it cannot
+/// read (`not-applicable`), differs from them too, so it cannot pass.
+fn check_exit_code_list(skill_md: &str) -> Result<(), String> {
+    let listed = exit_code_names_in(skill_md);
+    let published = published_failure_exits();
+    if listed == published {
+        Ok(())
+    } else {
+        Err(format!(
+            "the exit-code list in SKILL.md is {listed:?}; the manifest's non-zero \
+             `exit_codes` are {published:?}"
+        ))
+    }
+}
+
+/// SKILL.md reads the manifest's `exit_codes` by name, so a name it quotes that
+/// the manifest does not publish sends an agent looking for a code that never
+/// comes, and a published one it leaves out is a failure the skill has no
+/// instruction for. `the_published_exit_codes_are_the_ones_apply_returns` in
+/// rocm-core pins the manifest's keys; this pins the skill's list to them.
+#[test]
+fn exit_code_names_listed_in_the_skill_are_the_manifest_failure_exits() {
+    if let Err(problem) = check_exit_code_list(&skill_md_text()) {
+        panic!("{problem}");
+    }
+}
+
+/// The same check, run on lists that are wrong, must fail: otherwise it would
+/// pass for whatever the parser happened to read.
+#[test]
+fn a_wrong_exit_code_list_is_caught() {
+    let flat = flatten(&skill_md_text());
+    for (what, wrong) in [
+        ("a misspelt name", " - `fail` — "),
+        ("a name it cannot read", " - `not-applicable` — "),
+    ] {
+        let text = flat.replace(" - `failed` — ", wrong);
+        assert!(
+            check_exit_code_list(&text).is_err(),
+            "{what} in the exit-code list went unnoticed"
+        );
+    }
+}
+
+/// The `fix` fields SKILL.md names: the list between "a `fix` whose" and "are the
+/// fields". Reads the whitespace-collapsed text. Panics when either end of the
+/// list is missing (rather than reading every identifier to the end of the file
+/// as a field), when the list names no field, and on a backticked span that is
+/// not a field name (`needs-sudo`, `needsSudo`), which would otherwise be dropped
+/// instead of compared.
+fn fix_fields_in(skill_md: &str) -> BTreeSet<String> {
+    let flat = flatten(skill_md);
+    let mut fields = BTreeSet::new();
+    let after_start = after_marker(&flat, FIX_FIELDS_START);
+    let Some(end_at) = after_start.find(FIX_FIELDS_END) else {
+        panic!(
+            "marker missing: {FIX_FIELDS_END:?} no longer follows {FIX_FIELDS_START:?} in \
+             SKILL.md. It is a fixture phrase this test reads; reword it back, or update the \
+             test and the list in this file's module doc"
+        );
+    };
+    for (span, _) in backticked_with_tail(&after_start[..end_at]) {
+        assert!(
+            is_identifier(span),
+            "{span:?} in SKILL.md's `fix` field list is not a field name (lower-case letters, \
+             digits and `_` only)"
+        );
+        fields.insert(span.to_owned());
+    }
+    assert!(
+        !fields.is_empty(),
+        "SKILL.md's `fix` field list, between {FIX_FIELDS_START:?} and {FIX_FIELDS_END:?}, names \
+         no field"
+    );
+    fields
+}
+
+/// The same check for the `fix` sub-fields, one-way: a field SKILL.md tells the
+/// agent to act on has to exist in the diagnosis JSON, but the skill need not
+/// name every field the JSON carries. `needs` is set so the one field the
+/// serializer omits when absent is present in the sample.
+#[test]
+fn fix_fields_quoted_in_the_skill_exist_in_the_diagnosis_json() {
+    let quoted = fix_fields_in(&skill_md_text());
+    let sample = rocm_core::Fix {
+        needs: Some("--device-index".to_owned()),
+        ..rocm_core::Fix::default()
+    };
+    let json = serde_json::to_value(&sample).expect("a Fix serializes");
+    let emitted: BTreeSet<String> = json
+        .as_object()
+        .expect("a Fix is a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    let unknown: Vec<&String> = quoted.difference(&emitted).collect();
+    assert!(
+        unknown.is_empty(),
+        "SKILL.md names `fix` fields the diagnosis JSON does not carry: {unknown:?}. \
+         Carried: {emitted:?}"
+    );
+}
+
+/// `text` re-wrapped to lines of at most `width` characters, so every phrase in it
+/// may now break across lines in a different place.
+fn rewrap(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line_len = 0;
+    for word in text.split_whitespace() {
+        if line_len > 0 && line_len + 1 + word.len() > width {
+            out.push('\n');
+            line_len = 0;
+        } else if line_len > 0 {
+            out.push(' ');
+            line_len += 1;
+        }
+        out.push_str(word);
+        line_len += word.len();
+    }
+    out
+}
+
+/// Re-wrapping SKILL.md must not change what the two parsers read: they match
+/// phrases on the whitespace-collapsed text, not one physical line at a time.
+#[test]
+fn the_skill_parsers_do_not_depend_on_line_wrapping() {
+    let skill_md = skill_md_text();
+    for width in [37, 61, 200] {
+        let wrapped = rewrap(&skill_md, width);
+        assert_eq!(
+            exit_code_names_in(&wrapped),
+            exit_code_names_in(&skill_md),
+            "exit-code names changed when SKILL.md was re-wrapped to {width} columns"
+        );
+        assert_eq!(
+            fix_fields_in(&wrapped),
+            fix_fields_in(&skill_md),
+            "fix fields changed when SKILL.md was re-wrapped to {width} columns"
+        );
+    }
+}
+
+/// A fixture phrase that is gone must fail loudly, not leave a parser finding
+/// nothing (or, for the field list, everything to the end of the file).
+#[test]
+#[should_panic(expected = "marker missing")]
+fn a_reworded_exit_code_marker_is_loud() {
+    exit_code_names_in(&flatten(&skill_md_text()).replace(EXIT_CODES_MARKER, "by its code name"));
+}
+
+#[test]
+#[should_panic(expected = "marker missing")]
+fn a_reworded_fix_field_start_is_loud() {
+    fix_fields_in(&flatten(&skill_md_text()).replace(FIX_FIELDS_START, "a fix whose "));
+}
+
+#[test]
+#[should_panic(expected = "marker missing")]
+fn a_reworded_fix_field_end_is_loud() {
+    fix_fields_in(&flatten(&skill_md_text()).replace(FIX_FIELDS_END, " are the columns"));
+}
+
+#[test]
+#[should_panic(expected = "names no field")]
+fn an_emptied_fix_field_list_is_loud() {
+    fix_fields_in(&format!("{FIX_FIELDS_START}x{FIX_FIELDS_END}"));
+}
+
+#[test]
+#[should_panic(expected = "is not a field name")]
+fn a_hyphenated_fix_field_is_loud() {
+    fix_fields_in(&flatten(&skill_md_text()).replace("`needs_sudo`", "`needs-sudo`"));
+}
+
+#[test]
+#[should_panic(expected = "is not a field name")]
+fn a_camel_case_fix_field_is_loud() {
+    fix_fields_in(&flatten(&skill_md_text()).replace("`needs_sudo`", "`needsSudo`"));
 }

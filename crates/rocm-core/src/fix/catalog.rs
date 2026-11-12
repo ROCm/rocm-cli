@@ -2378,7 +2378,8 @@ mod tests {
         // apply() returns 1 only when a platform's class is Auto and the recipe
         // has no runner (`Plan::MissingRunner`). `a_recipe_that_acts_has_a_runner`
         // keeps that impossible; assert the reachability argument here so
-        // reference.md's row 1 is accounted for rather than silently untested.
+        // the manifest's `internal` exit code is accounted for rather than
+        // silently untested.
         assert!(
             RECIPES.iter().all(|r| {
                 !r.applies_on.iter().any(|p| p.class.applies_itself()) || r.runner.is_some()
