@@ -10,7 +10,8 @@
 # record for both. A bash login shell with no fish install must not grow a fish
 # config. Re-running must not append a second PATH block. A `rocm` that cannot
 # print completions, or a fish config that cannot be written, must not stop the
-# install or be reported as done.
+# install or be reported as done. Every install also gets the rocm(1) manual
+# page beside the install folder, on the same terms as the completions.
 #
 # Usage: tests/install-sh/run.sh
 # Set INSTALL_SH to test another copy of the installer (mutation checks).
@@ -80,9 +81,23 @@ mkdir -p "${BUNDLE}"
 # print nothing once when it says `empty-once`: the stub consumes the file, so
 # the next run works, as a failure that clears by itself would. They also fail
 # when the installer hands `rocm` its own stdin, which under `curl | sh` is the
-# rest of the script.
+# rest of the script. The manual page does the same with $HOME/.stub-man-page.
 cat > "${BUNDLE}/rocm" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = "__man-page" ] && [ "$#" -eq 1 ]; then
+  if IFS= read -r _line; then
+    printf '%s\n' "rocm read the installer's stdin: ${_line}" >&2
+    exit 1
+  fi
+  _mode="$(cat "${HOME}/.stub-man-page" 2>/dev/null || true)"
+  rm -f "${HOME}/.stub-man-page"
+  case "${_mode}" in
+    fail-once) printf '%s\n' "stub manual page failure" >&2; exit 1 ;;
+    empty-once) exit 0 ;;
+  esac
+  printf '%s\n' '.TH ROCM 1 "" "rocm stub" "ROCm CLI"' '.SH NAME' 'rocm \- stub manual page'
+  exit 0
+fi
 if [ "${1:-}" = "completions" ] && [ "${2:-}" = "fish" ]; then
   if IFS= read -r _line; then
     printf '%s\n' "rocm read the installer's stdin: ${_line}" >&2
@@ -129,6 +144,27 @@ COMPLETIONS_MARKER='# rocm-cli fish completions for '
 # What install.sh writes to rocm.fish for an install under home $1.
 installed_completions() {
   printf '%s%s\n%s' "${COMPLETIONS_MARKER}" "$1/.local/bin" "${COMPLETIONS_FIXTURE}"
+}
+# What the stub prints for `rocm __man-page`, and the line install.sh puts
+# above it.
+MAN_FIXTURE='.TH ROCM 1 "" "rocm stub" "ROCm CLI"
+.SH NAME
+rocm \- stub manual page'
+MAN_MARKER='.\" rocm-cli manual page for '
+
+# Where install.sh writes the manual page for an install under home $1.
+man_page_path() {
+  printf '%s\n' "$1/.local/share/man/man1/rocm.1"
+}
+
+# What install.sh writes to rocm.1 for an install under home $1.
+installed_man_page() {
+  printf '%s%s\n%s' "${MAN_MARKER}" "$1/.local/bin" "${MAN_FIXTURE}"
+}
+
+# How many `man` lines the uninstall record under home $1 holds.
+man_record_count() {
+  grep -c '^man ' "$1/.local/bin/.rocm-cli-path-edit" 2>/dev/null || true
 }
 # The installer's stdin: what `curl | sh` would still have to run.
 STDIN_FIXTURE="${WORK}/installer-stdin"
@@ -258,6 +294,31 @@ if [ "${FAILURES}" -eq 0 ]; then
   pass "bash login shell also configures fish"
 fi
 
+# The manual page goes in share/man/man1 under the folder above the install
+# folder, with the installer's marker naming the install folder, and is on the
+# record for uninstall.
+failures_before="${FAILURES}"
+bash_man="$(man_page_path "${bash_home}")"
+assert_file_eq "manual page" "${bash_man}" "$(installed_man_page "${bash_home}")"
+assert_contains "${record}" "man ${bash_man}" "uninstall record missing the manual page"
+assert_log_contains "${WORK}/bash-fish.log" "manual page installed:" "installer did not report the manual page"
+assert_log_contains "${WORK}/bash-fish.log" "  ${bash_man}" "installer did not report the manual page path"
+assert_log_contains "${WORK}/bash-fish.log" "man rocm" "installer did not suggest man rocm"
+if [ -f "${bash_man}" ] && [ "$(find "${bash_man}" -perm 0644)" != "${bash_man}" ]; then
+  fail "manual page is not mode 0644"
+fi
+# man-db finds the page from the install folder on PATH alone, with no
+# MANPATH, as it does for a user whose new terminal has ~/.local/bin on PATH.
+if man_bin="$(command -v man)"; then
+  found="$(env -u MANPATH HOME="${bash_home}" PATH="${bash_home}/.local/bin:/usr/bin:/bin" "${man_bin}" -w rocm 2>&1 || true)"
+  assert_eq "man -w rocm with the install folder on PATH" "${found}" "${bash_man}"
+else
+  echo "not checked: man is not installed, so lookup through PATH was not tried"
+fi
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "the manual page is installed beside the install folder and recorded"
+fi
+
 # A second install must not append another marked block or another record line.
 install_case "${WORK}/bash-fish-again.log" "${bash_home}" /bin/bash "${FISH_PATH}" 1
 assert_eq "bash marker count after reinstall" "$(marker_count "${bash_profile}")" 1
@@ -269,6 +330,13 @@ assert_eq "completions file after reinstall" "$(cat "${fish_completions}")" "$(i
 assert_log_contains "${WORK}/bash-fish-again.log" "fish shell profile already configured:" "reinstall did not report the existing fish profile"
 if [ "${FAILURES}" -eq 0 ]; then
   pass "reinstall does not duplicate the fish block"
+fi
+failures_before="${FAILURES}"
+assert_file_eq "manual page after reinstall" "${bash_man}" "$(installed_man_page "${bash_home}")"
+assert_eq "recorded manual page lines" "$(man_record_count "${bash_home}")" 1
+assert_log_contains "${WORK}/bash-fish-again.log" "manual page installed:" "reinstall did not replace its own manual page"
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "reinstall replaces its own manual page and records it once"
 fi
 
 # Bash, no fish binary and no fish config directory.
@@ -368,6 +436,15 @@ assert_absent_file "${skip_home}/.config/fish/completions/rocm.fish" "shell upda
 assert_log_contains "${WORK}/skip.log" "shell profile update skipped" "opt-out did not report the skip"
 if [ "${FAILURES}" -eq 0 ]; then
   pass "shell profile opt-out leaves fish unconfigured"
+fi
+# The manual page is no shell profile: the opt-out still installs it, but does
+# not suggest `man rocm`, since nothing puts the install folder on PATH.
+failures_before="${FAILURES}"
+assert_file_eq "manual page with the shell profile opt-out" "$(man_page_path "${skip_home}")" "$(installed_man_page "${skip_home}")"
+assert_eq "recorded manual page lines with the opt-out" "$(man_record_count "${skip_home}")" 1
+assert_log_lacks "${WORK}/skip.log" "man rocm" "opt-out suggested man rocm without a PATH change"
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "shell profile opt-out still installs the manual page"
 fi
 
 # A profile the user named still receives the login-shell snippet, and fish
@@ -505,6 +582,117 @@ if [ "${FAILURES}" -eq 0 ]; then
   pass "a rocm.fish the installer did not write is left alone, and one it wrote is replaced"
 fi
 
+# A rocm that cannot print its manual page, or prints nothing, still installs
+# cleanly and writes and records no page. The printed advice, run as printed
+# from a bare environment in a home whose name holds a space, writes the page
+# the installer would have, marker included, so the next install takes it as
+# its own and records it.
+failures_before="${FAILURES}"
+for mode in fail-once empty-once; do
+  mp_home="${WORK}/homes/spaced man ${mode}"
+  mp_log="${WORK}/man-page-${mode}.log"
+  mp_path="$(man_page_path "${mp_home}")"
+  mkdir -p "${mp_home}"
+  printf '%s\n' "${mode}" > "${mp_home}/.stub-man-page"
+  install_case "${mp_log}" "${mp_home}" /bin/bash "${BASE_PATH}" 1
+  assert_absent_file "${mp_home}/.stub-man-page" "manual page (${mode}) was never attempted"
+  assert_absent_file "${mp_path}" "manual page (${mode}) left a file"
+  [ -x "${mp_home}/.local/bin/rocm" ] || fail "manual page (${mode}) stopped the install"
+  assert_contains "${mp_home}/.bashrc" "${POSIX_SNIPPET}" "manual page (${mode}) lost the PATH block"
+  assert_log_contains "${mp_log}" "note: could not install the manual page" "manual page (${mode}) did not print the note"
+  assert_log_lacks "${mp_log}" "manual page installed:" "manual page (${mode}) was reported installed"
+  assert_log_lacks "${mp_log}" "man rocm" "manual page (${mode}) suggested man rocm"
+  assert_eq "manual page (${mode}) record lines" "$(man_record_count "${mp_home}")" 0
+  assert_log_contains "${mp_log}" "to try again, run the installer again, or run:" "manual page (${mode}) did not offer to run the installer again"
+  # The three command lines after the manual page note's "to try again".
+  advice="$(awk '/note: could not install the manual page/ { found = 1 } found && /to try again/ { n = 3; found = 0; next } n > 0 { sub(/^  /, ""); print; n-- }' "${mp_log}")"
+  if [ -z "${advice}" ]; then
+    fail "manual page (${mode}) printed no advice"
+  elif ! env -i HOME="${mp_home}" PATH="${TOOLS}" \
+    "${TOOLS}/sh" -c "${advice}" < /dev/null; then
+    fail "manual page (${mode}) advice did not run"
+  fi
+  assert_file_eq "manual page (${mode}) after the advice" "${mp_path}" "$(installed_man_page "${mp_home}")"
+  install_case "${mp_log}.again" "${mp_home}" /bin/bash "${BASE_PATH}" 1
+  assert_log_contains "${mp_log}.again" "manual page installed:" "manual page (${mode}) written by the advice was not taken as the installer's"
+  assert_eq "manual page (${mode}) record lines after reinstall" "$(man_record_count "${mp_home}")" 1
+done
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "a manual page that cannot be generated leaves the install and a working hint"
+fi
+
+# A rocm.1 that is already there and did not come from this installer is the
+# user's: a regular file, links (even to a marked page) and a dangling link are
+# left exactly as they are, not recorded, with a note saying why.
+failures_before="${FAILURES}"
+USERS_MAN_PAGE='.TH ROCM 1 "" "my own notes"'
+for kind in file link markedlink dangling; do
+  om_home="${WORK}/homes/own-man-${kind}"
+  om_log="${WORK}/own-man-${kind}.log"
+  om_path="$(man_page_path "${om_home}")"
+  om_target="${om_home}/dotfiles/rocm.1"
+  mkdir -p "${om_home}/.local/share/man/man1" "${om_home}/dotfiles"
+  case "${kind}" in
+    file) printf '%s\n' "${USERS_MAN_PAGE}" > "${om_path}" ;;
+    link)
+      printf '%s\n' "${USERS_MAN_PAGE}" > "${om_target}"
+      ln -s "${om_target}" "${om_path}"
+      ;;
+    markedlink)
+      printf '%s\n%s\n' "${MAN_MARKER}${om_home}/.local/bin" "${USERS_MAN_PAGE}" > "${om_target}"
+      ln -s "${om_target}" "${om_path}"
+      ;;
+    dangling) ln -s "${om_target}" "${om_path}" ;;
+    *) fail "unknown rocm.1 kind ${kind}" ;;
+  esac
+  install_case "${om_log}" "${om_home}" /bin/bash "${BASE_PATH}" 1
+  assert_log_contains "${om_log}" "note: manual page not installed: ${om_path} already exists and was not written by this installer" "user's rocm.1 (${kind}) was not reported as left alone"
+  assert_log_lacks "${om_log}" "manual page installed:" "user's rocm.1 (${kind}) was reported replaced"
+  case "${kind}" in
+    file) assert_file_eq "user's rocm.1 (${kind})" "${om_path}" "${USERS_MAN_PAGE}" ;;
+    link | markedlink)
+      [ -L "${om_path}" ] || fail "user's rocm.1 ${kind} was replaced"
+      assert_eq "what the user's rocm.1 ${kind} points at" "$(tail -n 1 "${om_target}")" "${USERS_MAN_PAGE}"
+      ;;
+    dangling)
+      [ -L "${om_path}" ] || fail "user's dangling rocm.1 link was replaced"
+      assert_absent_file "${om_target}" "the installer wrote through the user's dangling rocm.1 link"
+      ;;
+    *) fail "unknown rocm.1 kind ${kind}" ;;
+  esac
+  assert_eq "user's rocm.1 (${kind}) record lines" "$(man_record_count "${om_home}")" 0
+  [ -x "${om_home}/.local/bin/rocm" ] || fail "user's rocm.1 (${kind}) stopped the install"
+done
+# A page another install folder of this installer wrote is replaced, and the
+# new install records it.
+mm_home="${WORK}/homes/marked-man"
+mkdir -p "${mm_home}/.local/share/man/man1"
+printf '%s\n%s\n' "${MAN_MARKER}/opt/other/bin" "old page" > "$(man_page_path "${mm_home}")"
+install_case "${WORK}/marked-man.log" "${mm_home}" /bin/bash "${BASE_PATH}" 1
+assert_file_eq "an earlier installer's rocm.1" "$(man_page_path "${mm_home}")" "$(installed_man_page "${mm_home}")"
+assert_eq "a replaced installer rocm.1 record lines" "$(man_record_count "${mm_home}")" 1
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "a rocm.1 the installer did not write is left alone, and one it wrote is replaced"
+fi
+
+# A relative install folder has no fixed folder above it, so the page is
+# skipped with a note and the rest of the install goes ahead.
+failures_before="${FAILURES}"
+rl_home="${WORK}/homes/relative-install"
+mkdir -p "${rl_home}/cwd"
+(cd "${rl_home}/cwd" && install_case "${WORK}/relative-install.log" "${rl_home}" /bin/bash "${BASE_PATH}" 0 "ROCM_CLI_INSTALL_DIR=rel-bin")
+[ -x "${rl_home}/cwd/rel-bin/rocm" ] || fail "a relative install folder stopped the install"
+assert_log_contains "${WORK}/relative-install.log" "note: manual page not installed: the install folder rel-bin is not an absolute path" "a relative install folder did not explain the skipped manual page"
+if find "${rl_home}" -name rocm.1 | grep -q .; then
+  fail "a relative install folder still wrote a manual page"
+fi
+if grep -q '^man ' "${rl_home}/cwd/rel-bin/.rocm-cli-path-edit" 2>/dev/null; then
+  fail "a relative install folder recorded a manual page"
+fi
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "a relative install folder skips the manual page with a note"
+fi
+
 # The login shell's own profile is recorded only when it holds the installer's
 # block: a PATH line the user wrote is theirs, and uninstall must not look for
 # a block there.
@@ -585,4 +773,4 @@ if [ "${FAILURES}" -ne 0 ]; then
   echo "${FAILURES} failed" >&2
   exit 1
 fi
-echo "all install.sh fish checks passed"
+echo "all install.sh fish and manual page checks passed"

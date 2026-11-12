@@ -1411,7 +1411,27 @@ rocm config clear-planner-provider
 ## 10. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
-`cargo` build, whose binaries uninstall leaves alone):
+`cargo` build, whose binaries uninstall leaves alone).
+
+First, on Linux, check the manual page the installer wrote. The installer
+prints `manual page installed:` with its path
+(`~/.local/share/man/man1/rocm.1` for the default install folder) and lists
+`man rocm` under `Get started:`. Open a new terminal and run:
+
+```bash
+man rocm
+man -w rocm
+```
+
+Expected result: `man rocm` shows rocm's page, whose NAME section calls it
+the ROCm AI Command Center CLI, with a COMMANDS list matching `rocm --help`, and `man -w rocm` prints the
+path the installer reported (scenario `lifecycle-36`). If you set `MANPATH`
+yourself, it must end in `:` for this to work. A `rocm.1` you already had there
+is left as it is, and the installer prints `note: manual page not installed: …
+already exists and was not written by this installer` (scenario
+`lifecycle-37`).
+
+Then uninstall:
 
 ```powershell
 rocm uninstall --dry-run
@@ -1424,7 +1444,8 @@ Expected result:
   as the command exits), on Linux the `shell completions` file
   `completions/rocm.fish` in fish's config folder (`$XDG_CONFIG_HOME/fish`
   when that is an absolute path, else `~/.config/fish`) when the installer
-  wrote one, and, under `PATH changes from the installer that would be
+  wrote one, a `manual page` entry for the `man1/rocm.1` the installer wrote
+  (Linux), and, under `PATH changes from the installer that would be
   undone:`, each shell profile the installer wrote (Linux, including fish's
   `config.fish` when fish was installed) or the user `PATH` entry (Windows).
   It removes nothing, and at a
@@ -1434,12 +1455,12 @@ Expected result:
   its output piped to a file or another command, or its input redirected, it
   lists the same items and omits that last line (scenario `uninstall-08`).
 - After confirming, the install folder holds no `rocm`/`rocmd` files, the
-  fish completion script is gone (its `completions` folder stays), and a new
-  terminal no longer gets the install folder on `PATH` from the installer's
-  change.
+  fish completion script and the manual page are gone (their `completions`
+  and `man1` folders stay), `man rocm` finds no page, and a new terminal no
+  longer gets the install folder on `PATH` from the installer's change.
 - If another program lives in the install folder, the review instead says
   `PATH change left in place` and names it, and the `PATH` change stays; the
-  fish completion script still goes.
+  fish completion script and the manual page still go.
 - If you already have your own `completions/rocm.fish` (or a link there) when
   you run the installer, it prints `note: fish completions not installed: …
   already exists and was not written by this installer`, changes nothing, and
@@ -1452,8 +1473,9 @@ Expected result:
   uninstall prints `warning: could not remove shell completions <path>`,
   still removes everything else, and ends with `uninstall complete`
   (scenario `lifecycle-34`).
-- With `rocm uninstall --keep-binaries`, the review says the `PATH` change and
-  fish completions stay too, and they do (scenario `lifecycle-25`).
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change,
+  fish completions and manual page stay too, and they do (scenario
+  `lifecycle-25`).
 - On a home folder ROCm CLI never touched, the dry run says
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run

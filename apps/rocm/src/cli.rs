@@ -265,6 +265,12 @@ pub(crate) enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Print the rocm(1) manual page, as roff, to standard output.
+    ///
+    /// Hidden: the Linux installer runs it to install the page that `man rocm`
+    /// shows, generated from this binary's own command tree.
+    #[command(name = "__man-page", hide = true)]
+    ManPage,
     #[command(hide = true)]
     Bootstrap {
         #[command(subcommand)]
@@ -713,9 +719,9 @@ rocm logs --search error timeout")]
     ///
     /// Removes the config, data, and cache directories and the installed
     /// binaries, including the running rocm.exe on Windows, and the fish
-    /// completion script the Linux installer wrote for them (a rocm.fish it
-    /// did not write is left in place, and one it cannot remove is only a
-    /// warning). It also undoes the PATH change the installer made (its marked
+    /// completion script and manual page the Linux installer wrote for them
+    /// (a rocm.fish or rocm.1 it did not write is left in place, and one it
+    /// cannot remove is only a warning). It also undoes the PATH change the installer made (its marked
     /// shell-profile block, or the user PATH entry it recorded adding on
     /// Windows), unless other programs share the install folder.
     #[command(after_help = "EXAMPLES:\n  \
@@ -733,7 +739,7 @@ rocm uninstall --keep-data --yes")]
         #[arg(long)]
         dry_run: bool,
         /// Keep installed rocm-cli binaries, the installer's PATH change, and the
-        /// fish completions it wrote.
+        /// fish completions and manual page it wrote.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.

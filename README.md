@@ -90,11 +90,19 @@ including when the login shell is bash, zsh, or ksh. Fish's config folder is
 installer did not write (your own file, or a link) is left as it is: the
 installer prints a note that completions were not installed, and
 `rocm uninstall` leaves it too.
+On Linux the installer also writes the `rocm` manual page, made by the binary
+it just installed, to `share/man/man1/rocm.1` in the folder above the install
+folder (`~/.local/share/man/man1/rocm.1` by default). `man` finds a page there
+for any folder on `PATH`, so `man rocm` works in a new terminal once
+`~/.local/bin` is on `PATH`; a `MANPATH` you set yourself hides it unless it
+ends in `:`. A `rocm.1` already there that the installer did not write is left
+as it is, with a note, like the fish completions.
 Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
-its completions included. Rerun the installer any time to upgrade.
-`rocm uninstall` removes the binaries and the fish completions the installer
-wrote for them, and undoes the `PATH` change too when no other program lives
-in that directory.
+its completions included; the manual page is still installed. Rerun the
+installer any time to upgrade.
+`rocm uninstall` removes the binaries and the fish completions and manual page
+the installer wrote for them, and undoes the `PATH` change too when no other
+program lives in that directory.
 
 ### Linux and WSL2 (x86_64)
 
@@ -1793,7 +1801,8 @@ nothing to remove. Outside an interactive terminal, when there is something to
 remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
 Each `--keep-*` flag skips the removal of one category:
 
-- `--keep-binaries` keeps the installed ROCm CLI binaries.
+- `--keep-binaries` keeps the installed ROCm CLI binaries, the installer's
+  `PATH` change, and the fish completions and manual page it wrote.
 - `--keep-config` keeps your saved settings.
 - `--keep-data` keeps app data such as logs, services, engines, downloaded
   models, the managed ROCm SDK installs, and the managed `uv` package cache.
@@ -1829,7 +1838,11 @@ and uninstall removes the file only when that line names its own folder. A
 `rocm.fish` you wrote yourself, a link, or one another install folder wrote
 since is left in place, and the review says so under `Left alone:`. If the
 file cannot be removed, uninstall prints a warning naming it and carries on,
-since the completions are only a convenience; delete it yourself then.
+since the completions are only a convenience; delete it yourself then. The
+manual page the installer recorded writing (`man1/rocm.1`) is treated the
+same way: removed with the binaries when its first line names this install
+folder, kept with `--keep-binaries`, and left in place, with the reason, when
+the installer did not write it.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
@@ -1895,6 +1908,21 @@ rocm completions elvish >> ~/.config/elvish/rc.elv
 # powershell (current session only; to persist, append the output to $PROFILE)
 rocm completions powershell | Out-String | Invoke-Expression
 ```
+
+### Manual page
+
+On Linux the installer also installs a `rocm` manual page (see
+[Installation](#installation)), so the overview of every command, the
+examples, the files ROCm CLI keeps and the environment variables it reads are
+available offline:
+
+```
+man rocm
+```
+
+The page is made by the installed binary, so it matches it; run the installer
+again after building or upgrading by other means to refresh it. Each command's
+own options are in `rocm <command> --help`.
 
 ## Contributing
 

@@ -29,6 +29,7 @@ e2e-oom-fault-injection = []
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+clap_mangen.workspace = true
 crossterm.workspace = true
 flate2 = "1.1"
 keyring-core.workspace = true
@@ -48,6 +49,7 @@ rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 rocmd = { path = "../rocmd" }
 rocm-engine-vllm = { path = "../../engines/vllm" }
 rocm-engine-aim = { path = "../../engines/aim" }
+roff.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true

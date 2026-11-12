@@ -1889,13 +1889,217 @@ async fn then_xdg_kept(world: &mut E2eWorld) {
 #[then("uninstall reports keeping the PATH change with the binaries")]
 async fn then_reports_path_kept_with_binaries(world: &mut E2eWorld) {
     // The message is true because lifecycle-25 also asserts the state it
-    // promises: the PATH change and the fish completions stay (see
-    // `then_fish_completions_still_in_place` and the profile step).
+    // promises: the PATH change, the fish completions and the manual page stay
+    // (see `then_fish_completions_still_in_place`,
+    // `then_man_page_still_in_place` and the profile step).
     let out = &state(world).last_output;
     assert!(
         out.contains("binary removal disabled by --keep-binaries")
-            && out.contains("any PATH change and fish completions the installer made stay too"),
+            && out.contains(
+                "any PATH change, fish completions and manual page the installer made stay too"
+            ),
         "uninstall did not say the PATH change stays with the binaries:\n{out}"
+    );
+}
+
+// ── Manual page ────────────────────────────────────────────────────────
+
+/// Where the installer writes the manual page in this scenario: share/man/man1
+/// under the folder above the install directory.
+fn man_page(st: &LifecycleState) -> PathBuf {
+    st.install_dir
+        .parent()
+        .expect("the install directory has a parent")
+        .join("share")
+        .join("man")
+        .join("man1")
+        .join("rocm.1")
+}
+
+/// What the user keeps as their own `rocm.1` in a scenario.
+const USERS_OWN_MAN_PAGE: &str = ".TH ROCM 1 \"\" \"my own notes\"\n";
+
+/// Run `man` with `args` as a new terminal would after this install: PATH
+/// holds the install directory and the system folders, MANPATH is unset, so
+/// man-db finds pages only through PATH. The output is ASCII and unwrapped
+/// (`LC_ALL=C`, a wide `MANWIDTH`, `cat` as the pager), so a heading or an
+/// example is one line with plain hyphens.
+fn man_in_new_terminal(st: &LifecycleState, args: &[&str]) -> (String, bool) {
+    let output = Command::new("man")
+        .env("LC_ALL", "C")
+        .env("MANWIDTH", "200")
+        .env_remove("MAN_KEEP_FORMATTING")
+        .args(["-P", "cat"])
+        .args(args)
+        .env_remove("MANPATH")
+        .env("HOME", &st.home_dir)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", st.install_dir.display()),
+        )
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("could not run man ({e}); this scenario needs man (man-db) installed")
+        });
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (combined, output.status.success())
+}
+
+#[then("the installer reports the manual page and suggests man rocm")]
+async fn then_installer_reports_man_page(world: &mut E2eWorld) {
+    // The suggestion is true because lifecycle-36 then runs `man rocm` the way
+    // a new terminal would (`then_man_rocm_shows_installed_manual`).
+    let st = state(world);
+    let path = man_page(st);
+    let out = &st.last_output;
+    assert!(
+        out.contains("manual page installed:") && out.contains(&path.display().to_string()),
+        "the installer did not report the manual page at {}:\n{out}",
+        path.display()
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.trim_start().starts_with("man rocm ")),
+        "the installer did not suggest man rocm:\n{out}"
+    );
+    let marker = format!(
+        ".\\\" rocm-cli manual page for {}\n",
+        st.install_dir.display()
+    );
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        contents.starts_with(&marker),
+        "{} does not start with the installer's marker {marker:?}:\n{contents}",
+        path.display()
+    );
+    let record = std::fs::read_to_string(st.install_dir.join(".rocm-cli-path-edit"))
+        .expect("the installer wrote no PATH-edit record");
+    assert!(
+        record
+            .lines()
+            .any(|line| line == format!("man {}", path.display())),
+        "the installer did not record the manual page for uninstall:\n{record}"
+    );
+}
+
+#[then("man rocm in a new terminal shows the installed rocm's manual")]
+async fn then_man_rocm_shows_installed_manual(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    let (found, ok) = man_in_new_terminal(st, &["-w", "rocm"]);
+    assert!(
+        ok && found.trim() == path.display().to_string(),
+        "man -w rocm did not find the installed page {}:\n{found}",
+        path.display()
+    );
+    let (page, ok) = man_in_new_terminal(st, &["rocm"]);
+    assert!(ok, "man rocm failed:\n{page}");
+    assert!(
+        page.lines()
+            .any(|line| line.trim() == "rocm - ROCm AI Command Center CLI"),
+        "man rocm did not show rocm's NAME line:\n{page}"
+    );
+    assert!(
+        page.lines().any(|line| line.trim() == "rocm examine"),
+        "man rocm did not show the rocm examine example:\n{page}"
+    );
+}
+
+#[then("the rocm manual page is gone")]
+async fn then_man_page_gone(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    assert!(
+        !path.exists(),
+        "uninstall left {} behind for a rocm that is gone",
+        path.display()
+    );
+    assert!(
+        path.parent().is_some_and(Path::is_dir),
+        "uninstall removed the man1 folder, not just rocm's page"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!("removed manual page {}", path.display())),
+        "uninstall did not report removing the manual page:\n{out}"
+    );
+}
+
+#[then("the rocm manual page is still in place")]
+async fn then_man_page_still_in_place(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains(".TH ROCM 1"),
+        "{} is gone after an uninstall that keeps the binaries",
+        path.display()
+    );
+    assert!(
+        !st.last_output.contains("removed manual page"),
+        "uninstall reported removing the manual page it was told to keep:\n{}",
+        st.last_output
+    );
+}
+
+#[given("the user already has their own rocm manual page")]
+async fn given_users_own_man_page(world: &mut E2eWorld) {
+    let path = man_page(state(world));
+    std::fs::create_dir_all(path.parent().expect("the page has a folder"))
+        .expect("failed to create the man1 folder");
+    std::fs::write(&path, USERS_OWN_MAN_PAGE).expect("failed to seed the manual page");
+}
+
+#[then("the installer leaves the user's own manual page and says why")]
+async fn then_installer_leaves_users_man_page(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_MAN_PAGE,
+        "the installer changed {}, which it did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "note: manual page not installed: {} already exists and was not written by this \
+             installer",
+            path.display()
+        )),
+        "the installer did not say it left the manual page:\n{out}"
+    );
+    assert!(
+        !out.contains("manual page installed:"),
+        "the installer reported installing a page it did not write:\n{out}"
+    );
+    let record = std::fs::read_to_string(st.install_dir.join(".rocm-cli-path-edit"))
+        .expect("the installer wrote no PATH-edit record");
+    assert!(
+        !record.lines().any(|line| line.starts_with("man ")),
+        "the installer recorded a page it did not write, so uninstall could remove it:\n{record}"
+    );
+}
+
+#[then("the user's own manual page is untouched")]
+async fn then_users_man_page_untouched(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_MAN_PAGE,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    assert!(
+        !st.last_output.contains("removed manual page"),
+        "uninstall reported removing a page it should not have touched:\n{}",
+        st.last_output
     );
 }
 
