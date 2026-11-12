@@ -684,6 +684,35 @@ mod tests {
         assert_eq!(result, AcceleratorMemory::Dedicated(16.0));
     }
 
+    /// Whether the recipe's engine is one no platform gate rules out anywhere.
+    ///
+    /// A test that picks a recipe by memory minimum alone picks one by
+    /// accident, and the accident is platform-shaped: the first builtin recipe
+    /// above 8 GiB prefers vLLM, which the gate rules out on native Windows
+    /// before memory is ever consulted. The verdict comes back `Blocked` for a
+    /// reason that has nothing to do with the pool, so an assertion about the
+    /// pool fails on Windows while passing everywhere else — which is what the
+    /// first Windows CI run on this branch caught.
+    ///
+    /// **Not "ungated on this host".** That reads as the obvious fix and is a
+    /// worse one: it would select a vLLM recipe on Linux and a Lemonade recipe
+    /// on Windows, so neither lane would exercise what the other runs and the
+    /// Linux lane could not catch a Windows regression again. Pinning the
+    /// engine class instead keeps these tests the same test everywhere, leaving
+    /// the memory arithmetic they are named for as the only thing that varies.
+    ///
+    /// Lemonade is that engine today: vLLM and AIM are both gated on native
+    /// Windows, and AIM additionally on Docker reachability. The gate call is
+    /// kept as a live guard rather than a comment — if Lemonade ever becomes
+    /// conditional, the `expect` at the call site fires here instead of the
+    /// assertion failing somewhere less obvious.
+    fn recipe_engine_runs_everywhere(recipe: &rocm_core::ModelRecipeRecord) -> bool {
+        recipe.preferred_engines.first().is_some_and(|engine| {
+            engine.eq_ignore_ascii_case("lemonade")
+                && engine_ruled_out_by_platform(engine) == PlatformRuleOut::Allowed
+        })
+    }
+
     /// The APU's pool is the aperture, and the carve-out rides along only as a
     /// label.
     ///
@@ -721,6 +750,7 @@ mod tests {
                 recipe
                     .min_gpu_mem_gb
                     .is_some_and(|min| (8..=48).contains(&min))
+                    && recipe_engine_runs_everywhere(recipe)
             })
             .expect("a recipe needing more than the carve-out and less than the aperture");
         let report = assess_model_for_host(
@@ -883,7 +913,10 @@ mod tests {
         let recipe = registry
             .recipes
             .iter()
-            .find(|recipe| recipe.min_gpu_mem_gb.is_some_and(|min| min >= 8))
+            .find(|recipe| {
+                recipe.min_gpu_mem_gb.is_some_and(|min| min >= 8)
+                    && recipe_engine_runs_everywhere(recipe)
+            })
             .expect("the builtin registry ships a recipe with a real GPU-memory minimum");
         let minimum = f64::from(recipe.min_gpu_mem_gb.expect("a minimum"));
 
