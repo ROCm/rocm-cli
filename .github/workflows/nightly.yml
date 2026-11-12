@@ -12,6 +12,13 @@ on:
           change to those jobs from a branch without publishing a release.
         type: boolean
         default: false
+      queue_deadline_minutes:
+        description: >-
+          How long an E2E lane may wait for a runner before the run gives up on
+          it (default 60). Lower it to try the give-up path from a branch
+          quickly; keep it at or below 120 (see HARD_DEADLINE_MINUTES).
+        type: string
+        default: "60"
 
 permissions:
   contents: read
@@ -1611,9 +1618,9 @@ jobs:
   e2e-lanes-settled:
     name: E2E lanes settled (queue deadline)
     runs-on: ubuntu-24.04 # one LTS: only polls the GitHub API
-    # QUEUE_DEADLINE_MINUTES + the longest lane's timeout-minutes (120) + slack;
-    # the script stops itself at HARD_DEADLINE_MINUTES, before this cap.
-    timeout-minutes: 330
+    # HARD_DEADLINE_MINUTES + slack; the script stops itself at the hard
+    # deadline, before this cap.
+    timeout-minutes: 270
     permissions:
       contents: read
       actions: read
@@ -1629,8 +1636,12 @@ jobs:
         id: settle
         env:
           GH_TOKEN: ${{ github.token }}
-          QUEUE_DEADLINE_MINUTES: "120"
-          HARD_DEADLINE_MINUTES: "300"
+          # A schedule run has no inputs, so it takes the default. A leg still
+          # queued this long after the run started is given up on.
+          QUEUE_DEADLINE_MINUTES: ${{ inputs.queue_deadline_minutes || '60' }}
+          # A leg that started is waited for, but not past this: the queue
+          # deadline plus the longest lane's timeout-minutes (120) plus slack.
+          HARD_DEADLINE_MINUTES: "240"
           LANES: |
             e2e-gpu-nightly=E2E tests (MI300X, incl. nightly-only)
             e2e-gpu-nightly-rad3=E2E tests (rad3 R9700, incl. nightly-only)

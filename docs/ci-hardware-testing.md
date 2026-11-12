@@ -499,9 +499,11 @@ jobs, which wait on every lane, never ran.
   polls the run's own job list
   ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
   once every lane leg has finished or can be given up on: a leg still queued
-  after `QUEUE_DEADLINE_MINUTES` (120) is abandoned, and a leg that started is
-  waited for but abandoned at `HARD_DEADLINE_MINUTES` (300) so a hung runner
-  cannot hold the wait either.
+  after `QUEUE_DEADLINE_MINUTES` (60, or the `queue_deadline_minutes` dispatch
+  input) is abandoned, and a leg that started is waited for but abandoned at
+  `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold the wait either.
+  A lane that starts just inside the queue deadline still has its full
+  `timeout-minutes`, so keep the input at or below 120.
 - `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
   whatever finished. An abandoned lane has no report artifact, so the report
   job's missing-report check flags it by name, the consolidated grid shows the
@@ -518,6 +520,9 @@ release, dispatch the workflow with `skip_build` set:
 ```bash
 gh workflow run nightly.yml --ref <branch> -f skip_build=true
 ```
+
+Add `-f queue_deadline_minutes=5` to give up on lanes that have no runner after
+five minutes, which exercises the give-up and cancel path without a long wait.
 
 That skips the Linux and Windows builds and the release publish, and runs the
 lanes, the report, readiness and the settle job. The wiki publishers run only
