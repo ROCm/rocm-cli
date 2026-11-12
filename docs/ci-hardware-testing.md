@@ -485,6 +485,39 @@ Dispatch the GPU lanes with, e.g.:
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
 
+## Nightly lanes that never get a runner
+
+GitHub cannot time a job out while it waits for a runner: `timeout-minutes`
+only counts once a runner has taken the job, and a job that is still queued
+after 24 hours is cancelled. A lane whose runner pool is offline or saturated
+therefore held `nightly.yml` pending for a day, and the report and readiness
+jobs, which wait on every lane, never ran.
+
+`nightly.yml` bounds that wait itself:
+
+- `e2e-lanes-settled` stands in for the lanes in the report job's `needs`. It
+  polls the run's own job list
+  ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
+  once every lane leg has finished or can be given up on: a leg still queued
+  after `QUEUE_DEADLINE_MINUTES` (120) is abandoned, and a leg that started is
+  waited for but abandoned at `HARD_DEADLINE_MINUTES` (300) so a hung runner
+  cannot hold the wait either.
+- `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
+  whatever finished. An abandoned lane has no report artifact, so the report
+  job's missing-report check flags it by name, the consolidated grid shows the
+  gap and readiness reads it as a failed report rather than as success.
+- `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
+  which is what stops the abandoned legs from holding the run open until the
+  24-hour limit. It runs only when something was abandoned, and only after the
+  report and readiness jobs are done, because cancelling the run also skips any
+  job that is still gated on `!cancelled()`.
+
+A lane added to `nightly.yml` must be added to the `LANES` list of
+`e2e-lanes-settled`;
+`nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
+and also fails if a job waits on a lane directly. The per-PR workflow
+does not use this mechanism.
+
 ## The shared pre-warmed runtime
 
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,

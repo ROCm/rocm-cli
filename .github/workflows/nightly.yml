@@ -1579,6 +1579,50 @@ jobs:
           # its own.
           if-no-files-found: error
 
+  # GitHub has no queue timeout: `timeout-minutes` counts from the moment a
+  # runner takes the job, so a lane whose pool is offline sat queued for the full
+  # 24 hours and held the report and readiness jobs (which `needs` every lane)
+  # back with it. This job stands in for the lanes in those `needs`: it polls
+  # this run's job list and settles once every lane leg has finished or can be
+  # given up on -- a leg still queued after QUEUE_DEADLINE_MINUTES, or one
+  # unfinished after HARD_DEADLINE_MINUTES. Legs that started are waited for,
+  # so a slow lane still lands in the report. The report then covers whatever
+  # finished, and the lanes given up on show as gaps (see lane_results).
+  # .github/scripts/settle-e2e-lanes.sh holds the logic; the lanes are listed
+  # here by display name, and a contract test checks the list against the jobs.
+  e2e-lanes-settled:
+    name: E2E lanes settled (queue deadline)
+    runs-on: ubuntu-24.04 # one LTS: only polls the GitHub API
+    # QUEUE_DEADLINE_MINUTES + the longest lane's timeout-minutes (120) + slack;
+    # the script stops itself at HARD_DEADLINE_MINUTES, before this cap.
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      lane_results: ${{ steps.settle.outputs.lane_results }}
+      abandoned_count: ${{ steps.settle.outputs.abandoned_count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Wait for the E2E lanes to finish or time out in the queue
+        id: settle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_DEADLINE_MINUTES: "120"
+          HARD_DEADLINE_MINUTES: "300"
+          LANES: |
+            e2e-gpu-nightly=E2E tests (MI300X, incl. nightly-only)
+            e2e-gpu-nightly-rad3=E2E tests (rad3 R9700, incl. nightly-only)
+            e2e-gpu-nightly-mi350p=E2E tests (MI350P, incl. nightly-only)
+            e2e-gpu-nightly-w7900=E2E tests (W7900, incl. nightly-only)
+            e2e-gpu-nightly-strix=E2E tests (Strix Halo, incl. nightly-only)
+            e2e-gpu-nightly-strix-windows=E2E tests (Strix Halo, Windows, incl. nightly-only)
+            e2e-wsl-nightly=E2E tests (Strix Halo, WSL2, incl. nightly-only)
+        run: bash .github/scripts/settle-e2e-lanes.sh
+
   # The nightly lanes each uploaded a report nobody joined up, so reading a
   # nightly meant opening every artifact and comparing them by hand — on the
   # run that covers the most scenarios, since only nightly sets
@@ -1594,14 +1638,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # Not the lanes themselves: a lane whose runner pool never answers would hold
+    # this job for 24 hours. e2e-lanes-settled waits for them with a queue
+    # deadline instead, and hands over their results in `lane_results`.
     needs:
-      - e2e-gpu-nightly
-      - e2e-gpu-nightly-rad3
-      - e2e-gpu-nightly-mi350p
-      - e2e-gpu-nightly-w7900
-      - e2e-gpu-nightly-strix
-      - e2e-gpu-nightly-strix-windows
-      - e2e-wsl-nightly
+      - e2e-lanes-settled
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
     # filter to consult on a schedule, and the lanes are `continue-on-error`, so
     # a failed lane must still be reported. A nightly that broke is precisely
@@ -1664,7 +1705,9 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
-          NEEDS: ${{ toJSON(needs) }}
+          # Shaped like the `needs` context: lane job id -> {result}, with
+          # `abandoned` for a lane that never got a runner.
+          NEEDS: ${{ needs.e2e-lanes-settled.outputs.lane_results }}
           LANE_REPORTS: |
             e2e-gpu-nightly=e2e-gpu-release-report,e2e-gpu-nightly-report
             e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report,e2e-gpu-rad3-nightly-report
@@ -2044,3 +2087,32 @@ jobs:
           git add "$page"
           git commit -m "Update release readiness from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD
+
+  # Ends the run once everything that can report has. A lane given up on above is
+  # still queued, so without this the run would stay pending until GitHub's 24h
+  # limit even though its reports are out. Cancelling is safe here only because
+  # it runs after every other job: `needs` below lists them all, so what is
+  # cancelled is the stragglers, never a job that is still producing a report.
+  cancel-abandoned-e2e-lanes:
+    name: Cancel E2E lanes that never got a runner
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    needs:
+      - nightly
+      - windows-nightly
+      - publish-nightly
+      - cleanup-staging-nightly
+      - e2e-lanes-settled
+      - e2e-report-nightly
+      - publish-e2e-wiki
+      - release-readiness-nightly
+      - release-readiness-narrative
+      - publish-release-readiness-wiki
+    if: ${{ always() && needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0' }}
+    steps:
+      - name: Cancel the run's unfinished lanes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
