@@ -5,6 +5,7 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use e2e_cucumber::torch_alignment_outcome::{EngineTorchRequirement, is_settled};
 
 #[given("a machine with no CLI-managed runtimes")]
 async fn setup_no_runtimes(world: &mut E2eWorld) {
@@ -326,44 +327,67 @@ async fn assert_runtime_can_still_use_the_gpu(world: &mut E2eWorld) {
 /// reading the verdict is what tells the settled states apart from each other and
 /// from a skip.
 fn torch_alignment_verdict(output: &str) -> &str {
-    output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("torch_alignment: "))
-        .unwrap_or_else(|| {
-            panic!("no torch alignment block, so the runtime was never settled:\n{output}")
-        })
+    torch_alignment_lines(output)[0]
         .split_whitespace()
         .next()
         .unwrap_or_default()
 }
 
-/// Verdicts that mean the runtime was settled and its torch left in a state this
-/// tool produces on purpose.
-///
-/// Four, not one. Whether a reinstall rewrites torch or finds it already correct
-/// depends on what the shared pre-warm tree held when the scenario started, and a
-/// torch that has already executed a GPU kernel with this SDK is kept exactly as
-/// it is and reported as `retained_*` — settled without anything being installed.
-const SETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
-    "realigned",
-    "already_aligned",
-    "retained_sdk_build",
-    "retained_engine_build",
-];
+/// The text after `torch_alignment: ` for every block in the output, reason
+/// included. Never empty: an install that printed none never settled the runtime.
+fn torch_alignment_lines(output: &str) -> Vec<&str> {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("torch_alignment: "))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "no torch alignment block, so the runtime was never settled:\n{output}"
+    );
+    lines
+}
 
-/// Verdicts that mean the question was left unanswered.
+/// The vLLM requirement the verdicts are judged against, asked of the runtime only
+/// when a `not_applicable` line makes it matter. Every other verdict is decided by
+/// its own text, so a probe that cannot run is never reported as an alignment result.
+fn engine_requirement_for(lines: &[&str], output: &str) -> EngineTorchRequirement {
+    if lines.iter().any(|line| line.starts_with("not_applicable")) {
+        engine_torch_requirement(output)
+    } else {
+        EngineTorchRequirement::Declared
+    }
+}
+
+/// Whether the vLLM installed in the runtime that `output` describes requires
+/// torch in its own package metadata.
 ///
-/// `not_applicable` is the one that would otherwise go unnoticed: it is what a
-/// manifest yielding no SDK build produces, which is exactly the repair path for
-/// every runtime installed before `sdk_torch` was recorded. `disabled` belongs
-/// here for every scenario that did not ask for the opt-out — seeing it means the
-/// opt-out was applied to a user who never set it.
-const UNSETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
-    "torch_alignment: unavailable",
-    "torch_alignment: install_failed",
-    "torch_alignment: not_applicable",
-    "torch_alignment: disabled",
-];
+/// Asked of the runtime's interpreter rather than read from the CLI's output, so
+/// the answer does not depend on the thing being judged. The ROCm 10.x discover
+/// install pins torch itself and installs vLLM without its dependencies, which is
+/// the case where this is `Absent` and `not_applicable` is the right verdict.
+fn engine_torch_requirement(output: &str) -> EngineTorchRequirement {
+    let python = super::examine_steps::field_value(output, "python_executable")
+        .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
+    let probe = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m, re\n\
+             names = [re.match(r'[A-Za-z0-9._-]+', r.split(';')[0].strip()) for r in (m.requires('vllm') or [])]\n\
+             print(any(n and n.group(0).lower().replace('_', '-') == 'torch' for n in names))",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to ask {python} for vllm's requirements: {error}"));
+    assert!(
+        probe.status.success(),
+        "asking {python} for vllm's requirements failed: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    if String::from_utf8_lossy(&probe.stdout).trim() == "True" {
+        EngineTorchRequirement::Declared
+    } else {
+        EngineTorchRequirement::Absent
+    }
+}
 
 /// The alignment ran, and settled.
 ///
@@ -375,17 +399,18 @@ const UNSETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
 #[then("the torch alignment settled rather than being skipped")]
 async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
-    let verdict = torch_alignment_verdict(output);
-    assert!(
-        SETTLED_TORCH_ALIGNMENTS.contains(&verdict),
-        "torch alignment reached no settled outcome (`{verdict}`):\n{output}"
-    );
-    // Asserted negatively as well, because the check above reads only the first
-    // block and would pass on a second one that failed.
-    for unsettled in UNSETTLED_TORCH_ALIGNMENTS {
+    // Every block, not only the first: a second one that failed would otherwise
+    // pass behind a first that settled. `disabled` is unsettled here because it
+    // belongs only to the scenario that asked for the opt-out, and seeing it
+    // anywhere else means the opt-out was applied to a user who never set it.
+    // `not_applicable` is unsettled too, except over an engine that declares no
+    // torch requirement.
+    let lines = torch_alignment_lines(output);
+    let engine = engine_requirement_for(&lines, output);
+    for line in lines {
         assert!(
-            !output.contains(unsettled),
-            "torch alignment reported `{unsettled}`:\n{output}"
+            is_settled(line, engine),
+            "torch alignment reached no settled outcome (`{line}`):\n{output}"
         );
     }
     // Asserted on the verdict, not on the divergence lines. Requiring
@@ -412,11 +437,13 @@ async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
 /// the day, not of anything the scenario controls. Every other accepted verdict
 /// is one where torch was kept as it was, which is what the user asked for.
 ///
-/// `not_applicable` is rejected for a reason of its own: it is the generic bucket
-/// for "nothing to decide", and folding the opt-out into it leaves the user who
-/// set the variable unable to tell whether it took effect. The reason line is
-/// read too, so the block names the variable that caused the skip rather than
-/// leaving the reader to guess which of several causes applied.
+/// `not_applicable` is accepted only over an engine that declares no torch
+/// requirement (the ROCm 10.x discover install, where the CLI pins torch itself):
+/// there is no alignment to skip, so `disabled` cannot be printed. Any other
+/// `not_applicable` is the generic bucket for "nothing to decide", and folding the
+/// opt-out into it leaves the user who set the variable unable to tell whether it
+/// took effect. In the accepted case the SDK install's own line has to name the
+/// variable instead, so the reader is still told it was honoured.
 #[then("the torch alignment reports the opt-out instead of rewriting torch")]
 async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
@@ -426,12 +453,15 @@ async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
         "torch was realigned even though the user opted out:\n{output}"
     );
     // Every settled state except the rewrite, plus the skip the opt-out produces.
-    let kept_torch = verdict == "disabled" || SETTLED_TORCH_ALIGNMENTS.contains(&verdict);
+    let lines = torch_alignment_lines(output);
+    let line = lines[0];
+    let kept_torch =
+        verdict == "disabled" || is_settled(line, engine_requirement_for(&lines, output));
     assert!(
         kept_torch,
-        "the opt-out left torch in a state this tool does not produce (`{verdict}`):\n{output}"
+        "the opt-out left torch in a state this tool does not produce (`{line}`):\n{output}"
     );
-    if verdict == "disabled" {
+    if verdict == "disabled" || verdict == "not_applicable" {
         assert!(
             output.contains("ROCM_CLI_DISABLE_TORCH_ALIGNMENT"),
             "the skipped alignment does not name the variable that skipped it:\n{output}"

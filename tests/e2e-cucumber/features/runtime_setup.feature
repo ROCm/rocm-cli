@@ -50,6 +50,10 @@ Feature: Runtime configuration
   # It reads the block's verdict rather than one string, because a torch that has
   # already run a GPU kernel with this SDK is kept instead of rewritten and reports
   # a `retained_*` verdict — settled, with nothing installed.
+  # On a ROCm 10.x runtime the vLLM install pins torch itself and the engine's own
+  # metadata declares none, so the verdict is `not_applicable (vllm does not pin
+  # torch)`; the step accepts it only after asking the runtime's interpreter that
+  # the installed vLLM really requires no torch.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
   Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
