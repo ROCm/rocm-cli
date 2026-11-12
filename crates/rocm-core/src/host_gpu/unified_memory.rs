@@ -72,24 +72,34 @@ pub(crate) struct DxgiAdapter {
     pub(crate) software: bool,
 }
 
-/// The shared-memory budget of the AMD adapter that has the most of it.
+/// The shared-memory budget of the host's single AMD adapter.
 ///
 /// Only AMD adapters, because the figure is attributed to an AMD APU: a host
 /// whose integrated graphics are Intel's and whose discrete card is AMD's would
 /// otherwise have the Intel iGPU's budget reported as the AMD part's pool. The
 /// Microsoft Basic Render Driver and the WARP software adapter both carry
 /// `DXGI_ADAPTER_FLAG_SOFTWARE` and describe no hardware at all, so they are
-/// dropped before the comparison rather than after it.
+/// dropped before the count rather than after it.
 ///
-/// `None` when no adapter qualifies, which the caller must read as "the figure
-/// was not readable", never as "this host has no memory".
+/// **Exactly one must survive that filter**, which is the same rule
+/// [`super::linux::linux_drm_amdgpu_gtt_total_bytes_in`] applies to DRM cards
+/// and for the same reason: the budget is per-adapter, so on an APU paired with
+/// a discrete Radeon there is no way to tell from here which of the two figures
+/// belongs to the integrated part. Picking the larger would credit the APU with
+/// the discrete card's budget on exactly the host this module exists to measure
+/// — the Windows spelling of the contamination `the_gtt_aperture_never_reaches_a_discrete_card`
+/// pins on Linux. Two AMD adapters is therefore a figure that could not be
+/// attributed, not a figure to choose between.
+///
+/// `None` when no adapter qualifies or more than one does, which the caller must
+/// read as "the figure was not readable", never as "this host has no memory".
 #[cfg(any(windows, test))]
 pub(crate) fn amd_shared_system_memory(adapters: &[DxgiAdapter]) -> Option<u64> {
-    adapters
+    let mut amd = adapters
         .iter()
-        .filter(|adapter| !adapter.software && adapter.vendor_id == PCI_VENDOR_AMD)
-        .map(|adapter| adapter.shared_system_memory)
-        .max()
+        .filter(|adapter| !adapter.software && adapter.vendor_id == PCI_VENDOR_AMD);
+    let budget = amd.next()?.shared_system_memory;
+    amd.next().is_none().then_some(budget)
 }
 
 /// A pool size in bytes as GiB, or `None` when the reading is not one to trust.
@@ -413,6 +423,37 @@ mod tests {
                 &[adapter(INTEL, 64 << 30), adapter(PCI_VENDOR_AMD, 8 << 30),]
             ),
             Some(8 << 30)
+        );
+    }
+
+    /// Two real AMD adapters leave the budget unattributable, the same answer
+    /// `two_amd_cards_leave_the_gtt_aperture_unattributable` gives for DRM cards.
+    ///
+    /// The failing shape is an APU paired with a discrete Radeon. The budget is
+    /// per-adapter and nothing here says which adapter is the integrated one, so
+    /// taking the larger would report the discrete card's figure as the APU's
+    /// pool — the contamination this module exists to avoid, reached through
+    /// DXGI instead of sysfs. Asserted in both orders, because a rule that only
+    /// holds when the bigger adapter happens to enumerate second is not a rule.
+    #[test]
+    fn two_amd_adapters_leave_the_shared_budget_unattributable() {
+        let igpu = adapter(PCI_VENDOR_AMD, 8 << 30);
+        let discrete = adapter(PCI_VENDOR_AMD, 64 << 30);
+
+        assert_eq!(amd_shared_system_memory(&[igpu, discrete]), None);
+        assert_eq!(amd_shared_system_memory(&[discrete, igpu]), None);
+
+        // A software adapter does not count towards the pair: it is dropped
+        // before the count, so a real AMD part beside WARP still answers.
+        let software = DxgiAdapter {
+            vendor_id: PCI_VENDOR_AMD,
+            shared_system_memory: 64 << 30,
+            software: true,
+        };
+        assert_eq!(
+            amd_shared_system_memory(&[software, igpu]),
+            Some(8 << 30),
+            "a software adapter must not make a single real AMD part ambiguous"
         );
     }
 
