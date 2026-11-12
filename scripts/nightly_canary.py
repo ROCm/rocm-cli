@@ -3,20 +3,20 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Metadata-only canary for the canonical TheRock nightly stream.
+"""Metadata-only canary for the current TheRock nightly stream.
 
 Runs ``rocm install sdk --channel nightly --family F --dry-run`` for each
-family and checks that the plan it prints still comes from the canonical
-nightly stream: the source constants are read from the resolver's own source
-file, so the canary cannot drift from them, and no build version is
-hard-coded. Nothing is installed and no GPU is needed.
+family and checks that the plan it prints still comes from the current
+(next-layout) nightly stream, which an unpinned nightly install resolves to:
+the source constants are read from the resolver's own source file, so the
+canary cannot drift from them, and no build version is hard-coded. Nothing is installed and no GPU is needed.
 
 What it fails on:
 
 * the dry run itself failing (unknown layout, redirect, no complete build);
-* a channel, source layout generation or source URL other than the canonical
-  nightly ones, which covers a legacy endpoint or the stable stream taking
-  part in nightly resolution;
+* a channel, source layout generation or source URL other than the current
+  nightly ones, which covers the earlier multi-arch endpoint or the stable
+  stream taking part in nightly resolution;
 * a selected version that is not a dated nightly (``X.Y.ZaYYYYMMDD``);
 * a selected build older than ``--max-age-days``, which is how a resolver that
   quietly keeps choosing a stale train shows up.
@@ -41,10 +41,12 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_SOURCE_FILE = Path("apps/rocm/src/therock/source.rs")
-# Instinct families (``-dcgpu``) are Linux-only, so a Windows run probing one
-# would fail for a reason that is not drift.
-DEFAULT_FAMILIES = ("gfx110X-all", "gfx120X-all") + (
-    () if sys.platform == "win32" else ("gfx950-dcgpu",)
+# The next layout selects its device payload by exact arch and refuses a
+# grouped family such as ``gfx120X-all``, so the probes name exact arches.
+# Instinct arches are Linux-only, so a Windows run probing one would fail for a
+# reason that is not drift.
+DEFAULT_FAMILIES = ("gfx1100", "gfx1200") + (
+    () if sys.platform == "win32" else ("gfx950",)
 )
 DEFAULT_MAX_AGE_DAYS = 3
 NIGHTLY_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+a(?P<date>\d{8})$")
@@ -58,12 +60,12 @@ class CanaryError(Exception):
 
 
 def read_constants(source_text: str) -> dict[str, str]:
-    """The canonical nightly base and layout generation, from the resolver source."""
+    """The current nightly base and layout generation, from the resolver source."""
     base = re.search(
-        r'const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "([^"]+)";', source_text
+        r'const THEROCK_NEXT_NIGHTLY_PIP_INDEX_BASE: &str = "([^"]+)";', source_text
     )
     generation = re.search(
-        r'const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "([^"]+)";', source_text
+        r'const THEROCK_NEXT_LAYOUT_GENERATION: &str = "([^"]+)";', source_text
     )
     if not base or not generation:
         raise CanaryError(
@@ -89,7 +91,7 @@ def check_plan(
     today: dt.date,
     max_age_days: int,
 ) -> list[str]:
-    """Why this plan is not the canonical nightly one; empty when it is."""
+    """Why this plan is not the current nightly one; empty when it is."""
     failures: list[str] = []
     if plan.get("channel") != "nightly":
         failures.append(f"channel is {plan.get('channel')!r}, expected 'nightly'")
@@ -105,7 +107,7 @@ def check_plan(
             failures.append(f"the plan has no {key} line")
         elif not value.rstrip("/").startswith(constants["base"]):
             failures.append(
-                f"{key} is {value!r}, which is not under the canonical "
+                f"{key} is {value!r}, which is not under the current "
                 f"nightly stream {constants['base']!r}"
             )
     version = plan.get("selected_rocm_version", "")
@@ -211,19 +213,19 @@ def probe(rocm: str, family: str, constants: dict[str, str], max_age_days: int):
 
 SAMPLE_PLAN = """sdk install
   channel: nightly
-  canonical_source: https://rocm.nightlies.amd.com/whl-multi-arch
-  selected_rocm_version: 7.14.0a20260601
-  build_date: 2026-06-01
-  source_layout_generation: multi-arch-v2
+  canonical_source: https://nightly.repo.amd.com/rocm/whl-next
+  selected_rocm_version: 10.3.0a20261101
+  build_date: 2026-11-01
+  source_layout_generation: next-v1
   format: wheel
   device_target: <undetermined>
-  index_url: https://rocm.nightlies.amd.com/whl-multi-arch
-  package_specs: rocm[libraries,device-<undetermined>]==7.14.0a20260601 torch[device-<undetermined>]==2.11.0+rocm7.14.0a20260601 torchaudio==2.11.0+rocm7.14.0a20260601
+  index_url: https://nightly.repo.amd.com/rocm/whl-next
+  package_specs: rocm[libraries,device-gfx1200]==10.3.0a20261101 torch[device-gfx1200]==2.11.0+rocm10.3.0a20261101 torchaudio==2.11.1+rocm10.3.0a20261101
   mode: dry-run
 """
 SAMPLE_SOURCE = """
-const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
-pub(super) const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
+const THEROCK_NEXT_NIGHTLY_PIP_INDEX_BASE: &str = "https://nightly.repo.amd.com/rocm/whl-next";
+const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
 """
 
 
@@ -231,10 +233,10 @@ def self_test() -> None:
     """Each rule must reject the plan it exists for, and accept a good one."""
     constants = read_constants(SAMPLE_SOURCE)
     assert constants == {
-        "base": "https://rocm.nightlies.amd.com/whl-multi-arch",
-        "generation": "multi-arch-v2",
+        "base": "https://nightly.repo.amd.com/rocm/whl-next",
+        "generation": "next-v1",
     }, constants
-    today = dt.date(2026, 6, 2)
+    today = dt.date(2026, 11, 2)
 
     def failures(**overrides: str | None) -> list[str]:
         plan = parse_plan(SAMPLE_PLAN)
@@ -247,23 +249,22 @@ def self_test() -> None:
 
     assert failures() == []
     assert any("channel" in f for f in failures(channel="release"))
-    assert any(
-        "layout generation" in f for f in failures(source_layout_generation="next-v1")
-    )
-    legacy = "https://rocm.nightlies.amd.com/v2/gfx110X-all"
+    earlier = failures(source_layout_generation="multi-arch-v2")
+    assert any("layout generation" in f for f in earlier)
+    legacy = "https://rocm.nightlies.amd.com/whl-multi-arch"
     assert any("canonical_source" in f for f in failures(canonical_source=legacy))
     assert any("index_url" in f for f in failures(index_url=legacy))
     assert any("index_url" in f for f in failures(index_url=None))
-    assert any("dated nightly" in f for f in failures(selected_rocm_version="7.14.1"))
+    assert any("dated nightly" in f for f in failures(selected_rocm_version="10.3.1"))
     assert any(
-        "days old" in f for f in failures(selected_rocm_version="7.14.0a20260520")
+        "days old" in f for f in failures(selected_rocm_version="10.3.0a20261020")
     )
-    assert failures(selected_rocm_version="7.14.0a20260530") != [], (
-        "the specs still name the 0601 build, so a different selection is a mix"
+    assert failures(selected_rocm_version="10.3.0a20261030") != [], (
+        "the specs still name the 1101 build, so a different selection is a mix"
     )
     mixed = SAMPLE_PLAN.replace(
-        "torch[device-<undetermined>]==2.11.0+rocm7.14.0a20260601",
-        "torch[device-<undetermined>]==2.11.0+rocm7.14.0a20260515",
+        "torch[device-gfx1200]==2.11.0+rocm10.3.0a20261101",
+        "torch[device-<undetermined>]==2.11.0+rocm10.3.0a20261015",
     )
     mixed_failures = check_plan(
         parse_plan(mixed), constants, today, DEFAULT_MAX_AGE_DAYS
@@ -277,10 +278,10 @@ def self_test() -> None:
     else:
         raise AssertionError("a renamed constant must fail loudly, not pass")
     listing = (
-        '<a href="rocm-7.14.0a20260601-py3-none-linux_x86_64.whl">x</a>'
-        '<a href="rocm-7.14.0a20260603.tar.gz">y</a>'
+        '<a href="rocm-10.3.0a20261101-py3-none-linux_x86_64.whl">x</a>'
+        '<a href="rocm-10.3.0a20261103.tar.gz">y</a>'
     )
-    assert newest_listed_version(listing) == "7.14.0a20260603"
+    assert newest_listed_version(listing) == "10.3.0a20261103"
     assert newest_listed_version("<html></html>") is None
     print("nightly canary self-test: ok")
 
@@ -307,7 +308,7 @@ def main() -> int:
         for failure in failures:
             print(f"::error::{failure}")
         if not failures:
-            print(f"{family}: canonical nightly resolution ok")
+            print(f"{family}: current nightly resolution ok")
         all_failures += failures
     return 1 if all_failures else 0
 

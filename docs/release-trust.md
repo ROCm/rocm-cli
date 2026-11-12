@@ -240,7 +240,7 @@ approval, or manual-only blocking. Existing signed indexes without
 ## TheRock Source Base Overrides
 
 rocm-cli hardcodes the pip index and tarball catalog bases it resolves TheRock
-SDK artifacts from. Six of those bases can be overridden, for fixture-server
+SDK artifacts from. Eight of those bases can be overridden, for fixture-server
 testing only:
 
 ```text
@@ -250,11 +250,16 @@ ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE
 ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE
 ROCM_CLI_THEROCK_NEXT_PIP_BASE
 ROCM_CLI_THEROCK_NEXT_TARBALL_BASE
+ROCM_CLI_THEROCK_NEXT_NIGHTLY_PIP_BASE
+ROCM_CLI_THEROCK_NEXT_NIGHTLY_TARBALL_BASE
 ```
 
-The last two address the ROCm 10 ("next") source layout, which is a layout
-rather than a channel: it has no nightly counterpart and is never resolved
-unless an install explicitly pins a ROCm version of 10 or newer.
+The first four address the canonical (earlier) layout, `repo.amd.com` and
+`rocm.nightlies.amd.com`, which an install reads only when it pins a build that
+exists only there: a ROCm 7 release, or a nightly built before 2026-08-23. The
+last four address the newest layout, `stable.repo.amd.com` and
+`nightly.repo.amd.com`, which an install with no pin reads, and which a stable
+ROCm 10 or newer pin or a nightly built on or after 2026-08-23 reads too.
 
 None of these take effect unless `ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE` is also
 set to a non-empty value. Without that gate, a stray override left in a

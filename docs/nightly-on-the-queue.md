@@ -39,8 +39,10 @@ repository.
 Dispatch `queue-run.yml` with the branch to test (`main` by default); it also
 runs every night at 02:17 UTC on `main`. The job asks the queue side for a run
 of that branch, named for the job's run id and attempt, so re-running the job
-starts a new run. It waits for every lane to finish, up to 4 h 10 min (15000 s, the run's
-wait limit below), then publishes the run as below. The job log starts with the run's inputs
+starts a new run. Each lane may wait up to 4 h 10 min (15000 s, the run's wait limit below)
+to be started, then run for up to 3 h (10800 s, its run limit below), however
+long it waited. The job waits until every lane has finished or been
+cancelled, then publishes the run as below. The job log starts with the run's inputs
 (below). Only one run goes at a time: a second
 dispatch waits for the first, and the queue side refuses one while another,
 however started, is unfinished. GitHub keeps at most one job waiting, so a
@@ -89,8 +91,11 @@ can be overridden for a single run (`queue-run.yml` sets the branch):
   lane runs is changed here, by a pull request, like any other test
 - the blocking lanes — which lanes can fail the run; left empty, every lane can
 - the excluded lanes — GPU models to leave out of this run
-- the wait — how long the run waits for its slowest lane before cancelling
-  what is left, which is then reported as **incomplete**; at most 15000
+- the wait — how long a lane may wait to be started before it is cancelled and
+  reported as **incomplete** (no capacity); at most 15000
+  seconds, and a run given more does not start
+- the run time — how long a started lane may run, counted from its start,
+  before it is cancelled and reported as **incomplete**; at most 10800
   seconds, and a run given more does not start
 
 The lane set itself is discovered, not listed: one lane per GPU model available
@@ -108,13 +113,21 @@ channels are the command's, not the queue's: the default command runs the
 nightly`), each with its own runtimes and its own suite run, so a lane takes
 about twice as long as one channel would. That time has not been measured on a
 queue lane from a cold start, so a lane that cannot finish both channels within
-the run's wait (which also covers waiting for a GPU) is reported as
-**incomplete**; the wait can be raised for a run, up to its limit (see the
-run's inputs above). Each channel starts with the GPU preflight, as each
+its run time (counted from its start, so waiting for a GPU does not use it)
+is reported as **incomplete**; the run time can be raised for a run, up to its
+limit (see the run's inputs above). Each channel starts with the GPU preflight, as each
 channel's job in `nightly.yml` does, so a model server the previous channel's
 suite left on the GPU is reclaimed first; the lane log shows it. Both always
 run, so a failing channel does not hide the other, and the lane fails if either
 did.
+
+A lane starts cold, so its first steps fetch from the network: the build
+packages, the rustup installer, the toolchain and the crates for the host
+being built. The lane command tries each of those up to four times, and never
+retries a build or a test. The pre-warm's package downloads and the suite's
+model downloads are left to the tools doing them, so a model that downloads
+more slowly than its scenario waits fails that scenario. The lane fetches only
+the host's crates, so it refuses to start with `CARGO_BUILD_TARGET` set.
 
 The queue's results are an additional signal, not a replacement: the lanes
 write only into the queue artifact, and the `e2e-gpu-<channel>-report`

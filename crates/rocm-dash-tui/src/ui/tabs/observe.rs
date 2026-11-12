@@ -156,6 +156,16 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     );
 }
 
+/// What the node-throughput hero shows, worked out once from the snapshot.
+#[derive(Default)]
+struct ThroughputHero {
+    tps: f64,
+    has_tps: bool,
+    power: f64,
+    has_power: bool,
+    any_held: bool,
+}
+
 /// Node-throughput hero: Σ generation tok/s across instances + total board
 /// power (W). Both honest `—` when absent.
 fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -170,30 +180,29 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
-    let (tps, has_tps, power, has_power, any_held) =
-        state
-            .latest
-            .as_ref()
-            .map_or((0.0, false, 0.0_f32, false, false), |snap| {
-                let mut tps = 0.0;
-                let mut has_tps = false;
-                let mut any_held = false;
-                for inst in &snap.instances {
-                    // Finite-value filter: a single NaN/Inf sample must not
-                    // poison the whole sum, mirroring `node_efficiency`.
-                    if let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) {
-                        tps += v;
-                        has_tps = true;
-                        if inst.gen_tps_observation.as_ref().is_some_and(|m| {
-                            m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
-                        }) {
-                            any_held = true;
-                        }
-                    }
-                }
-                let power: f32 = snap.gpus.iter().map(|g| g.power_w).sum();
-                (tps, has_tps, power, !snap.gpus.is_empty(), any_held)
-            });
+    let ThroughputHero {
+        tps,
+        has_tps,
+        power,
+        has_power,
+        any_held,
+    } = state
+        .latest
+        .as_ref()
+        .map_or_else(ThroughputHero::default, |snap| {
+            // The same aggregate, and the same notion of "held", as the
+            // efficiency hero beside it.
+            let throughput = rocm_dash_core::efficiency::node_throughput(&snap.instances);
+            let power = rocm_dash_core::efficiency::node_power_w(&snap.gpus);
+            ThroughputHero {
+                tps: throughput.map_or(0.0, |t| t.tokens_per_sec),
+                has_tps: throughput.is_some(),
+                power,
+                // Zero or unusable power means no telemetry, not "0 W".
+                has_power: power > 0.0,
+                any_held: throughput.is_some_and(|t| t.held()),
+            }
+        });
     // Aggregate formatted via shared formatter: NaN/Inf guard + held marker.
     let tps_str = format::gen_tps_aggregate(has_tps.then_some(tps), any_held);
     let power_str = if has_power {
@@ -497,6 +506,62 @@ mod tests {
         assert!(
             out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must appear in a hero when held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn throughput_hero_power_is_a_dash_when_gpus_report_no_usable_power() {
+        // GPUs that read exactly 0 W have no power telemetry (a platform with no
+        // power source). The hero used to print `0.0 W` for them; it now says
+        // `—`, like the other power figures. A usable reading still prints.
+        let busy = instance_with_obs("busy", 300.0, Some(fresh_obs()));
+        let mut state = connected_with_instances(vec![busy]);
+        if let Some(snap) = state.latest.as_mut() {
+            for g in &mut snap.gpus {
+                g.power_w = 0.0;
+            }
+        }
+        let out = render(&state, 160, 50);
+        assert!(
+            out.contains("power —"),
+            "no-telemetry power must be a dash:\n{out}"
+        );
+        assert!(!out.contains("power 0.0 W"), "must not print 0.0 W:\n{out}");
+        let with_power =
+            connected_with_instances(vec![instance_with_obs("busy", 300.0, Some(fresh_obs()))]);
+        assert!(render(&with_power, 160, 50).contains("power 300.0 W"));
+    }
+
+    #[test]
+    fn the_two_heroes_agree_for_a_held_instance_at_zero_throughput() {
+        use crate::ui::format;
+        // A held instance at 0 tok/s beside a fresh one with real throughput:
+        // neither hero may show the held marker, and they must say the same.
+        let busy = instance_with_obs("busy", 300.0, Some(fresh_obs()));
+        let idle = instance_with_obs("idle", 0.0, Some(held_obs()));
+        let state = connected_with_instances(vec![busy, idle]);
+        let out = render(&state, 160, 50);
+        // The Instances table below marks the held idle row, and prints its
+        // legend, correctly; only the two heroes are under test, so look at
+        // their own text. Each shows its figure unmarked and its plain footer
+        // (not the held legend).
+        assert!(
+            out.contains("300.0 tok/s")
+                && !out.contains(&format!("300.0 tok/s{}", format::HELD_MARKER)),
+            "{out}"
+        );
+        assert!(
+            out.contains("1.00 tok/W")
+                && !out.contains(&format!("1.00 tok/W{}", format::HELD_MARKER)),
+            "{out}"
+        );
+        assert!(
+            out.contains("tokens per watt · whole node"),
+            "efficiency hero footer: {out}"
+        );
+        assert!(
+            out.contains("Σ generation throughput · all instances"),
+            "throughput hero footer: {out}"
         );
     }
 

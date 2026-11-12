@@ -1035,10 +1035,12 @@ download could start. The printed `command:` line then shows
 `uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
 so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
 with a different Python 3.12 it can choose that one rather than the managed one
-a real install prepares. That scenario is a canonical-layout preview.
+a real install prepares. That scenario is a canonical-layout preview, pinned to
+an earlier ROCm 7 release because an unpinned install now reads the newest layout.
 
-A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
-to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later, a
+nightly built since 2026-08-23, or any install with no pin, which now reads that
+layout) is held to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
 is the one step that chooses the `torch` and `torchvision` versions (the CLI
 picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
@@ -1060,6 +1062,7 @@ preview runs it exactly once, for the compile, and prints the resolved plan. The
 `therock-next` scenarios that print resolved package specs start from `And a uv
 is already installed`, which installs the managed `uv` into the scenario's data
 folder the way a real install would have.
+
 The decision is unit-tested on every platform, Windows included
 (`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
 [uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
@@ -1076,6 +1079,30 @@ entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
 first is a network call, and the second is held only by the types (those entry
 points return a resolved plan and refuse the unresolved one) and by the lanes
 that install a ROCm 10 runtime for real.
+
+Which source an install reads is covered by the `therock-next` scenarios against
+loopback fixtures served through the trust gate (the
+`ROCM_CLI_THEROCK_*_BASE` variables, see [release-trust.md](release-trust.md)).
+`therock-next-01` is the default (an unpinned release install reads the newest
+layout) and `therock-next-16` its other half (a pin to an earlier ROCm 7 release
+reads the canonical stream); `therock-next-17` refuses a group family with no
+pin and then runs the earlier-release pin the refusal names; `therock-next-18`
+and `therock-next-19` are the same two shapes for a tarball install;
+`therock-next-20` to `therock-next-22` are the nightly channel: no pin reads the
+newest layout at its newest build that has PyTorch wheels, and a build date on
+either side of the 2026-08-22/2026-08-23 boundary reads the stream that holds
+it; `therock-next-23` is the tarball refusal for a nightly pin before that
+boundary, run together with the wheel install it points to. `update-11` holds
+that an update installs from the layout its runtime recorded: a runtime of the
+earlier release stream recorded with only a family label still updates, instead
+of being refused for an exact arch. The live counterparts, which resolve the real indexes and so run on
+gated lanes, are `runtime-08` and `runtime-31` (nightly, `@nightly` lane) and
+`runtime-09` and `runtime-32` (release, `@requires-gfx-target`: they need a
+detected GPU target). The routing rule
+itself, `layout_serving`, is a table of every request shape on both channels in
+[source.rs](../apps/rocm/src/therock/source.rs), including the boundary dates.
+The paced tarball download in `download-progress-01` reads the newest layout's
+catalog with an exact arch for the same reason.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
@@ -1173,7 +1200,7 @@ Use a deterministic family only for developer tests that need fixed package
 selection:
 
 ```bash
-python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
+python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx1200
 ```
 
 ### GPU targets with no ROCm build
@@ -1446,20 +1473,19 @@ install.
 `serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
 restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
-per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
-the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
-and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
-is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
-dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
-cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
-they stay reachable when the opt-in is set.
+Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
+them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
+i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
+`E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
+`include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
+gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
+the tagging and that they stay reachable when the opt-in is set.
 
-Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
-every nightly run, and only a manual `include_nightly` dispatch on a host with
-Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
-is reachable ("Report whether Docker is reachable"); check that line before
-relying on this coverage.
+Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
+logs whether Docker is reachable ("Report whether Docker is reachable").
+`serve-27`'s known failure on the Strix Halo pool is an xfail row in
+`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
+means the row is stale.
 
 ### Lemonade managed-serve failure evidence
 
@@ -3018,6 +3044,37 @@ streaming request that offers `tools` (no scenario covers that refusal). The
 tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
 blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
 same module; `serve-53` is the real-engine check.
+
+A recipe may publish a different build of the same model per engine, through the
+`model_id_override` on its `engine_recipes` entry: Lemonade serves GGUF with an
+explicit quantization variant, vLLM serves the safetensors repo. The resolution
+is pinned on every host by `serve_small_assistant_resolves_the_gguf_build_on_lemonade`
+and, catalog-wide, by `every_lemonade_catalog_recipe_resolves_to_a_servable_ref`
+in [serve_cmd.rs](../apps/rocm/src/serve_cmd.rs) — the second fails for any
+recipe that *lists* Lemonade whose resolved ref is a Hugging Face `owner/repo`
+with no `:variant`, which the engine refuses only after it has already been
+launched. A recipe that lists no Lemonade entry is still handed its canonical
+id when Lemonade is reached some other way (an explicit `--engine`, a
+configured default, the platform default), and that is deliberate: such a
+recipe has no GGUF build to substitute.
+
+```bash
+cargo test -p rocm --bin rocm every_lemonade_catalog_recipe_resolves_to_a_servable_ref
+```
+
+The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
+`rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
+It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
+engine is the CLI's to pick here — so the lane that exercises the Lemonade half
+is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
+the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
+([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
+path filter matches) but none of their check names is a required status check,
+so the two unit tests above are the blocking per-PR coverage. The scenario
+carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
+unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
+their known serve failure there has not been observed, and a row claiming a
+known bug before one is seen would say something untrue.
 
 Natural-language plan handoff tests:
 
@@ -4867,13 +4924,13 @@ generated. It was recorded once from a real older build and lives in
 
 A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
 `examine-fails`. The stub then answers `rocm examine --json`, and a case without a
-`host` still refuses it. The reply is the recorded examination with only the fields
-the host implies changed (`is_wsl`, `has_amd_gpu` and, for `amd-found`, one GPU), and
-its `status` is recomputed by `Examination::compute_status`, the rule the probe uses,
-so a recording cannot say a status the other fields contradict. The real command prints
-those fields plus a `summary` object that only the `rocm` binary can build, so the
-replay leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in
-it. Some fields are typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+`host` still refuses it. The reply is the recorded examination with the fields the host
+implies set, whatever the recording held for them, and its `status` is recomputed by
+`Examination::compute_status`, the rule the probe uses, so a recording cannot say a
+status the other fields contradict. The real command prints those fields plus a
+`summary` object that only the `rocm` binary can build, so the replay leaves `summary`
+out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
+typed, not probed: the one GPU of `amd-found`, and the WSL facts of
 `wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
 with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
 exits 1 with a fixed message on stderr, which is what the case pins.
@@ -4916,3 +4973,26 @@ always keep the stub first on `PATH`, so a machine that has a `rocm` installed (
 developer's, not a grading runner) may show the real CLI's output and miss the pins. A
 miss on the `logs_contain` pin with the agent otherwise behaving as expected is that,
 not a regression.
+
+## Dashboard Chat Request Timeout
+
+A dashboard chat message is cut off after a fixed wait so a hung backend ends the
+turn instead of freezing the pane. The wait is 2 minutes by default and
+`ROCM_DASH_CHAT_TIMEOUT_SECS` (whole seconds, 1 to 3600) changes it; an unset,
+empty, non-numeric or out-of-range value keeps the default.
+
+The behavior is covered by unit tests in
+[mod.rs](../crates/rocm-dash-tui/src/agent/mod.rs) (how the variable is read) and
+[clients.rs](../crates/rocm-dash-tui/src/agent/clients.rs) (a request that outlives
+its budget times out and names that budget, a slow reply inside it is returned, and
+the real request path takes its budget from the variable):
+
+```bash
+cargo test -p rocm-dash-tui --lib request_timeout
+cargo test -p rocm-dash-tui --lib agent::clients
+```
+
+There is no Gherkin scenario: the timeout is a dashboard (TUI) behavior that no
+`rocm` command output exposes, and driving it end to end needs a model that
+answers slower than the wait. The manual check is in
+[manual-testing.md](manual-testing.md#4d-dashboard-chat-request-timeout).

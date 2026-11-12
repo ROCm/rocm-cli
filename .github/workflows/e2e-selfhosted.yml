@@ -9,6 +9,12 @@ name: E2E self-hosted
 # THIS workflow's supersession, never the required checks in ci.yml. Only
 # pull_request runs are superseded (see `concurrency:` below).
 #
+# Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
+# MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
+# pool (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
+# Ubuntu and W7900 lanes keep their push / dispatch triggers and run nightly
+# (nightly.yml); neither starts on pull_request or merge_group.
+#
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
 # because of `continue-on-error`, which is `false` on every lane but
@@ -31,6 +37,13 @@ on:
   # Mirror ci.yml: run on PRs against ANY base branch so a stacked PR still gets
   # the GPU lanes. Affected-crate/heavy selection diffs against github.base_ref.
   pull_request:
+    # `closed` (merge OR close) joins the PR's concurrency group below, so it
+    # supersedes that PR's earlier run. It runs only the no-op `pr-closed` job;
+    # every GPU lane skips because `changes` skips. This frees runners only where
+    # the cancel completes: a job queued for a runner that is not picking it up
+    # (W7900 while its one runner is busy) may not finish cancelling, so this
+    # does NOT clear such queued runs.
+    types: [opened, synchronize, reopened, closed]
   merge_group:
     branches: [main]
     types: [checks_requested]
@@ -93,13 +106,18 @@ jobs:
   # forced true, matching ci.yml.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
+    # Skipped on `closed`, and with it every lane and `e2e-report`: the lanes gate
+    # on `needs.changes.result == 'success'`, the report on
+    # `needs.changes.outputs.serve`, which is empty for a skipped job.
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     permissions:
       contents: read
       pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
       # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
-      # full matrix (every lane but MI300X, which skips merge_group) and its
+      # full matrix (every lane but MI300X, Strix Ubuntu and W7900, which skip
+      # merge_group) and its
       # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
       # ROCMAI-430: the three most recent rows of the official release list
@@ -183,6 +201,19 @@ jobs:
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
           fi
 
+  # Exists only to start a run in the PR's concurrency group when the PR is
+  # merged or closed: that run cancels the PR's older run. A GPU job of that run
+  # which is queued for a runner that is not picking it up may not finish
+  # cancelling (observed on W7900-queued runs).
+  pr-closed:
+    name: Supersede runs of a closed PR
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: echo "PR closed; its earlier E2E runs are superseded by this run."
+
   e2e-gpu:
     name: E2E tests (MI300X, ${{ matrix.sdk_version }})
     timeout-minutes: 90
@@ -199,7 +230,7 @@ jobs:
       # single-element `["current"]` matrix, so the ordinary PR/merge-queue path
       # runs exactly one job, unchanged from before this matrix existed.
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself, and this check isn't in the required list (see the
     # file header), so a broken build here still can't block a merge; ci.yml's
@@ -441,16 +472,24 @@ jobs:
     # ratio the 35 was chosen for.
     # An include_nightly dispatch also runs the AIM serve scenarios (serve-26/27,
     # @nightly, up to 1200s readiness each on a cold pull) and the large-model
-    # serve, which cannot fit the per-PR 45min budget.
+    # serve, which cannot fit the 45min budget of an ordinary push run.
     timeout-minutes: ${{ inputs.include_nightly && 105 || 45 }}
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
+    # Not on pull_request: a PR gets exactly one Linux GPU node (MI300X, the only
+    # lane where vLLM runs) and one Windows pool (Strix Halo). Not on
+    # merge_group either: over 7 days 35% of its merge-queue jobs (98 of 281) were
+    # cancelled at the 45 min cap, and the queue does not wait for this
+    # non-required check. Still runs on push (main, release/**), dispatch and
+    # nightly (nightly.yml, e2e-gpu-nightly-strix, same pool labels).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
+          && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
@@ -462,8 +501,8 @@ jobs:
         channel: [release, nightly]
         # See `e2e-gpu` (ROCMAI-430): layered alongside the pre-existing
         # `channel` dimension above, not replacing it — this lane is the only
-        # per-PR job with two independent matrix axes.
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        # job with two independent matrix axes.
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
         # The nightly channel only carries the latest (pre-)release builds, so
         # it cannot resolve the n-1/n-2 released versions the matrix pins
         # (`rocm install sdk` fails with "no mutually compatible TheRock ...
@@ -484,8 +523,6 @@ jobs:
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -618,7 +655,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-windows.
     if: >-
       always()
@@ -966,7 +1003,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
     # `serve` like the sibling lanes rather than the broader `heavy`: the
     # consolidated report gates on `serve` too, so a heavy-but-not-serve change
@@ -1574,12 +1611,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
+    # Not on pull_request or merge_group: one runner on borrowed quota, 58-70% of
+    # its PR jobs never started before being superseded, and a merge_group run
+    # would queue behind it the same way (the queue does not wait for this
+    # check). Still runs on push (main, release/**), dispatch and nightly
+    # (nightly.yml, e2e-gpu-nightly-w7900).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
+          && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'w7900'))
@@ -1592,8 +1636,6 @@ jobs:
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Full serve matrix at the merge-queue gate.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
