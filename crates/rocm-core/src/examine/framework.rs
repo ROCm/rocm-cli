@@ -454,7 +454,17 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
 
         assert!(!written, "the probe wrote the shim directory");
-        assert_ne!(without.framework_version, "2.11.0+rocm7.14.1");
+        // Without the link the fake interpreter fails with its one specific
+        // message, so the test goes red only for the missing link directory.
+        assert!(
+            without
+                .framework_notes
+                .iter()
+                .any(|note| note == "torch import failed: no amd-smi link on the loader path"),
+            "{:?}",
+            without.framework_notes
+        );
+        assert_eq!(without.framework_version, "");
         assert_eq!(with.framework_version, "2.11.0+rocm7.14.1");
     }
 

@@ -409,14 +409,17 @@ pub(super) fn runtime_environment_assignments(
         values.push(("PATH", path));
     }
     // The amd-smi link a managed runtime's torch needs to count devices (see
-    // `rocm_core::ensure_amd_smi_compat`), after the recorded directories.
+    // `rocm_core::ensure_amd_smi_compat`), after the recorded directories. Linux
+    // only, like the `LD_LIBRARY_PATH` it goes on: other platforms never write it.
     let mut library_entries = env.library_entries.clone();
-    if let Some(shim) = env.venv_root.as_ref().and_then(|venv_root| {
-        rocm_core::ensure_amd_smi_compat(
-            &venv_root.join(rocm_core::RUNTIME_COMPAT_DIR_NAME),
-            &env.library_entries,
-        )
-    }) {
+    if runtime_is_linux()
+        && let Some(shim) = env.venv_root.as_ref().and_then(|venv_root| {
+            rocm_core::ensure_amd_smi_compat(
+                &venv_root.join(rocm_core::RUNTIME_COMPAT_DIR_NAME),
+                &env.library_entries,
+            )
+        })
+    {
         library_entries.push(shim);
     }
     if runtime_is_linux()
