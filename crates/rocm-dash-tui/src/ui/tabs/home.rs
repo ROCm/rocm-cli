@@ -46,15 +46,25 @@ fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
 }
 
 /// History series helper: map each snapshot to a 0..=100 magnitude via `pick`.
+///
+/// Delegates the GPU-less skip to [`crate::ui::widgets::gpu_history`], which
+/// owns that rule for every panel that draws a GPU series.
 fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
     state: &AppState,
     pick: F,
 ) -> Vec<u64> {
-    state
-        .history
-        .iter()
-        .map(|s| pick(s).clamp(0.0, 100.0) as u64)
-        .collect()
+    crate::ui::widgets::gpu_history(state.history.iter(), pick)
+}
+
+/// The POWER trace: the node's usable board power over the recent snapshots,
+/// scaled to a nominal 1 kW ceiling (power can exceed 100 W, the trace is 0-100).
+///
+/// It uses the same filtered sum as the headline label beside it, so a faulty
+/// sensor cannot show in one and not the other.
+fn power_trace(state: &AppState) -> Vec<u64> {
+    history(state, |s| {
+        rocm_dash_core::efficiency::node_power_w(&s.gpus) / 10.0
+    })
 }
 
 /// Label for the node-load sparkline: no data → `—`; simulated telemetry is
@@ -443,9 +453,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .map(|g| f64::from(g.temperature_c))
             .fold(0.0, f64::max)
     });
-    let power: f64 = latest.map_or(0.0, |s| {
-        s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>()
-    });
+    let power = latest.map_or(0.0, |s| rocm_dash_core::efficiency::node_power_w(&s.gpus));
     // While there's no GPU telemetry at all, show "—" rather than 0%/0°C/0W
     // — those look like real (broken) readings rather than a loading/unknown
     // state. The same applies per-metric once data has arrived but a given
@@ -467,7 +475,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let power_label = if unavailable || power == 0.0 {
         "—".to_string()
     } else {
-        format::watts(power as f32)
+        format::watts(power)
     };
     mini_spark(
         f,
@@ -497,20 +505,16 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[3],
         "POWER",
         &power_label,
-        // Power can exceed 100; scale to a nominal 1kW ceiling for the trace.
-        &history(state, |s| {
-            s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>() / 10.0
-        }),
+        &power_trace(state),
         false,
         theme,
     );
-    let tps = instance_aggregate(state, |i| i.gen_tps);
-    let any_tps_held = state.instances.values().any(|i| {
-        i.gen_tps.is_some_and(f64::is_finite)
-            && i.gen_tps_observation
-                .as_ref()
-                .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
-    });
+    // The same aggregate, and the same notion of "held", as the Observe heroes:
+    // a held instance at zero tok/s must not mark a figure that comes from fresh
+    // ones.
+    let throughput = rocm_dash_core::efficiency::node_throughput(state.instances.values());
+    let tps = throughput.map(|t| t.tokens_per_sec);
+    let any_tps_held = throughput.is_some_and(|t| t.held());
     // The held marker is suppressed with the legend row that explains it, as
     // in `draw_hero_left`.
     let legend_fits = rh[5].height > 0;
@@ -1328,6 +1332,60 @@ mod tests {
     }
 
     #[test]
+    fn home_power_label_skips_a_faulty_sensor_like_the_trace_beside_it() {
+        // One GPU at 420 W and one reporting infinity: the label must show the
+        // usable 420 W, not `inf W`, and agree with the sparkline's filtered sum.
+        let mut state = state_with_gpu();
+        if let Some(snap) = state.latest.as_mut() {
+            let mut bad = snap.gpus[0].clone();
+            bad.device_id = "gpu-1".into();
+            bad.power_w = f32::INFINITY;
+            snap.gpus.push(bad);
+        }
+        // ...and the trace beside it, drawn from the same snapshot, skips the
+        // sensor too: 420 W / 10 = 42, where a raw sum would clamp to 100.
+        if let Some(snap) = state.latest.clone() {
+            state.history.push_back(snap);
+        }
+        assert_eq!(
+            power_trace(&state),
+            vec![42],
+            "the trace must skip it as well"
+        );
+        let out = render(&state, 160, 30);
+        assert!(out.contains("420.0 W"), "usable power missing:\n{out}");
+        assert!(
+            !out.contains("inf W") && !out.contains("NaN W"),
+            "a faulty sensor reached the label:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_throughput_is_not_marked_held_by_a_held_instance_at_zero_tok_s() {
+        // The same rule as the Observe heroes: an instance at zero tok/s adds
+        // nothing to the throughput, so its freshness must not mark it.
+        let mut state = state_with_instance(instance_with_obs(300.0, Some(fresh_obs())));
+        let mut idle = instance_with_obs(0.0, Some(held_obs()));
+        idle.container_id = "idle".into();
+        idle.container_name = "idle".into();
+        state.instances.insert(idle.container_id.clone(), idle);
+        let out = render(&state, 160, 30);
+        assert_eq!(hero_tps_value(&out), "300", "got:\n{out}");
+        // ...while a held instance that does contribute still marks it.
+        let mut state = state_with_instance(instance_with_obs(300.0, Some(fresh_obs())));
+        let mut slow = instance_with_obs(5.0, Some(held_obs()));
+        slow.container_id = "slow".into();
+        slow.container_name = "slow".into();
+        state.instances.insert(slow.container_id.clone(), slow);
+        let out = render(&state, 160, 30);
+        assert_eq!(
+            hero_tps_value(&out),
+            format!("305{}", format::HELD_MARKER),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
     fn home_held_legend_absent_when_all_fresh() {
         let out = render(
             &state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))),
@@ -1850,5 +1908,28 @@ mod tests {
             glyph_color_for("running-job", &JobStatus::Running),
             theme.accent
         );
+    }
+
+    #[test]
+    fn history_skips_snapshots_with_no_gpus() {
+        // Every `pick` folds or sums over `gpus`, so a GPU-less snapshot comes
+        // out as 0. Since the widget now draws a baseline for every sample it
+        // is handed, letting those through would paint a host with no GPU as
+        // one idling at 0 °C and 0 W.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.history.push_back(Snapshot::default());
+        s.history.push_back(Snapshot::default());
+        assert!(
+            history(&s, snap_util).is_empty(),
+            "a GPU-less snapshot reached the series"
+        );
+
+        let mut with_gpu = Snapshot::default();
+        with_gpu.gpus.push(GpuMetrics {
+            gpu_utilization_pct: 50.0,
+            ..Default::default()
+        });
+        s.history.push_back(with_gpu);
+        assert_eq!(history(&s, snap_util), vec![50]);
     }
 }

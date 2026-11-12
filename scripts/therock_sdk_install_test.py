@@ -436,7 +436,7 @@ def main() -> int:
     )
     parser.add_argument("--channel", choices=["release", "nightly"], default="release")
     parser.add_argument(
-        "--family", help="override ROCM_CLI_THEROCK_FAMILY, e.g. gfx120X-all"
+        "--family", help="override ROCM_CLI_THEROCK_FAMILY, e.g. gfx1200"
     )
     parser.add_argument(
         "--python", help="Python executable used by rocm-cli to create the SDK venv"

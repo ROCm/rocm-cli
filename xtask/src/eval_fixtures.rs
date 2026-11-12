@@ -209,19 +209,25 @@ fn load_examination(root: &Path) -> Result<rocm_core::Examination> {
         .with_context(|| format!("{} is not a valid examination", path.display()))
 }
 
-/// The recorded examination, edited to be the machine `host` names. Only the
-/// fields the host implies change, and `status` is recomputed from them by the
-/// probe's own rule, never typed.
+/// The recorded examination, edited to be the machine `host` names. The host sets
+/// the fields it implies whatever the recording held, and `status` is recomputed
+/// from them by the probe's own rule, never typed.
 fn examination_for(base: &rocm_core::Examination, host: Host) -> rocm_core::Examination {
     let mut examination = base.clone();
+    // Every host states each field `compute_status` and the replay depend on, so
+    // what comes out never depends on what the recorded examination happened to
+    // hold for it. `os_family` and `probe_failures` count: a recording captured
+    // with a failed probe would otherwise turn `amd-found` into `degraded`.
+    examination.os_family = "linux".to_owned();
+    examination.probe_failures = Vec::new();
+    examination.is_wsl = host == Host::WslHostGpuHidden;
+    examination.wsl = None;
+    examination.has_amd_gpu = host == Host::AmdFound;
+    examination.has_discrete_amd = host == Host::AmdFound;
+    examination.gpus = Vec::new();
     match host {
-        Host::NoAmdGpu | Host::ExamineFails => {
-            examination.is_wsl = false;
-            examination.has_amd_gpu = false;
-        }
+        Host::NoAmdGpu | Host::ExamineFails => {}
         Host::WslHostGpuHidden => {
-            examination.is_wsl = true;
-            examination.has_amd_gpu = false;
             // A WSL2 distro whose Windows host exposes a GPU to it (`/dev/dxg`,
             // DXCore) but not an AMD one, so nothing ROCm-side is installed. Typed,
             // not probed: the probe fills this from the distro it runs in.
@@ -234,13 +240,12 @@ fn examination_for(base: &rocm_core::Examination, host: Host) -> rocm_core::Exam
             });
         }
         Host::AmdFound => {
-            examination.is_wsl = false;
-            examination.has_amd_gpu = true;
-            examination.has_discrete_amd = true;
+            // `pci_id` is what the Linux probe reads: the bus address that starts
+            // the `lspci` line.
             examination.gpus = vec![rocm_core::examine::Gpu {
                 name: "AMD Radeon RX 7900 XTX".to_owned(),
                 gfx_target: "gfx1100".to_owned(),
-                pci_id: "1002:744c".to_owned(),
+                pci_id: "0000:c3:00.0".to_owned(),
                 is_apu: Some(false),
                 is_amd: true,
             }];
@@ -495,10 +500,6 @@ mod tests {
                 serde_json::from_str(&examine.stdout).expect("an examination is JSON");
             assert_eq!(value["status"], status, "{}", case.id);
             assert_eq!(value["has_amd_gpu"], has_amd_gpu, "{}", case.id);
-            // The status in the file is what the probe's own rule says for the
-            // edited fields, not text typed beside them.
-            let examination = examination_for(&recorded, host);
-            assert_eq!(examination.status, examination.compute_status());
         }
         for host in [
             Host::NoAmdGpu,
@@ -507,6 +508,63 @@ mod tests {
             Host::ExamineFails,
         ] {
             assert!(seen.contains(&host), "no case replays the host {host:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_does_not_depend_on_what_the_recorded_examination_held() {
+        /// What one host must come out as, whatever the base held.
+        struct Expected {
+            host: Host,
+            is_wsl: bool,
+            has_amd_gpu: bool,
+            gpus: usize,
+            wsl_facts: bool,
+            status: &'static str,
+        }
+
+        // A base that says the opposite of every host, so a host that forgot to
+        // state a field would show the base's value instead of its own. The
+        // recorded examination alone cannot tell: it already is a Linux host with
+        // no AMD GPU, so emptying the `NoAmdGpu` arm changed nothing there.
+        let root = paths::workspace_root().expect("workspace root");
+        let mut hostile = load_examination(&root).expect("examination");
+        hostile.is_wsl = true;
+        hostile.has_amd_gpu = true;
+        hostile.has_discrete_amd = true;
+        hostile.gpus = vec![rocm_core::examine::Gpu::default()];
+        hostile.wsl = Some(rocm_core::examine::WslFacts::default());
+        // `compute_status` reads these two as well, so the base disagrees on them.
+        hostile.os_family = "other".to_owned();
+        hostile.probe_failures = vec!["lspci missing".to_owned()];
+        hostile.status = "degraded".to_owned();
+
+        let expected = |host, is_wsl, has_amd_gpu, gpus, wsl_facts, status| Expected {
+            host,
+            is_wsl,
+            has_amd_gpu,
+            gpus,
+            wsl_facts,
+            status,
+        };
+        for want in [
+            expected(Host::NoAmdGpu, false, false, 0, false, "no-amd-gpu"),
+            // Shares an arm with `NoAmdGpu` today; listed so a later split of that
+            // arm is still pinned.
+            expected(Host::ExamineFails, false, false, 0, false, "no-amd-gpu"),
+            expected(Host::WslHostGpuHidden, true, false, 0, true, "wsl"),
+            expected(Host::AmdFound, false, true, 1, false, "ok"),
+        ] {
+            let host = want.host;
+            let examination = examination_for(&hostile, host);
+            assert_eq!(examination.is_wsl, want.is_wsl, "{host:?}");
+            assert_eq!(examination.has_amd_gpu, want.has_amd_gpu, "{host:?}");
+            assert_eq!(examination.has_discrete_amd, want.has_amd_gpu, "{host:?}");
+            assert_eq!(examination.gpus.len(), want.gpus, "{host:?}");
+            assert_eq!(examination.wsl.is_some(), want.wsl_facts, "{host:?}");
+            assert_eq!(examination.os_family, "linux", "{host:?}");
+            assert!(examination.probe_failures.is_empty(), "{host:?}");
+            assert_eq!(examination.status, want.status, "{host:?}");
         }
     }
 
@@ -812,8 +870,8 @@ mod tests {
         // `hooks.py` is what keeps the recorded `rocm` from running anything but a
         // replay, so its tests (replay, refusal, PATH and temp-dir cleanup) run
         // with the rest of this crate. Python is on every lane that runs `cargo
-        // test` in CI (the smoke steps need it), so on CI a missing Python is a
-        // failure; on a machine without one the test says so and stops.
+        // test` in CI, so on CI a missing Python is a failure; on a machine
+        // without one the test says so and stops.
         let Some(python) = python() else {
             assert!(
                 std::env::var_os("CI").is_none(),

@@ -42,6 +42,7 @@ mod rocm_releases;
 #[cfg(test)]
 mod rust_source;
 mod signing;
+mod smoke;
 mod tpn;
 mod verify_commits;
 mod verify_pinned_keys;
@@ -158,15 +159,10 @@ pub(crate) enum Command {
     /// is one limit for every file and no way to exempt one; the definition is
     /// in `xtask/src/module_size.rs`.
     CheckModuleSize,
-    /// The same check as `check-module-size`, but it only reports: it prints the
-    /// offenders and exits successfully, including when the check itself cannot
-    /// run (`cargo metadata` fails, a file does not parse). That holds once xtask
-    /// has built: if xtask or `rocm-core` fails to compile, `cargo xtask` exits
-    /// non-zero before this code runs. The local pre-commit hook runs this until
-    /// the hook itself is made blocking; the CI check already is.
-    CheckModuleSizeAdvisory,
     /// Fail if a production source file (a `.rs` file under `apps/*/src`,
-    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`.
+    /// `crates/*/src` or `engines/*/src`), or a `.rs` file under `xtask/src`,
+    /// `tests/e2e-cucumber/src` or `tests/e2e-cucumber/tests`, has no entry in
+    /// `docs/architecture.md`.
     CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
@@ -388,6 +384,26 @@ pub(crate) enum Command {
         #[arg(long)]
         table_out: PathBuf,
     },
+    /// Run the local no-fallback smoke gate: build, then drive the built
+    /// `rocm`, `rocmd` and engine binaries against a throwaway state root and
+    /// assert their first-run output — chiefly that every GPU-required path
+    /// fails loudly rather than falling back to CPU.
+    Smoke {
+        /// Build profile to build and smoke. `debug` builds the whole workspace
+        /// with all targets; `release` builds only the four binaries the gate
+        /// runs.
+        #[arg(long, value_enum, default_value_t = smoke::Profile::Debug)]
+        profile: smoke::Profile,
+        /// Smoke binaries that are already built instead of building first.
+        #[arg(long)]
+        skip_build: bool,
+        /// Target directory to build into and to find the binaries in, under its
+        /// profile subdirectory. Relative paths resolve against the workspace
+        /// root. Defaults to `CARGO_TARGET_DIR`, or `target` under the workspace
+        /// root; either way the build is given the same directory explicitly.
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -426,7 +442,6 @@ fn run() -> Result<()> {
         command @ Command::PrePushCheck { .. } => run_pre_push_check(command, prepush::run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckModuleSize => module_size::run()?,
-        Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
         Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
@@ -500,6 +515,11 @@ fn run() -> Result<()> {
             &out,
             &table_out,
         )?,
+        Command::Smoke {
+            profile,
+            skip_build,
+            target_dir,
+        } => smoke::run(profile, skip_build, target_dir)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())
