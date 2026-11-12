@@ -7460,6 +7460,182 @@ jobs:
         );
     }
 
+    /// `text` with every comment removed, so a match cannot come from prose.
+    fn yaml_without_comments(text: &str) -> String {
+        text.lines()
+            .map(strip_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A job's block with comments removed.
+    fn uncommented_job_block(text: &str, job: &str) -> String {
+        yaml_without_comments(job_block(text, job))
+    }
+
+    /// The job-level `if:` of an already uncommented job block, with a folded
+    /// (`>-`) condition joined onto one line. Empty when the job has none.
+    fn job_level_if(block: &str) -> String {
+        let mut lines = block.lines();
+        let Some(first) = lines.find(|l| l.starts_with("    if:")) else {
+            return String::new();
+        };
+        let mut parts = vec![first.trim_start_matches("    if:").trim().to_owned()];
+        // Continuation lines are indented deeper than the 4-space job keys.
+        parts.extend(
+            lines
+                .take_while(|l| l.starts_with("      "))
+                .map(|l| l.trim().to_owned()),
+        );
+        normalized_whitespace(&parts.join(" "))
+            .trim_start_matches(">- ")
+            .to_owned()
+    }
+
+    /// The `if` a job must carry so it skips on a closed PR, and whether the job
+    /// is a matrix lane (and so must also read its matrix through `MATRIX_EXPR`).
+    struct PinnedIf {
+        job: &'static str,
+        condition: String,
+        matrix_lane: bool,
+    }
+
+    /// How every matrix lane must read its matrix: the placeholder only when
+    /// `changes` was skipped (a closed PR), the real output otherwise.
+    const MATRIX_EXPR: &str = "fromJSON(needs.changes.result == 'skipped' && '[\"current\"]' \
+                                || needs.changes.outputs.sdk_version_matrix)";
+
+    #[test]
+    fn closing_a_pr_supersedes_its_self_hosted_runs() {
+        // A merged or closed PR's queued GPU run is dead work that still takes a
+        // runner. `closed` is not a default `pull_request` activity type, so it
+        // must be listed; the run it starts joins the PR's group (same key as the
+        // opened/synchronize runs) and so cancels the earlier one. It must run
+        // nothing but the no-op job: `changes` skips, and with it every lane.
+        // Every assertion reads one job's comment-free block, so prose or another
+        // job cannot satisfy it.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let on = normalized_whitespace(&yaml_without_comments(&top_level_block(&sh, "on")));
+        assert!(
+            on.contains("types: [opened, synchronize, reopened, closed]"),
+            "pull_request must list `closed` next to the default types, got `{on}`"
+        );
+
+        let changes = uncommented_job_block(&sh, "changes");
+        assert_eq!(
+            job_level_if(&changes),
+            "github.event_name != 'pull_request' || github.event.action != 'closed'",
+            "the `changes` job must skip on `closed`, or every GPU lane would run for a closed PR"
+        );
+
+        let closed = uncommented_job_block(&sh, "pr-closed");
+        assert_eq!(
+            job_level_if(&closed),
+            "github.event_name == 'pull_request' && github.event.action == 'closed'",
+            "`pr-closed` must run on `closed` and on nothing else"
+        );
+        assert!(
+            closed.contains("    runs-on: ubuntu-24.04\n"),
+            "`pr-closed` must run on a GitHub-hosted runner, never queue for a GPU:\n{closed}"
+        );
+        assert!(
+            closed.contains("    permissions: {}\n"),
+            "`pr-closed` must hold no token permissions:\n{closed}"
+        );
+        for forbidden in ["uses:", "needs:", "secrets", "checkout"] {
+            assert!(
+                !closed.contains(forbidden),
+                "`pr-closed` is a no-op and must not contain `{forbidden}`:\n{closed}"
+            );
+        }
+
+        // Every other job must skip when `changes` skips. Each `if` is pinned in
+        // full, not by prefix: an `||` arm appended to a lane's condition (as
+        // `&&` binds tighter than `||`) would make it true whatever `changes`
+        // did, while a prefix check still passed. A new job has no entry here
+        // and fails until it is added, which is the point: someone must decide
+        // how it behaves on `closed`.
+        let lane_if = |extra: &str, platform: &str| {
+            format!(
+                "always() && needs.changes.result == 'success' && {extra}\
+                 ( (github.event_name != 'workflow_dispatch' \
+                 && needs.changes.outputs.serve == 'true') \
+                 || (github.event_name == 'workflow_dispatch' \
+                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+            )
+        };
+        let lane = |job, extra: &str, platform: &str| PinnedIf {
+            job,
+            condition: lane_if(extra, platform),
+            matrix_lane: true,
+        };
+        let expected = vec![
+            lane(
+                "e2e-gpu",
+                "github.event_name != 'merge_group' && ",
+                "app-dev-gpu",
+            ),
+            lane("e2e-gpu-strix-ubuntu", "", "strix-ubuntu"),
+            lane("e2e-gpu-strix-windows", "", "strix-windows"),
+            lane("e2e-wsl", "", "strix-wsl"),
+            lane("e2e-gpu-w7900", "", "w7900"),
+            // Skips because the `serve` output of a skipped `changes` is empty.
+            PinnedIf {
+                job: "e2e-report",
+                condition: "always() && (needs.changes.outputs.serve == 'true' \
+                            || github.event_name == 'workflow_dispatch')"
+                    .to_owned(),
+                matrix_lane: false,
+            },
+        ];
+        let ids = job_ids(&sh);
+        for id in ids
+            .iter()
+            .filter(|id| !["changes", "pr-closed"].contains(&id.as_str()))
+        {
+            let pinned = expected
+                .iter()
+                .find(|pinned| pinned.job == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "job `{id}` has no pinned `if`: add it, deciding how it behaves on `closed`"
+                    )
+                });
+            let block = uncommented_job_block(&sh, id);
+            assert_eq!(
+                job_level_if(&block),
+                pinned.condition,
+                "job `{id}` must skip when `changes` is skipped (a closed PR)"
+            );
+            // Only a job pinned as a matrix lane reads the matrix, so a future
+            // non-matrix helper is not forced to carry it.
+            if pinned.matrix_lane {
+                // `changes` is skipped on `closed`, so its matrix output is empty.
+                // The placeholder applies only then (`&&` yields the string when
+                // the result is `skipped`, else `false`, so `||` falls through to
+                // the output): a missing output after `changes` succeeded still
+                // makes `fromJSON('')` fail instead of quietly running `current`.
+                assert!(
+                    block.contains(MATRIX_EXPR),
+                    "lane `{id}` must read its matrix as `{MATRIX_EXPR}`:\n{block}"
+                );
+                assert_eq!(
+                    block.matches("sdk_version_matrix").count(),
+                    1,
+                    "lane `{id}` must read `sdk_version_matrix` only through that guarded \
+                     expression:\n{block}"
+                );
+            }
+        }
+        for pinned in &expected {
+            assert!(
+                ids.iter().any(|id| id == pinned.job),
+                "pinned job `{}` is gone",
+                pinned.job
+            );
+        }
+    }
+
     #[test]
     fn mi300x_lane_is_skipped_in_the_merge_queue() {
         // The MI300X check is not required for merging, so a merge_group run's
