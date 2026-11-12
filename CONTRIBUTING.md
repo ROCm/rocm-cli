@@ -20,7 +20,7 @@ Bug reports and feature requests are tracked as [GitHub Issues](https://github.c
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages:
 
-```
+```text
 feat: add support for vLLM multi-GPU serving
 fix: correct VRAM probe when amd-smi is absent
 docs: clarify GPU selection flag behavior
@@ -29,7 +29,7 @@ chore: bump rust-toolchain to 1.96
 
 Branch names should be short and descriptive:
 
-```
+```text
 feat/vllm-multi-gpu
 fix/vram-probe-fallback
 ```
@@ -46,9 +46,22 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests of the crates the push affects)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), and the generated files (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`, and the published Doctor catalog, `doctor-catalog.json`).
 
-The pre-push hooks (`cargo clippy`, the e2e harness clippy and `cargo test`) check only the crates your push affects: the crates whose files changed plus every crate that depends on them, selected the way CI's `cargo xtask affected` does. They check the whole workspace when a change cannot be confined to specific crates (the lockfile, the root manifest, the toolchain file, workflow files, a doc an xtask test reads, or a path no crate owns), and when the affected crates cannot be determined at all, for example because the remote branch tip is not fetched locally or the pushed range lists no changed files. They also add the crates whose tests read files from outside their own crate: any Rust file adds `xtask`, whose contract tests scan every source file, and `README.md`, `docs/` and `skills/` add `rocm` and `xtask`. Each step prints the scope it chose and why. A push that changes no Rust file runs none of the cargo steps, whatever else it changes (a lockfile-only push included). A green hook is an early warning and not the gate: on pull requests CI lints the whole workspace, but its Linux test job runs only the affected crates, and the whole workspace's tests run in the Windows debug job, in the merge queue and on `main`. To see what a push would check without compiling anything, run `cargo xtask pre-push-check test --dry-run --base origin/main` (the steps are `clippy`, `clippy-e2e` and `test`).
+The pre-push hooks (`cargo clippy`, the e2e harness clippy, and `cargo test`) check only the crates your push affects: the crates whose files changed plus every crate that depends on them, selected the way CI's `cargo xtask affected` does. Each step prints the scope it chose and why.
+
+The hooks check the whole workspace when:
+
+- A change cannot be confined to specific crates (the lockfile, the root manifest, the toolchain file, workflow files, a doc an xtask test reads, or a path no crate owns).
+- The affected crates cannot be determined at all, for example because the remote branch tip is not fetched locally or the pushed range lists no changed files.
+
+The hooks also add the crates whose tests read files from outside their own crate. Any Rust file adds `xtask`, whose contract tests scan every source file. `README.md`, `docs/`, and `skills/` add `rocm` and `xtask`. A push that changes no Rust file runs none of the cargo steps, whatever else it changes (a lockfile-only push included).
+
+A green hook is an early warning, not the gate. On pull requests, CI lints the whole workspace, but its Linux test job runs only the affected crates. The whole workspace's tests run in the Windows debug job, in the merge queue, and on `main`. To see what a push would check without compiling anything, run the following command (the steps are `clippy`, `clippy-e2e`, and `test`):
+
+```bash
+cargo xtask pre-push-check test --dry-run --base origin/main
+```
 
 The manifest hooks only run when you change the dependency graph. They *rewrite* the generated file instead of only reporting that it is stale. When that happens, the commit stops so you can re-stage the refreshed file.
 
@@ -58,7 +71,9 @@ The `THIRD_PARTY_NOTICES.txt` hook also needs the pinned generator. Without it, 
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
-The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, including untracked files that aren't gitignored, so an unrelated unheadered file (even one not yet committed) can block an otherwise-unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is. `prek` runs it like the others, but doesn't provision the `hawkeye` binary. Unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version may run whatever that version's own license-header rules happen to be, which may disagree with CI, or may reject `licenserc.toml` outright. For example, `hawkeye` 6.x rejects this repository's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code:
+The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml`, including untracked files that aren't gitignored. An unrelated unheadered file, even one not yet committed, can therefore block an otherwise unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is.
+
+`prek` runs the hook like the others but doesn't provision the `hawkeye` binary. Unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It also doesn't check that an installed binary is the pinned version. A mismatched version might apply different license-header rules than CI, or might reject `licenserc.toml` outright. For example, `hawkeye` 6.x rejects this repository's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code. Install the pinned version:
 
 ```bash
 cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
@@ -66,7 +81,7 @@ cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers 
 
 To commit or push without it (for example, while iterating without the binary installed, or on a version it rejects), skip it explicitly: `SKIP=license-headers git commit ...` or `SKIP=license-headers git push`. CI's `license-headers` job still enforces the check either way.
 
-The Markdown-links hook (`lychee`) runs on every commit, over the whole repository rather than just the changed files, since moving or deleting a file can break a link in a Markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. The hook runs `cargo xtask lychee --if-available`. `prek` doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate, and a version other than the pinned one runs with a warning:
+The Markdown-links hook (`lychee`) runs on every commit, over the whole repository instead of just the changed files, because moving or deleting a file can break a link in a Markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. The hook runs `cargo xtask lychee --if-available`. `prek` doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate, and a version other than the pinned one runs with a warning:
 
 ```bash
 cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
@@ -74,31 +89,36 @@ cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (
 
 ### Workspace layout
 
+The workspace contains these top-level components:
+
 | Path | Description |
 | --- | --- |
 | `apps/rocm` | Main CLI binary |
 | `apps/rocmd` | Background daemon |
 | `crates/rocm-core` | Core library |
 | `crates/rocm-dash-*` | Dashboard terminal user interface (TUI) libraries |
-| `crates/rocm-engine-protocol` | Engine IPC protocol |
+| `crates/rocm-engine-protocol` | Engine inter-process communication (IPC) protocol |
 | `engines/` | Inference engine adapters (lemonade, vllm, aim) |
 
 ### Module organization
 
-New subcommands and subsystems default to their own file from day one. Don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full. Its file links, including every concrete file citation in the per-crate inventories, are checked for resolution (not prose accuracy) by the `docs-links` job below; its section headings and directory names stay bare and unchecked.
+New subcommands and subsystems default to their own file from day one. Don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See [`docs/architecture.md`](https://github.com/ROCm/rocm-cli/blob/main/docs/architecture.md) for the two extraction patterns in use, the current module map, and the module-organization convention in full.
+
+The `docs-links` job below checks the file links in that document, including every concrete file citation in the per-crate inventories. It checks that they resolve, not that the prose is accurate. Its section headings and directory names stay bare and unchecked.
 
 Crate-layering invariants, such as `rocmd` never depending on `rocm`, are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`). File size is checked by `cargo xtask check-module-size` (`xtask/src/module_size.rs`): no source file may exceed 1,500 production lines, test code excluded, and a change that would cross the limit splits the file instead. Editing a file that is already over the limit does not by itself require a split; those files are split under their own tickets. For now the CI step and the `cargo-module-size` pre-commit hook report offenders without failing.
 
 Every local (relative-path) Markdown link and `#anchor` fragment in the repository (outside `docs/rocm-docs/`, which `docs-build` covers instead, and hidden directories such as `.github/`, which neither check walks) is checked by the `docs-links` CI job and by the `lychee` prek hook above, both configured by `lychee.toml` (which lists the current exclusions). Both run offline only, so they don't catch broken external `https://` links.
 
-Since only links are checked, cite a specific repository file as a link relative to the citing file, `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/`, rather than a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, links leaving a `skills/` folder, and `docs/rocm-docs/` along with the files it includes, which are this file and README.md), is in AGENTS.md section 5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
+Because only links are checked, cite a specific repository file as a link relative to the citing file, `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/`, instead of a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, links leaving a `skills/` folder, and `docs/rocm-docs/` along with the files it includes, which are this file and README.md), is in [AGENTS.md](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md) section 5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
 
 ### Updating the AIM catalog
 
-AIM model entries are hand-maintained in `crates/rocm-core/src/model_catalog.json`;
-see `docs/aim-catalog.md` for the refresh process and staleness warning.
+AIM model entries are hand-maintained in `crates/rocm-core/src/model_catalog.json`; see [`docs/aim-catalog.md`](https://github.com/ROCm/rocm-cli/blob/main/docs/aim-catalog.md) for the refresh process and staleness warning.
 
 ### Test commands
+
+Run the tests with these commands:
 
 | Component | Command |
 | --- | --- |
@@ -108,6 +128,8 @@ see `docs/aim-catalog.md` for the refresh process and staleness warning.
 See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps.
 
 ## Making changes
+
+To contribute a change:
 
 1. **Fork** the repository and create a branch from `main`.
 2. **Make your changes.** Keep commits focused, with one logical change per commit.
@@ -130,6 +152,8 @@ git config --global commit.gpgsign true
 See [Commit signatures](https://github.com/ROCm/rocm-cli/blob/main/docs/commit-signatures.md) for GPG signing, GitHub "Verified" status, and troubleshooting.
 
 ### What reviewers look for
+
+Reviewers look for the following:
 
 - Tests cover the new behavior
 - No secrets, credentials, or internal hostnames in committed files
