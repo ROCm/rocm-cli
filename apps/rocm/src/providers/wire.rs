@@ -460,6 +460,22 @@ fn parse_openai_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
     }
     let payload = serde_json::from_str::<serde_json::Value>(data)
         .context("failed to parse local provider SSE data")?;
+    // Servers such as vLLM report a mid-generation failure in-band, as a
+    // `{"error": ...}` payload or a bare `{"object": "error", ...}` one, and
+    // then still end the stream with `[DONE]`. Skipping it would present the
+    // text produced so far as a complete answer. `"error": null` is not one.
+    let has_error = payload.get("error").is_some_and(|error| !error.is_null())
+        || payload.get("object").and_then(serde_json::Value::as_str) == Some("error");
+    if has_error {
+        let error = payload.get("error").filter(|error| !error.is_null());
+        let message = error
+            .and_then(|error| error.get("message"))
+            .or(error)
+            .or_else(|| payload.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown OpenAI-compatible stream error");
+        bail!("OpenAI-compatible provider stream failed: {message}");
+    }
     let content = payload
         .get("choices")
         .and_then(serde_json::Value::as_array)
