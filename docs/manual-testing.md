@@ -111,6 +111,21 @@ Expected result:
 - `rocm runtimes list` shows the runtime key for the installed TheRock venv.
 - The active runtime is ready, or the output gives one clear next command.
 
+Then read the same listing as JSON:
+
+```powershell
+rocm runtimes list --json | python -m json.tool
+```
+
+Expected result:
+
+- `python -m json.tool` accepts the output and prints it back. Only stdout
+  enters the pipeline (stderr still shows on the console), so this checks that
+  stdout holds the document alone; a parse error means something else, such as
+  a banner, progress or hint line, reached stdout.
+- The runtime the text form marks `*` has `"active": true`, and it is the only
+  one; the runtime marked `-`, if any, has `"rollback_target": true`.
+
 Optional: an unreadable settings file. Copy `config.json` from the config
 directory aside, cut the original off part-way through, and run `rocm version`
 without `ROCM_CLI_DATA_DIR` set. Expected result:

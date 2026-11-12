@@ -801,7 +801,7 @@ old date is a hint to look at the driver, not a finding that it is broken. See
 Manage multiple side-by-side ROCm runtimes:
 
 ```
-rocm runtimes list
+rocm runtimes list [--json]
 rocm runtimes activate <runtime-key> [--restart-services [--yes]]
 rocm runtimes rollback [--restart-services [--yes]]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
@@ -816,6 +816,12 @@ by the packages they were installed from, not by version alone, so one version
 can appear more than once: a `--devel` install and a plain one of the same
 version are two separate runtimes, as are two installs that resolved different
 GPU device payloads.
+
+`list --json` prints the same listing as one JSON document on stdout for
+scripts: each runtime with its key, version, mode, status and toolchain, and
+`active` and `rollback_target` flags in place of the `*` and `-` markers. Unset
+values are `null`. Fields may be added in later releases; existing ones are not
+renamed or removed.
 
 `activate` and `rollback` change which runtime the next install or server
 picks up. A server that is already running is not moved: it keeps serving on

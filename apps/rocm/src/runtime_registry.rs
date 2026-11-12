@@ -665,8 +665,15 @@ pub(crate) fn select_runtime_manifest<'a>(
 pub(crate) fn runtime_usability_status(manifest: &InstalledRuntimeManifest) -> String {
     match validate_runtime_manifest_for_activation(manifest) {
         Ok(()) => "ready".to_owned(),
-        Err(error) => format!("unusable ({error})"),
+        Err(error) => unusable_status_text(&error.to_string()),
     }
+}
+
+/// How the text reports name a runtime that fails the manifest check
+/// activation applies, given the reason it fails it. `rocm runtimes list`
+/// prints the same words from the reason it also carries in its JSON.
+pub(crate) fn unusable_status_text(reason: &str) -> String {
+    format!("unusable ({reason})")
 }
 
 pub(crate) fn validate_runtime_manifest_for_activation(

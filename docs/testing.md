@@ -1786,6 +1786,60 @@ List registered managed or read-only runtimes and their exact side-by-side keys:
 
 ```bash
 rocm runtimes list
+rocm runtimes list --json
+```
+
+`--json` prints the same listing as one JSON document on stdout and nothing
+else: unset values are `null` rather than `<unset>`, each runtime carries
+`active` and `rollback_target` flags computed from the same values the text's
+`*`/`-` markers are drawn from, and the empty-registry next-step hint is
+text-only. The rules every `--json` command follows, and which commands have
+one, are in [json-output.md](json-output.md). Scenarios
+`@id:runtime-lifecycle-list-json-marks-active-and-rollback`
+(`runtime-lifecycle-19`) and `@id:runtime-lifecycle-list-json-empty-registry`
+(`runtime-lifecycle-20`) parse the whole of stdout as one document, so a stray
+line before or after it fails them; `runtime-lifecycle-19` also checks each
+runtime's values as planted, lists the same state as text and checks that the
+`*`/`-` rows name the runtimes the JSON flags, and `runtime-lifecycle-07` covers
+the text markers on their own.
+`@id:runtime-lifecycle-list-json-reports-unusable-runtime`
+(`runtime-lifecycle-21`) deletes a runtime's folder and reads
+`"status": "unusable"` with the reason `install root is missing: <folder>`, and
+`@id:runtime-lifecycle-list-json-reports-missing-active-manifest`
+(`runtime-lifecycle-22`) deletes the active runtime's registry entry and reads
+`active_problem` of kind `missing_manifest_for_key`. No scenario checks the
+listing's order: scenario 19's two runtimes share one install time, and the
+registry is read in filesystem order, which can match key order by chance.
+The order is pinned by unit tests:
+`runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
+plants five runtimes with one install time in reverse key order beside older
+and newer ones, and `registry_sort_is_newest_install_first_then_by_key` tests
+the sort on its own.
+
+The listing's matching rules, including how it uses `default_runtime_id`
+and where it differs from what `rocm examine` and `rocm runtimes
+activate`/`rollback` resolve, are in
+[json-output.md](json-output.md#known-limitation-the-listings-matching-rules).
+`rocm config set-default-runtime` reaches the state where only
+`default_runtime_id` is set.
+`@id:runtime-lifecycle-list-default-id-in-other-letter-case`
+(`runtime-lifecycle-23`) sets the first runtime's id in upper case and checks
+that the JSON marks that runtime active with `active_problem` `null`, and that
+the text marks it `*` with no `active_status:` line. The other branches of that
+path are covered by unit tests:
+`runtimes_list_json_marks_the_one_runtime_matching_the_default_id_active`
+(an exact single match),
+`runtimes_list_matches_a_default_id_differing_only_in_case_with_one_rule`,
+`runtimes_list_json_reports_a_default_id_with_no_manifest`
+(`missing_manifest_for_id`),
+`runtimes_list_json_reports_a_default_id_matching_two_runtimes_as_ambiguous`
+and `runtimes_list_reports_a_default_id_matching_ids_differing_only_in_case_as_ambiguous`
+(`ambiguous_runtime_id`):
+
+```bash
+cargo xtask e2e -- -n "runtime-lifecycle-(07|19|20|21|22|23) "
+cargo test -p rocm --bin rocm runtimes_list
+cargo test -p rocm --bin rocm registry_sort_is_newest_install_first_then_by_key
 ```
 
 Activate one validated runtime:
@@ -1904,6 +1958,7 @@ Focused unit coverage:
 
 ```bash
 cargo test -p rocm --bin rocm runtime_activation
+cargo test -p rocm --bin rocm runtimes_list
 cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
 cargo test -p rocm --bin rocm runtime_install_writes

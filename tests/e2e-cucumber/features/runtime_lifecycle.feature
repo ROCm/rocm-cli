@@ -262,3 +262,63 @@ Feature: Runtime lifecycle state machine
     And the server is still counted as left on the first runtime
     And the switch to the second runtime was kept
     And the server record still names the first runtime
+
+  # A script reads the runtime list without scraping the table. stdout must hold
+  # one JSON document and nothing else; diagnostics belong on stderr. The active
+  # and rollback flags are the facts the text marks with `*` and `-`, so the
+  # scenario also lists the same state as text and checks that both forms mark
+  # the same runtimes.
+  @id:runtime-lifecycle-list-json-marks-active-and-rollback
+  Scenario: runtime-lifecycle-19 - A script reads the runtime list as JSON
+    Given two registered runtimes with the second active after the first
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON lists both runtimes with their recorded values
+    And the JSON marks the second runtime active and the first as the rollback target
+    And the text listing marks the same runtimes as the JSON
+
+  # The empty registry is where the text form prints placeholders (`<unset>`)
+  # and a next-step hint; the JSON form has to stay a parseable document with
+  # nulls instead, not fall back to that text.
+  @id:runtime-lifecycle-list-json-empty-registry
+  Scenario: runtime-lifecycle-20 - Listing runtimes as JSON with none registered
+    Given no ROCm runtime is registered
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON lists no runtimes and no active runtime
+
+  # A runtime whose folder was deleted outside the CLI stays registered, but
+  # activation would refuse it. A script has to see that from the document
+  # alone, without trying the activation.
+  @id:runtime-lifecycle-list-json-reports-unusable-runtime
+  Scenario: runtime-lifecycle-21 - The JSON runtime list reports a runtime whose folder is gone as unusable
+    Given two registered runtimes with the second active after the first
+    And the first runtime's folder has been deleted
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON reports the first runtime unusable because its folder is missing
+    And the JSON reports the second runtime ready
+
+  # The active runtime's registry entry was removed by hand while the config
+  # still names it. The document has to say so, not just mark nothing active.
+  @id:runtime-lifecycle-list-json-reports-missing-active-manifest
+  Scenario: runtime-lifecycle-22 - The JSON runtime list says when the active runtime's registry entry is gone
+    Given two registered runtimes with the second active after the first
+    And the second runtime's registry entry has been deleted
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON reports that the active runtime key has no registered runtime
+    And the JSON marks no runtime active
+
+  # `rocm config set-default-runtime` stores the id as typed and clears the
+  # active key, so the list decides the active runtime from the default id
+  # alone. An id that differs from a runtime's only in letter case still names
+  # that runtime, and the list must not also report its registry entry missing.
+  @id:runtime-lifecycle-list-default-id-in-other-letter-case
+  Scenario: runtime-lifecycle-23 - A default runtime set in other letter case is listed as active with no problem
+    Given two registered runtimes and none active
+    When the user sets the default runtime to the first runtime's id in other letter case
+    And the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON marks only the first runtime active and reports no problem
+    And the text listing marks the first runtime active with no active_status line

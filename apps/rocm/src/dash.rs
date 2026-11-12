@@ -212,9 +212,26 @@ fn runtime_summaries(paths: &AppPaths, config: &RocmCliConfig) -> Vec<RuntimeSum
     let active_key = config.active_runtime_key.as_deref();
     let prev_key = config.previous_runtime_key.as_deref();
     let default_id = config.default_runtime_id.as_deref();
-    // Mirror `render_runtimes_text`: a runtime is active by an explicit
-    // active_runtime_key, or — absent one — by being the single manifest whose
-    // runtime_id matches the configured default_runtime_id.
+    // Which runtime is active is governed by `current_runtime_manifest`
+    // (runtime_registry.rs), the resolver `rocm examine`, `rocm runtimes
+    // activate` and `rocm runtimes rollback` use: active_runtime_key matched
+    // ignoring ASCII case, else, also when that key names no runtime, the
+    // single runtime whose id matches default_runtime_id ignoring case. The
+    // rollback target is governed by `select_runtime_manifest`, which rollback
+    // uses for previous_runtime_key: it trims the value and matches it as a
+    // key exactly, then as a key ignoring case, then as a runtime id.
+    //
+    // The dash's own rules match exactly: active_runtime_key exactly; with no
+    // active_runtime_key, the single runtime whose id equals
+    // default_runtime_id exactly; previous_runtime_key exactly. `rocm runtimes
+    // list` (`runtimes_listing` in runtimes_cmd.rs) differs from the dash in
+    // one rule: with no active_runtime_key it matches default_runtime_id
+    // ignoring ASCII case, and calls several such matches ambiguous. The two
+    // can differ either way: a default id differing from its only runtime's id
+    // in case is active in the list and not here, while with two runtimes
+    // whose ids differ only in case (`rocm runtimes adopt --runtime-id` can
+    // create them) the one whose id equals the default exactly is active here
+    // and nothing is active in the list (`ambiguous_runtime_id`).
     let default_matches: Vec<&str> = manifests
         .iter()
         .filter(|m| Some(m.runtime_id.as_str()) == default_id)

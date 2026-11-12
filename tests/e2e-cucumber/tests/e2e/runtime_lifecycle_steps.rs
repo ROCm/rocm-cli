@@ -27,6 +27,14 @@ use crate::E2eWorld;
 // `:` form only in `runtime_id`, which is a manifest field value, never a filename.
 const FIRST_KEY: &str = "release-tarball-gfx942";
 const SECOND_KEY: &str = "release-tarball-gfx1100";
+/// The GPU families `FIRST_KEY` and `SECOND_KEY` are planted with; each family
+/// also names the runtime's install folder (see [`planted_install_root`]).
+const FIRST_FAMILY: &str = "gfx942";
+/// The version every planted runtime records: a dated nightly-style version, so
+/// the JSON (which carries the version as recorded) and the text (which adds
+/// the build date) can be told apart.
+const PLANTED_VERSION: &str = "7.14.0a20260601";
+const SECOND_FAMILY: &str = "gfx1100";
 /// Two keys that differ only in letter case. Each is its own `<key>.json` in the
 /// registry, so the pair can only coexist on a case-sensitive filesystem — which
 /// is why the scenario using them carries `@requires-case-sensitive-fs`.
@@ -66,8 +74,7 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
         "runtime key must be production-style and safe as a registry filename: {key}"
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let install_root = root.path().join(format!("runtime-{family}"));
+    let install_root = planted_install_root(world, family);
     std::fs::create_dir_all(&install_root).expect("failed to create install root");
     std::fs::write(install_root.join("payload.txt"), "payload")
         .expect("failed to write runtime payload");
@@ -78,6 +85,16 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
     std::fs::write(registry.join(format!("{key}.json")), manifest)
         .expect("failed to write runtime manifest");
     install_root
+}
+
+/// Where [`plant_runtime`] puts the install root of a runtime of `family`.
+fn planted_install_root(world: &E2eWorld, family: &str) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join(format!("runtime-{family}"))
 }
 
 /// The runtime registry under the scenario's isolated data dir — where the CLI
@@ -118,7 +135,7 @@ fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String
         "format": "tarball",
         "family": family,
         "family_source": "manual",
-        "version": "1.0.0",
+        "version": PLANTED_VERSION,
         "install_root": install_root,
         "selected_artifact_url": format!("https://example.invalid/{key}.tar.gz"),
         "read_only": true,
@@ -302,18 +319,45 @@ fn write_import_manifest(world: &E2eWorld) -> PathBuf {
 
 #[given("two registered runtimes and none active")]
 async fn two_runtimes(world: &mut E2eWorld) {
-    plant_runtime(world, FIRST_KEY, "gfx942");
-    plant_runtime(world, SECOND_KEY, "gfx1100");
+    plant_runtime(world, FIRST_KEY, FIRST_FAMILY);
+    plant_runtime(world, SECOND_KEY, SECOND_FAMILY);
 }
 
 #[given("two registered runtimes with the second active after the first")]
 async fn two_runtimes_second_active(world: &mut E2eWorld) {
-    plant_runtime(world, FIRST_KEY, "gfx942");
-    plant_runtime(world, SECOND_KEY, "gfx1100");
+    plant_runtime(world, FIRST_KEY, FIRST_FAMILY);
+    plant_runtime(world, SECOND_KEY, SECOND_FAMILY);
     // Activate first, then second, so `previous_runtime_key` records the first —
     // the state rollback must return to.
     crate::run_rocm_ok(world, &["runtimes", "activate", FIRST_KEY]);
     crate::run_rocm_ok(world, &["runtimes", "activate", SECOND_KEY]);
+}
+
+/// Nothing to plant: each scenario starts from an empty isolated root. Asserted
+/// rather than assumed, so a fixture that starts seeding runtimes cannot turn
+/// the empty-registry scenario into one that lists something.
+#[given("no ROCm runtime is registered")]
+async fn no_runtime_registered(world: &mut E2eWorld) {
+    let registry = registry_dir(world);
+    let registered = std::fs::read_dir(&registry).map_or(0, Iterator::count);
+    assert_eq!(
+        registered,
+        0,
+        "the isolated registry {} must start empty",
+        registry.display()
+    );
+}
+
+#[given("the first runtime's folder has been deleted")]
+async fn first_runtime_folder_deleted(world: &mut E2eWorld) {
+    std::fs::remove_dir_all(planted_install_root(world, FIRST_FAMILY))
+        .expect("failed to delete the first runtime's install root");
+}
+
+#[given("the second runtime's registry entry has been deleted")]
+async fn second_runtime_manifest_deleted(world: &mut E2eWorld) {
+    std::fs::remove_file(registry_dir(world).join(format!("{SECOND_KEY}.json")))
+        .expect("failed to delete the second runtime's manifest");
 }
 
 #[given("two registered runtimes whose keys differ only in letter case")]
@@ -347,8 +391,8 @@ async fn two_case_twin_runtimes(world: &mut E2eWorld) {
 
 #[given("two registered runtimes and a local server recorded on the first")]
 async fn two_runtimes_and_service_on_first(world: &mut E2eWorld) {
-    plant_runtime(world, FIRST_KEY, "gfx942");
-    plant_runtime(world, SECOND_KEY, "gfx1100");
+    plant_runtime(world, FIRST_KEY, FIRST_FAMILY);
+    plant_runtime(world, SECOND_KEY, SECOND_FAMILY);
     // Planted BEFORE either activation, so the same record covers both halves of
     // the scenario: while the first runtime is the one being activated the
     // server is on it (nothing left behind), and activating the second leaves it
@@ -358,8 +402,8 @@ async fn two_runtimes_and_service_on_first(world: &mut E2eWorld) {
 
 #[given("two registered runtimes and a publicly bound local server recorded on the first")]
 async fn two_runtimes_and_public_service_on_first(world: &mut E2eWorld) {
-    plant_runtime(world, FIRST_KEY, "gfx942");
-    plant_runtime(world, SECOND_KEY, "gfx1100");
+    plant_runtime(world, FIRST_KEY, FIRST_FAMILY);
+    plant_runtime(world, SECOND_KEY, SECOND_FAMILY);
     // `0.0.0.0` with no endpoint key file planted is the whole setup. Restarting
     // a public bind that has no key is refused before the stop, so the
     // activation's restart fails while the server is left up on the first
@@ -369,8 +413,8 @@ async fn two_runtimes_and_public_service_on_first(world: &mut E2eWorld) {
 
 #[given("two registered runtimes and a local server recording no runtime")]
 async fn two_runtimes_and_service_without_runtime(world: &mut E2eWorld) {
-    plant_runtime(world, FIRST_KEY, "gfx942");
-    plant_runtime(world, SECOND_KEY, "gfx1100");
+    plant_runtime(world, FIRST_KEY, FIRST_FAMILY);
+    plant_runtime(world, SECOND_KEY, SECOND_FAMILY);
     // `runtime_id: None` is the whole setup — a record that predates runtime
     // pinning and so says nothing about which runtime its server loaded.
     write_service_record_with(
@@ -432,7 +476,7 @@ async fn services_cannot_be_read(world: &mut E2eWorld) {
 
 #[given("a registered read-only runtime")]
 async fn one_readonly_runtime(world: &mut E2eWorld) {
-    let install_root = plant_runtime(world, FIRST_KEY, "gfx942");
+    let install_root = plant_runtime(world, FIRST_KEY, FIRST_FAMILY);
     // Stash the install_root path so the uninstall scenario can assert it survives.
     world.model_name = Some(install_root.to_string_lossy().into_owned());
 }
@@ -581,6 +625,24 @@ async fn activate_upper_twin_exactly(world: &mut E2eWorld) {
 #[when("the user lists the registered runtimes")]
 async fn list_runtimes(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    record(world, stdout, stderr, rc);
+}
+
+/// The first runtime's id in upper case, which differs from the registered
+/// `therock-release:gfx942` only in letter case.
+fn first_runtime_id_in_other_case() -> String {
+    format!("therock-release:{FIRST_FAMILY}").to_ascii_uppercase()
+}
+
+#[when("the user sets the default runtime to the first runtime's id in other letter case")]
+async fn set_default_runtime_in_other_case(world: &mut E2eWorld) {
+    let runtime_id = first_runtime_id_in_other_case();
+    crate::run_rocm_ok(world, &["config", "set-default-runtime", &runtime_id]);
+}
+
+#[when("the user lists the registered runtimes as JSON")]
+async fn list_runtimes_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list", "--json"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -869,6 +931,291 @@ async fn second_marked_rollback(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("- {SECOND_KEY}")),
         "expected {SECOND_KEY} marked as rollback target, got:\n{out}"
+    );
+}
+
+/// The whole of stdout parsed as one JSON value: `serde_json::from_str` refuses
+/// anything but whitespace after the value, so a stray line before or after the
+/// document fails here rather than in a script that pipes it.
+fn listing_json(world: &E2eWorld) -> serde_json::Value {
+    let out = ok_output(world);
+    serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!(
+            "stdout of `runtimes list --json` is not one JSON document ({error}):\n{}",
+            combined(world)
+        )
+    })
+}
+
+/// The `runtime_key` of every listed runtime whose boolean `flag` is set.
+/// Every runtime must carry `flag` as a boolean: read through `runtime[flag]`
+/// alone, a missing or renamed field would count as `false` and an assertion
+/// that nothing is flagged would still pass.
+fn listed_keys_with(listing: &serde_json::Value, flag: &str) -> Vec<String> {
+    listing["runtimes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`runtimes` is not an array:\n{listing:#}"))
+        .iter()
+        .filter(|runtime| {
+            runtime
+                .get(flag)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| panic!("a runtime has no boolean `{flag}`:\n{listing:#}"))
+        })
+        .map(|runtime| {
+            runtime["runtime_key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a runtime has no runtime_key:\n{listing:#}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The `runtime_key`s of the runtime rows the text form of `runtimes list`
+/// marks with `glyph`, in listing order. A row is exactly what the CLI's
+/// `write_marked_row` prints under `installed:`: two spaces, the marker, a
+/// space, then `<runtime_key> runtime_id=...`. Anchoring on that layout keeps a
+/// legend, status or path line that happens to start with `- ` from counting.
+fn text_rows_marked(text: &str, glyph: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix(&format!("  {glyph} ")))
+        .filter_map(|row| {
+            let (key, rest) = row.split_once(' ')?;
+            rest.starts_with("runtime_id=").then(|| key.to_owned())
+        })
+        .collect()
+}
+
+#[then("the output is a single JSON document and nothing else")]
+async fn output_is_one_json_document(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    assert!(
+        listing.is_object(),
+        "expected a JSON object, got:\n{listing:#}"
+    );
+    let out = world.cli_output.as_deref().unwrap_or_default();
+    assert!(
+        out.starts_with('{'),
+        "stdout must start with the document itself, got {out:?}"
+    );
+    assert!(
+        out.ends_with('\n') && !out.ends_with("\n\n"),
+        "the document must end with exactly one newline, got {out:?}"
+    );
+}
+
+/// `key` is present in `value` and `null`. `value[key]` alone reads a missing
+/// key as `null` too, so it would not notice the key being dropped.
+fn assert_null_field(value: &serde_json::Value, key: &str) {
+    assert_eq!(
+        value.as_object().and_then(|object| object.get(key)),
+        Some(&serde_json::Value::Null),
+        "`{key}` must be present and null:\n{value:#}"
+    );
+}
+
+/// The listed runtime whose `runtime_key` is `key`.
+fn listed_runtime<'a>(listing: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    listing["runtimes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`runtimes` is not an array:\n{listing:#}"))
+        .iter()
+        .find(|runtime| runtime["runtime_key"] == key)
+        .unwrap_or_else(|| panic!("{key} is not listed:\n{listing:#}"))
+}
+
+/// Both planted runtimes, each with the values `plant_runtime` recorded in its
+/// manifest, and nothing else. The listing's order is not checked here: both
+/// share one install time, so the order rests on the `runtime_key` tie-break,
+/// which the unit tests
+/// `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
+/// and `registry_sort_is_newest_install_first_then_by_key` pin.
+#[then("the JSON lists both runtimes with their recorded values")]
+async fn json_lists_both_runtimes(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    let mut listed: Vec<&str> = listing["runtimes"]
+        .as_array()
+        .expect("`runtimes` is an array")
+        .iter()
+        .map(|runtime| runtime["runtime_key"].as_str().unwrap_or_default())
+        .collect();
+    listed.sort_unstable();
+    let mut expected = [FIRST_KEY, SECOND_KEY];
+    expected.sort_unstable();
+    assert_eq!(listed, expected, "{listing:#}");
+    for (key, family) in [(FIRST_KEY, FIRST_FAMILY), (SECOND_KEY, SECOND_FAMILY)] {
+        let runtime = listed_runtime(&listing, key);
+        assert_eq!(
+            runtime["runtime_id"],
+            format!("therock-release:{family}"),
+            "{key}"
+        );
+        assert_eq!(runtime["family"], family, "{key}");
+        assert_eq!(runtime["format"], "tarball", "{key}");
+        // As recorded, not the text's display form with the build date.
+        assert_eq!(runtime["version"], PLANTED_VERSION, "{key}");
+        assert_eq!(runtime["mode"], "read-only", "{key}");
+        assert_eq!(runtime["status"], "ready", "{key}");
+        assert_null_field(runtime, "unusable_reason");
+        // The planted manifest has no `devel` field, which the CLI reads as
+        // a legacy install that included the toolchain.
+        assert_eq!(runtime["toolchain"], "included", "{key}");
+        let install_root = runtime["install_root"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} has no install_root:\n{listing:#}"));
+        assert_eq!(
+            Path::new(install_root),
+            planted_install_root(world, family),
+            "{key}"
+        );
+    }
+}
+
+#[then("the JSON marks the second runtime active and the first as the rollback target")]
+async fn json_marks_active_and_rollback(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    assert_eq!(
+        listed_keys_with(&listing, "active"),
+        [SECOND_KEY],
+        "{listing:#}"
+    );
+    assert_eq!(
+        listed_keys_with(&listing, "rollback_target"),
+        [FIRST_KEY],
+        "{listing:#}"
+    );
+    assert_eq!(listing["active_runtime_key"], SECOND_KEY, "{listing:#}");
+    assert_eq!(listing["previous_runtime_key"], FIRST_KEY, "{listing:#}");
+    // A healthy state reports no problem, in either form.
+    assert_null_field(&listing, "active_problem");
+    let text = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    assert!(
+        !text.contains("active_status:"),
+        "a healthy listing must print no active_status line:\n{text}"
+    );
+}
+
+#[then("the JSON lists no runtimes and no active runtime")]
+async fn json_lists_nothing(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    assert_eq!(listing["runtimes"], serde_json::json!([]), "{listing:#}");
+    for unset in [
+        "active_runtime_id",
+        "active_runtime_key",
+        "previous_runtime_key",
+        "active_problem",
+    ] {
+        assert_null_field(&listing, unset);
+    }
+    // The paths are reported even with nothing registered, and each is the
+    // isolated data dir's own: swapping the two would fail here.
+    let runtimes_dir = registry_dir(world)
+        .parent()
+        .expect("the registry has a parent")
+        .to_path_buf();
+    for (field, expected) in [
+        ("registry", registry_dir(world)),
+        ("marker", runtimes_dir.join("active.json")),
+    ] {
+        let reported = listing
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("`{field}` is not a path:\n{listing:#}"));
+        assert_eq!(Path::new(reported), expected, "`{field}`:\n{listing:#}");
+    }
+}
+
+/// Lists the same state as text and compares its `*`/`-` rows with the JSON
+/// flags just read, so the two forms are shown to agree, not assumed to.
+#[then("the text listing marks the same runtimes as the JSON")]
+async fn text_marks_match_json(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    let text = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    let active = listed_keys_with(&listing, "active");
+    // Two empty lists agree too; this step is only evidence where something is
+    // active.
+    assert!(
+        !active.is_empty(),
+        "the JSON marks no runtime active, so there is nothing to compare:\n{listing:#}"
+    );
+    // The text has one marker column and gives it to `*` when a runtime is
+    // both active and the rollback target, so `-` shows only the others.
+    let rollback_only: Vec<String> = listed_keys_with(&listing, "rollback_target")
+        .into_iter()
+        .filter(|key| !active.contains(key))
+        .collect();
+    assert_eq!(text_rows_marked(&text, "*"), active, "{text}");
+    assert_eq!(text_rows_marked(&text, "-"), rollback_only, "{text}");
+}
+
+#[then("the JSON marks only the first runtime active and reports no problem")]
+async fn json_marks_first_active_without_problem(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    // The state under test: the id as typed, and no active key.
+    assert_eq!(
+        listing["active_runtime_id"],
+        first_runtime_id_in_other_case(),
+        "{listing:#}"
+    );
+    assert_null_field(&listing, "active_runtime_key");
+    assert_eq!(
+        listed_keys_with(&listing, "active"),
+        [FIRST_KEY],
+        "{listing:#}"
+    );
+    assert_null_field(&listing, "active_problem");
+}
+
+#[then("the text listing marks the first runtime active with no active_status line")]
+async fn text_marks_first_active_without_status(world: &mut E2eWorld) {
+    let text = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    assert_eq!(text_rows_marked(&text, "*"), [FIRST_KEY], "{text}");
+    assert!(
+        !text.contains("active_status:"),
+        "the runtime it marks active must not also be reported missing:\n{text}"
+    );
+}
+
+#[then("the JSON reports the first runtime unusable because its folder is missing")]
+async fn json_reports_first_unusable(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    let runtime = listed_runtime(&listing, FIRST_KEY);
+    assert_eq!(runtime["status"], "unusable", "{listing:#}");
+    // The reason is prose for a person, not a code; it is the message
+    // activation refuses with, naming the folder that is gone.
+    let folder = planted_install_root(world, FIRST_FAMILY);
+    assert_eq!(
+        runtime["unusable_reason"],
+        format!("install root is missing: {}", folder.display()),
+        "{listing:#}"
+    );
+}
+
+#[then("the JSON reports the second runtime ready")]
+async fn json_reports_second_ready(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    let runtime = listed_runtime(&listing, SECOND_KEY);
+    assert_eq!(runtime["status"], "ready", "{listing:#}");
+    assert_null_field(runtime, "unusable_reason");
+}
+
+#[then("the JSON reports that the active runtime key has no registered runtime")]
+async fn json_reports_missing_active_manifest(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    assert_eq!(
+        listing["active_problem"],
+        serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": SECOND_KEY}),
+        "{listing:#}"
+    );
+    assert_eq!(listing["active_runtime_key"], SECOND_KEY, "{listing:#}");
+}
+
+#[then("the JSON marks no runtime active")]
+async fn json_marks_none_active(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    assert!(
+        listed_keys_with(&listing, "active").is_empty(),
+        "{listing:#}"
     );
 }
 

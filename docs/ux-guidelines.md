@@ -179,3 +179,11 @@ Command navigability follow-up notes:
 - Keep backend labels such as wheels, tarballs, runtime keys, registries, and
   daemon policy out of first-visible TUI screens unless the user opens an
   explicit advanced/debug view.
+
+## Machine-Readable Output
+
+- Text for a person is the default; `--json` is an explicit opt-in per command.
+- With `--json`, stdout carries one JSON document and nothing else. Progress,
+  warnings and diagnostics go to stderr so a piped document stays parseable.
+- Which commands have `--json`, the frozen contracts, and the rules for
+  changing a documented field are in [json-output.md](json-output.md).

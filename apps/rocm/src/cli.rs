@@ -980,7 +980,11 @@ rocm engines install vllm --reinstall")]
 #[derive(Subcommand, Debug)]
 pub(crate) enum RuntimesCommand {
     /// Show ROCm runtimes known to ROCm CLI.
-    List,
+    List {
+        /// Print the runtime list as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
@@ -2121,6 +2125,24 @@ mod tests {
             }) => assert_eq!(runtime, "release-pip-x"),
             other => panic!("expected runtimes activate, got {other:?}"),
         }
+    }
+
+    /// `--json` belongs to `list` alone: bare `rocm runtimes` stays the text
+    /// listing, so a script has to name the subcommand to get JSON.
+    #[test]
+    fn runtimes_json_is_a_list_flag() {
+        for (args, json) in [(&["list", "--json"][..], true), (&["list"][..], false)] {
+            match parse_runtimes(args).expect("runtimes list parses").command {
+                Some(Command::Runtimes {
+                    command: Some(RuntimesCommand::List { json: parsed }),
+                }) => assert_eq!(parsed, json, "{args:?}"),
+                other => panic!("expected runtimes list, got {other:?}"),
+            }
+        }
+        assert!(
+            parse_runtimes(&["--json"]).is_err(),
+            "`rocm runtimes --json` must be rejected, not read as `list --json`"
+        );
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
