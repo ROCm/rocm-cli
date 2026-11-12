@@ -96,21 +96,7 @@ impl WinPerfCollector {
         // absent or fails to initialise answers Ok with no readings and no
         // warning, since "no AMD driver" is an expected state.
         let (adlx, adlx_warning) =
-            match run_single_flight(&ADLX_IN_FLIGHT, ADLX_TIMEOUT, adlx_readings).await {
-                SingleFlight::Done(Ok(readings)) => (readings, None),
-                SingleFlight::Done(Err(gone)) => (Vec::new(), Some(gone.warning())),
-                SingleFlight::Panicked => {
-                    (Vec::new(), Some("ADLX reading task panicked".to_string()))
-                }
-                SingleFlight::TimedOut => (
-                    Vec::new(),
-                    Some(format!("ADLX query timed out after {ADLX_TIMEOUT:?}")),
-                ),
-                SingleFlight::StillRunning => (
-                    Vec::new(),
-                    Some("ADLX query skipped: a previous call is still running".to_string()),
-                ),
-            };
+            adlx_outcome(run_single_flight(&ADLX_IN_FLIGHT, ADLX_TIMEOUT, adlx_readings).await);
         let metrics = parse_metrics(&out, &adlx);
         let warnings = counter_samples_missing_warning(&out, &metrics)
             .into_iter()
@@ -450,6 +436,20 @@ enum ReaderGone {
     /// tick; reported so a driver that panics every read is not silent.
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     ReadPanicked,
+    /// The init step panicked. Caught for the same reason as a read panic, and
+    /// kept apart from it because they are not the same fault: a read panic is
+    /// per-tick and the next read may succeed, while this one is terminal —
+    /// the state was never built and this design never rebuilds it.
+    ///
+    /// Before it was caught, an init panic unwound the reader thread outright,
+    /// so every later tick met a closed channel and reported
+    /// [`Self::ThreadGone`] — indistinguishable from the thread never having
+    /// started. Catching it keeps the thread alive to answer and names the real
+    /// cause. It does **not** restore the pre-resident-reader behaviour of
+    /// retrying init on the next tick; that is the deliberate trade this
+    /// design makes, and the reason the distinct variant is worth having.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    InitPanicked,
     /// The thread never started, or exited before answering.
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     ThreadGone,
@@ -457,10 +457,42 @@ enum ReaderGone {
 
 type ReaderAnswer = Result<Vec<AdlxReading>, ReaderGone>;
 
+/// What one ADLX attempt contributes to a snapshot: the readings to use, and
+/// the warning to show the user, if any.
+///
+/// Split out of [`WinPerfCollector::snapshot`] purely so it can be tested.
+/// `snapshot` itself calls `Self::run_script()` unconditionally, which shells
+/// out to PowerShell, so no test can drive it — the same impracticality
+/// `adlx_readings`'s own FFI chain is documented with. That left the mapping
+/// below, including the `Done(Err(_))` arm this change introduced, as the one
+/// piece of new wiring nothing exercised. It is pure and total, so testing it
+/// here costs nothing and covers every arm.
+///
+/// The asymmetry worth keeping: a driver that is absent or failed to
+/// initialise answers `Ok` with no readings and **no** warning, because "no AMD
+/// driver" is an expected state rather than a fault. Everything else is a
+/// fault, and says so.
+fn adlx_outcome(outcome: SingleFlight<ReaderAnswer>) -> (Vec<AdlxReading>, Option<String>) {
+    match outcome {
+        SingleFlight::Done(Ok(readings)) => (readings, None),
+        SingleFlight::Done(Err(gone)) => (Vec::new(), Some(gone.warning())),
+        SingleFlight::Panicked => (Vec::new(), Some("ADLX reading task panicked".to_string())),
+        SingleFlight::TimedOut => (
+            Vec::new(),
+            Some(format!("ADLX query timed out after {ADLX_TIMEOUT:?}")),
+        ),
+        SingleFlight::StillRunning => (
+            Vec::new(),
+            Some("ADLX query skipped: a previous call is still running".to_string()),
+        ),
+    }
+}
+
 impl ReaderGone {
     fn warning(self) -> String {
         match self {
             Self::ReadPanicked => "ADLX read panicked".to_string(),
+            Self::InitPanicked => "ADLX initialisation panicked".to_string(),
             Self::ThreadGone => "the ADLX reader thread is gone".to_string(),
         }
     }
@@ -479,18 +511,28 @@ impl ResidentReader {
                 // `state` is deliberately held until the request channel closes
                 // (never, for the process-wide reader) so it is not torn down
                 // and re-initialised between ticks.
-                let state = init();
+                //
+                // Init is caught for the same reason the read below is, and the
+                // asymmetry mattered more here: a panic escaping this line
+                // unwound the thread before the request loop started, so
+                // `inbox` dropped and every later tick reported `ThreadGone` —
+                // the one state that cannot be told apart from "the thread
+                // never started". Catching keeps the reader answering, with a
+                // variant that names what actually happened.
+                let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(init))
+                    .map_err(|_| ReaderGone::InitPanicked);
                 for reply in inbox {
                     // A panicking read would otherwise unwind this thread and
                     // leave every later tick answering from a closed channel,
                     // with no way to tell that from an absent driver. Catching
                     // it keeps the one reader alive and names the failure.
                     let answer = match state.as_ref() {
-                        Some(state) => {
+                        Ok(Some(state)) => {
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(state)))
                                 .map_err(|_| ReaderGone::ReadPanicked)
                         }
-                        None => Ok(Vec::new()),
+                        Ok(None) => Ok(Vec::new()),
+                        Err(gone) => Err(*gone),
                     };
                     let _ = reply.send(answer);
                 }
@@ -1051,6 +1093,98 @@ mod tests {
             );
         }
         assert_eq!(inits.load(Ordering::SeqCst), 1);
+    }
+
+    /// The asymmetry raised in review on #1020: `read` was wrapped in
+    /// `catch_unwind` and `init` was not.
+    ///
+    /// A panic escaping `init` unwound the reader thread before the request
+    /// loop began, so `inbox` dropped and every later tick answered
+    /// `ThreadGone` — the one verdict indistinguishable from "the thread never
+    /// started", for a cause that is neither. Worse, the reader is built once
+    /// per process, so that verdict was permanent.
+    ///
+    /// Both halves are asserted, and the second is what makes this
+    /// discriminating: the answer must name the init panic, **and** the reader
+    /// must still be answering on later calls rather than having died. Before
+    /// the fix the first assertion fails (`ThreadGone`, not `InitPanicked`).
+    #[test]
+    fn a_panicking_init_is_named_and_leaves_the_reader_answering() {
+        let reader = ResidentReader::spawn(
+            || -> Option<()> { panic!("ADLX init blew up") },
+            |()| vec![reading(1.0)],
+        );
+
+        for _ in 0..5 {
+            // `matches!`, not `assert_eq!`: `AdlxReading` carries no `Debug`
+            // or `PartialEq`, and adding them to a production struct to satisfy
+            // a test would be the tail wagging the dog.
+            assert!(
+                matches!(reader.read(), Err(ReaderGone::InitPanicked)),
+                "an init panic must be named, not reported as a thread that never started"
+            );
+        }
+        assert_eq!(
+            ReaderGone::InitPanicked.warning(),
+            "ADLX initialisation panicked"
+        );
+    }
+
+    /// The `snapshot` mapping, which nothing reached: `snapshot` shells out to
+    /// PowerShell unconditionally, so the `Done(Err(_))` arm this change added
+    /// was wired up and never executed by a test. See `adlx_outcome`.
+    ///
+    /// Every arm is covered, including the one that must stay silent: an absent
+    /// driver answers `Ok` with no readings and raises no warning, because a
+    /// machine with no AMD GPU is not a fault to report.
+    #[test]
+    fn the_adlx_outcome_mapping_warns_for_faults_and_stays_silent_for_an_absent_driver() {
+        let (readings, warning) = adlx_outcome(SingleFlight::Done(Ok(vec![reading(42.0)])));
+        assert_eq!(readings.len(), 1);
+        assert!(warning.is_none(), "a good read raises nothing");
+
+        let (readings, warning) = adlx_outcome(SingleFlight::Done(Ok(Vec::new())));
+        assert!(readings.is_empty());
+        assert!(
+            warning.is_none(),
+            "an absent driver is an expected state, not a warning"
+        );
+
+        for gone in [
+            ReaderGone::ReadPanicked,
+            ReaderGone::InitPanicked,
+            ReaderGone::ThreadGone,
+        ] {
+            let (readings, warning) = adlx_outcome(SingleFlight::Done(Err(gone)));
+            assert!(readings.is_empty());
+            assert_eq!(
+                warning.as_deref(),
+                Some(gone.warning().as_str()),
+                "a reader fault must surface its own wording: {gone:?}"
+            );
+        }
+
+        for (outcome, expected) in [
+            (SingleFlight::Panicked, "ADLX reading task panicked"),
+            (
+                SingleFlight::StillRunning,
+                "a previous call is still running",
+            ),
+        ] {
+            let (readings, warning) = adlx_outcome(outcome);
+            assert!(readings.is_empty());
+            assert!(
+                warning.as_deref().is_some_and(|w| w.contains(expected)),
+                "expected {expected:?}, got {warning:?}"
+            );
+        }
+
+        let (readings, warning) = adlx_outcome(SingleFlight::TimedOut);
+        assert!(readings.is_empty());
+        assert!(
+            warning.as_deref().is_some_and(|w| w.contains("timed out")),
+            "{warning:?}"
+        );
     }
 
     #[test]
