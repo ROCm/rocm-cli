@@ -610,6 +610,7 @@ pub async fn run_loop(
                 Ok(read) => {
                     let disc = crate::registry::discover_managed_services(&read.records);
                     discovery.managed_non_vllm = disc.non_vllm;
+                    discovery.managed_roots = disc.roots;
                     reconcile.reconcile_set(
                         DiscoverySource::Managed,
                         &disc.svcs,
@@ -805,10 +806,18 @@ pub async fn run_loop(
             match g.processes().await {
                 Ok(procs) => {
                     procs_nonempty = !procs.is_empty();
-                    per_container_used = rocm_dash_core::vram::aggregate_process_vram(
-                        &procs,
-                        rocm_dash_collectors::cgroup::container_id_for_pid,
-                    );
+                    // A container id when the process is in a docker/containerd
+                    // cgroup, otherwise the managed service whose engine it
+                    // descends from. Both key the same map the instances read.
+                    per_container_used =
+                        rocm_dash_core::vram::aggregate_process_vram(&procs, |pid| {
+                            rocm_dash_collectors::cgroup::container_id_for_pid(pid).or_else(|| {
+                                rocm_dash_collectors::ancestry::owner_of_pid(
+                                    pid,
+                                    &discovery.managed_roots,
+                                )
+                            })
+                        });
                 }
                 Err(e) => {
                     // Keep the last-known map; device fallback covers the gap.
@@ -882,11 +891,17 @@ pub async fn run_loop(
         // Warn only when a real process scrape happened but an instance with
         // live GPUs still fell back to device-summed (cgroup join missed).
         if procs_nonempty {
-            let vram_fallbacks = count_vram_join_misses(&instances, &gpus, &per_container_used);
+            let vram_fallbacks = count_vram_join_misses(
+                &instances,
+                &gpus,
+                &per_container_used,
+                &discovery.managed_roots,
+                &discovery.managed_non_vllm,
+            );
             if vram_fallbacks > 0 {
                 scrape_warns.push(format!(
                     "vram attribution: {vram_fallbacks} instance(s) fell back to device-summed \
-                     VRAM (no per-process cgroup match; check /proc access)"
+                     VRAM (no per-process cgroup or ancestry match; check /proc access)"
                 ));
             }
         }
@@ -934,20 +949,32 @@ pub async fn run_loop(
 
 /// Instances that *could* have joined the per-process VRAM map but did not.
 ///
-/// The map is keyed by docker/containerd ids read from `/proc/<pid>/cgroup`,
-/// so only an instance whose id has that shape can ever hit it. A managed
-/// `rocm serve` service (named by its service id) falls back to device-summed
-/// VRAM by design, and counting it would raise a false "check /proc access"
-/// warning on every healthy managed instance.
+/// Two kinds of instance can hit the map: one whose id is a docker/containerd
+/// id read from `/proc/<pid>/cgroup`, and a managed `rocm serve` service that
+/// has recorded `roots` (its engine/supervisor PIDs) to match by ancestry. A
+/// managed service with no roots cannot join and falls back to device-summed
+/// VRAM by design, so it is not counted. One that is not yet `Ready`/`Running`
+/// may still be loading its model with no GPU process to attribute, so it is
+/// not counted either; a serving one always holds VRAM, so a missing entry
+/// means its ancestry walk failed (unreadable `/proc`, a recycled root PID).
+/// A non-vLLM managed service (e.g. Lemonade on a backend `amd-smi` does not
+/// list) is not counted: it may hold GPU memory without ever appearing in the
+/// process list, which is not an access problem.
 fn count_vram_join_misses<S: std::hash::BuildHasher>(
     instances: &[Instance],
     gpus: &[GpuMetrics],
     per_container_used: &HashMap<String, u64, S>,
+    roots: &[rocm_dash_collectors::ancestry::Root],
+    non_vllm: &HashSet<String>,
 ) -> usize {
     instances
         .iter()
         .filter(|i| {
-            rocm_dash_collectors::cgroup::is_container_id(&i.container_id)
+            let can_join = rocm_dash_collectors::cgroup::is_container_id(&i.container_id)
+                || (matches!(i.status, InstanceStatus::Ready | InstanceStatus::Running)
+                    && !non_vllm.contains(&i.container_id)
+                    && roots.iter().any(|r| r.owner == i.container_id));
+            can_join
                 && !i.gpu_ids.is_empty()
                 && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, gpus)
                 && !per_container_used.contains_key(&i.container_id)
@@ -1048,6 +1075,10 @@ struct DiscoveryState {
     /// The subset of the registry ids whose engine is NOT vLLM, excluded from
     /// the vLLM Prometheus scrape so they aren't mis-parsed.
     managed_non_vllm: HashSet<String>,
+    /// Ancestry roots of the managed services the registry surfaced, used to
+    /// attribute GPU processes to a service when the cgroup join cannot (a
+    /// managed service is not a container).
+    managed_roots: Vec<rocm_dash_collectors::ancestry::Root>,
     /// The id of the currently-live Lemonade instance, if any.
     lemonade_id: Option<String>,
     /// How the registry reads have been going, so a condition that lasts many
@@ -1064,6 +1095,13 @@ impl DiscoveryState {
     fn keep_through_partial_registry(&mut self, disc: crate::registry::ManagedDiscovery) {
         self.managed_non_vllm.retain(|id| !disc.seen.contains(id));
         self.managed_non_vllm.extend(disc.non_vllm);
+        // Roots of the services this pass saw are replaced; the unseen ones
+        // keep theirs, as their services stay known.
+        // A service this pass read and found stopped loses its roots too, or its
+        // PID would stay matchable for as long as an unrelated record is broken.
+        self.managed_roots
+            .retain(|r| !disc.seen.contains(&r.owner) && !disc.retired.contains(&r.owner));
+        self.managed_roots.extend(disc.roots);
         self.known_services.extend(disc.seen);
     }
 }
@@ -1641,20 +1679,95 @@ mod tests {
     }
 
     #[test]
-    fn managed_instances_never_count_as_vram_join_misses() {
+    fn only_instances_that_can_join_count_as_vram_join_misses() {
+        use rocm_dash_collectors::ancestry::Root;
         let docker_id = "ab".repeat(32);
+        let rooted = "vllm-qwen-qwen2-5-0-5b-instru-1793361705247";
+        let unrooted = "vllm-other-1793361705248";
         let gpus = [gpu("gpu-0", 1000, 8000)];
-        let insts = [
-            inst_on("vllm-qwen-qwen2-5-0-5b-instru-1793361705247", "0"),
-            inst_on(&docker_id, "0"),
-        ];
-        // A docker instance with no /proc match is a real miss; the managed
-        // service, which could never match, is not.
+        let serving = |id: &str| Instance {
+            status: InstanceStatus::Ready,
+            ..inst_on(id, "0")
+        };
+        let insts = [serving(rooted), serving(unrooted), inst_on(&docker_id, "0")];
+        let roots = [Root {
+            pid: 10,
+            start_ticks: None,
+            owner: rooted.into(),
+        }];
+        // The docker instance and the rooted managed service could both have
+        // joined and did not; the managed service with no roots never could.
         let empty: HashMap<String, u64> = HashMap::new();
-        assert_eq!(count_vram_join_misses(&insts, &gpus, &empty), 1);
-        // Once the docker instance joins, nothing is missed.
-        let joined: HashMap<String, u64> = [(docker_id, 512)].into();
-        assert_eq!(count_vram_join_misses(&insts, &gpus, &joined), 0);
+        assert_eq!(
+            count_vram_join_misses(&insts, &gpus, &empty, &roots, &HashSet::new()),
+            2
+        );
+        // With no roots recorded, only the docker instance is a miss.
+        assert_eq!(
+            count_vram_join_misses(&insts, &gpus, &empty, &[], &HashSet::new()),
+            1
+        );
+        // Once both joined, nothing is missed.
+        let joined: HashMap<String, u64> = [(docker_id, 512), (rooted.to_string(), 256)].into();
+        assert_eq!(
+            count_vram_join_misses(&insts, &gpus, &joined, &roots, &HashSet::new()),
+            0
+        );
+    }
+
+    #[test]
+    fn a_rooted_non_vllm_service_is_not_a_vram_join_miss() {
+        use rocm_dash_collectors::ancestry::Root;
+        let id = "lemonade-gguf-1793361705247";
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let serving = Instance {
+            status: InstanceStatus::Ready,
+            ..inst_on(id, "0")
+        };
+        let roots = [Root {
+            pid: 10,
+            start_ticks: None,
+            owner: id.into(),
+        }];
+        let empty: HashMap<String, u64> = HashMap::new();
+        // As a vLLM service it would be a miss; marked non-vLLM it is not, since
+        // its backend may hold GPU memory without `amd-smi` listing the process.
+        assert_eq!(
+            count_vram_join_misses(
+                std::slice::from_ref(&serving),
+                &gpus,
+                &empty,
+                &roots,
+                &HashSet::new()
+            ),
+            1
+        );
+        let non_vllm: HashSet<String> = [id.to_string()].into();
+        assert_eq!(
+            count_vram_join_misses(&[serving], &gpus, &empty, &roots, &non_vllm),
+            0
+        );
+    }
+
+    #[test]
+    fn a_rooted_service_still_loading_is_not_a_vram_join_miss() {
+        use rocm_dash_collectors::ancestry::Root;
+        let id = "vllm-qwen-1793361705247";
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let loading = Instance {
+            status: InstanceStatus::Starting { phase: None },
+            ..inst_on(id, "0")
+        };
+        let roots = [Root {
+            pid: 10,
+            start_ticks: None,
+            owner: id.into(),
+        }];
+        let empty: HashMap<String, u64> = HashMap::new();
+        assert_eq!(
+            count_vram_join_misses(&[loading], &gpus, &empty, &roots, &HashSet::new()),
+            0
+        );
     }
 
     #[test]
@@ -2485,6 +2598,85 @@ mod tests {
             id_set(&["old-lemonade", "new-lemonade"]),
             "an unseen non-vLLM service keeps its mark, a seen one follows its record"
         );
+    }
+
+    #[test]
+    fn partial_registry_read_refreshes_the_roots_it_saw_and_keeps_the_unseen() {
+        use rocm_dash_collectors::ancestry::Root;
+        let root = |pid, owner: &str| Root {
+            pid,
+            start_ticks: None,
+            owner: owner.into(),
+        };
+        let mut state = DiscoveryState {
+            known_services: id_set(&["seen", "unseen"]),
+            managed_roots: vec![root(10, "seen"), root(20, "unseen")],
+            ..DiscoveryState::default()
+        };
+
+        // `seen` was relaunched under a new engine pid; `unseen` was not read.
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
+            seen: id_set(&["seen"]),
+            roots: vec![root(11, "seen")],
+            ..Default::default()
+        });
+
+        let mut got: Vec<_> = state
+            .managed_roots
+            .iter()
+            .map(|r| (r.pid, r.owner.as_str()))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![(11, "seen"), (20, "unseen")],
+            "a seen service's roots are replaced, an unseen one's survive"
+        );
+    }
+
+    #[test]
+    fn partial_registry_read_drops_the_roots_of_a_service_it_saw_stop() {
+        use rocm_dash_collectors::ancestry::Root;
+        let root = |pid, owner: &str| Root {
+            pid,
+            start_ticks: None,
+            owner: owner.into(),
+        };
+        let mut state = DiscoveryState {
+            managed_roots: vec![root(10, "stopped"), root(20, "unseen")],
+            ..DiscoveryState::default()
+        };
+        // `stopped` was read this pass and is no longer running; an unrelated
+        // record failed to read, which is what makes this a partial pass.
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
+            retired: id_set(&["stopped"]),
+            ..Default::default()
+        });
+        let owners: Vec<_> = state
+            .managed_roots
+            .iter()
+            .map(|r| r.owner.as_str())
+            .collect();
+        assert_eq!(
+            owners,
+            vec!["unseen"],
+            "a stopped service's PID must not stay matchable"
+        );
+    }
+
+    #[test]
+    fn partial_registry_read_that_saw_nothing_keeps_every_root() {
+        use rocm_dash_collectors::ancestry::Root;
+        let mut state = DiscoveryState {
+            managed_roots: vec![Root {
+                pid: 10,
+                start_ticks: Some(5),
+                owner: "a".into(),
+            }],
+            ..DiscoveryState::default()
+        };
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery::default());
+        assert_eq!(state.managed_roots.len(), 1);
     }
 
     #[test]

@@ -278,7 +278,7 @@ Without `--version`, `rocm install sdk` installs the newest stable release
 (ROCm 10.1 today) from `stable.repo.amd.com`, and `--channel nightly` installs the
 newest nightly build from `nightly.repo.amd.com`. Earlier releases stay
 installable by pinning them: `--version 7.14.1` installs the ROCm 7.14.1 release,
-and `--channel nightly --build-date 2026-08-20` installs a nightly from before
+and `--channel nightly --build-date 2026-08-19` installs a nightly from before
 the nightly channel moved on 2026-08-23. If ROCm CLI can't tell which exact GPU
 arch this computer has, or you want a different one, also add `--family` with the
 raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
@@ -1237,9 +1237,16 @@ with an explicit quantization variant, for example,
 `rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`.
 
 The vLLM engine (Instinct) serves
-**safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`.
+**safetensors** repos, such as `rocm serve Qwen/Qwen2.5-0.5B-Instruct`.
 A safetensors-only id has no GGUF build, so serving it through Lemonade fails
 instead of silently substituting a different model.
+
+The exception is a catalog recipe that lists Lemonade (`rocm model --verbose`):
+it records the build each engine it lists should serve, so one name works on
+each of them. `rocm serve qwen-small` gets the quantized GGUF build on Lemonade
+and the safetensors repo on vLLM, and `resolved model` in the output names
+which one it picked. A recipe that lists only vLLM, such as the `Qwen/Qwen2.5-0.5B-Instruct`
+above, gives Lemonade nothing to fall back on and still fails there.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment

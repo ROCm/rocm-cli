@@ -181,7 +181,7 @@ Expected result:
   `rocm` build does not yet). Pinning an earlier release or nightly reads the
   earlier stream instead: `--version 7.14.1` reads
   `https://repo.amd.com/rocm/whl-multi-arch` (`multi-arch-v2`), and `--channel
-  nightly --build-date 2026-08-20` reads
+  nightly --build-date 2026-08-19` reads
   `https://rocm.nightlies.amd.com/whl-multi-arch`, while `--build-date
   2026-09-01` reads the newest layout's nightly index. `--format tarball` with no
   pin reads `https://stable.repo.amd.com/rocm/core/tarball/` (or
@@ -378,6 +378,36 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
+
+With that foreground server stopped, check that a catalogued recipe reaches
+Lemonade with a build it can load, from a short name alone — no `--engine`, no
+quantization variant typed by hand:
+
+```powershell
+rocm serve qwen-small --managed
+```
+
+Expected result:
+
+- The resolved name is `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M`, not the
+  requested `qwen-small` and not the safetensors id
+  `Qwen/Qwen2.5-1.5B-Instruct`. In a terminal that is the deployment summary's
+  `resolved model` row, shown beside `requested model` because the two differ;
+  pipe the command (`| Out-String` in PowerShell, `| cat` in a POSIX shell) to
+  get the `serve plan` form carrying the same line.
+- The service reaches `ready` and answers a chat request. On Windows in
+  particular it must not exit immediately leaving an empty engine log: a
+  safetensors-only id handed to Lemonade fails that way, inside the engine
+  process, where the reason never reaches the terminal.
+- The same name under `--engine vllm` resolves to `Qwen/Qwen2.5-1.5B-Instruct`
+  instead (Linux or WSL, Instinct hardware).
+
+Stop it again before moving on, so it does not hold the GPU and the port for
+the checks below:
+
+```powershell
+rocm services stop <service-id> --yes
+```
 
 To check the recovery from a stale Lemonade backend pin (Windows or Linux with
 a managed Lemonade runtime already installed and an active managed ROCm SDK):
@@ -701,7 +731,7 @@ possibly running, which is the safe direction: the record never reconciles to
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
-up: section 3 serves Lemonade and then stops it on both of its branches, the
+up: section 3 serves Lemonade and then stops it on each of its branches, the
 block just above stops whatever was left, and section 2 leaves one runtime.
 
 **Get two distinct runtime keys.** A wheel runtime key is built from the
@@ -1028,6 +1058,14 @@ Expected result:
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
   utilization and VRAM usage working and temperature/power/clock at their
   unmeasured values, with no crash.
+- Leave the dashboard open for at least 30 minutes on an AMD host with the
+  driver's `amdadlx64.dll` present. It must keep running and keep updating
+  temperature, power and clock. ADLX is initialised once for the whole
+  session; initialising it on every tick made the driver's `atiadlxx.dll`
+  abort the process (exit code `0xC0000409`) with no message. If the
+  dashboard still exits silently, Event Viewer > Windows Logs > Application
+  shows an `Application Error` entry for `rocm.exe` naming the faulting
+  module and offset.
 - No other output of this section needs a daemon: `rocm dash` must not report
   a failed daemon connection.
 
