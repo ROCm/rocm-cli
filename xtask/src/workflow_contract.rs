@@ -2872,8 +2872,8 @@ jobs:
             }
         }
         assert_eq!(
-            delegating, 8,
-            "expected the eight native Linux preflight lanes to delegate to \
+            delegating, 7,
+            "expected the seven native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
     }
@@ -2941,8 +2941,8 @@ jobs:
         }
         assert_eq!(
             bodies.len(),
-            8,
-            "expected eight native Linux preflight bodies to compare, found {} — \
+            7,
+            "expected seven native Linux preflight bodies to compare, found {} — \
              if a lane was added or removed, update this count",
             bodies.len()
         );
@@ -4301,8 +4301,8 @@ fi
             }
         }
         assert_eq!(
-            delegating, 8,
-            "expected the 8 native Linux preflight lanes to delegate to \
+            delegating, 7,
+            "expected the 7 native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
         assert_eq!(
@@ -7576,7 +7576,7 @@ jobs:
             condition: lane_if(extra, "", platform),
             matrix_lane: true,
         };
-        // Strix Ubuntu and W7900 are off `pull_request` and `merge_group`.
+        // Strix Ubuntu is off `pull_request` and `merge_group`.
         let off_pr_lane = |job, platform: &str| PinnedIf {
             job,
             condition: lane_if(
@@ -7596,7 +7596,6 @@ jobs:
             off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
-            off_pr_lane("e2e-gpu-w7900", "w7900"),
             // Skips because the `serve` output of a skipped `changes` is empty.
             PinnedIf {
                 job: "e2e-report",
@@ -7717,38 +7716,33 @@ jobs:
             );
         }
         // A pull request runs one Linux node (MI300X) and one Windows pool (the
-        // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND
-        // merge_group (W7900 is one runner on borrowed quota; 35% of Strix
-        // Ubuntu's merge-queue jobs hit the 45 min cap; neither check is required
-        // and the queue does not wait for it) but still run on push and dispatch.
+        // Strix Halo pool). Strix Ubuntu is off pull_request AND merge_group (35%
+        // of its merge-queue jobs hit the 45 min cap; the check is not required
+        // and the queue does not wait for it) but still runs on push and dispatch.
         // Pin the WHOLE gate, not a substring: the event exclusions must sit in the
         // non-dispatch branch (so a dispatch can still select the lane) and nothing
         // else about the event may be named, so a gate that dropped push some other
         // way fails too.
-        for (job, platform) in [
-            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
-            ("e2e-gpu-w7900", "w7900"),
-        ] {
-            let expected = format!(
-                "always() && needs.changes.result == 'success' && ( \
-                 (github.event_name != 'workflow_dispatch' \
-                 && github.event_name != 'pull_request' \
-                 && github.event_name != 'merge_group' \
-                 && needs.changes.outputs.serve == 'true') \
-                 || (github.event_name == 'workflow_dispatch' \
-                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
-            );
-            assert_eq!(
-                normalized_whitespace(&gate(job)),
-                normalized_whitespace(&expected),
-                "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
-                 the non-dispatch branch only)"
-            );
-            assert!(
-                !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
-                "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
-            );
-        }
+        let (job, platform) = ("e2e-gpu-strix-ubuntu", "strix-ubuntu");
+        let expected = format!(
+            "always() && needs.changes.result == 'success' && ( \
+             (github.event_name != 'workflow_dispatch' \
+             && github.event_name != 'pull_request' \
+             && github.event_name != 'merge_group' \
+             && needs.changes.outputs.serve == 'true') \
+             || (github.event_name == 'workflow_dispatch' \
+             && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+        );
+        assert_eq!(
+            normalized_whitespace(&gate(job)),
+            normalized_whitespace(&expected),
+            "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
+             the non-dispatch branch only)"
+        );
+        assert!(
+            !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
+            "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
     }
 
     /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
