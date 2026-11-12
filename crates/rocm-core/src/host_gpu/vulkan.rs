@@ -439,7 +439,7 @@ pub fn classify_vulkan_support(
             return VulkanSupport {
                 status: VulkanStatus::Inconclusive,
                 detail: Some(
-                    "no Vulkan driver was found, and `vulkaninfo` did not answer (it is not \
+                    "no Vulkan driver was found, and `vulkaninfo` could not confirm that either (not \
                      installed, or it failed to run), so nothing here confirms one is absent"
                         .to_owned(),
                 ),
@@ -452,9 +452,25 @@ pub fn classify_vulkan_support(
         // read: the ICD search is not exhaustive, and `vulkaninfo` can see a
         // driver it misses. Say what was actually established — hardware
         // answered, none of it AMD — rather than denying the driver.
-        let detail = if !devices.is_empty() {
-            "Vulkan devices were enumerated, but none of them is an AMD GPU".to_owned()
-        } else if icds.is_empty() {
+        // A device that enumerated is proof a driver answered, so this host is
+        // not one where "no Vulkan GPU driver was found - install one" is true.
+        // Fixing only the detail text last round left the *status* saying the
+        // opposite of the detail beside it: `Absent` renders that install
+        // advice, while the `vulkan:` line said devices had been enumerated.
+        // It reports what was actually established instead — a driver answered,
+        // and none of what it listed is AMD, which is the same evidentiary
+        // state as an installed driver that enumerated nothing for us.
+        if !devices.is_empty() {
+            return VulkanSupport {
+                status: VulkanStatus::DriverPresentDevicesUnverified,
+                detail: Some(
+                    "Vulkan devices were enumerated, but none of them is an AMD GPU".to_owned(),
+                ),
+                icds,
+                devices,
+            };
+        }
+        let detail = if icds.is_empty() {
             "no Vulkan driver found".to_owned()
         } else {
             "only a software (CPU) Vulkan driver is installed; that is not a GPU path".to_owned()
@@ -832,6 +848,20 @@ GPU0:
         assert!(
             detail.contains("none of them is an AMD GPU"),
             "the report should say what was established: {support:?}"
+        );
+
+        // The status and the rendered line, not just the detail. Asserting only
+        // the detail is what let the two disagree: the text said devices were
+        // enumerated while `Absent` rendered "install one" right beside it.
+        assert_eq!(
+            support.status,
+            VulkanStatus::DriverPresentDevicesUnverified,
+            "a driver that answered is not an absent one: {support:?}"
+        );
+        assert_eq!(
+            crate::gfx_target::gpu_support_level(Some("gfx90c"), None, support.status),
+            crate::gfx_target::GpuSupportLevel::VulkanOnly,
+            "and it must not route to the confirmed-absence level"
         );
     }
 

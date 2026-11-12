@@ -791,9 +791,17 @@ Feature: GPU detection and system inspection
     And the inspection says the only renderer it found runs on the CPU
 
   # The shape examine-51 does not reach. examine-51 plants a `vulkaninfo` that
-  # fails, which is a confirmed absence; most hosts without a driver have no
-  # `vulkaninfo` at all, and that host must be told the check could not be made
-  # rather than either promised Vulkan or declared to have nothing.
+  # runs and reports no devices, which is the only shape that earns a confirmed
+  # absence; this host has no `vulkaninfo` to ask at all, and must be told the
+  # check could not be made rather than either promised Vulkan or declared to
+  # have nothing.
+  #
+  # Known gap, measured rather than assumed: a real `vulkaninfo` on a Linux host
+  # with no reachable driver does NOT produce examine-51's shape. It prints
+  # "Found no drivers!" and exits 1, which this probe classifies as
+  # inconclusive — so such a host lands at *this* scenario's level rather than
+  # examine-51's. Telling "no drivers" apart from "the tool is broken" needs the
+  # loader's own message, which the shared capture discards.
   @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
   Scenario: examine-53 - A machine that cannot be checked for Vulkan is not told either way
     Given a machine whose GPU has no official support and no way to check Vulkan

@@ -649,16 +649,29 @@ pub fn gpu_support_level(
             // no-driver shape, since most such hosts have no `vulkaninfo`
             // either. The wording it gets is hedged rather than a confirmed
             // absence — see `render.rs`.
+            // Every variant is spelled out, with no `_` and no guard. A guard
+            // (`v if v.is_usable()`) reads well but does not count toward
+            // exhaustiveness, so the arms below had to end in a wildcard — and
+            // a wildcard here silently routes any future `VulkanStatus` to
+            // `NoGpuBackend`, which renders as a confirmed fact. Listing them
+            // makes a new variant a compile error instead, the same discipline
+            // `render.rs` uses. The first arm is `VulkanStatus::is_usable` plus
+            // `Unknown`; keep them in step.
             match vulkan {
-                // A platform the probe cannot look at keeps the benefit of the
-                // doubt, as it did before any probe existed.
-                v if v.is_usable() || v == crate::host_gpu::VulkanStatus::Unknown => {
+                // A device answered, or a driver is installed and nothing
+                // contradicted it.
+                crate::host_gpu::VulkanStatus::Available
+                | crate::host_gpu::VulkanStatus::DriverPresentDevicesUnverified => {
                     GpuSupportLevel::VulkanOnly
                 }
+                // A platform the probe cannot look at keeps the benefit of the
+                // doubt, as it did before any probe existed.
+                crate::host_gpu::VulkanStatus::Unknown => GpuSupportLevel::VulkanOnly,
                 // Looked at, and nothing either way. Not a confirmed absence —
                 // see `VulkanUnconfirmed`.
                 crate::host_gpu::VulkanStatus::Inconclusive => GpuSupportLevel::VulkanUnconfirmed,
-                _ => GpuSupportLevel::NoGpuBackend,
+                // The only status that has earned a confirmed absence.
+                crate::host_gpu::VulkanStatus::Absent => GpuSupportLevel::NoGpuBackend,
             }
         }
         _ => GpuSupportLevel::Unknown,

@@ -3520,7 +3520,7 @@ async fn assert_vulkan_unconfirmed(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     let line = rocm_support_line(output).expect("no rocm_support line");
     assert!(
-        line.contains("`vulkaninfo` did not answer"),
+        line.contains("`vulkaninfo` could not confirm"),
         "the support line must name the gap that stopped it confirming, not assert \
          a driver is absent: {line}\n{output}"
     );
@@ -3566,9 +3566,16 @@ async fn assert_vulkan_driver_named(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     // The driver the planted device reported, not a guess from the ICD file
     // name: naming it is what lets a reader check the claim.
+    //
+    // Asserted on the `rocm_support` line specifically, not the whole output.
+    // The `vulkan:` evidence line also carries the driver name, so a plain
+    // `output.contains("radv")` passed even when the support sentence — the
+    // half that actually makes the claim — named nothing at all.
+    let line = rocm_support_line(output).expect("no rocm_support line");
     assert!(
-        output.contains("radv"),
-        "the inspection must name the driver it found:\n{output}"
+        line.contains("radv"),
+        "the support sentence itself must name the driver, not just the \
+         evidence line: {line}\n{output}"
     );
 }
 

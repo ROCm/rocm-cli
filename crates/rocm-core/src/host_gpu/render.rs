@@ -117,11 +117,17 @@ impl ExamineSummary {
             // promising a backend or declaring one absent — neither of which
             // the evidence supports. See `GpuSupportLevel::VulkanUnconfirmed`.
             GpuSupportLevel::VulkanUnconfirmed => format!(
+                // Deliberately does NOT say "install `vulkaninfo`". Measured on
+                // a real driverless Linux host: `vulkaninfo --summary` is
+                // installed, prints "Found no drivers!" and exits 1 — which
+                // lands here. Telling that user to install the tool they are
+                // already running is advice that can never clear the state.
+                // Install a *driver* is the step that can.
                 "  rocm_support: GPU detected ({}) but not supported by ROCm; no Vulkan driver \
-                 was found, and `vulkaninfo` did not answer to confirm that - install \
-                 `vulkaninfo` (or find out why it fails) to check, or install a Vulkan driver \
-                 (Mesa RADV on Linux, the AMD display driver on Windows) to run models on this \
-                 GPU\n",
+                 was found, and `vulkaninfo` could not confirm that either (not installed, or \
+                 it failed to run) - install a Vulkan driver (Mesa RADV on Linux, the AMD \
+                 display driver on Windows) to run models on this GPU, and run `vulkaninfo` \
+                 yourself to see what it says\n",
                 detected.unwrap_or_default()
             ),
             // Both halves are established facts: the catalog confirmed there is
@@ -590,7 +596,7 @@ mod tests {
         let summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
             status: VulkanStatus::Inconclusive,
             detail: Some(
-                "no Vulkan driver was found, and `vulkaninfo` did not answer (it is not \
+                "no Vulkan driver was found, and `vulkaninfo` could not confirm that either (not \
                  installed, or it failed to run), so nothing here confirms one is absent"
                     .to_owned(),
             ),
@@ -600,7 +606,7 @@ mod tests {
         let rendered = summary.render_text();
 
         assert!(
-            rendered.contains("`vulkaninfo` did not answer"),
+            rendered.contains("`vulkaninfo` could not confirm"),
             "it must name the gap that stopped it confirming: {rendered}"
         );
         assert!(
