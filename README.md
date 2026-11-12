@@ -79,7 +79,8 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 ## Installation
 
-The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
+The installer downloads a prebuilt bundle, verifies its SHA-256 checksum and
+its detached signature against the release public key pinned in the installer,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
 `PATH`, or fish's config folder already exists), the installer also adds that
