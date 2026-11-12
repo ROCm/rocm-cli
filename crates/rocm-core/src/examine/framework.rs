@@ -74,7 +74,11 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
         "Probed torch with the active managed runtime's interpreter: {}",
         interpreter.python.display()
     ));
-    let env = runtime_library_path_env(e, &interpreter.library_paths);
+    let library_paths = crate::managed_runtime::runtime_loader_path_entries_read_only(
+        &interpreter.python,
+        &interpreter.library_paths,
+    );
+    let env = runtime_library_path_env(e, &library_paths);
     let (rc, out, err) = run_with_env(
         &interpreter.python.display().to_string(),
         &["-c", PYTORCH_PROBE],

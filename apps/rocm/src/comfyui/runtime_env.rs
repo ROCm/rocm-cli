@@ -408,9 +408,20 @@ pub(super) fn runtime_environment_assignments(
     if let Some(path) = prepend_env_paths(&path_entries, std::env::var_os("PATH"))? {
         values.push(("PATH", path));
     }
+    // The amd-smi link a managed runtime's torch needs to count devices (see
+    // `rocm_core::ensure_amd_smi_compat`), after the recorded directories.
+    let mut library_entries = env.library_entries.clone();
+    if let Some(shim) = env.venv_root.as_ref().and_then(|venv_root| {
+        rocm_core::ensure_amd_smi_compat(
+            &venv_root.join(rocm_core::RUNTIME_COMPAT_DIR_NAME),
+            &env.library_entries,
+        )
+    }) {
+        library_entries.push(shim);
+    }
     if runtime_is_linux()
         && let Some(ld_library_path) =
-            prepend_env_paths(&env.library_entries, std::env::var_os("LD_LIBRARY_PATH"))?
+            prepend_env_paths(&library_entries, std::env::var_os("LD_LIBRARY_PATH"))?
     {
         values.push(("LD_LIBRARY_PATH", ld_library_path));
     }

@@ -326,7 +326,8 @@ pub const fn ensure_mpi_cxx_compat(_compat_dir: &std::path::Path) -> Option<Path
 /// `target`, returning `compat_dir` on success.
 ///
 /// This is a generic symlink-based shim helper for managed-runtime libraries on
-/// hosts whose system or bundled library uses a different soname. Note that the
+/// hosts whose system or bundled library uses a different soname. Used for the amd-smi
+/// link (see `ensure_amd_smi_compat`). Note that the
 /// OpenMPI C++ bindings shim no longer uses this path (it materializes a compiled
 /// `libmpi_cxx.so.40` stub via [`ensure_mpi_cxx_compat`]), and libnuma is
 /// deliberately *not* shimmed — the real numactl runtime is installed instead.

@@ -481,6 +481,105 @@ pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+/// The directory, inside a managed Python environment, where rocm-cli keeps the
+/// library shims a runtime's processes need on their loader path.
+pub const RUNTIME_COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
+
+/// The shim directory of the environment `python` belongs to, or `None` for an
+/// interpreter that is not in a managed environment's `bin` folder.
+pub fn runtime_compat_dir_for_python(python: &Path) -> Option<PathBuf> {
+    crate::runtime_python_env_root_for_executable(python)
+        .map(|root| root.join(RUNTIME_COMPAT_DIR_NAME))
+}
+
+/// Make `libamd_smi.so` resolvable to the runtime's own amd-smi library.
+///
+/// The `amdsmi` Python package that ships with the SDK opens `libamd_smi.so` by
+/// that bare name, after a lookup relative to its own path that only fits the
+/// SDK's own tree and misses in a virtual environment. The SDK ships the library
+/// as `libamd_smi.so.<n>` and not under the bare name, so the bare name resolves
+/// through the host's loader cache to whatever amd-smi the host has installed (a
+/// system ROCm), or else to the copy inside the `amdsmi` package. Either way a
+/// second amd-smi library is loaded next to the SDK's own, which torch has already
+/// loaded through librccl, and two copies in one process enumerate nothing:
+/// `torch.cuda.device_count()` on ROCm counts devices through amd-smi, so it
+/// reports 0 while HIP itself sees every device. Measured on an MI300X with SDK
+/// 7.14.1 beside a system ROCm 7.2.4.
+///
+/// This links the bare name, inside `compat_dir`, to the SDK's own library, so a
+/// loader path that carries `compat_dir` makes the package open the library that
+/// is already loaded rather than a second one. Returns `compat_dir` when it holds
+/// the link, for the caller to add to the loader path. Returns `None`, and writes
+/// nothing, when no directory in `library_dirs` holds the library, when the first
+/// that does already holds the bare name (the loader finds it there), or when the
+/// link cannot be made.
+pub fn ensure_amd_smi_compat(compat_dir: &Path, library_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let library = amd_smi_library_needing_bare_name(library_dirs)?;
+    crate::openmpi::ensure_compat_symlink(compat_dir, "libamd_smi.so", &library)
+}
+
+/// The loader-path directories for a managed runtime's `python`: its recorded
+/// `library_paths`, plus the shim directory when [`ensure_amd_smi_compat`] made
+/// one.
+///
+/// What a caller that spawns the runtime's interpreter, outside an engine launch,
+/// puts on `LD_LIBRARY_PATH`. Exists so each such caller gets the same set.
+pub fn runtime_loader_path_entries(python: &Path, library_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut entries = library_paths.to_vec();
+    if let Some(shim) = runtime_compat_dir_for_python(python)
+        .and_then(|dir| ensure_amd_smi_compat(&dir, library_paths))
+    {
+        entries.push(shim);
+    }
+    entries
+}
+
+/// [`runtime_loader_path_entries`] without the write: the shim directory is added
+/// only where an install or a launch already made it. For a diagnostic, which must
+/// not change the environment it reports on.
+pub fn runtime_loader_path_entries_read_only(
+    python: &Path,
+    library_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut entries = library_paths.to_vec();
+    if let Some(dir) = runtime_compat_dir_for_python(python)
+        && dir.join("libamd_smi.so").exists()
+    {
+        entries.push(dir);
+    }
+    entries
+}
+
+fn amd_smi_library_needing_bare_name(library_dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in library_dirs {
+        if dir.join("libamd_smi.so").exists() {
+            return None;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        // The soname (`libamd_smi.so.26`): digits only after `.so.`, so a fully
+        // versioned file (`.so.26.2.2`) beside it is not taken for it.
+        let soname = entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("libamd_smi.so."))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            .map(|entry| entry.path())
+            .min();
+        if soname.is_some() {
+            return soname;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TheRockSdkProbeCandidate {
     pub(crate) root_path: PathBuf,
@@ -1186,6 +1285,153 @@ mod tests {
             "the recorded library_paths must survive into the candidate, or the \
              comgr/HIP search has nowhere else reliable to find them"
         );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// The SDK ships `libamd_smi.so.<n>` only; the bare name has to be made.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn amd_smi_shim_links_the_bare_name_to_the_sdks_own_library() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-links");
+        let sdk_lib = root.join("sdk").join("lib");
+        let compat = root.join("env").join(RUNTIME_COMPAT_DIR_NAME);
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.3"), b"older")?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+        // The fully versioned file and the static archive beside it are not the
+        // soname a dependent asks for.
+        fs::write(sdk_lib.join("libamd_smi.so.26.2.2"), b"sdk")?;
+        fs::write(sdk_lib.join("libamd_smi_static.a"), b"sdk")?;
+
+        let shim = ensure_amd_smi_compat(&compat, std::slice::from_ref(&sdk_lib));
+
+        assert_eq!(shim.as_deref(), Some(compat.as_path()));
+        assert_eq!(
+            fs::read_link(compat.join("libamd_smi.so"))?,
+            sdk_lib.join("libamd_smi.so.26"),
+            "the bare name must open the library torch has already loaded, not a second copy"
+        );
+        // Run again over a link that is already right, and over one left dangling
+        // by an earlier install of another version.
+        assert_eq!(
+            ensure_amd_smi_compat(&compat, std::slice::from_ref(&sdk_lib)).as_deref(),
+            Some(compat.as_path())
+        );
+        fs::remove_file(compat.join("libamd_smi.so"))?;
+        std::os::unix::fs::symlink(
+            sdk_lib.join("libamd_smi.so.25"),
+            compat.join("libamd_smi.so"),
+        )?;
+        assert_eq!(
+            ensure_amd_smi_compat(&compat, std::slice::from_ref(&sdk_lib)).as_deref(),
+            Some(compat.as_path())
+        );
+        assert_eq!(
+            fs::read_link(compat.join("libamd_smi.so"))?,
+            sdk_lib.join("libamd_smi.so.26")
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// A library directory that already holds the bare name needs no shim: the
+    /// loader finds it there before it consults the host's cache.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn amd_smi_shim_is_not_written_when_the_sdk_ships_the_bare_name() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-bare");
+        let sdk_lib = root.join("sdk").join("lib");
+        let compat = root.join("env").join(RUNTIME_COMPAT_DIR_NAME);
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+        std::os::unix::fs::symlink("libamd_smi.so.26", sdk_lib.join("libamd_smi.so"))?;
+
+        assert_eq!(ensure_amd_smi_compat(&compat, &[sdk_lib]), None);
+        assert!(
+            !compat.exists(),
+            "nothing may be written when no shim is due"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// No amd-smi library in any recorded directory, or none recorded at all.
+    #[test]
+    fn amd_smi_shim_is_not_written_without_an_sdk_library() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-none");
+        let empty = root.join("sdk").join("lib");
+        let compat = root.join("env").join(RUNTIME_COMPAT_DIR_NAME);
+        fs::create_dir_all(&empty)?;
+        fs::write(empty.join("libamd_smi_static.a"), b"x")?;
+
+        assert_eq!(
+            ensure_amd_smi_compat(&compat, &[empty, root.join("missing")]),
+            None
+        );
+        assert_eq!(ensure_amd_smi_compat(&compat, &[]), None);
+        assert!(!compat.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// What an interpreter outside an engine launch gets on its loader path: the
+    /// recorded directories first, the shim directory after them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_loader_path_entries_append_the_shim_directory() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-entries");
+        let env_root = root.join("env");
+        let python = env_root.join("bin").join("python");
+        let sdk_lib = root.join("sdk").join("lib");
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+
+        let entries = runtime_loader_path_entries(&python, std::slice::from_ref(&sdk_lib));
+        assert_eq!(
+            entries,
+            vec![sdk_lib.clone(), env_root.join(RUNTIME_COMPAT_DIR_NAME)]
+        );
+        // An interpreter outside a managed environment has nowhere to keep a shim.
+        assert_eq!(
+            runtime_loader_path_entries(&root.join("python"), std::slice::from_ref(&sdk_lib)),
+            vec![sdk_lib]
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// Only a fully versioned file is not the soname a dependent asks for.
+    #[test]
+    fn amd_smi_shim_is_not_written_for_a_fully_versioned_file_alone() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-versioned-only");
+        let sdk_lib = root.join("sdk").join("lib");
+        let compat = root.join("env").join(RUNTIME_COMPAT_DIR_NAME);
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26.2.2"), b"sdk")?;
+        assert_eq!(ensure_amd_smi_compat(&compat, &[sdk_lib]), None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// A diagnostic reads the shim directory where it exists and never makes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_read_only_entries_never_write_the_shim() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-read-only");
+        let env_root = root.join("env");
+        let python = env_root.join("bin").join("python");
+        let sdk_lib = root.join("sdk").join("lib");
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+
+        let before = runtime_loader_path_entries_read_only(&python, std::slice::from_ref(&sdk_lib));
+        assert_eq!(before, vec![sdk_lib.clone()]);
+        assert!(!env_root.exists(), "a diagnostic must not create anything");
+
+        runtime_loader_path_entries(&python, std::slice::from_ref(&sdk_lib));
+        let after = runtime_loader_path_entries_read_only(&python, std::slice::from_ref(&sdk_lib));
+        assert_eq!(after, vec![sdk_lib, env_root.join(RUNTIME_COMPAT_DIR_NAME)]);
         fs::remove_dir_all(root).ok();
         Ok(())
     }

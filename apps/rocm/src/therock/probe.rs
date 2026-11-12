@@ -89,7 +89,8 @@ pub(crate) struct RuntimeDeviceProbe {
 ///
 /// `library_paths` must be the runtime's recorded ROCm library directories (see
 /// [`RocmSdkPythonProbe::library_paths`]). They are prepended to
-/// `LD_LIBRARY_PATH` for the child, which is how a served process resolves them.
+/// `LD_LIBRARY_PATH` for the child, which is how a served process resolves them,
+/// followed by the directory holding the amd-smi link when one is needed.
 ///
 /// This cannot be replaced with an in-process `rocm_sdk.initialize_process()`
 /// call in the probe script. Measured on MI300X against a runtime that serves
@@ -103,7 +104,10 @@ pub(crate) fn probe_runtime_devices(
 ) -> Result<RuntimeDeviceProbe> {
     let mut env = Vec::new();
     if !library_paths.is_empty() {
-        let mut entries = library_paths.to_vec();
+        // The recorded directories plus the amd-smi shim (see
+        // `rocm_core::ensure_amd_smi_compat`): without it torch reports no devices
+        // beside a system ROCm although HIP sees them.
+        let mut entries = rocm_core::runtime_loader_path_entries(python_executable, library_paths);
         if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
             entries.extend(split_runtime_path(&existing));
         }
@@ -446,6 +450,45 @@ mod tests {
     use crate::runtime_registry::validate_rocm_sdk_runtime_probe;
     use crate::therock::test_support::test_paths;
     use std::fs;
+
+    /// The device probe has to carry the amd-smi link's directory on its loader
+    /// path, or a torch beside a host ROCm counts no devices. The interpreter here
+    /// is a script that reports the `LD_LIBRARY_PATH` it was started with.
+    #[cfg(unix)]
+    #[test]
+    fn the_device_probe_runs_with_the_amd_smi_link_on_its_loader_path() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "rocm-probe-amd-smi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let bin = root.join("env").join("bin");
+        let sdk_lib = root.join("sdk").join("lib");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&sdk_lib)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+        let python = bin.join("python");
+        fs::write(
+            &python,
+            "#!/bin/sh\nprintf '{\"import_ok\": true, \"error\": \"%s\"}' \"$LD_LIBRARY_PATH\"\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+
+        let probe = probe_runtime_devices(&python, std::slice::from_ref(&sdk_lib))?;
+
+        let loader_path = probe.error.unwrap_or_default();
+        let compat_dir = root.join("env").join("rocm-cli-lib-compat");
+        assert!(
+            loader_path.starts_with(&format!("{}:{}", sdk_lib.display(), compat_dir.display())),
+            "{loader_path}"
+        );
+        assert!(compat_dir.join("libamd_smi.so").exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
 
     #[test]
     fn parses_rocm_sdk_probe_contract() -> Result<()> {
