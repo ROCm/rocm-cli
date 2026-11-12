@@ -1203,7 +1203,15 @@ services restart` whose engine dies on start all fail loudly: non-zero exit, the
 reason quoted from the service log, and both the service record and the engine
 state file left `failed`. A death that was *asked for* — `rocm services stop`, or
 `rocm dash`'s stop action — is reported as a stop on all of them instead, and
-marks nothing `failed`.
+rocm itself marks nothing `failed` for it.
+
+One caveat, because rocm is not the only writer. The Lemonade and vLLM adapters
+see a SIGTERM'd server as an unsuccessful exit, so they write `failed` to the
+engine state file themselves, and `refresh_from_engine_state` reads that back
+into the record. A deliberate stop of a real adapter-backed service can
+therefore still end up showing `failed`. That is the adapter's verdict rather
+than this stop-versus-crash check, and nothing covers it: the stop scenarios all
+use the scripted engine or planted records, so no real-adapter stop is exercised.
 
 The distinction is made from the stop's own recorded evidence, not from the
 record's status: a reconciliation that merely notices the processes are gone

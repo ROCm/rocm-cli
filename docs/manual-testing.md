@@ -1116,8 +1116,17 @@ Expected result:
 
 Then repeat, but stop it deliberately from the second shell with `rocm services
 stop <service-id>` instead of killing it. That is the control: the attached
-shell must exit **0**, report a stop rather than a crash, and leave the record
-**not** `failed`.
+shell must exit **0** and report a stop rather than a crash.
+
+On the record, expect the stop itself **not** to be what marks it `failed` — but
+do not read a `failed` record here as an automatic bug. The Lemonade and vLLM
+adapters see a SIGTERM'd server as an unsuccessful exit and write `failed` to
+the engine state file themselves, which `refresh_from_engine_state` reads back
+into the record. This is the only place that can be observed at all, since every
+automated stop test uses the scripted engine or a planted record. If you do see
+`failed`, read the service log: an adapter's own error there is the adapter's
+verdict, whereas a *rocm* "exited unexpectedly" line for a stop you asked for is
+the real regression.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

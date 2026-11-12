@@ -109,8 +109,26 @@ pub struct ManagedServiceRecord {
     /// existed, which is the safe default (keep the key).
     #[serde(default)]
     pub stop_requested_unix_ms: Option<u128>,
-    /// The stop marker a liveness refresh cleared off a record that named no
-    /// process, kept as the evidence that it was cleared and not by a relaunch.
+    /// Where a stop marker goes once consumed, kept as evidence that *a stop*
+    /// consumed it rather than a relaunch clearing it.
+    ///
+    /// # Writers
+    ///
+    /// | Writer | When |
+    /// | --- | --- |
+    /// | `settle_pending_stop_key_cleanup` (`managed_service_status.rs`) | A liveness refresh consumes the marker off a record naming no process. |
+    /// | `stop_internal_managed_service_confirmed_with` (`service_control.rs`) | A stop confirms every recorded process gone and moves its own marker here. |
+    /// | `rocmd`'s stop (`apps/rocmd/src/service.rs`) | The same move, on the daemon's path. |
+    /// | [`Self::reset_for_restart`] | Clears it — a relaunch is no longer the stop settled under it. |
+    ///
+    /// The second writer is newer than this field's original purpose and is why
+    /// it is now load-bearing: the stop-versus-crash check reads it as proof a
+    /// death was asked for. Before that, a confirmed stop dropped its marker and
+    /// left only `status == "stopped"` — which a liveness reconciliation also
+    /// writes for a record whose pids are merely gone, making a crash
+    /// indistinguishable from a stop. Nothing a crash can do sets this field.
+    ///
+    /// The original case still holds:
     ///
     /// A record naming no process has nothing for a pending stop to wait on, so
     /// the refresh drops the marker (and the key) at once. A `starting` or

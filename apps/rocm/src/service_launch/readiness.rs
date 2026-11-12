@@ -1394,6 +1394,12 @@ mod tests {
         stopped.supervisor_pid = std::process::id();
         stopped.stop_requested_unix_ms = Some(1);
         stopped.write().expect("write");
+        // The crash arm above stamped the *engine state file* `failed`, and
+        // `settle_exited_service` refreshes the record from it — so without
+        // clearing it this arm would re-adopt the previous arm's verdict and
+        // the state assertion below would fail on fixture carry-over rather
+        // than on the behaviour. Found by adding that assertion.
+        let _ = fs::remove_file(&stopped.engine_state_path);
         let error =
             died_during_wait(&paths, &id, true, pending, |_| false).expect("the wait still ends");
         let message = error.to_string();
@@ -1404,6 +1410,21 @@ mod tests {
         assert!(
             !message.contains("exited before it became ready"),
             "{message}"
+        );
+
+        // The message and the state it leaves, pinned together. Asserting only
+        // the wording would stay green if the same stop were still recorded as
+        // a crash — the user would read "stopped" and `rocm services list`
+        // would say `failed`.
+        let after = ManagedServiceRecord::read_manifest(&paths, &id).expect("read");
+        assert_ne!(
+            after.status, "failed",
+            "a stop reported as a stop must not also be recorded as a crash"
+        );
+        let engine_state = fs::read_to_string(&after.engine_state_path).unwrap_or_default();
+        assert!(
+            !engine_state.contains("\"failed\""),
+            "nor may its engine state file say failed: {engine_state}"
         );
         let _ = fs::remove_dir_all(root);
     }
