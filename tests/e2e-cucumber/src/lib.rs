@@ -33,6 +33,7 @@ pub mod stand_in_uname;
 pub mod stray_process;
 pub mod tasklist;
 pub mod terminal_size;
+pub mod torch_alignment_outcome;
 
 use std::path::{Path, PathBuf};
 
