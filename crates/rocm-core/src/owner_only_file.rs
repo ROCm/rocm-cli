@@ -21,9 +21,13 @@
 //!   No entry is added for administrators or `SYSTEM`.
 //!
 //! The file is created with `create_new` semantics on both platforms: an
-//! existing file or symbolic link at `path` is an error and is never opened,
-//! so a caller cannot be made to write a secret through a file somebody else
-//! prepared. To replace an existing secret, use
+//! existing file or symbolic link at `path`, dangling or not, is an error and is
+//! never followed or opened, so a caller cannot be made to write a secret
+//! through a file or link somebody else prepared. On Windows that takes
+//! `FILE_FLAG_OPEN_REPARSE_POINT`, which `std` also passes for `create_new`,
+//! and the path goes through the same long-path (`\\?\`) conversion `std`
+//! applies, so a path longer than `MAX_PATH` works here as it does for
+//! `std::fs`. To replace an existing secret, use
 //! [`crate::atomic_write::write_owner_only_file_atomically`], which stages the
 //! bytes in a fresh owner-only file and renames it over the old one.
 
@@ -79,6 +83,95 @@ fn create_new_owner_only(path: &Path) -> io::Result<File> {
     win32::create_new_with_sddl(path, &owner_only_sddl(&sid))
 }
 
+/// Test support: `None` when the file at `path` has a protected DACL whose
+/// only entry grants the current user full access, as [`open_new_owner_only`]
+/// creates it; otherwise the DACL found, in SDDL, for the failure message.
+///
+/// Compiled only for this crate's tests and under the `test-support` feature,
+/// which the apps enable as a dev-dependency so their own Windows tests can
+/// check the files they store.
+#[cfg(all(windows, any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub fn owner_only_dacl_mismatch(path: &Path) -> io::Result<Option<String>> {
+    use win32::test_support::{canonical_sddl, dacl_sddl, flags_and_entries};
+
+    let actual = dacl_sddl(path)?;
+    let expected = canonical_sddl(&owner_only_sddl(&win32::current_user_sid()?))?;
+    let (flags, entries) = flags_and_entries(&actual);
+    let (_, expected_entries) = flags_and_entries(&expected);
+    Ok((!(flags.contains('P') && entries == expected_entries)).then_some(actual))
+}
+
+// UTF-16 units of the path syntax below; all ASCII.
+#[cfg(any(windows, test))]
+const SEP: u16 = b'\\' as u16;
+#[cfg(any(windows, test))]
+const ALT_SEP: u16 = b'/' as u16;
+#[cfg(any(windows, test))]
+const COLON: u16 = b':' as u16;
+/// `\\?\`
+#[cfg(any(windows, test))]
+const VERBATIM_PREFIX: [u16; 4] = [SEP, SEP, b'?' as u16, SEP];
+/// `\??\`
+#[cfg(any(windows, test))]
+const NT_PREFIX: [u16; 4] = [SEP, b'?' as u16, b'?' as u16, SEP];
+/// `\\.\`
+#[cfg(any(windows, test))]
+const DEVICE_PREFIX: [u16; 4] = [SEP, SEP, b'.' as u16, SEP];
+/// `\\?\UNC\`
+#[cfg(any(windows, test))]
+const UNC_PREFIX: [u16; 8] = [
+    SEP,
+    SEP,
+    b'?' as u16,
+    SEP,
+    b'U' as u16,
+    b'N' as u16,
+    b'C' as u16,
+    SEP,
+];
+/// The length below which `std` passes a drive-absolute or UNC path to Windows
+/// unchanged (the `CreateDirectoryW` limit, the tightest of the `MAX_PATH`
+/// family).
+#[cfg(any(windows, test))]
+const LEGACY_MAX_PATH: usize = 248;
+
+/// Whether `std` would pass the UTF-16 path `wide` (no NUL) to Windows as it
+/// is: a verbatim path, or a short one that is already drive-absolute or UNC.
+#[cfg(any(windows, test))]
+fn usable_as_is(wide: &[u16]) -> bool {
+    if wide.starts_with(&VERBATIM_PREFIX) || wide.starts_with(&NT_PREFIX) {
+        return true;
+    }
+    if wide.len() + 1 >= LEGACY_MAX_PATH {
+        return false;
+    }
+    match wide {
+        [drive, COLON] | [drive, COLON, SEP | ALT_SEP, ..] => *drive != SEP && *drive != ALT_SEP,
+        [SEP | ALT_SEP, SEP | ALT_SEP, ..] => true,
+        _ => false,
+    }
+}
+
+/// The verbatim, NUL-terminated form of `absolute`, a path `GetFullPathNameW`
+/// already made absolute and normalized: `C:\x` becomes `\\?\C:\x`,
+/// `\\.\x` becomes `\\?\x`, `\\server\share` becomes
+/// `\\?\UNC\server\share`, and a path already verbatim is kept. The same
+/// mapping `std` applies before it opens a file.
+#[cfg(any(windows, test))]
+fn with_verbatim_prefix(absolute: &[u16]) -> Vec<u16> {
+    let (prefix, rest): (&[u16], &[u16]) = match absolute {
+        [_, COLON, SEP, ..] => (&VERBATIM_PREFIX, absolute),
+        _ if absolute.starts_with(&DEVICE_PREFIX) => (&VERBATIM_PREFIX, &absolute[4..]),
+        _ if absolute.starts_with(&VERBATIM_PREFIX) || absolute.starts_with(&NT_PREFIX) => {
+            (&[], absolute)
+        }
+        [SEP, SEP, ..] => (&UNC_PREFIX, &absolute[2..]),
+        _ => (&[], absolute),
+    };
+    prefix.iter().chain(rest).copied().chain(Some(0)).collect()
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 pub(crate) mod win32 {
@@ -105,8 +198,8 @@ pub(crate) mod win32 {
         TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -145,8 +238,29 @@ pub(crate) mod win32 {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "string is not valid Unicode"))
     }
 
-    fn wide_nul(text: &std::ffi::OsStr) -> Vec<u16> {
-        text.encode_wide().chain(Some(0)).collect()
+    /// `path` as the NUL-terminated UTF-16 name `std::fs` would hand
+    /// `CreateFileW`: unchanged when it is already verbatim, or short and
+    /// absolute; otherwise made absolute and given the verbatim prefix, which
+    /// lifts the `MAX_PATH` limit. `std` keeps this conversion private, so it
+    /// is repeated here on top of the public [`std::path::absolute`]; the
+    /// decisions are in [`super::usable_as_is`] and
+    /// [`super::with_verbatim_prefix`], which are tested on every host.
+    pub(crate) fn long_path_wide(path: &Path) -> io::Result<Vec<u16>> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "strings passed to WinAPI cannot contain NULs",
+            ));
+        }
+        if super::usable_as_is(&wide) {
+            return Ok(wide.into_iter().chain(Some(0)).collect());
+        }
+        let absolute: Vec<u16> = std::path::absolute(path)?
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        Ok(super::with_verbatim_prefix(&absolute))
     }
 
     /// The string form (`S-1-5-21-…`) of the SID of the user this process runs
@@ -240,11 +354,14 @@ pub(crate) mod win32 {
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };
-        let path_wide = wide_nul(path.as_os_str());
+        let path_wide = long_path_wide(path)?;
         // SAFETY: `path_wide` is NUL-terminated and `attributes` points at a
         // descriptor that `descriptor` keeps alive past the call. The sharing
-        // mode is what `std::fs::OpenOptions` uses, so the handle behaves like
-        // one `std` would have opened.
+        // mode, the long-path form of the name and `FILE_FLAG_OPEN_REPARSE_POINT`
+        // are what `std::fs::OpenOptions` uses for `create_new`, so the handle
+        // behaves like one `std` would have opened: with that flag `CREATE_NEW`
+        // fails on a symbolic link at `path`, dangling or not, instead of
+        // creating the file where the link points.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
@@ -252,7 +369,7 @@ pub(crate) mod win32 {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 &raw const attributes,
                 CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 ptr::null_mut(),
             )
         };
@@ -264,12 +381,13 @@ pub(crate) mod win32 {
         Ok(unsafe { File::from_raw_handle(handle) })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) mod test_support {
-        //! Reading a file's DACL back, for the Windows tests here and in
-        //! `atomic_write`.
+        //! Reading a file's DACL back, for the Windows tests here, in
+        //! `atomic_write`, and (through [`super::super::owner_only_dacl_mismatch`])
+        //! in the crates that store secrets with this module.
 
-        use super::{LocalBuffer, security_descriptor_from_sddl, string_from_wide, wide_nul};
+        use super::{LocalBuffer, long_path_wide, security_descriptor_from_sddl, string_from_wide};
         use std::io;
         use std::path::Path;
         use std::ptr;
@@ -302,7 +420,7 @@ pub(crate) mod win32 {
 
         /// The DACL of the file at `path`, in SDDL (`D:P(A;;FA;;;S-1-…)`).
         pub(crate) fn dacl_sddl(path: &Path) -> io::Result<String> {
-            let path_wide = wide_nul(path.as_os_str());
+            let path_wide = long_path_wide(path)?;
             let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
             // SAFETY: `path_wide` is NUL-terminated; the owner, group and SACL
             // out-pointers are null because they are not requested, and the
@@ -456,27 +574,167 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_new_file_has_a_protected_dacl_for_the_current_user_only() {
-        use win32::test_support::{canonical_sddl, dacl_sddl, flags_and_entries};
-
         let root = scratch_dir("dacl");
         let path = root.join("secret");
         let mut file = open_new_owner_only(&path).unwrap();
         file.write_all(b"key").unwrap();
         drop(file);
 
-        let actual = dacl_sddl(&path).unwrap();
-        let sid = win32::current_user_sid().unwrap();
-        let expected = canonical_sddl(&owner_only_sddl(&sid)).unwrap();
+        let mismatch = owner_only_dacl_mismatch(&path).unwrap();
         let contents = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_dir_all(&root);
 
-        let (flags, entries) = flags_and_entries(&actual);
-        let (_, expected_entries) = flags_and_entries(&expected);
-        assert!(flags.contains('P'), "the DACL is not protected: {actual}");
-        assert_eq!(
-            entries, expected_entries,
-            "the DACL grants more than the user"
-        );
+        assert_eq!(mismatch, None, "the DACL is not protected owner-only");
         assert_eq!(contents, b"key", "the owner cannot read the file back");
+    }
+
+    /// The checker itself: a file created with an inherited DACL, as
+    /// `std::fs::write` leaves it, is reported, so a `None` above means
+    /// something.
+    #[cfg(windows)]
+    #[test]
+    fn the_dacl_check_reports_an_inherited_dacl() {
+        let root = scratch_dir("dacl-inherited");
+        let path = root.join("plain");
+        std::fs::write(&path, b"plain").unwrap();
+
+        let mismatch = owner_only_dacl_mismatch(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(mismatch.is_some(), "an inherited DACL passed the check");
+    }
+
+    /// A symbolic link at the destination — dangling, or pointing at a file —
+    /// fails the create instead of being followed, so nothing is created or
+    /// written where it points. Creating a link needs Developer Mode or the
+    /// symlink privilege; where neither is available the test fails on CI
+    /// (`CI` set) and elsewhere says so and passes without checking.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlink_is_never_followed_on_windows() {
+        let root = scratch_dir("symlink-win");
+        let missing_target = root.join("missing-target");
+        let dangling = root.join("dangling");
+        if let Err(error) = std::os::windows::fs::symlink_file(&missing_target, &dangling) {
+            let _ = std::fs::remove_dir_all(&root);
+            // On CI this test is the only check of the reparse-point flag, so
+            // a runner that cannot create links fails rather than passing
+            // unchecked; a developer machine without the privilege skips.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "cannot create a symbolic link on CI, so the link-following check did not run: {error}"
+            );
+            eprintln!("SKIPPED: this account cannot create a symbolic link ({error})");
+            return;
+        }
+        let target = root.join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        let live = root.join("live");
+        std::os::windows::fs::symlink_file(&target, &live).unwrap();
+
+        let dangling_result = open_new_owner_only(&dangling).map(drop);
+        let live_result = open_new_owner_only(&live).map(drop);
+        let created_at_target = missing_target.exists();
+        let target_contents = std::fs::read(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            dangling_result.map_err(|error| error.kind()),
+            Err(io::ErrorKind::AlreadyExists),
+            "a dangling link was followed"
+        );
+        assert!(
+            !created_at_target,
+            "the file was created at the link's target"
+        );
+        assert_eq!(
+            live_result.map_err(|error| error.kind()),
+            Err(io::ErrorKind::AlreadyExists),
+            "a link to a file was followed"
+        );
+        assert_eq!(target_contents, b"untouched");
+    }
+
+    /// A destination past `MAX_PATH` is created, as `std::fs` would create it.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_longer_than_max_path_is_created() {
+        let root = scratch_dir("long-path");
+        let mut dir = root.clone();
+        while dir.as_os_str().len() < 300 {
+            dir.push("a-directory-name-that-makes-the-path-long");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+
+        let created = open_new_owner_only(&path).map(|mut file| file.write_all(b"key"));
+        let contents = std::fs::read(&path);
+        let mismatch = owner_only_dacl_mismatch(&path);
+        let _ = std::fs::remove_dir_all(&root);
+
+        created.unwrap().unwrap();
+        assert_eq!(contents.unwrap(), b"key");
+        assert_eq!(mismatch.unwrap(), None);
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn wide_nul(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// The long-path decisions, with expectations written from `std`'s
+    /// `get_long_path` (its conversion is private, so it cannot be compared
+    /// at run time): short absolute and UNC paths and verbatim ones pass as
+    /// they are; anything relative, or long, is converted.
+    #[test]
+    fn usable_as_is_follows_std_for_each_path_shape() {
+        assert!(usable_as_is(&wide(r"C:\Users\me\data\svc.endpoint-key")));
+        assert!(usable_as_is(&wide("C:/Users/me/key")));
+        assert!(usable_as_is(&wide("C:")));
+        assert!(usable_as_is(&wide(r"\\server\share\key")));
+        assert!(usable_as_is(&wide(r"\\?\C:\key")));
+        assert!(usable_as_is(&wide(r"\??\C:\key")));
+        assert!(!usable_as_is(&wide("relative\\key")));
+        assert!(!usable_as_is(&wide(r"\rooted-on-the-current-drive")));
+        assert!(!usable_as_is(&wide("C:relative-to-the-drive's-cwd")));
+        let long = format!(r"C:\{}", "a".repeat(LEGACY_MAX_PATH));
+        assert!(!usable_as_is(&wide(&long)));
+        // The exact edge: `std` counts the terminating NUL, so a path of 246
+        // units (247 with the NUL) still passes as it is and one of 247 does
+        // not.
+        let of_len = |len: usize| format!(r"C:\{}", "a".repeat(len - 3));
+        assert_eq!(of_len(246).encode_utf16().count(), 246);
+        assert!(usable_as_is(&wide(&of_len(246))));
+        assert!(!usable_as_is(&wide(&of_len(247))));
+        assert!(!usable_as_is(&wide(&of_len(248))));
+        // A long path that is already verbatim needs nothing.
+        assert!(usable_as_is(&wide(&format!(r"\\?\{long}"))));
+    }
+
+    /// Expectations written from `std`'s `get_long_path`, as above.
+    #[test]
+    fn with_verbatim_prefix_follows_std_for_each_absolute_shape() {
+        assert_eq!(
+            with_verbatim_prefix(&wide(r"C:\Users\me\key")),
+            wide_nul(r"\\?\C:\Users\me\key")
+        );
+        assert_eq!(
+            with_verbatim_prefix(&wide(r"\\server\share\key")),
+            wide_nul(r"\\?\UNC\server\share\key")
+        );
+        assert_eq!(
+            with_verbatim_prefix(&wide(r"\\.\C:\key")),
+            wide_nul(r"\\?\C:\key")
+        );
+        assert_eq!(
+            with_verbatim_prefix(&wide(r"\\?\C:\key")),
+            wide_nul(r"\\?\C:\key")
+        );
+        assert_eq!(
+            with_verbatim_prefix(&wide(r"\??\C:\key")),
+            wide_nul(r"\??\C:\key")
+        );
     }
 }

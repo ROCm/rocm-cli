@@ -587,6 +587,14 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "a credential must be owner-only");
         }
+        // On Windows: a protected DACL granting only this user, not whatever
+        // the data directory would have handed down.
+        #[cfg(windows)]
+        assert_eq!(
+            rocm_core::owner_only_file::owner_only_dacl_mismatch(&path).expect("read the DACL"),
+            None,
+            "a credential must be owner-only"
+        );
 
         clear_key(&paths, "remote-gpu-box-11434");
         assert!(!path.exists());

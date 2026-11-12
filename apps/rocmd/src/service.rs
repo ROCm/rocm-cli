@@ -159,9 +159,8 @@ pub(crate) fn stop_managed_service_via(
     // that is otherwise fine, with no way to re-mint it. The marker written
     // above defers the cleanup instead; see there for who performs it.
     if all_stopped {
-        let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
-            paths, service_id,
-        ));
+        // With any staged copy a store killed before publishing left beside it.
+        rocm_engine_protocol::remove_endpoint_key_files(paths, service_id);
     }
     Ok(json!({
         "service": record,
@@ -236,12 +235,17 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
         fs::write(&key_path, "secret-key")?;
         assert!(key_path.exists());
+        // What a `rocm` store killed between staging and publishing leaves: a
+        // second copy of the key, named by the shared atomic writer.
+        let staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&key_path, b"secret-key")?;
 
         let result = stop_managed_service(&paths, service_id);
         // Observe the real filesystem state before the blanket temp-dir cleanup,
         // otherwise remove_dir_all would delete the key file and mask a missing
         // production cleanup (the regression this test guards).
         let key_removed = !key_path.exists();
+        let staged_removed = !staged.exists();
         fs::remove_dir_all(root).ok();
 
         let value = result?;
@@ -253,6 +257,7 @@ mod tests {
             Some("stopped")
         );
         assert!(key_removed, "endpoint key file must be removed after stop");
+        assert!(staged_removed, "a staged copy of the key must go with it");
         Ok(())
     }
 

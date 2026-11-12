@@ -152,6 +152,24 @@ pub fn endpoint_key_file_if_present(
     path.exists().then_some(path)
 }
 
+/// Remove `service_id`'s endpoint key file and any leftover staged copy of it.
+///
+/// A store killed between staging and publishing leaves a staged copy beside
+/// the key (see `rocm_core::atomic_write::staged_siblings`); removing it too
+/// means no copy of the key outlives the service. Best-effort and idempotent:
+/// a missing file is not an error, and nothing is reported because no caller
+/// can act on a failed cleanup.
+///
+/// A store still in flight for the same service loses its staged file too and
+/// then fails to publish. That is deliberate, fail-closed: the service's key
+/// is being removed, and a store finishing afterwards would bring it back.
+pub fn remove_endpoint_key_files(paths: &rocm_core::AppPaths, service_id: &str) {
+    let key = endpoint_key_file_path(paths, service_id);
+    for path in std::iter::once(key.clone()).chain(rocm_core::atomic_write::staged_siblings(&key)) {
+        let _ = fs::remove_file(&path);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePluginDescriptor {
     pub id: String,
@@ -816,6 +834,31 @@ mod tests {
         // Different service ids never collide.
         assert_ne!(path, endpoint_key_file_path(&paths, "svc-2"));
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// A store killed between staging and publishing leaves a staged copy of
+    /// the key; removing the service's key takes that copy too, and leaves
+    /// another service's key and staged copy alone.
+    #[test]
+    fn remove_endpoint_key_files_takes_the_key_and_its_leftover_staged_copies() {
+        let paths = test_app_paths("key-file-remove");
+        let key = endpoint_key_file_path(&paths, "svc-a");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "published").unwrap();
+        let staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"staged").unwrap();
+        let other_key = endpoint_key_file_path(&paths, "svc-ab");
+        let other_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&other_key, b"other")
+                .unwrap();
+
+        remove_endpoint_key_files(&paths, "svc-a");
+        let left = (key.exists(), staged.exists(), other_staged.exists());
+        // A second removal finds nothing and is a no-op.
+        remove_endpoint_key_files(&paths, "svc-a");
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+
+        assert_eq!(left, (false, false, true));
     }
 
     #[test]
