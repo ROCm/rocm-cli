@@ -7,9 +7,10 @@
 //! holds the fixtures every module's tests share.
 
 use super::source::FamilyResolution;
+use super::venv_python_path;
 use crate::runtime_registry::{InstalledRuntimeManifest, runtime_manifest_path};
 use anyhow::Result;
-use rocm_core::AppPaths;
+use rocm_core::{AppPaths, unix_time_millis};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -124,6 +125,96 @@ pub(super) fn write_test_runtime_manifest(
     fs::create_dir_all(path.parent().expect("manifest path should have parent"))?;
     fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
     Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn write_fake_python_reporting(
+    dir: &Path,
+    name: &str,
+    tag: &str,
+    version: &str,
+) -> Result<PathBuf> {
+    use rocm_core::fake_executable::write_fake_executable;
+    let path = dir.join(name);
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
+    );
+    write_fake_executable(&path, script)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+pub(super) fn write_fake_uv_creating_venv(
+    dir: &Path,
+    name: &str,
+    tag: &str,
+    version: &str,
+) -> Result<PathBuf> {
+    use rocm_core::fake_executable::write_fake_executable;
+    let path = dir.join(name);
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
+  /bin/mkdir -p "$4/bin"
+  /bin/cat > "$4/bin/python" <<PY
+#!/bin/sh
+if [ "\$1" = "-c" ]; then
+  echo {tag}
+  exit 0
+fi
+echo {version}
+PY
+  /bin/chmod +x "$4/bin/python"
+  exit 0
+fi
+exit 1
+"#
+    );
+    write_fake_executable(&path, script)?;
+    Ok(path)
+}
+
+/// A canonical sandbox with `AppPaths` inside it and a sentinel file
+/// outside every install root the test will use.
+#[cfg(unix)]
+pub(super) fn venv_rebuild_sandbox(label: &str) -> (PathBuf, AppPaths) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "rocm-cli-venv-rebuild-{label}-{}-{}-{}",
+        std::process::id(),
+        unix_time_millis(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::create_dir_all(root.join("cache")).unwrap();
+    let root = root.canonicalize().unwrap();
+    fs::write(root.join("sentinel"), b"outside every install root").unwrap();
+    let paths = AppPaths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        cache_dir: root.join("cache"),
+    };
+    (root, paths)
+}
+
+/// A venv Python that appends a line to `ran` every time it is run, then
+/// behaves as [`plant_working_venv_python`]'s does: runs, reports `cp312`,
+/// and reports `prefix` as its `sys.prefix`, and creates a venv when asked.
+#[cfg(unix)]
+pub(super) fn plant_recording_venv_python(install_root: &Path, prefix: &Path, ran: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let python = venv_python_path(install_root);
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(
+        &python,
+        format!(
+            "#!/bin/sh\necho \"$0 $*\" >> \"{}\"\nif [ \"$1\" = \"-m\" ]; then /bin/mkdir -p \"$3\"; exit 0; fi\nif [ \"$1\" = \"-c\" ]; then\n  case \"$2\" in *sys.prefix*) echo \"{}\" ;; *) echo cp312 ;; esac\n  exit 0\nfi\necho Python 3.12.10\n",
+            ran.display(),
+            prefix.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(test)]

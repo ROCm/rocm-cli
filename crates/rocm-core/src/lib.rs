@@ -55,6 +55,7 @@ pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
 pub mod service_record;
+mod sigpipe;
 pub mod terminal;
 pub mod user_path;
 
@@ -85,7 +86,9 @@ pub use binary_paths::{
     daemon_binary_path, engine_binary_path, sibling_binary_path, sibling_binary_path_from,
 };
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
-pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
+pub use command_capture::{
+    CommandCapture, CommandOutcome, command_capture_text, run_rocm_capture_with_env,
+};
 pub use config::{
     AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
     DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
@@ -179,16 +182,20 @@ pub use net::{
     http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
-pub use paths::{AppPaths, engine_plugin_dirs};
+pub use paths::{
+    AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV, DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs,
+};
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
+    RecordedPidStop, TerminationOutcome, identity_state, process_start_ticks,
+    terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
+    terminate_verified,
 };
 pub use process::{
-    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
     is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
-    lease_loopback_port_or_bind_error, process_is_running, terminate_process,
-    terminate_process_tree,
+    lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
+    terminate_process_tree, windows_system_tool,
 };
 #[cfg(windows)]
 pub use process::{
@@ -234,6 +241,7 @@ pub use service_record::{
     INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
     engine_stop_decides_confirmation,
 };
+pub use sigpipe::with_sigpipe_ignored;
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
@@ -268,6 +276,17 @@ pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT
 pub fn torch_alignment_disabled() -> bool {
     std::env::var_os(TORCH_ALIGNMENT_DISABLED_ENV).is_some()
 }
+
+/// The packages the SDK installs together with torch, in one transaction.
+///
+/// Under [`torch_alignment_disabled`] these are all treated as the user's: the SDK
+/// overwrites the lot, and vLLM pins an exact build of each, so sparing only torch
+/// leaves the others as defects whose repair reinstalls the engine's torch over the
+/// one the opt-out keeps. The CLI's dependency check and the engine's repair
+/// assessment both read this list, so they agree on which packages are spared. They
+/// still gate it differently: the engine spares them whenever the opt-out is set, the
+/// CLI only when the install settled on a torch divergence.
+pub const SDK_TORCH_STACK_PACKAGES: &[&str] = &["torch", "torchvision", "torchaudio", "triton"];
 
 pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     if value.trim().is_empty() {

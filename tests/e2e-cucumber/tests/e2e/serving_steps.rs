@@ -2207,22 +2207,13 @@ async fn assert_service_still_lists_openai_endpoint(world: &mut E2eWorld) {
     );
 }
 
-#[when("the user sends a request to the Anthropic messages endpoint")]
-async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
+/// POST `body` to the served model's Anthropic endpoint and return the JSON
+/// reply, whatever its status.
+async fn post_anthropic_messages(world: &mut E2eWorld, body: serde_json::Value) {
     let base = listed_anthropic_endpoint(world)
         .await
         .expect("no Anthropic endpoint is listed for the served model");
     let budget = Duration::from_secs(crate::inference_timeout_for(world));
-    // Sent under a Claude model name on purpose: an Anthropic client names a
-    // Claude model, and the endpoint answers for the model that is served.
-    // The budget leaves room for a reasoning model (Qwen3) to finish thinking
-    // before it answers: at 32 tokens the whole reply was spent on reasoning
-    // and the text block came back empty with `stop_reason: max_tokens`.
-    let body = serde_json::json!({
-        "model": "claude-sonnet-4-5",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": "Hello"}],
-    });
     let reply = tokio::spawn(async move {
         reqwest::Client::builder()
             .timeout(budget)
@@ -2241,6 +2232,92 @@ async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
     .await
     .expect("the Anthropic request task panicked");
     world.anthropic_response = Some(reply);
+}
+
+#[when("the user sends a request to the Anthropic messages endpoint")]
+async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
+    // Sent under a Claude model name on purpose: an Anthropic client names a
+    // Claude model, and the endpoint answers for the model that is served.
+    // The budget leaves room for a reasoning model (Qwen3) to finish thinking
+    // before it answers: at 32 tokens the whole reply was spent on reasoning
+    // and the text block came back empty with `stop_reason: max_tokens`.
+    post_anthropic_messages(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }),
+    )
+    .await;
+}
+
+/// The tool the tool-use scenario offers, and the argument it requires.
+const ANTHROPIC_TOOL_NAME: &str = "get_weather";
+const ANTHROPIC_TOOL_ARGUMENT: &str = "city";
+
+#[when("the user sends a tool-use request to the Anthropic messages endpoint")]
+async fn user_sends_anthropic_tool_use_request(world: &mut E2eWorld) {
+    // The tool is named in `tool_choice` so the reply does not depend on the
+    // model choosing to call it: what is under test is the translation of the
+    // definition out and of the call back, not the model's judgement.
+    post_anthropic_messages(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "tools": [{
+                "name": ANTHROPIC_TOOL_NAME,
+                "description": "Get the current weather for a city.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {ANTHROPIC_TOOL_ARGUMENT: {"type": "string"}},
+                    "required": [ANTHROPIC_TOOL_ARGUMENT],
+                },
+            }],
+            "tool_choice": {"type": "tool", "name": ANTHROPIC_TOOL_NAME},
+            "messages": [{"role": "user", "content": "What is the weather in Oslo?"}],
+        }),
+    )
+    .await;
+}
+
+fn anthropic_tool_use_block(world: &E2eWorld) -> serde_json::Value {
+    let reply = world
+        .anthropic_response
+        .as_ref()
+        .expect("no Anthropic response");
+    reply["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no tool_use content block in the reply: {reply}"))
+}
+
+#[then("the response contains a tool_use content block")]
+async fn assert_anthropic_tool_use_block(world: &mut E2eWorld) {
+    let block = anthropic_tool_use_block(world);
+    assert!(
+        block["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the tool_use block has no id: {block}"
+    );
+    assert_eq!(
+        world.anthropic_response.as_ref().unwrap()["stop_reason"],
+        "tool_use",
+        "a reply with a tool call stops for tool use"
+    );
+}
+
+#[then("the tool_use block names a tool and arguments from the request")]
+async fn assert_anthropic_tool_use_names_request_tool(world: &mut E2eWorld) {
+    let block = anthropic_tool_use_block(world);
+    assert_eq!(block["name"], ANTHROPIC_TOOL_NAME, "{block}");
+    assert!(
+        block["input"][ANTHROPIC_TOOL_ARGUMENT]
+            .as_str()
+            .is_some_and(|city| !city.is_empty()),
+        "the tool_use input has no `{ANTHROPIC_TOOL_ARGUMENT}` argument: {block}"
+    );
 }
 
 #[then("the response is a valid Anthropic Messages API response")]
@@ -2277,6 +2354,141 @@ async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
     assert!(
         model_ids_match(model, expected),
         "the Anthropic response model '{model}' does not identify '{expected}'"
+    );
+}
+
+#[when("the user sends a streaming request to the Anthropic messages endpoint")]
+async fn user_sends_streaming_anthropic_messages_request(world: &mut E2eWorld) {
+    let base = listed_anthropic_endpoint(world)
+        .await
+        .expect("no Anthropic endpoint is listed for the served model");
+    let budget = Duration::from_secs(crate::inference_timeout_for(world));
+    // Same budget and model name as the non-streaming request above.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+    let (content_type, events) = tokio::spawn(async move {
+        let response = reqwest::Client::builder()
+            .timeout(budget)
+            .build()
+            .expect("failed to build HTTP client")
+            .post(format!("{base}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages failed: {error}"));
+        assert!(
+            response.status().is_success(),
+            "streaming request answered HTTP {}",
+            response.status()
+        );
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let events = response
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("reading the event stream failed: {error}"));
+        (content_type, events)
+    })
+    .await
+    .expect("the Anthropic streaming request task panicked");
+    world.anthropic_stream = Some(format!("content-type: {content_type}\n\n{events}"));
+}
+
+/// The content type and `(event name, data)` pairs of the streamed response.
+fn parse_anthropic_stream(world: &E2eWorld) -> (String, Vec<(String, serde_json::Value)>) {
+    let raw = world
+        .anthropic_stream
+        .as_deref()
+        .expect("no Anthropic streaming response");
+    let (header, body) = raw.split_once("\n\n").expect("stream capture is malformed");
+    let events = body
+        .split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .map(|frame| {
+            let event = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .unwrap_or_else(|| panic!("an SSE frame has no `event:` line:\n{frame}"));
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("an SSE frame has no `data:` line:\n{frame}"));
+            let data = serde_json::from_str(data)
+                .unwrap_or_else(|error| panic!("SSE data is not JSON ({error}):\n{frame}"));
+            (event.to_owned(), data)
+        })
+        .collect();
+    (header.to_owned(), events)
+}
+
+#[then("the response is delivered as Anthropic-style server-sent events")]
+async fn assert_anthropic_server_sent_events(world: &mut E2eWorld) {
+    let (header, events) = parse_anthropic_stream(world);
+    assert!(
+        header.contains("text/event-stream"),
+        "the streaming response is not an event stream: {header}"
+    );
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names.first(), Some(&"message_start"), "{names:?}");
+    assert_eq!(names.last(), Some(&"message_stop"), "{names:?}");
+    for required in [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+    ] {
+        assert!(
+            names.contains(&required),
+            "no `{required}` event: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"error"),
+        "the stream carried an error: {events:?}"
+    );
+    let model = events[0].1["message"]["model"].as_str().unwrap_or("");
+    let expected = world.model_name.as_deref().unwrap_or("");
+    assert!(
+        model_ids_match(model, expected),
+        "the streamed message model '{model}' does not identify '{expected}'"
+    );
+}
+
+#[then("the streamed content reassembles into a complete reply")]
+async fn assert_anthropic_stream_reassembles(world: &mut E2eWorld) {
+    let (_, events) = parse_anthropic_stream(world);
+    let text: String = events
+        .iter()
+        .filter(|(name, _)| name == "content_block_delta")
+        .filter_map(|(_, data)| data["delta"]["text"].as_str())
+        .collect();
+    assert!(
+        !text.is_empty(),
+        "the streamed deltas carry no text: {events:?}"
+    );
+    let delta = events
+        .iter()
+        .find(|(name, _)| name == "message_delta")
+        .map(|(_, data)| data)
+        .expect("no message_delta");
+    assert!(
+        delta["delta"]["stop_reason"].is_string(),
+        "message_delta has no stop_reason: {delta}"
+    );
+    assert!(
+        delta["usage"]["output_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "message_delta reports no output tokens: {delta}"
     );
 }
 

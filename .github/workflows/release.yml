@@ -58,7 +58,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # No rust-cache restore/save: this job holds publishing credentials,
           # so it builds from a clean tree rather than a restorable cache.
@@ -87,6 +87,17 @@ jobs:
               exit 1
               ;;
           esac
+          # `rocm version` reports a release only for this shape; any other
+          # tag would ship binaries that call themselves 0.0.0-dev. Checked
+          # here so it fails before the builds rather than after them. The
+          # pattern and the length are RELEASE_TAG_PATTERN and
+          # RELEASE_VERSION_MAX_LEN (+1 for the v) in apps/rocm/build.rs, and
+          # its test `release_tag_grammar_is_the_same_everywhere` fails if
+          # they differ.
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || [ "${#VERSION}" -gt 65 ]; then
+            echo "release version must be vX.Y.Z with an optional -pre or +build suffix of letters, digits, '.', '-' and '+', at most 65 characters, got: ${VERSION}" >&2
+            exit 1
+          fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
         env:
           GITHUB_EVENT_INPUTS_TAG: ${{ github.event.inputs.tag }}
@@ -142,6 +153,23 @@ jobs:
             '
         env:
           STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
+
+      # The tag shape of `rocm version` (`X.Y.Z (vX.Y.Z, <hash>)`) is otherwise
+      # unit-tested only: every PR and nightly build resolves a branch, which
+      # reports `0.0.0-dev`. Run the binary this release ships and check that it
+      # leads with the tag's own version; "Determine version" has already
+      # checked that the tag has the `vX.Y.Z` shape that makes it a release.
+      - name: Check the release binary's version
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          OUTPUT="$(target/release/rocm --version)"
+          EXPECTED_PREFIX="rocm-cli ${VERSION#v} (${VERSION}, "
+          if [[ "${OUTPUT}" != "${EXPECTED_PREFIX}"*")" ]]; then
+            echo "release binary reports '${OUTPUT}', expected '${EXPECTED_PREFIX}<hash>)'" >&2
+            exit 1
+          fi
+          echo "release binary reports: ${OUTPUT}"
 
       - name: Package release bundle
         env:
@@ -228,7 +256,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -245,6 +273,20 @@ jobs:
         env:
           ROCM_CLI_RELEASE_REF: ${{ needs.release.outputs.version }}
         run: cargo build --release -p rocm -p rocmd -p xtask
+
+      # See the Linux job's "Check the release binary's version" step.
+      - name: Check the release binary's version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $version = $env:VERSION
+          $output = (& .\target\release\rocm.exe --version | Out-String).Trim()
+          $prefix = "rocm-cli $($version.Substring(1)) ($version, "
+          if (-not ($output.StartsWith($prefix, [StringComparison]::Ordinal) -and $output.EndsWith(')', [StringComparison]::Ordinal))) {
+            throw "release binary reports '$output', expected '$prefix<hash>)'"
+          }
+          Write-Host "release binary reports: $output"
 
       - name: Package Windows bundle
         shell: pwsh

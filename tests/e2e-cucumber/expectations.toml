@@ -116,10 +116,30 @@ reason = "Lemonade managed serve never exposes the model, so the Anthropic reque
 serve_timeout_secs = 90
 flaky = true
 
+[["serve-anthropic-messages-tool-use"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the tool-use request never gets an answer."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-messages-tool-use"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7223"
+reason = "The served vLLM model is started without a tool-call parser, so it rejects a request that names a tool; the endpoint relays that refusal."
+serve_timeout_secs = 90
+
 [["serve-anthropic-endpoint-readiness"]]
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model, so readiness never covers the Anthropic endpoint."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-messages-streaming"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the streaming Anthropic request never gets an answer."
 serve_timeout_secs = 90
 flaky = true
 

@@ -7,12 +7,9 @@ use rocm_core::{AppPaths, ManagedServiceRecord};
 use rocm_engine_protocol::{EngineMethod, StopRequest, StopResponse};
 use serde_json::Value;
 use serde_json::json;
-#[cfg(windows)]
-use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration;
 
 pub(crate) fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
-    stop_managed_service_with(paths, service_id, terminate_recorded_pid)
+    stop_managed_service_with(paths, service_id, rocm_core::terminate_recorded_pid)
 }
 
 fn find_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
@@ -23,8 +20,8 @@ fn find_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
 }
 
 /// [`stop_managed_service`], with the per-PID termination supplied by the
-/// caller. Production passes [`terminate_recorded_pid`]; a test passes a
-/// stand-in for the outcomes it cannot construct on demand. Only the signalling
+/// caller. Production passes [`rocm_core::terminate_recorded_pid`]; a test
+/// passes a stand-in for the outcomes it cannot construct on demand. Only the signalling
 /// and its verdict are replaced: building the PID list, the manifest writes,
 /// the key cleanup and the report all run for real.
 pub(crate) fn stop_managed_service_with(
@@ -59,7 +56,7 @@ pub(crate) fn stop_managed_service_via(
 ) -> Result<Value> {
     let mut stopping = find_managed_service(paths, service_id)?;
     // Record the request before the stop starts, not only after it ends. A stop
-    // can take up to `MANAGED_STOP_GRACE` twice per recorded PID, and for that
+    // can take up to `rocm_core::MANAGED_STOP_GRACE` twice per recorded PID, and for that
     // whole window the service still reads `ready`/`running` while its endpoint
     // stops answering — exactly what the daemon's `server-recover` watcher
     // restarts. The marker is what that watcher skips (`stop_requested`), so it
@@ -73,32 +70,27 @@ pub(crate) fn stop_managed_service_via(
     // container-backed engine (`aim`) this is the only thing that stops the
     // container, since its recorded PIDs are only the supervisor that follows it.
     let engine_stop = (stopping.engine != "lemonade").then(|| engine_stop(paths, &stopping));
-    let stops = terminate_recorded_service_pids(&stopping, terminate);
-    let pids_where = |keep: fn(&RecordedPidStop) -> bool| -> Vec<u32> {
+    let stops = rocm_core::terminate_recorded_service_pids(&stopping, terminate);
+    let pids_where = |keep: fn(rocm_core::RecordedPidStop) -> bool| -> Vec<u32> {
         stops
             .iter()
-            .filter(|stop| keep(stop))
-            .map(|s| s.pid)
+            .copied()
+            .filter(|stop| keep(*stop))
+            .map(|stop| stop.pid)
             .collect()
     };
-    let signaled_pids = pids_where(|stop| stop.signaled);
-    let force_signaled_pids = pids_where(|stop| stop.forced);
+    let signaled_pids = pids_where(rocm_core::RecordedPidStop::signaled);
+    let force_signaled_pids = pids_where(rocm_core::RecordedPidStop::forced);
     // Everything that was deliberately not signalled, which is no longer one
     // kind of thing: the stopping process itself; a PID that was already gone;
     // a PID that is live but provably belongs to somebody else now; and a live
     // PID whose identity could not be read at all, which may still be the engine
     // and may still hold the device. Only `pid_outcomes` separates them, and
     // only `stopped` reports that the last of those is not a completed stop.
-    let skipped_pids = pids_where(|stop| !stop.signaled);
+    let skipped_pids = pids_where(|stop| !stop.signaled());
     let pid_outcomes = stops
         .iter()
-        .map(|stop| {
-            json!({
-                "pid": stop.pid,
-                "role": stop.role,
-                "outcome": stop.outcome,
-            })
-        })
+        .map(|stop| stop.report_entry())
         .collect::<Vec<_>>();
     // Re-read the record rather than write back the copy loaded before the
     // stop: `write` replaces the whole file, and other writers — a supervisor
@@ -113,8 +105,8 @@ pub(crate) fn stop_managed_service_via(
     // would each be false.
     let engine_stop_confirms = !rocm_core::engine_stop_decides_confirmation(&stopping.engine)
         || engine_stop.as_ref().is_some_and(Result::is_ok);
-    let all_stopped = stops.iter().all(|stop| stop.stopped)
-        && stopping.names_same_processes(&record)
+    let all_stopped = stops.iter().all(|stop| stop.stopped())
+        && record.is_covered_by_stop_of(&stopping)
         && engine_stop_confirms;
     // A PID whose identity cannot be read at all — `/proc/<pid>/stat`
     // unreadable while `kill(pid, 0)` still answers: another uid, `hidepid`, an
@@ -135,11 +127,9 @@ pub(crate) fn stop_managed_service_via(
         record.stop_requested_unix_ms = None;
         // Recorded PIDs go stale the instant their processes exit, and a stale
         // PID is exactly what the identity check exists to catch — so do not
-        // leave one behind for the next stop to find.
-        record.supervisor_pid = 0;
-        record.supervisor_start_ticks = None;
-        record.engine_pid = None;
-        record.engine_start_ticks = None;
+        // leave one behind for the next stop to find. The same call
+        // `rocm services stop` makes on its confirmed path.
+        record.clear_recorded_processes();
     } else {
         // The recorded PIDs stay: an unconfirmed survivor is still the
         // service's, and the record is what names it.
@@ -206,179 +196,6 @@ fn engine_stop_report(engine_stop: Option<Result<StopResponse>>) -> Value {
 /// caller can never mistake a missing field for a completed stop.
 pub(crate) fn stop_report_confirmed(report: &Value) -> bool {
     report.get("stopped").and_then(Value::as_bool) == Some(true)
-}
-
-/// How long a stop waits for a recorded process tree to exit on its own before
-/// escalating to a forced kill. Matches `rocm services stop`, which terminates
-/// the same records.
-const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
-
-/// What a stop did about one PID recorded in a service manifest.
-struct RecordedPidStop {
-    pid: u32,
-    /// Which recorded PID this is: `supervisor`, `engine`, or
-    /// `supervisor_and_engine` when the record holds the same PID for both.
-    role: &'static str,
-    /// Stable label for what happened, from
-    /// [`rocm_core::TerminationOutcome::as_str`], plus `self` for the stopping
-    /// process's own PID.
-    outcome: &'static str,
-    signaled: bool,
-    forced: bool,
-    /// Whether the recorded process is confirmed to be no longer running.
-    stopped: bool,
-}
-
-/// Terminate the processes a service manifest records, verifying identity first.
-///
-/// PIDs are recycled, so a persisted PID is not by itself evidence that the
-/// recorded process is still the one holding it. Each PID is therefore paired
-/// with **its own** start-time token — `supervisor_start_ticks` with
-/// `supervisor_pid`, `engine_start_ticks` with `engine_pid` — and routed through
-/// [`rocm_core::terminate_verified`], which signals nothing when the recorded
-/// identity is refuted. `rocm services stop` reads the same records through the
-/// same primitive, so neither command can decide differently about one.
-///
-/// Descendants are reached from the *verified* root rather than expanded out of
-/// a live process listing keyed on a PID nobody checked — which, given a stale
-/// root, enumerated a stranger's children and signalled those too. Where the
-/// kernel start-time is readable, `terminate_verified` additionally binds each
-/// child to its own identity before any forced kill; see
-/// [`terminate_recorded_pid`] for what Windows can and cannot do here.
-///
-/// The stopping process's own PID is reported but never signalled, and does not
-/// count towards "the recorded service is gone": `rocmd` records itself as the
-/// supervisor of the services it launches, and it is the launcher, not the
-/// service.
-///
-/// `terminate` performs the verified termination of one recorded PID;
-/// production passes [`terminate_recorded_pid`].
-fn terminate_recorded_service_pids(
-    record: &ManagedServiceRecord,
-    terminate: impl Fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
-) -> Vec<RecordedPidStop> {
-    // Build the (pid, role, own-token) work list, de-duplicating on PID and
-    // preferring an entry that carries a verifiable start-time. The two PIDs can
-    // coincide — a launcher that is also the server — and a token must never be
-    // read across from the PID it does not belong to.
-    let mut entries: Vec<(u32, &'static str, Option<u64>)> = Vec::new();
-    for (pid, role, ticks) in [
-        (
-            Some(record.supervisor_pid),
-            "supervisor",
-            record.supervisor_start_ticks,
-        ),
-        (record.engine_pid, "engine", record.engine_start_ticks),
-    ] {
-        let Some(pid) = pid.filter(|pid| *pid != 0) else {
-            continue;
-        };
-        if let Some(existing) = entries.iter_mut().find(|(seen, _, _)| *seen == pid) {
-            // Only the engine entry can land here, aliasing the supervisor: the
-            // one PID is both, and is reported as both.
-            existing.1 = "supervisor_and_engine";
-            if existing.2.is_none() {
-                existing.2 = ticks;
-            }
-        } else {
-            entries.push((pid, role, ticks));
-        }
-    }
-
-    entries
-        .into_iter()
-        .map(|(pid, role, ticks)| {
-            if pid == std::process::id() {
-                return RecordedPidStop {
-                    pid,
-                    role,
-                    outcome: "self",
-                    signaled: false,
-                    forced: false,
-                    stopped: true,
-                };
-            }
-            let outcome = terminate(&rocm_core::ProcessIdentity::new(pid, ticks));
-            RecordedPidStop {
-                pid,
-                role,
-                outcome: outcome.as_str(),
-                // TimedOut belongs with the signalled: the signal went out, the
-                // exit was just never observed. `stopped` carries that truth.
-                signaled: matches!(
-                    outcome,
-                    rocm_core::TerminationOutcome::Graceful
-                        | rocm_core::TerminationOutcome::Forced
-                        | rocm_core::TerminationOutcome::TimedOut
-                ),
-                // "The stop escalated to a forced kill", not "the forced kill
-                // worked": a forced stop only reaches `TimedOut` by way of that
-                // escalation, and `stopped` is what says whether the process
-                // actually went away.
-                forced: matches!(
-                    outcome,
-                    rocm_core::TerminationOutcome::Forced | rocm_core::TerminationOutcome::TimedOut
-                ),
-                stopped: outcome.stopped(),
-            }
-        })
-        .collect()
-}
-
-/// Terminate one recorded process after verifying its identity.
-///
-/// The stop is forced: its contract is definitive, so the command must not
-/// report success while an engine worker still holds the GPU. Only a process
-/// whose recorded identity is confirmed is ever reached by it.
-fn terminate_recorded_pid(identity: &rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome {
-    // Windows needs the descendants taken separately. `rocm_core` has no way to
-    // walk a process tree there — `process_tree_pids` returns just the root — and
-    // the engine runs one level below the recorded PID, because `rocmd` launches
-    // it through an `__engine-serve-http` process. A root-only kill would leave
-    // the engine running and still holding the device.
-    //
-    // Identity verification does not apply on Windows. `process_start_ticks`
-    // has no `/proc` to read there and returns `None`, so no recorded identity
-    // can be refuted and the gate below only ever turns away a PID that is not
-    // running at all. A recorded PID that has been recycled by an unrelated
-    // process still passes it, and `taskkill /T /F` then takes that process and
-    // its whole subtree: the stale-PID hazard is unchanged on Windows, exactly
-    // as it was before this gate existed. Closing it needs `rocm_core` to read a
-    // Windows process creation time.
-    #[cfg(windows)]
-    if matches!(
-        rocm_core::identity_state(identity),
-        rocm_core::IdentityState::Matches
-    ) {
-        // Taken while the root is still alive: `taskkill /T` resolves children
-        // through the live parent, so it cannot reach them once the root is gone.
-        let _ = ProcessCommand::new("taskkill")
-            .args(["/PID", &identity.pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        // `terminate_verified` still owns the bounded wait and the verdict, but
-        // a root the tree kill already took now reads back as `AlreadyGone` —
-        // which would deny a stop this command did perform.
-        let outcome = rocm_core::terminate_verified(
-            identity,
-            rocm_core::KillScope::Tree,
-            MANAGED_STOP_GRACE,
-            true,
-        );
-        return if matches!(outcome, rocm_core::TerminationOutcome::AlreadyGone) {
-            rocm_core::TerminationOutcome::Forced
-        } else {
-            outcome
-        };
-    }
-    rocm_core::terminate_verified(
-        identity,
-        rocm_core::KillScope::Tree,
-        MANAGED_STOP_GRACE,
-        true,
-    )
 }
 
 #[cfg(test)]
@@ -510,10 +327,11 @@ mod tests {
     /// a different process: the recorded service already exited and its PID was
     /// recycled. The stop must refuse it rather than signal a stranger.
     ///
-    /// Linux-only: a refutable identity needs a readable start-time, and
-    /// `rocm_core::process_start_ticks` reads it from `/proc`. On Windows it is
-    /// always `None`, so no identity can be refuted there and the state this
-    /// asserts on cannot be constructed.
+    /// Linux-only: it stages the bystander with `sleep` and offsets its token
+    /// read from `/proc`. The same refusal on Windows, where the token is the
+    /// process creation time, is asserted in `rocm-core`'s `proc_lifecycle`
+    /// tests (`terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
+    /// and its Windows-only neighbour) and by scenario `service-stop-08`.
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_managed_service_refuses_a_pid_whose_recorded_identity_no_longer_matches() -> Result<()>
@@ -1037,6 +855,137 @@ mod tests {
         Ok(())
     }
 
+    /// A `rocm` listing that sees every process gone completes the pending stop
+    /// and persists it (marker and key cleared, recorded processes forgotten,
+    /// `stopped`), possibly before this stop reads the record again. That record
+    /// names no process, which is not a restart: the stop is still confirmed and
+    /// the marker is not put back. The write below is exactly the one the
+    /// listing's cleanup makes (it lives in the `rocm` binary, which this crate
+    /// cannot call; `rocm` has the test that runs the real refresh).
+    #[test]
+    fn a_stop_completed_by_a_concurrent_listing_is_still_confirmed() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-listing-completed-it");
+        paths.ensure()?;
+        let service_id = "svc-stop-listing-completed-it";
+        let key_path = seed_keyed_service(&paths, service_id, 11455)?;
+
+        let result = stop_managed_service_with(&paths, service_id, |_| {
+            let mut on_disk = load_service_record(&paths, service_id).expect("record");
+            on_disk.clear_recorded_processes();
+            on_disk.stop_requested_unix_ms = None;
+            on_disk.status = "stopped".to_owned();
+            on_disk.write().expect("concurrent listing write");
+            rocm_core::TerminationOutcome::Graceful
+        });
+        let key_removed = !key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("stopped").and_then(Value::as_bool),
+            Some(true),
+            "{value}"
+        );
+        let reloaded = reloaded?;
+        assert_eq!(reloaded.status, "stopped");
+        assert_eq!(
+            reloaded.stop_requested_unix_ms, None,
+            "a confirmed stop does not put the marker back"
+        );
+        assert!(key_removed);
+        Ok(())
+    }
+
+    /// The listing's cleanup of an empty record (see above) leaves a `starting` or
+    /// `failed` record at its status with the marker gone and the marker's stamp
+    /// kept: that is the stop's own marker consumed, not a relaunch, so the stop
+    /// is confirmed. A record naming no process has no PID to terminate, so the
+    /// per-PID callback never runs; the engine `Stop` does (for every engine but
+    /// lemonade), and that is where the listing's write is made, with an assertion
+    /// that it happened. `rocm` has the test that runs the real refresh.
+    #[test]
+    fn a_stop_of_an_empty_record_whose_marker_a_listing_consumed_is_still_confirmed() -> Result<()>
+    {
+        for status in ["starting", "failed"] {
+            let (root, paths) = temp_app_paths(&format!("stop-empty-listing-{status}"));
+            paths.ensure()?;
+            let service_id = "svc-stop-empty-listing";
+            let key_path = seed_keyed_service(&paths, service_id, 11457)?;
+            let mut empty = load_service_record(&paths, service_id)?;
+            empty.clear_recorded_processes();
+            status.clone_into(&mut empty.status);
+            empty.write()?;
+            let interleaved = std::cell::Cell::new(false);
+
+            let result = stop_managed_service_via(
+                &paths,
+                service_id,
+                |_| unreachable!("a record naming no process has no PID to terminate"),
+                |_, _| {
+                    let mut on_disk = load_service_record(&paths, service_id).expect("record");
+                    assert!(on_disk.stop_requested_unix_ms.is_some(), "{status}");
+                    on_disk.settled_stop_unix_ms = on_disk.stop_requested_unix_ms.take();
+                    on_disk.write().expect("concurrent listing write");
+                    interleaved.set(true);
+                    Ok(StopResponse {
+                        stopped: true,
+                        graceful: true,
+                    })
+                },
+            );
+            let key_removed = !key_path.exists();
+            let reloaded = load_service_record(&paths, service_id);
+            fs::remove_dir_all(root).ok();
+
+            assert!(interleaved.get(), "{status}: premise: the listing ran");
+            let value = result?;
+            assert_eq!(
+                value.get("stopped").and_then(Value::as_bool),
+                Some(true),
+                "{status}: {value}"
+            );
+            let reloaded = reloaded?;
+            assert_eq!(reloaded.status, "stopped", "{status}");
+            assert_eq!(reloaded.stop_requested_unix_ms, None, "{status}");
+            assert!(key_removed, "{status}");
+        }
+        Ok(())
+    }
+
+    /// A restart that has begun launching but recorded no process yet reads
+    /// `starting` with nothing named: not the stop completing, so the stop does
+    /// not claim it or drop the key.
+    #[test]
+    fn a_stop_does_not_claim_a_restart_that_has_recorded_no_process_yet() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-restart-in-flight");
+        paths.ensure()?;
+        let service_id = "svc-stop-restart-in-flight";
+        let key_path = seed_keyed_service(&paths, service_id, 11456)?;
+
+        let result = stop_managed_service_with(&paths, service_id, |_| {
+            let mut on_disk = load_service_record(&paths, service_id).expect("record");
+            on_disk.clear_recorded_processes();
+            on_disk.stop_requested_unix_ms = None;
+            on_disk.status = "starting".to_owned();
+            on_disk.write().expect("concurrent restart write");
+            rocm_core::TerminationOutcome::Graceful
+        });
+        let key_kept = key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("stopped").and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_eq!(reloaded?.status, "starting");
+        assert!(key_kept, "the restarting service's key must be kept");
+        Ok(())
+    }
+
     /// A launcher that is also the server is recorded under both roles. The
     /// stop handles that PID once, and must report it under both.
     #[test]
@@ -1078,6 +1027,291 @@ mod tests {
             Some("supervisor_and_engine"),
             "{value}"
         );
+        Ok(())
+    }
+
+    // ---- This module's stop, through the routine it shares with `rocm`. ----
+    //
+    // The routine itself (visiting order, start-time pairing, the `self` row,
+    // the per-outcome classification, the Windows tree-kill step) is tested in
+    // `rocm-core`'s `proc_lifecycle.rs`. These check that this caller reaches it
+    // and reports what it returns. The termination is a stand-in throughout, so
+    // no process is signalled and the tests behave the same on every host.
+
+    const SUPERVISOR_PID: u32 = 999_999_998;
+    const ENGINE_PID: u32 = 999_999_997;
+
+    /// Plant a record naming `supervisor` and `engine`, with the given start-time
+    /// tokens, and return the paths it lives under.
+    fn plant_record_naming(
+        name: &str,
+        supervisor: u32,
+        supervisor_ticks: Option<u64>,
+        engine: Option<u32>,
+        engine_ticks: Option<u64>,
+    ) -> Result<(std::path::PathBuf, AppPaths, &'static str)> {
+        let (root, paths) = temp_app_paths(name);
+        paths.ensure()?;
+        let service_id = "svc-stop-through-the-shared-routine";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            supervisor,
+            None,
+            None,
+            None,
+        );
+        record.supervisor_start_ticks = supervisor_ticks;
+        record.engine_pid = engine;
+        record.engine_start_ticks = engine_ticks;
+        record.status = "ready".to_owned();
+        record.write()?;
+        Ok((root, paths, service_id))
+    }
+
+    fn pids_listed(report: &Value, key: &str) -> Vec<u64> {
+        report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("no `{key}` in {report}"))
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_terminates_the_supervisor_then_the_engine_each_with_its_own_start_time() -> Result<()>
+    {
+        let (root, paths, service_id) = plant_record_naming(
+            "stop-order",
+            SUPERVISOR_PID,
+            Some(11),
+            Some(ENGINE_PID),
+            Some(22),
+        )?;
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        let report = stop_managed_service_with(&paths, service_id, |identity| {
+            seen.borrow_mut().push(*identity);
+            rocm_core::TerminationOutcome::Graceful
+        });
+        fs::remove_dir_all(root).ok();
+
+        let report = report?;
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                rocm_core::ProcessIdentity::new(SUPERVISOR_PID, Some(11)),
+                rocm_core::ProcessIdentity::new(ENGINE_PID, Some(22)),
+            ]
+        );
+        assert_eq!(
+            report["pid_outcomes"],
+            json!([
+                {"pid": SUPERVISOR_PID, "role": "supervisor", "outcome": "graceful"},
+                {"pid": ENGINE_PID, "role": "engine", "outcome": "graceful"},
+            ])
+        );
+        assert_eq!(
+            pids_listed(&report, "signaled_pids"),
+            vec![u64::from(SUPERVISOR_PID), u64::from(ENGINE_PID)]
+        );
+        Ok(())
+    }
+
+    /// The stopping process's own PID is reported as `self`, never handed to the
+    /// termination, and does not stand in the way of a confirmed stop.
+    #[test]
+    fn a_stop_reports_its_own_pid_as_self_and_skips_it() -> Result<()> {
+        let own = std::process::id();
+        let (root, paths, service_id) =
+            plant_record_naming("stop-own-pid", own, None, Some(ENGINE_PID), None)?;
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        let report = stop_managed_service_with(&paths, service_id, |identity| {
+            seen.borrow_mut().push(identity.pid);
+            rocm_core::TerminationOutcome::Graceful
+        });
+        fs::remove_dir_all(root).ok();
+
+        let report = report?;
+        assert_eq!(seen.into_inner(), vec![ENGINE_PID]);
+        assert_eq!(
+            report["pid_outcomes"][0],
+            json!({"pid": own, "role": "supervisor", "outcome": "self"})
+        );
+        assert_eq!(pids_listed(&report, "skipped_pids"), vec![u64::from(own)]);
+        assert_eq!(
+            pids_listed(&report, "signaled_pids"),
+            vec![u64::from(ENGINE_PID)]
+        );
+        assert_eq!(report["stopped"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_sorts_each_outcome_into_the_signaled_forced_and_skipped_lists() -> Result<()> {
+        use rocm_core::TerminationOutcome::{
+            AlreadyGone, Forced, Graceful, IdentityMismatch, TimedOut, Unverified,
+        };
+        // (outcome, signaled, forced, skipped, stopped)
+        let expected = [
+            (AlreadyGone, false, false, true, true),
+            (IdentityMismatch, false, false, true, true),
+            (Unverified, false, false, true, false),
+            (Graceful, true, false, false, true),
+            (Forced, true, true, false, true),
+            (TimedOut, true, true, false, false),
+        ];
+        for (outcome, signaled, forced, skipped, stopped) in expected {
+            let (root, paths, service_id) =
+                plant_record_naming("stop-classes", SUPERVISOR_PID, None, None, None)?;
+
+            let report = stop_managed_service_with(&paths, service_id, |_| outcome);
+            fs::remove_dir_all(root).ok();
+
+            let report = report?;
+            let listed = |key| !pids_listed(&report, key).is_empty();
+            assert_eq!(
+                (
+                    listed("signaled_pids"),
+                    listed("force_signaled_pids"),
+                    listed("skipped_pids"),
+                    report["stopped"].as_bool()
+                ),
+                (signaled, forced, skipped, Some(stopped)),
+                "{outcome:?}: {report}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_production_stop_reports_an_absent_pid_as_already_gone() -> Result<()> {
+        let (root, paths, service_id) =
+            plant_record_naming("stop-production-absent", SUPERVISOR_PID, None, None, None)?;
+
+        let report = stop_managed_service(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let report = report?;
+        assert_eq!(report["pid_outcomes"][0]["outcome"], "already_gone");
+        assert_eq!(report["stopped"], true);
+        Ok(())
+    }
+
+    /// A second copy of the shared routine, or of its grace constant, is how the
+    /// two binaries diverged in the first place; the shared one lives in
+    /// `rocm-core`'s `proc_lifecycle.rs`. The needles are assembled so that this
+    /// test does not match itself.
+    #[test]
+    fn this_module_carries_no_private_copy_of_the_shared_stop_routine() {
+        let source = include_str!("service.rs");
+        for needle in [
+            ["const ", "MANAGED_STOP_GRACE"].concat(),
+            ["fn ", "terminate_recorded_service_pids"].concat(),
+            ["fn ", "terminate_recorded_pid"].concat(),
+            ["Command::new(\"task", "kill\")"].concat(),
+        ] {
+            assert!(
+                !source.contains(&needle),
+                "`{needle}` is defined in `rocm-core`, not here"
+            );
+        }
+    }
+
+    /// A root that exited by itself before its tree could be taken down confirms
+    /// the stop only through the record's other roles, as this caller folds
+    /// them: the supervisor's own row is not enough, and the record, its PIDs,
+    /// its stop marker and its key are kept unless the engine role is
+    /// confirmed gone too.
+    #[test]
+    fn a_root_that_exited_alone_confirms_the_stop_only_when_the_engine_role_does() -> Result<()> {
+        use rocm_core::TerminationOutcome::{ExitedBeforeTreeKill, Forced, TimedOut};
+
+        for (engine, confirmed) in [(Forced, true), (TimedOut, false)] {
+            let (root, paths, service_id) = plant_record_naming(
+                "stop-root-exited-alone",
+                SUPERVISOR_PID,
+                None,
+                Some(ENGINE_PID),
+                None,
+            )?;
+            let key = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+            fs::create_dir_all(paths.services_dir())?;
+            fs::write(&key, "secret-key")?;
+
+            let report = stop_managed_service_with(&paths, service_id, |identity| {
+                if identity.pid == SUPERVISOR_PID {
+                    ExitedBeforeTreeKill
+                } else {
+                    engine
+                }
+            })?;
+            let record = find_managed_service(&paths, service_id)?;
+            let key_kept = key.exists();
+            fs::remove_dir_all(root).ok();
+
+            assert_eq!(
+                stop_report_confirmed(&report),
+                confirmed,
+                "{engine:?}: {report}"
+            );
+            assert_eq!(
+                report["pid_outcomes"][0]["outcome"],
+                if confirmed {
+                    "already_gone"
+                } else {
+                    "exited_before_tree_kill"
+                },
+                "{engine:?}: {report}"
+            );
+            if confirmed {
+                assert_eq!(record.status, "stopped");
+                assert_eq!(
+                    record.supervisor_pid, 0,
+                    "the confirmed stop clears the PIDs"
+                );
+                assert!(!key_kept, "and the key");
+            } else {
+                assert_eq!(record.status, "ready", "{engine:?}");
+                assert_eq!(record.supervisor_pid, SUPERVISOR_PID, "the PIDs are kept");
+                assert!(
+                    record.stop_requested_unix_ms.is_some(),
+                    "the marker is kept"
+                );
+                assert!(key_kept, "the key is kept");
+            }
+        }
+        Ok(())
+    }
+
+    /// A root that exited by itself with no other role recorded cannot be
+    /// vouched for, so this caller does not clear the record on its say-so.
+    #[test]
+    fn a_lone_root_that_exited_alone_leaves_the_stop_unconfirmed() -> Result<()> {
+        let (root, paths, service_id) = plant_record_naming(
+            "stop-lone-root-exited-alone",
+            SUPERVISOR_PID,
+            None,
+            None,
+            None,
+        )?;
+
+        let report = stop_managed_service_with(&paths, service_id, |_| {
+            rocm_core::TerminationOutcome::ExitedBeforeTreeKill
+        })?;
+        let record = find_managed_service(&paths, service_id)?;
+        fs::remove_dir_all(root).ok();
+
+        assert!(!stop_report_confirmed(&report), "{report}");
+        assert_eq!(record.supervisor_pid, SUPERVISOR_PID);
+        assert!(record.stop_requested_unix_ms.is_some());
         Ok(())
     }
 }

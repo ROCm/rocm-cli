@@ -31,15 +31,16 @@
 use super::family::family_override_or_recovered_arch;
 use super::process::SuppressProgressOutput;
 use super::python::{
-    PythonLauncher, PythonSource, plan_python_launcher, python_launcher_install_ready,
-    python_requirement, resolve_python_launcher, wheel_compatibility_for_python,
+    PythonLauncher, PythonRequirement, PythonSource, plan_python_launcher,
+    python_launcher_install_ready, python_requirement, python_requirement_for_tag,
+    resolve_python_launcher, wheel_compatibility_for_python,
 };
 use super::resolve::{
     AggregateDeviceTarget, resolve_pip_runtime_with_timeout, resolve_tarball_artifact_with_timeout,
     wheel_runtime_composition,
 };
-use super::source::{SourceLayout, TheRockChannel};
-use super::version::{runtime_version_display, version_relation};
+use super::source::{SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel};
+use super::version::{parse_version, runtime_version_display, version_relation};
 use super::{runtime_key, wheel_runtime_key};
 use crate::runtime_registry::{
     InstalledRuntimeManifest, WheelRuntimeComposition, load_runtime_manifests,
@@ -476,6 +477,66 @@ fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String
     family_override_or_recovered_arch(&manifest.family, recorded_arch)
 }
 
+/// The layout whose interpreters `manifest`'s runtime was built against.
+///
+/// The recorded source layout is not enough: an unpinned or build-date nightly
+/// install records the canonical layout even when the channel's newest build is
+/// ROCm 10 and the install went on the ROCm 10 Python (see
+/// `canonical_auto_select_needs_next_python`). The recorded ROCm version is the
+/// other half of the answer, so a ROCm 10+ runtime counts as `Next` whichever
+/// layout it was read from.
+fn python_layout_of(manifest: &InstalledRuntimeManifest, layout: SourceLayout) -> SourceLayout {
+    let rocm_10_or_newer = parse_version(&manifest.version)
+        .is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR);
+    if layout == SourceLayout::Next || rocm_10_or_newer {
+        SourceLayout::Next
+    } else {
+        SourceLayout::Canonical
+    }
+}
+
+/// The interpreter an update of `manifest` goes on with.
+///
+/// A ROCm 10+ runtime installed with `--python-version` keeps the Python it was
+/// built on, so an update does not silently move it to the layout's default
+/// (which would also leave it unable to carry the packages it was chosen for).
+/// Anything else follows the layout.
+fn recorded_python_requirement(
+    manifest: &InstalledRuntimeManifest,
+    layout: SourceLayout,
+) -> PythonRequirement {
+    let tag = manifest
+        .python_executable
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .and_then(|path| wheel_compatibility_for_python(&path).ok())
+        .map(|compatibility| compatibility.python_tag);
+    requirement_for_recorded_tag(manifest, layout, tag.as_deref())
+}
+
+/// [`recorded_python_requirement`] once the recorded interpreter's wheel tag has
+/// been read (`None` when it is missing or unreadable), so the decision runs
+/// without a Python on disk.
+fn requirement_for_recorded_tag(
+    manifest: &InstalledRuntimeManifest,
+    layout: SourceLayout,
+    tag: Option<&str>,
+) -> PythonRequirement {
+    let layout = python_layout_of(manifest, layout);
+    tag.and_then(|tag| python_requirement_for_tag(layout, tag))
+        .unwrap_or_else(|| python_requirement(layout))
+}
+
+/// The `--python-version` an update of `manifest` reinstalls with: the one the
+/// runtime was built on, for a ROCm 10+ wheel runtime, and none for any other (a
+/// tarball runtime has no Python of its own to carry over).
+pub(crate) fn recorded_python_version(manifest: &InstalledRuntimeManifest) -> Option<&'static str> {
+    let layout = manifest_source_layout(manifest).ok()?;
+    (manifest.format == "wheel" && python_layout_of(manifest, layout) == SourceLayout::Next)
+        .then(|| recorded_python_requirement(manifest, layout).version)
+}
+
 fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
@@ -490,7 +551,7 @@ fn resolve_latest_for_manifest(
             // interpreter, so the recorded one is re-checked rather than trusted
             // on `is_file()` alone; otherwise a canonical cp312 venv would carry
             // into a next-layout update and resolve nothing.
-            let requirement = python_requirement(layout);
+            let requirement = recorded_python_requirement(manifest, layout);
             let manifest_python = manifest
                 .python_executable
                 .as_deref()
@@ -769,6 +830,66 @@ mod tests {
         let manifest = test_runtime_manifest("v1:gfx120X-all", "canonical:gfx120X-all", 0);
 
         assert_eq!(manifest_wheel_family_override(&manifest), "gfx120X-all");
+    }
+
+    /// The engine auto-install skip reads this: a ROCm 7 (canonical) runtime has no
+    /// recorded Python choice even when it was installed with a redundant
+    /// `--python-version 3.12`, so vLLM is never skipped on it.
+    #[test]
+    fn recorded_python_version_is_only_reported_for_a_rocm_10_runtime() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-release:gfx94X-dcgpu", 0);
+        assert_eq!(recorded_python_version(&manifest), None);
+
+        manifest.source_layout_generation = Some("next-v1".to_owned());
+        manifest.format = "wheel".to_owned();
+        assert_eq!(
+            recorded_python_version(&manifest),
+            Some(super::super::NEXT_MANAGED_PYTHON_VERSION)
+        );
+
+        manifest.format = "tarball".to_owned();
+        assert_eq!(recorded_python_version(&manifest), None);
+    }
+
+    /// An unpinned nightly install that resolved to ROCm 10 records the canonical
+    /// layout, yet it runs on the ROCm 10 Python; the chosen interpreter must still
+    /// be carried over, and a ROCm 7 runtime on the same layout must not.
+    #[test]
+    fn nightly_rocm_10_runtime_recorded_as_canonical_keeps_its_chosen_python() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-nightly:gfx94X-dcgpu", 0);
+        manifest.channel = "nightly".to_owned();
+        manifest.version = "10.0.0a20261105".to_owned();
+        manifest.source_layout_generation = Some("multi-arch-v2".to_owned());
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Canonical
+        );
+
+        let layout = SourceLayout::Canonical;
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, Some("cp312")).version,
+            "3.12"
+        );
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, Some("cp314")).version,
+            super::super::NEXT_MANAGED_PYTHON_VERSION
+        );
+        // Interpreter missing or unreadable: the ROCm 10 default, not cp312.
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, None).version,
+            super::super::NEXT_MANAGED_PYTHON_VERSION
+        );
+        assert_eq!(
+            recorded_python_version(&manifest),
+            Some(super::super::NEXT_MANAGED_PYTHON_VERSION)
+        );
+
+        manifest.version = "7.13.0a20260416".to_owned();
+        assert_eq!(recorded_python_version(&manifest), None);
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, Some("cp312")).tag,
+            "cp312"
+        );
     }
 
     /// An installed runtime must keep resolving the stream it came from, and a

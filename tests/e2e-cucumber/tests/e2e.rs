@@ -83,6 +83,9 @@ pub struct E2eWorld {
     /// The reply to a request sent to the served model's Anthropic-compatible
     /// `/v1/messages` endpoint.
     pub anthropic_response: Option<serde_json::Value>,
+    /// The raw server-sent-event body of a streaming request sent to the same
+    /// endpoint.
+    pub anthropic_stream: Option<String>,
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
@@ -93,11 +96,21 @@ pub struct E2eWorld {
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
-    /// lock was still held cannot have waited for it. It is a one-sided bound:
-    /// the measurement brackets the whole child process, so a long elapsed time
-    /// does not establish that the prune blocked. Set by the When step that
-    /// measures it; `None` everywhere else.
+    /// lock was still held cannot have waited for it, and `examine-48`, where an
+    /// inspection that finished long before a probe tool's background process
+    /// did cannot have waited for it. Both assert the short side of a one-sided
+    /// bound: the measurement brackets the whole child process, so a long elapsed
+    /// time does not establish that the command blocked. Set by the When step
+    /// that measures it; `None` everywhere else.
     pub cli_elapsed: Option<std::time::Duration>,
+    /// The `ROCM_CLI_DATA_DIR` value a refusal told the user to set, read from
+    /// its stderr by the first step that follows that advice, so later steps
+    /// can follow it again after other commands have replaced `cli_stderr`.
+    pub suggested_data_dir: Option<String>,
+    /// The file a refusal told the user to rename and the name to give it,
+    /// read from its stderr by the step that checks the refusal, for the step
+    /// that follows that advice after other commands have replaced `cli_stderr`.
+    pub suggested_settings_rename: Option<(String, String)>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
@@ -204,6 +217,11 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// The identity of a process the recorded one started (`service-stop-07`'s
+    /// `ping`). Teardown ends it on its own account, because a stop that fails
+    /// to take it down leaves it running with a dead parent, where nothing else
+    /// can find it.
+    pub recorded_descendant: Option<rocm_core::ProcessIdentity>,
     /// Whether the Doctor report preview in the dashboard console was the CLI's
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
@@ -346,12 +364,15 @@ impl Default for E2eWorld {
             model_name: None,
             chat_response: None,
             anthropic_response: None,
+            anthropic_stream: None,
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
             serve_runs: None,
             cli_elapsed: None,
+            suggested_data_dir: None,
+            suggested_settings_rename: None,
             remote_env: Vec::new(),
             launch_release: None,
             launch_stage: None,
@@ -372,6 +393,7 @@ impl Default for E2eWorld {
             skill_symptom: None,
             helper_identity: None,
             recorded_process: None,
+            recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,
         }
@@ -720,6 +742,21 @@ impl Drop for E2eWorld {
             let _ = process.kill();
             let _ = process.wait();
         }
+        // The process the recorded one started: ended too when it is still the
+        // process that was recorded, so a failed scenario does not leave it
+        // running until its own timeout.
+        if let Some(descendant) = self.recorded_descendant.take() {
+            use e2e_cucumber::stray_process::{Leftover, RecordedState, leftover_action};
+            let state = match rocm_core::identity_state(&descendant) {
+                rocm_core::IdentityState::Matches => RecordedState::Same,
+                rocm_core::IdentityState::Gone => RecordedState::Gone,
+                rocm_core::IdentityState::Recycled => RecordedState::Reused,
+                rocm_core::IdentityState::Indeterminate => RecordedState::Unconfirmed,
+            };
+            if leftover_action(state) == Leftover::Terminate {
+                let _ = rocm_core::terminate_recorded_pid(&descendant);
+            }
+        }
         // A scenario that enabled a watcher started a real detached `rocm daemon`,
         // which only exits once the watcher is disabled. If a step failed first,
         // nothing else would stop it, and it would keep polling a config dir
@@ -1023,6 +1060,44 @@ pub fn run_rocm_with_env_and_unset(
     )
 }
 
+/// Like [`run_rocm`], but without `ROCM_CLI_DATA_DIR`, so the CLI has to work
+/// out its data folder from its own settings file as it does for a user who
+/// never set it.
+///
+/// The home directory is pointed inside the scenario's sandbox as well, so the
+/// default data folder the CLI falls back to (`~/.rocm`) is never the real
+/// one on the runner.
+pub fn run_rocm_without_data_dir_override(
+    world: &E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let home = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has an isolated root")
+        .path()
+        .join("home");
+    std::fs::create_dir_all(&home).expect("failed to create sandbox home");
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.env_remove("ROCM_CLI_DATA_DIR");
+    cmd.env("HOME", &home);
+    cmd.env("USERPROFILE", &home);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
 /// Run `rocm` with the behavioral fixture established by a Given step, then
 /// consume it so it cannot leak into a later action in the same scenario.
 pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
@@ -1262,8 +1337,35 @@ fn load_expectations() -> e2e_cucumber::expectation::Expectations {
         .unwrap_or_else(|e| panic!("failed to parse expectations.toml: {e}"))
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack for the thread that drives the whole suite.
+///
+/// The cucumber run is one future polled by `block_on` on the calling thread, so
+/// every step future, and the evidence-gathering futures a failing serve step
+/// awaits, is held on that thread's stack. Windows gives a main thread 1 MiB
+/// against 8 MiB on Linux, and a stalled serve-06 overflowed it (#1003) instead
+/// of reporting a failure. A spawned thread's stack is whatever is asked for here.
+const SUITE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() {
+    let suite = std::thread::Builder::new()
+        .name("e2e-suite".to_owned())
+        .stack_size(SUITE_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build the tokio runtime")
+                .block_on(run_suite());
+        })
+        .expect("failed to spawn the e2e suite thread");
+    if let Err(payload) = suite.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+// `block_on` needs no `Send`, and the cucumber writers held across awaits are not.
+#[allow(clippy::future_not_send)]
+async fn run_suite() {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 

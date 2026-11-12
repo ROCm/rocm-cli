@@ -816,7 +816,8 @@ Feature: Model serving
   # beside the OpenAI one — the engine's own when it serves one, else a
   # translation front on its own port — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Streaming and tool use are not translated yet, so they have no scenario.
+  # Tool use is translated for non-streaming requests (serve-53); a streaming
+  # request that offers tools is refused, which only the unit tests cover.
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -839,3 +840,21 @@ Feature: Model serving
     And a model is being served on GPU
     When the CLI reports the service as ready
     Then both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy
+
+  # ROCMAI-920: tool use is translated in both directions. A request offering
+  # one tool and requiring it gets a `tool_use` block back.
+  @id:serve-anthropic-messages-tool-use @requires-gpu
+  Scenario: serve-53 - A served model handles tool use via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a tool-use request to the Anthropic messages endpoint
+    Then the response contains a tool_use content block
+    And the tool_use block names a tool and arguments from the request
+
+  @id:serve-anthropic-messages-streaming @requires-gpu
+  Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a streaming request to the Anthropic messages endpoint
+    Then the response is delivered as Anthropic-style server-sent events
+    And the streamed content reassembles into a complete reply

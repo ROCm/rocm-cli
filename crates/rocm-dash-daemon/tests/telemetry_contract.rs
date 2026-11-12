@@ -796,18 +796,155 @@ esac
     .unwrap_or_else(|e| panic!("limit and attributed power never appeared: {e}"));
 
     assert!((limit - 750.0).abs() < f32::EPSILON, "limit was {limit}");
-    // Neither service joins the per-container VRAM map (managed services can
-    // not), so the board is split equally and the two shares add back up to
+    // Neither service joins the per-container VRAM map (these records carry no
+    // pids, so there is no ancestry root to match), so the board is split equally and the two shares add back up to
     // what the GPU actually draws.
     assert!((a - 200.0).abs() < 1e-6, "shared-a got {a} W");
     assert!((b - 200.0).abs() < 1e-6, "shared-b got {b} W");
     // amd-smi lists a GPU process, so the VRAM scrape is "real", but that
-    // process is in no container the cgroup join can name. Managed services
-    // can never join that map by design, so this must not read as a /proc
-    // problem.
+    // process is in no container the cgroup join can name, and these services
+    // have no ancestry roots, so they could not join by design and this must
+    // not read as a /proc problem.
     assert!(
         !warnings.iter().any(|w| w.starts_with("vram attribution")),
         "false vram-attribution warning for healthy managed services: {warnings:?}"
+    );
+}
+
+// ── Managed-service VRAM attribution by process ancestry (ROCMAI-941) ───────
+
+/// A real child of `parent`, found through `/proc`, once the shell has forked it.
+#[cfg(target_os = "linux")]
+fn first_child_of(parent: u32) -> u32 {
+    for _ in 0..100 {
+        if let Ok(kids) = std::fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))
+            && let Some(pid) = kids.split_whitespace().next().and_then(|p| p.parse().ok())
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("process {parent} never forked a child");
+}
+
+/// Two fake "engine" processes, killed on drop, so a panic while waiting for a
+/// fork (or in any assert) does not leave the shells and their sleeping
+/// children behind.
+#[cfg(target_os = "linux")]
+struct Engines([std::process::Child; 2]);
+
+#[cfg(target_os = "linux")]
+impl Drop for Engines {
+    fn drop(&mut self) {
+        for e in &mut self.0 {
+            let _ = e.kill();
+            let _ = e.wait();
+        }
+    }
+}
+
+/// Contract: GPU processes that `amd-smi` lists are attributed to the managed
+/// service they descend from, by walking parent links to the PID rocm-cli
+/// recorded for it. Two services share one 400 W GPU; each gets its own VRAM
+/// (not the whole device) and a power share weighted by it, and the dashboard
+/// raises no "vram attribution" warning for them.
+///
+/// Uses real processes: each "engine" is a shell with a real child standing in
+/// for a GPU worker, so the `/proc/<pid>/stat` walk is the production one.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_services_get_their_own_vram_and_a_weighted_power_split() {
+    use rocm_core::fake_executable::write_fake_executable;
+    use std::process::{Command, Stdio};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+    std::fs::create_dir_all(&services_dir).unwrap();
+
+    // `; true` stops the shell exec-ing straight into `sleep`, so it really forks.
+    let spawn = |script: &str| {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake process")
+    };
+    // own-a: the recorded engine forks the worker directly. own-b: only the
+    // supervisor is recorded (as before the supervisor has seen its engine) and
+    // the worker sits two hops down, behind an unregistered intermediate shell.
+    let engines = Engines([
+        spawn("sleep 120; true"),
+        spawn("sh -c 'sleep 120; true'; true"),
+    ]);
+    let workers: Vec<u32> = vec![
+        first_child_of(engines.0[0].id()),
+        first_child_of(first_child_of(engines.0[1].id())),
+    ];
+
+    for (id, pids) in [
+        ("own-a", format!(r#""engine_pid":{}"#, engines.0[0].id())),
+        (
+            "own-b",
+            format!(r#""supervisor_pid":{}"#, engines.0[1].id()),
+        ),
+    ] {
+        let json = format!(
+            r#"{{"service_id":"{id}","engine":"vllm","model_ref":"M/{id}","canonical_model_id":"M/{id}","host":"127.0.0.1","port":9,"status":"ready","gpu_indices":[0],{pids},"created_at_unix_ms":0}}"#
+        );
+        std::fs::write(services_dir.join(format!("{id}.json")), json).unwrap();
+    }
+
+    let fake = tmp.path().join("amd-smi-fake");
+    write_fake_executable(
+        &fake,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  metric) echo '{{"gpu_data":[{{"gpu":0,"mem_usage":{{"used_vram":{{"value":4000}},"total_vram":{{"value":8000}}}},"usage":{{"gfx_activity":{{"value":50}}}},"temperature":{{"hotspot":{{"value":60}}}},"power":{{"socket_power":{{"value":400.0,"unit":"W"}}}}}}]}}' ;;
+  process) echo '{{"gpu_data":[{{"gpu":0,"process_list":[{{"process_info":{{"pid":{a},"memory_usage":{{"vram_mem":{{"value":3000,"unit":"MB"}}}}}}}},{{"process_info":{{"pid":{b},"memory_usage":{{"vram_mem":{{"value":1000,"unit":"MB"}}}}}}}}]}}]}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            a = workers[0],
+            b = workers[1]
+        ),
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let opts = RunnerOptions {
+        amd_smi_binary: Some(fake.into_os_string()),
+        amd_smi_skip_device_preflight: true,
+        ..fast_opts(services_dir)
+    };
+    let _runner = spawn_runner(tx, opts).await;
+
+    let seen = wait_for_snapshot(&mut rx, |snap| {
+        let get = |id: &str| snap.instances.iter().find(|i| i.container_id == id);
+        let (a, b) = (get("own-a")?, get("own-b")?);
+        Some((
+            a.vram_used_mb,
+            b.vram_used_mb,
+            a.power_w?,
+            b.power_w?,
+            snap.warnings.clone(),
+        ))
+    })
+    .await;
+
+    drop(engines);
+    let (a_vram, b_vram, a_w, b_w, warnings) =
+        seen.unwrap_or_else(|e| panic!("per-service VRAM and power never appeared: {e}"));
+
+    // Each service shows what its own GPU process holds, not the device total.
+    assert_eq!((a_vram, b_vram), (3000, 1000), "VRAM must be per service");
+    // Power follows that VRAM split of the 400 W board.
+    assert!((a_w - 300.0).abs() < 1e-6, "own-a got {a_w} W");
+    assert!((b_w - 100.0).abs() < 1e-6, "own-b got {b_w} W");
+    assert!(
+        !warnings.iter().any(|w| w.starts_with("vram attribution")),
+        "unexpected vram-attribution warning: {warnings:?}"
     );
 }
 

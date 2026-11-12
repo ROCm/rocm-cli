@@ -7,7 +7,7 @@
 //!
 //! Split out of `agent.rs` to keep the `AgentClient` seam focused. The shared
 //! seam types (`StateSnapshot`, `AgentError`, `AgentClient`, `InferenceParams`,
-//! `REQUEST_TIMEOUT`) stay in `agent/mod.rs`; the rig `Tool` registration these
+//! `request_timeout`) stay in `agent/mod.rs`; the rig `Tool` registration these
 //! backends call into lives in `agent::tools`.
 
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::tools::{
     FiredLog, register_rocm_mutating_tools, register_rocm_read_tools, register_telemetry_tools,
 };
-use super::{AgentClient, AgentError, InferenceParams, REQUEST_TIMEOUT, StateSnapshot};
+use super::{AgentClient, AgentError, InferenceParams, StateSnapshot, request_timeout};
 
 /// Max tool-calling turns the model may take before producing a final answer.
 const MAX_TOOL_TURNS: usize = 5;
@@ -191,7 +191,8 @@ pub fn annotate_reply(reply: String, fired: &[String]) -> String {
 }
 
 /// Drive a built rig prompt request to completion under the shared
-/// [`REQUEST_TIMEOUT`], then annotate the reply with the tools that fired.
+/// [`request_timeout`] budget, then annotate the reply with the tools that
+/// fired.
 ///
 /// The shared `complete()` tail, called from [`run_agent_request`] — the one
 /// call site all three backends (RigAgentClient, ChatGptAgentClient,
@@ -217,16 +218,31 @@ where
     F: std::future::IntoFuture<Output = Result<String, E>>,
     E: std::fmt::Display,
 {
+    finish_agent_request_within(request_timeout(), backend, req, fired).await
+}
+
+/// [`finish_agent_request`] with the budget passed in, so a test can drive the
+/// timeout path without touching the process environment.
+async fn finish_agent_request_within<F, E>(
+    budget: std::time::Duration,
+    backend: &'static str,
+    req: F,
+    fired: &FiredLog,
+) -> Result<String, AgentError>
+where
+    F: std::future::IntoFuture<Output = Result<String, E>>,
+    E: std::fmt::Display,
+{
     let started = Instant::now();
     info!(backend, "chat request start");
-    let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
+    let reply = match tokio::time::timeout(budget, req.into_future()).await {
         Err(_) => {
             warn!(
                 backend,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "chat request timed out"
             );
-            return Err(AgentError::Timeout);
+            return Err(AgentError::Timeout(budget.as_secs()));
         }
         Ok(Err(e)) => {
             error!(
@@ -887,6 +903,95 @@ mod tests {
     use crate::agent::{
         ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, TELEMETRY_TOOL_NAMES, fixture_snapshot,
     };
+
+    /// A request still running when its budget ends is reported as a timeout
+    /// that names the budget it was actually given, not a fixed number.
+    #[tokio::test]
+    async fn a_request_that_outlives_its_budget_times_out_naming_that_budget() {
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+        let never = std::future::pending::<Result<String, String>>();
+
+        let err =
+            finish_agent_request_within(std::time::Duration::from_secs(1), "test", never, &fired)
+                .await
+                .expect_err("a request that never answers must time out");
+
+        assert!(matches!(err, AgentError::Timeout(1)), "{err:?}");
+    }
+
+    /// The other half of the budget: a reply that arrives after a delay but
+    /// inside the budget reaches `annotate_reply` rather than the timeout arm.
+    /// The budget is passed in here, so this pins the in-budget branch, not the
+    /// default's size — `the_budget_and_its_upper_bound_are_the_values_the_docs_promise`
+    /// in `agent` is what holds the 2 minutes.
+    #[tokio::test]
+    async fn a_slow_reply_inside_its_budget_is_returned_not_cancelled() {
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok::<String, String>("hello".to_owned())
+        };
+
+        let reply =
+            finish_agent_request_within(std::time::Duration::from_secs(30), "test", slow, &fired)
+                .await
+                .expect("a reply inside the budget must be returned");
+
+        assert!(reply.contains("hello"), "{reply}");
+    }
+
+    /// Serializes the tests that write `ROCM_DASH_CHAT_TIMEOUT_SECS`, as the
+    /// repo's environment-mutation contract (`xtask`'s `env_mutation_contract`)
+    /// requires of any test that calls `set_var`.
+    static CHAT_TIMEOUT_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The wiring the two tests above cannot see: that the real request path
+    /// takes its budget from `ROCM_DASH_CHAT_TIMEOUT_SECS`. They hand
+    /// `finish_agent_request_within` a budget directly, and `parse_request_timeout`
+    /// is tested on its own, so a `finish_agent_request` that went back to a fixed
+    /// constant would pass every one of them. This drives `finish_agent_request`
+    /// itself, with a request that never answers, and expects the 1 s the
+    /// environment asked for, not the 2 minute default.
+    ///
+    /// A plain `#[test]` that builds its own runtime, rather than a
+    /// `#[tokio::test]`: the lock has to be held across the whole run, and a
+    /// `std` mutex guard held over an `.await` is what `clippy::await_holding_lock`
+    /// rejects.
+    #[test]
+    fn the_request_path_honours_the_chat_timeout_environment_variable() {
+        let _guard = CHAT_TIMEOUT_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized against the other writers by
+        // `CHAT_TIMEOUT_ENV_TEST_LOCK`. The tests that only read the variable,
+        // through `finish_agent_request`, are offline and finish in milliseconds,
+        // inside the 1 s it holds for.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::agent::REQUEST_TIMEOUT_ENV, "1");
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+            let never = std::future::pending::<Result<String, String>>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("build a runtime for the request");
+
+            let err = runtime
+                .block_on(finish_agent_request("test", never, &fired))
+                .expect_err("a request that never answers must time out");
+
+            assert!(matches!(err, AgentError::Timeout(1)), "{err:?}");
+        }));
+        // Restored before the result is surfaced, so a failed assertion cannot
+        // leave the override set for the rest of the test binary.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(crate::agent::REQUEST_TIMEOUT_ENV);
+        }
+        result.unwrap();
+    }
 
     /// A throwaway, never-pre-existing directory for
     /// `ChatGptAgentClient::new_in`'s OAuth token cache, so a test builds a
