@@ -551,28 +551,35 @@ pub fn runtime_loader_path_entries_read_only(
 }
 
 fn amd_smi_library_needing_bare_name(library_dirs: &[PathBuf]) -> Option<PathBuf> {
+    // A bare name in any directory is found by the loader before the shim, which
+    // sits last on the path, so no shim is needed whichever directory holds it.
+    if library_dirs
+        .iter()
+        .any(|dir| dir.join("libamd_smi.so").exists())
+    {
+        return None;
+    }
     for dir in library_dirs {
-        if dir.join("libamd_smi.so").exists() {
-            return None;
-        }
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         // The soname (`libamd_smi.so.26`): digits only after `.so.`, so a fully
-        // versioned file (`.so.26.2.2`) beside it is not taken for it.
+        // versioned file (`.so.26.2.2`) beside it is not taken for it. Where an
+        // in-place upgrade left an older soname beside the current one, take the
+        // highest by number, not by string (`.so.8` sorts after `.so.26`).
         let soname = entries
             .flatten()
-            .filter(|entry| {
-                entry
+            .filter_map(|entry| {
+                let version: u64 = entry
                     .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_prefix("libamd_smi.so."))
-                    .is_some_and(|suffix| {
-                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                    })
+                    .to_str()?
+                    .strip_prefix("libamd_smi.so.")?
+                    .parse()
+                    .ok()?;
+                Some((version, entry.path()))
             })
-            .map(|entry| entry.path())
-            .min();
+            .max_by_key(|(version, _)| *version)
+            .map(|(_, path)| path);
         if soname.is_some() {
             return soname;
         }
@@ -1297,7 +1304,7 @@ mod tests {
         let sdk_lib = root.join("sdk").join("lib");
         let compat = root.join("env").join(RUNTIME_COMPAT_DIR_NAME);
         fs::create_dir_all(&sdk_lib)?;
-        fs::write(sdk_lib.join("libamd_smi.so.3"), b"older")?;
+        fs::write(sdk_lib.join("libamd_smi.so.1"), b"older")?;
         fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
         // The fully versioned file and the static archive beside it are not the
         // soname a dependent asks for.
@@ -1331,6 +1338,36 @@ mod tests {
             fs::read_link(compat.join("libamd_smi.so"))?,
             sdk_lib.join("libamd_smi.so.26")
         );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// Versions compare by number: `.so.8` is older than `.so.26` though it sorts
+    /// after it, and a bare name in a later directory is found by the loader
+    /// before the shim, so it needs none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn amd_smi_shim_picks_the_highest_soname_and_yields_to_a_later_bare_name() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-numeric");
+        let first = root.join("first");
+        let later = root.join("later");
+        let compat = root.join("env").join(RUNTIME_COMPAT_DIR_NAME);
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&later)?;
+        fs::write(first.join("libamd_smi.so.8"), b"stale")?;
+        fs::write(first.join("libamd_smi.so.26"), b"sdk")?;
+
+        let dirs = [first.clone(), later.clone()];
+        assert!(ensure_amd_smi_compat(&compat, &dirs).is_some());
+        assert_eq!(
+            fs::read_link(compat.join("libamd_smi.so"))?,
+            first.join("libamd_smi.so.26")
+        );
+
+        fs::write(later.join("libamd_smi.so"), b"bare")?;
+        let other = root.join("env2").join(RUNTIME_COMPAT_DIR_NAME);
+        assert_eq!(ensure_amd_smi_compat(&other, &dirs), None);
+        assert!(!other.join("libamd_smi.so").exists());
         fs::remove_dir_all(root).ok();
         Ok(())
     }
