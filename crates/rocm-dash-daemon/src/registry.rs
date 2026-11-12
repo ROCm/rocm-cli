@@ -57,9 +57,10 @@ use serde::Deserialize;
 
 /// Minimal read-only view of a rocm-cli `ManagedServiceRecord` on disk.
 ///
-/// Mirrors the stable subset the scrape seam needs; unknown fields (manifest paths,
-/// pids, recipe json, …) are ignored. Every field defaults so partial/older
-/// records still parse.
+/// Mirrors the stable subset the scrape seam needs; the engine and supervisor
+/// pids (with their start times) are kept to match GPU processes by ancestry;
+/// unknown fields (manifest paths, recipe json, …) are ignored. Every field
+/// defaults so partial/older records still parse.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceRecord {
     #[serde(default)]
@@ -86,8 +87,44 @@ pub struct ServiceRecord {
     /// joins it to GPU power and VRAM.
     #[serde(default)]
     pub gpu_indices: Vec<u32>,
+    /// The launcher process rocm-cli recorded for the service.
+    #[serde(default)]
+    pub supervisor_pid: u32,
+    /// Kernel start time of the supervisor, which tells it from a recycled PID.
+    #[serde(default)]
+    pub supervisor_start_ticks: Option<u64>,
+    /// The engine server process, once the supervisor has seen it.
+    #[serde(default)]
+    pub engine_pid: Option<u32>,
+    /// Kernel start time of the engine server process.
+    #[serde(default)]
+    pub engine_start_ticks: Option<u64>,
     #[serde(default)]
     pub created_at_unix_ms: u128,
+}
+
+impl ServiceRecord {
+    /// The recorded processes whose descendants are this service's GPU
+    /// processes: the engine server and its launcher. Either can be absent on
+    /// an old or half-written record, and a PID that is zero (not recorded) or
+    /// 1 (init, an ancestor of everything) is never a root, since it would claim
+    /// processes that belong to no service.
+    pub fn ancestry_roots(&self) -> Vec<rocm_dash_collectors::ancestry::Root> {
+        let root = |pid: u32, start_ticks| rocm_dash_collectors::ancestry::Root {
+            pid,
+            start_ticks,
+            owner: self.service_id.clone(),
+        };
+        let usable = |pid: u32| pid >= rocm_dash_collectors::ancestry::MIN_ROOT_PID;
+        let mut roots = Vec::new();
+        if let Some(pid) = self.engine_pid.filter(|p| usable(*p)) {
+            roots.push(root(pid, self.engine_start_ticks));
+        }
+        if usable(self.supervisor_pid) {
+            roots.push(root(self.supervisor_pid, self.supervisor_start_ticks));
+        }
+        roots
+    }
 }
 
 /// Service statuses worth scraping.
@@ -349,6 +386,13 @@ pub struct ManagedDiscovery {
     /// A live record with no bound port is NOT counted: it is skipped for a
     /// different reason and is not a past attempt.
     pub past_attempts: usize,
+    /// Ancestry roots of every live service surfaced, so a GPU process can be
+    /// attributed to the managed service it belongs to.
+    pub roots: Vec<rocm_dash_collectors::ancestry::Root>,
+    /// Ids of records that were read in this pass and found no longer running.
+    /// A partial read keeps what it did not see; it must still drop the roots
+    /// of a service it saw stop, or a dead service's PID would stay matchable.
+    pub retired: HashSet<String>,
 }
 
 /// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
@@ -368,10 +412,12 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
             // live record with no bound port. Only the first is a past attempt.
             if !is_scrapeable_status(&record.status) {
                 out.past_attempts += 1;
+                out.retired.insert(record.service_id.clone());
             }
             continue;
         };
         out.seen.insert(svc.container_id.clone());
+        out.roots.extend(record.ancestry_roots());
         if engine_kind_for(record) != Some(EngineKind::Vllm) {
             out.non_vllm.insert(svc.container_id.clone());
         }
@@ -782,6 +828,104 @@ mod tests {
                 .unwrap_or_else(|| panic!("status {status:?} must be scrapeable"));
             assert_eq!(svc.status, expected, "status {status:?}");
         }
+    }
+
+    #[test]
+    fn ancestry_roots_come_from_the_recorded_engine_and_supervisor() {
+        let with = record_json("svc", "vllm", 8000, "ready", 1).replace(
+            r#""supervisor_pid": 4242,"#,
+            r#""supervisor_pid": 4242, "supervisor_start_ticks": 11, "engine_pid": 4300, "engine_start_ticks": 22,"#,
+        );
+        let rec: ServiceRecord = serde_json::from_str(&with).unwrap();
+        let roots = rec.ancestry_roots();
+        let got: Vec<_> = roots.iter().map(|r| (r.pid, r.start_ticks)).collect();
+        assert_eq!(got, vec![(4300, Some(22)), (4242, Some(11))]);
+        assert!(roots.iter().all(|r| r.owner == "svc"));
+        // An old record: no engine yet, no start times. The supervisor alone.
+        let old: ServiceRecord =
+            serde_json::from_str(&record_json("svc", "vllm", 8000, "ready", 1)).unwrap();
+        let got: Vec<_> = old
+            .ancestry_roots()
+            .iter()
+            .map(|r| (r.pid, r.start_ticks))
+            .collect();
+        assert_eq!(got, vec![(4242, None)]);
+        // Zero is "not recorded" and 1 is init: neither is ever a root, or it
+        // would own every process on the host.
+        for bad in [0, 1] {
+            let json = format!(
+                r#"{{"service_id":"z","engine":"vllm","port":1,"status":"ready","supervisor_pid":{bad},"engine_pid":{bad}}}"#
+            );
+            let rec: ServiceRecord = serde_json::from_str(&json).unwrap();
+            assert!(
+                rec.ancestry_roots().is_empty(),
+                "pid {bad} must not be a root"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_pids_survive_the_producer_to_daemon_serde_handoff() {
+        // Same contract as the startup-phase test above, for the pid fields the
+        // ancestry join reads: serialize the producer's real type and read it
+        // back as ours, so a rename or retype on either side fails here.
+        use rocm_core::{AppPaths, ManagedServiceRecord};
+
+        let root = PathBuf::from("/tmp/rocm-xcrate-pids");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let mut produced = ManagedServiceRecord::new(
+            &paths,
+            "svc-pids",
+            "vllm",
+            "M/pids",
+            "M/pids",
+            "127.0.0.1",
+            8000,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        );
+        produced.status = "ready".to_owned();
+        produced.supervisor_start_ticks = Some(111);
+        produced.engine_pid = Some(4300);
+        produced.engine_start_ticks = Some(222);
+
+        let json = serde_json::to_string(&produced).expect("producer record serializes");
+        let consumed: ServiceRecord =
+            serde_json::from_str(&json).expect("daemon record deserializes the producer's JSON");
+        let got: Vec<_> = consumed
+            .ancestry_roots()
+            .iter()
+            .map(|r| (r.pid, r.start_ticks, r.owner.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (4300, Some(222), "svc-pids".to_string()),
+                (4242, Some(111), "svc-pids".to_string()),
+            ],
+            "engine and supervisor pids and start times must cross the serde handoff by name"
+        );
+    }
+
+    #[test]
+    fn discover_managed_services_collects_roots_only_for_live_services() {
+        let live = record_json("live", "vllm", 8000, "ready", 1);
+        let dead = record_json("dead", "vllm", 8001, "stopped", 1).replace("4242", "5252");
+        let recs: Vec<ServiceRecord> = [live, dead]
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect();
+        let disc = discover_managed_services(&recs);
+        let owners: Vec<_> = disc.roots.iter().map(|r| r.owner.as_str()).collect();
+        assert_eq!(owners, vec!["live"], "a stopped service owns nothing");
+        assert!(disc.retired.contains("dead") && !disc.retired.contains("live"));
     }
 
     #[test]
