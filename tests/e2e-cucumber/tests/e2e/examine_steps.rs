@@ -3312,9 +3312,25 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
         (_, Some(_), Some(_)) => ("rocm serve <model>", &["rocm install sdk"]),
         // ROCm-capable with no managed SDK yet: that install is the next step.
         (_, Some(_), None) => ("rocm install sdk", &[]),
-        // A GPU no package family covers — confirmed Vulkan-only (gfx90c) or
-        // merely unrecognized. Either way the SDK has nothing for it and
-        // Lemonade's Vulkan backend is what can serve on it.
+        // A GPU no package family covers. Two different tiers land here and
+        // they do NOT owe the same command, which this arm used to miss:
+        //
+        //  * merely unrecognized — the catalog has no opinion, and it may be a
+        //    newer ROCm-capable card, so pinning the Vulkan backend would claim
+        //    something nothing established. Plain `rocm serve <model>`, and
+        //    `--engine lemonade` is forbidden.
+        //  * confirmed to have no ROCm build (gfx90c) — Vulkan is the backend
+        //    that can serve it, so the advice names it.
+        //
+        // Told apart by the line's own level wording, which is what the user
+        // reads. Before this split the arm required `--engine lemonade` for
+        // both, so a lane with an unrecognized GPU would have failed against
+        // *correct* output; no current lane has one, which is the only reason
+        // it stayed green.
+        (Some(_), None, _) if line.contains("is not in this build's catalog") => (
+            "rocm serve <model>",
+            &["rocm install sdk", "--engine lemonade"],
+        ),
         (Some(_), None, _) => (
             "rocm serve <model> --engine lemonade",
             &["rocm install sdk"],
