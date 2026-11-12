@@ -3914,9 +3914,11 @@ same report prints, so every lane checks the level its own hardware implies:
 cargo xtask e2e -- -n '(examine-49)'
 ```
 
-A fourth level, `NoGpuBackend`, and the scenarios covering the Vulkan tiers
-live in the Vulkan-probe change (#1036), which is what makes that level
-knowable.
+Vulkan-only here is inferred from the gfx table, not probed: this change has
+three levels and this section describes three. Probing the host for a Vulkan
+driver, and the further levels that evidence makes knowable, is separate work.
+Written this way deliberately — a forward reference to an unmerged change reads
+as false the moment this merges on its own.
 
 ## Windows Tool Notes
 
