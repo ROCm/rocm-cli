@@ -764,13 +764,9 @@ jobs:
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits; on a
-    # host without Docker they skip and cost nothing. Docker is reachable on this
-    # pool: a dispatch of the same lane (e2e-selfhosted.yml run 43025895270) passed
-    # serve-26 on both channel legs. serve-27 fails there at stopping the AIM
-    # service (STOP FAILED rc=1); it is an expected failure in expectations.toml
-    # (rocm-cli#1058), so the nightly reports it as xfail, and an XPASS means the
-    # row is stale. The "Report whether Docker is reachable" step still logs the
-    # answer each run.
+    # host without Docker they skip and cost nothing. The "Report whether Docker
+    # is reachable" step logs the answer each run. serve-27's known failure on
+    # this pool is an xfail row in expectations.toml (rocm-cli#1058).
     timeout-minutes: 120
     # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
     # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request

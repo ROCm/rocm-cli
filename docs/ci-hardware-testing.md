@@ -45,7 +45,7 @@ covered, but off every PR's critical path, so they moved to the nightly-only
 rung instead of being removed outright.
 
 A pull request now runs on exactly one Linux GPU node and one Windows GPU
-node: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
+pool: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
 the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu (`e2e-gpu-strix-ubuntu`) and W7900 (`e2e-gpu-w7900`) lanes no longer
 start on `pull_request` or in the merge queue; they keep their

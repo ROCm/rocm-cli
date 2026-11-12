@@ -7706,7 +7706,7 @@ jobs:
                 "`{job}` must keep running in the merge queue (gate: `{gate}`)"
             );
         }
-        // A pull request runs one Linux node (MI300X) and one Windows node (the
+        // A pull request runs one Linux node (MI300X) and one Windows pool (the
         // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND
         // merge_group (W7900 is one runner on borrowed quota; 35% of Strix
         // Ubuntu's merge-queue jobs hit the 45 min cap; neither check is required

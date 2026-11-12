@@ -11,7 +11,7 @@ name: E2E self-hosted
 #
 # Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
 # MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
-# node (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
+# pool (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
 # Ubuntu and W7900 lanes keep their push / dispatch triggers and run nightly
 # (nightly.yml); neither starts on pull_request or merge_group.
 #
@@ -478,7 +478,7 @@ jobs:
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
     # Not on pull_request: a PR gets exactly one Linux GPU node (MI300X, the only
-    # lane where vLLM runs) and one Windows node (the Strix Halo pool). Not on
+    # lane where vLLM runs) and one Windows pool (Strix Halo). Not on
     # merge_group either: over 7 days 35% of its merge-queue jobs (98 of 281) were
     # cancelled at the 45 min cap, and the queue does not wait for this
     # non-required check. Still runs on push (main, release/**), dispatch and
