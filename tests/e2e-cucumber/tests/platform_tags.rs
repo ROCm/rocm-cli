@@ -16,9 +16,14 @@
 //! So every capability-tagged scenario must either carry a tag that decides
 //! its OS (`@requires-os:<os>` or `@requires-wsl`) or be listed in
 //! [`ALLOWED_ANY_OS`] with the reason its assertions hold on every OS a lane
-//! runs it on. The tags are read by [`ScenarioDecl::from_tags`] from each
-//! scenario's own tags, exactly as the harness's `filter_run` does, so this
-//! guard cannot disagree with the harness about what a scenario declares.
+//! runs it on. docs/testing.md lists everything this fails on.
+//!
+//! What it reads is what the harness's `filter_run` reads under its default
+//! discovery: every `*.feature` file (extension in any case) under `features/`,
+//! recursively, with Scenario Outlines expanded by cucumber's own
+//! `expand_examples` so an `Examples:` block's tags join its scenarios' tags,
+//! and each scenario's tags parsed by the same [`ScenarioDecl::from_tags`]. A
+//! feature file run through cucumber's `--input` instead is not read here.
 //!
 //! This runs in the ordinary `cargo test` set (unlike the `e2e` target, which
 //! needs a real `rocm` binary), so a missing tag is caught without a suite run.
@@ -26,8 +31,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use cucumber::feature::Ext as _;
 use cucumber::gherkin::{self, GherkinEnv};
 use e2e_cucumber::expectation::ScenarioDecl;
+
+/// For the remote scenarios, which share one reason.
+const REMOTE_OVER_SSH: &str = "drives the CLI's SSH client against a Linux container and asserts \
+     the client's output, its session list and the container's own state. The client's \
+     Unix-only parts (SSH connection multiplexing, the credential file's 0600 mode) are \
+     asserted by no step. Only lanes that set E2E_INCLUDE_DOCKER run it, which today are the \
+     GitHub-hosted Ubuntu lanes, so a native Windows client is never exercised here";
 
 /// Capability-tagged scenarios reviewed as meaningful on every OS a lane runs
 /// them on, by `@id`, with the reason. An entry is a claim about the steps: if
@@ -42,19 +55,20 @@ const ALLOWED_ANY_OS: &[(&str, &str)] = &[
     // diagnose.feature
     (
         "diagnose-fix-needing-an-argument-says-so",
-        "the needs-arg fix is catalogued for bare-metal Linux and Windows alike; \
-         @requires-bare-metal only keeps it off WSL2, whose refusal has its own scenario",
+        "`fix-9-igpu-dgpu` needs `--device-index` on both `linux` and `windows`, and the step \
+         asserts exit code 0, the `Flags:` line and no claimed change, the same on both. \
+         @requires-bare-metal keeps it off WSL2, which the CLI reports as `wsl`, a platform \
+         the entry has no row for: there it is declined as not applicable, the contract \
+         diagnose-fix-inapplicable-here-is-declined-not-attempted covers with another entry",
     ),
     // examine.feature
     (
         "examine-detects-gpu-and-driver",
-        "the GPU and driver assertions read `examine` output on every OS; its KFD target \
-         cross-check returns early off bare-metal Linux, so on Windows that one step checks nothing",
-    ),
-    (
-        "examine-can-skip-framework-probing",
-        "skipping the framework probe is OS-neutral; @requires-bare-metal only keeps it off \
-         WSL2, where the probe stops before the framework step",
+        "asserts that `examine` names a gfx target, which it prints on every OS. The driver \
+         step passes when the output contains `amdgpu` or `driver_status` anywhere, and \
+         `examine` prints a `driver_status:` line on every host whatever its value, so it \
+         asserts no driver state on any OS; the KFD target cross-check returns early off \
+         Linux, so on Windows it checks nothing",
     ),
     (
         "examine-framework-names-the-interpreter-that-answered",
@@ -130,54 +144,9 @@ const ALLOWED_ANY_OS: &[(&str, &str)] = &[
     ),
     (
         "serve-stop-leaves-no-background-helper",
-        "Lemonade serves on Linux and Windows; the helper check reads the CLI's service records",
-    ),
-    // vLLM: the engine gate decides the OS
-    (
-        "serve-vllm-inference",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    (
-        "serve-vllm-default-on-instinct",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    (
-        "runtime-sdk-reinstall-keeps-engine-consistent",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    (
-        "runtime-torch-alignment-opt-out",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    (
-        "runtime-install-sdk-serves-without-toolchain",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    (
-        "runtime-lifecycle-activate-restart-services-succeeds",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    (
-        "therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins",
-        "OS decided by the vLLM engine gate, which refuses native Windows; the native \
-         Windows refusal is covered by serve-33/34/35",
-    ),
-    // AIM: engine availability (Docker plus a verified GPU family) decides the host
-    (
-        "serve-aim-inference",
-        "where AIM runs is decided by its engine gate (Docker and a verified GPU family), \
-         not by the OS",
-    ),
-    (
-        "serve-aim-lifecycle-parity",
-        "where AIM runs is decided by its engine gate (Docker and a verified GPU family), \
-         not by the OS",
+        "Lemonade serves on Linux and Windows; the step reads serve's output, the helper's \
+         autostart claim and runtime state under the scenario's own data directory, and \
+         `rocm daemon --status`, which the CLI keeps the same way on both",
     ),
     // No-GPU refusal
     (
@@ -193,35 +162,16 @@ const ALLOWED_ANY_OS: &[(&str, &str)] = &[
         "serve-unrelated-live-service-still-fails-fast",
         "the no-GPU refusal is OS-neutral code that runs before any engine is prepared",
     ),
-    // remote.feature — the second machine is a container; the steps assert only what
-    // the remote reports, not the client's Unix-only socket multiplexing or file modes
-    (
-        "remote-doctor-refuses-to-install",
-        "asserts what the container reports over SSH, which is the same from any client OS",
-    ),
-    (
-        "remote-serve-publishes-endpoint",
-        "asserts what the container reports over SSH, which is the same from any client OS",
-    ),
-    (
-        "remote-status-reports-both-halves",
-        "asserts what the container reports over SSH, which is the same from any client OS",
-    ),
-    (
-        "remote-attach-restores-endpoint",
-        "asserts what the container reports over SSH, which is the same from any client OS",
-    ),
-    (
-        "remote-stop-clears-both",
-        "asserts what the container reports over SSH, which is the same from any client OS",
-    ),
-    (
-        "remote-doctor-reports-remote-health",
-        "asserts what the container reports over SSH, which is the same from any client OS",
-    ),
+    // remote.feature
+    ("remote-doctor-refuses-to-install", REMOTE_OVER_SSH),
+    ("remote-serve-publishes-endpoint", REMOTE_OVER_SSH),
+    ("remote-status-reports-both-halves", REMOTE_OVER_SSH),
+    ("remote-attach-restores-endpoint", REMOTE_OVER_SSH),
+    ("remote-stop-clears-both", REMOTE_OVER_SSH),
+    ("remote-doctor-reports-remote-health", REMOTE_OVER_SSH),
     (
         "remote-serve-refuses-reusing-already-serving-session",
-        "asserts what the container reports over SSH, which is the same from any client OS",
+        REMOTE_OVER_SSH,
     ),
     // runtime_setup.feature
     (
@@ -277,72 +227,154 @@ fn features_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("features")
 }
 
-/// Every scenario in every `.feature` file, including those under a `Rule:`,
-/// since the harness filters those too. Only each scenario's own tags are read:
-/// the harness passes `scenario.tags` to `ScenarioDecl::from_tags` and ignores
-/// feature- and rule-level tags, so a tag placed there gates nothing.
+/// Every `*.feature` file under `dir`, at any depth, matching the extension in
+/// any case — the files cucumber's default discovery (`*.feature`,
+/// case-insensitive) hands the harness.
+fn feature_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let file_type = entry.file_type().expect("file type");
+        if file_type.is_dir() {
+            feature_files(&path, out);
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("feature"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// What [`parse_dir`] read: every scenario the harness would filter, and
+/// every tag found where the harness never looks.
+struct Suite {
+    scenarios: Vec<Parsed>,
+    /// Tags on a `Feature:` or `Rule:` line. The harness passes only
+    /// `scenario.tags` to `ScenarioDecl::from_tags`, so these do nothing.
+    misplaced_tags: Vec<String>,
+}
+
+/// The real suite. Panics where [`parse_dir`] fails, since every check here
+/// would otherwise pass over nothing.
+fn parsed_suite() -> Suite {
+    parse_dir(&features_dir()).unwrap_or_else(|e| panic!("{e}"))
+}
+
 fn parsed_scenarios() -> Vec<Parsed> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(features_dir())
-        .expect("features dir")
-        .map(|e| e.expect("dir entry").path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "feature"))
-        .collect();
+    parsed_suite().scenarios
+}
+
+/// Every scenario under `dir` the harness would filter, including those under
+/// a `Rule:` and each expanded row of a Scenario Outline, with each scenario's
+/// own tags plus its `Examples:` tags once expanded. Fails where there is no
+/// feature file or no scenario, either of which would leave every check here
+/// passing over nothing.
+fn parse_dir(dir: &Path) -> Result<Suite, String> {
+    let mut paths = Vec::new();
+    feature_files(dir, &mut paths);
     paths.sort();
-    assert!(
-        !paths.is_empty(),
-        "no .feature files found under {} — every check here would pass vacuously",
-        features_dir().display(),
-    );
-    let mut out = Vec::new();
+    if paths.is_empty() {
+        return Err(format!(
+            "no .feature files found under {} — every check here would pass vacuously",
+            dir.display(),
+        ));
+    }
+    let mut suite = Suite {
+        scenarios: Vec::new(),
+        misplaced_tags: Vec::new(),
+    };
     for path in paths {
         let feature = gherkin::Feature::parse_path(&path, GherkinEnv::default())
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .expand_examples()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let file = path
-            .file_name()
-            .expect("file name")
+            .strip_prefix(dir)
+            .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
+        let headers = std::iter::once((&feature.keyword, &feature.name, &feature.tags))
+            .chain(feature.rules.iter().map(|r| (&r.keyword, &r.name, &r.tags)));
+        for (keyword, name, tags) in headers {
+            for tag in tags {
+                suite
+                    .misplaced_tags
+                    .push(format!("{file}: {keyword} {name:?} carries @{tag}"));
+            }
+        }
         let scenarios = feature
             .scenarios
             .iter()
             .chain(feature.rules.iter().flat_map(|r| r.scenarios.iter()));
         for scenario in scenarios {
-            out.push(Parsed {
+            suite.scenarios.push(Parsed {
                 file: file.clone(),
                 name: scenario.name.clone(),
                 decl: ScenarioDecl::from_tags(&scenario.tags),
             });
         }
     }
-    assert!(
-        !out.is_empty(),
-        "no scenarios parsed from {} — every check here would pass vacuously",
-        features_dir().display(),
-    );
-    out
+    if suite.scenarios.is_empty() {
+        return Err(format!(
+            "no scenarios parsed from {} — every check here would pass vacuously",
+            dir.display(),
+        ));
+    }
+    Ok(suite)
 }
 
-/// Whether the scenario is gated on something the host has — every
-/// `@requires-*` tag `ScenarioDecl` knows, except the two that decide the OS.
-/// `@nightly`, `@lifecycle`, `@merge-queue` and `@serve-timeout` choose when a
-/// scenario runs, not where, so they are not capabilities.
-const fn is_capability_gated(d: &ScenarioDecl) -> bool {
-    d.requires_gpu
-        || d.requires_multi_gpu
-        || d.requires_gfx_target
-        || d.requires_no_gpu
-        || d.requires_bare_metal
-        || d.requires_engine.is_some()
-        || d.requires_docker
-        || d.requires_oom_fault_injection
-        || d.requires_case_sensitive_fs
-        || d.requires_dir_permissions
+/// What a scenario's tags say about where it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    /// Gated on something the host has: every `@requires-*` tag except the
+    /// two that decide the OS.
+    capability_gated: bool,
+    /// The tags pin the OS: `@requires-os:<os>` or `@requires-wsl`.
+    /// `@requires-bare-metal` does not: it skips WSL2 only, so native Windows
+    /// still runs it — and `@requires-os:linux` still admits WSL2, which
+    /// reports itself as Linux.
+    platform_decided: bool,
 }
 
-/// Whether the scenario's tags pin the OS it runs on. `@requires-bare-metal`
-/// does not: it skips WSL2 only, so native Windows still runs it.
-const fn is_platform_decided(d: &ScenarioDecl) -> bool {
-    d.requires_os.is_some() || d.requires_wsl
+/// Classify a scenario's declaration. Destructured without `..`, so a field
+/// added to `ScenarioDecl` fails to compile here until it is put on one side or
+/// the other. `@nightly`, `@lifecycle`, `@merge-queue` and `@serve-timeout`
+/// choose when a scenario runs, not where, so they are neither.
+const fn placement(d: &ScenarioDecl) -> Placement {
+    let ScenarioDecl {
+        id: _,
+        requires_gpu,
+        requires_multi_gpu,
+        requires_gfx_target,
+        requires_no_gpu,
+        requires_bare_metal,
+        requires_wsl,
+        requires_oom_fault_injection,
+        requires_case_sensitive_fs,
+        requires_dir_permissions,
+        requires_engine,
+        requires_os,
+        serve_timeout_secs: _,
+        requires_docker,
+        nightly: _,
+        lifecycle: _,
+        merge_queue: _,
+    } = d;
+    Placement {
+        capability_gated: *requires_gpu
+            || *requires_multi_gpu
+            || *requires_gfx_target
+            || *requires_no_gpu
+            || *requires_bare_metal
+            || requires_engine.is_some()
+            || *requires_docker
+            || *requires_oom_fault_injection
+            || *requires_case_sensitive_fs
+            || *requires_dir_permissions,
+        platform_decided: requires_os.is_some() || *requires_wsl,
+    }
 }
 
 fn label(p: &Parsed) -> String {
@@ -350,44 +382,58 @@ fn label(p: &Parsed) -> String {
     format!("@id:{id} ({}: {:?})", p.file, p.name)
 }
 
-#[test]
-fn capability_tagged_scenarios_decide_their_os_or_are_reviewed() {
-    let allowed: BTreeMap<&str, &str> = ALLOWED_ANY_OS.iter().copied().collect();
-    let is_allowed = |p: &&Parsed| {
-        p.decl
-            .id
-            .as_deref()
-            .is_some_and(|id| allowed.contains_key(id))
-    };
-    let violations: Vec<String> = parsed_scenarios()
+/// Capability-tagged scenarios that neither decide their OS nor are listed in
+/// `allowed`, each with what to do about it.
+fn undecided_scenarios(scenarios: &[Parsed], allowed: &[(&str, &str)]) -> Vec<String> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(|(id, _)| *id).collect();
+    scenarios
         .iter()
-        .filter(|p| is_capability_gated(&p.decl) && !is_platform_decided(&p.decl))
-        .filter(|p| !is_allowed(p))
-        .map(label)
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "{} capability-tagged scenario(s) neither decide their OS nor are reviewed as \
-         OS-neutral. A capability tag is not a platform tag: the Windows GPU lane satisfies \
-         `@requires-gpu`, so a step whose premise is OS-specific runs there and can pass \
-         without asserting anything (AGENTS.md §3). For each, add @requires-os:<os> (plus \
-         @requires-bare-metal if WSL2 lacks the interface), or add the id with a reason to \
-         ALLOWED_ANY_OS in tests/e2e-cucumber/tests/platform_tags.rs:\n  {}",
-        violations.len(),
-        violations.join("\n  "),
-    );
+        .filter(|p| {
+            let placement = placement(&p.decl);
+            placement.capability_gated && !placement.platform_decided
+        })
+        .filter_map(|p| match p.decl.id.as_deref() {
+            None => Some(format!(
+                "{}: add an @id:<feature-key>-<slug> tag and then an OS tag, or an \
+                 ALLOWED_ANY_OS entry under that id",
+                label(p)
+            )),
+            Some(id) if !allowed.contains(id) => Some(format!(
+                "{}: add an OS tag, or add the id to ALLOWED_ANY_OS with a reason",
+                label(p)
+            )),
+            Some(_) => None,
+        })
+        .collect()
 }
 
-#[test]
-fn allowlist_entries_are_live_and_needed() {
-    let scenarios = parsed_scenarios();
+/// `@id`s that more than one scenario carries. The harness fails a run on the
+/// first one; here it would also let one scenario's allowlist entry vouch for
+/// another.
+fn duplicate_ids(scenarios: &[Parsed]) -> Vec<String> {
+    let mut by_id: BTreeMap<&str, Vec<&Parsed>> = BTreeMap::new();
+    for p in scenarios {
+        if let Some(id) = p.decl.id.as_deref() {
+            by_id.entry(id).or_default().push(p);
+        }
+    }
+    by_id
+        .into_values()
+        .filter(|ps| ps.len() > 1)
+        .map(|ps| ps.into_iter().map(label).collect::<Vec<_>>().join(" and "))
+        .collect()
+}
+
+/// Entries in `allowed` that are duplicated, unexplained, name no scenario, or
+/// name one that needs no entry.
+fn allowlist_problems(scenarios: &[Parsed], allowed: &[(&str, &str)]) -> Vec<String> {
     let by_id: BTreeMap<&str, &Parsed> = scenarios
         .iter()
         .filter_map(|p| p.decl.id.as_deref().map(|id| (id, p)))
         .collect();
     let mut seen = BTreeSet::new();
     let mut problems = Vec::new();
-    for (id, reason) in ALLOWED_ANY_OS {
+    for (id, reason) in allowed {
         if !seen.insert(*id) {
             problems.push(format!("{id}: listed more than once"));
         }
@@ -396,11 +442,11 @@ fn allowlist_entries_are_live_and_needed() {
         }
         match by_id.get(id) {
             None => problems.push(format!("{id}: no scenario has this @id — drop the entry")),
-            Some(p) if !is_capability_gated(&p.decl) => problems.push(format!(
+            Some(p) if !placement(&p.decl).capability_gated => problems.push(format!(
                 "{}: carries no capability tag, so it needs no entry — drop it",
                 label(p)
             )),
-            Some(p) if is_platform_decided(&p.decl) => problems.push(format!(
+            Some(p) if placement(&p.decl).platform_decided => problems.push(format!(
                 "{}: its tags already decide its OS, which contradicts an \"any OS\" entry — \
                  drop the entry or the OS tag",
                 label(p)
@@ -408,6 +454,50 @@ fn allowlist_entries_are_live_and_needed() {
             Some(_) => {}
         }
     }
+    problems
+}
+
+#[test]
+fn capability_tagged_scenarios_decide_their_os_or_are_reviewed() {
+    let violations = undecided_scenarios(&parsed_scenarios(), ALLOWED_ANY_OS);
+    assert!(
+        violations.is_empty(),
+        "{} capability-tagged scenario(s) neither decide their OS nor are reviewed as \
+         OS-neutral. A capability tag is not a platform tag: the Windows GPU lane satisfies \
+         `@requires-gpu`, so a step whose premise is OS-specific runs there and can pass \
+         without asserting anything (AGENTS.md §3). The OS tags are @requires-os:<os> and \
+         @requires-wsl; @requires-os:linux still admits WSL2, so add @requires-bare-metal \
+         too when WSL2 lacks the interface. An ALLOWED_ANY_OS entry, in \
+         tests/e2e-cucumber/tests/platform_tags.rs, states why the steps hold on every OS:\n  {}",
+        violations.len(),
+        violations.join("\n  "),
+    );
+}
+
+#[test]
+fn scenario_ids_are_unique() {
+    let duplicates = duplicate_ids(&parsed_scenarios());
+    assert!(
+        duplicates.is_empty(),
+        "scenario @ids must be unique — the harness fails the run on a repeat:\n  {}",
+        duplicates.join("\n  "),
+    );
+}
+
+#[test]
+fn feature_and_rule_lines_carry_no_tags() {
+    let misplaced = parsed_suite().misplaced_tags;
+    assert!(
+        misplaced.is_empty(),
+        "the harness reads only each scenario's own tags, so a tag on a Feature: or \
+         Rule: line does nothing — put it on each scenario instead:\n  {}",
+        misplaced.join("\n  "),
+    );
+}
+
+#[test]
+fn allowlist_entries_are_live_and_needed() {
+    let problems = allowlist_problems(&parsed_scenarios(), ALLOWED_ANY_OS);
     assert!(
         problems.is_empty(),
         "ALLOWED_ANY_OS in tests/e2e-cucumber/tests/platform_tags.rs has stale or \
@@ -437,5 +527,212 @@ fn the_kfd_topology_scenario_is_pinned_to_bare_metal_linux() {
         examine_17.decl.requires_bare_metal,
         "{}: WSL2 has no KFD topology either, so it needs @requires-bare-metal",
         label(examine_17),
+    );
+}
+
+// The checks above run over the real suite, which holds no violation, so they
+// cannot show that a broken check would notice one. These feed each check a
+// fixture holding exactly one.
+
+fn fixture(tags: &[&str]) -> Parsed {
+    Parsed {
+        file: "fixture.feature".to_owned(),
+        name: tags.join(" "),
+        decl: ScenarioDecl::from_tags(tags),
+    }
+}
+
+#[test]
+fn every_tag_is_classified_as_a_capability_an_os_decision_or_neither() {
+    // (tag, capability_gated, platform_decided). Every tag `from_tags` reads.
+    let table: &[(&str, bool, bool)] = &[
+        ("@requires-gpu", true, false),
+        ("@requires-multi-gpu", true, false),
+        ("@requires-gfx-target", true, false),
+        ("@requires-no-gpu", true, false),
+        ("@requires-bare-metal", true, false),
+        ("@requires-engine:aim", true, false),
+        ("@requires-docker", true, false),
+        ("@requires-oom-fault-injection", true, false),
+        ("@requires-case-sensitive-fs", true, false),
+        ("@requires-dir-permissions", true, false),
+        ("@requires-os:linux", false, true),
+        ("@requires-wsl", false, true),
+        ("@id:fixture-01", false, false),
+        ("@serve-timeout:60", false, false),
+        ("@nightly", false, false),
+        ("@lifecycle", false, false),
+        ("@merge-queue", false, false),
+    ];
+    for &(tag, capability_gated, platform_decided) in table {
+        assert_eq!(
+            placement(&ScenarioDecl::from_tags(&[tag])),
+            Placement {
+                capability_gated,
+                platform_decided
+            },
+            "{tag}",
+        );
+    }
+}
+
+#[test]
+fn an_undecided_scenario_is_reported_and_an_id_less_one_is_told_to_add_an_id() {
+    let scenarios = [
+        fixture(&["@id:listed", "@requires-gpu"]),
+        fixture(&["@id:decided", "@requires-gpu", "@requires-os:linux"]),
+        fixture(&["@id:ungated"]),
+        fixture(&["@id:unlisted", "@requires-gpu"]),
+        fixture(&["@requires-gpu"]),
+    ];
+    let violations = undecided_scenarios(&scenarios, &[("listed", "a reason")]);
+    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert!(
+        violations[0].starts_with("@id:unlisted ") && violations[0].contains("ALLOWED_ANY_OS"),
+        "{violations:#?}"
+    );
+    assert!(
+        violations[1].starts_with("@id:<no @id> ") && violations[1].contains("add an @id"),
+        "{violations:#?}"
+    );
+}
+
+#[test]
+fn a_repeated_id_is_reported() {
+    let scenarios = [
+        fixture(&["@id:twice", "@requires-gpu"]),
+        fixture(&["@id:once"]),
+        fixture(&["@id:twice"]),
+    ];
+    let duplicates = duplicate_ids(&scenarios);
+    assert_eq!(duplicates.len(), 1, "{duplicates:#?}");
+    assert!(duplicates[0].starts_with("@id:twice "), "{duplicates:#?}");
+}
+
+#[test]
+fn each_kind_of_bad_allowlist_entry_is_reported() {
+    let scenarios = [
+        fixture(&["@id:needed", "@requires-gpu"]),
+        fixture(&["@id:ungated"]),
+        fixture(&["@id:decided", "@requires-gpu", "@requires-wsl"]),
+    ];
+    assert_eq!(
+        allowlist_problems(&scenarios, &[("needed", "a reason")]),
+        Vec::<String>::new(),
+        "a needed entry with a reason is fine",
+    );
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (
+            &[("needed", "a reason"), ("needed", "a reason")],
+            "needed: listed more than once",
+        ),
+        (&[("needed", " ")], "needed: has no reason"),
+        (&[("gone", "a reason")], "gone: no scenario has this @id"),
+        (&[("ungated", "a reason")], "carries no capability tag"),
+        (&[("decided", "a reason")], "already decide its OS"),
+    ];
+    for &(allowed, expected) in cases {
+        let problems = allowlist_problems(&scenarios, allowed);
+        assert_eq!(problems.len(), 1, "{allowed:?}: {problems:#?}");
+        assert!(
+            problems[0].contains(expected),
+            "{allowed:?}: expected {expected:?}, got {problems:#?}"
+        );
+    }
+}
+
+/// A fresh, empty directory under the test target's own scratch space.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    dir
+}
+
+#[test]
+fn discovery_reads_what_the_harness_reads() {
+    // A nested file with an upper-case extension, an outline whose Examples
+    // block carries the OS tag, and a scenario under a Rule: each is something
+    // the harness's default discovery and outline expansion pick up.
+    let dir = scratch_dir("platform_tags_discovery");
+    std::fs::create_dir_all(dir.join("nested")).expect("fixture dir");
+    std::fs::write(
+        dir.join("nested").join("Outline.FEATURE"),
+        "Feature: fixture\n\
+         \n\
+         \x20 @id:fixture-outline @requires-gpu\n\
+         \x20 Scenario Outline: fixture-01 - row <n>\n\
+         \x20   Given a step\n\
+         \n\
+         \x20   @requires-os:linux\n\
+         \x20   Examples:\n\
+         \x20     | n |\n\
+         \x20     | 1 |\n\
+         \n\
+         \x20 Rule: a rule\n\
+         \n\
+         \x20   @id:fixture-under-rule @requires-gpu\n\
+         \x20   Scenario: fixture-02 - under a rule\n\
+         \x20     Given a step\n",
+    )
+    .expect("fixture file");
+    std::fs::write(dir.join("ignored.txt"), "not a feature").expect("fixture file");
+    let scenarios = parse_dir(&dir).expect("fixture parses").scenarios;
+    assert_eq!(scenarios.len(), 2, "one expanded row and one rule scenario");
+    let row = &scenarios[0];
+    assert_eq!(row.decl.id.as_deref(), Some("fixture-outline"));
+    assert_eq!(
+        row.decl.requires_os.as_deref(),
+        Some("linux"),
+        "the Examples tag must reach the row"
+    );
+    assert!(Path::new(&row.file).ends_with("nested/Outline.FEATURE"));
+    let under_rule = &scenarios[1];
+    assert_eq!(under_rule.decl.id.as_deref(), Some("fixture-under-rule"));
+    assert!(
+        placement(&under_rule.decl).capability_gated,
+        "a scenario under a Rule is checked like any other"
+    );
+}
+
+#[test]
+fn a_directory_with_no_feature_file_or_no_scenario_is_refused() {
+    let empty = scratch_dir("platform_tags_empty");
+    std::fs::write(empty.join("notes.txt"), "not a feature").expect("fixture file");
+    let err = parse_dir(&empty)
+        .err()
+        .expect("no feature file must be refused");
+    assert!(err.contains("no .feature files"), "{err}");
+
+    let bare = scratch_dir("platform_tags_no_scenarios");
+    std::fs::write(bare.join("bare.feature"), "Feature: nothing in it\n").expect("fixture file");
+    let err = parse_dir(&bare).err().expect("no scenario must be refused");
+    assert!(err.contains("no scenarios parsed"), "{err}");
+}
+
+#[test]
+fn a_tag_on_a_feature_or_rule_line_is_reported() {
+    let dir = scratch_dir("platform_tags_misplaced");
+    std::fs::write(
+        dir.join("misplaced.feature"),
+        "@requires-gpu @nightly\n\
+         Feature: tagged at the top\n\
+         \n\
+         \x20 @id:fixture-rule\n\
+         \x20 Rule: tagged rule\n\
+         \n\
+         \x20   @id:fixture-01\n\
+         \x20   Scenario: fixture-01 - a scenario\n\
+         \x20     Given a step\n",
+    )
+    .expect("fixture file");
+    let misplaced = parse_dir(&dir).expect("fixture parses").misplaced_tags;
+    assert_eq!(
+        misplaced,
+        [
+            "misplaced.feature: Feature \"tagged at the top\" carries @requires-gpu",
+            "misplaced.feature: Feature \"tagged at the top\" carries @nightly",
+            "misplaced.feature: Rule \"tagged rule\" carries @id:fixture-rule",
+        ],
     );
 }

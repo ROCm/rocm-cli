@@ -144,25 +144,11 @@ Scenarios carry stable-id and capability tags:
 | `@requires-dir-permissions` | Premise is a directory that refuses new files once its write bits are cleared. Resolves to **skip** for a user those bits do not bind: root, which is what the self-hosted WSL2 guest runs the suite as. The capability probe's `dir_permissions_bind` clears the write bits on a directory under the temp root and tries to create a file in it. `@requires-os:linux` cannot express this: root on Linux is still `linux`, and the scenario would pass without testing anything. Always **skip** on Windows, which has no such bits. |
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
-| `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
+| `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. A capability tag such as `@requires-gpu` does not decide the OS, so an OS-specific scenario carries this too: see "Capability-tagged scenarios name their OS" in [docs/testing.md](../../docs/testing.md). |
 | `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch that runs out of GPU memory so the OOM guidance can be verified without a GPU. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM refusal scenarios serve-33/34/35. |
-
-A capability tag is not a platform tag. `@requires-gpu`, `@requires-engine:<e>`
-and the other capability tags ask what the host has, so the Windows GPU lane
-satisfies `@requires-gpu` and runs every scenario that carries it. A scenario
-whose premise exists on one OS only (sysfs, the KFD topology, `lspci`, a Win32
-call) also carries `@requires-os:<os>`, plus `@requires-bare-metal` when WSL2
-lacks the interface; a step that returns early when its premise is missing
-otherwise passes there without asserting anything.
-[platform_tags.rs](tests/platform_tags.rs) enforces this in the ordinary
-`cargo test` run: it fails on a capability-tagged scenario that has neither
-`@requires-os:<os>` nor `@requires-wsl`, unless its `@id` is listed in
-`ALLOWED_ANY_OS` there with the reason its assertions hold on every OS. It also
-fails on an entry that names no scenario, or one whose tags already decide its
-OS.
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.

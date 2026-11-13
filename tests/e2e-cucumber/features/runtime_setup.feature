@@ -50,7 +50,7 @@ Feature: Runtime configuration
   # It reads the block's verdict rather than one string, because a torch that has
   # already run a GPU kernel with this SDK is kept instead of rewritten and reports
   # a `retained_*` verdict — settled, with nothing installed.
-  @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
+  @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @requires-os:linux @nightly
   Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
@@ -84,7 +84,7 @@ Feature: Runtime configuration
   # Same lane as scenario 4 and for the same reasons: a real SDK install and a
   # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
   # because only vLLM shares the runtime environment the alignment writes into.
-  @id:runtime-torch-alignment-opt-out @requires-gpu @requires-engine:vllm @nightly
+  @id:runtime-torch-alignment-opt-out @requires-gpu @requires-engine:vllm @requires-os:linux @nightly
   Scenario: runtime-04 - Opting out of the torch alignment keeps the torch the user installed
     Given a managed runtime with an inference engine already installed
     And the user has opted out of realigning torch
@@ -374,7 +374,7 @@ Feature: Runtime configuration
   # The other half: that a runtime installed without the toolchain can actually
   # serve. vLLM compiles Triton kernels at runtime, which is the case most
   # likely to need `devel`, so it is the one worth proving end to end.
-  @id:runtime-install-sdk-serves-without-toolchain @requires-gpu @requires-engine:vllm @nightly
+  @id:runtime-install-sdk-serves-without-toolchain @requires-gpu @requires-engine:vllm @requires-os:linux @nightly
   Scenario: runtime-18 - A runtime-only SDK install serves vLLM inference
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK

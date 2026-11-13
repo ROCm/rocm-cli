@@ -156,14 +156,14 @@ fail without the change. A test that runs only elsewhere is not that check, and 
 is one that runs on the target but returns early when its premise is missing. For a
 `cfg(windows)` path e2e cannot drive, put its logic behind a pure helper or an injectable
 function (a script runner, a clock) so a unit test runs on the Windows CI job, including
-the error and timeout paths. A capability tag (`@requires-gpu`, `@requires-engine:<e>`)
-is not a platform tag — the Windows GPU lane satisfies `@requires-gpu` — so a scenario
-whose premise is OS-specific also carries `@requires-os:<os>`, plus `@requires-bare-metal`
-where WSL2 lacks the interface; [`platform_tags.rs`](tests/e2e-cucumber/tests/platform_tags.rs)
-fails on a capability-tagged scenario with neither an OS tag nor a reviewed
-`ALLOWED_ANY_OS` entry. A value matched across files (a version tag, a sentinel string)
-gets one shared constant and a test tying the producer to the consumer. If a path stays
-untested, say which and why in the PR text.
+the error and timeout paths. A value matched across files (a version tag, a sentinel
+string) gets one shared constant and a test tying the producer to the consumer. If a path
+stays untested, say which and why in the PR text.
+
+**A capability tag is not a platform tag.** A scenario whose premise exists on one OS only
+carries `@requires-os:<os>`, plus `@requires-bare-metal` where WSL2 lacks the interface, even
+when `@requires-gpu` or another capability tag already gates it; "Capability-tagged scenarios
+name their OS" in [docs/testing.md](docs/testing.md) says why and what checks it.
 
 ## 4) Live State Verification Before Any External Claim
 

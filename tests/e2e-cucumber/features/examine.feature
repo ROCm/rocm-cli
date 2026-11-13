@@ -101,15 +101,9 @@ Feature: GPU detection and system inspection
 
   # Leaving the frameworks out is the variant pinned here: the outcome is
   # identical on every host, whereas asserting that a *named* framework was
-  # probed would depend on what happens to be installed.
-  #
-  # @requires-bare-metal because the probe never reaches its framework step on
-  # WSL2 — it returns as soon as it recognises the platform — so `framework`
-  # stays "unknown" there whatever the flag says. That the probe gives up that
-  # early is its own defect, tracked separately; this scenario is about whether
-  # the choice is reachable, and it cannot answer that where no choice is acted
-  # on at all.
-  @id:examine-can-skip-framework-probing @requires-bare-metal
+  # probed would depend on what happens to be installed. The probe honours the
+  # choice on every platform, WSL2 included, so the scenario carries no tag.
+  @id:examine-can-skip-framework-probing
   Scenario: examine-10 - The user can leave the frameworks out of the inspection
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks

@@ -18,9 +18,9 @@ use serde::Deserialize;
 
 use crate::capability::{HostCapability, docker_available};
 
-/// Tag prefixes in their normalized bare form. cucumber-rs currently supplies
-/// scenario tags with a leading `@`; [`ScenarioDecl::from_tags`] accepts either
-/// shape so direct unit fixtures and runtime parser output cannot drift.
+/// Tag prefixes in their normalized bare form. The gherkin parser yields
+/// scenario tags without the leading `@` and unit fixtures write it;
+/// [`ScenarioDecl::from_tags`] accepts either shape so the two cannot drift.
 const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
@@ -98,9 +98,13 @@ pub struct ScenarioDecl {
     /// apply, so a scenario needing one of those bare-metal matches has no
     /// premise. (Keyword-only checks explicitly registered for WSL — e.g. the
     /// vLLM startup-OOM entry — do run there; those belong under
-    /// `@requires-os:linux`, not this tag.) And `examine`'s probe returns as
-    /// soon as it recognises WSL2, before most of its steps run, so a scenario
-    /// asserting anything those steps populate has none either.
+    /// `@requires-os:linux`, not this tag.) And `examine` skips its bare-metal
+    /// probes on WSL2 — the CPU, the PCI and KFD GPU enumeration, kernel
+    /// modules, the user's render and video groups, device nodes, Secure Boot
+    /// and the amdgpu kernel log — so the CPU details, the `gpus` list and
+    /// what those other probes report are absent there, and a scenario
+    /// asserting one of them has no premise either. Whether the host has an
+    /// AMD GPU is still reported, from the Windows side's detection.
     ///
     /// This is a SKIP and not an xfail row: the diagnose half is deliberate and
     /// separately unit-tested, and recording it as a known bug would tell every
@@ -181,8 +185,9 @@ pub struct ScenarioDecl {
 }
 
 impl ScenarioDecl {
-    /// Parse a scenario's declaration from its gherkin tags, accepting the
-    /// leading `@` shape cucumber-rs supplies at runtime and bare unit fixtures.
+    /// Parse a scenario's declaration from its gherkin tags, accepting them as
+    /// the gherkin parser yields them at runtime (no leading `@`) and with the
+    /// leading `@` unit fixtures write.
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
         let mut requires_docker = false;
