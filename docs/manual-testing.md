@@ -779,8 +779,9 @@ when the engine already exists.
 installed vLLM (a vLLM with no known Python is not probed), which can take up to a
 minute. If the vLLM wheel was built against a
 different torch than the runtime's, the list shows `runtime: installed, not usable`
-with the failing extension in the notes, and `rocm serve` exits before starting
-vLLM, and `rocm logs` for the service shows why, rather than failing during engine start-up.
+with the failing extension in the notes, and the vLLM engine process
+exits before starting vLLM. `rocm serve` then reports the server as not ready, and
+`rocm logs` for the service shows why, rather than failing during engine start-up.
 
 **Start from runtime A.** Make it the active runtime and start a server on it.
 `--runtime-id` names the runtime explicitly, so the server's recorded runtime

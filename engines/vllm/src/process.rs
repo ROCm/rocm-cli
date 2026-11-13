@@ -507,8 +507,8 @@ fn require_importable_extensions(runtime: &VllmRuntime) -> Result<()> {
 }
 
 fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> Option<String> {
-    let python = runtime.python_executable.as_ref()?;
-    let mut command = ProcessCommand::new(python);
+    let python = absolute_probe_python(runtime.python_executable.as_ref()?);
+    let mut command = ProcessCommand::new(&python);
     command.arg("-c").arg(VLLM_EXTENSION_PROBE_SCRIPT);
     // `python -c` puts the working directory first on `sys.path`, which the
     // `vllm serve` launcher does not: run from a vLLM source checkout, or any
@@ -522,6 +522,15 @@ fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> 
         .ok()
         .filter(|output| output.status.success())?;
     extension_import_problem_from_probe(&String::from_utf8_lossy(&output.stdout), runtime)
+}
+
+/// The interpreter as an absolute path. The probe runs from the interpreter's
+/// directory, and a relative program path is resolved against the new working
+/// directory, so a relative `ROCM_CLI_VLLM_PYTHON` would otherwise fail to spawn
+/// and read as "the check could not run". Not canonicalized: a venv interpreter
+/// is a symlink whose own path is what finds the venv.
+fn absolute_probe_python(python: &Path) -> PathBuf {
+    std::path::absolute(python).unwrap_or_else(|_| python.to_path_buf())
 }
 
 /// Reads the probe's JSON into the guidance a user can act on.
@@ -1133,6 +1142,13 @@ mod tests {
         assert!(marker.exists(), "the probe interpreter was never run");
         Ok(())
     }
+    #[test]
+    fn a_relative_interpreter_path_is_made_absolute_for_the_probe() {
+        let relative = Path::new("venv/bin/python");
+        let absolute = absolute_probe_python(relative);
+        assert!(absolute.is_absolute(), "{}", absolute.display());
+        assert!(absolute.ends_with(relative), "{}", absolute.display());
+    }
     #[cfg(unix)]
     #[test]
     fn the_probe_runs_from_the_interpreters_directory_not_the_callers() -> Result<()> {
@@ -1232,7 +1248,7 @@ mod tests {
             .env("PYTHONPATH", dir.path())
             .output()
         else {
-            return Ok(None);
+            panic!("python3 is required to run the probe-script tests; none was found on PATH");
         };
         assert!(output.status.success(), "{output:?}");
         Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
@@ -1271,6 +1287,12 @@ mod tests {
             problem.contains("vllm._C_stable_libtorch: undefined symbol: boom"),
             "{problem}"
         );
+        // A dependency's missing-module error is cut like any other error.
+        let out = run_probe_script("", &[("_C", "__import__('m' * 5000)")])?.expect("python3");
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a missing dependency of _C is a problem");
+        assert!(problem.contains(&"m".repeat(380)), "{problem}");
+        assert!(!problem.contains(&"m".repeat(400)), "{problem}");
         // Two failing extensions are both named, joined by `; `.
         let out = run_probe_script("", &[("_C", fails), ("_rocm_C", fails)])?.expect("python3");
         let problem = extension_import_problem_from_probe(&out, &runtime)
