@@ -101,7 +101,8 @@ definitions when no existing scenario already covers it:
 - if a scenario for the behavior already exists, say in the PR text which `@id:` it is
   and that the change makes it pass — do not silently rely on it
 - if the scenario can only run on a gated lane (`@requires-gpu`, `@nightly`), say so in
-  the PR text and name the lane that will exercise it
+  the PR text and name the lane that will exercise it; moving an existing scenario off the
+  blocking mock `e2e` job onto such a lane is justified as §8 says
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
@@ -422,6 +423,18 @@ coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when 
 below it. If a drop is legitimate, re-bless with `cargo xtask coverage --bless` and say in
 the commit why — do not re-bless to clear a red check.
 
+Moving a scenario off the blocking mock `e2e` job is a deletion too, in any change
+including CI plumbing, and no coverage floor catches it. A tag that makes an existing
+scenario skip there (`@nightly`, `@requires-gpu`; the tag table in
+[the e2e README](tests/e2e-cucumber/README.md) says what
+each tag resolves to) removes its pre-merge coverage as surely as deleting it, though the
+diff shows only a tag. Justify it as a deletion: the PR text names, for each direction the
+behavior could be broken in (for a flag, hardcoded on and hardcoded off), which blocking
+check still fails. A scenario that is the only pre-merge guard for a seam no unit test
+reaches says so in a comment beside it, as
+`@id:therock-next-09-wheel-devel-adds-the-toolchain` does; when such a scenario slows or
+destabilizes a neighbor, fix the neighbor at its own layer instead of moving the guard.
+
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
 - focused Rust test groups for touched modules
@@ -523,6 +536,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 17. Comments and doc lines stating how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
 18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
+19. Any existing scenario moved off the blocking mock `e2e` job justified as a deletion — *§8*
 
 ## 14) Related Internal Workflows
 
