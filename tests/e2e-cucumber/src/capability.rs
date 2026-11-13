@@ -134,9 +134,12 @@ pub struct HostCapability {
     /// scenarios can run. A real `detected_gfx_target`, plus a ready ROCm
     /// driver path on WSL — see [`host_has_usable_gpu`].
     pub has_amd_gpu: bool,
-    /// How many AMD GPUs are PRESENT on this host, before any visibility mask.
-    /// `None` where the count could not be determined (non-Linux, unreadable
-    /// sysfs). Gates `@requires-multi-gpu`; see [`probe_amd_gpu_count`].
+    /// How many AMD GPUs the kernel exposes to this job (its KFD GPU nodes,
+    /// else the DRM cards on a zero-KFD host), before any visibility-mask
+    /// environment variable. Not the cards on the PCI bus: a shared host can
+    /// list more there than this job may use. `None` where the count could not
+    /// be determined (non-Linux, unreadable sysfs). Gates
+    /// `@requires-multi-gpu`; see [`probe_amd_gpu_count`].
     pub amd_gpu_count: Option<usize>,
     /// Engine adapters the binary reports as present. Both builtins are always
     /// "built-in", so this is NOT the same as "can start here" — use
@@ -715,8 +718,8 @@ fn host_has_usable_gpu_with_mask(
         && visibility_mask.is_none_or(|mask| !mask.is_empty())
 }
 
-/// How many AMD GPUs are present on this host, independent of any visibility
-/// mask. `None` when the count could not be determined.
+/// How many AMD GPUs the kernel exposes to this job, independent of any
+/// visibility mask. `None` when the count could not be determined.
 ///
 /// This is the file's second deliberate re-implementation (see the module
 /// header). It mirrors the product's
@@ -730,8 +733,12 @@ fn host_has_usable_gpu_with_mask(
 /// best-effort subprocess the product only falls back to, it is absent on hosts
 /// that serve fine without it, and it can disagree with KFD+DRM (see
 /// `combine_amd_gpu_counts`). Gating on it would skip these scenarios wherever
-/// amd-smi is not installed. The combine rule is unit-tested below; the sysfs
-/// readers are not (they need a real host).
+/// amd-smi is not installed.
+///
+/// The figure is the KFD GPU-node set whenever KFD reports one, so on a shared
+/// host it is the GPUs this job can reach, not the cards on the PCI bus. The
+/// combine rule and the KFD reader ([`kfd_gpu_node_count_in`]) are unit-tested
+/// below; the DRM reader is not (it needs a real host).
 #[cfg(target_os = "linux")]
 fn probe_amd_gpu_count() -> Option<usize> {
     combine_amd_gpu_counts(kfd_gpu_node_count(), drm_amdgpu_card_count())
@@ -762,31 +769,72 @@ fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usiz
     }
 }
 
-/// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
-/// GPU"; `None` means `/dev/kfd` exists but its topology could not be read.
+/// Count AMD GPU nodes in the KFD topology: the GPUs the kernel exposes to
+/// this process, which on a shared host can be fewer than the cards on its PCI
+/// bus. `Some(0)` is an authoritative "no GPU"; `None` means `/dev/kfd` exists
+/// but its topology could not be read.
 #[cfg(target_os = "linux")]
 fn kfd_gpu_node_count() -> Option<usize> {
-    let nodes = std::path::Path::new("/sys/class/kfd/kfd/topology/nodes");
-    match std::fs::read_dir(nodes) {
+    kfd_gpu_node_count_in(
+        std::path::Path::new("/sys/class/kfd/kfd/topology/nodes"),
+        std::path::Path::new("/dev/kfd"),
+    )
+}
+
+/// [`kfd_gpu_node_count`] against a caller-supplied nodes directory and
+/// device path, so unit tests can plant a topology. Mirrors the product's
+/// `linux_kfd_gpu_node_count_in` in rocm-core, which also takes the nodes
+/// directory; the device path is a parameter here too so both unreadable
+/// branches are testable.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_gpu_node_count_in(
+    nodes_dir: &std::path::Path,
+    kfd_device: &std::path::Path,
+) -> Option<usize> {
+    match std::fs::read_dir(nodes_dir) {
         Ok(entries) => Some(
             entries
                 .flatten()
                 .filter(|entry| {
                     // CPU nodes report a `gfx_target_version` of 0; GPUs don't.
-                    std::fs::read_to_string(entry.path().join("gfx_target_version"))
-                        .ok()
-                        .is_some_and(|value| {
-                            value
-                                .trim()
-                                .parse::<u64>()
-                                .is_ok_and(|version| version != 0)
-                        })
+                    kfd_node_gfx_target_version(&entry.path()).is_some_and(|value| {
+                        value
+                            .trim()
+                            .parse::<u64>()
+                            .is_ok_and(|version| version != 0)
+                    })
                 })
                 .count(),
         ),
-        Err(_) if std::path::Path::new("/dev/kfd").exists() => None,
+        Err(_) if kfd_device.exists() => None,
         Err(_) => Some(0),
     }
+}
+
+/// A KFD topology node's `gfx_target_version`, or `None` when the node does
+/// not state one. The kernel exposes it as a `gfx_target_version N` line in
+/// the node's `properties` file, not as a standalone file; the standalone file
+/// is only a fallback. Mirrors the product's `kfd_node_gfx_target_version` in
+/// rocm-core, which is private to that crate.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_node_gfx_target_version(node_dir: &std::path::Path) -> Option<String> {
+    let from_properties = std::fs::read_to_string(node_dir.join("properties"))
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                if parts.next()? != "gfx_target_version" {
+                    return None;
+                }
+                parts.next().map(str::to_owned)
+            })
+        });
+    if from_properties.is_some() {
+        return from_properties;
+    }
+    std::fs::read_to_string(node_dir.join("gfx_target_version"))
+        .ok()
+        .map(|value| value.trim().to_owned())
 }
 
 /// Count AMD primary DRM cards under `/sys/class/drm` (`card0`, `card1`, …),
@@ -1158,6 +1206,83 @@ rocm examine
         assert_eq!(combine_amd_gpu_counts(None, Some(2)), Some(2));
         assert_eq!(combine_amd_gpu_counts(None, None), None);
         assert_eq!(combine_amd_gpu_counts(Some(2), None), Some(2));
+    }
+
+    /// Plant a KFD topology node directory holding `files` (name, contents).
+    fn plant_kfd_node(nodes: &std::path::Path, name: &str, files: &[(&str, &str)]) {
+        let node = nodes.join(name);
+        std::fs::create_dir_all(&node).expect("create node dir");
+        for (file, contents) in files {
+            std::fs::write(node.join(file), contents).expect("write node file");
+        }
+    }
+
+    /// The real kernel layout: `gfx_target_version` is a line inside the
+    /// node's `properties` file, with no standalone file beside it. A count
+    /// that reads only the standalone file returns 0 on every real KFD host,
+    /// which drops `@requires-multi-gpu` back onto the DRM card count.
+    #[test]
+    fn kfd_gpu_node_count_reads_gfx_target_version_from_properties() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let nodes = tmp.path().join("nodes");
+        plant_kfd_node(
+            &nodes,
+            "0",
+            &[("properties", "cpu_cores_count 16\ngfx_target_version 0\n")],
+        );
+        plant_kfd_node(
+            &nodes,
+            "1",
+            &[(
+                "properties",
+                "simd_count 128\ngfx_target_version 90402\ndrm_render_minor 128\n",
+            )],
+        );
+        plant_kfd_node(&nodes, "2", &[("properties", "gfx_target_version 90402\n")]);
+        let absent_device = tmp.path().join("no-kfd");
+        assert_eq!(kfd_gpu_node_count_in(&nodes, &absent_device), Some(2));
+    }
+
+    /// Older layouts with a standalone `gfx_target_version` file still count,
+    /// as the product's `kfd_node_gfx_target_version` falls back to it.
+    #[test]
+    fn kfd_gpu_node_count_falls_back_to_the_standalone_file() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let nodes = tmp.path().join("nodes");
+        plant_kfd_node(&nodes, "0", &[("gfx_target_version", "0\n")]);
+        plant_kfd_node(&nodes, "1", &[("gfx_target_version", "110501\n")]);
+        let absent_device = tmp.path().join("no-kfd");
+        assert_eq!(kfd_gpu_node_count_in(&nodes, &absent_device), Some(1));
+    }
+
+    /// A CPU node (value 0) and a node whose `properties` cannot be read are
+    /// not GPUs; neither may raise the count.
+    #[test]
+    fn kfd_gpu_node_count_skips_cpu_and_unreadable_nodes() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let nodes = tmp.path().join("nodes");
+        plant_kfd_node(&nodes, "0", &[("properties", "gfx_target_version 0\n")]);
+        // `properties` is a directory here, so reading it as a file fails.
+        std::fs::create_dir_all(nodes.join("1").join("properties")).expect("create dir");
+        plant_kfd_node(
+            &nodes,
+            "2",
+            &[("properties", "gfx_target_version 110501\n")],
+        );
+        let absent_device = tmp.path().join("no-kfd");
+        assert_eq!(kfd_gpu_node_count_in(&nodes, &absent_device), Some(1));
+    }
+
+    /// No topology directory: an authoritative "no GPU" when `/dev/kfd` is
+    /// absent, unknown when the device exists but its topology is unreadable.
+    #[test]
+    fn kfd_gpu_node_count_without_a_topology_directory() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let missing = tmp.path().join("nodes");
+        let device = tmp.path().join("kfd");
+        assert_eq!(kfd_gpu_node_count_in(&missing, &device), Some(0));
+        std::fs::write(&device, "").expect("plant device stand-in");
+        assert_eq!(kfd_gpu_node_count_in(&missing, &device), None);
     }
 
     #[test]
