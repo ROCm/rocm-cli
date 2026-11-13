@@ -148,11 +148,21 @@ data. Fixing only the state a reviewer named invites the next round to name its 
 when a finding is one instance of a class, fix the class and list the sibling cases in
 the reply.
 
-**Platform-gated code gets a test that runs on its gate.** When a `cfg(windows)` path
-cannot be driven by e2e, put its logic behind a pure helper or an injectable function
-(a script runner, a clock) so a unit test runs on the Windows CI job, including the error
-and timeout paths. A value matched across files (a version tag, a sentinel string) gets
-one shared constant and a test tying the producer to the consumer. If a path stays
+**Platform-conditional behavior is verified on the platform it targets.** A change that
+takes effect on one platform only — a `cfg(windows)` or `cfg(unix)` branch, a read of an
+interface one OS alone has (sysfs, a Win32 call), a scenario whose premise is
+OS-specific — names in the PR text that platform and the check that runs there and would
+fail without the change. A test that runs only elsewhere is not that check, and neither
+is one that runs on the target but returns early when its premise is missing. For a
+`cfg(windows)` path e2e cannot drive, put its logic behind a pure helper or an injectable
+function (a script runner, a clock) so a unit test runs on the Windows CI job, including
+the error and timeout paths. A capability tag (`@requires-gpu`, `@requires-engine:<e>`)
+is not a platform tag — the Windows GPU lane satisfies `@requires-gpu` — so a scenario
+whose premise is OS-specific also carries `@requires-os:<os>`, plus `@requires-bare-metal`
+where WSL2 lacks the interface; [`platform_tags.rs`](tests/e2e-cucumber/tests/platform_tags.rs)
+fails on a capability-tagged scenario with neither an OS tag nor a reviewed
+`ALLOWED_ANY_OS` entry. A value matched across files (a version tag, a sentinel string)
+gets one shared constant and a test tying the producer to the consumer. If a path stays
 untested, say which and why in the PR text.
 
 ## 4) Live State Verification Before Any External Claim
@@ -492,7 +502,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 11. User approval obtained for any high-blast-radius external action — *§1*
 12. Force-push's live review/approval state checked before proposing or executing one — *§1*
 13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
-14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
+14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-conditional behavior verified by a check that runs on its target platform — *§3*
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 

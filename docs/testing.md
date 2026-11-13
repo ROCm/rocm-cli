@@ -266,6 +266,37 @@ a file it reads, so a pull request that touches nothing but
 `crates/rocm-dash-tui` does not run this test on Linux. The module-import
 contract above has the same property.
 
+### Capability-tagged scenarios name their OS
+
+A capability tag (`@requires-gpu`, `@requires-engine:<e>`, `@requires-docker`
+and the rest) asks what the host has, not which OS it runs, so the Windows GPU
+lane runs every `@requires-gpu` scenario. A scenario whose premise exists on
+one OS only also carries `@requires-os:<os>`, plus `@requires-bare-metal` when
+WSL2 lacks the interface. examine-17 is the case that prompted this: its step
+reads the KFD topology, found none on the Windows lane, and passed without
+asserting anything.
+[platform_tags.rs](../tests/e2e-cucumber/tests/platform_tags.rs) parses every
+`.feature` file, reads each scenario's own tags through the same
+`ScenarioDecl::from_tags` the harness uses, and fails on a capability-tagged
+scenario with neither `@requires-os:<os>` nor `@requires-wsl` whose `@id` is
+not in its `ALLOWED_ANY_OS` list. Each entry there carries the reason the
+scenario's assertions hold on every OS; an entry that names no scenario, names
+one without a capability tag, or names one whose tags already decide its OS
+fails the test too. Run it on its own with:
+
+```bash
+cargo test -p e2e-cucumber --test platform_tags
+```
+
+It reads tags, not steps, so whether an entry's reason is still true is a
+review question: a step that starts reading something only one OS has turns
+its entry wrong without failing anything here. Where it runs: the
+`windows-debug` job runs `cargo test --workspace` on every pull request that
+changes Rust or a `.feature` file, so a tag-only edit is checked there. The
+Linux pull-request lane runs it only when the change selects `e2e-cucumber` and
+passes that lane's Rust path filter, which a `.feature` file alone does not, and
+the pre-push hook does not run `e2e-cucumber`'s tests.
+
 ### Tests that run a fake executable
 
 Plant a stand-in `python`, `uv`, `amd-smi`, ... with

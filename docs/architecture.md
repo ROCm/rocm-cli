@@ -827,6 +827,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`tests/driver_host_guard.rs`](../tests/e2e-cucumber/tests/driver_host_guard.rs) | Ordinary test that the Windows driver-install steps run the host guard before calling the CLI, checked against the step source. | flat |
 | [`tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs) | The cucumber test binary: the `E2eWorld` state and its cleanup on drop, the `run_rocm` helpers, the runner `main`, and reconciliation of results with expectations. | flat |
 | [`tests/feature_naming.rs`](../tests/e2e-cucumber/tests/feature_naming.rs) | Drift guard, in the ordinary `cargo test` set, for the `<feature-key>-<NN>` scenario names and ids in the `.feature` files. | flat |
+| [`tests/platform_tags.rs`](../tests/e2e-cucumber/tests/platform_tags.rs) | Drift guard, in the ordinary `cargo test` set, that every capability-tagged scenario also carries an OS-deciding tag or a reviewed `ALLOWED_ANY_OS` entry. | flat |
 | [`tests/skill_reference.rs`](../tests/e2e-cucumber/tests/skill_reference.rs) | Drift guard, in the ordinary `cargo test` set, that the catalog table in [`reference.md`](../skills/rocm-doctor/reference.md) uses the vocabulary `rocm fix` prints. | flat |
 
 #### `tests/e2e/`

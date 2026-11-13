@@ -219,11 +219,17 @@ Feature: GPU detection and system inspection
   # `rocminfo` the per-node target the kernel reports is the only thing that can
   # fill the field.
   #
-  # The step no-ops where a premise does not hold -- no readable KFD topology,
-  # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
-  # target -- because on such a host the answer it would otherwise flag is the
-  # correct one.
-  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu
+  # The KFD topology exists only on bare-metal Linux -- native Windows has no
+  # sysfs and WSL2 exposes no KFD nodes -- so the scenario is tagged for that
+  # host. `@requires-gpu` alone let the Windows GPU lane run it, where the step
+  # found no topology and passed without asserting anything.
+  #
+  # The step still no-ops where a premise does not hold on Linux -- no readable
+  # KFD topology, no `lspci` to supply PCI addresses, or a topology whose nodes
+  # disagree on a target -- because on such a host the answer it would
+  # otherwise flag is the correct one. That early return covers a Linux host
+  # missing a premise; it is not a substitute for the OS tags.
+  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu @requires-os:linux @requires-bare-metal
   Scenario: examine-17 - The machine-readable report lists every GPU the kernel sees
     Given a machine with an AMD GPU
     When the user inspects the system both for reading and for scripting

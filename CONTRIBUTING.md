@@ -134,6 +134,7 @@ See [Commit signatures](https://github.com/ROCm/rocm-cli/blob/main/docs/commit-s
 ### What reviewers look for
 
 - Tests cover the new behavior
+- Platform-specific changes name the platform they target and a check that runs there and would fail without them
 - No secrets, credentials, or internal hostnames in committed files
 - Third-party dependencies recorded in `Cargo.lock`
 - License headers on new source files (see `licenserc.toml`)
