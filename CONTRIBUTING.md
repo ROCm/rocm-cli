@@ -139,6 +139,7 @@ See [Commit signatures](https://github.com/ROCm/rocm-cli/blob/main/docs/commit-s
 - License headers on new source files (see `licenserc.toml`)
 - Comments and documentation that state how the code behaves are checked against that code, and one that is the reason for a decision names the file and the function, constant or test that makes it true, as AGENTS.md section 3 states
 - A blocking objection resting on a timing, ordering, concurrency or "this cannot happen" argument names the mechanism it assumes and where that mechanism is defined, and one whose mechanism cannot be located is raised as a question instead, as AGENTS.md section 11 states
+- A revision answering review feedback is re-reviewed as a whole change, and a commit in it that answers the feedback widens no documented user-facing option's meaning or authority, as AGENTS.md section 11 states
 
 ## Reporting security issues
 

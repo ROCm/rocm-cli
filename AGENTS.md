@@ -467,8 +467,16 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - before resuming review-feedback work on a PR you authored, first check for review comments with no reply yet (same `in_reply_to_id` cross-reference technique below)
 - automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
+- when reviewing a revision that answers review feedback, diff it whole against the revision you last reviewed, the same way the author does (**Review-fix commits** below), not only the lines your finding named: a remediation is written in a narrow window, gets the least scrutiny, and is where new defects arrive
 - when reviewing, treat a comment or doc line in the diff that states how the code behaves as a claim to check against that code (§3), not as context; one that is the reason for a decision (§3 says which) is checked before you approve, including that it names where the code makes it true
 - when reviewing, before marking an objection blocking because it rests on a timing, ordering, concurrency or "this cannot happen" argument, name the mechanism it assumes and where that is defined (file and symbol); an objection whose mechanism you cannot locate is posted as a question, not a blocking finding
+
+**Review-fix commits** — a commit answering review feedback is reviewed by its author as a whole change:
+
+- diff it against the head the reviewer saw (the `commit.oid` of the review it answers, from `gh pr view <pr> --json reviews`, §1), not only the lines the finding named, and say in the reply whether it changes behavior outside the finding
+- once the base has moved into the branch since the review, by a rebase or by merging the base in, `git diff <reviewed-head>..HEAD` also shows everything the base gained. Fetch the PR's base branch (for a stacked PR, the branch it depends on, not `main`) and diff with `git range-diff origin/<base> <reviewed-head> HEAD` instead, reading in full each commit it marks new or changed. A commit it marks removed is either the base's old history, where the base was force-pushed, or a commit dropped from the branch since the review, so check which before setting one aside. `git range-diff` skips merge commits, so read a merge that resolved conflicts with `git show <merge>`
+- once a force-push has taken the reviewed head off the branch, a clone that never had it fetches it by its full SHA first, while the host still retains it (`git fetch origin <reviewed-head>`)
+- a review-fix commit does not widen what a documented user-facing option means or authorizes (a `--yes` that starts granting a second consent); where widening is needed, it is its own commit, described as such in the PR body, that changes the option's help text and docs together with its behavior
 
 **Stacked and dependent PRs:**
 
@@ -489,8 +497,9 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
-After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
-of sequence or a clippy lint cost more than running them first.
+After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6
+and §11's review-fix commit rules before pushing. Round-trips spent on a scenario number
+out of sequence or a clippy lint cost more than running them first.
 
 ## 13) Upstream Pre-flight Checklist
 
@@ -513,6 +522,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 17. Comments and doc lines stating how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
+18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
 
 ## 14) Related Internal Workflows
 
