@@ -579,9 +579,11 @@ fn runtime_status_label_with_extension_check(
     }
 }
 
-/// An installed vLLM whose own detect says its GPU path cannot run: its
-/// compiled extensions do not import. Reporting that as `ready` sends
-/// the user to a serve that is certain to fail.
+/// An installed vLLM whose own detect says a device is unavailable and gives a
+/// reason. vLLM's detect reports an unavailable device only when its compiled
+/// extensions do not import (or on native Windows, which the caller rules out
+/// first), so this reads that as "installed but not usable" rather than `ready`,
+/// which would send the user to a serve that is certain to fail.
 fn engine_reports_unusable_device(detect: &DetectResponse) -> bool {
     detect
         .available_devices

@@ -433,17 +433,8 @@ mod tests {
         )
         .expect("write stand-in interpreter");
         let runtime = crate::runtime::VllmRuntime {
-            runtime_id: "test".to_owned(),
-            env_id: "test".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(python),
-            version: None,
-            source: "test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..crate::runtime::VllmRuntime::for_test()
         };
         let detect = detect_response_for(Ok(runtime));
         assert!(detect.installed);

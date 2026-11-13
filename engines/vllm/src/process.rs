@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::runtime::{
     VllmRuntime, ensure_therock_compat_shims, runtime_bin_paths, runtime_has_discover_build,
-    therock_library_path_entries_for_launch,
+    therock_library_path_entries, therock_library_path_entries_for_launch,
 };
 use crate::startup_diagnostics::startup_log_context;
 use crate::{ServeHttpRequest, engine_recipe_launch_args};
@@ -416,6 +416,24 @@ fn apply_therock_env_with(
     runtime: &VllmRuntime,
     ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
 ) -> Result<()> {
+    apply_therock_env_using(command, runtime, |runtime| {
+        let compat_shim = ensure_therock_compat_shims(runtime, ensure_mpi_cxx_compat);
+        therock_library_path_entries_for_launch(runtime, compat_shim)
+    })
+}
+
+/// [`apply_therock_env`] for a caller that only reads: the same environment, but
+/// the compat-shim step (which writes a `libmpi_cxx` stub and removes a stale
+/// numa symlink) is not run, and the loader path is derived without it.
+fn apply_therock_env_read_only(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+    apply_therock_env_using(command, runtime, therock_library_path_entries)
+}
+
+fn apply_therock_env_using(
+    command: &mut ProcessCommand,
+    runtime: &VllmRuntime,
+    library_path_entries: impl FnOnce(&VllmRuntime) -> Vec<PathBuf>,
+) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
     if runtime_has_discover_build(runtime) {
         apply_vllm_rocm10_discover_env(command, runtime)?;
@@ -442,11 +460,10 @@ fn apply_therock_env_with(
         );
     }
     if !cfg!(windows) {
-        let compat_shim = ensure_therock_compat_shims(runtime, ensure_mpi_cxx_compat);
         command.env(
             "LD_LIBRARY_PATH",
             prepend_path_entries(
-                &therock_library_path_entries_for_launch(runtime, compat_shim),
+                &library_path_entries(runtime),
                 std::env::var_os("LD_LIBRARY_PATH"),
             )?,
         );
@@ -517,7 +534,10 @@ fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> 
     if let Some(dir) = python.parent().filter(|dir| dir.is_dir()) {
         command.current_dir(dir);
     }
-    apply_therock_env(&mut command, runtime).ok()?;
+    // Read-only: `rocm engines list` and the assistant's engines tool reach this
+    // and promise not to change the runtime. A missing compat stub only makes
+    // `import torch` fail, which the probe reports as nothing.
+    apply_therock_env_read_only(&mut command, runtime).ok()?;
     let output = rocm_core::process::run_with_timeout(command, timeout, "vLLM extension probe")
         .ok()
         .filter(|output| output.status.success())?;
@@ -1071,7 +1091,8 @@ mod tests {
     #[test]
     fn extension_check_runs_the_probe_with_the_runtimes_python() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        // Stands in for the interpreter: ignores `-c <script>` and prints a failing probe.
+        // Stands in for the interpreter: answers only to `-c <probe script>` (see
+        // `stand_in_python`) and prints a failing probe.
         let python = stand_in_python(
             dir.path(),
             r#"echo '{"failures": [{"module": "vllm._rocm_C", "error": "undefined symbol: x"}]}'"#,
@@ -1203,9 +1224,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_long_probe_error_is_cut_to_what_fits_in_guidance() -> Result<()> {
-        let Some(out) = run_probe_script("", &[("_C", "raise ImportError('y' * 5000)")])? else {
-            return Ok(());
-        };
+        let out = run_probe_script("", &[("_C", "raise ImportError('y' * 5000)")])?;
         let problem = extension_import_problem_from_probe(&out, &test_vllm_runtime(None, None))
             .expect("a failing _C is a problem");
         // Exactly the first 400 characters of the error survive.
@@ -1231,9 +1250,10 @@ mod tests {
         Ok(())
     }
     /// Runs the probe script under `python3` against stub `torch` and `vllm`
-    /// modules, returning its stdout, or `None` when there is no `python3`.
+    /// modules, returning its stdout. Panics when there is no `python3`: these
+    /// are the only tests of the script itself, so they must not pass unrun.
     #[cfg(unix)]
-    fn run_probe_script(torch: &str, extensions: &[(&str, &str)]) -> Result<Option<String>> {
+    fn run_probe_script(torch: &str, extensions: &[(&str, &str)]) -> Result<String> {
         let dir = tempfile::tempdir()?;
         let vllm = dir.path().join("vllm");
         fs::create_dir(&vllm)?;
@@ -1242,16 +1262,16 @@ mod tests {
         for (module, body) in extensions {
             fs::write(vllm.join(format!("{module}.py")), body)?;
         }
-        let Ok(output) = ProcessCommand::new("python3")
+        let output = ProcessCommand::new("python3")
             .arg("-c")
             .arg(VLLM_EXTENSION_PROBE_SCRIPT)
             .env("PYTHONPATH", dir.path())
             .output()
-        else {
-            panic!("python3 is required to run the probe-script tests; none was found on PATH");
-        };
+            .unwrap_or_else(|error| {
+                panic!("python3 is required to run the probe-script tests: {error}")
+            });
         assert!(output.status.success(), "{output:?}");
-        Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
     #[cfg(unix)]
     #[test]
@@ -1259,9 +1279,7 @@ mod tests {
         let runtime = test_vllm_runtime(None, None);
         let fails = "raise ImportError('undefined symbol: boom')";
         // `_C` fails to load; a `_rocm_C` that is merely absent is not a mismatch.
-        let Some(out) = run_probe_script("", &[("_C", fails)])? else {
-            return Ok(());
-        };
+        let out = run_probe_script("", &[("_C", fails)])?;
         let problem =
             extension_import_problem_from_probe(&out, &runtime).expect("a failing _C is a problem");
         assert!(
@@ -1270,7 +1288,7 @@ mod tests {
         );
         assert!(!problem.contains("_rocm_C"), "{problem}");
         // The ROCm extension, which the issue is about, is probed on its own.
-        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", fails)])?.expect("python3");
+        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", fails)])?;
         let problem = extension_import_problem_from_probe(&out, &runtime)
             .expect("a failing _rocm_C is a problem");
         assert!(
@@ -1279,8 +1297,7 @@ mod tests {
         );
         // So is the stable-libtorch extension: dropping it from the probe would
         // let a wheel that only that one breaks read as healthy.
-        let out =
-            run_probe_script("", &[("_C", ""), ("_C_stable_libtorch", fails)])?.expect("python3");
+        let out = run_probe_script("", &[("_C", ""), ("_C_stable_libtorch", fails)])?;
         let problem = extension_import_problem_from_probe(&out, &runtime)
             .expect("a failing _C_stable_libtorch is a problem");
         assert!(
@@ -1288,13 +1305,13 @@ mod tests {
             "{problem}"
         );
         // A dependency's missing-module error is cut like any other error.
-        let out = run_probe_script("", &[("_C", "__import__('m' * 5000)")])?.expect("python3");
+        let out = run_probe_script("", &[("_C", "__import__('m' * 5000)")])?;
         let problem = extension_import_problem_from_probe(&out, &runtime)
             .expect("a missing dependency of _C is a problem");
         assert!(problem.contains(&"m".repeat(380)), "{problem}");
         assert!(!problem.contains(&"m".repeat(400)), "{problem}");
         // Two failing extensions are both named, joined by `; `.
-        let out = run_probe_script("", &[("_C", fails), ("_rocm_C", fails)])?.expect("python3");
+        let out = run_probe_script("", &[("_C", fails), ("_rocm_C", fails)])?;
         let problem = extension_import_problem_from_probe(&out, &runtime)
             .expect("two failing extensions are a problem");
         assert!(
@@ -1304,8 +1321,7 @@ mod tests {
         );
         // An extension that is present but needs a module that is missing is a
         // broken install, not an extension absent from the wheel.
-        let out = run_probe_script("", &[("_C", "import a_module_vllm_needs_but_lacks")])?
-            .expect("python3");
+        let out = run_probe_script("", &[("_C", "import a_module_vllm_needs_but_lacks")])?;
         let problem = extension_import_problem_from_probe(&out, &runtime)
             .expect("a missing dependency of _C is a problem");
         assert!(
@@ -1313,7 +1329,7 @@ mod tests {
             "{problem}"
         );
         // Everything loads.
-        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", "")])?.expect("python3");
+        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", "")])?;
         assert_eq!(extension_import_problem_from_probe(&out, &runtime), None);
         Ok(())
     }
@@ -1321,15 +1337,12 @@ mod tests {
     #[test]
     fn extension_probe_script_stops_at_a_torch_that_does_not_import() -> Result<()> {
         let fails = "raise ImportError('undefined symbol: boom')";
-        let Some(out) = run_probe_script("raise ImportError('no torch')", &[("_C", fails)])? else {
-            return Ok(());
-        };
+        let out = run_probe_script("raise ImportError('no torch')", &[("_C", fails)])?;
         // Exactly the empty report: the extensions are not tried (and so not blamed).
         assert_eq!(out.trim(), r#"{"failures": []}"#);
         // Whatever torch raises on import, not only an `ImportError`: an
         // unrelated torch failure is never charged to the extensions.
-        let out = run_probe_script("raise RuntimeError('torch is broken')", &[("_C", fails)])?
-            .expect("python3");
+        let out = run_probe_script("raise RuntimeError('torch is broken')", &[("_C", fails)])?;
         assert_eq!(out.trim(), r#"{"failures": []}"#);
         Ok(())
     }
@@ -1345,6 +1358,49 @@ mod tests {
         let mut runtime = test_vllm_runtime(Some(python), None);
         runtime.sdk_root = Some(dir.path().to_path_buf());
         assert!(vllm_extension_import_problem(&runtime).is_some());
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_extension_probe_changes_nothing_in_the_runtime() -> Result<()> {
+        // `rocm engines list` and the assistant's read-only engines tool reach the
+        // probe, so it must not run the compat-shim step, which removes a stale
+        // numa symlink from the runtime.
+        let env = tempfile::tempdir()?;
+        let bin = env.path().join("bin");
+        fs::create_dir_all(&bin)?;
+        let python = stand_in_python(&bin, r#"echo '{"failures": []}'"#)?;
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        let stale_shim = compat_dir.join("libnuma.so.1");
+        std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
+        let runtime = VllmRuntime {
+            python_executable: Some(python),
+            sdk_root: Some(env.path().join("sdk")),
+            ..VllmRuntime::for_test()
+        };
+        assert_eq!(vllm_extension_import_problem(&runtime), None);
+        assert!(
+            stale_shim.symlink_metadata().is_ok(),
+            "the probe ran the compat-shim step"
+        );
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_interpreter_path_still_runs_the_probe() -> Result<()> {
+        // Through `vllm_extension_import_problem` itself: the probe runs from the
+        // interpreter's directory, so a relative program path would not spawn and
+        // the check would silently report nothing.
+        let dir = tempfile::tempdir_in(std::env::current_dir()?)?;
+        stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'"#,
+        )?;
+        let relative = Path::new(dir.path().file_name().expect("tempdir name")).join("python");
+        assert!(relative.is_relative());
+        let problem = vllm_extension_import_problem(&test_vllm_runtime(Some(relative), None));
+        assert!(problem.is_some(), "a relative interpreter was never run");
         Ok(())
     }
     #[test]
