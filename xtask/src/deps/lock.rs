@@ -148,8 +148,9 @@ fn run_with(
         // package and PyPI's), so a re-lock would never match.
         let output = work.join(lock_file_name(name, os));
         let _ = fs::remove_file(&output);
-        let cutoff = match fs::read_to_string(&committed) {
-            Ok(text) if !options.upgrade => pylock::recorded_cutoff(&text).unwrap_or_else(|| {
+        let previous = read_committed(&committed)?;
+        let cutoff = match &previous {
+            Some(text) if !options.upgrade => pylock::recorded_cutoff(text).unwrap_or_else(|| {
                 eprintln!(
                     "{} records no valid cutoff; resolving at a new one, {new_cutoff}",
                     super::profiles::slash_path(&Profiles::lock_path(name, os))
@@ -187,8 +188,8 @@ fn run_with(
         // A resolution that changes nothing but the cutoff keeps the lock as
         // it was, so a weekly `--upgrade` with nothing new rewrites no file
         // and proposes nothing.
-        let locked = match fs::read_to_string(&committed) {
-            Ok(previous) if pylock::same_but_cutoff(&previous, &locked) => previous,
+        let locked = match previous {
+            Some(previous) if pylock::same_but_cutoff(&previous, &locked) => previous,
             _ => locked,
         };
         resolved.push((committed, locked));
@@ -231,6 +232,23 @@ fn run_with(
     // under `--profile`, so a partial run removes only true leftovers.
     remove_stale_locks(root, &profiles)?;
     Ok(())
+}
+
+/// The committed lock at `path`, or `None` when there is none yet. Any other
+/// read failure (a directory there, no permission, not UTF-8) is an error,
+/// with or without `--upgrade`: taken as "no lock", it would pick a fresh
+/// cutoff and propose an update nothing asked for.
+fn read_committed(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to read {}; delete it to lock that profile afresh",
+                path.display()
+            )
+        }),
+    }
 }
 
 struct CompileInputs<'a> {
@@ -611,6 +629,10 @@ linux = "x86_64-manylinux_2_28"
         args: std::cell::RefCell<Vec<Vec<String>>>,
         /// What each compile writes.
         body: String,
+        /// A path the last compile (the workspace has two targets) fills with
+        /// a non-empty directory: after every committed lock has been read and
+        /// before any is replaced, so a test can make one lock's rename fail.
+        block: Option<PathBuf>,
     }
 
     impl FakeUv {
@@ -620,6 +642,7 @@ linux = "x86_64-manylinux_2_28"
                 calls: std::cell::RefCell::default(),
                 args: std::cell::RefCell::default(),
                 body: "lock-version = \"1.0\"\ncreated-by = \"test\"\n".to_owned(),
+                block: None,
             }
         }
 
@@ -656,6 +679,14 @@ linux = "x86_64-manylinux_2_28"
                     .collect(),
             );
             fs::write(&output, &self.body)?;
+            if let Some(block) = self
+                .block
+                .as_ref()
+                .filter(|_| self.calls.borrow().len() == 2)
+            {
+                fs::create_dir_all(block)?;
+                fs::write(block.join("keep"), "")?;
+            }
             Ok(())
         }
 
@@ -1298,14 +1329,17 @@ linux = "x86_64-manylinux_2_28"
     fn a_lock_that_cannot_be_written_leaves_no_partial_file() {
         let root = workspace();
         let locks = root.path().join("runtimes/locks");
-        // A non-empty directory where the lock goes makes the rename fail.
-        fs::create_dir_all(locks.join("pylock.p-linux.toml")).unwrap();
-        fs::write(locks.join("pylock.p-linux.toml/keep"), "").unwrap();
+        // A non-empty directory where the lock goes, appearing after the
+        // committed locks were read, makes the rename fail.
+        let uv = FakeUv {
+            block: Some(locks.join("pylock.p-linux.toml")),
+            ..FakeUv::new("0.13.6")
+        };
         let err = run_with(
             root.path(),
             &root.path().join("work"),
             &plain(),
-            &FakeUv::new("0.13.6"),
+            &uv,
             vec![],
             now(),
         )
@@ -1315,6 +1349,78 @@ linux = "x86_64-manylinux_2_28"
             !locks.join("pylock.p-linux.toml.partial").exists(),
             "the partial file is cleaned up"
         );
+    }
+
+    /// A committed lock that exists but cannot be read is an error, not "no
+    /// lock yet": that would resolve at a fresh cutoff and propose an update
+    /// nothing asked for.
+    #[test]
+    fn an_unreadable_committed_lock_is_an_error() {
+        let root = workspace();
+        let locks = root.path().join("runtimes/locks");
+        fs::create_dir_all(locks.join("pylock.p-linux.toml")).unwrap();
+        let uv = FakeUv::new("0.13.6");
+        let err = run_with(
+            root.path(),
+            &root.path().join("work"),
+            &plain(),
+            &uv,
+            vec![],
+            now(),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to read") && message.contains("pylock.p-linux.toml"),
+            "{message}"
+        );
+        assert!(uv.calls.borrow().is_empty(), "nothing was resolved");
+        // The advice in the message clears it: with the path deleted, the
+        // profile locks afresh.
+        assert!(
+            message.contains("delete it to lock that profile afresh"),
+            "{message}"
+        );
+        fs::remove_dir_all(locks.join("pylock.p-linux.toml")).unwrap();
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &plain(),
+            &uv,
+            vec![],
+            now(),
+        )
+        .unwrap();
+        assert!(locks.join("pylock.p-linux.toml").is_file());
+    }
+
+    /// The weekly update runs with `--upgrade`, which picks a new cutoff
+    /// without reading the old one; an unreadable lock is still an error.
+    #[test]
+    fn an_unreadable_committed_lock_is_an_error_with_upgrade_too() {
+        let root = workspace();
+        let locks = root.path().join("runtimes/locks");
+        fs::create_dir_all(locks.join("pylock.p-linux.toml")).unwrap();
+        let uv = FakeUv::new("0.13.6");
+        let upgrade = LockOptions {
+            upgrade: true,
+            ..plain()
+        };
+        let err = run_with(
+            root.path(),
+            &root.path().join("work"),
+            &upgrade,
+            &uv,
+            vec![],
+            now(),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to read") && message.contains("pylock.p-linux.toml"),
+            "{message}"
+        );
+        assert!(uv.calls.borrow().is_empty(), "nothing was resolved");
     }
 
     /// A rename that fails part-way names the lock it stopped at, leaves the
@@ -1329,16 +1435,18 @@ linux = "x86_64-manylinux_2_28"
             for name in names.iter().filter(|name| *name != blocked) {
                 fs::write(locks.join(name), "the committed lock\n").unwrap();
             }
-            // A non-empty directory where this lock goes makes its rename
-            // fail; its partial file is written first, so the write phase
-            // passes.
-            fs::create_dir_all(locks.join(blocked)).unwrap();
-            fs::write(locks.join(blocked).join("keep"), "").unwrap();
+            // A non-empty directory where this lock goes, appearing after the
+            // committed locks were read, makes its rename fail; its partial
+            // file is written first, so the write phase passes.
+            let uv = FakeUv {
+                block: Some(locks.join(blocked)),
+                ..FakeUv::new("0.13.6")
+            };
             let err = run_with(
                 root.path(),
                 &root.path().join("work"),
                 &plain(),
-                &FakeUv::new("0.13.6"),
+                &uv,
                 vec![],
                 now(),
             )

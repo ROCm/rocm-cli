@@ -22,8 +22,9 @@ name: Runtime dependency update
 #
 # The branch is rebuilt from scratch on every run. A fixup a maintainer pushes
 # to it is never discarded: while the branch holds a commit this workflow did
-# not make, the run fails instead of updating it. Merge (or close) the pull
-# request, or move the fixup to `main`.
+# not make, the run fails instead of updating it. Merge the pull request
+# (merging deletes the branch), or close it and delete the branch, or move the
+# fixup to `main`.
 #
 # PREREQUISITE: "Allow GitHub Actions to create and approve pull requests"
 # (Settings > Actions > General) must be on, or `gh pr create` below is
@@ -215,18 +216,27 @@ jobs:
           # The branch always restarts from that commit: one proposal,
           # regenerated from scratch each week, never stacked on the last one.
           # A commit on it that this workflow did not make (a maintainer's
-          # fixup) is never discarded: the run stops instead.
-          if gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
-            others=$(gh api "repos/$REPO/compare/$base_sha...$BRANCH" \
+          # fixup) is never discarded: the run stops instead. The head is read
+          # once, its commits are counted up to that exact SHA, and the reset
+          # is GraphQL `updateRefs` with that SHA as `beforeOid`, which GitHub
+          # applies only if the branch still points there (all zeros: only if
+          # it still does not exist), so a fixup pushed in between fails the
+          # run instead of being lost.
+          if head_sha=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>ref.err); then
+            others=$(gh api "repos/$REPO/compare/$base_sha...$head_sha" \
               --jq '[.commits[] | select((.author.login == "github-actions[bot]" or (.author == null and .commit.author.email == "41898282+github-actions[bot]@users.noreply.github.com")) | not)] | length')
             if [ "$others" != "0" ]; then
-              echo "::error::$BRANCH has $others commit(s) this workflow did not make. Merge or close its pull request, or move the fixups to main, before the next update."
+              echo "::error::$BRANCH has $others commit(s) this workflow did not make. Merge its pull request (which deletes the branch), or close it and delete the branch, or move the fixups to main, before the next update."
               exit 1
             fi
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$base_sha" -F force=true >/dev/null
           else
-            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$base_sha" >/dev/null
+            grep -q 'HTTP 404' ref.err || { cat ref.err >&2; exit 1; }
+            head_sha=0000000000000000000000000000000000000000
           fi
+          repo_id=$(gh api "repos/$REPO" --jq .node_id)
+          gh api graphql \
+            -f query='mutation($repo: ID!, $name: GitRefname!, $before: GitObjectID!, $after: GitObjectID!) { updateRefs(input: {repositoryId: $repo, refUpdates: [{name: $name, beforeOid: $before, afterOid: $after, force: true}]}) { clientMutationId } }' \
+            -f repo="$repo_id" -f name="refs/heads/$BRANCH" -f before="$head_sha" -f after="$base_sha" >/dev/null
 
           # Locks the update no longer produces are deleted on the branch.
           # A 404 means `main` has no locks yet; any other failure must stop the

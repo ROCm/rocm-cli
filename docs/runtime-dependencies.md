@@ -242,8 +242,13 @@ and commit through `createCommitOnBranch`, which GitHub signs, as the
 
 The update branch is rebuilt from the base commit on every run, but never
 over someone else's work: while it holds a commit the workflow did not make, a
-maintainer's fixup for example, the run fails instead of resetting it. Merge or
-close the pull request, or move the fixup to `main`.
+maintainer's fixup for example, the run fails instead of resetting it. The
+reset is a GraphQL `updateRefs` that GitHub applies only if the branch still
+points at the head the run checked, so a fixup pushed between the check and
+the reset fails the run rather than being discarded. Merge the pull request
+(merging deletes the branch in this repository), or close it and delete the
+`runtime-deps/update` branch, or move the fixup to `main`: a pull request
+closed without merging leaves the branch, and its fixup, in place.
 
 **Prerequisite:** the repository setting "Allow GitHub Actions to create and
 approve pull requests" (Settings → Actions → General) must be on. While it is

@@ -207,9 +207,11 @@ fn package_problems(
             out.push(format!("{name}: artifact is not an https URL: {url:?}"));
             continue;
         };
-        if !artifact.hashes.get("sha256").is_some_and(|h| {
-            h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }) {
+        if !artifact
+            .hashes
+            .get("sha256")
+            .is_some_and(|h| super::mise_lock::is_sha256_hex(h))
+        {
             out.push(format!("{name}: {url} has no sha256"));
         }
         let from_vendor = profiles
