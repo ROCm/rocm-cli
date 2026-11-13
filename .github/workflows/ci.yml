@@ -520,6 +520,13 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: sh tests/install-sh/run.sh
 
+      # Hermetic: a stub `gh` serves a local bundle, so the `pr-<number>`
+      # channel's choice of CI run, its checksum-only trust and its refusals
+      # are checked without GitHub access.
+      - name: Installer PR channel checks
+        if: needs.changes.outputs.heavy == 'true'
+        run: sh tests/install-sh/pr_channel.sh
+
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
         # The install lifecycle (package + real installer + install/uninstall) now
@@ -1059,25 +1066,34 @@ jobs:
           needs.changes.outputs.heavy == 'true' &&
           (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
         shell: pwsh
+        # The install command is only printed for a pull request: a manually
+        # dispatched build has no number, and the channel needs one.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          @'
+          $summary = @'
           ## Try this PR's build (Windows x86_64)
 
-          Download `rocm-cli-pr-windows-amd64` from this run's **Artifacts**
-          section below, then:
+          '@
+          $install = @'
+          With the [GitHub CLI](https://cli.github.com) signed in
+          (`gh auth login`), install the build of the PR's latest commit:
 
           ```powershell
-          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath pr-artifact   # GitHub's wrapper zip
-          Expand-Archive pr-artifact\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
-          $dest = "$env:LOCALAPPDATA\rocm-cli\bin"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Copy-Item rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocm.exe,rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocmd.exe $dest
-          $env:Path = "$dest;$env:Path"
-          rocm --version
+          $env:ROCM_CLI_CHANNEL = "pr-PR_NUMBER"
+          irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+          Remove-Item Env:ROCM_CLI_CHANNEL   # later installs go back to the release channel
           ```
 
+          '@
+          $artifact = @'
+          You can also download `rocm-cli-pr-windows-amd64` from this run's
+          **Artifacts** section below.
+
           Unsigned build for manual testing only — not for production use.
-          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '@
+          if ($env:PR_NUMBER) { $summary += $install.Replace('PR_NUMBER', $env:PR_NUMBER) }
+          ($summary + $artifact) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Upload PR bundle
         if: >-
@@ -1222,24 +1238,34 @@ jobs:
           cargo xtask package rocm-cli-pr-linux-amd64
 
       - name: Add install instructions to job summary
+        # The install command is only printed for a pull request: a manually
+        # dispatched build has no number, and the channel needs one.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          {
+          cat <<'EOF'
           ## Try this PR's build (Linux x86_64)
 
-          Download `rocm-cli-pr-linux-amd64` from this run's **Artifacts**
-          section below, then:
+          EOF
+          if [ -n "$PR_NUMBER" ]; then
+          sed "s/PR_NUMBER/$PR_NUMBER/" <<'EOF'
+          With the [GitHub CLI](https://cli.github.com) signed in
+          (`gh auth login`), install the build of the PR's latest commit:
 
           ```sh
-          unzip rocm-cli-pr-linux-amd64.zip   # GitHub wraps the artifact in a zip
-          tar -xzf rocm-cli-pr-linux-amd64.tar.gz
-          dest="$HOME/rocm-cli-pr/bin"
-          install -Dm0755 rocm-cli-pr-linux-amd64/bin/rocm rocm-cli-pr-linux-amd64/bin/rocmd -t "$dest"
-          export PATH="$dest:$PATH"
-          rocm --version
+          curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- pr-PR_NUMBER
           ```
+
+          EOF
+          fi
+          cat <<'EOF'
+          You can also download `rocm-cli-pr-linux-amd64` from this run's
+          **Artifacts** section below.
 
           Unsigned build for manual testing only — not for production use.
           EOF
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

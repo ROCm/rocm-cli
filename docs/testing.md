@@ -3404,6 +3404,100 @@ the heavy path (`needs.changes.outputs.heavy == 'true'`):
 sh tests/install-sh/run.sh
 ```
 
+The `pr-<number>` channel of `install.sh` (install the bundle CI built for a
+pull request) is covered by
+[`tests/install-sh/pr_channel.sh`](../tests/install-sh/pr_channel.sh). It puts a
+stub `gh` first on `PATH` that serves a local bundle, and checks:
+
+- the install uses the newest CI run for the head commit that still has an
+  unexpired artifact, found by run id: with the newest run's artifact expired
+  it takes the next run, and downloads neither the expired nor an older one;
+- the pinned release signing keys are not applied, so the bundle installs on
+  its checksum alone and the output says it is unsigned, while
+  `ROCM_CLI_REQUIRE_SIGNATURE=1` fails with nothing installed instead of being
+  skipped;
+- a wrong checksum, an unknown pull request, a pull request with no CI run,
+  one whose builds have all expired (the message names the 7 day retention),
+  a malformed channel (`pr-abc`, `pr-`, `pr-12x`, refused before `gh` is
+  called) and a missing `gh` each fail naming the cause, with no files
+  installed;
+- `ROCM_CLI_GITHUB_REPO` moves the lookup and the download to that repository;
+- an empty head commit is refused, and a run whose artifact list cannot be read
+  is skipped in favour of the next run instead of being taken as having a build;
+- `ROCM_CLI_ARCHIVE`, `ROCM_CLI_DOWNLOAD_BASE` and `ROCM_CLI_DOWNLOAD_ONLY`
+  with a `pr-` channel are refused, not ignored, before `gh` is called;
+- a public key the user names, through `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` or
+  `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`, is not cleared with the pinned ones: it
+  asks for verification and the install fails on the signature the bundle
+  lacks (each variable is checked on its own);
+- the stub rejects `gh pr view` without `--json headRefOid --jq .headRefOid`
+  and a run listing without `per_page=100`, and a run whose artifact list
+  cannot be read is skipped with a note saying so;
+- a required signature is refused with a message that does not point at a key
+  (CI never signs these bundles), and the expiry and workflow filters decide
+  the run: the stub hands the installer a newer run of another workflow and
+  expired artifacts, which it leaves out only where the installer's `--jq`
+  expression filters them;
+- the installer arriving on stdin, as under `curl | sh`, still installs: the
+  stub drains its stdin as a real `gh` may, so a `gh` call that is not
+  redirected from `/dev/null` swallows the rest of the script.
+
+The stub fails a call that names another repository than the one under test,
+lists runs for any commit but the pull request's head, or asks for or downloads
+another artifact than `rocm-cli-pr-linux-amd64`, so an installer that drops one
+of those fails here. It prints what the installer's `--jq` filters would, so
+the filters themselves are not exercised; they were run against the live API
+when the channel was written. It needs no network or GPU, and `INSTALL_SH` selects
+another copy of the installer. The Linux `build-and-test` job runs it under the
+same `heavy` condition as the fish checks:
+
+```bash
+sh tests/install-sh/pr_channel.sh
+```
+
+Both installers' `pr-<number>` channel is also covered end to end in the
+lifecycle set above, with the `fake-gh` stand-in
+([`fake-gh.rs`](../tests/e2e-cucumber/src/bin/fake-gh.rs)) in front of `PATH`
+and a bundle packaged unsigned, as CI packages it:
+`@id:lifecycle-linux-pr-channel-installs-ci-build` (lifecycle-36) and
+`@id:lifecycle-windows-pr-channel-installs-ci-build` (lifecycle-37) install the
+newest unexpired build, say it is unsigned and verify no signature, and run the
+installed `rocm`; the build they use belongs to a run with no conclusion yet, so
+that branch of each installer is exercised too.
+`@id:lifecycle-linux-pr-channel-refuses-required-signature` (lifecycle-38) and
+`@id:lifecycle-windows-pr-channel-refuses-required-signature` (lifecycle-39)
+keep `ROCM_CLI_REQUIRE_SIGNATURE=1` and check the install fails instead of
+skipping it, and
+`@id:lifecycle-linux-pr-channel-refuses-bundle-without-signature` (lifecycle-40)
+and `@id:lifecycle-windows-pr-channel-refuses-bundle-without-signature`
+(lifecycle-41) supply a public key and check the unsigned bundle is refused,
+each installing nothing. `@id:lifecycle-linux-pr-channel-refuses-expired-builds`
+(lifecycle-42) and `@id:lifecycle-windows-pr-channel-refuses-expired-builds`
+(lifecycle-43) refuse a pull request whose builds have all expired and install
+nothing. `@id:lifecycle-linux-pr-channel-rejects-bad-checksum` (lifecycle-44)
+and `@id:lifecycle-windows-pr-channel-rejects-bad-checksum` (lifecycle-45)
+corrupt the bundle's checksum sidecar,
+`@id:lifecycle-linux-pr-channel-unknown-pull-request` (lifecycle-46) and
+`@id:lifecycle-windows-pr-channel-unknown-pull-request` (lifecycle-47) ask for a
+pull request GitHub does not know, and
+`@id:lifecycle-linux-pr-channel-malformed-number` (lifecycle-48) and
+`@id:lifecycle-windows-pr-channel-malformed-number` (lifecycle-49) give
+`pr-abc`, which is refused before `gh` is called; each installs nothing. The
+Windows ones run on the Windows lifecycle lane; `install.ps1` has no hermetic
+script of its own, so the cases only `pr_channel.sh` covers (no CI run, a
+missing `gh`, an empty head commit, a run whose artifact list cannot be read,
+and `ROCM_CLI_ARCHIVE`, `ROCM_CLI_DOWNLOAD_BASE` or `ROCM_CLI_DOWNLOAD_ONLY`
+with the channel) have no Windows test yet.
+
+`fake-gh` is as strict as the real API: it fails a call that names the wrong
+repository, lists runs for another commit than the pull request's head, or asks
+for or downloads another artifact than the platform's pull request bundle. It
+also hands the installer what the real API would, a newer run of another
+workflow with a live artifact and expired artifacts on the newest CI run, and
+applies the expiry and workflow filters only where the installer asks for them,
+so an installer that drops one of those fails the install scenarios (36 and
+37).
+
 The same path with the packaged binary, including `rocm uninstall` putting the
 bash and fish configs back and removing the fish completions, is
 `@id:lifecycle-linux-fish-configured-from-bash` (lifecycle-32) in the lifecycle

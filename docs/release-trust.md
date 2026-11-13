@@ -152,6 +152,20 @@ happen before activation. Run the current host's set with
 `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e` (see
 `docs/testing.md`).
 
+### Pull request builds
+
+The `pr-<number>` channel (`install.sh pr-1234`, or `ROCM_CLI_CHANNEL=pr-1234`
+for `install.ps1`) installs the bundle CI built for a pull request. That bundle
+is a workflow artifact, not a release asset: CI does not sign it, so the
+pinned release keys are not applied and the install trusts the bundle's
+`.sha256` sidecar alone, which guards the download but not its origin. The
+installer says so when it installs. Asking for a signature anyway, with
+`ROCM_CLI_REQUIRE_SIGNATURE=1` or a public key, fails instead of being skipped,
+and `ROCM_CLI_DOWNLOAD_BASE` is refused with this channel by both installers,
+`ROCM_CLI_ARCHIVE` and `ROCM_CLI_DOWNLOAD_ONLY` by `install.sh`, which is the
+one that has them. These builds are for trying a pull request, never for a
+release or an offline mirror.
+
 ## WSL ROCDXG Package Verification
 
 The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to

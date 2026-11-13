@@ -5734,6 +5734,43 @@ fi
         );
     }
 
+    /// The `pr-<number>` channel of `install.sh` is exercised by a hermetic
+    /// shell script with a stub `gh`. The Linux build job must run it as a
+    /// gate, for the same reasons as the fish checks above: the step is
+    /// checked, not the job's text, so a commented-out step, `if: false` or
+    /// `continue-on-error: true` cannot leave the script mentioned while
+    /// nothing runs it.
+    #[test]
+    fn ci_linux_build_and_test_runs_the_install_sh_pr_channel_checks() {
+        let ci = read_workflow("ci.yml");
+        let linux = job_block(&ci, "build-and-test");
+        let lines: Vec<&str> = linux.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start() == "- name: Installer PR channel checks")
+            .expect(
+                "build-and-test must have an `Installer PR channel checks` step so a \
+                 pr-<number> install that trusts the wrong run or key fails in required CI",
+            );
+        let step = step_block(&lines, at);
+        assert_eq!(
+            step_key(&step, "run"),
+            "sh tests/install-sh/pr_channel.sh",
+            "the PR channel step must run tests/install-sh/pr_channel.sh:\n{step}"
+        );
+        assert_eq!(
+            step_key(&step, "if"),
+            "needs.changes.outputs.heavy == 'true'",
+            "the PR channel step must run whenever the job's other heavy checks do:\n{step}"
+        );
+        assert_eq!(
+            step_keys(&step),
+            ["name", "if", "run"],
+            "the PR channel step must not grow keys such as continue-on-error \
+             that turn it into an advisory check:\n{step}"
+        );
+    }
+
     /// The hermetic comfyui-01/02/03 scenarios (no GPU, no network, no
     /// `e2e-test-hooks` dependency, Windows-portable since #637) must stay
     /// explicitly selected into this otherwise-`@lifecycle`-only Windows lane

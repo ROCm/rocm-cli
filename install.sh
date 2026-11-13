@@ -556,7 +556,31 @@ if [ -n "${LOCAL_ARCHIVE}" ] && [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
   fail "ROCM_CLI_ARCHIVE and ROCM_CLI_DOWNLOAD_ONLY are mutually exclusive"
 fi
 
+# `pr-<number>` installs the bundle CI built for that pull request, which is a
+# workflow artifact rather than a release asset: see fetch_pr_bundle below.
+PR_NUMBER=""
 case "${CHANNEL}" in
+  pr-*)
+    PR_NUMBER="${CHANNEL#pr-}"
+    case "${PR_NUMBER}" in
+      ''|*[!0-9]*) fail "invalid channel: ${CHANNEL} (a pull request channel is pr-<number>, for example pr-1234)" ;;
+      *) ;;
+    esac
+    [ -z "${LOCAL_ARCHIVE}" ] || fail "ROCM_CLI_ARCHIVE cannot be combined with the ${CHANNEL} channel"
+    [ -z "${ROCM_CLI_DOWNLOAD_BASE:-}" ] || fail "ROCM_CLI_DOWNLOAD_BASE cannot be combined with the ${CHANNEL} channel: the build comes from CI, not from release assets"
+    # An unsigned bundle exported for another machine could not be installed
+    # there: ROCM_CLI_ARCHIVE refuses this channel, and the release channels
+    # demand a signature it does not have.
+    [ "${DOWNLOAD_ONLY}" -eq 0 ] || fail "ROCM_CLI_DOWNLOAD_ONLY cannot be combined with the ${CHANNEL} channel: a pull request build is unsigned, so it cannot be installed from a download"
+    ;;
+  *) ;;
+esac
+
+case "${CHANNEL}" in
+  pr-*)
+    asset_base="rocm-cli-pr-${platform_os}-${platform_arch}.tar.gz"
+    release_path=""
+    ;;
   nightly)
     asset_base="rocm-cli-nightly-${platform_os}-${platform_arch}.tar.gz"
     release_path="releases/download/nightly"
@@ -588,11 +612,63 @@ archive_path="${tmp_dir}/${asset_base}"
 sha_path="${archive_path}.sha256"
 sig_path="${archive_path}.sig"
 
+# Resolve pull request ${PR_NUMBER} to the CI artifact built from its current
+# head, download it, and point LOCAL_ARCHIVE at the bundle inside, so the checks
+# and the install below run exactly as they do for any archive on disk.
+#
+# Artifacts are not public downloads, so this needs the GitHub CLI signed in
+# (or GH_TOKEN set). The newest CI run for the head commit that still has its
+# artifact wins. A run whose later jobs failed still uploads one, so the run's
+# result is printed rather than required. gh reads nothing from stdin, which
+# under `curl | sh` is the rest of this script.
+fetch_pr_bundle() {
+  need_cmd gh
+  pr_artifact="rocm-cli-pr-${platform_os}-${platform_arch}"
+  pr_head="$(gh pr view "${PR_NUMBER}" -R "${REPO}" --json headRefOid --jq .headRefOid < /dev/null)" \
+    || fail "could not look up pull request #${PR_NUMBER} in ${REPO} (is gh signed in? try: gh auth login)"
+  [ -n "${pr_head}" ] || fail "pull request #${PR_NUMBER} has no head commit"
+  pr_short="$(printf '%.7s' "${pr_head}")"
+  pr_runs="$(gh api "repos/${REPO}/actions/runs?head_sha=${pr_head}&event=pull_request&per_page=100" \
+    --jq '.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | "\(.id) \(.status) \(.conclusion // "-")"' < /dev/null)" \
+    || fail "could not list CI runs for pull request #${PR_NUMBER}"
+  [ -n "${pr_runs}" ] || fail "no CI run found for pull request #${PR_NUMBER} at ${pr_short}; CI may not have started (a first-time contributor's run waits for approval)"
+  pr_run=""
+  pr_run_state=""
+  while read -r run_id run_status run_conclusion; do
+    [ -n "${run_id}" ] || continue
+    live="$(gh api "repos/${REPO}/actions/runs/${run_id}/artifacts?name=${pr_artifact}" \
+      --jq '[.artifacts[] | select(.expired | not)] | length' < /dev/null)" || {
+      live=0
+      info "note: could not list the artifacts of CI run ${run_id}; trying the next run"
+    }
+    if [ "${live:-0}" -gt 0 ]; then
+      pr_run="${run_id}"
+      pr_run_state="${run_status}/${run_conclusion}"
+      break
+    fi
+  done <<EOF_RUNS
+${pr_runs}
+EOF_RUNS
+  [ -n "${pr_run}" ] || fail "no downloadable ${pr_artifact} build for pull request #${PR_NUMBER} at ${pr_short}; builds are kept for 7 days and only made for changes that touch code, so push a commit or re-run CI"
+  info "pull request: #${PR_NUMBER} at ${pr_short}"
+  info "CI run: ${pr_run} (${pr_run_state})"
+  info "note: this is an unreviewed, unsigned build of the pull request; only its checksum is verified"
+  pr_dir="${tmp_dir}/pr-artifact"
+  mkdir -p "${pr_dir}"
+  gh run download "${pr_run}" -R "${REPO}" -n "${pr_artifact}" -D "${pr_dir}" < /dev/null \
+    || fail "failed to download the ${pr_artifact} artifact from run ${pr_run}"
+  LOCAL_ARCHIVE="${pr_dir}/${asset_base}"
+}
+
 step "rocm-cli installer"
 info "repo: ${REPO}"
 info "channel: ${CHANNEL}"
 info "platform: ${platform_os}-${platform_arch}"
-if [ -n "${LOCAL_ARCHIVE}" ]; then
+if [ -n "${PR_NUMBER}" ]; then
+  info "install_dir: ${INSTALL_DIR}"
+  fetch_pr_bundle
+  info "archive: ${LOCAL_ARCHIVE}"
+elif [ -n "${LOCAL_ARCHIVE}" ]; then
   info "archive: ${LOCAL_ARCHIVE}"
 elif [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
   info "download_only: ${DOWNLOAD_DIR}"
@@ -621,6 +697,12 @@ actual="$(sha256_file "${archive_path}")"
 [ "${expected}" = "${actual}" ] || fail "checksum verification failed"
 
 public_keys="$(resolve_public_keys)"
+# CI does not sign pull request bundles, so the pinned release keys do not
+# apply to them: a key is used only when one was named explicitly or a
+# signature was required, and then the missing .sig fails the install.
+if [ -n "${PR_NUMBER}" ] && [ -z "${ROCM_CLI_SIGNING_PUBLIC_KEY_PATH:-}" ] && [ -z "${ROCM_CLI_SIGNING_PUBLIC_KEY_PEM:-}" ]; then
+  public_keys=""
+fi
 
 require_sig=0
 if truthy "${ROCM_CLI_REQUIRE_SIGNATURE:-0}"; then
@@ -635,7 +717,13 @@ if [ "${CHANNEL}" = "release" ] && has_pinned_release_keys; then
 fi
 
 if [ "${require_sig}" -eq 1 ] || [ -n "${public_keys}" ]; then
-  [ -n "${public_keys}" ] || fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
+  if [ -z "${public_keys}" ]; then
+    # Only a pull request channel gets here with a signature required and no
+    # key by design; naming a key would send the user to a second failure,
+    # since CI never signs these bundles.
+    [ -z "${PR_NUMBER}" ] || fail "a signature cannot be required for the ${CHANNEL} channel: CI does not sign pull request builds"
+    fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
+  fi
   if [ -n "${LOCAL_ARCHIVE}" ]; then
     # A locally-supplied archive has no URL to fall back on: the signature had to
     # travel with it. Refusing here is the point -- an artifact delivered out of

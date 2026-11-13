@@ -40,6 +40,13 @@ path = "src/bin/fake-python.rs"
 name = "fake-docker"
 path = "src/bin/fake-docker.rs"
 
+# Stand-in for the GitHub CLI, planted by the install lifecycle scenarios for
+# the installers' `pr-<number>` channel so they need no GitHub access (see
+# `src/bin/fake-gh.rs`).
+[[bin]]
+name = "fake-gh"
+path = "src/bin/fake-gh.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
