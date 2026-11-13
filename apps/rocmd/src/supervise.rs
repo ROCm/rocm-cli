@@ -150,10 +150,8 @@ fn supervise_service_on(
     let rocm_binary = daemon_host.rocm_binary()?;
     record.write()?;
 
-    // Emptied for this run, then written in append mode, like the supervisor's
-    // own stderr on the same file: a handle with its own offset would write over
-    // whatever the supervisor appended meanwhile, such as the line reporting an
-    // engine it could not confirm stopped.
+    // Emptied for this run, then reopened for append: a handle with its own
+    // offset would write over anything appended to the log meanwhile.
     fs::File::create(&record.log_path)
         .with_context(|| format!("failed to create {}", record.log_path.display()))?;
     let log_file = fs::OpenOptions::new()
@@ -200,10 +198,10 @@ fn supervise_service_on(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
-    // Until the child is waited for, leaving this function any other way — an
-    // error from a record write below, or a panic — terminates and reaps it.
-    // `Child` itself does not kill on drop, and an engine left running here
-    // would hold the GPU under a record that may not even name it.
+    // `Child` itself does not kill on drop. Until the child is waited for,
+    // leaving this function any other way — an error from a record write below,
+    // or a panic — terminates and reaps the engine's process tree. What the
+    // guard does not act on is described on `EngineChild`.
     let mut engine_child = EngineChild::new(&mut child);
     #[cfg(test)]
     tests::engine_spawned(paths, &record.service_id, engine_child.pid());
@@ -219,7 +217,8 @@ fn supervise_service_on(
     update_supervised_record(paths, &record, |current| {
         current.record_engine_identity(engine_pid);
         current.status = "running".to_owned();
-    })?;
+    })
+    .context("failed to record the engine's PID")?;
 
     let became_ready = wait_for_service_ready(
         daemon_host,
@@ -239,7 +238,8 @@ fn supervise_service_on(
             current.status = "ready".to_owned();
             // The phase only describes the coming-up window; clear it once ready.
             current.startup_phase = None;
-        })?;
+        })
+        .context("failed to record the service as ready")?;
     }
 
     let exit_status = engine_child
@@ -778,7 +778,7 @@ fn fail_recovery(
     error
 }
 
-/// Grace given to a child this daemon spawned and now has to terminate: a
+/// Grace given to a child this process spawned and now has to terminate: a
 /// recovery supervisor whose record could not be published, or an engine whose
 /// supervisor is leaving before it waited for it. Short: neither has anything
 /// to flush that outweighs freeing the port and the GPU.
@@ -791,11 +791,8 @@ const RECOVERY_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// running when the termination did not confirm the stop, naming the child as
 /// `what`, and `None` when it did.
 ///
-/// Through [`rocm_core::terminate_recorded_pid_within`], the routine `rocm
-/// services stop` uses: on Windows it takes the processes under the child down
-/// with a separate tree kill first, where a kill through
-/// [`rocm_core::terminate_verified`] alone reaches only the child itself — and
-/// both callers' children run their real work one level below.
+/// Terminates through [`rocm_core::terminate_recorded_pid_within`], forced and
+/// over the child's process tree ([`terminate_child_tree`]).
 fn terminate_and_reap(
     child: &mut std::process::Child,
     identity: &rocm_core::ProcessIdentity,
@@ -884,14 +881,20 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// The engine child of [`supervise_service`], terminated and reaped if the
-/// supervisor stops supervising it before it waited for it.
+/// The engine child of [`supervise_service`], held from the spawn until it is
+/// waited for.
 ///
-/// Every return between the spawn and the wait — a record write that fails, a
-/// wait that errors — and a panic would otherwise leave the engine running
-/// with no supervisor, reparented to init and holding the GPU. When the failed
-/// write was the one recording the engine's PID, the record does not name it
-/// either, so `rocm services stop` has nothing to stop and reports success.
+/// Dropped before a successful wait — any return between the spawn and the
+/// wait, such as a record write or the wait failing, or a panic — the guard
+/// terminates and reaps the engine's process tree through
+/// [`terminate_and_reap_with`]. A guard whose wait succeeded signals nothing.
+/// A termination it cannot confirm is reported as a `rocmd: …` line on
+/// `report`.
+///
+/// A record write that `update_supervised_record` skips (returning `Ok`
+/// without writing) is not a return, so the guard does not act on it. An
+/// external kill of the supervisor (a signal, the OOM killer) bypasses the
+/// guard: not covered; see ROCMAI-957.
 struct EngineChild<'a> {
     child: &'a mut std::process::Child,
     /// Captured right after the spawn, while the child is certainly alive.
@@ -901,10 +904,10 @@ struct EngineChild<'a> {
     /// tests.
     terminate: fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
     /// Where the line about a termination that was not confirmed goes: the
-    /// supervisor's stderr, which is the service log, when `None` — the only
-    /// launcher of `rocmd supervise`, `restart_managed_service_via`, hands it the
-    /// log opened for append as stdout and stderr, which
-    /// `restart_hands_the_supervisor_its_service_log_as_stderr` pins.
+    /// supervisor's stderr when `None`
+    /// (`a_dropped_engine_guard_reports_to_stderr_by_default`). The recovery
+    /// restart hands the supervisor its service log as stderr
+    /// (`restart_hands_the_supervisor_its_service_log_as_stderr`).
     report: Option<&'a mut dyn std::io::Write>,
 }
 
@@ -968,9 +971,8 @@ impl Drop for EngineChild<'_> {
         }
         #[cfg(test)]
         ENGINE_CHILD_TERMINATIONS.with(|calls| calls.set(calls.get() + 1));
-        // The supervisor's stderr is the service log (see the `report` field),
-        // and the error it returns next says only why it is leaving, so this is
-        // the one place a surviving engine is recorded.
+        // The error the supervisor returns next says only why it is leaving, so
+        // this line is what records an engine that may have survived.
         let unconfirmed =
             terminate_and_reap_with(self.child, &self.identity, "engine", self.terminate);
         if let Some(line) = unconfirmed {
@@ -1005,22 +1007,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Terminate a recovery supervisor that could not be recorded, reap it when
-/// it is known gone, and return the line describing what may still be running
-/// when the termination was not confirmed.
+/// Terminate a recovery supervisor the restart could not record, with its
+/// process tree, through [`terminate_and_reap`], and reap it when it is known
+/// gone. After a timed-out or unverified termination it is reaped only if it
+/// has already exited, so one that exits later stays unreaped.
 ///
-/// Tree scope, forced, through [`terminate_and_reap`]: the supervisor may
-/// already have started an engine child, and leaving either alive would keep
-/// the recorded port occupied by a process no stop or recovery path can find.
-/// Reaping afterwards keeps the daemon free of zombies — except after an
-/// outcome that leaves the supervisor possibly alive (timed out, unverified),
-/// where it is reaped only if it has already exited: a supervisor that dies
-/// later stays a zombie until the daemon exits, the price of not blocking on
-/// one that may never die.
-///
-/// The line is for the restart's error ([`abandon_recovery_supervisor`]), not
-/// for stderr: the daemon that runs this is usually started with its stdio
-/// discarded, and the error is what its server-recover event records.
+/// Returns the line describing what may still be running when the termination
+/// was not confirmed, for the restart's error ([`abandon_recovery_supervisor`])
+/// rather than for stderr.
 fn terminate_recovery_supervisor(child: &mut std::process::Child) -> Option<String> {
     #[cfg(test)]
     TERMINATE_RECOVERY_SUPERVISOR_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1035,9 +1029,9 @@ fn terminate_recovery_supervisor(child: &mut std::process::Child) -> Option<Stri
 /// Give up on a recovery supervisor this restart spawned but cannot keep:
 /// terminate it, then roll the record back with [`fail_recovery`]. When the
 /// termination was not confirmed, `error` carries the line saying what may still
-/// be running, so it reaches the server-recover event the daemon records. Every
-/// such exit from `restart_managed_service_via` goes through here, so none of
-/// them can terminate without reporting, or report without terminating.
+/// be running. Every such exit from `restart_managed_service_via` goes through
+/// here, so none of them can terminate without reporting, or report without
+/// terminating.
 fn abandon_recovery_supervisor(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
@@ -1982,10 +1976,9 @@ mod tests {
         Ok(())
     }
 
-    /// The supervisor a restart launches writes its stderr into the service's
-    /// log: that is where `EngineChild` reports an engine it could not confirm
-    /// stopped, through the supervisor's own stderr. The stand-in `rocmd`
-    /// writes a line to stderr, and the line must turn up in the record's log.
+    /// A line the supervisor launched by the recovery restart writes to stderr
+    /// turns up in the record's log: the stand-in `rocmd` writes one, and the
+    /// test reads it back from `record.log_path`.
     #[cfg(target_os = "linux")]
     #[test]
     fn restart_hands_the_supervisor_its_service_log_as_stderr() -> Result<()> {
@@ -3065,7 +3058,7 @@ mod tests {
     /// A termination that leaves the child possibly alive — the child or a
     /// process under it outlived the deadline, or its identity could not be
     /// confirmed — must not be followed by a blocking reap, which would hang the
-    /// supervisor or the daemon on a process that may never exit. The child is
+    /// caller on a process that may never exit. The child is
     /// left unreaped, and the line says what may still be running and why.
     ///
     /// A kill fires after 20 s so that a blocking reap fails the test then
@@ -3187,9 +3180,8 @@ mod tests {
     }
 
     /// An engine guard dropped unwaited whose termination is not confirmed writes
-    /// the line saying what may still be running to its report — the service log
-    /// in production, where nothing else records it — and leaves the engine
-    /// unreaped rather than blocking on it.
+    /// the line saying what may still be running to its report, and leaves the
+    /// engine unreaped rather than blocking on it.
     #[test]
     fn a_dropped_engine_guard_logs_a_termination_it_could_not_confirm() {
         let (mut child, _) = spawn_sleeper("engine-unconfirmed", 120, false);
@@ -3228,6 +3220,100 @@ mod tests {
                 "rocmd: terminating the engine (pid {pid}) ended timed_out: the engine or a \
                  process under it may still be running\n"
             )
+        );
+    }
+
+    /// Run by [`a_dropped_engine_guard_reports_to_stderr_by_default`] in a child
+    /// process whose stderr it captures: drops an unwaited guard that reports
+    /// nowhere in particular, over a sleeper its stub termination leaves alive,
+    /// and prints the sleeper's PID so the parent can check the line names it.
+    #[test]
+    #[ignore = "spawned as a child process by a_dropped_engine_guard_reports_to_stderr_by_default"]
+    fn engine_guard_default_report_child() {
+        if std::env::var_os(GUARD_REPORT_CHILD_ENV).is_none() {
+            return;
+        }
+        let (mut child, _) = spawn_sleeper("engine-default-report", 120, false);
+        println!("engine-pid={}", child.id());
+        drop(
+            EngineChild::new(&mut child)
+                .terminating_with(|_| rocm_core::TerminationOutcome::TimedOut),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    const GUARD_REPORT_CHILD_ENV: &str = "ROCMD_TEST_GUARD_REPORT_CHILD";
+
+    /// A guard given no report writes to the process's own stderr, the
+    /// production default. Driven in a child process so its real stderr can be
+    /// read back.
+    #[test]
+    fn a_dropped_engine_guard_reports_to_stderr_by_default() {
+        let root = unique_test_root(&format!(
+            "rocmd-guard-default-report-{}",
+            std::process::id()
+        ));
+        let (stdout_path, stderr_path) = (root.join("stdout"), root.join("stderr"));
+        let mut run = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg({
+                let module = module_path!()
+                    .split_once("::")
+                    .map_or(module_path!(), |(_crate, module)| module);
+                format!("{module}::engine_guard_default_report_child")
+            })
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(GUARD_REPORT_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                fs::File::create(&stdout_path).expect("stdout file"),
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(&stderr_path).expect("stderr file"),
+            ))
+            .spawn()
+            .expect("spawn the child test");
+        let deadline = std::time::Instant::now() + Duration::from_mins(1);
+        let status = loop {
+            if let Ok(Some(status)) = run.try_wait() {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = run.kill();
+                let _ = run.wait();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        fs::remove_dir_all(&root).ok();
+        // Searched for, not matched at a line start: with `--nocapture` libtest
+        // may print the test's name on the same line just before it.
+        let pid: Option<String> = stdout
+            .split_once("engine-pid=")
+            .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).collect())
+            .filter(|pid: &String| !pid.is_empty());
+        if status.is_none() {
+            // Killing the child test left its sleeper behind.
+            if let Some(sleeper) = pid.as_deref().and_then(|pid| pid.parse().ok()) {
+                kill_if_running(sleeper);
+            }
+        }
+
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "the child test did not finish cleanly ({status:?}): {stdout}{stderr}"
+        );
+        let pid = pid.unwrap_or_else(|| panic!("the child test ran no guard: {stdout}"));
+        assert!(
+            stderr.contains(&format!(
+                "rocmd: terminating the engine (pid {pid}) ended timed_out: the engine or a \
+                 process under it may still be running\n"
+            )),
+            "the default report must reach stderr: {stderr:?}"
         );
     }
 
@@ -3274,10 +3360,10 @@ mod tests {
         /// Overwrite the service's manifest with something that does not parse,
         /// so the supervisor's next record write fails.
         corrupt_manifest: bool,
-        /// A file the stand-in engine writes its own child's PID to. The seam
-        /// waits for it before going on, so the engine is a process tree by the
-        /// time anything terminates it.
-        grandchild_pidfile: std::path::PathBuf,
+        /// A file the stand-in engine writes its own child's PID to, if it
+        /// starts one. The seam waits for it before going on, so the engine is
+        /// a process tree by the time anything terminates it.
+        grandchild_pidfile: Option<std::path::PathBuf>,
         /// The engine PID the supervisor reported, once it spawned one.
         engine_pid: Option<u32>,
         /// The PID of the process under the engine, read from the pidfile.
@@ -3308,15 +3394,17 @@ mod tests {
             seam.grandchild_pidfile.clone()
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let grandchild_pid = loop {
-            let pid = fs::read_to_string(&pidfile)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok());
-            if pid.is_some() || std::time::Instant::now() > deadline {
-                break pid;
+        let grandchild_pid = pidfile.and_then(|pidfile| {
+            loop {
+                let pid = fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                if pid.is_some() || std::time::Instant::now() > deadline {
+                    break pid;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(20));
-        };
+        });
         let mut seams = ENGINE_SPAWN_SEAMS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3338,7 +3426,7 @@ mod tests {
     fn register_engine_spawn_seam(
         service_id: &str,
         corrupt_manifest: bool,
-        grandchild_pidfile: std::path::PathBuf,
+        grandchild_pidfile: Option<std::path::PathBuf>,
     ) {
         ENGINE_SPAWN_SEAMS
             .lock()
@@ -3388,10 +3476,9 @@ mod tests {
     }
 
     /// Run `supervise_service_on` with the `rocm` at `root/rocm` beside a
-    /// `rocmd` that is not there. Bounded: every path these tests drive returns
-    /// within seconds, so one that does not is a hang nothing here expects, and
-    /// its engine, and the process under it, are killed before the test fails
-    /// rather than left sleeping.
+    /// `rocmd` that is not there. Bounded: if the supervisor does not return
+    /// within a minute, the engine and the process under it, as recorded by the
+    /// engine-spawn seam the caller registered, are killed before the test fails.
     #[cfg(target_os = "linux")]
     fn supervise_on_stand_in_rocm(
         root: &Path,
@@ -3439,9 +3526,8 @@ mod tests {
                     .chain(grandchild)
                     .for_each(kill_if_running);
                 panic!(
-                    "the supervisor did not return within a minute, which no path of this \
-                     test expects: it fails at a record write right after the spawn, and \
-                     returns at once even when it leaves its engine running"
+                    "the supervisor did not return within a minute; its engine (from the \
+                     registered seam) is killed before the test fails"
                 )
             };
             // The first exec of a new file can lose a race with an unrelated
@@ -3460,6 +3546,7 @@ mod tests {
     fn assert_engine_tree_terminated(
         outcome: std::result::Result<(), String>,
         service_id: &str,
+        failed_write: &str,
         engine: Option<u32>,
         grandchild: Option<u32>,
     ) {
@@ -3472,8 +3559,8 @@ mod tests {
 
         let error = outcome.expect_err("a record write after the spawn was made to fail");
         assert!(
-            error.contains(service_id),
-            "failed somewhere other than the record write: {error}"
+            error.contains(failed_write) && error.contains(service_id),
+            "failed somewhere other than the {failed_write:?} write: {error}"
         );
         assert!(engine.is_some(), "the engine was never spawned: {error}");
         assert!(
@@ -3493,9 +3580,7 @@ mod tests {
 
     /// The write that records the engine's PID fails after the engine started.
     /// The supervisor returns the error — and must take the engine, and what the
-    /// engine started, with it: the record names no engine PID, so `rocm services
-    /// stop` would find nothing to stop and report success while the engine kept
-    /// the GPU.
+    /// engine started, with it, although no record names the engine's PID.
     #[cfg(target_os = "linux")]
     #[test]
     fn supervise_terminates_the_engine_when_recording_its_pid_fails() -> Result<()> {
@@ -3510,13 +3595,19 @@ mod tests {
             &stand_in_rocm_with_an_engine_tree(&tools, &pidfile, "  exit 2"),
         )?;
         let service_id = "svc-supervise-engine-pid-write-fails";
-        register_engine_spawn_seam(service_id, true, pidfile);
+        register_engine_spawn_seam(service_id, true, Some(pidfile));
 
         let outcome = supervise_on_stand_in_rocm(&root, &paths, service_id, 11473);
         let (engine, grandchild) = take_engine_spawn_seam(service_id);
         fs::remove_dir_all(&root).ok();
 
-        assert_engine_tree_terminated(outcome, service_id, engine, grandchild);
+        assert_engine_tree_terminated(
+            outcome,
+            service_id,
+            "failed to record the engine's PID",
+            engine,
+            grandchild,
+        );
         Ok(())
     }
 
@@ -3557,21 +3648,25 @@ mod tests {
                 ),
             ),
         )?;
-        register_engine_spawn_seam(service_id, false, pidfile);
+        register_engine_spawn_seam(service_id, false, Some(pidfile));
 
         let outcome = supervise_on_stand_in_rocm(&root, &paths, service_id, 11474);
         let (engine, grandchild) = take_engine_spawn_seam(service_id);
         fs::remove_dir_all(&root).ok();
 
-        assert_engine_tree_terminated(outcome, service_id, engine, grandchild);
+        assert_engine_tree_terminated(
+            outcome,
+            service_id,
+            "failed to record the service as ready",
+            engine,
+            grandchild,
+        );
         Ok(())
     }
 
-    /// The engine writes its log in append mode, like the supervisor's own
-    /// stderr on the same file, so a line the supervisor appends while the
-    /// engine runs — such as the one reporting an engine it could not confirm
-    /// stopped — is not written over by the engine's next output. Here the
-    /// readiness check appends the line and the engine writes after it.
+    /// The engine writes its log in append mode, so a line appended to the log
+    /// while the engine runs is not written over by the engine's next output.
+    /// Here the readiness check appends the line and the engine writes after it.
     #[cfg(target_os = "linux")]
     #[test]
     fn supervise_engine_output_does_not_overwrite_lines_appended_to_its_log() -> Result<()> {
@@ -3599,7 +3694,8 @@ mod tests {
             &format!(
                 "case \"$1\" in\n\
                  __engine-serve-http)\n  echo engine-before\n  \
-                 while [ ! -e '{appended}' ]; do '{sleep}' 0.05; done\n  \
+                 n=0\n  \
+                 while [ ! -e '{appended}' ] && [ \"$n\" -lt 2400 ]; do '{sleep}' 0.05; n=$((n + 1)); done\n  \
                  echo engine-after-a-longer-line-than-the-appended-one\n  ;;\n\
                  __engine-stdio)\n  echo appended-by-the-supervisor >> '{log}'\n  : > '{appended}'\n  \
                  read -r _request\n  printf '%s\\n' '{ready}'\n  ;;\n\
@@ -3610,7 +3706,11 @@ mod tests {
             ),
         )?;
 
+        // Registered so a run that times out kills the engine; the engine's own
+        // wait for the marker gives up after about two minutes regardless.
+        register_engine_spawn_seam(service_id, false, None);
         let outcome = supervise_on_stand_in_rocm(&root, &paths, service_id, 11475);
+        let _ = take_engine_spawn_seam(service_id);
         let log = fs::read_to_string(&log_path).unwrap_or_default();
         fs::remove_dir_all(&root).ok();
 
@@ -3623,6 +3723,58 @@ mod tests {
             log.contains("engine-after-a-longer-line-than-the-appended-one\n"),
             "{log:?}"
         );
+        Ok(())
+    }
+
+    /// Each supervised run starts the service log afresh: what an earlier run
+    /// left there is gone, and this run's engine output is there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_empties_a_log_left_by_an_earlier_run() -> Result<()> {
+        let _serial = lock_script_tests();
+        let tools = script_tools();
+        let (root, paths) = temp_app_paths("supervise-log-emptied");
+        paths.ensure()?;
+        let service_id = "svc-supervise-log-emptied";
+        let log_path = paths.service_log_path(service_id);
+        fs::create_dir_all(paths.services_dir())?;
+        fs::write(&log_path, "stale-line-from-an-earlier-run\n")?;
+        let ready = serde_json::to_string(&rocm_engine_protocol::EngineResponseEnvelope::success(
+            rocm_engine_protocol::HealthcheckResponse {
+                status: "ready".to_owned(),
+                model_loaded: true,
+                device: "cpu".to_owned(),
+                uptime_sec: 1,
+                queue_depth: 0,
+                last_error: None,
+                tokens_per_sec: None,
+            },
+        ))?;
+        write_executable_script(
+            &root.join("rocm"),
+            &tools,
+            &format!(
+                "case \"$1\" in\n\
+                 __engine-serve-http)\n  echo output-of-this-run\n  exec '{sleep}' 1\n  ;;\n\
+                 __engine-stdio)\n  read -r _request\n  printf '%s\\n' '{ready}'\n  ;;\n\
+                 *) exit 2 ;;\nesac\n",
+                sleep = tools.sleep.display(),
+            ),
+        )?;
+
+        // Registered so a run that times out kills the engine.
+        register_engine_spawn_seam(service_id, false, None);
+        let outcome = supervise_on_stand_in_rocm(&root, &paths, service_id, 11477);
+        let _ = take_engine_spawn_seam(service_id);
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(outcome, Ok(()), "the engine exits cleanly");
+        assert!(
+            !log.contains("stale-line-from-an-earlier-run"),
+            "the earlier run's log must be emptied: {log:?}"
+        );
+        assert!(log.contains("output-of-this-run\n"), "{log:?}");
         Ok(())
     }
 
@@ -3761,10 +3913,9 @@ mod tests {
     }
 
     /// When the termination of the unrecorded supervisor is not confirmed, the
-    /// restart's error says so, naming the supervisor's PID: that error is what
-    /// the daemon's server-recover event records, and the daemon's own stderr is
-    /// usually discarded. The rollback still happens, and the supervisor is not
-    /// waited for, since nothing says it will exit.
+    /// restart's error says so, naming the supervisor's PID. The rollback still
+    /// happens, and the supervisor is not waited for, since nothing says it will
+    /// exit.
     #[test]
     fn restart_reports_a_supervisor_it_could_not_confirm_stopped_in_its_error() -> Result<()> {
         let (root, paths) = temp_app_paths("restart-unconfirmed-supervisor-termination");
