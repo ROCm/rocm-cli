@@ -47,6 +47,7 @@ mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
+pub mod recovery_hint;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
