@@ -616,11 +616,49 @@ pub enum GpuSupportLevel {
     Unknown,
 }
 
-/// Classify the host's GPU support level.
+/// The claim every *unprobed* [`GpuSupportLevel::VulkanOnly`] surface makes,
+/// written once.
+///
+/// `rocm install sdk`'s two refusals (`unsupported_host_gpu_message` /
+/// `unsupported_requested_target_message` in `apps/rocm/src/therock/family.rs`)
+/// tell the user the same two things about a Vulkan-only GPU: ROCm will not run
+/// on it, and Vulkan will. They are two different sentences around it — each
+/// adds its own subject and its own next step, because what they may promise
+/// differs — but the claim itself is shared, so it lives here next to the
+/// classifier that decides when it is true rather than being retyped at each
+/// site.
+///
+/// `rocm examine`'s `rocm_support` line used to interpolate this too, and
+/// deliberately no longer does. It is the one surface that pays for the Vulkan
+/// probe, so it grades the second half of the claim by what the probe actually
+/// established — an enumerated device is named, an installed-but-unenumerated
+/// driver gets a weaker sentence, an unprobed platform admits it — and the
+/// unconditional "can still be used" is exactly the promise that change exists
+/// to stop making. See `rocm_support_line` in `host_gpu/render.rs`. The two
+/// install refusals keep it because they are asked of a *target*, before and
+/// without any host probe (they classify with [`VulkanStatus::Unknown`]), so
+/// the graded wording has no evidence to grade on there.
+///
+/// Deliberately just the claim, with no leading subject and no trailing
+/// punctuation: a caller supplies both. Changing the wording here changes both
+/// refusals together, which is the point.
+pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
+    "not supported by ROCm; the Vulkan backend can still be used";
+
+/// Classify a GPU target's support level.
 ///
 /// Reads the two facts `ExamineSummary` and `resolve_family` already compute —
 /// the detected gfx target and whichever TheRock family (if any) covers it —
 /// plus what the Vulkan probe found.
+///
+/// Not only for a *host*: `resolve_family` also asks this of a target the user
+/// named with `--family` or `ROCM_CLI_THEROCK_FAMILY`, to decide whether to
+/// refuse it. The first two arguments are facts about a GPU target, not about
+/// this machine, so that is the same question. What differs is what the caller
+/// may then say — a requested target establishes nothing about the hardware
+/// here, which is why the two install refusals end differently, and why they
+/// pass [`VulkanStatus::Unknown`] rather than probing this host for a verdict
+/// about another one.
 ///
 /// `vulkan` only ever decides between [`GpuSupportLevel::VulkanOnly`],
 /// [`GpuSupportLevel::VulkanUnconfirmed`] and [`GpuSupportLevel::NoGpuBackend`],
@@ -778,6 +816,23 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx90a"),
             Some("gfx90a".to_owned())
+        );
+    }
+
+    /// The shared claim is user-visible text on both `rocm install sdk`
+    /// refusals, so its wording is pinned here rather than only asserted as
+    /// "whatever the constant says".
+    ///
+    /// Both refusals interpolate [`VULKAN_ONLY_SUPPORT_CLAIM`], which is what
+    /// stops them drifting — but it also means a careless edit to the constant
+    /// silently rewords both at once, and their own tests would still pass
+    /// because they assert containment of the same constant. This test is the
+    /// one place that has to be changed deliberately.
+    #[test]
+    fn the_vulkan_only_claim_is_pinned_word_for_word() {
+        assert_eq!(
+            VULKAN_ONLY_SUPPORT_CLAIM,
+            "not supported by ROCm; the Vulkan backend can still be used"
         );
     }
 

@@ -12,9 +12,9 @@
 use super::source::{FamilyResolution, TheRockChannel};
 use anyhow::{Result, bail};
 use rocm_core::{
-    AppPaths, detect_host_gfx_target, detect_host_gpu_diagnostics, detect_managed_therock_family,
-    gfx_target_has_no_rocm_build, known_therock_families, normalize_therock_family,
-    runtime_is_windows,
+    AppPaths, GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, detect_host_gfx_target,
+    detect_host_gpu_diagnostics, detect_managed_therock_family, gpu_support_level,
+    known_therock_families, normalize_therock_family, runtime_is_windows,
 };
 use std::fmt::Write as _;
 
@@ -99,7 +99,7 @@ pub(super) fn resolve_family(
     // left over from an earlier session happens to name gfx90c, and the
     // reverse for an env value once `--family` isn't the one in play.
     if let Some(value) = family_override {
-        if gfx_target_has_no_rocm_build(value) {
+        if target_is_vulkan_only(value) {
             bail!(unsupported_requested_target_message(
                 value.trim(),
                 "--family"
@@ -115,7 +115,7 @@ pub(super) fn resolve_family(
     }
 
     if let Some(value) = env_override.as_deref() {
-        if gfx_target_has_no_rocm_build(value) {
+        if target_is_vulkan_only(value) {
             bail!(unsupported_requested_target_message(
                 value.trim(),
                 "ROCM_CLI_THEROCK_FAMILY"
@@ -156,7 +156,7 @@ pub(super) fn resolve_family(
     // there is nothing to install for this GPU. Other unmapped targets keep the
     // generic error below, which points at `--family`.
     if let Some(raw_arch) = host_arch.as_deref()
-        && gfx_target_has_no_rocm_build(raw_arch)
+        && target_is_vulkan_only(raw_arch)
     {
         let message = unsupported_host_gpu_message(raw_arch);
         let diagnostics = detect_host_gpu_diagnostics();
@@ -169,6 +169,48 @@ pub(super) fn resolve_family(
          Recognized families: {}.\n\n{}",
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
+    )
+}
+
+/// Whether `value` is a GPU target the CLI recognizes and knows has no ROCm
+/// build — [`GpuSupportLevel::VulkanOnly`] — which is what `install sdk`
+/// refuses with the two messages below.
+///
+/// Asked of [`gpu_support_level`] rather than re-tested here. The install path
+/// used to call `gfx_target_has_no_rocm_build` directly, which was *exactly*
+/// equivalent (review on #678 checked that it was) and still wrong to keep: it
+/// made this a second, independent definition of the tier whose claim these
+/// messages then go on to make, so a change to the classification would have
+/// left `rocm examine` and `rocm install sdk` disagreeing about the same GPU
+/// while both looked correct in isolation. One classifier, one answer.
+///
+/// The family argument is computed rather than passed as `None` because this
+/// is also asked of a target the *user* named, before any host probe: for
+/// `--family gfx1100` the covering family is what makes the answer `RocmHip`,
+/// and hard-coding `None` here would classify every requested target as if no
+/// family covered it. On the host branch the caller has already established
+/// that `normalize_therock_family` answers `None`, so the extra call there is
+/// a no-op that costs a string compare.
+///
+/// The Vulkan argument is [`rocm_core::VulkanStatus::Unknown`] — "nobody
+/// looked" — and deliberately not this host's probe result. `value` may be a
+/// target the user *named*, which can be a GPU that is not in this machine, so
+/// a Vulkan driver found here would say nothing about it; and on the host
+/// branch, probing would make `install sdk` refuse or allow based on a Vulkan
+/// fact that has no bearing on whether a ROCm SDK exists. `Unknown` keeps the
+/// `VulkanOnly` tier for every target the catalog confirms has no ROCm build,
+/// which is exactly the set this gate refused before the probe existed — the
+/// refusals are unchanged. It is also why these two messages may still
+/// interpolate the unconditional `VULKAN_ONLY_SUPPORT_CLAIM` while `rocm
+/// examine`, which does probe, grades its wording instead.
+fn target_is_vulkan_only(value: &str) -> bool {
+    matches!(
+        gpu_support_level(
+            Some(value),
+            normalize_therock_family(value).as_deref(),
+            rocm_core::VulkanStatus::Unknown,
+        ),
+        GpuSupportLevel::VulkanOnly
     )
 }
 
@@ -203,8 +245,7 @@ fn unsupported_host_gpu_message(raw_arch: &str) -> String {
     format!(
         "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
          `rocm install sdk` has nothing to install for it.\n\
-         The GPU is detected but is not supported by ROCm; \
-         the Vulkan backend can still be used. \
+         The GPU is detected but is {VULKAN_ONLY_SUPPORT_CLAIM}. \
          Try `rocm serve <model> --engine lemonade` - it runs on Lemonade's \
          Vulkan backend instead."
     )
@@ -232,8 +273,8 @@ fn unsupported_requested_target_message(value: &str, source: &str) -> String {
     format!(
         "no ROCm SDK build exists for the GPU target `{value}` requested by \
          {source}, so `rocm install sdk` has nothing to install for it.\n\
-         That GPU is not supported by ROCm; the Vulkan backend can still be \
-         used. Nothing was installed and no other family was substituted. \
+         That GPU is {VULKAN_ONLY_SUPPORT_CLAIM}. Nothing was installed and no \
+         other family was substituted. \
          Run `rocm examine` to see what this host itself supports."
     )
 }
@@ -342,6 +383,66 @@ mod tests {
         assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
     }
 
+    /// The gate on both install refusals is the classifier's `VulkanOnly`
+    /// tier, not a private re-derivation of it.
+    ///
+    /// Every case is one `gpu_support_level` answers, so a change there has to
+    /// come through here: `gfx90c` is the recognized-with-no-ROCm-build tier
+    /// and is refused; a covered target is `RocmHip` and is not; an
+    /// unrecognized one is `Unknown`, a gap in this build's catalog rather
+    /// than a fact about the card, and refusing it would be the exact false
+    /// claim `GpuSupportLevel`'s doc comment exists to prevent.
+    #[test]
+    fn the_install_refusal_gate_is_the_classifiers_vulkan_only_tier() {
+        for refused in ["gfx90c", "GFX90C", "gfx90c:xnack-", " gfx90c "] {
+            assert!(
+                target_is_vulkan_only(refused),
+                "`{refused}` is the Vulkan-only tier and install must refuse it"
+            );
+        }
+        for allowed in ["gfx1100", "gfx1151", "gfx90a", "gfx950-dcgpu"] {
+            assert!(
+                !target_is_vulkan_only(allowed),
+                "`{allowed}` has a ROCm build; install must not refuse it"
+            );
+        }
+        for unknown in ["gfx803", "not-a-target", ""] {
+            assert!(
+                !target_is_vulkan_only(unknown),
+                "`{unknown}` is unrecognized, which is a gap in this catalog and \
+                 not a confirmed absence of a ROCm build: refusing it would claim \
+                 something about hardware nobody probed"
+            );
+        }
+    }
+
+    /// Both refusals make the same claim about a Vulkan-only GPU, so they
+    /// render it from the same string.
+    ///
+    /// Asserting the constant is *in* each message is what makes it one
+    /// claim; the wording itself is pinned word-for-word in `rocm-core`
+    /// (`the_vulkan_only_claim_is_pinned_word_for_word`), so neither test
+    /// alone can be satisfied by quietly rewriting the other's expectation.
+    ///
+    /// `rocm examine`'s `rocm_support` line is deliberately not in this list.
+    /// It is the one surface that pays for the Vulkan probe, so it grades the
+    /// claim by what the probe found rather than making it unconditionally -
+    /// see `rocm_support_line` in `rocm-core`'s `host_gpu/render.rs`. These
+    /// two share the constant precisely because they do *not* probe.
+    #[test]
+    fn both_install_refusals_render_the_shared_vulkan_only_claim() {
+        for message in [
+            unsupported_host_gpu_message("gfx90c"),
+            unsupported_requested_target_message("gfx90c", "--family"),
+        ] {
+            assert!(
+                message.contains(VULKAN_ONLY_SUPPORT_CLAIM),
+                "the claim must come from the shared constant, or install and \
+                 examine can drift apart while both look right: {message}"
+            );
+        }
+    }
+
     #[test]
     fn unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families() {
         let message = unsupported_host_gpu_message("gfx90c");
@@ -392,7 +493,7 @@ mod tests {
     /// Both refusals used to close with the same "`rocm serve <model>` runs on
     /// Lemonade's Vulkan backend" sentence. In `unsupported_host_gpu_message`
     /// that is a fact: it is only reached after `detect_host_gfx_target` returns
-    /// a target `gfx_target_has_no_rocm_build` confirms. This one fires from the
+    /// a target `target_is_vulkan_only` confirms. This one fires from the
     /// `--family` / `ROCM_CLI_THEROCK_FAMILY` branches before any probe runs —
     /// see `cli_family_overrides_a_stale_env_value_naming_an_unsupported_gpu`
     /// for an override that deliberately disagrees with its host — so on a
