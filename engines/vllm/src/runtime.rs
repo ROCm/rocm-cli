@@ -767,20 +767,6 @@ pub(crate) fn ensure_therock_compat_shims(
     runtime: &VllmRuntime,
     ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    ensure_therock_compat_shims_with(
-        runtime,
-        ensure_mpi_cxx_compat,
-        rocm_core::openmpi::real_libmpi_cxx_present,
-    )
-}
-
-/// [`ensure_therock_compat_shims`] with the "does the host have a real
-/// `libmpi_cxx`" answer injected as well, for the stub cleanup it gates.
-fn ensure_therock_compat_shims_with(
-    runtime: &VllmRuntime,
-    ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
-    real_libmpi_cxx_present: impl FnOnce() -> bool,
-) -> Option<PathBuf> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -801,7 +787,11 @@ fn ensure_therock_compat_shims_with(
     // SDK does not ship, so it loads a second amd-smi library beside torch's own
     // and torch counts no devices (see `rocm_core::ensure_amd_smi_compat`). The
     // link goes in the same directory, and the launch path carries the directory
-    // when either shim was written.
+    // when either shim was written. That function also removes a leftover
+    // `libmpi_cxx.so.40` stub where the host has a real `libmpi_cxx`, since the
+    // directory can now reach the loader path for the link alone. When it answers
+    // `None` the directory is not on this launch's loader path for the link, so
+    // there is nothing to clear.
     let amd_smi_shim = rocm_core::ensure_amd_smi_compat(
         &compat_dir,
         &therock_library_path_entries_inner(runtime, CompatDirSignal::Checked(None)),
@@ -817,24 +807,9 @@ fn ensure_therock_compat_shims_with(
     // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
     // the install/preflight.
     remove_stale_numa_shim(&compat_dir);
-    // The directory now reaches the loader path for the amd-smi link alone, so a
-    // `libmpi_cxx.so.40` stub an earlier run wrote, before the host gained a real
-    // `libmpi_cxx`, would shadow the real one there. Remove it only in that case.
-    // `None` from `ensure_mpi_cxx_compat` also means no stub was embedded or the
-    // stub could not be written, and then an existing stub may be the one torch
-    // is loading, so it stays.
-    if mpi_cxx_shim.is_none() && real_libmpi_cxx_present() {
-        remove_stale_mpi_cxx_stub(&compat_dir);
-    }
     mpi_cxx_shim.or(amd_smi_shim)
 }
 
-/// Remove a leftover `libmpi_cxx.so.40` stub from `compat_dir`: one written while
-/// the host had no real `libmpi_cxx`, which would shadow the real library once the
-/// directory is on the loader path. No-op when absent.
-fn remove_stale_mpi_cxx_stub(compat_dir: &Path) {
-    let _ = fs::remove_file(compat_dir.join("libmpi_cxx.so.40"));
-}
 /// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
 /// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
 /// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
@@ -1241,43 +1216,46 @@ mod tests {
         );
     }
 
-    /// The amd-smi link puts the compat directory on the loader path even when
-    /// the host has a real `libmpi_cxx`; a stub an earlier run left there must not
-    /// ride along and shadow it. Where the stub is merely not (re)written, with no
-    /// real `libmpi_cxx` on the host (no stub embedded, or not writable), it may be
-    /// the one torch is loading and stays.
+    /// The amd-smi link puts the compat directory on the loader path even when the
+    /// host has a real `libmpi_cxx`, so the launch removes a stub an earlier run
+    /// left there. With no real `libmpi_cxx` on the host the stub may be the one
+    /// torch is loading and stays.
+    ///
+    /// Which of the two holds depends on the host, so the expectation is derived
+    /// from the probe the launch uses, and only the half that matches this host
+    /// runs here. Both halves, with the host answer injected, are tested in
+    /// rocm-core (`the_shared_helpers_clear_a_leftover_mpi_cxx_stub_only_beside_a_real_library`);
+    /// this test pins that the launch goes through that helper.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_leftover_mpi_cxx_stub_is_removed_only_when_the_host_has_a_real_libmpi_cxx() {
-        for (real_libmpi_cxx, stub_remains) in [(true, false), (false, true)] {
-            let env = tempfile::tempdir().unwrap();
-            let sdk_root = env.path().join("sdk");
-            let sdk_lib = sdk_root.join("lib");
-            fs::create_dir_all(&sdk_lib).unwrap();
-            fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
-            let compat_dir = env.path().join("rocm-cli-lib-compat");
-            fs::create_dir_all(&compat_dir).unwrap();
-            fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stub").unwrap();
-            let runtime = VllmRuntime {
-                runtime_id: "release-wheel".to_owned(),
-                env_id: "release-wheel".to_owned(),
-                python_executable: Some(env.path().join("bin").join("python")),
-                sdk_root: Some(sdk_root),
-                sdk_library_paths: vec![sdk_lib],
-                ..VllmRuntime::for_test()
-            };
+    fn a_launch_clears_a_leftover_mpi_cxx_stub_only_beside_a_real_libmpi_cxx() {
+        let env = tempfile::tempdir().unwrap();
+        let sdk_root = env.path().join("sdk");
+        let sdk_lib = sdk_root.join("lib");
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        let stub = compat_dir.join(rocm_core::openmpi::MPI_CXX_STUB_NAME);
+        fs::write(&stub, b"stub").unwrap();
+        let runtime = VllmRuntime {
+            runtime_id: "release-wheel".to_owned(),
+            env_id: "release-wheel".to_owned(),
+            python_executable: Some(env.path().join("bin").join("python")),
+            sdk_root: Some(sdk_root),
+            sdk_library_paths: vec![sdk_lib],
+            ..VllmRuntime::for_test()
+        };
 
-            // `ensure_mpi_cxx_compat` answers `None` in both cases.
-            let shim = ensure_therock_compat_shims_with(&runtime, |_| None, || real_libmpi_cxx);
+        // `ensure_mpi_cxx_compat` answers `None`, whatever the reason.
+        let shim = ensure_therock_compat_shims(&runtime, |_| None);
 
-            assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
-            assert!(compat_dir.join("libamd_smi.so").exists());
-            assert_eq!(
-                compat_dir.join("libmpi_cxx.so.40").exists(),
-                stub_remains,
-                "real libmpi_cxx on the host: {real_libmpi_cxx}"
-            );
-        }
+        assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
+        assert!(compat_dir.join("libamd_smi.so").exists());
+        assert_eq!(
+            stub.exists(),
+            !rocm_core::openmpi::real_libmpi_cxx_present()
+        );
     }
 
     /// The "a bare name already exists" rule reads the SDK's directories only, not

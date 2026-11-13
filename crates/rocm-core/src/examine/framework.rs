@@ -88,9 +88,9 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
     if crate::managed_runtime::amd_smi_link_missing(&interpreter.python, &interpreter.library_paths)
     {
         e.framework_notes.push(
-            "The runtime ships libamd_smi.so.<n> without the bare libamd_smi.so name and has no amd-smi link \
-             yet: a launch or install writes it. On a host with another ROCm installed, torch can report \
-             0 devices until the link exists."
+            "The runtime ships libamd_smi.so.<n> without the bare libamd_smi.so name and has no usable \
+             amd-smi link yet: a launch or install writes it. Until then torch can report 0 devices \
+             (seen beside a host ROCm install)."
                 .to_owned(),
         );
     }
@@ -486,7 +486,7 @@ mod tests {
         let link_note = |e: &Examination| {
             e.framework_notes
                 .iter()
-                .any(|note| note.contains("has no amd-smi link yet"))
+                .any(|note| note.contains("has no usable amd-smi link yet"))
         };
         assert!(link_note(&without), "{:?}", without.framework_notes);
         assert!(!link_note(&with), "{:?}", with.framework_notes);

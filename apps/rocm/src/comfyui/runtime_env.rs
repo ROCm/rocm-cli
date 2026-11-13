@@ -1987,15 +1987,20 @@ mod tests {
         let sdk_lib = paths.data_dir.join("sdk-lib");
         fs::create_dir_all(&sdk_lib)?;
         fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+        // A `libmpi_cxx` stub a vLLM launch left in the same directory, which
+        // reaches this launch's loader path along with the link.
+        let compat = venv_root.join(rocm_core::RUNTIME_COMPAT_DIR_NAME);
+        fs::create_dir_all(&compat)?;
+        let stub = compat.join(rocm_core::openmpi::MPI_CXX_STUB_NAME);
+        fs::write(&stub, b"stub")?;
         let env = ComfyUiRuntimeEnvironment {
-            venv_root: Some(venv_root.clone()),
+            venv_root: Some(venv_root),
             library_entries: vec![sdk_lib.clone()],
             ..Default::default()
         };
 
         let assignments = runtime_environment_assignments(&env)?;
 
-        let compat = venv_root.join(rocm_core::RUNTIME_COMPAT_DIR_NAME);
         let ld_library_path = assignments
             .iter()
             .find(|(key, _)| *key == "LD_LIBRARY_PATH")
@@ -2011,6 +2016,15 @@ mod tests {
         assert_eq!(
             fs::read_link(compat.join("libamd_smi.so"))?,
             sdk_lib.join("libamd_smi.so.26")
+        );
+        // The stub shadows a real host library on that path, so it is gone where
+        // the host has one. Without one it may be the library torch loads, and stays.
+        // Only the half that matches this host runs here; both halves, with the host
+        // answer injected, are tested in rocm-core
+        // (`the_shared_helpers_clear_a_leftover_mpi_cxx_stub_only_beside_a_real_library`).
+        assert_eq!(
+            stub.exists(),
+            !rocm_core::openmpi::real_libmpi_cxx_present()
         );
         Ok(())
     }

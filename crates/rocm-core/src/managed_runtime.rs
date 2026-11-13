@@ -514,9 +514,32 @@ fn runtime_compat_dir_for_python(python: &Path) -> Option<PathBuf> {
 /// directory in `library_dirs` already holds the bare name (the loader finds it
 /// ahead of the link, which goes last), or when the link cannot be made. Where
 /// more than one soname is present in a directory, the highest by number is used.
+///
+/// The directory is also the one the vLLM launch keeps a `libmpi_cxx.so.40` stub
+/// in, and a loader path that carries it would load a leftover stub ahead of a
+/// real host `libmpi_cxx`. So before it returns the directory this removes such a
+/// stub where the host has a real library (see
+/// [`crate::openmpi::remove_stale_mpi_cxx_stub`]), which keeps every caller that
+/// adds the directory to its loader path clear of it.
 pub fn ensure_amd_smi_compat(compat_dir: &Path, library_dirs: &[PathBuf]) -> Option<PathBuf> {
+    ensure_amd_smi_compat_with(
+        compat_dir,
+        library_dirs,
+        crate::openmpi::real_libmpi_cxx_present,
+    )
+}
+
+/// [`ensure_amd_smi_compat`] with the "does the host have a real `libmpi_cxx`"
+/// answer injected, for the stub cleanup it gates.
+fn ensure_amd_smi_compat_with(
+    compat_dir: &Path,
+    library_dirs: &[PathBuf],
+    real_libmpi_cxx_present: impl FnOnce() -> bool,
+) -> Option<PathBuf> {
     let library = amd_smi_library_needing_bare_name(library_dirs)?;
-    crate::openmpi::ensure_compat_symlink(compat_dir, "libamd_smi.so", &library)
+    let dir = crate::openmpi::ensure_compat_symlink(compat_dir, "libamd_smi.so", &library)?;
+    crate::openmpi::remove_stale_mpi_cxx_stub(&dir, real_libmpi_cxx_present());
+    Some(dir)
 }
 
 /// The loader-path directories for a managed runtime's `python`: its recorded
@@ -526,40 +549,98 @@ pub fn ensure_amd_smi_compat(compat_dir: &Path, library_dirs: &[PathBuf]) -> Opt
 /// What a caller that spawns the runtime's interpreter, outside an engine launch,
 /// puts on `LD_LIBRARY_PATH`. Exists so each such caller gets the same set.
 pub fn runtime_loader_path_entries(python: &Path, library_paths: &[PathBuf]) -> Vec<PathBuf> {
+    runtime_loader_path_entries_with(
+        python,
+        library_paths,
+        crate::openmpi::real_libmpi_cxx_present,
+    )
+}
+
+fn runtime_loader_path_entries_with(
+    python: &Path,
+    library_paths: &[PathBuf],
+    real_libmpi_cxx_present: impl FnOnce() -> bool,
+) -> Vec<PathBuf> {
     let mut entries = library_paths.to_vec();
     if let Some(shim) = runtime_compat_dir_for_python(python)
-        .and_then(|dir| ensure_amd_smi_compat(&dir, library_paths))
+        .and_then(|dir| ensure_amd_smi_compat_with(&dir, library_paths, real_libmpi_cxx_present))
     {
         entries.push(shim);
     }
     entries
 }
 
-/// [`runtime_loader_path_entries`] without the write: the shim directory is added
-/// only where an install or a launch already made it. For a diagnostic, which must
-/// not change the environment it reports on.
+/// [`runtime_loader_path_entries`] without the write.
+///
+/// The shim directory is added only where an install or a launch already left it as
+/// they would: the link pointing at the library [`ensure_amd_smi_compat`] would
+/// pick, and no leftover `libmpi_cxx` stub beside it that a real host library
+/// should win over. For a diagnostic, which must not change the environment it
+/// reports on, and so must not report a link as healthy that a launch would rewrite.
 pub fn runtime_loader_path_entries_read_only(
     python: &Path,
     library_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
+    runtime_loader_path_entries_read_only_with(
+        python,
+        library_paths,
+        crate::openmpi::real_libmpi_cxx_present,
+    )
+}
+
+fn runtime_loader_path_entries_read_only_with(
+    python: &Path,
+    library_paths: &[PathBuf],
+    real_libmpi_cxx_present: impl FnOnce() -> bool,
+) -> Vec<PathBuf> {
     let mut entries = library_paths.to_vec();
-    if let Some(dir) = runtime_compat_dir_for_python(python)
-        && dir.join("libamd_smi.so").exists()
-    {
-        entries.push(dir);
-    }
+    entries.extend(amd_smi_ready_dir(
+        python,
+        library_paths,
+        real_libmpi_cxx_present,
+    ));
     entries
 }
 
-/// Whether `python`'s runtime needs the amd-smi link and does not have it.
+/// Whether `python`'s runtime needs the amd-smi link and has no usable one.
 ///
 /// The SDK ships `libamd_smi.so.<n>` without the bare name ([`ensure_amd_smi_compat`]),
-/// and the environment's shim directory holds no `libamd_smi.so`. Reads only. For a
-/// diagnostic, since a launch that could not make the link says nothing itself.
+/// and the environment's shim directory does not yet hold what a launch would leave
+/// (see [`runtime_loader_path_entries_read_only`]). Reads only. For a diagnostic,
+/// since a launch that could not make the link says nothing itself.
 pub fn amd_smi_link_missing(python: &Path, library_paths: &[PathBuf]) -> bool {
-    amd_smi_library_needing_bare_name(library_paths).is_some()
-        && runtime_compat_dir_for_python(python)
-            .is_some_and(|dir| !dir.join("libamd_smi.so").exists())
+    let Some(library) = amd_smi_library_needing_bare_name(library_paths) else {
+        return false;
+    };
+    runtime_compat_dir_for_python(python).is_some_and(|dir| {
+        !amd_smi_link_dir_ready(&dir, &library, crate::openmpi::real_libmpi_cxx_present)
+    })
+}
+
+/// The shim directory of `python`'s environment when it already holds what
+/// [`ensure_amd_smi_compat`] would leave there and is safe on a loader path, else
+/// `None`. Reads only.
+fn amd_smi_ready_dir(
+    python: &Path,
+    library_dirs: &[PathBuf],
+    real_libmpi_cxx_present: impl FnOnce() -> bool,
+) -> Option<PathBuf> {
+    let library = amd_smi_library_needing_bare_name(library_dirs)?;
+    let dir = runtime_compat_dir_for_python(python)?;
+    amd_smi_link_dir_ready(&dir, &library, real_libmpi_cxx_present).then_some(dir)
+}
+
+/// Whether `dir` holds the link to `library` and no stub that a real host library
+/// should win over.
+fn amd_smi_link_dir_ready(
+    dir: &Path,
+    library: &Path,
+    real_libmpi_cxx_present: impl FnOnce() -> bool,
+) -> bool {
+    // The write path repoints a link that goes anywhere else, so one that does is
+    // not healthy.
+    fs::read_link(dir.join("libamd_smi.so")).is_ok_and(|target| target == library)
+        && !crate::openmpi::mpi_cxx_stub_shadows_real_library(dir, real_libmpi_cxx_present())
 }
 
 fn amd_smi_library_needing_bare_name(library_dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -1481,6 +1562,105 @@ mod tests {
         runtime_loader_path_entries(&python, std::slice::from_ref(&sdk_lib));
         let after = runtime_loader_path_entries_read_only(&python, std::slice::from_ref(&sdk_lib));
         assert_eq!(after, vec![sdk_lib, env_root.join(RUNTIME_COMPAT_DIR_NAME)]);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// A `libmpi_cxx.so.40` stub in the shim directory shadows a real host
+    /// `libmpi_cxx` once the directory is on a loader path, and the amd-smi link
+    /// puts it there for every caller. So the shared helpers clear the stub where
+    /// the host has a real library, and leave it where the host has none (it may
+    /// be the library torch is loading then).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_shared_helpers_clear_a_leftover_mpi_cxx_stub_only_beside_a_real_library() -> Result<()> {
+        for (real_libmpi_cxx, stub_remains) in [(true, false), (false, true)] {
+            let (root, _) = temp_app_paths("amd-smi-shim-stub");
+            let env_root = root.join("env");
+            let python = env_root.join("bin").join("python");
+            let compat = env_root.join(RUNTIME_COMPAT_DIR_NAME);
+            let stub = compat.join("libmpi_cxx.so.40");
+            let sdk_lib = root.join("sdk").join("lib");
+            fs::create_dir_all(&sdk_lib)?;
+            fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+            let libs = std::slice::from_ref(&sdk_lib);
+
+            // The helper a launch calls with the directory.
+            fs::create_dir_all(&compat)?;
+            fs::write(&stub, b"stub")?;
+            assert_eq!(
+                ensure_amd_smi_compat_with(&compat, libs, || real_libmpi_cxx).as_deref(),
+                Some(compat.as_path())
+            );
+            assert_eq!(
+                stub.exists(),
+                stub_remains,
+                "real host library: {real_libmpi_cxx}"
+            );
+
+            // The helper the install device probe calls with an interpreter.
+            fs::write(&stub, b"stub")?;
+            let entries = runtime_loader_path_entries_with(&python, libs, || real_libmpi_cxx);
+            assert_eq!(entries, vec![sdk_lib.clone(), compat.clone()]);
+            assert_eq!(
+                stub.exists(),
+                stub_remains,
+                "real host library: {real_libmpi_cxx}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+        Ok(())
+    }
+
+    /// A diagnostic holds the shim directory back where a launch would not leave
+    /// it as it is: a link that goes to another library (an in-place SDK upgrade),
+    /// or a stub that a real host library should win over. It writes nothing
+    /// either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_read_only_entries_do_not_trust_a_link_or_a_stub_a_launch_would_change() -> Result<()> {
+        let (root, _) = temp_app_paths("amd-smi-shim-read-only-stale");
+        let env_root = root.join("env");
+        let python = env_root.join("bin").join("python");
+        let compat = env_root.join(RUNTIME_COMPAT_DIR_NAME);
+        let sdk_lib = root.join("sdk").join("lib");
+        fs::create_dir_all(&sdk_lib)?;
+        fs::create_dir_all(&compat)?;
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk")?;
+        fs::write(root.join("older.so.25"), b"older")?;
+        let libs = std::slice::from_ref(&sdk_lib);
+        let read = |real: bool| runtime_loader_path_entries_read_only_with(&python, libs, || real);
+        let link = compat.join("libamd_smi.so");
+
+        // Another SDK's library, and one that is gone.
+        for target in [root.join("older.so.25"), root.join("gone")] {
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert_eq!(
+                read(false),
+                vec![sdk_lib.clone()],
+                "link to {}",
+                target.display()
+            );
+            assert!(amd_smi_link_missing(&python, libs));
+            fs::remove_file(&link)?;
+        }
+
+        // The right link, and then a stub beside it.
+        std::os::unix::fs::symlink(sdk_lib.join("libamd_smi.so.26"), &link)?;
+        let healthy = vec![sdk_lib.clone(), compat.clone()];
+        assert_eq!(read(true), healthy);
+        assert_eq!(read(false), healthy);
+        fs::write(compat.join("libmpi_cxx.so.40"), b"stub")?;
+        assert_eq!(
+            read(false),
+            healthy,
+            "no real host library: the stub may be in use"
+        );
+        assert_eq!(read(true), vec![sdk_lib.clone()]);
+        assert!(
+            compat.join("libmpi_cxx.so.40").exists(),
+            "a diagnostic never removes it"
+        );
         fs::remove_dir_all(root).ok();
         Ok(())
     }

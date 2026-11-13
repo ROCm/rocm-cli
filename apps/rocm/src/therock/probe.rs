@@ -480,7 +480,7 @@ mod tests {
         let probe = probe_runtime_devices(&python, std::slice::from_ref(&sdk_lib))?;
 
         let loader_path = probe.error.unwrap_or_default();
-        let compat_dir = root.join("env").join("rocm-cli-lib-compat");
+        let compat_dir = root.join("env").join(rocm_core::RUNTIME_COMPAT_DIR_NAME);
         assert!(
             loader_path.starts_with(&format!("{}:{}", sdk_lib.display(), compat_dir.display())),
             "{loader_path}"
