@@ -5,7 +5,9 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::torch_alignment_outcome::{EngineTorchRequirement, is_settled};
+use e2e_cucumber::torch_alignment_outcome::{
+    EngineTorchRequirement, engine_import_verdict, is_settled,
+};
 
 #[given("a machine with no CLI-managed runtimes")]
 async fn setup_no_runtimes(world: &mut E2eWorld) {
@@ -389,6 +391,26 @@ fn engine_torch_requirement(output: &str) -> EngineTorchRequirement {
     }
 }
 
+/// The runtime's interpreter can import torch, torchvision and vLLM together.
+///
+/// Asked only where a `not_applicable` verdict means the alignment compared no pin,
+/// so nothing else vouches that the pair torch and torchvision came to rest on can
+/// register its operators. The verdict itself is `engine_import_verdict`.
+fn assert_engine_stack_imports(output: &str) {
+    let python = super::examine_steps::field_value(output, "python_executable")
+        .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
+    let probe = std::process::Command::new(python)
+        .args(["-c", "import torch, torchvision, vllm"])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {python}: {error}"));
+    if let Err(cause) = engine_import_verdict(
+        probe.status.success(),
+        &String::from_utf8_lossy(&probe.stderr),
+    ) {
+        panic!("the reinstalled runtime cannot import the stack vLLM needs ({cause}):\n{output}");
+    }
+}
+
 /// The alignment ran, and settled.
 ///
 /// Separate from the device check above because the two can disagree: a runtime
@@ -407,11 +429,14 @@ async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
     // torch requirement.
     let lines = torch_alignment_lines(output);
     let engine = engine_requirement_for(&lines, output);
-    for line in lines {
+    for line in &lines {
         assert!(
             is_settled(line, engine),
             "torch alignment reached no settled outcome (`{line}`):\n{output}"
         );
+    }
+    if lines.iter().any(|line| line.starts_with("not_applicable")) {
+        assert_engine_stack_imports(output);
     }
     // Asserted on the verdict, not on the divergence lines. Requiring
     // `expected_divergence` whenever `divergence:` appears cannot fail: one render

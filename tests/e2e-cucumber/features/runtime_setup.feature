@@ -54,6 +54,10 @@ Feature: Runtime configuration
   # metadata declares none, so the verdict is `not_applicable (vllm does not pin
   # torch)`; the step accepts it only after asking the runtime's interpreter that
   # the installed vLLM really requires no torch.
+  # Nothing compared a pin there, and the device check only proves torch can run a
+  # kernel, so the same step also imports torch, torchvision and vLLM in the
+  # runtime: a reinstall that leaves a torch and torchvision pair unable to
+  # register their operators fails here instead of passing and breaking every serve.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
   Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed

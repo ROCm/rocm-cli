@@ -53,6 +53,31 @@ pub fn is_settled(verdict_line: &str, engine: EngineTorchRequirement) -> bool {
         && verdict_line.strip_prefix(verdict).map(str::trim) == Some(NO_PIN_REASON)
 }
 
+/// Judge the result of importing the stack the engine needs (torch, torchvision and
+/// the engine itself) in the runtime's own interpreter.
+///
+/// Needed where the alignment decided nothing. `not_applicable` says no engine pin
+/// was compared, and the device check that follows only proves torch can run a
+/// kernel, so a torch and torchvision that cannot register their operators together
+/// passes both while every `rocm serve` on the runtime fails on import. The last
+/// line of the failure is returned, because that is the line that names the cause.
+///
+/// # Errors
+///
+/// The last non-empty stderr line when the import did not succeed.
+pub fn engine_import_verdict(succeeded: bool, stderr: &str) -> Result<(), String> {
+    if succeeded {
+        return Ok(());
+    }
+    Err(stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("the import failed with no error output")
+        .to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +111,25 @@ mod tests {
         ] {
             assert!(!is_settled(line, EngineTorchRequirement::Absent), "{line}");
         }
+    }
+
+    #[test]
+    fn a_successful_import_is_accepted_whatever_stderr_holds() {
+        assert_eq!(engine_import_verdict(true, "UserWarning: noise\n"), Ok(()));
+    }
+
+    #[test]
+    fn a_failed_import_names_the_last_line_of_its_error() {
+        let stderr = "Traceback (most recent call last):\n  File \"<string>\", line 1\n\
+                      RuntimeError: operator torchvision::nms does not exist\n\n";
+        assert_eq!(
+            engine_import_verdict(false, stderr),
+            Err("RuntimeError: operator torchvision::nms does not exist".to_owned())
+        );
+        assert_eq!(
+            engine_import_verdict(false, ""),
+            Err("the import failed with no error output".to_owned())
+        );
     }
 
     #[test]
