@@ -23,7 +23,7 @@ pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
 pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 
-/// Environment variable holding a *path* to a 0600 file whose contents are the
+/// Environment variable holding a *path* to an owner-only file whose contents are the
 /// endpoint API key.
 ///
 /// `rocm serve` sets this explicitly on the internal `__engine-serve-http` child
@@ -110,7 +110,7 @@ pub fn endpoint_api_key_from_file(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Deterministic path of the 0600 endpoint key file for `service_id`.
+/// Deterministic path of the owner-only endpoint key file for `service_id`.
 ///
 /// Shared so both binaries that need to locate a service's key file — `rocm`
 /// (which owns writing and clearing it) and `rocmd` (which only re-threads
@@ -150,6 +150,25 @@ pub fn endpoint_key_file_if_present(
 ) -> Option<PathBuf> {
     let path = endpoint_key_file_path(paths, service_id);
     path.exists().then_some(path)
+}
+
+/// Remove `service_id`'s endpoint key file and any leftover staged copy of it.
+///
+/// A store killed between staging and publishing leaves a staged copy beside
+/// the key (see `rocm_core::atomic_write::staged_siblings`), and this removes
+/// the copies it finds along with the key. Best-effort and idempotent: a
+/// missing file is not an error, a file it cannot remove is left where it is,
+/// and if the folder cannot be listed the staged copies are left, all without
+/// being reported, because no caller can act on a failed cleanup.
+///
+/// It removes the key and the staged copies present when the folder is
+/// listed. It does not exclude a store for the same service running at the
+/// same time, which may still publish a key or may fail.
+pub fn remove_endpoint_key_files(paths: &rocm_core::AppPaths, service_id: &str) {
+    let key = endpoint_key_file_path(paths, service_id);
+    for path in std::iter::once(key.clone()).chain(rocm_core::atomic_write::staged_siblings(&key)) {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -816,6 +835,31 @@ mod tests {
         // Different service ids never collide.
         assert_ne!(path, endpoint_key_file_path(&paths, "svc-2"));
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// A store killed between staging and publishing leaves a staged copy of
+    /// the key; removing the service's key takes that copy too, and leaves
+    /// another service's key and staged copy alone.
+    #[test]
+    fn remove_endpoint_key_files_takes_the_key_and_its_leftover_staged_copies() {
+        let paths = test_app_paths("key-file-remove");
+        let key = endpoint_key_file_path(&paths, "svc-a");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "published").unwrap();
+        let staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"staged").unwrap();
+        let other_key = endpoint_key_file_path(&paths, "svc-ab");
+        let other_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&other_key, b"other")
+                .unwrap();
+
+        remove_endpoint_key_files(&paths, "svc-a");
+        let left = (key.exists(), staged.exists(), other_staged.exists());
+        // A second removal finds nothing and is a no-op.
+        remove_endpoint_key_files(&paths, "svc-a");
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+
+        assert_eq!(left, (false, false, true));
     }
 
     #[test]

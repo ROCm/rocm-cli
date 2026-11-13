@@ -25,7 +25,7 @@ const ENGINE: &str = "vllm";
 /// A record whose manifest a user already deleted by hand, leaving its engine
 /// state file stranded — the state this feature has to be able to clean up.
 const ORPHAN_ID: &str = "vllm-e2e-hand-deleted";
-/// A service whose `rocm serve` has written its 0600 endpoint key but not yet
+/// A service whose `rocm serve` has written its owner-only endpoint key but not yet
 /// its record — the launch-in-progress shape the leftover sweep must not
 /// mistake for something to delete.
 const STARTING_ID: &str = "vllm-e2e-still-starting";
@@ -166,6 +166,31 @@ fn lists_live_server_row(listed: &str) -> bool {
         .any(|line| line.trim_end().strip_prefix("- ") == Some(SERVICE_ID))
 }
 
+/// Where a `rocm` save of `id`'s endpoint key that was killed between writing
+/// the key and putting it in place leaves its copy: the shared atomic writer's
+/// staged file, `{key file}.tmp-{pid}-{millis}-{attempt}`.
+fn leftover_key_copy(world: &E2eWorld, id: &str) -> PathBuf {
+    services_dir(world).join(format!("{id}.endpoint-key.tmp-4242-1700000000000-0"))
+}
+
+/// Plant that leftover copy, after checking the CLI's own reader takes the
+/// name for a staged copy of `id`'s key — so a change to the writer's naming
+/// fails here, as a premise, rather than as a mysterious survivor later.
+fn plant_leftover_key_copy(world: &E2eWorld, id: &str) {
+    let copy = leftover_key_copy(world, id);
+    let name = copy
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 name");
+    assert_eq!(
+        rocm_core::atomic_write::staged_destination_name(name),
+        Some(format!("{id}.endpoint-key").as_str()),
+        "premise: {name} must read as a staged copy of {id}'s key"
+    );
+    std::fs::create_dir_all(services_dir(world)).expect("failed to create services dir");
+    std::fs::write(&copy, "e2e-endpoint-key").expect("failed to write the leftover key copy");
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a local server record that is no longer running")]
@@ -230,6 +255,16 @@ async fn engine_state_cannot_be_deleted(world: &mut E2eWorld) {
     );
 }
 
+#[given("an interrupted save left a second copy of that server's API key")]
+async fn leftover_copy_of_the_record_key(world: &mut E2eWorld) {
+    plant_leftover_key_copy(world, SERVICE_ID);
+}
+
+#[given("an interrupted save left a copy of the API key of the record deleted by hand")]
+async fn leftover_copy_of_the_orphan_key(world: &mut E2eWorld) {
+    plant_leftover_key_copy(world, ORPHAN_ID);
+}
+
 #[given("an engine state file whose local server record was deleted by hand")]
 async fn orphaned_engine_state(world: &mut E2eWorld) {
     let states = engine_state_dir(world);
@@ -242,7 +277,7 @@ async fn orphaned_engine_state(world: &mut E2eWorld) {
 }
 
 /// A managed launch caught between its two writes, staged exactly as `rocm
-/// serve` stages it: the 0600 endpoint key is on disk, the record is not, and
+/// serve` stages it: the owner-only endpoint key is on disk, the record is not, and
 /// the managed-launch lock is held across the whole of that interval.
 ///
 /// The lock is taken with the production [`rocm_core::FileLock`] on the real
@@ -547,7 +582,7 @@ async fn prune_did_not_return_before_the_hold(world: &mut E2eWorld) {
     );
 }
 
-/// The scenario's discriminating assertion: the 0600 key of a launch that has
+/// The scenario's discriminating assertion: the owner-only key of a launch that has
 /// not published its record yet must survive the sweep.
 ///
 /// It discriminates only while `rocm`'s startup is shorter than the staged hold.
@@ -579,6 +614,53 @@ async fn starting_key_present(world: &mut E2eWorld) {
     assert!(
         services.join(format!("{STARTING_ID}.json")).exists(),
         "premise: the staged launch must have published its record:\n{}",
+        combined_output(world)
+    );
+}
+
+#[then("the second copy of that server's API key is gone")]
+async fn record_key_copy_gone(world: &mut E2eWorld) {
+    let copy = leftover_key_copy(world, SERVICE_ID);
+    assert!(
+        !copy.exists(),
+        "{} holds the key and must be deleted with the record:\n{}",
+        copy.display(),
+        combined_output(world)
+    );
+}
+
+/// The four planted files plus the leftover copy: the summary's count is how
+/// the user learns that more than the four usual files went.
+#[then("the CLI counts that copy among the files it removed")]
+async fn counts_the_key_copy(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    assert!(
+        combined.contains("files removed: 5"),
+        "the removal must count the leftover key copy (4 record files + 1):\n{combined}"
+    );
+}
+
+#[then("the preview lists the leftover copy of the API key")]
+async fn preview_lists_the_key_copy(world: &mut E2eWorld) {
+    let copy = leftover_key_copy(world, ORPHAN_ID);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&copy.display().to_string()),
+        "the preview must name the leftover key copy {}:\n{combined}",
+        copy.display()
+    );
+    assert!(
+        copy.exists(),
+        "a preview must not delete the leftover key copy"
+    );
+}
+
+#[then("the leftover copy of the API key is gone")]
+async fn orphan_key_copy_gone(world: &mut E2eWorld) {
+    let copy = leftover_key_copy(world, ORPHAN_ID);
+    assert!(
+        !copy.exists(),
+        "the leftover key copy of a deleted record must be swept:\n{}",
         combined_output(world)
     );
 }

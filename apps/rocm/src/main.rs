@@ -1765,7 +1765,7 @@ pub(crate) mod tests {
         Ok(record)
     }
 
-    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// Everything [`plant_service_record`] writes *except* the owner-only endpoint
     /// key: the manifest, the log, and the engine state file.
     ///
     /// Split out for the launch-lock test below, which writes the key itself —

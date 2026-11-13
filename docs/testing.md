@@ -2062,15 +2062,35 @@ on a non-default `--host` is still required: automatic selection only probes
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
 credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
-variable, or let one be generated. The key is handed to the engine via a 0600
-key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
-which is unavailable on headless serving hosts), and printed once as client
+variable, or let one be generated. The key is handed to the engine via a key
+file (never argv), persisted as a per-service file (not the OS keychain, which
+is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
-audit log. Verifying that the running server actually *rejects* an
-unauthenticated request requires a live engine; that end-to-end assertion is a
-deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
-(`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
-generation, the 0600 key file, and key-file resolution.
+audit log. Only the serving user can read the key file: it is mode 0600 on Unix
+and has a protected DACL granting only that user on Windows, and every store
+replaces it with a freshly created owner-only file, so permissions loosened in
+place do not survive a re-store. Verifying that the running server actually
+*rejects* an unauthenticated request requires a live engine; that end-to-end
+assertion is a deferred follow-up and is **not yet** exercised by the GPU
+acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
+key policy, generation, the owner-only key file (including one whose
+permissions were loosened before a re-store, and on the Windows build job the
+DACL read back from disk), and key-file resolution. The tests that fail
+without the repair of a loosened key file are `restoring_a_key_over_a_loosened_file_makes_it_0600_again`
+in [`endpoint_keys.rs`](../apps/rocm/src/endpoint_keys.rs), `write_owner_only_file_atomically_tightens_a_loosened_file`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), and on Windows
+`write_owner_only_file_atomically_replaces_a_loose_dacl_with_an_owner_only_one`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), which starts from a destination whose DACL grants Everyone. `serve-57` (`@id:serve-endpoint-key-readable-by-owner-only`
+in [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature))
+guards fresh-create behaviour only: it checks that a real serve's newly
+written key file is mode 0600 on the Linux GPU lanes, which held before this
+repair too, so it is a guard against a regression in that path, not evidence
+for the repair.
+
+```bash
+cargo test -p rocm-core --lib owner_only
+cargo test -p rocm --bin rocm endpoint_keys
+```
 
 The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
@@ -2096,15 +2116,28 @@ service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being
-deleted, so keeping its key would strand a 0600 secret belonging to a service
-that can no longer be restarted. Neither will touch a record the liveness
+deleted, so keeping its key would strand an owner-only secret belonging to a service
+that can no longer be restarted. They also delete any copy of the key a save
+killed part-way left beside it (`<id>.endpoint-key.tmp-<pid>-<millis>-<n>`):
+`remove` with its record, and `prune` with its record or, when the record is
+already gone, as a leftover under the same age rule. That copy is recognised
+only by the exact name the shared atomic writer gives it, so another service's
+key whose id happens to contain `.tmp-` is never taken for one. Neither will touch a record the liveness
 refresh still reads as running, and `prune` re-checks liveness immediately
 before each delete — but the check and the delete are not atomic, so that
 narrows the race against a concurrent `restart` rather than eliminating it.
-`features/service_record_cleanup.feature` covers both commands on the mock lane,
-asserting on the files left on disk rather than on the summary line the command
-prints — the defect they exist to fix is a file being left behind, which a
-summary claiming success cannot reveal.
+`features/service_record_cleanup.feature` covers both commands on the mock lane.
+Its scenarios assert mainly on the files left on disk, because the defect they
+exist to fix is a file being left behind, which a summary claiming success
+cannot reveal; where they read the output it is for what the user must be
+told, such as the log path before a removal. `service-cleanup-01` plants an
+interrupted-save key copy beside a record and checks `remove` deletes it and
+counts it in `files removed:`; `service-cleanup-03` plants one for a record
+already deleted by hand and checks `prune` previews and sweeps it. `prune`
+deleting the copy of a record it removes is covered by the unit test
+`services_prune_takes_a_pruned_records_staged_endpoint_key` in
+[service_records.rs](../apps/rocm/src/service_records.rs), and the age rule
+and what the sweep leaves alone by its neighbours there.
 
 Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
 and `rocm logs --service`) reads the record through one loader,
@@ -2120,7 +2153,7 @@ error names to confirm it works and does not list the id.
 
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
-writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
+writes the owner-only endpoint key before it writes the record, and `--any-age` leaves
 no age rule to hide that window behind. `serve` already holds the shared
 managed-launch lock across both writes, so `prune` acquires the same lock before
 it reads the directory.

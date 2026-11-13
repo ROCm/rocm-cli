@@ -1174,7 +1174,8 @@ the memory fraction when a small model shouldn't reserve most of a large card.
 
 `--require-api-key` makes a loopback endpoint require an API key too, which
 matters when something else republishes the port. A public bind generates a key
-automatically unless you supply one. Set `ROCM_SERVE_API_KEY` rather than
+automatically unless you supply one. The key is kept in a file under the data
+directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather than
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
@@ -1444,7 +1445,8 @@ bound by another process, it refuses and the service stays stopped
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
-its engine state file, and its endpoint key file; a running server is refused,
+its engine state file, its endpoint key file and any copy of that key an
+interrupted save left behind; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
 alone, and additionally clears leftover files whose record is already gone. A
 server counts as running while any process it recorded may be running, which on
