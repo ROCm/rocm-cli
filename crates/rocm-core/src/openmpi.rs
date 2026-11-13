@@ -35,9 +35,7 @@
 //! `build_libatomic_install_plan`, `build_libnuma_install_plan`) and the hints
 //! that name each runtime.
 
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
