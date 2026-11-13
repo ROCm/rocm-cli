@@ -24,8 +24,11 @@
 //! `therock/version.rs`. `wheel.rs` and `tarball.rs` raise the marker and call
 //! the hint.
 
-use super::super::source::{RuntimeVersionSelector, THEROCK_NEXT_MIN_MAJOR, next_layout_requested};
+use super::super::source::{
+    RuntimeVersionSelector, SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel, layout_serving,
+};
 use super::super::version::compare_version_strings;
+use rocm_core::runtime_is_windows;
 use std::fmt;
 
 /// A next-layout resolution failure that a different `--version` could clear.
@@ -104,7 +107,7 @@ const NEXT_LAYOUT_HINT_MAX_LISTED: usize = 5;
 /// (`None` when the listing could not be read), narrowed to one GPU family when
 /// `family_scope` names it. `attempted` is the release the failure recorded,
 /// and the hint leaves it out. It also leaves out any release
-/// [`next_layout_requested`] would not route back to this layout, so a re-run
+/// [`layout_serving`] would not route (the re-run is a release-channel pin) back to this layout, so a re-run
 /// searches the same layout. When nothing else qualifies, the hint says so and
 /// names no command.
 ///
@@ -145,7 +148,10 @@ pub(in crate::therock) fn next_layout_unsatisfied_hint(
         .iter()
         .filter(|version| attempted != Some(version.as_str()))
         .filter(|version| {
-            next_layout_requested(&RuntimeVersionSelector::Version((*version).clone()))
+            layout_serving(
+                TheRockChannel::Release,
+                Some(&RuntimeVersionSelector::Version((*version).clone())),
+            ) == SourceLayout::Next
         })
         .map(String::as_str)
         .collect::<Vec<_>>();
@@ -207,6 +213,90 @@ fn recovery_command(pinned: bool, version: &str, recovery: NextLayoutRecovery<'_
     format!(
         "Install one of them, for example `rocm install sdk --channel release --format {format} --version {version} --family {family}{devel}`{placeholder_note}."
     )
+}
+
+/// Recovery guidance appended to family/index resolution failures so a clean
+/// first run can recover without the user having to guess a `--family`.
+///
+/// `source` is the `FamilyResolution::source` that produced `family`:
+/// auto-detected (`host`, `managed-runtime`) versus user-supplied (`manifest`
+/// from `--family`, `env` from `ROCM_CLI_THEROCK_FAMILY`). The wording differs
+/// so an auto-detected miss points the user at `--family`, while a user-supplied
+/// miss confirms the family they already named. Both point at the other channel
+/// and, where valid for the platform, the other install format.
+pub(super) fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
+    let other_channel = match channel {
+        TheRockChannel::Release => "nightly",
+        TheRockChannel::Nightly => "release",
+    };
+    let mut hint = format!(
+        "No complete compatible package stack was found in the canonical {} aggregate stream. Try `--channel {other_channel}`",
+        channel.as_str()
+    );
+    if !runtime_is_windows() {
+        hint.push_str(" or `--format tarball`");
+    }
+    hint.push('.');
+    hint
+}
+
+/// The context added when wheel resolution fails.
+///
+/// A ROCm >= 10 pin already refused `--channel nightly` before resolution
+/// (`select_source_layout`), so the canonical hint's nightly suggestion must
+/// not be what a next-layout failure prints. On the next layout:
+/// - `published` is `None` when the `rocm` listing itself could not be read,
+///   and the context says no other version can be suggested.
+/// - `unsatisfied` is the [`VersionUnsatisfied`] in the failure's chain. Only
+///   such a failure is followed by [`next_layout_unsatisfied_hint`]'s list of
+///   releases to try, because only it can be cleared by another `--version`.
+/// - Any other failure gets the source line alone. Its own message (an
+///   undetermined device target, a `uv` that could not run, an unreachable
+///   index) is the advice, and a version suggestion would send the user to a
+///   re-run that meets the same failure.
+pub(super) fn wheel_resolution_failure_context(
+    channel: TheRockChannel,
+    layout: SourceLayout,
+    index_url: &str,
+    version_selector: Option<&RuntimeVersionSelector>,
+    published: Option<&[String]>,
+    unsatisfied: Option<&VersionUnsatisfied>,
+    recovery: NextLayoutRecovery<'_>,
+) -> String {
+    let (source_label, hint) = match layout {
+        SourceLayout::Next => {
+            let hint = match (published, unsatisfied) {
+                (None, _) => Some(next_layout_unsatisfied_hint(
+                    version_selector,
+                    None,
+                    None,
+                    recovery,
+                    None,
+                )),
+                (Some(published), Some(unsatisfied)) => Some(next_layout_unsatisfied_hint(
+                    version_selector,
+                    Some(published),
+                    unsatisfied.attempted(),
+                    recovery,
+                    None,
+                )),
+                (Some(_), None) => None,
+            };
+            ("next-layout source", hint)
+        }
+        SourceLayout::Canonical => (
+            "canonical source",
+            Some(canonical_wheel_resolution_hint(channel)),
+        ),
+    };
+    let head = format!(
+        "failed to resolve TheRock {} wheel runtime from {source_label} {index_url}",
+        channel.as_str()
+    );
+    match hint {
+        Some(hint) => format!("{head}\n\n{hint}"),
+        None => head,
+    }
 }
 
 #[cfg(test)]

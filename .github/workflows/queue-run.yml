@@ -2,11 +2,13 @@
 #
 # This job runs on the queue-report runner, which sits next to the queue. It asks
 # for a run of one branch of this repository (main when scheduled), waits for
-# every lane to finish (up to 4 h 10 min), then prints the run's report and
-# lane matrix, uploads the lanes' files, and passes or fails with the run's
-# verdict. It needs no credential and no permission: the runner asks from where
-# it stands. The runner is set up to run only this workflow and nightly-queue.yml
-# as they are on main; that is enforced on the runner, outside this repository.
+# every lane to finish (the lanes' limits, and the job's timeout that covers
+# them, are in the comment next to `timeout-minutes` below), then
+# prints the run's report and lane matrix, uploads the lanes' files, and passes
+# or fails with the run's verdict. It needs no credential and no permission:
+# the runner asks from where it stands. The runner is set up to run only this
+# workflow and nightly-queue.yml as they are on main; that is enforced on the
+# runner, outside this repository.
 # What that protects is in docs/nightly-on-the-queue.md.
 name: E2E on the queue
 
@@ -34,9 +36,11 @@ jobs:
   run:
     name: Run and publish
     runs-on: [queue-report]
-    # The lanes' wait is at most 15000 s (4 h 10 min); finishing and publishing
-    # the run can take 30 min more, and the rest is margin.
-    timeout-minutes: 330
+    # A lane waits at most 15000 s (4 h 10 min) to be started, then runs for at
+    # most 3 h counted from its start, however long it waited. Finishing and
+    # publishing the run can take 30 min more, and 20 min are margin for the
+    # runner's own delays: 480 min.
+    timeout-minutes: 480
     steps:
       - name: Run on the queue and publish
         env:

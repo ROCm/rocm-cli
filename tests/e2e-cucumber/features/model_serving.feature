@@ -10,10 +10,19 @@ Feature: Model serving
     When the user serves a model using its short name
     Then the output shows the full model name
 
+  # A short name is a catalog entry, and an entry can publish a different build
+  # of the same model per engine, so the names need not be identical -- what must
+  # hold is that each engine names the build it will serve.
+  #
+  # This discriminates nothing yet: the scenario is an expected failure on every
+  # host while its xfail row stands, and the vLLM run stops before printing a
+  # plan, so the step panics there whatever the lemonade half did. It becomes
+  # regression coverage when that row is narrowed. serve-55 and the unit tests in
+  # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
-  Scenario: serve-02 - Short name expansion is consistent across engines
+  Scenario: serve-02 - Every engine expands a short name rather than serving it
     When the user serves the same short name with different engines
-    Then all engines expand to the same full model name
+    Then every engine expands it to the full name of the model it will serve
 
   @id:serve-discoverable-by-name
   Scenario: serve-03 - A running model server is discoverable by name
@@ -359,14 +368,16 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
-  # image and a 9B checkpoint on a cold runner and may wait out the full
-  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. They run only when
+  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
+  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
+  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
-  # skip every night (the nightly job logs whether Docker is reachable).
+  # On a host without Docker both skip (the nightly job logs whether Docker is
+  # reachable). serve-27's known failure on Strix Halo Ubuntu is an xfail row in
+  # expectations.toml, tracked in rocm-cli#1058.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -816,7 +827,8 @@ Feature: Model serving
   # beside the OpenAI one — the engine's own when it serves one, else a
   # translation front on its own port — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Streaming is not translated yet, so it has no scenario.
+  # Tool use is translated for non-streaming requests (serve-53); a streaming
+  # request that offers tools is refused, which only the unit tests cover.
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -849,3 +861,29 @@ Feature: Model serving
     When the user sends a tool-use request to the Anthropic messages endpoint
     Then the response contains a tool_use content block
     And the tool_use block names a tool and arguments from the request
+
+  @id:serve-anthropic-messages-streaming @requires-gpu
+  Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a streaming request to the Anthropic messages endpoint
+    Then the response is delivered as Anthropic-style server-sent events
+    And the streamed content reassembles into a complete reply
+
+  # The catalog's recommended small assistant for a low-VRAM machine, asked for
+  # by its short name with no engine named. Whatever engine is chosen for the
+  # user has to be handed a build of that model it can actually load, so the
+  # short name alone must be enough. (The dash serve wizard fills the field with
+  # the recipe's canonical id rather than a short name; the unit tests cover that
+  # spelling, and it resolves through the same recipe.)
+  #
+  # Deliberately NOT tagged @requires-engine: the engine is the CLI's to pick
+  # here, and pinning one would make the harness attribute the run to an engine
+  # the scenario never asked for. The host's own default engine is what gates it.
+  @id:serve-small-assistant-short-name @requires-gpu
+  Scenario: serve-55 - The recommended small assistant serves from its short name alone
+    Given a managed runtime is active
+    And the recommended small assistant is being served by its short name
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model

@@ -13,8 +13,10 @@
 //! chosen in `resolve_pip_runtime_from_index`: on the canonical layout
 //! `select_matching_pip_package_versions` takes the newest `rocm` whose
 //! `torch`, `torchvision` and `torchaudio` listings agree; on the next layout
-//! `torchaudio_pin` pins a torchaudio first (the hardware-verified release when
-//! it is published) and `resolve_published_pip_package_versions` has
+//! `torchaudio::torchaudio_pin` pins a torchaudio first (the hardware-verified
+//! release when it is published), `rocm_versions_with_full_stack` first drops
+//! any `rocm` build that `torch`, `torchvision` or `torchaudio` do not all
+//! publish yet, and `resolve_published_pip_package_versions` has
 //! `uv pip compile` choose the rest. That compile is the one step that may fetch
 //! `uv`: a real install and an update acquire it; a preview
 //! (`preview_pip_runtime`) runs a present one or stops with an
@@ -43,13 +45,13 @@ use super::super::python::WheelCompatibility;
 use super::super::slugify;
 use super::super::source::{
     FamilyResolution, RuntimeVersionSelector, SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel,
-    resolve_source, select_source_layout,
+    gate_install_layout, resolve_source,
 };
 use super::super::version::{
     ParsedVersion, compare_version_strings, is_stable_runtime_version, parse_version,
 };
 use super::next_hint::{
-    NextLayoutRecovery, RecoveryFormat, VersionUnsatisfied, next_layout_unsatisfied_hint,
+    NextLayoutRecovery, RecoveryFormat, VersionUnsatisfied, wheel_resolution_failure_context,
 };
 use super::torchaudio::{TorchaudioPin, torchaudio_pin};
 use super::uv_access::{
@@ -59,7 +61,7 @@ use crate::runtime_registry::WheelRuntimeComposition;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, detect_host_gfx_target, ensure_uv_binary, extract_first_gfx_token, find_uv_binary,
-    normalize_therock_family, runtime_is_windows, uv_command_env,
+    normalize_therock_family, uv_command_env,
 };
 use std::io::Write;
 use std::path::Path;
@@ -752,10 +754,12 @@ fn resolve_pip_runtime_plan(
         acquire: &|| ensure_uv_binary(paths),
     };
     let family_resolution = resolve_family(paths, family_override)?;
-    let layout = match layout_override {
-        Some(layout) => layout,
-        None => select_source_layout(channel, &family_resolution, version_selector)?,
-    };
+    let layout = gate_install_layout(
+        channel,
+        &family_resolution,
+        version_selector,
+        layout_override,
+    )?;
     let source = resolve_source(channel, layout);
     let root_url = format!("{}/", source.wheel_index.trim_end_matches('/'));
     // Distinct cache keys per layout: the two streams answer the same request
@@ -938,17 +942,6 @@ fn resolve_pip_runtime_from_index(
                     )
                 }
             };
-            let rocm_version = select_rocm_version(channel, rocm_versions, version_selector)
-                .ok_or_else(|| {
-                    let requested = version_selector.map_or_else(
-                        || "latest compatible version".to_owned(),
-                        RuntimeVersionSelector::describe,
-                    );
-                    VersionUnsatisfied::new(
-                        None,
-                        format!("no TheRock rocm package was found for {requested} in {index_url}"),
-                    )
-                })?;
             // Chosen here, not by `uv`: see `published_pip_requirements`.
             let torchaudio_versions = load_simple_index_versions(
                 paths,
@@ -957,12 +950,76 @@ fn resolve_pip_runtime_from_index(
                 Some(wheel_compatibility),
                 download_timeout_secs,
             )?;
+            // The newest `rocm` build is not necessarily installable: a nightly
+            // `rocm` build is published before its framework wheels, so the
+            // newest one can have no torch stack yet. With no pin the install
+            // takes the newest build that has one, and `newest_repo_version`
+            // (set above for exactly this case) lets the caller warn about the
+            // gap. A pin is taken as named, so its absence stays an error.
+            let with_full_stack = if version_selector.is_none() {
+                let torch_versions = load_simple_index_versions(
+                    paths,
+                    index_url,
+                    "torch",
+                    Some(wheel_compatibility),
+                    download_timeout_secs,
+                )?;
+                let torchvision_versions = load_simple_index_versions(
+                    paths,
+                    index_url,
+                    "torchvision",
+                    Some(wheel_compatibility),
+                    download_timeout_secs,
+                )?;
+                rocm_versions_with_full_stack(
+                    rocm_versions,
+                    [&torch_versions, &torchvision_versions, &torchaudio_versions],
+                )
+            } else {
+                Vec::new()
+            };
+            // None with a full stack (or a pin): keep the full list, so the
+            // newest build is the one chosen and the failure that follows is
+            // about it. The torchaudio pin below refuses a build with no
+            // torchaudio by name; a missing torch or torchvision fails in
+            // `uv pip compile`.
+            let installable_rocm_versions = if with_full_stack.is_empty() {
+                rocm_versions
+            } else {
+                with_full_stack.as_slice()
+            };
+            let rocm_version =
+                select_rocm_version(channel, installable_rocm_versions, version_selector)
+                    .ok_or_else(|| {
+                        let requested = version_selector.map_or_else(
+                            || "latest compatible version".to_owned(),
+                            RuntimeVersionSelector::describe,
+                        );
+                        VersionUnsatisfied::new(
+                            None,
+                            format!(
+                                "no TheRock rocm package was found for {requested} in {index_url}"
+                            ),
+                        )
+                    })?;
             let pin = torchaudio_pin(
                 &torchaudio_versions,
                 &rocm_version,
                 rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
                 index_url,
-            )?;
+            )
+            .map_err(|error| {
+                // With no pin, the build was taken from those with a full stack,
+                // so a build without torchaudio means none has one (the full list
+                // is the fallback). Another `--version` fails the same way, so
+                // the failure must not carry the marker that triggers a
+                // suggestion.
+                if version_selector.is_none() && with_full_stack.is_empty() {
+                    anyhow::anyhow!("{error:#}")
+                } else {
+                    error
+                }
+            })?;
             let requirements = published_pip_requirements(
                 &rocm_version,
                 &pin.version,
@@ -992,8 +1049,9 @@ fn resolve_pip_runtime_from_index(
             // chose its version — so it needs a comparable aggregate budget, not
             // the single-fetch one: reusing the bare per-fetch value here would make
             // a startup check that budgets 2s per fetch reliably time out a call
-            // doing 4 fetches' worth of work. That listing is one more fetch on top,
-            // with its own single-fetch budget.
+            // doing 4 fetches' worth of work. The listings read above (torchaudio,
+            // and torch and torchvision for an unpinned install) are further
+            // fetches on top, each with its own single-fetch budget.
             let compile_uv = uv_for_compile(choice, uv.acquire)?;
             let versions = resolve_published_pip_package_versions(
                 paths,
@@ -1283,6 +1341,23 @@ fn select_latest_stack_package(
     candidates.pop()
 }
 
+/// The `rocm` versions that every package in `framework_listings` publishes a
+/// build for, in their original order.
+fn rocm_versions_with_full_stack(
+    rocm_versions: &[String],
+    framework_listings: [&Vec<String>; 3],
+) -> Vec<String> {
+    rocm_versions
+        .iter()
+        .filter(|rocm_version| {
+            framework_listings
+                .iter()
+                .all(|listing| !package_versions_matching_rocm(listing, rocm_version).is_empty())
+        })
+        .cloned()
+        .collect()
+}
+
 pub(super) fn package_versions_matching_rocm(
     versions: &[String],
     rocm_version: &str,
@@ -1330,16 +1405,17 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
     }
 }
 
-/// Whether a `Canonical`-layout install (auto-select, or a nightly
-/// build-date/prerelease pin) will actually resolve a ROCm build at major >=
-/// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`](super::super::version::VersionStage).
+/// Whether a `Canonical`-layout install (an earlier release pin, or a nightly
+/// build-date/prerelease pin from before the next layout began) will actually
+/// resolve a ROCm build at major >= [`THEROCK_NEXT_MIN_MAJOR`], regardless of
+/// [`VersionStage`](super::super::version::VersionStage).
 ///
-/// `requested_source_layout` only answers from the shape of the request: an
-/// explicit *stable* pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR` routes to `Next`
-/// and gets `cp314` that way, but the canonical/nightly feed can resolve a
-/// ROCm >= `THEROCK_NEXT_MIN_MAJOR` build (stable or prerelease) on its own,
-/// with no `Next` routing involved — and the `cp314` requirement is a property
-/// of the build itself, not of which index served it. Fetching the channel's
+/// `requested_source_layout` only answers from the shape of the request: a
+/// request with no pin, or a stable pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR`,
+/// routes to `Next` and gets `cp314` that way, but the earlier nightly feed
+/// carries ROCm >= `THEROCK_NEXT_MIN_MAJOR` alpha builds (up to 2026-08-22) that
+/// a build-date pin resolves with no `Next` routing involved — and the `cp314`
+/// requirement is a property of the build itself, not of which index served it. Fetching the channel's
 /// own interpreter-agnostic `rocm` listing ahead of interpreter selection is
 /// the only way to know; `resolve_pip_runtime` re-fetches the same URL for the
 /// real resolution afterwards and shares this call's cache entry, so this
@@ -1375,98 +1451,16 @@ fn highest_candidate_needs_next_python(
         .is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR)
 }
 
-/// Recovery guidance appended to family/index resolution failures so a clean
-/// first run can recover without the user having to guess a `--family`.
-///
-/// `source` is the [`FamilyResolution::source`] that produced `family`:
-/// auto-detected (`host`, `managed-runtime`) versus user-supplied (`manifest`
-/// from `--family`, `env` from `ROCM_CLI_THEROCK_FAMILY`). The wording differs
-/// so an auto-detected miss points the user at `--family`, while a user-supplied
-/// miss confirms the family they already named. Both point at the other channel
-/// and, where valid for the platform, the other install format.
-fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
-    let other_channel = match channel {
-        TheRockChannel::Release => "nightly",
-        TheRockChannel::Nightly => "release",
-    };
-    let mut hint = format!(
-        "No complete compatible package stack was found in the canonical {} aggregate stream. Try `--channel {other_channel}`",
-        channel.as_str()
-    );
-    if !runtime_is_windows() {
-        hint.push_str(" or `--format tarball`");
-    }
-    hint.push('.');
-    hint
-}
-
-/// The context added when wheel resolution fails.
-///
-/// A ROCm >= 10 pin already refused `--channel nightly` before resolution
-/// (`select_source_layout`), so the canonical hint's nightly suggestion must
-/// not be what a next-layout failure prints. On the next layout:
-/// - `published` is `None` when the `rocm` listing itself could not be read,
-///   and the context says no other version can be suggested.
-/// - `unsatisfied` is the [`VersionUnsatisfied`] in the failure's chain. Only
-///   such a failure is followed by [`next_layout_unsatisfied_hint`]'s list of
-///   releases to try, because only it can be cleared by another `--version`.
-/// - Any other failure gets the source line alone. Its own message (an
-///   undetermined device target, a `uv` that could not run, an unreachable
-///   index) is the advice, and a version suggestion would send the user to a
-///   re-run that meets the same failure.
-fn wheel_resolution_failure_context(
-    channel: TheRockChannel,
-    layout: SourceLayout,
-    index_url: &str,
-    version_selector: Option<&RuntimeVersionSelector>,
-    published: Option<&[String]>,
-    unsatisfied: Option<&VersionUnsatisfied>,
-    recovery: NextLayoutRecovery<'_>,
-) -> String {
-    let (source_label, hint) = match layout {
-        SourceLayout::Next => {
-            let hint = match (published, unsatisfied) {
-                (None, _) => Some(next_layout_unsatisfied_hint(
-                    version_selector,
-                    None,
-                    None,
-                    recovery,
-                    None,
-                )),
-                (Some(published), Some(unsatisfied)) => Some(next_layout_unsatisfied_hint(
-                    version_selector,
-                    Some(published),
-                    unsatisfied.attempted(),
-                    recovery,
-                    None,
-                )),
-                (Some(_), None) => None,
-            };
-            ("next-layout source", hint)
-        }
-        SourceLayout::Canonical => (
-            "canonical source",
-            Some(canonical_wheel_resolution_hint(channel)),
-        ),
-    };
-    let head = format!(
-        "failed to resolve TheRock {} wheel runtime from {source_label} {index_url}",
-        channel.as_str()
-    );
-    match hint {
-        Some(hint) => format!("{head}\n\n{hint}"),
-        None => head,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::super::source::{
         THEROCK_NEXT_PIP_INDEX_BASE, THEROCK_RELEASE_PIP_INDEX_BASE,
     };
     use super::super::super::test_support::test_runtime_manifest;
+    use super::super::next_hint::canonical_wheel_resolution_hint;
     use super::*;
     use crate::runtime_registry::{InstalledRuntimeManifest, wheel_composition_includes_devel};
+    use rocm_core::runtime_is_windows;
     use std::path::PathBuf;
 
     /// A representative slice of what the canonical aggregate index publishes.
@@ -1649,6 +1643,51 @@ mod tests {
         assert_eq!(
             parse_simple_index_versions(html, "torch", Some(&compatibility)),
             vec!["2.10.0+rocm7.13.0a20260513".to_owned()]
+        );
+    }
+
+    /// A nightly `rocm` build is published before its framework wheels (the
+    /// next layout's newest build had no torch stack on 2026-11-11), so the
+    /// newest `rocm` build is not necessarily the newest installable one. The
+    /// unpinned choice must skip a build that any of the three packages lacks,
+    /// not just one that torchaudio lacks.
+    #[test]
+    fn rocm_versions_with_full_stack_skips_a_build_any_package_lacks() {
+        let rocm = vec![
+            "10.3.0a20261109".to_owned(),
+            "10.3.0a20261110".to_owned(),
+            "10.3.0a20261111".to_owned(),
+        ];
+        let torch = vec![
+            "2.15.0+rocm10.3.0a20261109".to_owned(),
+            "2.15.0+rocm10.3.0a20261110".to_owned(),
+        ];
+        let torchvision = vec![
+            "0.29.2+rocm10.3.0a20261109".to_owned(),
+            "0.29.2+rocm10.3.0a20261110".to_owned(),
+        ];
+        // torchaudio lacks the 20261110 build only.
+        let torchaudio = vec![
+            "2.11.1+rocm10.3.0a20261109".to_owned(),
+            "2.11.1+rocm10.3.0a20261111".to_owned(),
+        ];
+
+        assert_eq!(
+            rocm_versions_with_full_stack(&rocm, [&torch, &torchvision, &torchaudio]),
+            vec!["10.3.0a20261109".to_owned()],
+            "20261111 lacks torch and torchvision, 20261110 lacks torchaudio"
+        );
+        let torchaudio_complete = vec![
+            "2.11.1+rocm10.3.0a20261109".to_owned(),
+            "2.11.1+rocm10.3.0a20261110".to_owned(),
+        ];
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Nightly,
+                &rocm_versions_with_full_stack(&rocm, [&torch, &torchvision, &torchaudio_complete]),
+                None
+            ),
+            Some("10.3.0a20261110".to_owned())
         );
     }
 
@@ -2688,6 +2727,7 @@ sdk install
                 install_root: &install_root,
                 runtime_key: &runtime_key,
                 package_specs: &composition.package_specs,
+                kept_torch: None,
                 manifest_path: &manifest_path,
             }),
         };
@@ -2711,6 +2751,92 @@ sdk install
         );
         assert!(!resolved.contains("not resolved"), "{resolved}");
         assert!(!resolved.contains("resolution_note"), "{resolved}");
+    }
+
+    /// A kept torch changes what `uv` is handed and nothing the runtime is recorded as.
+    /// The preview's `command:` is the line a user is invited to run, so it has to
+    /// leave the torch stack out exactly as the install does, while `package_specs:`
+    /// stays the composition the manifest and the runtime key are made from.
+    #[test]
+    fn a_kept_torch_is_left_out_of_the_command_but_not_out_of_the_composition() {
+        use super::super::super::kept_torch::{KeptTorch, kept_torch_stack};
+        use super::super::super::wheel_plan::{
+            PlanStack, ResolvedStack, WheelPlan, write_dry_run_tail, write_wheel_plan,
+        };
+
+        let resolution = resolved_runtime();
+        let composition = wheel_runtime_composition(&resolution, &resolution.device_target, false);
+        let install_root = PathBuf::from("/runtimes/kept");
+        let manifest_path = PathBuf::from("/manifests/kept");
+        let (python, compatibility) = clean_host_python();
+        let kept = kept_torch_stack(true, || {
+            Ok(vec![("torch".to_owned(), "2.9.0+gitd0c8b1f".to_owned())])
+        });
+        let render = |kept: Option<&KeptTorch>| {
+            let plan = WheelPlan {
+                channel: TheRockChannel::Release,
+                version_selector: None,
+                index_url: &resolution.index_url,
+                layout_generation: resolution.layout.generation(),
+                latest_version: &resolution.latest_version,
+                family: &resolution.family,
+                family_source: &resolution.family_source,
+                device_target: &resolution.device_target,
+                host_version_newer: None,
+                python: &python,
+                wheel_compatibility: &compatibility,
+                version_resolution_specs: resolution.version_resolution_specs.as_deref(),
+                torchaudio_pin: resolution.torchaudio_pin.as_ref(),
+                no_wheel_warning: None,
+                stack: PlanStack::Resolved(ResolvedStack {
+                    compatibility_key: &resolution.package_versions.compatibility_key,
+                    install_root: &install_root,
+                    runtime_key: "kept",
+                    package_specs: &composition.package_specs,
+                    kept_torch: kept,
+                    manifest_path: &manifest_path,
+                }),
+            };
+            let mut text = String::new();
+            write_wheel_plan(&mut text, &plan);
+            write_dry_run_tail(&mut text, &plan);
+            text
+        };
+        let line = |text: &str, key: &str| {
+            text.lines()
+                .find(|line| line.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("no `{key}` line in:\n{text}"))
+                .to_owned()
+        };
+
+        let plain = render(None);
+        assert!(!plain.contains("torch_kept:"), "{plain}");
+        assert!(
+            line(&plain, "command:").contains("torch[device-gfx1200]==2.10.0+rocm10.0.0"),
+            "without a kept torch the command installs it: {plain}"
+        );
+
+        let kept_plan = render(kept.as_ref());
+        assert!(
+            line(&kept_plan, "torch_kept:").contains("torch 2.9.0+gitd0c8b1f"),
+            "{kept_plan}"
+        );
+        let command = line(&kept_plan, "command:");
+        assert!(
+            command.contains("rocm["),
+            "the SDK is still installed: {command}"
+        );
+        for left_out in ["torch[", "torchvision", "torchaudio"] {
+            assert!(
+                !command.contains(left_out),
+                "the command still installs `{left_out}`: {command}"
+            );
+        }
+        assert_eq!(
+            line(&kept_plan, "package_specs:"),
+            line(&plain, "package_specs:"),
+            "the composition the manifest records does not change"
+        );
     }
 
     // ---- the recorded device target ------------------------------------------
@@ -2814,7 +2940,7 @@ sdk install
     /// The wording is produced by [`wheel_resolution_failure_context`], which
     /// `resolve_pip_runtime_plan` appends when resolution fails. The
     /// install that prints it, and the re-run that proves its suggestion
-    /// clears the failure, is `@id:therock-next-17-unsatisfied-line-pin-skips-nightly`.
+    /// clears the failure, is `@id:therock-next-25-unsatisfied-line-pin-skips-nightly`.
     #[test]
     fn unsatisfied_rocm_10_line_pin_does_not_suggest_nightly() {
         let line = RuntimeVersionSelector::version("10.1").unwrap();
@@ -2865,7 +2991,7 @@ sdk install
     /// target, a `uv` that could not be fetched and an unreachable index each
     /// fail again on any release, so naming one would send the user to a
     /// re-run that meets the same error. The end-to-end case, an update whose
-    /// runtime records no exact arch, is therock-next-20.
+    /// runtime records no exact arch, is therock-next-28.
     #[test]
     fn a_next_layout_failure_no_version_can_clear_suggests_no_version() {
         let line = RuntimeVersionSelector::version("10.1").unwrap();

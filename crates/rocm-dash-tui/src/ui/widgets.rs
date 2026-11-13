@@ -129,29 +129,6 @@ pub fn instances_on_gpu<'a>(device_id: &str, instances: &'a [Instance]) -> Vec<&
         .collect()
 }
 
-/// Node-level energy efficiency: total generation throughput divided by total board power, in tokens per watt.
-///
-/// `None` when there is no traffic
-/// (`sum gen_tps == 0`) or no power telemetry (`sum power_w == 0`), or when the
-/// result is non-finite.
-pub fn node_efficiency(snap: &Snapshot) -> Option<f64> {
-    // A single NaN/Inf `gen_tps` sample must not poison the whole sum —
-    // same guard commit 0bf99ac added to `home.rs`'s hero aggregates.
-    let tps: f64 = snap
-        .instances
-        .iter()
-        .filter_map(|i| i.gen_tps)
-        .filter(|v| v.is_finite())
-        .sum();
-    let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
-    if tps > 0.0 && power > 0.0 {
-        let eff = tps / power;
-        eff.is_finite().then_some(eff)
-    } else {
-        None
-    }
-}
-
 /// One-line GPU stats: id, util, vram, temp, power.
 pub fn gpu_stats_line<'a>(g: &'a GpuMetrics, theme: &Theme) -> Line<'a> {
     let vram_pct = if g.vram_total_mb > 0 {
@@ -186,6 +163,25 @@ pub fn gpu_stats_line<'a>(g: &'a GpuMetrics, theme: &Theme) -> Line<'a> {
     ])
 }
 
+/// Map snapshots to a sparkline series, skipping those with no GPUs.
+///
+/// Every GPU `pick` folds or sums over `gpus`, so a GPU-less snapshot yields 0.
+/// The braille widgets draw a baseline for every sample they are handed, so
+/// letting those through paints a host with no GPU as one sitting at 0 — a
+/// measured zero rather than an absent reading. One rule, one place: `home`,
+/// `dock` and the GPU panels all go through here.
+pub fn gpu_history<'a, I, F>(snapshots: I, pick: F) -> Vec<u64>
+where
+    I: IntoIterator<Item = &'a Snapshot>,
+    F: Fn(&Snapshot) -> f64,
+{
+    snapshots
+        .into_iter()
+        .filter(|s| !s.gpus.is_empty())
+        .map(|s| pick(s).clamp(0.0, 100.0) as u64)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,14 +195,6 @@ mod tests {
                 .map(std::string::ToString::to_string)
                 .collect(),
             gen_tps,
-            ..Default::default()
-        }
-    }
-
-    fn gpu(device_id: &str, power_w: f32) -> GpuMetrics {
-        GpuMetrics {
-            device_id: device_id.into(),
-            power_w,
             ..Default::default()
         }
     }
@@ -319,56 +307,6 @@ mod tests {
     }
 
     #[test]
-    fn node_efficiency_divides_tps_by_power() {
-        let snap = Snapshot {
-            gpus: vec![gpu("gpu-0", 400.0), gpu("gpu-1", 600.0)],
-            instances: vec![
-                inst("a", &["0"], Some(300.0)),
-                inst("b", &["1"], Some(200.0)),
-            ],
-            ..Default::default()
-        };
-        // (300 + 200) / (400 + 600) = 0.5 tok/W
-        let eff = node_efficiency(&snap).expect("some");
-        assert!((eff - 0.5).abs() < 1e-9, "got {eff}");
-    }
-
-    #[test]
-    fn node_efficiency_none_without_power_or_traffic() {
-        // no power
-        let no_power = Snapshot {
-            gpus: vec![gpu("gpu-0", 0.0)],
-            instances: vec![inst("a", &["0"], Some(100.0))],
-            ..Default::default()
-        };
-        assert_eq!(node_efficiency(&no_power), None);
-        // no traffic
-        let no_traffic = Snapshot {
-            gpus: vec![gpu("gpu-0", 500.0)],
-            instances: vec![inst("a", &["0"], None)],
-            ..Default::default()
-        };
-        assert_eq!(node_efficiency(&no_traffic), None);
-    }
-
-    #[test]
-    fn node_efficiency_ignores_non_finite_gen_tps() {
-        // A NaN sample from one instance must not poison the sum for the
-        // whole node — the same class of bug commit 0bf99ac fixed for
-        // `home.rs`'s hero aggregates.
-        let snap = Snapshot {
-            gpus: vec![gpu("gpu-0", 500.0)],
-            instances: vec![
-                inst("finite", &["0"], Some(250.0)),
-                inst("poisoned", &["0"], Some(f64::NAN)),
-            ],
-            ..Default::default()
-        };
-        let eff = node_efficiency(&snap).expect("finite gen_tps must still produce a result");
-        assert!((eff - 0.5).abs() < 1e-9, "got {eff}");
-    }
-
-    #[test]
     fn apply_char_key_appends_chars_in_order() {
         let mut buf = String::from("ab");
         assert!(apply_char_key(&mut buf, KeyCode::Char('c')));
@@ -427,5 +365,32 @@ mod tests {
             |_| false
         ));
         assert_eq!(buf, "a");
+    }
+
+    #[test]
+    fn gpu_history_skips_snapshots_with_no_gpus() {
+        // One rule for home, dock and the GPU panels: a snapshot with no GPUs
+        // is absent from the series, not a measured zero. Every `pick` folds
+        // over `gpus`, so letting one through would draw a baseline for a host
+        // that reported nothing.
+        let with_gpu = |util: f32| Snapshot {
+            gpus: vec![GpuMetrics {
+                gpu_utilization_pct: util,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snaps = [Snapshot::default(), with_gpu(40.0), Snapshot::default()];
+        let series = gpu_history(snaps.iter(), |s| {
+            s.gpus
+                .iter()
+                .map(|g| f64::from(g.gpu_utilization_pct))
+                .fold(0.0, f64::max)
+        });
+        assert_eq!(series, vec![40], "a GPU-less snapshot reached the series");
+        assert!(
+            gpu_history([Snapshot::default()].iter(), |_| 0.0).is_empty(),
+            "a host with no GPU at all should draw nothing"
+        );
     }
 }

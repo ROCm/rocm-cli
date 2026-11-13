@@ -815,6 +815,50 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     .await;
 }
 
+/// The catalog's recommended small assistant, asked for by a short name with no
+/// `--engine`.
+///
+/// The engine is deliberately left to the CLI: the model is what decides which
+/// one runs, and the point of the scenario is that the catalog hands that engine
+/// a model ref it can serve. The expected ref therefore differs per host, and
+/// each side is an assertion in its own right: a lemonade host must be given the
+/// GGUF build with its quantization variant pinned (a bare `owner/repo` is a
+/// safetensors-only repo lemonade refuses, from inside the engine process), and
+/// a vLLM host must still be given the safetensors repo the canonical id names.
+///
+/// `Qwen2.5-1.5B` is the readiness substring for both, short enough to survive
+/// whichever shape the endpoint reports — lemonade's direct-serve path aliases
+/// the server to the full `owner/repo:variant` ref, but a router path would name
+/// the GGUF artifact instead, as `Qwen3-0.6B` allows for in the steps above.
+/// That looseness is why the exact ref is asserted here from the plan the CLI
+/// printed instead. Neither later check can tell the GGUF build from the
+/// safetensors repo: readiness is a bare substring match, and `model_ids_match`
+/// on the chat reply normalizes the variant and the `-GGUF` suffix away — so a
+/// wrong variant, or an override that reached the wrong engine, would run green.
+#[given("the recommended small assistant is being served by its short name")]
+async fn setup_small_assistant_by_short_name(world: &mut E2eWorld) {
+    let model = if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade"
+    {
+        "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"
+    } else {
+        "Qwen/Qwen2.5-1.5B-Instruct"
+    };
+    let stdout = serve_and_wait(
+        world,
+        &["serve", "qwen-small", "--managed"],
+        model,
+        "Qwen2.5-1.5B",
+    )
+    .await;
+    assert_eq!(
+        resolved_model(&stdout),
+        Some(model),
+        "`rocm serve qwen-small` on a host serving with {} must resolve to {model}:\n{stdout}",
+        e2e_cucumber::capability::host_capability().effective_serve_engine,
+    );
+    world.cli_output = Some(stdout);
+}
+
 #[given("a model is being served on aim")]
 async fn setup_aim_model(world: &mut E2eWorld) {
     serve_aim_canary(world).await;
@@ -979,10 +1023,16 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
+/// The catalog alias the short-name scenarios (serve-01, serve-02) ask for, held
+/// in one place so the Then step can say whether it was expanded without
+/// repeating the literal.
+const SHORT_NAME_UNDER_TEST: &str = "qwen2.5";
+
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
     let engine = "vllm";
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", SHORT_NAME_UNDER_TEST, "--engine", engine]);
     // stderr and the exit code ride along so a run that stopped on a refusal reads
     // as one in the Then step, instead of as "the name was not expanded".
     world.serve_runs = Some(vec![ServeRun {
@@ -998,7 +1048,7 @@ async fn user_serves_multiple_engines(world: &mut E2eWorld) {
     let mut runs = Vec::new();
     for engine in ["lemonade", "vllm"] {
         let (stdout, stderr, rc) =
-            crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+            crate::run_rocm(world, &["serve", SHORT_NAME_UNDER_TEST, "--engine", engine]);
         runs.push(ServeRun {
             engine: engine.to_owned(),
             stdout,
@@ -2357,6 +2407,141 @@ async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user sends a streaming request to the Anthropic messages endpoint")]
+async fn user_sends_streaming_anthropic_messages_request(world: &mut E2eWorld) {
+    let base = listed_anthropic_endpoint(world)
+        .await
+        .expect("no Anthropic endpoint is listed for the served model");
+    let budget = Duration::from_secs(crate::inference_timeout_for(world));
+    // Same budget and model name as the non-streaming request above.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+    let (content_type, events) = tokio::spawn(async move {
+        let response = reqwest::Client::builder()
+            .timeout(budget)
+            .build()
+            .expect("failed to build HTTP client")
+            .post(format!("{base}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages failed: {error}"));
+        assert!(
+            response.status().is_success(),
+            "streaming request answered HTTP {}",
+            response.status()
+        );
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let events = response
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("reading the event stream failed: {error}"));
+        (content_type, events)
+    })
+    .await
+    .expect("the Anthropic streaming request task panicked");
+    world.anthropic_stream = Some(format!("content-type: {content_type}\n\n{events}"));
+}
+
+/// The content type and `(event name, data)` pairs of the streamed response.
+fn parse_anthropic_stream(world: &E2eWorld) -> (String, Vec<(String, serde_json::Value)>) {
+    let raw = world
+        .anthropic_stream
+        .as_deref()
+        .expect("no Anthropic streaming response");
+    let (header, body) = raw.split_once("\n\n").expect("stream capture is malformed");
+    let events = body
+        .split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .map(|frame| {
+            let event = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .unwrap_or_else(|| panic!("an SSE frame has no `event:` line:\n{frame}"));
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("an SSE frame has no `data:` line:\n{frame}"));
+            let data = serde_json::from_str(data)
+                .unwrap_or_else(|error| panic!("SSE data is not JSON ({error}):\n{frame}"));
+            (event.to_owned(), data)
+        })
+        .collect();
+    (header.to_owned(), events)
+}
+
+#[then("the response is delivered as Anthropic-style server-sent events")]
+async fn assert_anthropic_server_sent_events(world: &mut E2eWorld) {
+    let (header, events) = parse_anthropic_stream(world);
+    assert!(
+        header.contains("text/event-stream"),
+        "the streaming response is not an event stream: {header}"
+    );
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names.first(), Some(&"message_start"), "{names:?}");
+    assert_eq!(names.last(), Some(&"message_stop"), "{names:?}");
+    for required in [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+    ] {
+        assert!(
+            names.contains(&required),
+            "no `{required}` event: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"error"),
+        "the stream carried an error: {events:?}"
+    );
+    let model = events[0].1["message"]["model"].as_str().unwrap_or("");
+    let expected = world.model_name.as_deref().unwrap_or("");
+    assert!(
+        model_ids_match(model, expected),
+        "the streamed message model '{model}' does not identify '{expected}'"
+    );
+}
+
+#[then("the streamed content reassembles into a complete reply")]
+async fn assert_anthropic_stream_reassembles(world: &mut E2eWorld) {
+    let (_, events) = parse_anthropic_stream(world);
+    let text: String = events
+        .iter()
+        .filter(|(name, _)| name == "content_block_delta")
+        .filter_map(|(_, data)| data["delta"]["text"].as_str())
+        .collect();
+    assert!(
+        !text.is_empty(),
+        "the streamed deltas carry no text: {events:?}"
+    );
+    let delta = events
+        .iter()
+        .find(|(name, _)| name == "message_delta")
+        .map(|(_, data)| data)
+        .expect("no message_delta");
+    assert!(
+        delta["delta"]["stop_reason"].is_string(),
+        "message_delta has no stop_reason: {delta}"
+    );
+    assert!(
+        delta["usage"]["output_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "message_delta reports no output tokens: {delta}"
+    );
+}
+
 #[then("both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy")]
 async fn assert_both_endpoints_healthy(world: &mut E2eWorld) {
     // `services list` probes each endpoint it shows and marks one that does not
@@ -2788,26 +2973,42 @@ async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
     );
 }
 
-#[then("all engines expand to the same full model name")]
-async fn assert_consistent_expansion(world: &mut E2eWorld) {
+/// The build `SHORT_NAME_UNDER_TEST` must expand to on each engine.
+///
+/// The two differ on purpose: the catalog recipe behind this alias publishes a
+/// quantized GGUF for lemonade and the safetensors repo for vLLM, so equality
+/// across engines is the wrong check. Naming both refs is what keeps the step
+/// able to fail — on a wrong variant, on a missing expansion, and on an override
+/// that reached the wrong engine.
+const SHORT_NAME_EXPANSIONS: [(&str, &str); 2] = [
+    ("lemonade", "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"),
+    ("vllm", "Qwen/Qwen2.5-1.5B-Instruct"),
+];
+
+#[then("every engine expands it to the full name of the model it will serve")]
+async fn assert_short_name_expansion_per_engine(world: &mut E2eWorld) {
     let runs = world.serve_runs.as_ref().expect("no serve runs");
-    assert!(runs.len() >= 2, "need at least 2 serve outputs to compare");
-    let mut resolved: Vec<String> = Vec::new();
+    assert_eq!(
+        runs.len(),
+        SHORT_NAME_EXPANSIONS.len(),
+        "expected one serve output per engine in {SHORT_NAME_EXPANSIONS:?}"
+    );
     for (i, run) in runs.iter().enumerate() {
         // A missing `resolved model:` line means the engine never got far enough
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
-        // fail would produce equal ("") values and pass this check vacuously.
-        let Some(model) = run.resolved_model().map(str::to_string) else {
+        // fail would pass this check vacuously.
+        let Some(resolved) = run.resolved_model() else {
             panic!("engine #{i}: {}", run.missing_plan_message());
         };
-        resolved.push(model);
-    }
-    let first = &resolved[0];
-    for (i, r) in resolved.iter().enumerate().skip(1) {
+        let (_, expected) = SHORT_NAME_EXPANSIONS
+            .iter()
+            .find(|(engine, _)| *engine == run.engine)
+            .unwrap_or_else(|| panic!("no expected expansion recorded for engine {}", run.engine));
         assert_eq!(
-            r, first,
-            "inconsistent model name expansion across engines: {resolved:?} (index {i})"
+            &resolved, expected,
+            "engine '{}' expanded {SHORT_NAME_UNDER_TEST:?} to {resolved:?}:\n{}",
+            run.engine, run.stdout
         );
     }
 }

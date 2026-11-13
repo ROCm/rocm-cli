@@ -17,10 +17,12 @@ use super::super::family::{family_resolution_hint, resolve_family};
 use super::super::fetch::download_text_cached;
 use super::super::platform_tarball_token;
 use super::super::source::{
-    FamilyResolution, RuntimeVersionSelector, SourceLayout, TheRockChannel, resolve_source,
-    select_source_layout, selector_is_release_line,
+    FamilyResolution, RuntimeVersionSelector, SourceLayout, TheRockChannel, gate_install_layout,
+    resolve_source, selector_is_release_line,
 };
-use super::super::version::{compare_version_strings, is_stable_runtime_version};
+use super::super::version::{
+    compare_version_strings, is_parseable_runtime_version, is_stable_runtime_version,
+};
 use super::next_hint::{NextLayoutRecovery, RecoveryFormat, next_layout_unsatisfied_hint};
 use anyhow::{Context, Result, bail};
 use rocm_core::AppPaths;
@@ -74,10 +76,12 @@ pub(in crate::therock) fn resolve_tarball_artifact_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let layout = match layout_override {
-        Some(layout) => layout,
-        None => select_source_layout(channel, &family_resolution, version_selector)?,
-    };
+    let layout = gate_install_layout(
+        channel,
+        &family_resolution,
+        version_selector,
+        layout_override,
+    )?;
     let source = resolve_source(channel, layout);
     let catalog_cache_key = match layout {
         SourceLayout::Canonical => format!("tarball-index-{}", channel.as_str()),
@@ -179,6 +183,12 @@ fn tarball_family_candidates(
             if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
                 return None;
             }
+            // The next nightly catalog lists the same `-tests-` siblings, and its
+            // real versions are prereleases, so the stable check above cannot be
+            // applied there; a leftover that is not a version at all is dropped.
+            if matches!(layout, SourceLayout::Next) && !is_parseable_runtime_version(&version) {
+                return None;
+            }
             Some((file.clone(), version))
         })
         .collect()
@@ -186,13 +196,14 @@ fn tarball_family_candidates(
 
 /// The newest archive in `files` that this request can actually install.
 ///
-/// The release channel's stable-version filter does double duty on the next
-/// catalog: that catalog publishes non-release siblings beside the real dist
-/// archive (`...-tests-10.0.0.tar.gz`) whose leftover suffix is not a version at
-/// all, and whose mtime is *later* than the archive they shadow, so an unfiltered
-/// "newest wins" would pick the wrong file. Requiring a parseable stable version
-/// excludes them without inventing a second grammar for the canonical catalogs,
-/// which publish no such siblings and have never been held to one.
+/// The next catalogs (release and nightly) publish non-release siblings beside
+/// the real dist archive (`...-tests-10.0.0.tar.gz`) whose leftover suffix is not
+/// a version at all, and whose mtime is *later* than the archive they shadow, so
+/// an unfiltered "newest wins" would pick the wrong file. The release channel's
+/// stable-version filter excludes them there; the next layout additionally
+/// requires a parseable version on every channel, which covers the nightly
+/// catalog's prerelease names. The canonical catalogs publish no such siblings
+/// and have never been held to that grammar.
 fn select_tarball_candidate(
     files: &[TarballIndexFile],
     channel: TheRockChannel,
@@ -639,5 +650,34 @@ mod tests {
             "{canonical}"
         );
         assert!(canonical.contains("--channel nightly"), "{canonical}");
+    }
+
+    /// The next nightly catalog lists `-tests-` beside the real archive with a
+    /// later mtime; its prerelease version must still select the real one.
+    #[test]
+    fn next_nightly_tarball_selection_skips_tests_sibling() {
+        let platform = platform_tarball_token();
+        let prefix = format!("therock-dist-{platform}-gfx120X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}10.3.0a20261111.tar.gz"),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}tests-10.3.0a20261111.tar.gz"),
+                mtime: 2.0,
+            },
+        ];
+
+        let (file, version) = select_tarball_candidate(
+            &files,
+            TheRockChannel::Nightly,
+            SourceLayout::Next,
+            "gfx120X-all",
+            None,
+        )
+        .expect("the real nightly archive must be selected");
+        assert_eq!(version, "10.3.0a20261111");
+        assert_eq!(file.name, format!("{prefix}10.3.0a20261111.tar.gz"));
     }
 }

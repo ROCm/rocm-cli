@@ -432,6 +432,12 @@ pub(super) fn is_stable_runtime_version(version: &str) -> bool {
     parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable)
 }
 
+/// Whether `version` parses as a version at all, whatever its stage. Unlike
+/// [`is_stable_runtime_version`] this accepts prereleases such as `10.3.0a20261111`.
+pub(super) fn is_parseable_runtime_version(version: &str) -> bool {
+    parse_version(version).is_some()
+}
+
 pub(crate) fn runtime_version_display(version: &str) -> String {
     if let Some(date) = runtime_version_build_date(version) {
         format!("{version} (build {date})")

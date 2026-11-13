@@ -62,7 +62,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -243,7 +243,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
 
       - name: Verify pinned keys match the signing key
         shell: pwsh
@@ -452,7 +452,7 @@ jobs:
 
       # cache: false — this self-hosted runner persists the build cache itself via
       # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -551,7 +551,7 @@ jobs:
         run: |
           bash .github/scripts/gpu-preflight.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -630,7 +630,7 @@ jobs:
         run: |
           bash .github/scripts/gpu-preflight.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -671,10 +671,11 @@ jobs:
           name: e2e-gpu-mi350p-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # W7900 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-w7900 lane
-  # in e2e-selfhosted.yml (w7900 label, shared uv cache, GPU preflight), with
-  # @nightly scenarios enabled. Keep the two in step: the report crate asserts
-  # the nightly lanes publish the same platforms as the per-PR lanes.
+  # W7900 counterpart to e2e-gpu-nightly. Mirrors the e2e-gpu-w7900 lane (which
+  # no longer runs on pull_request) in e2e-selfhosted.yml (w7900 label, shared
+  # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in
+  # step: the report crate asserts the nightly lanes publish the same platforms
+  # as the lanes in e2e-selfhosted.yml.
   e2e-gpu-nightly-w7900:
     name: E2E tests (W7900, incl. nightly-only)
     timeout-minutes: 90
@@ -715,7 +716,7 @@ jobs:
         run: |
           bash .github/scripts/gpu-preflight.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
 
@@ -762,29 +763,24 @@ jobs:
   # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
-    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits when
-    # this host has Docker; on a host without it they skip and cost nothing.
-    # Whether it has Docker is unconfirmed: nothing in this job installs or checks
-    # it, so the "Report whether Docker is reachable" step logs the answer. If it
-    # does not, no nightly lane runs AIM serve and a pool-based one is needed.
+    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits; on a
+    # host without Docker they skip and cost nothing. The "Report whether Docker
+    # is reachable" step logs the answer each run. serve-27's known failure on
+    # this pool is an xfail row in expectations.toml (rocm-cli#1058).
     timeout-minutes: 120
-    # `native` disambiguates this runner from any host that might carry a bare
-    # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
-    # before the WSL lanes moved to the ephemeral pool) -- the paths below
-    # exist only on the native host, whether or not that other runner remains
-    # registered.
-    runs-on: [self-hosted, linux, strix-halo, native]
+    # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
+    # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request
+    # or merge_group (pinned by workflow_contract.rs). This lane used to target
+    # the static `native` host, which is offline: every nightly sat queued until
+    # the 12h run cap and the lane never ran. Pool hosts are cold,
+    # so there are no host-specific HOME or cache-dir overrides.
+    runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         channel: [release, nightly]
     env:
-      HOME: /home/ubuntu/actions-runner/e2e-home
-      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
-      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
-      TMPDIR: /home/ubuntu/actions-runner/tmp
-      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
@@ -793,11 +789,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
-        run: |
-          mkdir -p "$HOME" "$TMPDIR" "$PIP_CACHE_DIR"
-          echo "prepared"
-          bash scripts/reclaim-gpu.sh
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
       # process survives. gfx1151 shares system memory, so the floor is smaller
@@ -815,11 +808,11 @@ jobs:
 
       - name: Ensure Rust toolchain
         run: |
-          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # serve-26/27 (AIM) need Docker reachable on this host; without it they skip
       # silently. Say which it is, so a nightly that never ran them is visible.
@@ -1619,7 +1612,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -1801,14 +1794,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
           cache-key: ubuntu-24.04
 
       - name: Download consolidated nightly report
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: e2e-consolidated-report-nightly
           path: consolidated
@@ -1831,7 +1824,7 @@ jobs:
 
       - name: Upload release-readiness facts + table
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-readiness-nightly
           path: release-readiness/
@@ -1862,7 +1855,7 @@ jobs:
           persist-credentials: false
 
       - name: Download release-readiness facts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-readiness-nightly
           path: release-readiness
@@ -1902,7 +1895,7 @@ jobs:
         # `github-models`, not `copilot` (v3 flipped the default), so
         # `provider: copilot` below is required here, not just
         # documentation.
-        uses: actions/ai-inference@a7805884c80886efc241e94a5351df715968a0ad # v2.1.1
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
         with:
@@ -1925,7 +1918,7 @@ jobs:
 
       - name: Upload narrative
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-readiness-narrative
           path: release-readiness/narrative.md
@@ -1951,7 +1944,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Download release-readiness table
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         # release-readiness-nightly may have failed before writing or
         # uploading anything (bad `git describe`, `gh issue list` auth
         # failure, xtask crash); the script below handles a missing
@@ -1963,7 +1956,7 @@ jobs:
           path: release-readiness
 
       - name: Download narrative (if the narrative job produced one)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           name: release-readiness-narrative

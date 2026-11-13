@@ -6,9 +6,9 @@
 //! declarations and re-exports live here, no logic: `tarball` resolves the SDK
 //! tarball from the catalog's index, `wheel` resolves the wheel stack from the
 //! wheel indexes (with `uv_access` deciding who may fetch `uv` while it does),
-//! `torchaudio` chooses the torchaudio build a ROCm 10 stack pins, `next_hint`
-//! words what a failed ROCm 10 resolution suggests next, and the rest of
-//! `therock` reads the names below.
+//! `torchaudio` chooses the torchaudio build a ROCm 10 or newer install pins,
+//! `next_hint` words what a failed ROCm 10 resolution suggests next, and the
+//! rest of `therock` reads the names below.
 
 mod next_hint;
 mod tarball;
