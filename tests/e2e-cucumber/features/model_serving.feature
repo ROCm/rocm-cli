@@ -906,3 +906,30 @@ Feature: Model serving
     And the user is told the model needs an explicit GGUF variant
     And no quantization is suggested for a repo the CLI has not inspected
     And no local server was recorded
+
+  # A managed engine is spawned detached, so if it dies on the way up there is no
+  # terminal for it to report to: the child's own service log is the only account
+  # of why. The launch fails naming that log, and leaves its record `stopped`
+  # (not `failed`, which `rocmd`'s recovery would respawn) without naming the
+  # dead child: its pid is free, and a later stop or cleanup must not signal
+  # whatever process reuses it (on Windows no start-time token was captured for
+  # the dead engine that could tell the two apart). Serving the same model
+  # again then reaches the engine launch again. The engine is scripted to
+  # die at startup in test builds (`rocm/e2e-test-hooks`), which also waives the
+  # no-GPU pre-flight and engine preparation so this reaches a real spawn without
+  # GPU hardware or a runtime download — the death itself is real, only its
+  # trigger is scripted.
+  #
+  # Carries no host tag on purpose, so it runs on every lane built with the
+  # hooks, the self-hosted Windows lane among them: `@requires-no-gpu` would skip
+  # it on any host that HAS a GPU, and the premise is a dead engine, not an
+  # absent GPU. The required `windows-build-and-test` lane does not build the
+  # hooks, so it cannot run this; the Windows watch itself is covered there by
+  # `rocm-core`'s `watched_detached_spawn_*` unit tests.
+  @id:serve-managed-engine-dies-at-startup
+  Scenario: serve-57 - An engine that dies at startup fails the serve and names its log
+    Given the managed engine dies during startup
+    When the user serves a model with Lemonade
+    Then serving fails and names the engine's own log
+    When the user serves the same model again
+    Then that serve reaches the engine launch again and fails the same way

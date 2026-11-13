@@ -79,8 +79,8 @@ use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
     managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
-    resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
-    wait_begin_client_config,
+    resolve_endpoint_auth, run_attached_service, scripted_managed_engine_startup_failure,
+    start_managed_service, validate_bind_host, wait_begin_client_config,
 };
 use crate::{
     GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
@@ -421,12 +421,15 @@ fn aim_board_note(
 /// AMD GPU.
 ///
 /// Not "exactly when the bail fires", and the difference is only in test-hook
-/// builds: the bail also requires `!scripted_backend_failure` (see the `if`
-/// below it), which is `cfg!(feature = "e2e-test-hooks")`/env-gated. Under that
-/// scenario the gate can open while the bail cannot fire. That is deliberate —
-/// the hook stands in for the GPU the lane does not have, so the reuse path it
-/// exercises must still behave as it would on a real GPU-less host — and it
-/// costs nothing in a shipped binary, where the term can never be true.
+/// builds: the bail is also waived by `gpu_bail_waived_by_test_hook` in
+/// `serve()` — the scripted Lemonade backend failure or free-space override,
+/// the simulated OOM launch, and the scripted engine startup death — each
+/// compiled in only with a test feature and armed by an environment variable.
+/// Under any of them the gate can open while the bail cannot fire. That is
+/// deliberate — the hook stands in for the GPU the lane does not have, so the
+/// reuse path it exercises must still behave as it would on a real GPU-less
+/// host — and it costs nothing in a shipped binary, where none of the terms can
+/// be true.
 ///
 /// `host_has_no_usable_gpu` is therefore the bail's own predicate, computed once
 /// by the caller and handed to both, so the two cannot drift apart. They did:
@@ -767,7 +770,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             || selection.env_id.is_some()
             || engine_manages_own_runtime(&selected_engine);
         if can_resolve_model {
-            if engine_manages_own_runtime(&selected_engine) {
+            // Not under the scripted startup death, as for the same call below:
+            // that scenario asserts the launch, and a real runtime download is
+            // exactly what its ungated lane cannot do.
+            if engine_manages_own_runtime(&selected_engine)
+                && !scripted_managed_engine_startup_failure()
+            {
                 ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
             }
             let probe = engine_request::<_, ResolveModelResponse>(
@@ -877,12 +885,16 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         ]
         .iter()
         .any(|variable| std::env::var_os(variable).is_some());
-    if !cpu_only
-        && !scripted_backend_failure
-        && !e2e_simulate_oom_launch()
-        && !reuse_existing
-        && host_has_no_usable_gpu
-    {
+    // The scripted startup-death scenario bypasses the same host precondition, for
+    // the same reason: it asserts what happens *after* a spawn, so it must reach
+    // one without real GPU hardware.
+    //
+    // Every test hook that waives this bail is named here once, so the bail and
+    // `gpu_refusal_waived_for_reuse` below cannot disagree about which ones do.
+    let gpu_bail_waived_by_test_hook = scripted_backend_failure
+        || e2e_simulate_oom_launch()
+        || scripted_managed_engine_startup_failure();
+    if !cpu_only && !gpu_bail_waived_by_test_hook && !reuse_existing && host_has_no_usable_gpu {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
     // The Docker probe comes after every refusal that needs no daemon (the AIM
@@ -891,11 +903,11 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
     // Whether the refusal above was waived *only* because a live service was
     // expected to be reused. `reuse_existing` already implies `!cpu_only` and
-    // `host_has_no_usable_gpu` (the pre-gate requires both), so the scripted
-    // backend failure is the one remaining term. Handed to the spawn, which
+    // `host_has_no_usable_gpu` (the pre-gate requires both), so the test-hook
+    // waiver is the one remaining term. Handed to the spawn, which
     // re-checks reuse authoritatively under the launch lock and raises the
     // refusal itself if the service is gone by then.
-    let gpu_refusal_waived_for_reuse = reuse_existing && !scripted_backend_failure;
+    let gpu_refusal_waived_for_reuse = reuse_existing && !gpu_bail_waived_by_test_hook;
     // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
@@ -996,9 +1008,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             device_policy_name(&device_policy)
         );
     }
+    // Preparation is skipped for the scripted startup-death scenario too: it
+    // asserts the launch, not the install, and a real runtime download is exactly
+    // what the ungated lane cannot do.
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
         && resolved_model.is_none()
+        && !scripted_managed_engine_startup_failure()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }

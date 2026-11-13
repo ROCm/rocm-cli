@@ -48,6 +48,13 @@ pub(crate) fn service_forced_remove_hint(service_id: &str) -> String {
     )
 }
 
+/// The directly-runnable `rocm logs --service <id>` hint, which prints a local
+/// managed service's own log, for a message that sends the user there to see
+/// why the server exited.
+pub(crate) fn service_logs_hint(service_id: &str) -> String {
+    format!("rocm logs --service {}", shell_quote(service_id))
+}
+
 /// The directly-runnable `rocm services stop <id> --yes` hint.
 pub(crate) fn service_stop_hint(service_id: &str) -> String {
     service_action_hint("stop", service_id)
@@ -144,6 +151,24 @@ mod tests {
                     hint
                 );
             }
+        }
+
+        // Mutation: printing `service_id` bare in `service_logs_hint` fails this
+        // for any id carrying whitespace or a quote.
+        #[test]
+        fn the_logs_hint_denotes_the_argv_it_names(service_id in hostile_arg()) {
+            let hint = service_logs_hint(&service_id);
+            prop_assert_eq!(
+                shlex::split(&hint),
+                Some(vec![
+                    "rocm".to_owned(),
+                    "logs".to_owned(),
+                    "--service".to_owned(),
+                    service_id,
+                ]),
+                "{}",
+                hint
+            );
         }
     }
 }

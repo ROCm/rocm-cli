@@ -3627,3 +3627,157 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
         std::fs::read_to_string(&claim_path).ok()
     );
 }
+
+/// Arms the scripted startup death. Also waives serve's no-GPU pre-flight and
+/// engine preparation, so the black-box test reaches a real spawn on a host with
+/// neither GPU hardware nor an installed runtime.
+#[given("the managed engine dies during startup")]
+async fn managed_engine_dies_during_startup(world: &mut E2eWorld) {
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
+}
+
+#[then("serving fails and names the engine's own log")]
+async fn assert_startup_death_names_log(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // A binary built without `rocm/e2e-test-hooks` never arms the scripted death:
+    // on a GPU lane it launches a real engine, which this exit-code check is the
+    // first to notice — so it names the feature as the likely cause.
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "an engine that died at startup must fail the serve (if it did not die at \
+         all, check the binary under test was built with `rocm/e2e-test-hooks`):\n{output}"
+    );
+    // See the note in assert_lemonade_preparation_retry_is_bounded: the seam that
+    // scripts the death also waives the no-GPU pre-flight, so this refusal can
+    // only appear when the binary under test was built without the feature. That
+    // diagnosis is specific to a host with no usable GPU, where the pre-flight is
+    // what stops such a binary.
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached the \
+         engine launch:\n{output}"
+    );
+    assert!(
+        output.contains("managed engine exited immediately"),
+        "expected the launch to report the engine's immediate exit:\n{output}"
+    );
+    // The child is detached, so its own log is the only account of why it died —
+    // the user has to be told where it is. The path is read off the record the
+    // launch left behind, not matched as a `.log` suffix that any incidental
+    // mention of a log would satisfy; and it is the path `rocm` itself recorded,
+    // so a Windows 8.3 short form cannot make the comparison disagree with itself.
+    //
+    // The two platforms reach this through different branches of the message.
+    // On Unix the parent redirects the child's stdio into the log, so the dead
+    // child's output is there and the message carries a tail. On Windows the
+    // detached spawn does not redirect, and the scripted child never receives
+    // `--log`, so the log stays empty and only the no-tail branch runs. Naming
+    // the path is the claim both branches share, and it is the one pinned here.
+    let records = lemonade_service_records(world);
+    let log_paths: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["log_path"].as_str())
+        .collect();
+    assert!(
+        !log_paths.is_empty(),
+        "the failed launch left no lemonade service record"
+    );
+    assert!(
+        log_paths.iter().any(|path| output.contains(path)),
+        "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
+    );
+    assert_failed_launches_left_their_claims(&records, 1);
+}
+
+/// Every lemonade service record in the scenario's isolated data folder, read
+/// raw from disk.
+fn lemonade_service_records(world: &E2eWorld) -> Vec<serde_json::Value> {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    std::fs::read_dir(&services)
+        .unwrap_or_else(|e| panic!("no services dir at {}: {e}", services.display()))
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(|record| record["engine"] == "lemonade")
+        .collect()
+}
+
+/// `launches` failed launches of an engine that died at startup each left one
+/// record: `stopped`, and still the claim as it was written.
+fn assert_failed_launches_left_their_claims(records: &[serde_json::Value], launches: usize) {
+    // Read raw from disk, not through `rocm services`, whose liveness refresh
+    // would rewrite the very fields pinned here. `stopped`, not `failed`:
+    // `rocmd`'s recovery restarts a managed `failed` record that carries no stop
+    // marker, which would respawn the launch this serve just reported as failed.
+    let statuses: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["stopped"; launches],
+        "each failed launch must leave its record `stopped`, not claiming the engine \
+         and model"
+    );
+    // The startup check saw the child die, so the record never names it: the
+    // pid is free, and a later stop or cleanup must not signal whatever process
+    // reuses it. On Windows no start-time token was captured for the dead
+    // engine, so nothing else would tell that process from it. Both platforms
+    // leave the claim as it was written, before any child was put on record.
+    let pids: Vec<(serde_json::Value, serde_json::Value)> = records
+        .iter()
+        .map(|record| {
+            (
+                record["supervisor_pid"].clone(),
+                record["engine_pid"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pids,
+        vec![(serde_json::json!(0), serde_json::Value::Null); launches],
+        "a child the startup check saw die must not be named by the record"
+    );
+}
+
+#[when("the user serves the same model again")]
+async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
+    // Re-arm the scripted death: the runner consumes the scenario env on each
+    // invocation, and the retry has to die the same way to be recognisable.
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
+    user_serves_with_failing_lemonade_preparation(world).await;
+}
+
+#[then("that serve reaches the engine launch again and fails the same way")]
+async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
+    // The retry reaches the engine launch again and dies there the same way,
+    // rather than being answered by the first launch's record as an engine already
+    // starting. The `stopped` status asserted by the previous step is what frees
+    // the engine and model for it.
+    let output = serve_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the retry should fail the same way, not succeed:\n{output}"
+    );
+    assert!(
+        output.contains("managed engine exited immediately"),
+        "the retry must reach the engine launch again rather than being turned \
+         away by the previous failed launch:\n{output}"
+    );
+    // The retry's own cleanup left its record the same way, beside the first.
+    assert_failed_launches_left_their_claims(&lemonade_service_records(world), 2);
+}

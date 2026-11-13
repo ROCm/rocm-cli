@@ -134,21 +134,46 @@ const fn launch_cleanup_refusal(
 /// Order matters: a spawned child is terminated *first*, so it is not still
 /// holding the port or writing to the log by the time cleanup runs. The
 /// termination outcome is audited but not acted on: the record is marked
-/// abandoned (`stopped`, releasing the port) even when death was not confirmed. If no child was ever spawned (`record.engine_pid` is still `None`),
-/// every artifact this attempt created is removed: there is nothing for
-/// `rocm services`/`rocm logs` to show. If a child did run, its record and log
-/// are kept instead (marked `status = "stopped"`, see
-/// [`ManagedServiceRecord::mark_launch_abandoned`]), since the error that led here
-/// already told the user to go inspect that log; only the endpoint key, which a
-/// failed attempt has no use for, is cleared.
+/// abandoned (`stopped`, releasing the port) even when death was not confirmed.
+///
+/// If no child ran — none was spawned, so `record.engine_pid` is still `None`
+/// and `child_known_dead` is unset — every artifact this attempt created is
+/// removed: there is nothing for `rocm services`/`rocm logs` to show. If a
+/// child did run, its record and log are kept instead (marked
+/// `status = "stopped"`, see [`ManagedServiceRecord::mark_launch_abandoned`]),
+/// since the error that led here already told the user to go inspect that log;
+/// only the endpoint key, which a failed attempt has no use for, is cleared. A
+/// child ran in two shapes: its pid is on record, or `child_known_dead` says it
+/// died before its pid could be recorded (below).
 /// Every step is best-effort and idempotent; cleanup must never mask the
 /// original failure with a second one.
-pub(super) fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
+///
+/// `child_known_dead` is set when the startup check saw the child exit
+/// (`EngineDiedAtStartup` in `spawn`). Such a child is not signalled at all: it is
+/// gone, and its pid may already belong to an unrelated process. On Windows the
+/// check runs before the pid is recorded, so no start-time token was captured
+/// for it and nothing else would stop the kill from landing on that process; on
+/// Linux the token taken at spawn would refuse such a process, but there is
+/// nothing left to signal either way. Its record and log are still kept, since
+/// the error names that log.
+///
+/// The `stopped` mark is a guarded write ([`update_managed_record_on_disk`]):
+/// a stop that settled the record, a restart that took it over, or a removal
+/// is left as it is rather than overwritten or re-created. The endpoint key
+/// follows the same guard: it is cleared only when the mark applied or the
+/// record is gone. A record that is still there but no longer this launch's
+/// keeps it — a restart that took the record over stores its key under the same
+/// service id, and a stop that settled it does its own key cleanup.
+pub(super) fn abandon_failed_managed_launch(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    child_known_dead: bool,
+) {
     // The shared routine `rocm services stop` and `rocmd` use, not
     // `terminate_verified` alone: on Windows only the routine takes the
     // processes under the child down, so a failed launch cannot leave the engine
     // one level below the supervisor running.
-    abandon_failed_managed_launch_with(paths, record, |identity| {
+    abandon_failed_managed_launch_with(paths, record, child_known_dead, |identity| {
         rocm_core::terminate_recorded_pid_within(identity, MANAGED_LAUNCH_CLEANUP_GRACE)
     });
 }
@@ -159,55 +184,25 @@ pub(super) fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedSe
 fn abandon_failed_managed_launch_with(
     paths: &AppPaths,
     record: &ManagedServiceRecord,
+    child_known_dead: bool,
     terminate: impl Fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
 ) {
-    if let Some(pid) = record.engine_pid.filter(|pid| *pid != 0) {
-        // The token captured at spawn, not a fresh `capture`: when the child
-        // already exited, a fresh one would describe a recycled pid's new owner
-        // and the forced tree kill would hit it. Where start tokens exist
-        // (Linux, and Windows, which records the process creation time), a
-        // missing one means the child was gone before it could be captured, so
-        // the pid is unverifiable and nothing is signalled (`terminate_verified`
-        // alone would "best-effort proceed"). A token that was captured is
-        // verified by the termination on both.
-        //
-        // The tradeoff on Windows, chosen deliberately: a child whose creation
-        // time could not be read at capture is not killed, so if `OpenProcess`
-        // failed for a child that is in fact alive (it is this account's own
-        // fresh child, so that is not expected), a failed launch leaves its
-        // engine running and the audit event says `unverified`. The alternative
-        // is a forced tree kill of a pid that may by now belong to another
-        // process, which cannot be undone. The spawn primitive returns only the
-        // pid and closes its handle, so a handle-based identity would mean
-        // changing it; that is not done here. The refusal decision
-        // (`launch_cleanup_refusal`) and what the cleanup asks the termination to
-        // do are under tests that run on Windows; the cleanup of a real Windows
-        // child is run by no test.
-        let outcome = if let Some(refusal) =
-            launch_cleanup_refusal(record.engine_start_ticks, host_records_start_tokens())
-        {
-            refusal
-        } else {
-            terminate(&rocm_core::ProcessIdentity::new(
-                pid,
-                record.engine_start_ticks,
-            ))
-        };
-        record_cli_audit_event(
+    let spawned_pid = record.engine_pid.filter(|pid| *pid != 0);
+    if child_known_dead || spawned_pid.is_some() {
+        if let Some(pid) = spawned_pid.filter(|_| !child_known_dead) {
+            terminate_abandoned_launch_child(paths, record, pid, terminate);
+        }
+        let marked = update_managed_record_on_disk(
             paths,
-            "service",
-            "managed_service_launch_cleanup",
-            "warn",
-            format!(
-                "terminated engine child pid={pid} after a failed launch publication outcome={}",
-                outcome.as_str()
-            ),
-            Some(&record.service_id),
+            &record.service_id,
+            |current| launch_still_owns(current, record),
+            ManagedServiceRecord::mark_launch_abandoned,
         );
-        let mut abandoned = record.clone();
-        abandoned.mark_launch_abandoned();
-        let _ = abandoned.write();
-        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+        let owned_by_someone_else =
+            matches!(marked, Ok(None)) && paths.service_manifest_path(&record.service_id).exists();
+        if !owned_by_someone_else {
+            endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+        }
         return;
     }
     for path in [
@@ -218,6 +213,113 @@ fn abandon_failed_managed_launch_with(
         let _ = fs::remove_file(path);
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+}
+
+/// Terminate the child of an abandoned launch whose state is unknown, and audit
+/// the outcome.
+fn terminate_abandoned_launch_child(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    pid: u32,
+    terminate: impl Fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
+) {
+    // The token captured at spawn, not a fresh `capture`: when the child
+    // already exited, a fresh one would describe a recycled pid's new owner
+    // and the forced tree kill would hit it. Where start tokens exist
+    // (Linux, and Windows, which records the process creation time), a
+    // missing one means the child was gone before it could be captured, so
+    // the pid is unverifiable and nothing is signalled (`terminate_verified`
+    // alone would "best-effort proceed"). A token that was captured is
+    // verified by the termination on both.
+    //
+    // The tradeoff on Windows, chosen deliberately: a child whose creation
+    // time could not be read at capture is not killed, so if `OpenProcess`
+    // failed for a child that is in fact alive (it is this account's own
+    // fresh child, so that is not expected), a failed launch leaves its
+    // engine running and the audit event says `unverified`. The alternative
+    // is a forced tree kill of a pid that may by now belong to another
+    // process, which cannot be undone. The spawn primitive returns only the
+    // pid and closes its handle, so a handle-based identity would mean
+    // changing it; that is not done here. The refusal decision
+    // (`launch_cleanup_refusal`) and what the cleanup asks the termination to
+    // do are under tests that run on Windows; the cleanup of a real Windows
+    // child is run by no test.
+    let outcome = if let Some(refusal) =
+        launch_cleanup_refusal(record.engine_start_ticks, host_records_start_tokens())
+    {
+        refusal
+    } else {
+        terminate(&rocm_core::ProcessIdentity::new(
+            pid,
+            record.engine_start_ticks,
+        ))
+    };
+    record_cli_audit_event(
+        paths,
+        "service",
+        "managed_service_launch_cleanup",
+        "warn",
+        format!(
+            "terminated engine child pid={pid} after a failed launch publication outcome={}",
+            outcome.as_str()
+        ),
+        Some(&record.service_id),
+    );
+}
+
+/// Apply one change to a managed service's record as it is on disk now, rather
+/// than writing back a copy the caller holds.
+///
+/// `ManagedServiceRecord::write` replaces the whole file, and a stop records
+/// `stop_requested_unix_ms` and then `"stopped"` without taking the launch lock.
+/// A copy read before the stop and written back after it would erase both,
+/// bringing back as live a service the stop just reported stopped, and with it
+/// the marker that keeps `rocmd`'s recovery off it.
+///
+/// Returns `Ok(None)`, writing nothing, when the record is gone or
+/// `still_owned` refuses the record as it is now: whoever wrote since holds a
+/// truer view. This narrows the lost-update window; it does not close it, since
+/// the read and the write are separate steps and a stop takes no lock on the
+/// manifest.
+pub(super) fn update_managed_record_on_disk(
+    paths: &AppPaths,
+    service_id: &str,
+    still_owned: impl FnOnce(&ManagedServiceRecord) -> bool,
+    update: impl FnOnce(&mut ManagedServiceRecord),
+) -> Result<Option<ManagedServiceRecord>> {
+    // One read, not an `exists()` check before it: a removal landing between
+    // the two would turn "the record is gone" into a read error.
+    let mut current = match ManagedServiceRecord::read_manifest(paths, service_id) {
+        Ok(current) => current,
+        Err(error)
+            if error
+                .downcast_ref::<rocm_core::ManagedServiceNotFound>()
+                .is_some() =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !still_owned(&current) {
+        return Ok(None);
+    }
+    update(&mut current);
+    current.write()?;
+    Ok(Some(current))
+}
+
+/// Whether the launch that wrote `launched` may still write `current`, the same
+/// service's record as it is on disk now: it still reads as live, and names the
+/// supervisor the launch last recorded — 0 for the claim, before any child is
+/// on record. A confirmed stop writes `"stopped"`; a restart records its own
+/// supervisor. Either way the record is no longer the launch's to write.
+pub(super) fn launch_still_owns(
+    current: &ManagedServiceRecord,
+    launched: &ManagedServiceRecord,
+) -> bool {
+    crate::managed_service_status::managed_service_is_live(current)
+        && current.supervisor_pid == launched.supervisor_pid
+        && current.supervisor_start_ticks == launched.supervisor_start_ticks
 }
 
 /// The ways a live managed service that already matches on liveness, engine and
@@ -353,7 +455,6 @@ pub(crate) fn managed_service_reuse_refusal(
 mod tests {
     use super::*;
     use crate::service_hints;
-    #[cfg(not(windows))]
     use crate::service_launch::test_support::sleeper_test_name;
     use crate::service_launch::test_support::{reusable_record, write_live_service_record};
     use crate::tests::test_paths;
@@ -939,7 +1040,7 @@ mod tests {
         // Simulate a pre-spawn failure: nothing ever ran.
         record.engine_pid = None;
 
-        abandon_failed_managed_launch(&paths, &record);
+        abandon_failed_managed_launch(&paths, &record, false);
 
         assert!(!record.manifest_path.exists());
         assert!(!record.log_path.exists());
@@ -980,7 +1081,7 @@ mod tests {
             record.engine_start_ticks = token;
             let asked = RefCell::new(Vec::new());
 
-            abandon_failed_managed_launch_with(&paths, &record, |identity| {
+            abandon_failed_managed_launch_with(&paths, &record, false, |identity| {
                 asked.borrow_mut().push(*identity);
                 rocm_core::TerminationOutcome::Forced
             });
@@ -1029,13 +1130,13 @@ mod tests {
         record.record_engine_identity(bystander.id());
         record.engine_start_ticks = record.engine_start_ticks.map(|ticks| ticks + 1);
 
-        abandon_failed_managed_launch(&paths, &record);
+        abandon_failed_managed_launch(&paths, &record, false);
 
         let mismatched_left_alone = bystander.try_wait().expect("poll bystander").is_none();
         // A child that was gone before its token could be captured leaves none:
         // that must not fall back to "best-effort" signalling either.
         record.engine_start_ticks = None;
-        abandon_failed_managed_launch(&paths, &record);
+        abandon_failed_managed_launch(&paths, &record, false);
         let still_running =
             mismatched_left_alone && bystander.try_wait().expect("poll bystander").is_none();
         let _ = bystander.kill();
@@ -1073,7 +1174,7 @@ mod tests {
         let child_pid = child.id();
         record.record_engine_identity(child_pid);
 
-        abandon_failed_managed_launch(&paths, &record);
+        abandon_failed_managed_launch(&paths, &record, false);
 
         let wait_result = child.wait();
 
@@ -1101,6 +1202,247 @@ mod tests {
             persisted.status, "stopped",
             "a spawned child's record must be kept, but in a status recovery ignores"
         );
+        Ok(())
+    }
+
+    /// A sleeper the test owns, standing in for an unrelated process that now
+    /// holds a pid the launch once recorded. Spawned with `std`'s `Command`
+    /// directly, so the test runs on Windows too, where this matters most: the
+    /// startup check there runs before the dead engine's pid is recorded, so no
+    /// start-time token was captured that could guard a kill.
+    fn spawn_bystander() -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--exact")
+            .arg(sleeper_test_name())
+            .arg("--ignored")
+            .arg("--test-threads=1")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bystander")
+    }
+
+    #[test]
+    fn an_engine_seen_dead_at_startup_is_never_signalled() -> Result<()> {
+        // The startup check saw the engine exit, so its pid is free. Here a
+        // bystander holds it. Cleanup must not signal it — not even through a
+        // start-time token, which on Windows would be read only after the
+        // engine had died and so would describe the bystander — and must
+        // still keep the record and log of the failed launch for the error
+        // that names them.
+        let (root, paths) = test_paths("abandon-known-dead-engine");
+        paths.ensure()?;
+        let mut record = write_live_service_record(
+            &paths,
+            "lemonade-abandon-known-dead",
+            "abandon-known-dead-model",
+            11_495,
+            "starting",
+        )?;
+        fs::write(&record.log_path, "engine: bad flag\n")?;
+        let mut bystander = spawn_bystander();
+        record.record_engine_identity(bystander.id());
+
+        abandon_failed_managed_launch(&paths, &record, true);
+
+        let left_alone = bystander.try_wait().expect("poll bystander").is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        let persisted = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+        let log_kept = record.log_path.exists();
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            left_alone,
+            "a pid the dead engine freed must not be signalled"
+        );
+        assert_eq!(persisted?.status, "stopped");
+        assert!(log_kept, "the log the error names must be kept");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoning_a_launch_does_not_recreate_a_removed_record() -> Result<()> {
+        let (root, paths) = test_paths("abandon-removed-record");
+        paths.ensure()?;
+        let record = write_live_service_record(
+            &paths,
+            "lemonade-abandon-removed",
+            "abandon-removed-model",
+            11_496,
+            "starting",
+        )?;
+        fs::remove_file(&record.manifest_path)?;
+
+        abandon_failed_managed_launch(&paths, &record, true);
+
+        let recreated = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(root);
+        assert!(!recreated, "cleanup must not bring back a removed record");
+        Ok(())
+    }
+
+    #[test]
+    fn the_launch_does_not_publish_over_a_record_a_restart_took_over() -> Result<()> {
+        // A restart records its own supervisor on a record that still reads as
+        // live. The launch's claim names supervisor 0, so it is no longer the
+        // launch's to write.
+        let (root, paths) = test_paths("launch-owns-supervisor");
+        paths.ensure()?;
+        let launched = write_live_service_record(
+            &paths,
+            "lemonade-owns-supervisor",
+            "owns-supervisor-model",
+            11_497,
+            "starting",
+        )?;
+        let mut taken = ManagedServiceRecord::read_manifest(&paths, &launched.service_id)?;
+        taken.supervisor_pid = launched.supervisor_pid.wrapping_add(7);
+        taken.write()?;
+        assert!(crate::managed_service_status::managed_service_is_live(
+            &taken
+        ));
+
+        assert!(!launch_still_owns(&taken, &launched));
+        let written = update_managed_record_on_disk(
+            &paths,
+            &launched.service_id,
+            |current| launch_still_owns(current, &launched),
+            |current| current.status = "running".to_owned(),
+        )?;
+        let after = ManagedServiceRecord::read_manifest(&paths, &launched.service_id)?;
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            written.is_none(),
+            "the launch wrote over a restart's record"
+        );
+        assert_eq!(after.status, "starting");
+        assert_eq!(after.supervisor_pid, taken.supervisor_pid);
+        // Same supervisor pid but a different start token: a restart whose new
+        // supervisor reused the pid. Not the launch's either.
+        let mut reused = launched.clone();
+        reused.supervisor_start_ticks = Some(launched.supervisor_start_ticks.unwrap_or(0) + 1);
+        assert!(!launch_still_owns(&reused, &launched));
+        // Same supervisor, same start token, still live: the launch owns it.
+        assert!(launch_still_owns(&launched, &launched));
+        Ok(())
+    }
+
+    /// Through the seam, with a token captured and so on every host: a child the
+    /// startup check saw die is never handed to the termination at all, while
+    /// the same record with the child not known dead is.
+    #[test]
+    fn an_engine_seen_dead_at_startup_is_never_handed_to_the_termination() -> Result<()> {
+        use std::cell::Cell;
+        for (child_known_dead, expect_call) in [(true, false), (false, true)] {
+            let (root, paths) = test_paths("abandon-known-dead-seam");
+            paths.ensure()?;
+            let mut record = write_live_service_record(
+                &paths,
+                "lemonade-abandon-known-dead-seam",
+                "abandon-known-dead-seam-model",
+                11_493,
+                "starting",
+            )?;
+            record.engine_pid = Some(4243);
+            record.engine_start_ticks = Some(78);
+            let asked = Cell::new(false);
+
+            abandon_failed_managed_launch_with(&paths, &record, child_known_dead, |_| {
+                asked.set(true);
+                rocm_core::TerminationOutcome::Forced
+            });
+
+            let persisted = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+            let _ = fs::remove_dir_all(root);
+            assert_eq!(
+                asked.get(),
+                expect_call,
+                "child_known_dead {child_known_dead}"
+            );
+            assert_eq!(
+                persisted?.status, "stopped",
+                "child_known_dead {child_known_dead}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A restart that took the record over during the failed launch stored its
+    /// own endpoint key under the same service id. The cleanup leaves that
+    /// record alone, and must leave its key alone too; the same cleanup on a
+    /// record that is still the launch's own clears the key.
+    #[test]
+    fn abandoning_a_launch_keeps_the_key_of_a_record_a_restart_took_over() -> Result<()> {
+        for taken_over in [true, false] {
+            let (root, paths) = test_paths("abandon-keeps-restart-key");
+            paths.ensure()?;
+            let launched = write_live_service_record(
+                &paths,
+                "lemonade-abandon-restart-key",
+                "abandon-restart-key-model",
+                11_492,
+                "starting",
+            )?;
+            if taken_over {
+                let mut taken = ManagedServiceRecord::read_manifest(&paths, &launched.service_id)?;
+                taken.supervisor_pid = launched.supervisor_pid.wrapping_add(7);
+                taken.write()?;
+            }
+            endpoint_keys::store_endpoint_api_key(&paths, &launched.service_id, "restart-key")?;
+
+            abandon_failed_managed_launch(&paths, &launched, true);
+
+            let key = endpoint_keys::endpoint_api_key(&paths, &launched.service_id);
+            let persisted = ManagedServiceRecord::read_manifest(&paths, &launched.service_id);
+            let _ = fs::remove_dir_all(root);
+            let persisted = persisted?;
+            if taken_over {
+                assert_eq!(
+                    key.as_deref(),
+                    Some("restart-key"),
+                    "the restart's key was cleared"
+                );
+                assert_eq!(
+                    persisted.status, "starting",
+                    "the restart's record was overwritten"
+                );
+            } else {
+                assert_eq!(key, None, "a failed launch's own key must be cleared");
+                assert_eq!(persisted.status, "stopped");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_engine_seen_dead_before_it_was_recorded_keeps_its_record_and_log() -> Result<()> {
+        // The Windows shape: the startup check saw the engine exit before
+        // `record_engine_identity` ran, so no engine pid is on record. Nothing
+        // is spawned-and-recorded, yet the failure names the log, so the record
+        // and log must survive, marked `stopped`.
+        let (root, paths) = test_paths("abandon-dead-engine-never-recorded");
+        paths.ensure()?;
+        let mut record = write_live_service_record(
+            &paths,
+            "lemonade-abandon-never-recorded",
+            "abandon-never-recorded-model",
+            11_498,
+            "starting",
+        )?;
+        record.engine_pid = None;
+        record.supervisor_pid = 0;
+        fs::write(&record.log_path, "engine: bad flag\n")?;
+        record.write()?;
+
+        abandon_failed_managed_launch(&paths, &record, true);
+
+        let persisted = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+        let log_kept = record.log_path.exists();
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(persisted?.status, "stopped");
+        assert!(log_kept, "the log the error names must be kept");
         Ok(())
     }
 

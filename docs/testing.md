@@ -2016,6 +2016,59 @@ same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
 
+Managed-launch startup-death and record-write focused tests:
+
+```bash
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_child_that_exited_during_the_startup_window
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_signalled
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_handed
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_keeps_the_key
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_does_not_recreate_a_removed_record
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_stop_settled_while_the_engine_spawns
+cargo test -p rocm --bin rocm service_launch::readiness::tests::a_stop_settled_during_the_wait
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_keeps_what_changed
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_does_not_recreate
+cargo test -p rocm --bin rocm service_launch::spawn::tests::the_publish_applies
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::the_launch_does_not_publish_over
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_before
+cargo test -p rocm --bin rocm service_launch::spawn::tests::an_engine_that_dies_at_startup_keeps
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_watched_spawn_seen_dead
+cargo test -p rocm --bin rocm service_launch::readiness::tests::an_engine_that_exited_during_the_wait
+cargo test -p rocm-core watched_detached_spawn   # Windows only
+```
+
+They pin that an engine seen dead inside the 200 ms startup window fails the
+launch naming its own log, on Windows from the exit code read through the
+process handle `CreateProcessW` returned (not by re-checking a pid Windows may
+already have reused); that cleanup never signals such an engine, since its pid is
+free; and that the launch's writes after its claim — the `running` record, the
+`stopped` mark of a failed launch, the readiness verdict — go to the record as it
+is on disk, so a `rocm services stop` settled meanwhile keeps its `stopped` and
+stop marker, and a `rocm services remove` is not undone by re-creating the record.
+A serve whose server is stopped during its readiness wait fails (non-zero exit) saying
+the service was stopped while it was starting, instead of reporting a launch; one whose
+server exited on its own during the wait (a record settled without a stop marker) fails
+saying it exited and naming `rocm logs --service <id>`. Each of those writes reads
+the record and then writes it, with no lock against a stop, so a stop landing
+between the two is still overwritten: the tests pin the narrowed race, not a
+closed one. The publish applies only the launch's own fields (engine and
+supervisor identities, `running`) over the record on disk, and a failed launch's
+cleanup leaves the endpoint key of a record a restart took over.
+The `watched_detached_spawn_*` tests run on the required Windows lane.
+
+`serve-57` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
+`e2e-test-hooks` build scripts the managed engine's death (the spawned `rocm`
+gets an argument it rejects), and the scenario checks that the serve fails naming
+the engine's own log, that the record left on disk reads `stopped` and names no
+pid, and that serving the same model again reaches the engine launch again. It
+carries no host tag, so every lane built with the hooks runs it, including the
+self-hosted Windows lane; the required `windows-build-and-test` lane builds
+without the hooks and does not. Run it locally with:
+
+```bash
+cargo xtask e2e -- -n "serve-57 "
+```
+
 Serve resolver focused tests:
 
 ```bash

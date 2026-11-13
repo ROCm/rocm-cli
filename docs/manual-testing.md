@@ -684,6 +684,46 @@ outcome for the stopping process itself; the JSON answer of the sandbox
 `stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
 as stopped).
 
+**An engine that dies at startup.** On Windows and Linux alike, a managed
+engine that exits within its first 200 ms fails `rocm serve --managed`
+instead of reporting a server that is still starting.
+To see it without a broken engine, build the CLI with its test hooks and arm
+the scripted death, which makes the spawned engine reject its arguments:
+
+```powershell
+cargo build -p rocm --features e2e-test-hooks
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"
+./target/debug/rocm serve qwen --engine lemonade --managed
+./target/debug/rocm services list --all
+```
+
+Expected result:
+
+- The serve exits non-zero with `managed engine exited immediately with status
+  ...; inspect <log path>`, where `<log path>` is the service's own log, plus a
+  tail of that log when the engine wrote anything to it. On Windows the status
+  is the engine's exit code too.
+- `rocm services list --all` shows the attempt as `stopped`. Running the same
+  `rocm serve` again fails again with the same `managed engine exited
+  immediately ...` error, rather than reporting the earlier attempt as already
+  running, and `rocm services list --all` then shows two `stopped` records.
+- An engine that dies later than that — while loading its runtime or model —
+  is not caught by this check; the serve then waits for readiness and reports
+  the service as still starting, as before.
+
+Unset the variable afterwards; a build without `--features e2e-test-hooks`
+ignores it.
+
+To see the stop-during-start case, run `rocm serve <model> --managed` in one
+terminal and, while it is still waiting for the server, `rocm services stop
+<service-id> --yes` from another. The serve exits non-zero with an error saying
+the managed service "was stopped while it was starting", and
+`rocm services list --all` shows the service as `stopped`. This is the usual
+result, not a certain one: the launch reads the record and writes its readiness
+verdict as two separate steps, and a stop takes no lock on the record, so a stop
+that lands between the two is overwritten by the verdict and the serve reports
+the server as it found it.
+
 #### Windows host check
 
 The Windows build-and-test job runs the workspace unit tests, which include two

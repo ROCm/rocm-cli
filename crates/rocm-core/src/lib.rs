@@ -191,16 +191,16 @@ pub use proc_lifecycle::{
     terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
     terminate_verified,
 };
+#[cfg(windows)]
+pub use process::{
+    DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
+    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+};
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
     is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
     lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
     terminate_process_tree, windows_system_tool,
-};
-#[cfg(windows)]
-pub use process::{
-    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
-    wait_for_process_exit,
 };
 pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{
@@ -254,6 +254,14 @@ pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
     vllm_oom_display_line,
 };
+
+/// E2E-only switch that makes `rocm serve`'s managed engine die during startup.
+///
+/// Honoured only by a `rocm` binary built with the `e2e-test-hooks` feature; a
+/// release build has no code that reads it. Defined here, rather than in the
+/// binary that reads it, because the E2E suite sets it from another crate: one
+/// constant both sides name cannot drift the way two copies of the string could.
+pub const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
 pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";
