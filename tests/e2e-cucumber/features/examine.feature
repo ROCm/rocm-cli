@@ -733,10 +733,13 @@ Feature: GPU detection and system inspection
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
 
-  # Whether a GPU is integrated decides two things a user sees: `rocm serve`
-  # withholds its low-VRAM warning on an APU (whose "VRAM" is a BIOS carve-out
-  # of system RAM), and `rocm diagnose` raises `fix-9-igpu-dgpu` only on a host
-  # with both an integrated and a discrete AMD GPU. Every AMD GPU on this bus
+  # Whether a GPU is integrated decides what a user sees: `rocm diagnose`
+  # raises `fix-9-igpu-dgpu` from `is_apu` only on a host with both an
+  # integrated and a discrete AMD GPU, and on a single-GPU host whose target is
+  # an APU family (whose "VRAM" is a BIOS carve-out of system RAM) `rocm serve`
+  # withholds its low-VRAM warning and `rocm diagnose --model` does not judge
+  # the fit against the carve-out; those two ask the same `gfx_is_apu_family`
+  # predicate `is_apu` is derived from. Every AMD GPU on this bus
   # used to be misreported: the PCI scan ignored the `[1002:xxxx]` device id,
   # so a GPU `pci.ids` cannot name ("Device") got no architecture; `examine`
   # kept its own name table, which called Krackan Point gfx1150 (it is gfx1152)

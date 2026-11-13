@@ -70,13 +70,15 @@ pub(super) fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
         //
         // `Win32_VideoController` hands us `PCI\VEN_1002&DEV_1636&...` in the
         // same row as the name, and the PCI-id table in the `gfx_target` module
-        // answers for parts the name table has no arm for -- every Vega iGPU
-        // among them. This probe used to drop the id and ask the name alone,
-        // so a Renoir / Lucienne / Cezanne / Barcelo laptop reported an empty
-        // `gfx_target` unless a HIP SDK was installed for `hipInfo` to fill it
-        // in: exactly the host that has no HIP SDK to ask. A device id is also
-        // the stronger answer where both have one, being the ASIC rather than
-        // the brand.
+        // answers for parts whose Windows name resolves nothing -- every gfx90c
+        // Vega iGPU (Renoir / Lucienne / Cezanne / Barcelo) among them, which
+        // Windows names only "AMD Radeon(TM) Graphics" (the name table knows
+        // those codenames, but this string carries none). This probe used to drop
+        // the id and ask the name alone, so a Renoir / Lucienne / Cezanne /
+        // Barcelo laptop reported an empty `gfx_target` unless a HIP SDK was
+        // installed for `hipInfo` to fill it in: exactly the host that has no
+        // HIP SDK to ask. A device id is also the stronger answer where both
+        // have one, being the ASIC rather than the brand.
         let (gfx_target, is_apu) = match crate::host_gpu::gfx_target_from_pnp_device_id(&pnp) {
             // `gfx_is_apu_family` knows the answer whenever the id resolved a
             // target; the name table is only consulted when the id did not.
@@ -372,8 +374,8 @@ mod tests {
         //
         // The two inputs are made to DISAGREE on purpose, and that disagreement
         // is the whole point: PNP id `73a0` is Navi 21 (gfx1030, discrete),
-        // while the name "AMD Radeon(TM) 8060S Graphics" is one of the handful
-        // `classify_amd_marketing_name` answers for, as gfx1151 and an APU. No
+        // while the name "AMD Radeon(TM) 8060S Graphics" is one the shared
+        // marketing-name table resolves, as gfx1151 and an APU. No
         // such part ships -- which is exactly why it is the input. A pair the
         // two paths agree about passes with the PNP lookup deleted, silently
         // re-testing the marketing fallback that `marketing_name_maps_strix_halo`
@@ -393,7 +395,7 @@ mod tests {
         assert_eq!(
             gpu.is_apu,
             Some(false),
-            "`is_apu` has to follow the id's target too, not the name heuristic: {gpu:?}"
+            "`is_apu` has to follow the id's target too, not the name's: {gpu:?}"
         );
     }
 

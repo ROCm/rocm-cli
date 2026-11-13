@@ -181,8 +181,9 @@ pub(crate) fn parse_windows_display_name(text: &str) -> Option<String> {
 /// can answer from the same table rather than from marketing-name matching
 /// alone: `Win32_VideoController` hands that probe the PNP id in the same
 /// query that gives it the name, and without this it dropped the id on the
-/// floor and left `gfx_target` empty for every part the name table does not
-/// cover -- which is every Vega iGPU, so a Renoir/Cezanne laptop reported no
+/// floor and left `gfx_target` empty for every part whose Windows name the
+/// name table cannot resolve -- among them every gfx90c Vega iGPU, named only
+/// "AMD Radeon(TM) Graphics" there, so a Renoir/Cezanne laptop reported no
 /// architecture at all unless a HIP SDK was installed to ask `hipInfo`.
 ///
 /// Returns the first match only. Which GPU of several a caller is asking about

@@ -4309,11 +4309,15 @@ the same statement next to the code.
 
 ## Integrated Or Discrete GPU
 
-`rocm examine` reports each AMD GPU's `gfx_target` and `is_apu`, and two things
-a user sees follow from `is_apu`: `rocm serve` withholds its low-VRAM warning
-on a single-APU host, whose "VRAM" is a BIOS carve-out of system RAM, and
-`rocm diagnose` raises `fix-9-igpu-dgpu` only when a host has both an
-integrated and a discrete AMD GPU.
+`rocm examine` reports each AMD GPU's `gfx_target` and `is_apu`. `rocm
+diagnose` raises `fix-9-igpu-dgpu` from `is_apu`, only when a host has both an
+integrated and a discrete AMD GPU. `rocm serve` withholds its low-VRAM warning
+on a single-GPU host whose detected `gfx_target` is an APU family, whose "VRAM"
+is a BIOS carve-out of system RAM: `vram_capacity_is_meaningful` in
+[gpu_policy.rs](../apps/rocm/src/gpu_policy.rs) asks `gfx_is_apu_family`, the
+predicate `is_apu` is derived from, rather than reading `is_apu` itself, and
+`rocm diagnose --model` asks the same check before judging a fit against that
+carve-out.
 
 `examine-49` in [examine.feature](../tests/e2e-cucumber/features/examine.feature)
 covers the PCI scan end to end on every Linux lane, GPU or not. It puts a
