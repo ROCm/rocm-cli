@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
-use rocm_core::AppPaths;
+use rocm_core::{AppPathSources, AppPaths};
 
 use crate::uninstall_plan::{UninstallOptions, build_uninstall_plan, remove_path};
 
@@ -516,6 +516,14 @@ enum Target {
     RegularFile,
     /// A symlink planted in home whose target does not exist.
     DanglingLink,
+    /// `$HOME` spelled relative to the process's working directory — what
+    /// `ROCM_CLI_DATA_DIR=.` run from home amounts to.
+    RelativeHome,
+    /// `<home>/Documents/..` spelled relative to the working directory — `..`
+    /// run from a project folder in home.
+    RelativeHomeViaChild,
+    /// `$HOME` reached through a symlink to its parent (`/home -> var/home`).
+    HomeViaLinkedParent,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -538,6 +546,9 @@ fn target() -> impl Strategy<Value = Target> {
         1 => Just(Target::LinkToHome),
         1 => Just(Target::RegularFile),
         1 => Just(Target::DanglingLink),
+        1 => Just(Target::RelativeHome),
+        1 => Just(Target::RelativeHomeViaChild),
+        1 => Just(Target::HomeViaLinkedParent),
     ]
 }
 
@@ -592,13 +603,42 @@ fn resolve_target(home: &Path, name: &str, target: Target, spelling: Spelling) -
             let _ = symlink(home.join("does-not-exist"), &link);
             link
         }
+        Target::RelativeHome => relative_from_cwd(home),
+        Target::RelativeHomeViaChild => relative_from_cwd(&home.join("Documents")).join(".."),
+        Target::HomeViaLinkedParent => {
+            let sandbox = home.parent().expect("home has a parent");
+            let link = sandbox.join(format!("linked-parent-{name}"));
+            let _ = symlink(sandbox, &link);
+            link.join(home.file_name().expect("home has a name"))
+        }
     };
     respell(&raw, spelling)
 }
 
 /// Is `target` one that plainly names somewhere ROCm CLI did not create?
 const fn names_foreign_dir(target: Target) -> bool {
-    matches!(target, Target::Home | Target::LinkToHome)
+    matches!(
+        target,
+        Target::Home
+            | Target::LinkToHome
+            | Target::RelativeHome
+            | Target::RelativeHomeViaChild
+            | Target::HomeViaLinkedParent
+    )
+}
+
+/// `target` spelled relative to this process's working directory with `..`
+/// segments, so a case can use a relative root without changing the
+/// (process-global) working directory.
+fn relative_from_cwd(target: &Path) -> PathBuf {
+    let cwd = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .expect("working directory");
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.join(target.strip_prefix("/").expect("absolute target"))
 }
 
 fn uninstall_case(
@@ -645,6 +685,9 @@ fn uninstall_case(
                     Target::LinkToHome => "target: symlink -> $HOME",
                     Target::RegularFile => "target: regular file",
                     Target::DanglingLink => "target: dangling symlink",
+                    Target::RelativeHome => "target: $HOME, relative to cwd",
+                    Target::RelativeHomeViaChild => "target: $HOME/Documents/.., relative",
+                    Target::HomeViaLinkedParent => "target: $HOME via a symlinked parent",
                 });
                 reach.hit(match s {
                     Spelling::Plain => "spelling: plain",
@@ -660,13 +703,41 @@ fn uninstall_case(
             }
         }
 
+        // Shared caches the review must talk about truthfully: one inside the
+        // own cache dir, one inside the own data dir, one outside everything.
+        let shared_caches = [
+            rocm.join("cache").join("uv-shared"),
+            rocm.join("data").join("hf-hub"),
+            home.join(".cache").join("uv"),
+        ];
+        for cache in &shared_caches {
+            std::fs::create_dir_all(cache).expect("shared cache");
+            std::fs::write(cache.join("blob"), b"cached").expect("shared cache blob");
+        }
+        let candidates: Vec<crate::uninstall_plan::SharedCache> = shared_caches
+            .iter()
+            .map(|path| crate::uninstall_plan::SharedCache {
+                path: path.clone(),
+                kept: "a shared cache is",
+                name: "a shared cache",
+                loss: "It is shared.",
+                pronoun: "it",
+            })
+            .collect();
+
         let options = UninstallOptions {
             yes: true,
             keep_binaries: true,
             ..UninstallOptions::default()
         };
-        let plan = build_uninstall_plan(&paths, &options)
-            .map_err(|error| TestCaseError::fail(format!("plan failed: {error:#}")))?;
+        let plan = crate::uninstall_plan::build_uninstall_plan_for_home(
+            &paths,
+            &AppPathSources::default(),
+            &options,
+            Some(&home),
+        )
+        .map_err(|error| TestCaseError::fail(format!("plan failed: {error:#}")))?;
+        let notes = crate::uninstall_plan::shared_cache_notes_for(&plan.actions, &candidates);
         let rendered = crate::uninstall_plan::render_uninstall_plan(
             &plan,
             &UninstallOptions {
@@ -677,23 +748,39 @@ fn uninstall_case(
         );
         let planned: BTreeSet<PathBuf> = plan.actions.iter().map(|e| e.path.clone()).collect();
         prop_assert_eq!(&listed_in_render(&rendered), &planned, "{}", rendered);
+        let refused = !plan.refused.is_empty();
+        if refused {
+            reach.lock().expect("reach lock").hit("plan: refused");
+            // The review names every refused root and the flag that clears it.
+            for root in &plan.refused {
+                prop_assert!(
+                    rendered.contains(&root.path.display().to_string())
+                        && rendered.contains(&format!("--keep-{}", root.kind)),
+                    "refused {} root not named with its remedy:\n{}",
+                    root.kind,
+                    rendered
+                );
+            }
+        }
 
         let before = snapshot(&sandbox);
         let mut expected_gone = BTreeSet::new();
-        for path in &planned {
-            assert_inside_sandbox(&sandbox, path);
-            if let Some(id) = identity_of(path) {
-                expected_gone.extend(subtree_ids(&before, id));
+        if !refused {
+            for path in &planned {
+                assert_inside_sandbox(&sandbox, path);
+                if let Some(id) = identity_of(path) {
+                    expected_gone.extend(subtree_ids(&before, id));
+                }
             }
         }
-        for entry in &plan.actions {
-            remove_path(&entry.path).map_err(|error| {
-                TestCaseError::fail(format!(
-                    "remove_path({}) failed: {error:#}",
-                    entry.path.display()
-                ))
-            })?;
-        }
+        // The real removal step, which refuses on its own when the plan does.
+        let outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        prop_assert_eq!(
+            outcome.is_err(),
+            refused,
+            "apply_uninstall_plan result {:?} disagrees with the plan's refusal",
+            outcome
+        );
         let after = snapshot(&sandbox);
         let actually_gone: BTreeSet<(u64, u64)> = before
             .keys()
@@ -763,6 +850,31 @@ fn uninstall_case(
             describe(&missed)
         );
 
+        // Every shared cache is mentioned exactly once, and the review warns
+        // that it will be deleted exactly when the removal deleted it.
+        for cache in &shared_caches {
+            let text = cache.display().to_string();
+            let mentions: Vec<&String> = notes.iter().filter(|n| n.contains(&text)).collect();
+            prop_assert_eq!(mentions.len(), 1, "{} mentioned {:?}", text, mentions);
+            let warned = mentions[0].contains("WILL BE DELETED");
+            if !refused {
+                let deleted = !cache.join("blob").exists();
+                prop_assert_eq!(
+                    warned,
+                    deleted,
+                    "{} deleted={} but the review said: {}",
+                    text,
+                    deleted,
+                    mentions[0]
+                );
+                reach.lock().expect("reach lock").hit(if deleted {
+                    "shared cache: deleted and warned"
+                } else {
+                    "shared cache: kept and noted"
+                });
+            }
+        }
+
         if require_safety {
             for sentinel in [
                 home.join("Documents/thesis.txt"),
@@ -820,12 +932,10 @@ fn uninstall_removes_exactly_what_the_review_lists() {
 }
 
 /// Safety: `rocm uninstall` must never delete a folder ROCm CLI did not create.
-/// It applies no guard at all to the three AppPaths roots, so a data/cache/
-/// config dir that names `$HOME` itself is deleted wholesale (a link to it,
-/// however spelled, is only unlinked). Shrinks to one root naming `$HOME`.
-/// Tracked in #531; un-ignore this when that guard lands.
+/// A data/cache/config dir that names `$HOME` (directly, or through a link,
+/// however spelled) must be refused or unlinked, never emptied — the shape
+/// this used to shrink to was `cache_dir = $HOME`.
 #[test]
-#[ignore = "known gap: rocm uninstall applies no guard to config/data/cache roots (#531)"]
 fn uninstall_never_deletes_a_folder_rocm_cli_did_not_create() {
     if let Err(error) = run_uninstall_property(case_count(), true) {
         panic!("{error}");
@@ -853,7 +963,15 @@ fn uninstall_removes_a_link_whose_target_an_earlier_step_removed() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &options).expect("plan");
+    // Judged against the sandbox home, so the data folder inside it is removed
+    // first and the link really dangles by its turn.
+    let plan = crate::uninstall_plan::build_uninstall_plan_for_home(
+        &paths,
+        &AppPathSources::default(),
+        &options,
+        Some(&home),
+    )
+    .expect("plan");
     let listed = plan.actions.iter().any(|entry| entry.path == link);
     for entry in &plan.actions {
         remove_path(&entry.path).expect("remove");
@@ -888,7 +1006,7 @@ fn uninstall_lists_and_removes_a_dangling_link_root() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &options).expect("plan");
+    let plan = build_uninstall_plan(&paths, &AppPathSources::default(), &options).expect("plan");
     let listed = plan.actions.iter().any(|entry| entry.path == link);
     for entry in &plan.actions {
         remove_path(&entry.path).expect("remove");
@@ -919,7 +1037,7 @@ fn uninstall_plan_fails_when_a_root_cannot_be_checked() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &options);
+    let plan = build_uninstall_plan(&paths, &AppPathSources::default(), &options);
     cleanup(&sandbox);
     let error = plan.expect_err("a root that cannot be checked must fail the plan");
     let message = format!("{error:#}");
@@ -948,7 +1066,7 @@ fn a_root_below_a_regular_file_is_not_present() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &options);
+    let plan = build_uninstall_plan(&paths, &AppPathSources::default(), &options);
     let removal = remove_path(&cache);
     let file_kept = file.is_file();
     cleanup(&sandbox);
@@ -1046,7 +1164,8 @@ fn a_regular_file_spelled_as_a_directory_is_not_removed() {
             keep_binaries: true,
             ..UninstallOptions::default()
         };
-        let plan = build_uninstall_plan(&paths, &options).expect("plan");
+        let plan =
+            build_uninstall_plan(&paths, &AppPathSources::default(), &options).expect("plan");
         cleanup(&sandbox);
 
         assert!(

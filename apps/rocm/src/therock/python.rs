@@ -115,6 +115,28 @@ fn current_platform_wheel_tags() -> Result<Vec<String>> {
     Ok(vec![platform_tag.to_owned(), "any".to_owned()])
 }
 
+/// [`ensure_uv_venv`], marking `install_root` as ROCm CLI's own when this
+/// call is what created it. `uv venv` creates the folder, and an SDK
+/// `--prefix` becomes the data folder `rocm uninstall` later judges; a folder
+/// that already existed is not marked, since ROCm CLI did not make it.
+pub(super) fn ensure_marked_uv_venv(
+    paths: &AppPaths,
+    uv: &Path,
+    python_launcher: &Path,
+    install_root: &Path,
+) -> Result<()> {
+    // Both decided BEFORE `ensure_uv_venv`, which may remove and recreate the
+    // folder (an incompatible venv is rebuilt) and so lose the marker: a
+    // folder ROCm CLI created, or one it had already marked, is marked again.
+    let created = !install_root.exists();
+    let was_marked = install_root.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+    ensure_uv_venv(paths, uv, python_launcher, install_root)?;
+    if (created || was_marked) && !install_root.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file() {
+        rocm_core::mark_root(install_root);
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_uv_venv(
     paths: &AppPaths,
     uv: &Path,
@@ -2910,5 +2932,67 @@ exit 1
             );
         }
         Ok(())
+    }
+
+    /// The SDK folder `uv venv` creates for an install is marked as ROCm CLI's
+    /// own; a folder that was already there (here, a stale venv being rebuilt)
+    /// is not.
+    #[test]
+    #[cfg(unix)]
+    fn a_created_install_root_is_marked_and_an_existing_one_is_not() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-marked-venv-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let python_launcher =
+            write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
+        let uv = write_fake_uv_creating_venv(&root, "uv", "cp314", "Python 3.14.5").unwrap();
+
+        let fresh = root.join("prefix");
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &fresh).unwrap();
+        let existing = root.join("existing");
+        fs::create_dir_all(existing.join("bin")).unwrap();
+        write_fake_python_reporting(&existing.join("bin"), "python", "cp312", "Python 3.12.10")
+            .unwrap();
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &existing).unwrap();
+
+        // A stale venv ROCm CLI had already marked is rebuilt (removed and
+        // recreated) and must keep its marker.
+        let rebuilt = root.join("rebuilt");
+        fs::create_dir_all(rebuilt.join("bin")).unwrap();
+        write_fake_python_reporting(&rebuilt.join("bin"), "python", "cp312", "Python 3.12.10")
+            .unwrap();
+        fs::write(rebuilt.join(rocm_core::ROCM_CLI_ROOT_MARKER), b"").unwrap();
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &rebuilt).unwrap();
+        let rebuilt_python = wheel_compatibility_for_python(&venv_python_path(&rebuilt))
+            .map(|compat| compat.python_tag);
+
+        let fresh_marked = fresh.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        let existing_marked = existing.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        let rebuilt_marked = rebuilt.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        fs::remove_dir_all(root).ok();
+        assert!(
+            fresh_marked,
+            "the install folder this install created is not marked"
+        );
+        assert!(!existing_marked, "a folder that already existed was marked");
+        assert_eq!(
+            rebuilt_python.ok().as_deref(),
+            Some("cp314"),
+            "the stale venv was not rebuilt, so this case proves nothing"
+        );
+        assert!(
+            rebuilt_marked,
+            "rebuilding a marked venv dropped its marker"
+        );
     }
 }

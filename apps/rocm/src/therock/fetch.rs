@@ -416,6 +416,8 @@ pub(super) fn download_text_cached(
     let cache_dir = body_path
         .parent()
         .context("metadata cache path has no parent directory")?;
+    // The cache folder itself is ROCm CLI's own when this is what creates it.
+    rocm_core::create_marked_root(&paths.cache_dir)?;
     fs::create_dir_all(cache_dir)?;
 
     let tmp_public_key = body_path.with_extension("public-key.pem");

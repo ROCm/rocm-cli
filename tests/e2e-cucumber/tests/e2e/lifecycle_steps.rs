@@ -689,10 +689,13 @@ async fn given_capture_user_path(world: &mut E2eWorld) {
 /// Seed isolated config/data/cache dirs with a marker so the installed-binary
 /// smoke can prove the CLI reads only them, not the real user state.
 fn seed_isolated_dirs(world: &mut E2eWorld) {
-    let root = root(world);
-    let config = root.join("smoke-config");
-    let data = root.join("smoke-data");
-    let cache = root.join("smoke-cache");
+    // Inside the isolated HOME, where ROCm CLI's folders normally live: a
+    // folder beside HOME counts as another user's home to `rocm uninstall`,
+    // which refuses it whatever it holds.
+    let home = state(world).home_dir.clone();
+    let config = home.join("smoke-config");
+    let data = home.join("smoke-data");
+    let cache = home.join("smoke-cache");
     for dir in [&config, &data, &cache] {
         std::fs::create_dir_all(dir).expect("failed to create isolated smoke dir");
         std::fs::write(dir.join("state-marker"), "seeded by the scenario\n")

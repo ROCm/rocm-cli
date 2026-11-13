@@ -1820,10 +1820,54 @@ Before removing anything, `uninstall` prints warnings about two situations:
   Otherwise the model keeps running on the remote machine with its endpoint
   published, and the record that tracked it is gone.
 
-It also lists the shared caches it leaves in place, when they live outside the
-ROCm CLI directories: a `uv` package cache that `UV_CACHE_DIR` or the default
-`~/.cache/uv` points to, and the Hugging Face model cache. Delete them yourself
-if you no longer need them.
+It also names the shared caches: a `uv` package cache that `UV_CACHE_DIR` or
+the default `~/.cache/uv` points to, and the Hugging Face model cache. One that
+lives outside the folders being removed is left in place; delete it yourself if
+you no longer need it. If one sits inside a folder being removed (for example
+`ROCM_CLI_CACHE_DIR=~/.cache`), the review says it WILL BE DELETED before you
+confirm, and which `--keep-` flag keeps it.
+
+`rocm uninstall` removes a config, data, or cache folder inside your home
+folder as usual. It never removes:
+
+- `/`, your home folder, or a folder that contains it;
+- `/usr`, `/etc`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/sys`, `/proc`, `/dev`,
+  `/run`, `/media`, `/snap`, or anything inside them — on Windows, `Windows`,
+  `Program Files`, `Program Files (x86)` and `ProgramData` on the system drive,
+  and the same folders on a drive WSL mounts at `/mnt/<drive>`;
+- a folder other programs share: anything directly under `/` (`/opt`, `/srv`,
+  `/tmp`, ...), `/var/lib`, `/var/cache`, `/var/log`, `/var/tmp`, or a mounted
+  drive itself (`/mnt/c`);
+- another user's home folder (anything under `/home`, `/Users`, `C:\Users`
+  or a WSL drive's `Users`, or beside your own home, that is not inside yours).
+
+Anywhere else outside your home folder — `/opt/rocm-cli`, `/srv/rocm`,
+`/mnt/d/rocm`, another disk — it removes a folder only if it carries a
+`.rocm-cli-root` file. ROCm CLI writes that file only into a folder it creates
+itself: the config, data and cache folders when its setup, its first log line
+or its first config save creates them, the cache folder its download metadata
+or a vLLM install first writes to, and an SDK `--prefix` it creates. A folder
+that already existed, one made by hand, one made by a release before this one,
+or one some other command happened to create first is not marked, and is
+refused rather than removed until you create the file or keep the folder. The check looks at where a folder really is as well as how it is
+written, so `ROCM_CLI_DATA_DIR=.` run from your home folder, a home reached
+through a linked parent folder, or a system folder reached through a link is
+caught too.
+
+If a folder is refused (for example `ROCM_CLI_DATA_DIR=/`, or an SDK installed
+with `--prefix ~`), the review lists it under "Refused" with why and the
+setting it came from, the command exits with an error, and nothing is removed.
+The message says what clears it: re-run with the `--keep-config`,
+`--keep-data`, or `--keep-cache` flag to leave that folder in place; point the
+`ROCM_CLI_*_DIR` variable it came from elsewhere; or, for an unmarked folder
+that is ROCm CLI's, create the `.rocm-cli-root` file it names. For a folder
+set by `setup.therock_venv`, use `--keep-data`: moving that setting would leave
+the SDK installed there behind. The same flags work in the dashboard's
+`/uninstall` and in the assistant's preview, and their refusals name the same
+setting. Between the review and the removal, each folder is resolved again;
+if it now points somewhere else, the uninstall stops instead.
+`rocm runtimes uninstall` and `rocm storage remove-old-installs` keep their own
+rule for runtime folders.
 
 ### Shell completions
 

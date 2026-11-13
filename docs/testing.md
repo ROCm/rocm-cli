@@ -1795,6 +1795,29 @@ The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
 local run, and a lower value is ignored. They are Unix-only because they plant
 symlinks.
 
+The uninstall properties also point roots at the sandbox's own home folder
+(directly, relative to the working directory, through `..`, and through a
+symlinked parent folder) and plant shared caches inside and outside the
+removed roots. They check that a
+protected root refuses the whole uninstall and removes nothing, that no file
+ROCm CLI did not create is deleted, and that the review says a shared cache
+WILL BE DELETED exactly when the removal deletes it.
+
+The protected-location rules live in `rocm-core` and are property-tested
+there against oracles restated from each policy, over seeds that include other
+users' homes, `/mnt`, `/run`, `/srv`, `/usr/local` and deeper system
+descendants, for several homes (including `/`). Runtime folders are refused
+inside the runtime system list; `rocm uninstall`'s roots are refused inside its
+own list (checked before any home allowance), at shared top-level folders and
+mounted drives, and in other users' homes, and need the `.rocm-cli-root`
+marker anywhere else outside home:
+
+```bash
+cargo test -p rocm-core --lib runtime::tests::delete_guard_properties
+cargo test -p rocm --bin rocm uninstall_
+cargo test -p rocm --bin rocm shared_cache
+```
+
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
@@ -1807,7 +1830,7 @@ empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
 mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
 is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
 its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
-ends differently, since it has no flag to offer: it says removal needs approval,
+ends differently, since it has no command line to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
 `uninstall-13` to `uninstall-15` drive the confirmation prompt under a
 pseudo-terminal, which is the only way to reach it, and pin the shared `[y/N]`
@@ -1816,6 +1839,16 @@ with Ctrl-D, and for a plain no, each together with the config folder being left
 in place. They run on the default mock lane; the helper's other callers (`rocm fix`,
 the SDK-overwrite prompt) share it and are covered by its unit tests in
 [confirm.rs](../crates/rocm-core/src/confirm.rs).
+`uninstall-16` to `uninstall-21` cover the protected-location refusal: the top
+of the filesystem as the data folder, refused in a dry run (`uninstall-16`); the
+home folder, refused with the home file and config folder left in place and the
+advised `--keep-data` then succeeding (`uninstall-17`); shared caches inside the
+cache folder named as deleted, then kept by `--keep-cache` and really deleted
+without it (`uninstall-18`); a data folder of `.` run from home, refused with
+nothing removed (`uninstall-19`); an unmarked folder outside home, refused in a
+dry run until the marker the refusal names is created (`uninstall-20`); and the
+dashboard's approved-command path naming `setup.therock_venv`, with the home
+file and config folder left in place (`uninstall-21`).
 The `uninstall` command does not start the file logger, which would otherwise
 create the data folder's `logs` folder before the plan is built:
 

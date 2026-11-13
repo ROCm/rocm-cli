@@ -149,10 +149,12 @@ pub fn require_yes_or_interactive(yes: bool, action: &str) -> Result<bool> {
     require_yes_or_interactive_with(yes, action, interactive_terminal)
 }
 
-/// [`require_yes_or_interactive`] with the terminal probe injected, so the
-/// refusal is testable without depending on how the test runner's streams are
-/// wired. The probe is only called when `yes` is false.
-fn require_yes_or_interactive_with(
+/// [`require_yes_or_interactive`] with the terminal probe injected.
+///
+/// The refusal is then testable without depending on how the test runner's
+/// streams are wired. The probe is only called when `yes` is false. Public for
+/// a caller whose own tests drive the confirmation path past this guard.
+pub fn require_yes_or_interactive_with(
     yes: bool,
     action: &str,
     interactive: impl FnOnce() -> bool,

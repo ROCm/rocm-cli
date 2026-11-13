@@ -96,7 +96,9 @@ pub use config::{
     SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
     WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
-pub use confirm::{interactive_terminal, require_yes_or_interactive};
+pub use confirm::{
+    interactive_terminal, require_yes_or_interactive, require_yes_or_interactive_with,
+};
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
@@ -183,7 +185,9 @@ pub use net::{
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{
-    AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV, DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs,
+    APP_PATH_SOURCES_ENV, AppPathSource, AppPathSources, AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV,
+    DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, ForwardedAppPathSources, PinnedAppPathSource,
+    engine_plugin_dirs,
 };
 pub use proc_lifecycle::{
     IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
@@ -217,23 +221,26 @@ pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;
 pub use runtime::{
-    RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform, current_executable_path,
-    default_cache_dir, default_config_dir, default_data_dir, default_interactive_shell_program,
-    install_root_has_payload, managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir,
-    managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
-    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
-    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
-    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
-    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
-    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
-    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
-    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    ProtectedLocation, ROCM_CLI_ROOT_MARKER, RUNTIME_LIBRARY_PATH_ENV, RuntimeHost,
+    RuntimePlatform, UninstallRootVerdict, canonicalize_for_compare, create_marked_root,
+    current_executable_path, default_cache_dir, default_config_dir, default_data_dir,
+    default_interactive_shell_program, install_root_has_payload, managed_logs_dir,
+    managed_pip_cache_dir, managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir,
+    managed_uv_cache_dir, mark_root, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
+    platform_binary_name, prepend_runtime_path, resolve_path_through_symlinks,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
+    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
+    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
+    runtime_paths_equivalent, runtime_protected_location, runtime_protected_location_for_home,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_env_root_for_executable,
     runtime_python_executable_in_env, runtime_python_executable_name,
-    runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
+    runtime_rocm_library_filename, shell_command_for_host, uninstall_root_verdict,
+    uninstall_system_roots, user_runtime_dir, windows_system_drive,
 };
 pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::{

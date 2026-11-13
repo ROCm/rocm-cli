@@ -22,6 +22,7 @@
 
 use super::summaries::managed_service_running_state;
 use crate::automations::{render_automations_text, render_daemon_text};
+use crate::engine_runtime_select::rocm_child_app_path_env;
 use crate::freeform_planner::{format_structured_tool_call, plan_freeform_request_with_context};
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
 use crate::rocm_argv::{chat_cli_arg_value, chat_cli_has_flag};
@@ -31,7 +32,7 @@ use crate::services_text::{
     render_services_text,
 };
 use crate::tool_policy::{
-    ChatRocmCommandAction, chat_install_prefix_is_system, chat_rocm_command_action,
+    ChatRocmCommandAction, chat_install_prefix_protection, chat_rocm_command_action,
     chat_tool_call_is_read_only, json_string, rocm_chat_tool_requested_args,
     validate_chat_tool_call,
 };
@@ -457,7 +458,12 @@ fn run_rocm_capture_for_paths(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    rocm_core::run_rocm_capture_with_env(args, &paths.env_vars(), timeout)
+    let vars = rocm_child_app_path_env(paths);
+    let env = vars
+        .iter()
+        .map(|(key, value)| (*key, Path::new(value)))
+        .collect::<Vec<_>>();
+    rocm_core::run_rocm_capture_with_env(args, &env, timeout)
 }
 
 fn run_rocm_command_for_paths(
@@ -483,7 +489,7 @@ fn run_rocm_command_for_paths(
     }
 }
 
-fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<String> {
+pub(crate) fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<String> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
     match args {
         [] => bail!("rocm command requires at least one argument"),
@@ -599,7 +605,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
             if command.eq_ignore_ascii_case("uninstall")
                 && rest.iter().any(|arg| arg.eq_ignore_ascii_case("--dry-run")) =>
         {
-            render_uninstall_dry_run(paths)
+            render_uninstall_dry_run(paths, rest)
         }
         [command] if command.eq_ignore_ascii_case("setup") => {
             render_setup_status_text(paths, &config)
@@ -682,9 +688,9 @@ fn internal_mcp_install_sdk_args(
     ];
     if let Some(prefix) = json_string(arguments, "prefix") {
         let prefix_path = Path::new(&prefix);
-        if chat_install_prefix_is_system(prefix_path) {
+        if let Some(why) = chat_install_prefix_protection(prefix_path) {
             bail!(
-                "install_sdk prefix `{}` is a system folder; choose a user folder instead",
+                "install_sdk prefix `{}` is {why}; choose a user folder instead",
                 prefix_path.display()
             );
         }
