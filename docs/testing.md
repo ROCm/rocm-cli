@@ -3960,7 +3960,6 @@ To run them on a host that *does* have a GPU, mask it so the harness resolves to
 its no-GPU premise — `HIP_VISIBLE_DEVICES="" cargo xtask e2e -- -n "serve-5[56]"`
 — otherwise `@requires-no-gpu` skips them.
 
-
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global

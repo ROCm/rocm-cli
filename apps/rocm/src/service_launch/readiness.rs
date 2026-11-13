@@ -622,6 +622,29 @@ impl StopWatch {
 /// `stop_requested_unix_ms` a concurrent stop just wrote to disk — the same
 /// hazard the merge above (and the attach path's equivalent write) already
 /// guards against.
+/// Whether the service's files on disk still name the supervisor the caller
+/// spawned, read fresh rather than from a spawn-time snapshot.
+///
+/// `supervisor_pid`/`supervisor_start_ticks` are the right pair to compare on:
+/// `refresh_from_engine_state` never touches them, and a legitimate restart
+/// does rewrite them (`record_supervisor_identity` at the top of the spawn
+/// path), so they distinguish "these files still describe the child I am
+/// watching" from "a restart has already replaced it". The pid alone would not
+/// — pids are recycled, which is what the start-time token rules out.
+pub(super) fn still_watching_this_supervisor(
+    paths: &AppPaths,
+    service_id: &str,
+    supervisor_pid: u32,
+    supervisor_start_ticks: Option<u64>,
+) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
+        |(current, _)| {
+            current.supervisor_pid == supervisor_pid
+                && current.supervisor_start_ticks == supervisor_start_ticks
+        },
+    )
+}
+
 pub(super) fn finalize_managed_launch_readiness(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
@@ -642,8 +665,28 @@ pub(super) fn finalize_managed_launch_readiness(
             }
             return Ok(false);
         }
-        record.status = "failed".to_owned();
-        mark_service_failed(&record.manifest_path, &record.engine_state_path);
+        // Only stamp the service's own files while they still describe the
+        // child this invocation spawned. `child_is_alive` is bound to this
+        // `rocm serve`'s own pid, but the files are named by `service_id`, so a
+        // restart that lands inside this readiness wait leaves them describing
+        // a different, possibly healthy child. `reset_for_restart` clears the
+        // stop evidence the branch above looks for, so without this check the
+        // two true facts "no stop evidence" and "my child is dead" combine into
+        // `failed` on somebody else's record -- and stick, because
+        // `refresh_managed_service_runtime_liveness_with` short-circuits on a
+        // `failed` status and never re-probes to correct it.
+        //
+        // The attached path has guarded this since ROCMAI-541; this is the same
+        // guard for the background launch, which is the more common one.
+        if still_watching_this_supervisor(
+            paths,
+            &record.service_id,
+            record.supervisor_pid,
+            record.supervisor_start_ticks,
+        ) {
+            record.status = "failed".to_owned();
+            mark_service_failed(&record.manifest_path, &record.engine_state_path);
+        }
         bail!(
             "{}",
             managed_engine_exit_failure_detail(&record.service_id, &record.log_path)
@@ -858,6 +901,81 @@ mod tests {
         let engine_state: serde_json::Value =
             serde_json::from_slice(&fs::read(&record.engine_state_path)?)?;
         assert_eq!(engine_state["status"], "failed");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A restart that lands inside this invocation's readiness wait must not be
+    /// stamped `failed` by it.
+    ///
+    /// The two facts this function decides on are both still true in that case:
+    /// this invocation's own child really is dead, and `reset_for_restart` has
+    /// already cleared the stop evidence the branch above looks for. What is no
+    /// longer true is that the service's files describe *this* child — the
+    /// restart rewrote `supervisor_pid`/`supervisor_start_ticks` — and stamping
+    /// them would mislabel a service that may be serving. It sticks, too:
+    /// `refresh_managed_service_runtime_liveness_with` short-circuits on a
+    /// `failed` status and never re-probes to correct it.
+    ///
+    /// The launch still fails for the caller, because this invocation's child
+    /// did die; what the guard changes is whose record pays for it. Removing
+    /// the `still_watching_this_supervisor` call fails this test.
+    #[test]
+    fn finalize_managed_launch_readiness_does_not_stamp_a_restarted_service() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-restarted");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-restarted-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11531,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
+        fs::write(&record.log_path, "Model pulled successfully\n")?;
+        record.status = "running".to_owned();
+        record.write()?;
+
+        // What a restart leaves behind: the same `service_id`, a different
+        // supervisor. Written to disk only -- `record` keeps this invocation's
+        // own identity, which is exactly the divergence the guard reads.
+        let (mut restarted, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-restarted-1")?;
+        restarted.supervisor_pid = record.supervisor_pid.wrapping_add(1);
+        restarted.supervisor_start_ticks = Some(4_242_424_242);
+        restarted.status = "running".to_owned();
+        restarted.write()?;
+
+        let result = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
+
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(&root);
+            panic!("this invocation's child died, so its own launch must still fail");
+        };
+        assert!(error.to_string().contains("svc-restarted-1"));
+
+        // The restarted service's record must be untouched by this invocation.
+        let (reread, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-restarted-1")?;
+        assert_eq!(
+            reread.status, "running",
+            "a restarted service was stamped `failed` by an older invocation's readiness wait"
+        );
+        assert_ne!(record.status, "failed");
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

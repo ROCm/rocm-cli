@@ -1205,6 +1205,14 @@ state file left `failed`. A death that was *asked for* — `rocm services stop`,
 `rocm dash`'s stop action — is reported as a stop on all of them instead, and
 rocm itself marks nothing `failed` for it.
 
+That changes the verdict and the message, not every exit code. `rocm serve
+--wait` still exits non-zero when a stop ends its wait, because the thing it was
+asked to wait for — the server becoming ready — did not happen. What changed is
+that it now says `the server for service <id> was stopped before it became
+ready` rather than reporting an operator's own stop as the server failing to
+come up, and leaves the record `stopped` rather than `failed`. See the `--wait`
+description below.
+
 One caveat, because rocm is not the only writer. The Lemonade and vLLM adapters
 see a SIGTERM'd server as an unsuccessful exit, so they write `failed` to the
 engine state file themselves, and `refresh_from_engine_state` reads that back
@@ -1221,9 +1229,11 @@ writes `stopped` too, and that is not proof anyone asked for it.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
 `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
-`rocm services stop`), it fails with an error that points at the server's logs
-instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
+of returning `starting` after 45 seconds; if the server exits first it ends
+non-zero rather than waiting forever, and says which of the two happened: a
+crash or a kill fails with an error pointing at the server's logs and leaves the
+record `failed`, while a deliberate `rocm services stop` reports that the server
+was stopped before it became ready and leaves it `stopped`. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
 begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
 when the model is already being served and still starting, it waits on that

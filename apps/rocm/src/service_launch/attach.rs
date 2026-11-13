@@ -268,14 +268,15 @@ pub(crate) fn run_attached_service(
             // reads back into a newer manifest, so leaving this write
             // unguarded would let the clobber this guard prevents on the
             // manifest simply round-trip back in through that file instead.
-            let still_watching_this_supervisor =
-                crate::services_text::read_managed_service_manifest(paths, &service_id).is_ok_and(
-                    |(current, _)| {
-                        current.supervisor_pid == child_pid
-                            && current.supervisor_start_ticks == supervisor_start_ticks
-                    },
-                );
-            if still_watching_this_supervisor {
+            // One copy of this check, shared with the background launch path,
+            // so the two cannot drift: both decide the same question about the
+            // same two fields.
+            if crate::service_launch::readiness::still_watching_this_supervisor(
+                paths,
+                &service_id,
+                child_pid,
+                supervisor_start_ticks,
+            ) {
                 mark_service_failed(
                     &paths.service_manifest_path(&service_id),
                     &engine_state_path,
