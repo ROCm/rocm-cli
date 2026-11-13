@@ -3467,6 +3467,7 @@ cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
 cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
 cargo test -p rocmd supervise_terminates_the_engine_when_recording_its_pid_fails
 cargo test -p rocmd supervise_terminates_the_engine_when_recording_ready_fails
+cargo test -p rocmd supervise_empties_a_log_left_by_an_earlier_run
 cargo test -p rocmd an_engine_child_dropped_before_its_wait_is_terminated_and_reaped
 cargo test -p rocmd an_engine_child_that_was_waited_for_is_not_signalled_on_drop
 cargo test -p rocmd terminate_recovery_supervisor_kills_and_reaps_the_child_and_its_tree
@@ -3475,6 +3476,7 @@ cargo test -p rocmd a_termination_that_stops_the_child_reaps_it_and_reports_noth
 cargo test -p rocmd a_termination_with_unconfirmed_descendants_reaps_the_child_and_says_so
 cargo test -p rocmd a_failed_wait_leaves_the_engine_guard_armed
 cargo test -p rocmd a_dropped_engine_guard_logs_a_termination_it_could_not_confirm
+cargo test -p rocmd a_dropped_engine_guard_reports_to_stderr_by_default
 cargo test -p rocmd a_report_that_cannot_be_written_does_not_panic
 cargo test -p rocmd restart_reports_a_supervisor_it_could_not_confirm_stopped_in_its_error
 cargo test -p rocmd restart_hands_the_supervisor_its_service_log_as_stderr
