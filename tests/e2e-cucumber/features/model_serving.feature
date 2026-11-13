@@ -1,5 +1,14 @@
 Feature: Model serving
 
+  # Interactive `rocm serve` (a terminal, not --verbose or --foreground) follows
+  # download, load, and health on the status line until the server is ready or
+  # the startup wait fails. There is no scenario for it yet: the harness can
+  # drive a PTY (download_progress_pty.feature), but interactive `rocm serve`
+  # needs a live engine, and the no-GPU mock lane stubs the HTTP endpoint
+  # without running `rocm serve`, so one would be `@requires-gpu`. The state matrix is
+  # covered without a GPU by `decide_serve_startup` and `wait_for_serve_startup`
+  # in apps/rocm/src/serve_progress.rs.
+
   # Per-platform expectations (pass / xfail / skip) are resolved at runtime from
   # the host capability probe + expectations.toml, keyed by the @id tag — not by
   # @expected-failure tags. Engine requirements are declared via @requires-engine

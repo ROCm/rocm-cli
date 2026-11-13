@@ -7,13 +7,14 @@
 
 use super::endpoint_auth::drop_orphaned_endpoint_key_on_already_running;
 use super::readiness::{
-    died_during_wait, record_wait_outcome, service_pid_is_alive, wait_for_record_ready,
-    wait_on_existing_service,
+    died_during_wait, record_wait_outcome, service_pid_is_alive, settle_ended_launch,
+    wait_for_launch_startup, wait_for_record_ready, wait_on_existing_service,
 };
 #[cfg(feature = "e2e-oom-fault-injection")]
 use super::readiness::{e2e_simulate_oom_launch, simulate_oom_managed_launch};
 use super::spawn::{ManagedLaunchReport, ManagedSpawn, spawn_managed_engine_child};
 use crate::serve_port;
+use crate::serve_progress::{self, ServeStartupPhase, ServeStartupPolicy, ServeStartupView};
 use crate::{record_cli_audit_event, status_for_readiness};
 use anyhow::Result;
 use rocm_core::format_http_base_url;
@@ -22,6 +23,7 @@ use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse}
 use std::fmt::Write as _;
 #[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
 use std::time::Duration;
 
 /// Launch a managed service in the background: run the locked allocation and
@@ -55,9 +57,15 @@ pub(crate) fn start_managed_service(
     require_api_key: bool,
     gpu_refusal_waived_for_reuse: bool,
     wait_until_ready: bool,
+    policy: &ServeStartupPolicy,
     on_wait_begin: &mut dyn FnMut(&str, u16),
-    on_wait_tick: &mut dyn FnMut(Duration),
+    on_view: &mut dyn FnMut(&ServeStartupView),
 ) -> Result<ManagedLaunchReport> {
+    // `--wait` keeps the label it started with: its wait reports no stage.
+    let steady = ServeStartupView {
+        phase: ServeStartupPhase::Unreachable,
+        label: serve_progress::starting_label(requested_model, engine),
+    };
     #[cfg(feature = "e2e-oom-fault-injection")]
     if e2e_simulate_oom_launch() {
         return simulate_oom_managed_launch(
@@ -104,7 +112,9 @@ pub(crate) fn start_managed_service(
                 report,
                 wait_until_ready,
                 on_wait_begin,
-                on_wait_tick,
+                &mut |_elapsed| {
+                    on_view(&steady);
+                },
             );
         }
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
@@ -121,16 +131,27 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    if wait_until_ready {
+    if announces_wait(wait_until_ready, policy) {
         on_wait_begin(service_id, port);
     }
-    let readiness = wait_for_record_ready(
-        paths,
-        &record,
-        wait_until_ready,
-        endpoint_api_key,
-        on_wait_tick,
-    );
+    let (readiness, startup_stop) = if wait_until_ready {
+        let readiness = wait_for_record_ready(paths, &record, endpoint_api_key, &mut |_elapsed| {
+            on_view(&steady);
+        });
+        (readiness, None)
+    } else {
+        match wait_for_launch_startup(
+            paths,
+            &record,
+            requested_model,
+            endpoint_api_key,
+            policy,
+            on_view,
+        ) {
+            Ok(readiness) => (readiness, None),
+            Err(stop) => (stop.readiness, Some(stop)),
+        }
+    };
     if let Some(error) = died_during_wait(
         paths,
         service_id,
@@ -140,13 +161,38 @@ pub(crate) fn start_managed_service(
     ) {
         return Err(error);
     }
-    let launch_status = status_for_readiness(readiness);
-    record_wait_outcome(
+    if let Some(stop) = startup_stop
+        .as_ref()
+        .filter(|stop| !stop.leaves_server_running())
+    {
+        // The engine failed or the process ended: settled the way a `--wait`
+        // that saw the server exit is, with the same memory guidance.
+        let message = stop.user_message(requested_model, engine, service_id);
+        let why = format!("{:?}", stop.reason);
+        return Err(serve_progress::ServeStartupFailed {
+            message: settle_ended_launch(paths, service_id, &why, message),
+            server_running: false,
+        }
+        .into());
+    }
+    // A stall or the deadline left the server up: `running`, which `rocmd`
+    // leaves alone until the startup deadline.
+    let launch_status = if startup_stop.is_some() {
+        "running"
+    } else {
+        status_for_readiness(readiness)
+    };
+    let recorded = record_wait_outcome(
         paths,
         &mut record,
         launch_status,
         readiness == EndpointReadiness::Serving,
-    )?;
+    );
+    // After a stop, the stop is what the user needs to read; a record that
+    // could not be rewritten is best-effort there, as `settle_ended_launch` is.
+    if startup_stop.is_none() {
+        recorded?;
+    }
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
         paths,
@@ -159,6 +205,13 @@ pub(crate) fn start_managed_service(
         ),
         Some(service_id),
     );
+    if let Some(stop) = startup_stop {
+        return Err(serve_progress::ServeStartupFailed {
+            message: stop.user_message(requested_model, engine, service_id),
+            server_running: true,
+        }
+        .into());
+    }
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
@@ -168,6 +221,17 @@ pub(crate) fn start_managed_service(
         log_path: Some(record.log_path),
         manifest_path: Some(record.manifest_path),
     })
+}
+
+/// Whether a fresh launch announces its wait (the server id, how to follow its
+/// log, and a public bind's key) before waiting.
+///
+/// `--wait` does, and so does the interactive wait, which can run for
+/// [`rocm_core::SERVE_STARTUP_DEADLINE`] and can end in an error that prints no
+/// summary: without the announcement a public bind's key would never be shown.
+/// The piped status budget returns a report either way and prints the key there.
+const fn announces_wait(wait_until_ready: bool, policy: &ServeStartupPolicy) -> bool {
+    wait_until_ready || policy.stop_on_give_up
 }
 
 /// Reproduce the original plain, line-by-line managed-launch output. Used for
@@ -263,6 +327,21 @@ mod tests {
     use std::fs;
     #[cfg(not(windows))]
     use std::io;
+    #[cfg(not(windows))]
+    use std::time::Duration;
+
+    /// A wait that can end in an error without a summary announces itself, so
+    /// a public bind's key is printed before it. The piped status budget
+    /// always returns a report, and the summary prints the key there.
+    #[test]
+    fn a_wait_that_can_fail_without_a_summary_is_announced() {
+        let interactive = ServeStartupPolicy::interactive();
+        let piped = ServeStartupPolicy::status_budget(serve_progress::PIPED_SERVE_STATUS_BUDGET);
+        assert!(announces_wait(false, &interactive));
+        assert!(announces_wait(true, &interactive));
+        assert!(announces_wait(true, &piped));
+        assert!(!announces_wait(false, &piped));
+    }
 
     #[test]
     fn wait_begin_shows_the_key_only_for_the_launch_it_belongs_to() {
@@ -369,8 +448,9 @@ mod tests {
             false,
             false,
             false,
+            &ServeStartupPolicy::status_budget(Duration::ZERO),
             &mut |_, _| {},
-            &mut |_elapsed| {},
+            &mut |_view| {},
         );
         let Err(error) = result else {
             let _ = fs::remove_dir_all(root);
@@ -389,6 +469,175 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// What a fresh launch through the spawn hook left behind.
+    #[cfg(not(windows))]
+    struct HookedLaunch {
+        result: Result<ManagedLaunchReport>,
+        record: Result<ManagedServiceRecord>,
+        announced: Vec<String>,
+        child_alive_after: bool,
+        audit: Vec<rocm_core::AuditEventRecord>,
+    }
+
+    /// Launch `service_id` with `argv` as the engine child, under a short
+    /// interactive policy: nothing listens on the port, so the wait ends on
+    /// the silent limit or on the child's exit.
+    #[cfg(not(windows))]
+    fn launch_hooked_child(
+        service_id: &str,
+        argv: &'static [&'static str],
+        silent_unreachable: Duration,
+    ) -> Result<HookedLaunch> {
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        let (root, paths) = test_paths(service_id);
+        paths.ensure()?;
+        let child = std::rc::Rc::new(std::cell::RefCell::new(None::<u32>));
+        let spawned = child.clone();
+        TEST_SPAWN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(std::rc::Rc::new(move |_command| {
+                let process = std::process::Command::new(argv[0])
+                    .args(&argv[1..])
+                    .spawn()?;
+                *spawned.borrow_mut() = Some(process.id());
+                Ok(process)
+            }));
+        });
+        let mut policy = ServeStartupPolicy::interactive();
+        policy.poll = Duration::from_millis(20);
+        policy.bounds.silent_unreachable = silent_unreachable;
+        policy.bounds.deadline = Duration::from_secs(10);
+        let mut announced = Vec::new();
+        let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+        let result = start_managed_service(
+            &paths,
+            "lemonade",
+            service_id,
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            serve_port::PortRequest::Auto,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            launch_lock,
+            false,
+            false,
+            false,
+            &policy,
+            &mut |id, _port| announced.push(id.to_owned()),
+            &mut |_view| {},
+        );
+        TEST_SPAWN_HOOK.with(|hook| *hook.borrow_mut() = None);
+        let record = ManagedServiceRecord::read_manifest(&paths, service_id);
+        let audit = rocm_core::load_recent_audit_events(&paths, 20).unwrap_or_default();
+        let pid = *child.borrow();
+        let child_alive_after = pid.is_some_and(super::service_pid_is_alive);
+        if let Some(pid) = pid {
+            let _ = rocm_core::terminate_process(pid);
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(HookedLaunch {
+            result,
+            record,
+            announced,
+            child_alive_after,
+            audit,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn startup_failure(result: Result<ManagedLaunchReport>) -> serve_progress::ServeStartupFailed {
+        let Err(error) = result else {
+            panic!("the startup wait must stop");
+        };
+        error
+            .downcast::<serve_progress::ServeStartupFailed>()
+            .expect("the stop is the typed startup failure")
+    }
+
+    /// A fresh launch whose wait stops on a live server: the wait is announced
+    /// first, the server is left running and recorded `running` without an
+    /// inference verification, and the typed failure names that service's
+    /// logs and stop commands and asks `serve` to supervise it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_startup_stop_records_the_live_server_and_returns_the_typed_failure() -> Result<()> {
+        let service_id = "lemonade-startup-stop";
+        let launch = launch_hooked_child(service_id, &["sleep", "30"], Duration::from_millis(300))?;
+        assert!(launch.child_alive_after, "the wait must not end the server");
+        let failure = startup_failure(launch.result);
+        assert!(failure.server_running, "{}", failure.message);
+        for hint in [
+            crate::service_hints::service_logs_hint(service_id),
+            crate::service_hints::service_stop_hint(service_id),
+        ] {
+            assert!(failure.message.contains(&hint), "{}", failure.message);
+        }
+        assert_eq!(launch.announced, [service_id], "the wait is announced once");
+        let record = launch.record?;
+        assert_eq!(record.status, "running", "the live server stays recorded");
+        assert_eq!(record.inference_verified_at_unix_ms, None);
+        Ok(())
+    }
+
+    /// A launch whose server exits during the wait is over: settled `stopped`
+    /// the way a `--wait` that saw it exit is, not `failed`, which `rocmd`
+    /// would restart behind the error the user just read; and the typed
+    /// failure does not ask `serve` to supervise it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_server_that_exits_during_the_wait_is_settled_stopped_and_not_supervised() -> Result<()> {
+        let service_id = "lemonade-startup-exit";
+        // The silent limit is far past the child's life, so the exit is what
+        // ends the wait.
+        let launch = launch_hooked_child(service_id, &["sleep", "0.3"], Duration::from_secs(5))?;
+        let failure = startup_failure(launch.result);
+        assert!(!failure.server_running, "{}", failure.message);
+        assert!(
+            failure.message.contains("the server process exited"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            !failure
+                .message
+                .contains(&crate::service_hints::service_stop_hint(service_id)),
+            "{}",
+            failure.message
+        );
+        assert_eq!(launch.record?.status, "stopped");
+        assert!(
+            launch
+                .audit
+                .iter()
+                .any(|event| event.action == "managed_service_launch"
+                    && event.level == "error"
+                    && event.service_id.as_deref() == Some(service_id)
+                    && event.message.contains("ProcessExited")),
+            "the ended launch is audited: {:?}",
+            launch.audit
+        );
         Ok(())
     }
 
@@ -466,8 +715,9 @@ mod tests {
                     false,
                     false,
                     false,
+                    &ServeStartupPolicy::status_budget(Duration::ZERO),
                     &mut |_, _| {},
-                    &mut |_elapsed| {},
+                    &mut |_view| {},
                 )
                 .map(|_| ())
             };

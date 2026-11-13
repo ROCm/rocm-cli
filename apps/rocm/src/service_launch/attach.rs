@@ -105,7 +105,7 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {}", report.service_id);
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
-            println!("  logs: rocm logs {}", report.service_id);
+            println!("{}", logs_row("logs", &report.service_id));
             println!(
                 "  stop: {}",
                 service_hints::service_stop_hint(&report.service_id)
@@ -169,7 +169,7 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
-            println!("  logs: rocm logs {service_id}");
+            println!("{}", logs_row("logs", &service_id));
             println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             Ok(())
         }
@@ -189,10 +189,20 @@ pub(crate) fn run_attached_service(
         AttachOutcome::ServerExited => {
             println!("server process exited");
             println!("  service_id: {service_id}");
-            println!("  recent logs: rocm logs {service_id}");
+            println!("{}", logs_row("recent logs", &service_id));
             Ok(())
         }
     }
+}
+
+/// The `  {label}: rocm logs --service <id>` row of the attached path's
+/// reports. A bare `rocm logs <id>` would be a free-text search, not that
+/// service's log.
+fn logs_row(label: &str, service_id: &str) -> String {
+    format!(
+        "  {label}: {}",
+        service_hints::service_logs_hint(service_id)
+    )
 }
 
 /// Restores cooked terminal mode when dropped, so [`stream_attached_logs`] leaves
@@ -433,6 +443,26 @@ fn finish_attached_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `logs` row the attached path prints names a command that selects
+    /// that service's log. `rocm logs <id>` parses as a free-text search.
+    #[test]
+    fn attached_logs_rows_select_the_service_log() {
+        use clap::Parser as _;
+        for label in ["logs", "recent logs"] {
+            let row = logs_row(label, "svc-1");
+            let command = row
+                .strip_prefix(&format!("  {label}: "))
+                .expect("row starts with its label");
+            let parsed = crate::cli::Cli::try_parse_from(command.split_whitespace())
+                .expect("the printed command parses");
+            let Some(crate::cli::Command::Logs { service, query, .. }) = parsed.command else {
+                panic!("`{command}` is not `rocm logs`");
+            };
+            assert_eq!(service.as_deref(), Some("svc-1"), "`{command}`");
+            assert!(query.is_empty(), "`{command}` searches for {query:?}");
+        }
+    }
     use crate::endpoint_keys;
     use crate::tests::test_paths;
     use rocm_core::ManagedServiceRecord;

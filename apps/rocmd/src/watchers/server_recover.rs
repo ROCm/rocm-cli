@@ -12,8 +12,8 @@ use crate::persistence::load_service_record;
 use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result};
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, AutomationTriggerEvent, ManagedServiceRecord, WatcherMode,
-    format_host_port, unix_time_millis,
+    AppPaths, AutomationRuntimeState, AutomationTriggerEvent, IdentityState, ManagedServiceRecord,
+    ProcessIdentity, WatcherMode, format_host_port, unix_time_millis,
 };
 #[cfg(test)]
 use serde_json::json;
@@ -96,10 +96,14 @@ fn service_record_matches_recovery_event(
         return false;
     }
     match event.kind.as_str() {
+        // The same guarded reasons as the scan, so a live startup the scan
+        // spared cannot be restarted by an event raised before it was spared.
         "service.manifest_recoverable" => {
-            manifest_service_recovery_reason(record, unix_time_millis()).is_some()
+            stale_manifest_recovery_reason(record, unix_time_millis()).is_some()
         }
-        "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
+        "service.endpoint_recoverable" => {
+            unreachable_endpoint_recovery_reason(record, unix_time_millis()).is_some()
+        }
         "service.healthcheck_recoverable" => crate::engine_ipc::engine_healthcheck_response(
             paths,
             &record.engine,
@@ -326,8 +330,12 @@ pub(crate) fn find_recoverable_service(
         {
             continue;
         }
-        if let Some(reason) = manifest_service_recovery_reason(&record, now) {
+        if let Some(reason) = stale_manifest_recovery_reason(&record, now) {
             return Ok(Some((record, reason)));
+        }
+        if manifest_service_recovery_reason(&record, now).is_some() {
+            // A live startup the guard above spared.
+            continue;
         }
         if matches!(record.status.as_str(), "ready" | "running") {
             let Ok(healthcheck) = crate::engine_ipc::engine_healthcheck_response(
@@ -335,7 +343,7 @@ pub(crate) fn find_recoverable_service(
                 &record.engine,
                 &record.service_id,
             ) else {
-                if let Some(reason) = endpoint_service_recovery_reason(&record) {
+                if let Some(reason) = unreachable_endpoint_recovery_reason(&record, now) {
                     return Ok(Some((record, reason)));
                 }
                 continue;
@@ -346,12 +354,30 @@ pub(crate) fn find_recoverable_service(
                     format!("healthcheck_status_{}", healthcheck.status),
                 )));
             }
-            if let Some(reason) = endpoint_service_recovery_reason(&record) {
+            if let Some(reason) = unreachable_endpoint_recovery_reason(&record, now) {
                 return Ok(Some((record, reason)));
             }
         }
     }
     Ok(None)
+}
+
+/// Why a `ready`/`running` service whose endpoint does not answer should be
+/// recovered, or `None` when it should not.
+///
+/// A live `running` process that has not opened its port is still the
+/// interactive serve wait's job: restarting it kills a download the CLI is
+/// reporting. A dead pid is not spared. One function for every place that
+/// falls back to the endpoint, scan and event re-check, so none can drop the
+/// guard.
+fn unreachable_endpoint_recovery_reason(
+    record: &ManagedServiceRecord,
+    now_unix_ms: u128,
+) -> Option<String> {
+    if record.status == "running" && live_startup_still_in_progress(record, now_unix_ms) {
+        return None;
+    }
+    endpoint_service_recovery_reason(record)
 }
 
 /// Whether an operator asked for this service to stop and that stop is still
@@ -366,6 +392,55 @@ pub(crate) fn find_recoverable_service(
 /// stop apart from a crash; a confirmed stop, and any fresh launch, clear it.
 pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
     record.stop_requested_unix_ms.is_some()
+}
+
+/// A recorded process is alive and the service is younger than
+/// [`rocm_core::SERVE_STARTUP_DEADLINE`].
+///
+/// That is the window interactive `rocm serve` spends following a download
+/// or load before the port accepts connections. Endpoint-unreachable
+/// recovery during it restarts the process out from under that wait.
+fn live_startup_still_in_progress(record: &ManagedServiceRecord, now_unix_ms: u128) -> bool {
+    let started_at = record
+        .last_restart_unix_ms
+        .unwrap_or(record.created_at_unix_ms);
+    let age_ms = now_unix_ms.saturating_sub(started_at);
+    if age_ms >= rocm_core::SERVE_STARTUP_DEADLINE.as_millis() {
+        return false;
+    }
+    // A recorded pid alone could have been recycled within the window, so the
+    // recorded start time must match too. A record with none is the
+    // best-effort `Matches` `identity_state` gives a legacy record.
+    [
+        Some((record.supervisor_pid, record.supervisor_start_ticks)),
+        record
+            .engine_pid
+            .map(|pid| (pid, record.engine_start_ticks)),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|(pid, start_ticks)| {
+        pid != 0
+            && rocm_core::identity_state(&ProcessIdentity { pid, start_ticks })
+                == IdentityState::Matches
+    })
+}
+
+/// Why a stale or failed manifest should be recovered, or `None`.
+///
+/// `rocm services` persists an engine's own `starting` state into the
+/// record, so a live server still downloading under the interactive serve
+/// wait (or left by a Ctrl-C of it) can read `starting` past the stale-start
+/// window. It is not stale until the startup deadline. Shared by the scan and
+/// the event re-check, so neither can drop the guard.
+fn stale_manifest_recovery_reason(
+    record: &ManagedServiceRecord,
+    now_unix_ms: u128,
+) -> Option<String> {
+    if record.status == "starting" && live_startup_still_in_progress(record, now_unix_ms) {
+        return None;
+    }
+    manifest_service_recovery_reason(record, now_unix_ms)
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
@@ -1120,6 +1195,183 @@ mod tests {
 
         let (record, _reason) = found?.expect("service B is recoverable");
         assert_eq!(record.service_id, "svc-backoff-b");
+        Ok(())
+    }
+
+    fn recovery_event(record: &ManagedServiceRecord, kind: &str) -> AutomationTriggerEvent {
+        AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: kind.to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: None,
+            payload: json!({}),
+        }
+    }
+
+    /// A live process that has not opened its port yet is the interactive
+    /// `rocm serve` wait, not a crash. Endpoint recovery must leave it alone
+    /// until [`rocm_core::SERVE_STARTUP_DEADLINE`]. A dead pid at the same age
+    /// is still recovered: the guard is the live process, not the clock alone.
+    #[test]
+    fn recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-live-startup");
+        paths.ensure()?;
+
+        let mut live = ManagedServiceRecord::new(
+            &paths,
+            "svc-live-startup",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            free_loopback_port(),
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        live.status = "running".to_owned();
+        let now = unix_time_millis();
+        let deadline_ms = rocm_core::SERVE_STARTUP_DEADLINE.as_millis();
+        // Two seconds inside the bound, so the check below cannot cross it.
+        // A shorter window than the shared deadline would recover this.
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms.saturating_sub(2_000));
+        live.write()?;
+
+        let found_inside = find_recoverable_service(&paths)?;
+        let event_inside = service_record_matches_recovery_event(
+            &paths,
+            &live,
+            &recovery_event(&live, "service.endpoint_recoverable"),
+        );
+
+        // The pid is alive but the recorded start time is not its own: a
+        // recycled pid is not the startup, so it is recovered.
+        live.supervisor_start_ticks = Some(u64::MAX);
+        live.write()?;
+        let found_recycled = find_recoverable_service(&paths)?;
+        live.supervisor_start_ticks = None;
+
+        live.supervisor_pid = u32::MAX;
+        live.engine_pid = None;
+        live.write()?;
+        let found_dead = find_recoverable_service(&paths)?;
+
+        live.supervisor_pid = std::process::id();
+        // Age equal to the deadline is no longer the interactive wait.
+        // A longer window than the shared deadline would spare this.
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms);
+        live.write()?;
+        let found_at_deadline = find_recoverable_service(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            found_inside.is_none(),
+            "a live process inside the startup deadline must not be restarted: {found_inside:?}"
+        );
+        assert!(
+            !event_inside,
+            "an endpoint event raised earlier must not restart it either"
+        );
+        for (found, why) in [
+            (
+                found_recycled,
+                "a recycled pid is not a startup still in progress",
+            ),
+            (found_dead, "a dead pid is not a startup still in progress"),
+        ] {
+            assert_eq!(
+                found.map(|(record, reason)| (record.service_id, reason)),
+                Some((
+                    "svc-live-startup".to_owned(),
+                    "endpoint_status_unreachable".to_owned()
+                )),
+                "{why}"
+            );
+        }
+        assert_eq!(
+            found_at_deadline.map(|(record, reason)| (record.service_id, reason)),
+            Some((
+                "svc-live-startup".to_owned(),
+                "endpoint_status_unreachable".to_owned()
+            )),
+            "at the startup deadline a live process with a closed port is recoverable"
+        );
+        Ok(())
+    }
+
+    /// `rocm services` writes an engine's own `starting` state into the
+    /// record, so a live startup can read `starting` past the five-minute
+    /// stale-start window. That record is spared until
+    /// [`rocm_core::SERVE_STARTUP_DEADLINE`] like a `running` one; a dead pid
+    /// at the same age, or a live one past the deadline, is still stale.
+    #[test]
+    fn recovery_leaves_a_live_starting_record_alone_until_the_startup_deadline() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-live-starting");
+        paths.ensure()?;
+
+        let mut live = ManagedServiceRecord::new(
+            &paths,
+            "svc-live-starting",
+            "lemonade",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            free_loopback_port(),
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        live.status = "starting".to_owned();
+        let now = unix_time_millis();
+        let deadline_ms = rocm_core::SERVE_STARTUP_DEADLINE.as_millis();
+        // Past the stale-start window, two seconds inside the startup deadline.
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms.saturating_sub(2_000));
+        assert!(now.saturating_sub(live.created_at_unix_ms) >= SERVER_TRANSIENT_STALE_MS);
+        live.write()?;
+        let found_inside = find_recoverable_service(&paths)?;
+        let event_inside = service_record_matches_recovery_event(
+            &paths,
+            &live,
+            &recovery_event(&live, "service.manifest_recoverable"),
+        );
+
+        live.supervisor_pid = u32::MAX;
+        live.write()?;
+        let found_dead = find_recoverable_service(&paths)?;
+
+        live.supervisor_pid = std::process::id();
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms);
+        live.write()?;
+        let found_at_deadline = find_recoverable_service(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            found_inside.is_none(),
+            "a live starting process inside the startup deadline must not be restarted: {found_inside:?}"
+        );
+        assert!(
+            !event_inside,
+            "a manifest event raised earlier must not restart it either"
+        );
+        for (found, why) in [
+            (found_dead, "a dead pid is a stale start"),
+            (found_at_deadline, "a live start past the deadline is stale"),
+        ] {
+            assert_eq!(
+                found.map(|(record, reason)| (record.service_id, reason)),
+                Some((
+                    "svc-live-starting".to_owned(),
+                    "manifest_status_starting_stale".to_owned()
+                )),
+                "{why}"
+            );
+        }
         Ok(())
     }
 }

@@ -373,6 +373,16 @@ Expected result:
 - The OpenAI-compatible endpoint answers a simple chat request.
 - `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.
 
+The same model without `--foreground` or `--verbose` is the interactive
+summary. While the server starts, the status line follows the engine (a
+download percent, a load line, or a wait for the model to serve) and keeps
+updating past the first minute. It does not finish with
+`Deployment summary (not ready yet)` while the server is still loading. A
+ready server then prints the deployment summary. If that wait fails and the
+process is still up, the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and `rocm services` still lists the
+server.
+
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
@@ -530,6 +540,20 @@ Expected result:
 - The command refuses up front, naming the service already holding that port
   and how to free it (`rocm services stop <service-id> --yes`), without
   spawning an engine process or writing a new record.
+
+The default command, without `--foreground` or `--verbose`, leaves the server
+in the background. While it starts, the status line follows the engine: a
+download percent, a load line, or a wait for the model to serve. A model that
+is still loading after 45 seconds (the old wait, which piped output still
+uses) keeps that line; it is not replaced by a finished "not ready yet"
+summary. The wait fails with a non-zero exit only when the engine fails or
+exits, a download percent stops for 3 minutes, the port stays closed with no
+engine log for 2 minutes, a load line stops changing for 5 minutes, or 30
+minutes pass. When the endpoint answers, the
+command prints the deployment summary and returns to the shell. If the wait
+fails and the process is still up, the message names `rocm logs --service
+<service-id>` and `rocm services stop <service-id> --yes`, and `rocm services`
+still lists the server.
 
 ### Windows display driver check
 

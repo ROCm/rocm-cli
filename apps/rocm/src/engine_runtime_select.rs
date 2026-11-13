@@ -70,7 +70,9 @@
 //! `service_launch.rs` and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `wait_for_service_http_ready` is `pub(crate)`, read from `service_control.rs`'s
 //! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
-//! is `pub(crate)`, read from `service_launch.rs`. `http_post_local_service_json`
+//! is `pub(crate)`, read from `service_launch.rs`. `service_http_lists_model` and
+//! `service_http_inference_answers`, the two halves of its readiness probe, are
+//! `pub(crate)`, read from `serve_progress.rs`'s `wait_for_serve_startup`. `http_post_local_service_json`
 //! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
 //! `service_model_names_match` is `pub(crate)`, read from `chat/turn.rs`.
 //! `service_http_readiness_paths`, `http_get_local_service`,
@@ -346,48 +348,83 @@ pub(crate) fn wait_for_service_http_ready_with_progress(
     on_tick: &mut dyn FnMut(Duration),
 ) -> EndpointReadiness {
     let start = std::time::Instant::now();
-    let endpoint = format_http_base_url(host, port);
     let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
         // Re-evaluated each pass: a container engine reports the name its server
         // answers to only after it starts, so a name fixed up front can be wrong.
-        let canonical_model_id = model_name();
-        let canonical_model_id = canonical_model_id.as_str();
-        let listed = service_http_readiness_paths(engine).iter().any(|path| {
-            http_get_local_service(
-                host,
-                port,
-                path,
-                endpoint_api_key,
-                Duration::from_millis(750),
-            )
-            .is_ok_and(|(status, body)| {
-                service_http_readiness_response_ready(
-                    engine,
-                    path,
-                    status,
-                    &body,
-                    canonical_model_id,
-                )
-            })
-        });
-        if listed {
-            best = EndpointReadiness::Listing;
-            if rocm_core::openai_chat_completion_probe(
-                &endpoint,
-                canonical_model_id,
-                endpoint_api_key,
-                rocm_core::INFERENCE_PROBE_TIMEOUT,
-            )
-            .unwrap_or(false)
-            {
-                return EndpointReadiness::Serving;
-            }
+        match probe_service_http_readiness(engine, host, port, &model_name(), endpoint_api_key) {
+            EndpointReadiness::Serving => return EndpointReadiness::Serving,
+            EndpointReadiness::Listing => best = EndpointReadiness::Listing,
+            EndpointReadiness::Unreachable => {}
         }
         on_tick(start.elapsed());
         thread::sleep(Duration::from_millis(250));
     }
     best
+}
+
+/// One readiness probe: [`EndpointReadiness::Serving`] only after an inference
+/// request comes back, [`EndpointReadiness::Listing`] when the model is
+/// advertised but that request does not, otherwise unreachable.
+///
+/// Probes inference on every call. [`crate::serve_progress::wait_for_serve_startup`]
+/// spaces those probes out instead, through [`service_http_lists_model`] and
+/// [`service_http_inference_answers`], the same two checks, so the interactive
+/// status line and this wait cannot disagree about "ready".
+fn probe_service_http_readiness(
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> EndpointReadiness {
+    if !service_http_lists_model(engine, host, port, canonical_model_id, endpoint_api_key) {
+        return EndpointReadiness::Unreachable;
+    }
+    if service_http_inference_answers(host, port, canonical_model_id, endpoint_api_key) {
+        return EndpointReadiness::Serving;
+    }
+    EndpointReadiness::Listing
+}
+
+/// The cheap half of a readiness probe: the endpoint answers and advertises
+/// the model (a short GET per readiness path).
+pub(crate) fn service_http_lists_model(
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    service_http_readiness_paths(engine).iter().any(|path| {
+        http_get_local_service(
+            host,
+            port,
+            path,
+            endpoint_api_key,
+            Duration::from_millis(750),
+        )
+        .is_ok_and(|(status, body)| {
+            service_http_readiness_response_ready(engine, path, status, &body, canonical_model_id)
+        })
+    })
+}
+
+/// The expensive half: a real one-token chat request, which can wait up to
+/// [`rocm_core::INFERENCE_PROBE_TIMEOUT`] on a model that is still loading.
+pub(crate) fn service_http_inference_answers(
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    rocm_core::openai_chat_completion_probe(
+        &format_http_base_url(host, port),
+        canonical_model_id,
+        endpoint_api_key,
+        rocm_core::INFERENCE_PROBE_TIMEOUT,
+    )
+    .unwrap_or(false)
 }
 
 fn service_http_readiness_paths(engine: &str) -> &'static [&'static str] {
