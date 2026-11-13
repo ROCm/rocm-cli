@@ -6,10 +6,26 @@ SPDX-License-Identifier: MIT
 
 # Getting started with ROCm CLI
 
+## First run
+
 ```{include} ../../README.md
 :start-after: "## First run"
 :end-before: "## Interactive interfaces"
 ```
+
+![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
+
+## Interactive interfaces
+
+```{include} ../../README.md
+:start-after: "## Interactive interfaces"
+:end-before: "## Configure ROCm and serve a model"
+```
+
+The following recording shows the full-screen Console exploring simulated GPU
+telemetry, model serving, and offline chat:
+
+![ROCm Console demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/console.gif)
 
 ## Configure ROCm and serve a model
 
@@ -39,11 +55,4 @@ because which form works depends on the engine your GPU selects.
 ```{include} ../../README.md
 :start-after: "form works depends on the engine your GPU selects."
 :end-before: "## Commands"
-```
-
-## Interactive interfaces
-
-```{include} ../../README.md
-:start-after: "## Interactive interfaces"
-:end-before: "## Configure ROCm and serve a model"
 ```
