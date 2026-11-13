@@ -445,6 +445,115 @@ fn serve_two_next_builds_with_torchaudio_rebuilds(world: &mut E2eWorld) {
     serve_two_next_builds(world, &torchaudio);
 }
 
+/// One build of each stack package per `rocm` version in `builds`, every one
+/// labelled for its `rocm` build and requiring it the way the live index does:
+/// torch its exact `rocm`, torchvision and torchaudio their exact torch. The
+/// torch and torchvision releases are any pair the canonical matcher accepts;
+/// what a scenario reads is which `rocm` build was chosen.
+fn write_line_builds(served: &Path, builds: &[&str], torch: &str, torchvision: &str) {
+    write_fixture(&served.join("index.html"), &aggregate_root_html());
+    let torch_of = |rocm: &str| format!("{torch}+rocm{rocm}");
+    let rocm = builds
+        .iter()
+        .map(|rocm| (*rocm, ANY_WHEEL_TAG, Vec::new()))
+        .collect::<Vec<_>>();
+    let torch_versions = builds.iter().map(|rocm| torch_of(rocm)).collect::<Vec<_>>();
+    let torchvision_versions = builds
+        .iter()
+        .map(|rocm| format!("{torchvision}+rocm{rocm}"))
+        .collect::<Vec<_>>();
+    let torch_builds = builds
+        .iter()
+        .zip(&torch_versions)
+        .map(|(rocm, torch)| (torch.as_str(), ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]))
+        .collect::<Vec<_>>();
+    let torchvision_builds = torchvision_versions
+        .iter()
+        .zip(&torch_versions)
+        .map(|(torchvision, torch)| {
+            (
+                torchvision.as_str(),
+                ANY_WHEEL_TAG,
+                vec![format!("torch=={torch}")],
+            )
+        })
+        .collect::<Vec<_>>();
+    // torchaudio shares torch's release number and build label.
+    let torchaudio_builds = torch_versions
+        .iter()
+        .map(|torch| {
+            (
+                torch.as_str(),
+                ANY_WHEEL_TAG,
+                vec![format!("torch=={torch}")],
+            )
+        })
+        .collect::<Vec<_>>();
+    write_wheel_index_builds(&served.join("rocm"), "rocm", &rocm);
+    write_wheel_index_builds(&served.join("torch"), "torch", &torch_builds);
+    write_wheel_index_builds(
+        &served.join("torchvision"),
+        "torchvision",
+        &torchvision_builds,
+    );
+    write_wheel_index_builds(&served.join("torchaudio"), "torchaudio", &torchaudio_builds);
+}
+
+/// The 10.1 line's newest stable build: what `--version 10.1` must select.
+const NEXT_LINE_NEWEST_VERSION: &str = "10.1.2";
+/// A prerelease above it, a `10.10` build a prefix match would take, an older
+/// build of the line and a build of the previous line.
+const NEXT_LINE_BUILDS: [&str; 5] = [
+    "10.0.0",
+    "10.1.0",
+    NEXT_LINE_NEWEST_VERSION,
+    "10.1.3rc1",
+    "10.10.0",
+];
+
+#[given(
+    "a ROCm 10 pip index fixture that publishes several 10.1 builds, a 10.1 prerelease and a 10.10 build"
+)]
+async fn pip_index_fixture_with_next_line_builds(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures").join("next");
+    write_line_builds(&served, &NEXT_LINE_BUILDS, "2.11.0", "0.26.0");
+    serve_pip_fixtures(world);
+}
+
+/// The 7.14 line's newest stable build: what `--version 7.14` must select.
+const CANONICAL_LINE_NEWEST_VERSION: &str = "7.14.1";
+const CANONICAL_LINE_BUILDS: [&str; 4] = [
+    "7.14.0",
+    CANONICAL_LINE_NEWEST_VERSION,
+    "7.14.2rc1",
+    "7.15.0",
+];
+
+#[given(
+    "a canonical release pip index fixture that publishes several 7.14 builds, a 7.14 prerelease and a 7.15 build"
+)]
+async fn pip_index_fixture_with_canonical_line_builds(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures").join("current");
+    write_line_builds(&served, &CANONICAL_LINE_BUILDS, "2.9.0", "0.24.0");
+    serve_pip_fixtures(world);
+}
+
+/// The newer build's only torchaudio is a wheel this host cannot install, so
+/// for this Python and platform it publishes none; the older build publishes
+/// an installable one. The mirror of the fixture below.
+#[given(
+    "a ROCm 10 pip index fixture whose ROCm 10.1.0 torchaudio is only a wheel this host cannot install"
+)]
+async fn pip_index_fixture_without_newest_torchaudio(world: &mut E2eWorld) {
+    serve_two_next_builds(
+        world,
+        &[
+            (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+            (NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION, FOREIGN_WHEEL_TAG),
+        ],
+    );
+}
+
 #[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
 async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
     serve_two_next_builds_with_torchaudio_rebuilds(world);
@@ -457,6 +566,19 @@ async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
 #[given("a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label")]
 async fn pip_index_fixture_with_torchaudio_rebuilds_sharing_a_label(world: &mut E2eWorld) {
     serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
+/// Every build's only torchaudio is a wheel this host cannot install, so no
+/// build has a full stack and nothing else is worth suggesting.
+#[given("a ROCm 10 pip index fixture where no build has a torchaudio this host can install")]
+async fn pip_index_fixture_without_any_torchaudio(world: &mut E2eWorld) {
+    serve_two_next_builds(
+        world,
+        &[
+            (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
+            (NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION, FOREIGN_WHEEL_TAG),
+        ],
+    );
 }
 
 /// The pinned build's only torchaudio is a wheel this host cannot install, so
@@ -488,6 +610,22 @@ const NEXT_GROUPED_FAMILY_RUNTIME_KEY: &str = "release-wheel-next-v1-gfx120x-all
 /// `source_layout_generation`, not derived from the version string.
 #[given("a registered ROCm 10 wheel runtime with a grouped family")]
 async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld) {
+    plant_next_wheel_runtime(world, Some(RAW_ARCH));
+}
+
+/// The same runtime from before ROCm CLI recorded the exact arch: no
+/// `rocm_sdk_target`, and no `device-*` extra in its specs to recover one from,
+/// so only the grouped family is known.
+#[given("a registered ROCm 10 wheel runtime that records no exact arch")]
+async fn registered_next_wheel_runtime_without_exact_arch(world: &mut E2eWorld) {
+    plant_next_wheel_runtime(world, None);
+}
+
+fn plant_next_wheel_runtime(world: &mut E2eWorld, exact_arch: Option<&str>) {
+    let rocm_extras = exact_arch.map_or_else(
+        || "libraries,devel".to_owned(),
+        |arch| format!("libraries,devel,device-{arch}"),
+    );
     let install_root = root(world).join("runtime-next-grouped-family");
     std::fs::create_dir_all(&install_root).expect("failed to create install root");
 
@@ -508,12 +646,12 @@ async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld)
         "wheel_composition": {
             "source_layout_generation": "next-v1",
             "package_specs": [
-                format!("rocm[libraries,devel,device-{RAW_ARCH}]==9.0.0"),
+                format!("rocm[{rocm_extras}]==9.0.0"),
                 "torch==2.9.0+rocm9.0.0",
                 "torchvision==0.24.0+rocm9.0.0",
                 "torchaudio==2.9.0+rocm9.0.0",
             ],
-            "rocm_sdk_target": RAW_ARCH,
+            "rocm_sdk_target": exact_arch,
         },
         "installed_at_unix_ms": 1_700_000_000_000u64,
     }))
@@ -732,6 +870,20 @@ async fn preview_apply_pending_update(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user tries to preview applying the pending update to that runtime")]
+async fn try_preview_apply_pending_update(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "update",
+            "--apply",
+            "--dry-run",
+            "--runtime",
+            NEXT_GROUPED_FAMILY_RUNTIME_KEY,
+        ],
+    );
+}
+
 #[given("an untrusted ROCm 10 pip base override")]
 async fn untrusted_pip_index_fixture(world: &mut E2eWorld) {
     let served = root(world).join("untrusted-therock-pip-fixture");
@@ -778,6 +930,45 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
+}
+
+/// The newer 10.1 patch, uploaded first.
+const NEXT_LINE_NEWEST_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.1.2.tar.gz";
+/// The older 10.1 patch, uploaded last: newest by mtime, not by version.
+const NEXT_LINE_LATEST_UPLOAD_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.1.0.tar.gz";
+
+/// Queue the env that points the next `rocm` run at the served tarball
+/// catalogs. Each run consumes `command_env`, so a second run calls this again.
+fn point_at_tarball_fixtures(world: &mut E2eWorld) {
+    allow_base_overrides(world);
+    let base = server_base(world);
+    let next = next_tarball_base(world);
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
+}
+
+#[given("a ROCm 10 tarball fixture whose older 10.1 patch was uploaded last")]
+async fn tarball_line_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-tarball-fixtures");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+    write_fixture(
+        &served.join("tarball").join("next").join("index.html"),
+        &tarball_index_html(&[
+            (NEXT_REAL_TARBALL, 1_787_500_000.0),
+            (NEXT_LINE_NEWEST_TARBALL, 1_787_600_000.0),
+            (NEXT_LINE_LATEST_UPLOAD_TARBALL, 1_787_700_000.0),
+        ]),
+    );
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    point_at_tarball_fixtures(world);
 }
 
 /// Size and pacing for the paced tarball fixture below: large enough (versus
@@ -1006,6 +1197,24 @@ fn preview_ok(world: &mut E2eWorld, args: &[&str]) {
 #[when("the user previews a wheel SDK install for arch gfx1200 with no version pin")]
 async fn preview_unpinned_wheel_install(world: &mut E2eWorld) {
     preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 with no version pin")]
+async fn try_preview_unpinned_wheel_install(world: &mut E2eWorld) {
+    preview(
         world,
         &[
             "install",
@@ -1308,6 +1517,46 @@ async fn preview_newer_pinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1")]
+async fn preview_line_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.1",
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.1")]
+async fn try_preview_line_pinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.1",
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
     preview(
@@ -1429,6 +1678,66 @@ async fn preview_pinned_tarball_install(world: &mut E2eWorld) {
             RAW_ARCH,
             "--version",
             NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.1")]
+async fn preview_line_pinned_tarball_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.1",
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user tries to preview a tarball SDK install for arch gfx1200 pinned to ROCm 10.2")]
+async fn try_preview_unpublished_line_tarball_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.2",
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 7.14")]
+async fn preview_canonical_line_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "7.14",
             "--dry-run",
         ],
     );
@@ -1880,6 +2189,91 @@ async fn preview_resolves_next_pip_index(world: &mut E2eWorld) {
     );
 }
 
+/// The `selected_rocm_version:` line names `expected` and none of the other
+/// builds the fixture publishes.
+fn assert_selected_rocm_version(world: &E2eWorld, expected: &str, published: &[&str]) {
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {expected}\n"),
+        "selected ROCm build",
+    );
+    for other in published.iter().filter(|version| **version != expected) {
+        assert!(
+            !stdout(world).contains(&format!("selected_rocm_version: {other}\n")),
+            "the preview selected {other} instead of {expected}:\n{}",
+            stdout(world)
+        );
+    }
+}
+
+#[then(
+    "the preview resolves the ROCm 10 pip index for ROCm 10.1.2, the newest stable build of the 10.1 line"
+)]
+async fn preview_resolves_next_pip_index_for_rocm_10_1_line(world: &mut E2eWorld) {
+    let base = next_pip_base(world);
+    assert_contains(world, &format!("canonical_source: {base}"), "next source");
+    assert_contains(
+        world,
+        "requested: version 10.1",
+        "the pin that selected the line",
+    );
+    assert_selected_rocm_version(world, NEXT_LINE_NEWEST_VERSION, &NEXT_LINE_BUILDS);
+    // What `uv` would be asked to install: the line's newest build, whole.
+    assert_contains(
+        world,
+        &format!("rocm[libraries,device-{RAW_ARCH}]=={NEXT_LINE_NEWEST_VERSION} "),
+        "line build in the requirements",
+    );
+    assert!(
+        !stdout(world).contains(&current_pip_base(world)),
+        "a 10.1 line pin resolved the canonical index:\n{}",
+        stdout(world)
+    );
+}
+
+#[then("the preview resolves the ROCm 10 pip index for exactly ROCm 10.1.0, not the later 10.1.2")]
+async fn preview_resolves_exact_pin_despite_later_patch(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("canonical_source: {}", next_pip_base(world)),
+        "next source",
+    );
+    assert_selected_rocm_version(world, NEWER_NEXT_ROCM_VERSION, &NEXT_LINE_BUILDS);
+}
+
+#[then("the preview resolves the canonical release pip index for ROCm 7.14.1")]
+async fn preview_resolves_canonical_line(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("canonical_source: {}", current_pip_base(world)),
+        "canonical source",
+    );
+    assert_contains(
+        world,
+        "requested: version 7.14",
+        "the pin that selected the line",
+    );
+    assert_selected_rocm_version(world, CANONICAL_LINE_NEWEST_VERSION, &CANONICAL_LINE_BUILDS);
+    // The device extra on the canonical layout follows the GPU this host
+    // reports, so only the versions are asserted: the whole stack is the
+    // line's newest build.
+    assert_contains(
+        world,
+        &format!("latest_compatible_version: {CANONICAL_LINE_NEWEST_VERSION}\n"),
+        "canonical line version",
+    );
+    assert_contains(
+        world,
+        &format!("]=={CANONICAL_LINE_NEWEST_VERSION} torch[device-"),
+        "canonical line install plan",
+    );
+    assert_contains(
+        world,
+        &format!("torchaudio==2.9.0+rocm{CANONICAL_LINE_NEWEST_VERSION}\n"),
+        "canonical line torchaudio",
+    );
+}
+
 #[then("the preview resolves the default ROCm 10 pip index")]
 async fn preview_resolves_default_next_pip_index(world: &mut E2eWorld) {
     assert_contains(
@@ -2056,6 +2450,22 @@ async fn preview_selects_real_tarball(world: &mut E2eWorld) {
     );
 }
 
+#[then("the preview selects the ROCm 10.1.2 tarball, not the later-uploaded 10.1.0")]
+async fn preview_selects_newest_line_tarball(world: &mut E2eWorld) {
+    let base = next_tarball_base(world);
+    assert_contains(
+        world,
+        &format!("tarball_url: {base}{NEXT_LINE_NEWEST_TARBALL}"),
+        "newest 10.1 release",
+    );
+    assert_contains(world, "latest_version: 10.1.2", "selected line version");
+    assert!(
+        !stdout(world).contains(NEXT_LINE_LATEST_UPLOAD_TARBALL),
+        "a 10.1 line pin took the latest upload instead of the newest release:\n{}",
+        stdout(world)
+    );
+}
+
 #[then("the preview does not select the tests artifact")]
 async fn preview_does_not_select_tests_tarball(world: &mut E2eWorld) {
     assert!(
@@ -2110,6 +2520,174 @@ async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
         !reported.contains("package_specs:"),
         "the refusal still printed an install plan:\n{reported}"
     );
+}
+
+fn reported_output(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    )
+}
+
+#[then(
+    "the failure suggests the published ROCm 10.0.0 for arch gfx1200, without suggesting nightly or a 10.1 version"
+)]
+async fn failure_suggests_published_next_release(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    assert!(
+        reported.contains(&next_pip_base(world)),
+        "the refusal did not search the ROCm 10 next layout:\n{reported}"
+    );
+    assert!(
+        !reported.contains(&current_pip_base(world)),
+        "the refusal searched the canonical index:\n{reported}"
+    );
+    assert!(
+        reported.contains("next layout"),
+        "the refusal did not name the next layout:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!(
+            "`--version {NEXT_ROCM_VERSION} --family {RAW_ARCH}`"
+        )),
+        "the refusal did not suggest the published {NEXT_ROCM_VERSION} with the requested arch:\n{reported}"
+    );
+    assert!(
+        !reported.contains("--version 10.1"),
+        "the refusal suggested a 10.1 version the index does not publish:\n{reported}"
+    );
+    assert!(
+        !reported.contains("--channel nightly"),
+        "the refusal told the user to try nightly:\n{reported}"
+    );
+    assert!(
+        !reported.contains("package_specs:"),
+        "the refusal still printed an install plan:\n{reported}"
+    );
+}
+
+/// Runs exactly the `--version`/`--family` pair the previous failure printed,
+/// so the scenario proves the advice clears the failure rather than only
+/// pinning its wording.
+#[when("the user re-runs the preview with the version and arch the failure suggested")]
+async fn rerun_with_suggested_version(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    let suggested = reported
+        .split('`')
+        .find(|chunk| chunk.starts_with("--version "))
+        .unwrap_or_else(|| panic!("the failure suggested no `--version` command:\n{reported}"))
+        .to_owned();
+    let mut args = vec![
+        "install",
+        "sdk",
+        "--channel",
+        "release",
+        "--format",
+        "wheel",
+    ];
+    args.extend(suggested.split_whitespace());
+    args.push("--dry-run");
+    arm_pip_fixture_env(world);
+    preview_ok(world, &args);
+}
+
+#[then(
+    "the failure lists the published ROCm 10 archives for gfx120X-all and suggests 10.1.2 for arch gfx1200"
+)]
+async fn failure_lists_published_next_archives(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    assert!(
+        reported.contains("next-layout TheRock release tarball stream is incomplete"),
+        "the refusal did not name the next-layout catalog:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!(
+            "No archive for {GROUP_FAMILY} was found for version 10.2 on the ROCm 10+ next layout. \
+             Stable releases it publishes for {GROUP_FAMILY}: 10.1.2, 10.1.0, 10.0.0. \
+             Re-run with one of them, for example `--version 10.1.2 --family {RAW_ARCH}`."
+        )),
+        "the refusal did not list the published archives and suggest the newest:\n{reported}"
+    );
+    for absent in ["nightly", "package stack", "tarball_url:"] {
+        assert!(
+            !reported.contains(absent),
+            "the refusal contains `{absent}`:\n{reported}"
+        );
+    }
+}
+
+/// The tarball twin of [`rerun_with_suggested_version`].
+#[when("the user re-runs the tarball preview with the version and arch the failure suggested")]
+async fn rerun_tarball_with_suggested_version(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    let suggested = reported
+        .split('`')
+        .find(|chunk| chunk.starts_with("--version "))
+        .unwrap_or_else(|| panic!("the failure suggested no `--version` command:\n{reported}"))
+        .to_owned();
+    let mut args = vec![
+        "install",
+        "sdk",
+        "--channel",
+        "release",
+        "--format",
+        "tarball",
+    ];
+    args.extend(suggested.split_whitespace());
+    args.push("--dry-run");
+    point_at_tarball_fixtures(world);
+    preview_ok(world, &args);
+}
+
+#[then(
+    "the failure says no exact device target is known, without suggesting a version or a --family re-run"
+)]
+async fn failure_names_missing_device_target_without_version_advice(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    assert!(
+        reported.contains("without an exact device target"),
+        "the refusal did not say the device target is unknown:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!("from next-layout source {}", next_pip_base(world))),
+        "the refusal did not name the next-layout source:\n{reported}"
+    );
+    // No release can clear this, and `rocm update` takes no `--family`.
+    for absent in [
+        "--version",
+        "re-run with `--family`",
+        "Install one of them",
+        "Re-run with one of them",
+        "nightly",
+    ] {
+        assert!(
+            !reported.contains(absent),
+            "the refusal contains `{absent}`:\n{reported}"
+        );
+    }
+}
+
+#[then("the failure names the missing torchaudio without suggesting another version")]
+async fn failure_names_missing_torchaudio_without_version_advice(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    assert!(
+        reported.contains(&format!(
+            "no torchaudio built for ROCm {NEWER_NEXT_ROCM_VERSION} is published for this Python and platform"
+        )),
+        "the refusal did not say why {NEWER_NEXT_ROCM_VERSION} failed:\n{reported}"
+    );
+    for absent in [
+        "--version",
+        "Install one of them",
+        "Re-run with one of them",
+        "nightly",
+    ] {
+        assert!(
+            !reported.contains(absent),
+            "the refusal contains `{absent}`:\n{reported}"
+        );
+    }
 }
 
 #[then("the failure asks for an exact GPU arch and names --family gfx1200")]

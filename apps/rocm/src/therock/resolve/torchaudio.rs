@@ -2,17 +2,27 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Which torchaudio build a ROCm 10 or newer install pins, and why. The wheel
-//! indexes publish torchaudio rebuilds under one `+rocm<version>` label that
-//! nothing in their metadata tells apart, so `wheel` asks `torchaudio_pin` for
-//! the build instead of leaving it to `uv`: the hardware-verified release when
-//! the index publishes it, the newest build for that ROCm build otherwise. The
-//! `TorchaudioPin` it returns carries the reason, and the plan line and the
-//! install-log note are both derived from it. Depends on `wheel` for the PEP 440
-//! ordering of package versions.
+//! Which torchaudio build a ROCm 10 wheel stack pins, and why.
+//!
+//! `torchaudio_pin` picks the build for one ROCm release. It prefers the
+//! hardware-verified release the vLLM engine records for that ROCm line, and
+//! falls back to the newest build (`latest_build_for_rocm`) when none is
+//! recorded or it is not published here. `TorchaudioPin` carries the choice
+//! and its basis, and `describe` words it. The plan's `torchaudio_selection:`
+//! line and `unverified_torchaudio_note`'s install-log note both come from
+//! `describe`, so what is printed follows from the decision. A ROCm release
+//! with no torchaudio for this Python and platform fails as a
+//! `VersionUnsatisfied`, because another release may publish one.
+//!
+//! A leaf child of `therock/resolve.rs`, split out of `wheel.rs` to keep that
+//! module within the size limit. It reads the PEP 440 helpers
+//! (`package_release_key`, `package_rocm_suffix`,
+//! `package_versions_matching_rocm`) from `wheel.rs`, and `wheel.rs` calls
+//! `torchaudio_pin` while resolving the next layout.
 
+use super::next_hint::VersionUnsatisfied;
 use super::wheel::{package_release_key, package_rocm_suffix, package_versions_matching_rocm};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 /// The torchaudio build pinned for a ROCm 10 install, and why it was chosen.
 /// The plan line and install-log note are both [`TorchaudioPin::describe`], so
@@ -117,9 +127,15 @@ pub(super) fn torchaudio_pin(
 ) -> Result<TorchaudioPin> {
     let built_for_rocm = package_versions_matching_rocm(published, rocm_version);
     if built_for_rocm.is_empty() {
-        bail!(
-            "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
-        );
+        // Another ROCm release can publish a torchaudio this host can install,
+        // so a different `--version` can clear this one.
+        return Err(VersionUnsatisfied::new(
+            Some(rocm_version),
+            format!(
+                "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
+            ),
+        )
+        .into());
     }
     let pin = |version, basis| TorchaudioPin {
         version,
@@ -179,7 +195,7 @@ fn published_build_of(versions: &[String], release: &str) -> Option<String> {
 /// against that build's torch — the same choice `uv` made unaided when the
 /// pinned build was also the newest one on the index.
 ///
-/// Not `select_latest_stack_package` (in `wheel.rs`): `parse_version` reads only
+/// Not [`select_latest_stack_package`]: [`parse_version`] reads only
 /// `major.minor.patch` and rejects the rest, and torchaudio publishes rebuilds
 /// as extra release segments (`2.11.0.2`, `2.11.0.3`), so that would drop every
 /// rebuild and settle on the original `2.11.0` build.

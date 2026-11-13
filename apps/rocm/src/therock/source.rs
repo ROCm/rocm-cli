@@ -14,19 +14,20 @@
 
 use super::version::{
     VersionStage, normalize_requested_build_date, parse_version, runtime_version_build_date,
+    stable_release_line_pin, version_request_matches,
 };
 use anyhow::{Result, bail};
 use rocm_core::detect_host_gpu_diagnostics;
 
 const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
-const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+pub(super) const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
 /// The next layout's stable aggregate pip index. Same simple-index shape the
 /// canonical multi-arch stream publishes, on a separate host, with its own
 /// package generation; it is not a mirror of, or a fallback for, the canonical
 /// index.
-const THEROCK_NEXT_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
+pub(super) const THEROCK_NEXT_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
 /// The next layout's stable tarball catalog. Same scrapeable listing the
 /// canonical catalog uses, but it publishes non-release sibling archives beside
 /// the real dist archive (see `select_tarball_candidate` in `resolve/tarball.rs`).
@@ -150,10 +151,19 @@ impl RuntimeVersionSelector {
 
     pub(super) fn matches_version(&self, version: &str) -> bool {
         match self {
-            Self::Version(requested) => version == requested,
+            Self::Version(requested) => version_request_matches(requested, version),
             Self::BuildDate(date) => runtime_version_build_date(version).as_deref() == Some(date),
         }
     }
+}
+
+/// Whether `selector` pins a `major.minor` release line rather than one
+/// release.
+pub(super) fn selector_is_release_line(selector: &RuntimeVersionSelector) -> bool {
+    matches!(
+        selector,
+        RuntimeVersionSelector::Version(version) if stable_release_line_pin(version).is_some()
+    )
 }
 
 impl TheRockChannel {
@@ -255,6 +265,8 @@ pub(super) fn resolve_source(channel: TheRockChannel, layout: SourceLayout) -> R
 ///   channel names a release, so it routes to the next layout, where
 ///   [`select_source_layout`] refuses it.
 ///
+/// A `major.minor` pin (`10.1`) is a release pin for that line and routes as
+/// its stable releases do; a prerelease of it never reads as a line.
 /// A pin this CLI cannot read stays canonical: nothing can be said about where
 /// it lives, and the canonical lookup fails on it as it always has.
 pub(super) fn layout_serving(
@@ -275,11 +287,17 @@ pub(super) fn layout_serving(
         (TheRockChannel::Nightly, RuntimeVersionSelector::BuildDate(date)) => by_build_date(date),
         (TheRockChannel::Release, RuntimeVersionSelector::BuildDate(_)) => SourceLayout::Canonical,
         (_, RuntimeVersionSelector::Version(version)) => {
-            let Some(parsed) = parse_version(version) else {
-                return SourceLayout::Canonical;
+            // `parse_version` reads only `major.minor.patch`; a `major.minor`
+            // line pin (`10.1`) is a stable release pin too, routed by its major.
+            let stable_next = match parse_version(version) {
+                Some(parsed) => {
+                    parsed.stage == VersionStage::Stable && parsed.major >= THEROCK_NEXT_MIN_MAJOR
+                }
+                None => match stable_release_line_pin(version) {
+                    Some((major, _)) => major >= THEROCK_NEXT_MIN_MAJOR,
+                    None => return SourceLayout::Canonical,
+                },
             };
-            let stable_next =
-                parsed.stage == VersionStage::Stable && parsed.major >= THEROCK_NEXT_MIN_MAJOR;
             match channel {
                 TheRockChannel::Release if stable_next => SourceLayout::Next,
                 TheRockChannel::Release => SourceLayout::Canonical,
@@ -310,12 +328,10 @@ pub(super) fn select_source_layout(
     }
     if let Some(RuntimeVersionSelector::Version(version)) = version_selector
         && matches!(channel, TheRockChannel::Nightly)
-        && let Some(parsed) = parse_version(version)
-        && parsed.stage == VersionStage::Stable
+        && let Some(major) = stable_pin_major(version)
     {
         bail!(
-            "ROCm {} and newer stable releases are published only on the release channel; re-run `rocm install sdk --channel release --version {version}`",
-            parsed.major
+            "ROCm {major} and newer stable releases are published only on the release channel; re-run `rocm install sdk --channel release --version {version}`"
         );
     }
     if family_resolution.raw_arch.is_none() {
@@ -329,6 +345,17 @@ pub(super) fn select_source_layout(
         );
     }
     Ok(SourceLayout::Next)
+}
+
+/// The major of a stable pin: an exact `major.minor.patch` stable release or a
+/// `major.minor` line. A `parse_version` miss falls to the line parser, so an
+/// `11.2` request is told ROCm 11, not the minimum next-layout major. `None`
+/// for a prerelease or anything unreadable.
+fn stable_pin_major(version: &str) -> Option<u32> {
+    match parse_version(version) {
+        Some(parsed) => (parsed.stage == VersionStage::Stable).then_some(parsed.major),
+        None => stable_release_line_pin(version).map(|(major, _)| major),
+    }
 }
 
 /// One real arch that `family` groups, for the remediation text. `None` for a
@@ -392,6 +419,7 @@ pub(super) fn requested_source_layout(
 mod tests {
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
+    use crate::therock::resolve::select_rocm_version;
     use crate::therock::test_support::family_for_test;
 
     /// Which layout serves a request, for every shape of request on both
@@ -780,6 +808,202 @@ mod tests {
         );
         assert_eq!(
             requested_source_layout(TheRockChannel::Release, Some(SourceLayout::Next), None),
+            SourceLayout::Next
+        );
+    }
+
+    /// `--version 10.1` is a stable 10.1 line, not a failed parse and not the
+    /// literal `10.1.0`. It must take the next layout, the same exact-arch
+    /// gate as `10.1.0`, and the newest stable release in that line. A
+    /// three-component pin stays exact, a prerelease is not a line pin, and
+    /// an unpinned request reads the newest layout.
+    #[test]
+    fn two_component_version_pin_routes_and_matches_its_release_line() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let grouped = family_for_test("gfx120X-all", None);
+        let line = RuntimeVersionSelector::version("10.1").unwrap();
+
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&line)).unwrap(),
+            SourceLayout::Next,
+            "a ROCm 10.1 line pin must leave the canonical index"
+        );
+        assert_eq!(
+            requested_source_layout(TheRockChannel::Release, None, Some(&line)),
+            SourceLayout::Next
+        );
+        assert!(
+            line.matches_version("10.1.0"),
+            "10.1 must match the published 10.1.0 release"
+        );
+        assert!(line.matches_version("10.1.2"));
+        assert!(
+            !line.matches_version("10.1.0a20260822"),
+            "a line pin must not swallow a prerelease in that line"
+        );
+        assert!(!line.matches_version("10.0.0"));
+        assert!(
+            !line.matches_version("10.10.0"),
+            "10.1 must not prefix-match 10.10"
+        );
+
+        let selected = select_rocm_version(
+            TheRockChannel::Release,
+            &[
+                "10.0.0".to_owned(),
+                "10.1.0".to_owned(),
+                "10.1.0a20260822".to_owned(),
+                "10.1.2".to_owned(),
+                "10.10.0".to_owned(),
+                "7.14.1".to_owned(),
+            ],
+            Some(&line),
+        );
+        assert_eq!(selected.as_deref(), Some("10.1.2"));
+
+        let grouped_error = select_source_layout(TheRockChannel::Release, &grouped, Some(&line))
+            .expect_err("a 10.1 line pin still requires an exact arch")
+            .to_string();
+        assert!(
+            grouped_error.contains("requires an exact GPU arch"),
+            "{grouped_error}"
+        );
+        assert!(
+            grouped_error.contains("--family gfx1200"),
+            "{grouped_error}"
+        );
+
+        let nightly_error = select_source_layout(TheRockChannel::Nightly, &exact, Some(&line))
+            .expect_err("a 10.1 line pin has no nightly stream")
+            .to_string();
+        assert!(
+            nightly_error.contains("--channel release"),
+            "{nightly_error}"
+        );
+        assert!(
+            !nightly_error.contains("try `--channel nightly`"),
+            "{nightly_error}"
+        );
+
+        // A post-release is not a release of the line: the release channel
+        // installs only `X.Y.Z` stables (`is_stable_runtime_version`), and a
+        // line pin must not reach what an unpinned pick on that channel skips.
+        assert!(!line.matches_version("10.1.0.post1"));
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Release,
+                &["10.1.0".to_owned(), "10.1.0.post1".to_owned()],
+                Some(&line),
+            )
+            .as_deref(),
+            Some("10.1.0")
+        );
+
+        // PEP 440 reads release components as integers, so `10.01` is `10.1`,
+        // as `uv` and pip read it. It routes and matches as the 10.1 line.
+        let zero_padded = RuntimeVersionSelector::version("10.01").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&zero_padded)).unwrap(),
+            SourceLayout::Next
+        );
+        assert!(zero_padded.matches_version("10.1.2"));
+        assert!(!zero_padded.matches_version("10.10.0"));
+
+        // A line pin's refusals name its own major, not the ROCm 10 floor.
+        let later_line = RuntimeVersionSelector::version("11.2").unwrap();
+        let later_nightly_error =
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&later_line))
+                .expect_err("an 11.2 line pin has no nightly stream")
+                .to_string();
+        assert!(
+            later_nightly_error.starts_with("ROCm 11 and newer stable releases are published only"),
+            "{later_nightly_error}"
+        );
+
+        // A component past u32 is not a line pin. Truncating 2^32 + 10 would
+        // read it as the ROCm 10 line and leave the canonical index.
+        let overflowing = RuntimeVersionSelector::version("4294967306.1").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&overflowing)).unwrap(),
+            SourceLayout::Canonical
+        );
+        assert!(!overflowing.matches_version("10.1.0"));
+
+        // Routes that already worked must not move.
+        let exact_next = RuntimeVersionSelector::version("10.1.0").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&exact_next)).unwrap(),
+            SourceLayout::Next
+        );
+        assert!(exact_next.matches_version("10.1.0"));
+        assert!(!exact_next.matches_version("10.1.2"));
+        assert!(!exact_next.matches_version("10.1"));
+
+        let older = RuntimeVersionSelector::version("7.14.1").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&older)).unwrap(),
+            SourceLayout::Canonical
+        );
+        assert!(older.matches_version("7.14.1"));
+        assert!(!older.matches_version("7.14.0"));
+        assert!(!older.matches_version("7.14.2"));
+
+        let older_line = RuntimeVersionSelector::version("7.14").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&older_line)).unwrap(),
+            SourceLayout::Canonical,
+            "a two-component pin below ROCm 10 stays on the canonical index"
+        );
+        assert!(older_line.matches_version("7.14.0"));
+        assert!(older_line.matches_version("7.14.1"));
+        assert!(!older_line.matches_version("7.15.0"));
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Release,
+                &[
+                    "7.14.0".to_owned(),
+                    "7.14.1".to_owned(),
+                    "7.15.0".to_owned()
+                ],
+                Some(&older_line),
+            )
+            .as_deref(),
+            Some("7.14.1")
+        );
+
+        // A four-component publish is still a stable release of its line.
+        let four_component_line = RuntimeVersionSelector::version("7.2").unwrap();
+        assert!(four_component_line.matches_version("7.2.4.70204"));
+        assert!(!four_component_line.matches_version("7.20.4.70204"));
+        assert!(!four_component_line.matches_version("7.2.4.70204rc1"));
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Release,
+                &["7.2.3".to_owned(), "7.2.4.70204".to_owned()],
+                Some(&four_component_line),
+            )
+            .as_deref(),
+            Some("7.2.4.70204")
+        );
+
+        let prerelease = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&prerelease)).unwrap(),
+            SourceLayout::Canonical,
+            "a prerelease must not be read as a stable two-component pin"
+        );
+        assert_eq!(
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&prerelease)).unwrap(),
+            SourceLayout::Canonical
+        );
+
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, None).unwrap(),
+            SourceLayout::Next,
+            "an unpinned request reads the newest layout"
+        );
+        assert_eq!(
+            requested_source_layout(TheRockChannel::Release, None, None),
             SourceLayout::Next
         );
     }

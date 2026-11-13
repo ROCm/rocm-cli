@@ -378,3 +378,96 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user tries to preview a nightly tarball SDK install for arch gfx1200 pinned to the earlier stream's last build date
     Then the install fails
     And the failure names the first build date of the newer layout and points to a wheel install that resolves that earlier nightly
+
+  # `--version 10.1` is the 10.1 line, not a failed parse of `10.1.0` and not
+  # an exact pin. The fixture publishes the 10.1 line's 10.1.0 and 10.1.2 beside
+  # a 10.1.3rc1 prerelease, a 10.10.0 and a 10.0.0, so the pin must take
+  # 10.1.2: the oldest of the line, an exact `10.1.0`, a prerelease and a
+  # `10.10` prefix match would each pick something else. It must also leave the
+  # canonical 7.x index. Needs no uv: the version is chosen before `uv` runs.
+  @id:therock-next-24-two-component-line-pin
+  Scenario: therock-next-24 - A ROCm 10.1 line pin installs the newest stable build in that line
+    Given a ROCm 10 pip index fixture that publishes several 10.1 builds, a 10.1 prerelease and a 10.10 build
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1
+    Then the preview resolves the ROCm 10 pip index for ROCm 10.1.2, the newest stable build of the 10.1 line
+    And the preview reports the next source layout generation
+
+  # The same pin against a next index that only publishes 10.0.0 cannot be
+  # satisfied. The refusal must name the next layout and suggest a release that
+  # index does publish, with the arch the request used. It must not offer
+  # `--channel nightly` (that channel refuses ROCm 10) or a 10.1 version (the
+  # index has none), because neither suggestion can succeed. Running the
+  # suggested command proves the advice clears the failure.
+  @id:therock-next-25-unsatisfied-line-pin-skips-nightly
+  Scenario: therock-next-25 - An unsatisfied ROCm 10.1 line pin suggests a published release, not the nightly channel
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.1
+    Then the install fails
+    And the failure suggests the published ROCm 10.0.0 for arch gfx1200, without suggesting nightly or a 10.1 version
+    When the user re-runs the preview with the version and arch the failure suggested
+    Then the preview resolves the ROCm 10 pip index
+
+  # On the tarball catalog an unpinned pick is "newest upload". A line pin is
+  # "newest stable release in the line": the fixture uploads 10.1.0 AFTER
+  # 10.1.2, so upload order alone would pick the older patch.
+  @id:therock-next-26-tarball-line-pin-takes-newest-release @requires-os:linux
+  Scenario: therock-next-26 - A ROCm 10.1 line pin on the tarball catalog takes the newest 10.1 release, not the newest upload
+    Given a ROCm 10 tarball fixture whose older 10.1 patch was uploaded last
+    When the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.1
+    Then the preview selects the ROCm 10.1.2 tarball, not the later-uploaded 10.1.0
+
+  # A line pin that matches nothing on the tarball catalog. The refusal names
+  # the archives that catalog does publish for the family, newest first, and a
+  # `--version`/`--family` pair to re-run with. It says archive, not package
+  # stack, and offers no nightly. Re-running the suggestion proves it clears
+  # the failure.
+  @id:therock-next-27-unsatisfied-tarball-line-pin-suggests-a-published-archive @requires-os:linux
+  Scenario: therock-next-27 - An unsatisfied ROCm 10 tarball pin suggests an archive the catalog publishes
+    Given a ROCm 10 tarball fixture whose older 10.1 patch was uploaded last
+    When the user tries to preview a tarball SDK install for arch gfx1200 pinned to ROCm 10.2
+    Then the install fails
+    And the failure lists the published ROCm 10 archives for gfx120X-all and suggests 10.1.2 for arch gfx1200
+    When the user re-runs the tarball preview with the version and arch the failure suggested
+    Then the preview selects the ROCm 10.1.2 tarball, not the later-uploaded 10.1.0
+
+  # `rocm update` re-resolves an installed runtime with no `--version` and has
+  # no `--family`. A ROCm 10 runtime whose manifest records only its grouped
+  # family has no exact arch, so its update cannot resolve a device payload on
+  # any release. That failure must say so and must not send the user to a
+  # `--version` or tell them to re-run the update with `--family`, which it
+  # does not accept.
+  @id:therock-next-28-update-with-no-exact-arch-gets-no-version-advice
+  Scenario: therock-next-28 - An update that cannot resolve a device target is not told to change its version
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a registered ROCm 10 wheel runtime that records no exact arch
+    When the user tries to preview applying the pending update to that runtime
+    Then the install fails
+    And the failure says no exact device target is known, without suggesting a version or a --family re-run
+
+  # A `major.minor.patch` pin stays exact even when later patches of its line
+  # are published: `--version 10.1.0` must not drift to 10.1.2.
+  @id:therock-next-29-exact-pin-ignores-later-patches
+  Scenario: therock-next-29 - An exact ROCm 10.1.0 pin installs 10.1.0 even when a later 10.1 patch is published
+    Given a ROCm 10 pip index fixture that publishes several 10.1 builds, a 10.1 prerelease and a 10.10 build
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0
+    Then the preview resolves the ROCm 10 pip index for exactly ROCm 10.1.0, not the later 10.1.2
+
+  # A line pin below ROCm 10 stays on the canonical index and takes the newest
+  # stable release of its line: 7.14.1, not 7.14.0, the 7.14.2rc1 prerelease or
+  # 7.15.0.
+  @id:therock-next-30-canonical-line-pin
+  Scenario: therock-next-30 - A ROCm 7.14 line pin installs the newest stable 7.14 build from the canonical index
+    Given a canonical release pip index fixture that publishes several 7.14 builds, a 7.14 prerelease and a 7.15 build
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 7.14
+    Then the preview resolves the canonical release pip index for ROCm 7.14.1
+    And the preview never mentions the ROCm 10 pip index
+
+  # With no pin the install takes the newest build that has a full stack, so a
+  # failure on torchaudio means no build has one. Another `--version` would
+  # fail the same way, so the failure must not suggest one.
+  @id:therock-next-31-unpinned-install-with-no-installable-torchaudio-suggests-no-version
+  Scenario: therock-next-31 - An unpinned ROCm 10 install where no build has an installable torchaudio suggests no other version
+    Given a ROCm 10 pip index fixture where no build has a torchaudio this host can install
+    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    Then the install fails
+    And the failure names the missing torchaudio without suggesting another version

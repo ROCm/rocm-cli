@@ -1177,6 +1177,44 @@ Then it verifies:
   `rocm_sdk.find_libraries("amdhip64", "hipblas")`
 - vLLM adapter discovery of the managed TheRock runtime environment
 
+`--version` accepts a `major.minor` line as well as an exact
+`major.minor.patch`. `--version 10.1` resolves the newest stable 10.1.x on the
+ROCm 10 next layout, and `--version 7.14` the newest stable 7.14.x on the
+canonical index. A `major.minor.patch` pin stays exact. When a ROCm 10 pin
+cannot be satisfied because no release matches, the release has no torchaudio
+for this Python and platform, or `uv` finds no installable package set for it,
+the error lists the other stable ROCm 10 releases that layout publishes, if
+any, and suggests one of them, never the release that just failed and never
+`--channel nightly`. An install is told which `--version`/`--family` to re-run
+with. `rocm update`, which has neither flag, is given a whole
+`rocm install sdk` command with the runtime's `--format` and `--devel`. Any
+other failure, such as an unknown device target, a `uv` that could not be
+fetched or an unreachable index, suggests no version, because no release can
+clear it.
+
+Loopback-fixture scenarios in
+[therock_next_generation.feature](../tests/e2e-cucumber/features/therock_next_generation.feature)
+cover this:
+
+- `therock-next-24`: a wheel line pin takes the line's newest stable build,
+  not an older one, a prerelease or a `10.10` build.
+- `therock-next-25`: an unsatisfied wheel pin. The scenario re-runs the
+  suggested command to prove it succeeds.
+- `therock-next-26`: a tarball line pin takes the newest release in the line,
+  not the newest upload.
+- `therock-next-27`: an unsatisfied tarball pin lists the archives the catalog
+  publishes. The scenario re-runs the suggestion.
+- `therock-next-28`: an update whose runtime records no exact arch gets no
+  version or `--family` advice.
+- `therock-next-29`: an exact pin ignores later patches.
+- `therock-next-30`: a canonical `7.14` line pin.
+- `therock-next-31`: an unpinned install where no build has an installable
+  torchaudio fails with no version suggested, because another version would
+  fail the same way.
+
+They run in the default e2e lane. `therock-next-26` and `therock-next-27` are
+Linux-only, because Windows refuses tarball installs.
+
 Run the full live test with auto-detected GPU family:
 
 ```bash
@@ -3187,10 +3225,15 @@ compare them in one PEP 440 order over published version strings (`7.9` <
 `7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`, `7.2.4.70204` above
 `7.2.4`). That covers picking the newest ROCm version from a wheel index,
 breaking ties between tarball builds uploaded at the same time, and the
-update-or-not verdict. It does not decide everything on its own: tarball builds
-are picked by upload time first, and on the release channel only a stable
-version in the strict `X.Y.Z` shape is a candidate at all, so a four-component
-release such as `7.2.4.70204` is never picked there. The property tests check
+update-or-not verdict. It does not decide everything on its own: an unpinned
+tarball pick goes by upload time first (a `major.minor` line pin such as
+`--version 10.1` goes by this order first), and without a `--version` pin the
+release channel takes only a stable version in the strict `X.Y.Z` shape, so an
+unpinned pick never lands on a four-component release such as `7.2.4.70204`.
+A wheel line pin is different: `--version 7.2` selects the newest stable
+release in the 7.2 line, `7.2.4.70204` included. The tarball catalog still
+requires the strict shape, so the same line pin cannot pick that release
+there. The property tests check
 that the order is total, that picks do not depend on the order the index lists
 versions in, and that the update verdict points the same way as the order. Two
 spellings of one version (`7.0.0-rc1` and `7.0.0rc1`) are not offered as an

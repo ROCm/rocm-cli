@@ -281,6 +281,22 @@ Use `--family` only when a test needs a fixed package family. Do not use it for
 normal user setup. The script checks the default install; add `--devel` to check
 the opt-in compiler toolchain path instead.
 
+Version pins, checked with `--dry-run`:
+
+- `rocm install sdk --version 10.1 --family <gfx code> --dry-run` previews the
+  newest stable 10.1.x from the ROCm 10 source (`source_layout_generation:
+  next-v1`), and `--version 10.1.0` previews exactly 10.1.0.
+- `--version 7.14 --dry-run` previews the newest stable 7.14.x from the
+  canonical index.
+- A ROCm 10 pin the source cannot satisfy fails with a list of the other
+  stable ROCm 10 releases it publishes, if any, and a `--version` to try. Running that suggestion
+  must succeed, and the error must not suggest `--channel nightly`.
+- A `rocm update --apply` of a ROCm 10 runtime that fails the same way
+  suggests a whole `rocm install sdk` command with the runtime's `--format`
+  and, for a `--devel` runtime, `--devel`. Running that command with
+  `--dry-run` must succeed. A failure no other version can clear, such as an
+  unknown device target, must suggest no version.
+
 ### 2a. A GPU target with no ROCm build
 
 Any machine can run this one; it needs no particular GPU. `gfx90c` is the Vega

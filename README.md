@@ -278,10 +278,14 @@ Without `--version`, `rocm install sdk` installs the newest stable release
 (ROCm 10.1 today) from `stable.repo.amd.com`, and `--channel nightly` installs the
 newest nightly build from `nightly.repo.amd.com`. Earlier releases stay
 installable by pinning them: `--version 7.14.1` installs the ROCm 7.14.1 release,
+`--version 7.14` the newest release in the 7.14 line,
 and `--channel nightly --build-date 2026-08-19` installs a nightly from before
 the nightly channel moved on 2026-08-23. If ROCm CLI can't tell which exact GPU
 arch this computer has, or you want a different one, also add `--family` with the
 raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
+A `major.minor` pin such as `--version 10.1` selects the newest stable release in
+that line (for example `10.1.0`); a `major.minor.patch` pin such as
+`--version 10.1.0` stays exact.
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
@@ -510,7 +514,7 @@ hardware, not something an install or a setting can put right.
 
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
-                    [--version x.y.z | --build-date YYYY-MM-DD]
+                    [--version x.y[.z] | --build-date YYYY-MM-DD]
                     [--family gfx1100] [--prefix PATH] [--devel] [--dry-run]
                     [--python-version X.Y]
                     [--approve-replacing-active-default] [--yes]
@@ -631,7 +635,9 @@ ROCm 10 and newer ship from a different source layout than ROCm 7: stable
 releases from `stable.repo.amd.com` and nightlies from `nightly.repo.amd.com`.
 That is the layout an install reads unless it asks for something older. A stable
 pin of ROCm 10 or newer, a nightly pinned to a build date of 2026-08-23 or later,
-and an install with no pin at all all read it. The earlier release stream
+and an install with no pin at all all read it. A two-component pin
+(`--version 10.1`) is the 10.1 line and installs the newest stable release in it;
+`--version 10.1.0` installs that exact release. The earlier release stream
 (`repo.amd.com`) and the earlier nightly stream (`rocm.nightlies.amd.com`), which
 stopped receiving builds on 2026-08-22, are read only when you pin something that
 exists only there: a ROCm 7 release, or a nightly from before 2026-08-23. These
@@ -691,6 +697,14 @@ installed from an earlier stream is not moved to the newest layout, and those
 streams no longer publish new builds, so reinstall with `rocm install sdk` to
 move it. `install sdk` doesn't quietly retry against the other layout when a
 lookup finds nothing; it tells you what it couldn't find instead.
+
+When a ROCm 10 pin can't be satisfied because that release isn't published, or
+has no installable packages for this computer, the error lists the other stable
+ROCm 10 releases that source publishes, if any, and suggests one of them to
+re-run with, in the same `--format` as the failed request. When `rocm update`
+fails the same way, it suggests a whole `rocm install sdk` command that keeps
+the runtime's format and `--devel` toolchain. A failure no other version can
+fix, such as an unknown GPU arch or a network error, suggests no version.
 
 #### Driver installation
 

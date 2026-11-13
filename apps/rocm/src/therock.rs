@@ -243,7 +243,7 @@ pub(crate) fn install_sdk(
                 && layout_serving(channel, Some(selector)) == SourceLayout::Canonical
             {
                 bail!(
-                    "specific TheRock version selection for tarball installs is supported only for the newer package layout: a stable ROCm 10+ release (e.g. `--version 10.0.0`) or a nightly built on or after {THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE}; for any earlier version, use `--format wheel`"
+                    "specific TheRock version selection for tarball installs is supported only for the newer package layout: a stable ROCm 10+ release or release line (e.g. `--version 10.0.0` or `--version 10.1`) or a nightly built on or after {THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE}; for any earlier version, use `--format wheel`"
                 )
             }
             install_tarball_runtime(

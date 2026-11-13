@@ -824,9 +824,13 @@ rocm install sdk --version 10.0.0 --python-version 3.12")]
         /// Full folder path where the ROCm Python environment should be created.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
-        /// Exact TheRock package version to install; with none, the channel's
-        /// newest build. An earlier ROCm 7 release such as 7.14.1 is supported,
-        /// for a wheel install only.
+        /// TheRock package version to install; with none, the channel's newest
+        /// build.
+        ///
+        /// `major.minor.patch` is exact, including a prerelease suffix.
+        /// `major.minor` (for example `10.1`) selects the newest stable
+        /// release in that line. An earlier ROCm 7 release such as 7.14.1 or
+        /// the 7.14 line is supported, for a wheel install only.
         #[arg(long, conflicts_with = "build_date")]
         version: Option<String>,
         /// Pick the TheRock package built on this date; nightlies from before
@@ -1552,6 +1556,46 @@ mod tests {
             !yes_help.to_lowercase().contains("overwrit"),
             "`--yes` must not claim an overwrite; an upgrade or downgrade leaves \
              the previous install on disk:\n{yes_help}"
+        );
+    }
+
+    #[test]
+    fn install_sdk_version_help_describes_line_and_exact_pins() {
+        // Wording pin: `--version 10.1` selecting the newest stable 10.1.x, and
+        // `--version 10.1.0` staying exact, are proven by
+        // `two_component_version_pin_routes_and_matches_its_release_line` in
+        // `therock/source.rs` and by scenarios therock-next-24 and -26. This
+        // only keeps the help that describes them from drifting back to
+        // "exact version". It reads the `version` argument's own help, so the
+        // sibling `--build-date` doc cannot satisfy it.
+        let mut command = Cli::command();
+        let sdk = command
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand");
+        let version = sdk
+            .get_arguments()
+            .find(|arg| arg.get_id() == "version")
+            .expect("`install sdk` must offer --version");
+        let version_help = version
+            .get_long_help()
+            .or_else(|| version.get_help())
+            .expect("--version must be documented")
+            .to_string();
+
+        assert!(
+            version_help.contains("`major.minor.patch` is exact"),
+            "`--version` must say a three-component pin is exact:\n{version_help}"
+        );
+        assert!(
+            version_help.contains("`major.minor` (for example `10.1`) selects the newest stable"),
+            "`--version` must say a two-component pin selects the newest stable \
+             release in that line:\n{version_help}"
+        );
+        assert!(
+            !version_help.starts_with("Exact"),
+            "`--version` no longer takes only an exact version:\n{version_help}"
         );
     }
 
