@@ -201,7 +201,7 @@ pub fn duration(seconds: f64) -> String {
 }
 
 /// Power in watts. One decimal, always trailing `W`.
-pub fn watts(value: f32) -> String {
+pub fn watts(value: f64) -> String {
     format!("{value:.1} W")
 }
 
