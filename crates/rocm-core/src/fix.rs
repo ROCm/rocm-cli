@@ -64,7 +64,7 @@ pub(crate) use catalog::{ShellRun, run_typed_in_cmd_and_powershell};
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
-        fail!("Unknown fix-id: {fix_id}");
+        fail!("{} {fix_id}", exit::UNKNOWN_ID_PREFIX);
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
@@ -278,6 +278,25 @@ mod tests {
             act_on(&elsewhere, &opts),
             3,
             "a recipe that does not apply here is a wrong-machine result, whatever its class"
+        );
+    }
+
+    /// The published `internal` description: a recipe the catalog says the CLI
+    /// carries out here, with no runner to carry it out, is the CLI's own fault
+    /// and exits with the code published as `internal`, not `failed`.
+    /// `a_recipe_that_acts_has_a_runner` keeps the real catalog off this path;
+    /// this drives the path itself with a synthetic recipe.
+    #[test]
+    fn a_recipe_the_catalog_says_is_applied_with_no_runner_exits_internal() {
+        // `Auto` is the class that says the CLI applies the fix itself
+        // (`FixClass::applies_itself`); a runner-less `NeedsArgument` entry only
+        // prints steps, so it is not this path.
+        let recipe = unfixable_recipe(FixClass::Auto);
+        assert_eq!(plan_of(&recipe), Plan::MissingRunner);
+        assert_eq!(
+            act_on(&recipe, &FixOptions::default()),
+            exit::INTERNAL,
+            "an AUTO entry with no runner must exit with the code published as internal"
         );
     }
 
