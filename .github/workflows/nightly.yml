@@ -407,8 +407,11 @@ jobs:
   # Mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
   # Like every nightly lane, it sets no `continue-on-error`: a failing leg fails
   # this job and the Nightly run, and `needs` downstream reads `failure`. The
-  # report, wiki and readiness jobs below still run on such a night. Nightly
-  # gates no merge or tag, so a red run blocks nothing; it only reports.
+  # report and release-readiness jobs below still run on such a night. The E2E
+  # wiki page is updated only when e2e-report-nightly succeeded (it fails, for
+  # example, when a lane that ran uploaded no report) and the other guards in
+  # publish-e2e-wiki's `if:` hold; otherwise the previous page stays in place.
+  # Nightly gates no merge or tag, so a red run blocks nothing; it only reports.
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
@@ -509,11 +512,13 @@ jobs:
           name: e2e-gpu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
-  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, shared uv
-  # cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
-  # the report crate asserts the nightly lanes publish the same platforms as the
-  # per-PR lanes.
+  # rad3 R9700 counterpart to e2e-gpu-nightly (r9700 label, shared uv cache, GPU
+  # preflight), with @nightly scenarios enabled. Nightly-only: the per-PR R9700
+  # lane was demoted per ROCMAI-125, so e2e-selfhosted.yml has no counterpart to
+  # keep in step with. xtask's
+  # `the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes` asserts
+  # only that nightly covers every platform e2e-selfhosted.yml publishes,
+  # which this lane adds to.
   e2e-gpu-nightly-rad3:
     name: E2E tests (rad3 R9700, incl. nightly-only)
     timeout-minutes: 90
@@ -545,8 +550,8 @@ jobs:
       # leftover serve, low enough that a clean pod passes on the first poll; do
       # NOT scale it down for a smaller part. On a 32GB card it still only trips
       # past 16 GiB held, so the floor alone would miss a leftover serve holding
-      # less than that; the process gate is what catches it (#446). Same as the
-      # per-PR rad3 lane. See .github/scripts/gpu-preflight.sh.
+      # less than that; the process gate is what catches it (#446). See
+      # .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
         env:
           GPU_PREFLIGHT_MIN_FREE_GIB: 16
@@ -620,11 +625,11 @@ jobs:
         run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
-      # process survives. Floor matches the per-PR MI350P lane and the other
-      # Instinct lane — low enough that a clean pod passes on the first poll,
-      # and against a pool this size it only trips near exhaustion, so the
-      # process gate is what actually catches a leftover serve (#446). See
-      # .github/scripts/gpu-preflight.sh.
+      # process survives. Floor matches the other Instinct lane (there is no
+      # per-PR MI350P lane, ROCMAI-125) — low enough that a clean pod passes on
+      # the first poll, and against a pool this size it only trips near
+      # exhaustion, so the process gate is what actually catches a leftover
+      # serve (#446). See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
         env:
           GPU_PREFLIGHT_MIN_FREE_GIB: 16
@@ -675,8 +680,10 @@ jobs:
   # W7900 counterpart to e2e-gpu-nightly. Mirrors the e2e-gpu-w7900 lane (which
   # no longer runs on pull_request) in e2e-selfhosted.yml (w7900 label, shared
   # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in
-  # step: the report crate asserts the nightly lanes publish the same platforms
-  # as the lanes in e2e-selfhosted.yml.
+  # step. xtask's
+  # `the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes` asserts
+  # only that nightly covers every platform e2e-selfhosted.yml publishes, not
+  # that the lanes agree.
   e2e-gpu-nightly-w7900:
     name: E2E tests (W7900, incl. nightly-only)
     timeout-minutes: 90

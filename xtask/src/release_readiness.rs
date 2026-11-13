@@ -138,17 +138,15 @@ fn assemble_facts(
     // The Total row above only counts platforms whose `report.json` actually
     // got uploaded — a GPU lane that dies before uploading (preflight failure,
     // timeout, runner loss) just drops out of it, silently reading as zero
-    // failures. Gate on `e2e-report-nightly`'s result rather than each lane
-    // job's own `needs.<job>.result`: the lanes were once `continue-on-error`,
-    // which made those read `success` even when a lane failed, and a lane's
-    // failing scenarios already reach the Total row above, so the one thing
-    // left to catch is a missing report. Its "every lane that ran uploaded its
-    // report" check (`nightly.yml`, `LANE_REPORTS`) already fails that job when
-    // a lane is silently missing, covering every lane in `LANE_REPORTS` —
-    // including ones added later — for free (a re-run can pass on an earlier
-    // attempt's artifact, so it can still miss a lane). Unlike the build gates,
-    // this job is `if: always()` and has no legitimate no-op-night skip, so
-    // `skipped` isn't accepted here.
+    // failures. `e2e-report-nightly`'s "every lane that ran uploaded its
+    // report" check (`nightly.yml`, `LANE_REPORTS`) fails that job when a lane
+    // is silently missing, covering every lane in `LANE_REPORTS` — including
+    // ones added later — without a second copy of the lane list here (a re-run
+    // can pass on an earlier attempt's artifact, so it can still miss a lane),
+    // so gate on that job's result. The lane jobs' own results are not read;
+    // docs/ci-hardware-testing.md's readiness paragraph says what that leaves
+    // out. Unlike the build gates, this job is `if: always()` and has no
+    // legitimate no-op-night skip, so `skipped` isn't accepted here.
     if e2e_report_job_result != "success" {
         failing_gates.push(format!("E2E (lane report check: {e2e_report_job_result})"));
     }
@@ -400,8 +398,9 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 /// for every per-platform row that reports a non-`PASS` `Status` with a `Fail`
 /// cell of `0`.
 ///
-/// The second part exists because an `EMPTY` platform (no `report.json`, or
-/// one that's empty/unparseable) contributes `0` to every numeric column —
+/// The second part exists because an `EMPTY` platform (a `report.json` that is
+/// empty or unparseable, with no `platform.json` beside it; a missing
+/// `report.json` gives no row at all) contributes `0` to every numeric column —
 /// including `Fail` — so the Total row's own Fail cell has no record that the
 /// platform was ever there at all. A genuine `FAIL` status always has a
 /// nonzero own `Fail` cell (already folded into the Total row), so this only
