@@ -12,14 +12,15 @@ name: E2E self-hosted
 # Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
 # MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
 # pool (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
-# Ubuntu and W7900 lanes keep their push / dispatch triggers and run nightly
-# (nightly.yml); neither starts on pull_request or merge_group.
+# Ubuntu lane keeps its push / dispatch triggers; it does not start on
+# pull_request or merge_group. There is no W7900 lane here: W7900 is covered only
+# by the scheduled queue nightly's `w7900-dual` lane (docs/nightly-on-the-queue.md),
+# not on push, release/** or dispatch.
 #
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
-# because of `continue-on-error`, which is `false` on every lane but
-# one, so a real hardware regression shows red instead of always green. The
-# exception is `e2e-gpu-w7900`, `true` only while that hardware is proven out. PRs #334, #335 and #343 all
+# because of `continue-on-error`, which is `false` on every lane, so a real
+# hardware regression shows red instead of always green. PRs #334, #335 and #343 all
 # landed while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the
 # merge_group ref, which a required check under ALLGREEN would have blocked;
 # renaming a lane is therefore safe.
@@ -41,7 +42,7 @@ on:
     # supersedes that PR's earlier run. It runs only the no-op `pr-closed` job;
     # every GPU lane skips because `changes` skips. This frees runners only where
     # the cancel completes: a job queued for a runner that is not picking it up
-    # (W7900 while its one runner is busy) may not finish cancelling, so this
+    # (a lane whose runner is busy) may not finish cancelling, so this
     # does NOT clear such queued runs.
     types: [opened, synchronize, reopened, closed]
   merge_group:
@@ -57,7 +58,7 @@ on:
         type: choice
         default: all
         # Each value also selectable on its own; `all` covers every lane below.
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl, w7900]
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
@@ -116,7 +117,7 @@ jobs:
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
       # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
-      # full matrix (every lane but MI300X, Strix Ubuntu and W7900, which skip
+      # full matrix (every lane but MI300X and Strix Ubuntu, which skip
       # merge_group) and its
       # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
@@ -204,7 +205,7 @@ jobs:
   # Exists only to start a run in the PR's concurrency group when the PR is
   # merged or closed: that run cancels the PR's older run. A GPU job of that run
   # which is queued for a runner that is not picking it up may not finish
-  # cancelling (observed on W7900-queued runs).
+  # cancelling (observed on queued runs).
   pr-closed:
     name: Supersede runs of a closed PR
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
@@ -1597,150 +1598,6 @@ jobs:
           path: tests/e2e-cucumber/results/
           if-no-files-found: error
 
-  e2e-gpu-w7900:
-    name: E2E tests (W7900, ${{ matrix.sdk_version }})
-    # 90min: matches every other Linux GPU lane — same collapsed suite. The card
-    # is smaller than the Instinct parts, so do not tighten this below their cap.
-    timeout-minutes: 90
-    # `w7900` names the hardware rather than reusing the generic `amd-gpu`:
-    # GitHub matches a job to any runner whose labels are a superset, so a shared
-    # label would let this workstation card pick up Instinct-targeted work and
-    # vice versa.
-    runs-on: [self-hosted, linux, w7900]
-    needs: [changes]
-    strategy:
-      fail-fast: false
-      matrix:
-        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
-    # Not on pull_request or merge_group: one runner on borrowed quota, 58-70% of
-    # its PR jobs never started before being superseded, and a merge_group run
-    # would queue behind it the same way (the queue does not wait for this
-    # check). Still runs on push (main, release/**), dispatch and nightly
-    # (nightly.yml, e2e-gpu-nightly-w7900).
-    if: >-
-      always()
-      && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && github.event_name != 'pull_request'
-          && github.event_name != 'merge_group'
-          && needs.changes.outputs.serve == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'w7900'))
-      )
-    # Non-blocking while this hardware is proven out, as the MI350P lane is.
-    # Flip to `false` once it has a track record — that is what the older lanes
-    # run with, so a real regression on this silicon shows red instead of
-    # always green.
-    continue-on-error: true
-    env:
-      E2E_SERVE_TIMEOUT_SECS: "300"
-      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Reclaim the GPU before running: a serve leaked by a killed or
-      # timed-out prior run (its Drop teardown never executed) keeps an engine
-      # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees: a manual /workload serve is matched only if its command line
-      # also names an E2E root — see the exposure documented in
-      # scripts/reclaim-gpu.sh.
-      - name: Reclaim GPU from stray E2E processes
-        run: bash scripts/reclaim-gpu.sh
-
-      # Bounded wait, as in e2e-gpu, then an assertion that no leaked E2E engine
-      # process survives. One card per job, so rocm-smi sees exactly the GPU this
-      # lane runs on. The floor stays at the shared 16 GiB default, which is a
-      # flat constant rather than a proportion of capacity: it only has to be
-      # high enough to catch a leftover serve still holding the card, and low
-      # enough that a clean host passes on the first poll. e2e-gpu uses the same
-      # 16 GiB against a very different VRAM size for exactly that reason — do
-      # NOT scale it down for a smaller part. On a 48GB card that floor only
-      # trips past ~32 GiB held, so the floor alone would miss a leftover serve
-      # holding less; the process gate is what catches it (#446). The floor is
-      # kept for the case the process gate cannot see: a non-E2E tenant
-      # exhausting the host. See .github/scripts/gpu-preflight.sh.
-      - name: GPU preflight (bounded wait for an available GPU)
-        env:
-          GPU_PREFLIGHT_MIN_FREE_GIB: 16
-        run: |
-          bash .github/scripts/gpu-preflight.sh
-
-      # cache: false for the same reason as e2e-gpu — the build cache is kept in
-      # CARGO_TARGET_DIR on the work volume, not in GitHub's cache service.
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-        with:
-          cache: false
-
-      - name: Run E2E tests on W7900
-        run: |
-          # $RUNNER_WORKSPACE is on a volume that outlives any single job, so the
-          # cargo target dir and the shared caches are still warm on the next one.
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same mount as the runtimes it populates, so uv hardlinks into them
-          # instead of copying, and inside the directory the runner's uv-cache-gc
-          # initContainer bounds — see the e2e-gpu lane for both mechanisms and
-          # why a cache one level deeper keeps the links but loses the floor.
-          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
-          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          # Pre-warm one shared runtime in place before the suite. Not an
-          # optimization — `install sdk` bakes absolute paths into the runtime
-          # manifest, so installing anywhere temporary breaks every later serve.
-          # See e2e-gpu for the full rationale.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
-          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
-
-          # See the e2e-gpu lane for why the e2e-test-hooks feature is the
-          # floor a pre-built binary must carry (xtask builds a superset).
-          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
-          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
-          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
-
-          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
-          # the channel index has moved on — the tree is a cache, not a one-shot.
-          # See the e2e-gpu lane and `xtask e2e-prewarm`.
-          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
-              --release-label "${MATRIX_SDK_VERSION}"
-
-          # Optional scenario-name filter for a scoped manual dispatch — a cheap
-          # way to exercise this lane against a single scenario without the full suite.
-          NAME_FILTER="${GITHUB_EVENT_INPUTS_NAME_FILTER}"
-          if [ -n "$NAME_FILTER" ]; then
-            echo "name filter active: $NAME_FILTER"
-            cargo xtask e2e -- --name "$NAME_FILTER"
-          else
-            cargo xtask e2e
-          fi
-        env:
-          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
-          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
-
-      - name: Upload E2E report (current)
-        if: always() && matrix.sdk_version == 'current'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-report
-          path: tests/e2e-cucumber/results/
-
-      - name: Upload E2E report (n-1)
-        if: always() && matrix.sdk_version == 'n-1'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-n-1-report
-          path: tests/e2e-cucumber/results/
-
-      - name: Upload E2E report (n-2)
-        if: always() && matrix.sdk_version == 'n-2'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-n-2-report
-          path: tests/e2e-cucumber/results/
-
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
   # required `E2E consolidated report` so it does NOT collide with that required
@@ -1761,7 +1618,6 @@ jobs:
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
       - e2e-wsl
-      - e2e-gpu-w7900
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
     # produced. On dispatch `serve` is unset, so also run when the trigger was
@@ -1833,7 +1689,6 @@ jobs:
             e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
             e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
             e2e-wsl=e2e-gpu-strix-wsl-report
-            e2e-gpu-w7900=e2e-gpu-w7900-report
         run: |
           uploaded=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
