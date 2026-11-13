@@ -631,6 +631,35 @@ pub fn format_reported_device(
     device
 }
 
+/// The first pinned GPU ordinal recorded in a service state file, if any.
+///
+/// The ordinal half of what [`format_reported_device`] renders, read from the
+/// state file every engine writes at launch. It lives beside that function for
+/// the same reason that one does: `rocm serve`'s `device:` row and
+/// `rocm services list` print whichever engine answered verbatim, so the two
+/// engines that pin ordinals (`engines/lemonade`, `engines/vllm`) have to agree
+/// on *which* ordinal they report, not only on how it is spelled. They had
+/// byte-identical private copies of this, which is one keystroke away from
+/// disagreeing silently — the same duplication `format_reported_device` was
+/// centralized to end.
+///
+/// `None` covers every shape that is not a usable ordinal: no `gpu_indices`
+/// key, a non-array value, an empty list (a launch that pinned nothing, which
+/// is the default on Windows — see `format_reported_device`), a non-integer
+/// entry, and a value too large for `u32`. Those are "no ordinal to report",
+/// not errors: state files are written by engine processes of possibly
+/// different versions, and a row that says less is better than one that
+/// invents an ordinal or refuses to render.
+#[must_use]
+pub fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
+    state
+        .get("gpu_indices")
+        .and_then(Value::as_array)
+        .and_then(|indices| indices.first())
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthcheckResponse {
     /// Engine-reported service state. `ready` is reserved for a service that has
@@ -757,6 +786,45 @@ mod tests {
         assert_eq!(
             super::format_reported_device("rocm", Some(2), Some("  MI300X  ")),
             "rocm gpu 2 (MI300X)"
+        );
+    }
+
+    /// Every shape a state file can carry in `gpu_indices` resolves to "an
+    /// ordinal" or "no ordinal", never to a panic or an invented value.
+    ///
+    /// This used to be two byte-identical private helpers in `engines/lemonade`
+    /// and `engines/vllm`, neither of which tested the shapes below; only the
+    /// happy path was reachable from either engine's own tests. Centralizing it
+    /// is what makes the edge cases testable in one place for both callers.
+    #[test]
+    fn the_first_pinned_ordinal_is_read_and_every_other_shape_is_absent() {
+        use serde_json::json;
+
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": [1, 2]})),
+            Some(1),
+            "the first pinned ordinal is the one reported"
+        );
+        // A launch that pinned nothing — the default on Windows, which is the
+        // host ROCMAI-550 was filed from.
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": []})),
+            None
+        );
+        assert_eq!(super::first_gpu_index_from_state(&json!({})), None);
+        // A state file written by some other version of an engine must degrade
+        // to "no ordinal", not to a wrong one.
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": "0"})),
+            None
+        );
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": [-1]})),
+            None
+        );
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": [u64::from(u32::MAX) + 1]})),
+            None
         );
     }
 

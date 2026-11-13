@@ -146,11 +146,15 @@ pub(crate) const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
 ///
 /// Formatted by [`rocm_engine_protocol::format_reported_device`] so all three
 /// engines render one shape; see that function for why the ordinal-less row
-/// drops the `gpu` noun rather than printing a bare `vulkan gpu`.
+/// drops the `gpu` noun rather than printing a bare `vulkan gpu`. The ordinal
+/// is read by [`rocm_engine_protocol::first_gpu_index_from_state`] for the same
+/// reason — `engines/vllm` reads the same `gpu_indices` key out of a state file
+/// of the same shape, and kept a byte-identical copy of that read until it
+/// moved next to the formatter.
 pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
     rocm_engine_protocol::format_reported_device(
         backend,
-        state.and_then(first_gpu_index_from_state),
+        state.and_then(rocm_engine_protocol::first_gpu_index_from_state),
         state.and_then(gpu_name_from_state).as_deref(),
     )
 }
@@ -163,16 +167,6 @@ pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
 /// host is the one whose GPU actually ran the server.
 fn gpu_name_from_state(state: &Value) -> Option<String> {
     crate::state::value_string(state, "gpu_name")
-}
-
-/// The first pinned GPU ordinal recorded in service state, if any.
-fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
-    state
-        .get("gpu_indices")
-        .and_then(Value::as_array)
-        .and_then(|indices| indices.first())
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
 }
 
 #[cfg(test)]
