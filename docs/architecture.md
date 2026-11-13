@@ -809,6 +809,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`src/stray_process.rs`](../tests/e2e-cucumber/src/stray_process.rs) | What scenario teardown does about a process a scenario started and recorded: only a process that is still the one recorded is ended, never one that has since exited or whose PID another process has taken. Decided apart from the system reads, so a table test covers each case on every host. | flat |
 | [`src/tasklist.rs`](../tests/e2e-cucumber/src/tasklist.rs) | What `tasklist` says about one process, read so that a failed query cannot pass for an answer: the exit status is judged before the text, so a run that did not succeed gives no answer rather than "the process exited". Pure, so a table test covers every case on every host. | flat |
 | [`src/terminal_size.rs`](../tests/e2e-cucumber/src/terminal_size.rs) | Validates a requested terminal size and applies it to the emulated screen before the real PTY. | flat |
+| [`src/torch_alignment_outcome.rs`](../tests/e2e-cucumber/src/torch_alignment_outcome.rs) | Which `torch_alignment:` outcomes the runtime scenarios accept as settled, including `not_applicable` when the engine declares no torch pin, and the verdict on importing the engine's stack. | flat |
 
 #### `src/bin/`
 
