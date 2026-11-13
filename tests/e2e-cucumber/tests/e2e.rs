@@ -226,6 +226,12 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// The scripted-engine `service_id` a serve step captured from the CLI's
+    /// own printed output (ROCMAI-541) — not by scanning the services dir
+    /// for "the newest record" after the fact, which a concurrent recovery
+    /// mechanism could make ambiguous. Set as soon as the id is known; read
+    /// by the later `Then` steps instead of re-deriving it.
+    pub scripted_service_id: Option<String>,
     /// The identity of a process the recorded one started (`service-stop-07`'s
     /// `ping`). Teardown ends it on its own account, because a stop that fails
     /// to take it down leaves it running with a dead parent, where nothing else
@@ -404,6 +410,7 @@ impl Default for E2eWorld {
             symptom_file_runs: Vec::new(),
             helper_identity: None,
             recorded_process: None,
+            scripted_service_id: None,
             recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,

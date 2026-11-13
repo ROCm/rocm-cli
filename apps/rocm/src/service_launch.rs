@@ -68,16 +68,19 @@ pub(crate) use helper_autostart::{
     ensure_background_helper_running, ensure_background_helper_running_quiet,
 };
 pub(crate) use launch_transaction::{managed_service_reuse_refusal, no_usable_gpu_refusal};
-pub(crate) use readiness::e2e_simulate_oom_launch;
+pub(crate) use readiness::{
+    StopWatch, e2e_simulate_oom_launch, managed_engine_exit_failure_detail,
+    managed_service_stop_marker_present, managed_service_stop_was_requested,
+};
 #[cfg(not(windows))]
 pub(crate) use spawn::{
-    attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
-    managed_service_process_command,
+    attach_background_stdio, detach_background_command, managed_service_process_command,
 };
-// The helper is platform-independent, but outside tests nothing on Windows
-// calls it through this path, so a plain re-export there would be unused. The
-// `services_text` log-tail tests call it and are compiled on Windows too.
-#[cfg(all(windows, test))]
+// Platform-independent, and now called on both: `service_control.rs`'s Windows
+// restart branch renders it for a child the liveness probe found already gone,
+// the same way the Unix branch renders it for one `try_wait()` caught. It used
+// to be `#[cfg(all(windows, test))]` here, for the `services_text` log-tail
+// tests, because no Windows production path reached it.
 pub(crate) use spawn::managed_engine_startup_failure_detail;
 pub(crate) use start::{
     print_managed_launch_plain, start_managed_service, wait_begin_client_config,

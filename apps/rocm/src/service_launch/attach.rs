@@ -7,6 +7,10 @@
 
 use super::endpoint_auth::drop_orphaned_endpoint_key_on_already_running;
 use super::helper_autostart::ensure_background_helper_running_quiet;
+use super::readiness::{
+    StopWatch, managed_engine_exit_failure_detail, managed_service_stop_was_requested,
+    mark_service_failed,
+};
 use super::spawn::{ManagedSpawn, spawn_managed_engine_child};
 use super::start::render_endpoint_client_config;
 use crate::record_cli_audit_event;
@@ -18,7 +22,7 @@ use crate::services_text::{
 };
 use anyhow::{Context, Result, bail};
 use rocm_core::AppPaths;
-use rocm_core::{format_http_base_url, process_is_running};
+use rocm_core::format_http_base_url;
 use rocm_engine_protocol::ResolveModelResponse;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -96,7 +100,15 @@ pub(crate) fn run_attached_service(
 
     // Attached mode is a managed record too, so it shares the transaction's
     // resolved concrete port.
-    let (service_id, log_path, port, child_pid) = match spawn {
+    let (
+        service_id,
+        log_path,
+        engine_state_path,
+        port,
+        child_pid,
+        supervisor_start_ticks,
+        mut liveness,
+    ) = match spawn {
         // A server for this engine+model is already live. Don't fight it for the
         // port — point the user at the existing one instead of tailing a log we
         // did not start.
@@ -105,7 +117,7 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {}", report.service_id);
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
-            println!("  logs: rocm logs {}", report.service_id);
+            println!("  logs: rocm services logs {}", report.service_id);
             println!(
                 "  stop: {}",
                 service_hints::service_stop_hint(&report.service_id)
@@ -113,11 +125,18 @@ pub(crate) fn run_attached_service(
             drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
             return Ok(());
         }
-        ManagedSpawn::Spawned { record, child_pid } => (
+        ManagedSpawn::Spawned {
+            record,
+            child_pid,
+            liveness,
+        } => (
             service_id.to_owned(),
             record.log_path.clone(),
+            record.engine_state_path.clone(),
             record.port,
             child_pid,
+            record.supervisor_start_ticks,
+            liveness,
         ),
     };
 
@@ -150,7 +169,16 @@ pub(crate) fn run_attached_service(
     println!("  streaming engine logs - Ctrl-D detaches (leaves it running), Ctrl-C stops it");
     println!();
 
-    let outcome = stream_attached_logs(&log_path, child_pid)?;
+    // Sampled on every liveness poll for the whole attached session: an external
+    // `rocm services stop` clears its own marker once it confirms, so reading it
+    // only after the child is gone can miss it and report a deliberate stop as a
+    // crash. See `StopWatch`.
+    let mut stop_watch = StopWatch::default();
+    let outcome = stream_attached_logs(&log_path, || {
+        stop_watch.sample(paths, &service_id);
+        liveness.is_running()
+    })?;
+    let stop_seen_while_attached = stop_watch.stop_was_requested();
     println!();
 
     match outcome {
@@ -169,7 +197,7 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
-            println!("  logs: rocm logs {service_id}");
+            println!("  logs: rocm services logs {service_id}");
             println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             Ok(())
         }
@@ -187,10 +215,77 @@ pub(crate) fn run_attached_service(
             )
         }
         AttachOutcome::ServerExited => {
-            println!("server process exited");
-            println!("  service_id: {service_id}");
-            println!("  recent logs: rocm logs {service_id}");
-            Ok(())
+            // `Stop` above is only this attached session's *own* keystroke
+            // reader (Ctrl-C) or its own fallback — it says nothing about a
+            // stop triggered any other way. `rocm services stop <id>` from
+            // another shell and `rocm dash`'s stop action both kill the pid
+            // this loop is watching by signalling it directly, which lands
+            // here, in `ServerExited`, not `Stop`. So an exited child alone
+            // does not mean a crash (ROCMAI-541): check the manifest's stop
+            // marker (`stop_requested_unix_ms`, set before any such external
+            // stop signals anything — see
+            // `stop_internal_managed_service_confirmed_with`) and its
+            // `stopped` status before concluding one — see
+            // `managed_service_stop_was_requested`'s doc comment for why
+            // `rocmd`'s own restart-recovery watcher needs no such carve-out
+            // here. Only when neither is present is this an unexplained exit
+            // — i.e. a crash.
+            if stop_seen_while_attached || managed_service_stop_was_requested(paths, &service_id) {
+                println!("server process exited");
+                println!("  service_id: {service_id}");
+                println!("  recent logs: rocm services logs {service_id}");
+                return Ok(());
+            }
+            // Mark both the manifest and the engine state file `failed` (the
+            // engine process is gone and cannot do it for itself) and fail
+            // loudly instead of the previous "server process exited" / exit 0.
+            // The manifest write is a best-effort merge, not a full
+            // `ManagedServiceRecord::write()`: this attached session's own copy
+            // of the record was captured at spawn time and may be stale by now
+            // (a concurrent restart could have replaced it), so only the one
+            // field this crash verdict owns is touched — never a write-back
+            // that could clobber a newer record with an older snapshot.
+            //
+            // Guarded on the manifest still naming the exact *supervisor*
+            // process this session spawned and has been watching — `child_pid`
+            // is `supervisor_pid`/`supervisor_start_ticks`'s subject, the
+            // `__engine-serve-http` process this loop's `liveness` tracks and
+            // whose exit is what landed us here. `engine_pid` is the wrong
+            // identity to gate on: `refresh_from_engine_state` overwrites it
+            // with whatever the engine itself reports as `server_pid`, which
+            // for an engine like Lemonade that spawns its own child server is
+            // *that* child's pid, not this loop's `child_pid` — so comparing
+            // on `engine_pid` is false for the exact case this whole fix is
+            // for (a Lemonade-backed server that was running and then died),
+            // and the manifest would never get stamped. `supervisor_pid`/
+            // `supervisor_start_ticks` are never touched by
+            // `refresh_from_engine_state` and ARE rewritten by a legitimate
+            // restart (`record_supervisor_identity` at the top of this same
+            // spawn path), so comparing on them actually distinguishes "this
+            // manifest still names the child we're watching" from "a restart
+            // already replaced it". The engine state file is guarded the same
+            // way: its own `status` is exactly what `refresh_from_engine_state`
+            // reads back into a newer manifest, so leaving this write
+            // unguarded would let the clobber this guard prevents on the
+            // manifest simply round-trip back in through that file instead.
+            // One copy of this check, shared with the background launch path,
+            // so the two cannot drift: both decide the same question about the
+            // same two fields.
+            if crate::service_launch::readiness::still_watching_this_supervisor(
+                paths,
+                &service_id,
+                child_pid,
+                supervisor_start_ticks,
+            ) {
+                mark_service_failed(
+                    &paths.service_manifest_path(&service_id),
+                    &engine_state_path,
+                );
+            }
+            bail!(
+                "{}",
+                managed_engine_exit_failure_detail(&service_id, &log_path)
+            );
         }
     }
 }
@@ -224,14 +319,23 @@ const fn detach_key_outcome(ctrl: bool, ch: char) -> Option<AttachOutcome> {
 /// capture the keys directly (in raw mode Ctrl-C does not raise SIGINT, so we see
 /// it as a key event). When stdin is not a TTY (piped/CI), keystroke capture is
 /// impossible, so we follow the log until the process exits instead.
-fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+///
+/// `is_alive` is injected rather than this calling `process_is_running` on a
+/// bare pid directly, so the real caller can back it with
+/// [`rocm_core::ManagedChildLiveness`] — a `kill(pid, 0)` probe alone succeeds
+/// for a zombie this process has not reaped yet on Unix (ROCMAI-541; see that
+/// type's doc comment).
+fn stream_attached_logs(
+    log_path: &Path,
+    mut is_alive: impl FnMut() -> bool,
+) -> Result<AttachOutcome> {
     use std::io::IsTerminal as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     if !std::io::stdin().is_terminal() {
-        return stream_attached_logs_no_tty(log_path, child_pid);
+        return stream_attached_logs_no_tty(log_path, is_alive);
     }
 
     // Enter raw mode *before* spawning the key reader. In raw mode Ctrl-C arrives
@@ -300,7 +404,7 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
         if let Ok(signal) = rx.try_recv() {
             break signal;
         }
-        if !process_is_running(child_pid) {
+        if !is_alive() {
             break AttachOutcome::ServerExited;
         }
         thread::sleep(Duration::from_millis(150));
@@ -314,7 +418,17 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
 /// Non-interactive fallback for [`stream_attached_logs`]: no keystroke capture,
 /// so just follow the log until the (detached) engine process exits. A Ctrl-C
 /// here delivers SIGINT to this process and leaves the managed server running.
-fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+///
+/// This is the *only* possible outcome of a piped/non-TTY attached session
+/// (there is no keystroke reader to ever produce `Detach`/`Stop` here), so
+/// every externally-triggered stop during such a session reaches here as
+/// `ServerExited` — making the caller's stop-marker check
+/// (`managed_service_stop_was_requested`) load-bearing for every scripted or
+/// CI `rocm serve --verbose` invocation, not just an edge case.
+fn stream_attached_logs_no_tty(
+    log_path: &Path,
+    mut is_alive: impl FnMut() -> bool,
+) -> Result<AttachOutcome> {
     let mut stdout = io::stdout();
     let mut log_reader: Option<io::BufReader<fs::File>> = None;
     let mut line = String::new();
@@ -335,7 +449,7 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
                 }
             }
         }
-        if !process_is_running(child_pid) {
+        if !is_alive() {
             return Ok(AttachOutcome::ServerExited);
         }
         thread::sleep(Duration::from_millis(200));

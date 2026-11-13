@@ -75,12 +75,65 @@ pub fn spawn_hidden_console_no_inherit(
     )
 }
 
+/// Detached background spawn whose stdout/stderr land in `log_path`.
+///
+/// The managed-engine spawn (ROCMAI-541). Identical in creation flags to
+/// [`spawn_detached_no_inherit`] — no console, own process group, outlives this
+/// process — and differs only in attaching the child's output to the service
+/// log, which is what [`spawn_detached_no_inherit`] loses. Deliberately NOT
+/// [`spawn_hidden_console_with_log`]: that one creates a console
+/// (`CREATE_NEW_CONSOLE`) and so pays for a `conhost` per engine, which a
+/// detached background service has no use for.
+///
+/// Handing `CreateProcessW` std handles forces `bInheritHandles`, so the child
+/// inherits every inheritable handle this process holds, not only the two
+/// below. That is the same blanket-inheritance model
+/// [`spawn_hidden_console_with_log`] already uses; scoping it would need
+/// `STARTUPINFOEXW` with an explicit handle list.
 #[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
+pub fn spawn_detached_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+) -> Result<u32> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        false,
+        log_path,
+    )
+}
+
+#[cfg(windows)]
 pub fn spawn_hidden_console_with_log(
     program: &Path,
     args: &[String],
     env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+) -> Result<u32> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        true,
+        log_path,
+    )
+}
+
+/// Duplicate `log_path` into inheritable stdout/stderr handles and spawn with
+/// them, closing this process's copies whether or not the spawn succeeded.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn spawn_windows_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    creation_flags: u32,
+    hide_window: bool,
     log_path: &Path,
 ) -> Result<u32> {
     use std::os::windows::io::AsRawHandle;
@@ -138,8 +191,8 @@ pub fn spawn_hidden_console_with_log(
         program,
         args,
         env_overrides,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        true,
+        creation_flags,
+        hide_window,
         Some((stdout_handle, stderr_handle)),
     );
     unsafe {
@@ -1013,6 +1066,76 @@ mod tree_properties;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROCMAI-541, and the only check that runs on the platform the bug was
+    /// reported on: a detached child's stdout AND stderr must both reach the
+    /// log file the caller named.
+    ///
+    /// `spawn_detached_no_inherit` attaches neither, which is what lost a
+    /// failing `__engine-serve-http`'s reason on Windows. Nothing else in the
+    /// suite covers that: the liveness test is Unix-only, and the
+    /// scripted-engine e2e scenarios run on the Linux no-GPU lane, where the
+    /// Unix `attach_background_stdio` branch does the attaching and this code
+    /// never executes.
+    ///
+    /// stderr matters more than stdout here — an engine's final error chain is
+    /// printed there — so both streams are asserted, not just the easy one.
+    #[cfg(windows)]
+    #[test]
+    fn a_detached_child_writes_both_streams_into_the_log() {
+        const OUT_MARKER: &str = "rocmai541-stdout-reached-the-log";
+        const ERR_MARKER: &str = "rocmai541-stderr-reached-the-log";
+
+        // Plain pid, no thread id: `ThreadId`'s Debug form is `ThreadId(2)`, and
+        // `quote_windows_arg` only quotes an argument containing whitespace or a
+        // quote — so a path carrying cmd's own metacharacters reaches it bare and
+        // `(` ends the token early. Only this test uses this name, so the pid
+        // alone keeps it unique.
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-detached-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the fixture dir");
+
+        // A .bat rather than `cmd /c "echo a & echo b 1>&2"`: `CreateProcessW`
+        // cannot run a .bat directly, but handing cmd a single path argument
+        // sidesteps cmd's quoting rules entirely, which an inline compound
+        // command would otherwise have to survive.
+        let script = dir.join("emit.bat");
+        fs::write(
+            &script,
+            format!("@echo off\r\necho {OUT_MARKER}\r\necho {ERR_MARKER} 1>&2\r\n"),
+        )
+        .expect("write the fixture script");
+        let log_path = dir.join("service.log");
+
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        let pid = spawn_detached_with_log(
+            Path::new(&comspec),
+            &["/c".to_owned(), script.to_string_lossy().into_owned()],
+            &[],
+            &log_path,
+        )
+        .expect("spawn the detached child");
+
+        let exit_code = wait_for_process_exit(pid).expect("wait for the detached child");
+        let log = fs::read(&log_path).map_or_else(
+            |error| panic!("failed to read {}: {error}", log_path.display()),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(exit_code, 0, "fixture child failed; log was:\n{log}");
+        assert!(
+            log.contains(OUT_MARKER),
+            "the child's stdout never reached the log:\n{log}"
+        );
+        assert!(
+            log.contains(ERR_MARKER),
+            "the child's stderr never reached the log, which is the half that \
+             carries an engine's error chain:\n{log}"
+        );
+    }
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
 

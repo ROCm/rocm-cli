@@ -1130,6 +1130,42 @@ Expected result:
   disabling the wait. Clear the override with
   `Remove-Item Env:ROCM_DASH_CHAT_TIMEOUT_SECS` afterwards.
 
+### 4e. An Attached Serve That Crashes (ROCMAI-541)
+
+Check that a managed engine dying under `--verbose` is reported rather than
+swallowed. This is the behavior that regressed on Windows, where the child's
+output reached nothing, so run it there if you can.
+
+```powershell
+rocm serve <model> --verbose
+```
+
+Kill the engine from a second shell while the first is still streaming — on
+Windows, end the `rocm` child running `__engine-serve-http` in Task Manager; on
+Linux, `kill -9` that same pid (`rocm services list --all` names it).
+
+Expected result:
+
+- the first shell prints why it stopped, quoting the end of the service log —
+  not a bare `server process exited`;
+- it exits **non-zero** (`$LASTEXITCODE`, or `echo $?`);
+- `rocm services list --all` shows the record as `failed`, and `rocm services
+  logs <service-id>` ends with the engine's own error.
+
+Then repeat, but stop it deliberately from the second shell with `rocm services
+stop <service-id>` instead of killing it. That is the control: the attached
+shell must exit **0** and report a stop rather than a crash.
+
+On the record, expect the stop itself **not** to be what marks it `failed` — but
+do not read a `failed` record here as an automatic bug. The Lemonade and vLLM
+adapters see a SIGTERM'd server as an unsuccessful exit and write `failed` to
+the engine state file themselves, which `refresh_from_engine_state` reads back
+into the record. This is the only place that can be observed at all, since every
+automated stop test uses the scripted engine or a planted record. If you do see
+`failed`, read the service log: an adapter's own error there is the adapter's
+verdict, whereas a *rocm* "exited unexpectedly" line for a stop you asked for is
+the real regression.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are

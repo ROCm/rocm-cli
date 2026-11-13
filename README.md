@@ -1219,13 +1219,52 @@ can:
   itself fails, the command says why on stderr, signals the server process
   directly and exits 0; if that signal fails too, it says so on stderr.
 
+If the server dies on its own while you are attached, `rocm serve` exits
+**non-zero** and prints why, quoting the end of the service log, and the service
+is left marked `failed`. Stopping it deliberately — Ctrl-C here, or `rocm
+services stop` from another shell — is not a crash: the service is never marked
+`failed`, and the command exits 0 once the stop is confirmed. The one exception
+is the unconfirmed-stop case described above, which still exits with an error —
+that is a stop whose outcome is unknown, not a stop reported as a failure.
+
+The same rule now holds on **every** path a managed engine can die on, not only
+the attached one. A background `rocm serve` whose child dies during the readiness
+wait, a `rocm serve --wait` whose server dies before it answers, and a `rocm
+services restart` whose engine dies on start all fail loudly: non-zero exit, the
+reason quoted from the service log, and both the service record and the engine
+state file left `failed`. A death that was *asked for* — `rocm services stop`, or
+`rocm dash`'s stop action — is reported as a stop on all of them instead, and
+rocm itself marks nothing `failed` for it.
+
+That changes the verdict and the message, not every exit code. `rocm serve
+--wait` still exits non-zero when a stop ends its wait, because the thing it was
+asked to wait for — the server becoming ready — did not happen. What changed is
+that it now says `the server for service <id> was stopped before it became
+ready` rather than reporting an operator's own stop as the server failing to
+come up, and leaves the record `stopped` rather than `failed`. See the `--wait`
+description below.
+
+One caveat, because rocm is not the only writer. The Lemonade and vLLM adapters
+see a SIGTERM'd server as an unsuccessful exit, so they write `failed` to the
+engine state file themselves, and `refresh_from_engine_state` reads that back
+into the record. A deliberate stop of a real adapter-backed service can
+therefore still end up showing `failed`. That is the adapter's verdict rather
+than this stop-versus-crash check, and nothing covers it: the stop scenarios all
+use the scripted engine or planted records, so no real-adapter stop is exercised.
+
+The distinction is made from the stop's own recorded evidence, not from the
+record's status: a reconciliation that merely notices the processes are gone
+writes `stopped` too, and that is not proof anyone asked for it.
+
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
 `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
-`rocm services stop`), it fails with an error that points at the server's logs
-instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
+of returning `starting` after 45 seconds; if the server exits first it ends
+non-zero rather than waiting forever, and says which of the two happened: a
+crash or a kill fails with an error pointing at the server's logs and leaves the
+record `failed`, while a deliberate `rocm services stop` reports that the server
+was stopped before it became ready and leaves it `stopped`. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
 begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
 when the model is already being served and still starting, it waits on that

@@ -457,8 +457,10 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
     /// fails, it says why on stderr, signals the server process directly and exits 0,
-    /// noting on stderr if that signal fails too. Inspect or stop servers later with
-    /// `rocm services`.
+    /// noting on stderr if that signal fails too. If instead the server dies on its own
+    /// while you are attached, the command exits non-zero, names the crash and quotes the
+    /// end of the service log, and leaves the service marked `failed`. Inspect or stop
+    /// servers later with `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
     /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
@@ -2623,6 +2625,41 @@ mod tests {
             }
             other => panic!("expected Bench/Load, got {other:?}"),
         }
+    }
+
+    /// ROCMAI-541: the log-remediation lines printed next to a crash told users
+    /// to run `rocm logs <service_id>`, which has never selected a service —
+    /// `rocm logs` takes `--service`, and its positional argument is a
+    /// free-text search query, so the recommended command ran and quietly
+    /// searched for the id. Nothing caught it because no test ever parsed the
+    /// commands the output recommends.
+    ///
+    /// Both surviving spellings are genuine and both are kept: `rocm services
+    /// logs <id>` is the services-cluster form and `rocm logs --service <id>`
+    /// the top-level one. What has to hold is that whichever a message names
+    /// actually parses as a way to read that service's log.
+    #[test]
+    fn the_log_commands_the_crash_messages_name_actually_parse() {
+        for argv in [
+            ["rocm", "services", "logs", "svc-1"].as_slice(),
+            ["rocm", "services", "logs", "svc-1", "--follow"].as_slice(),
+            ["rocm", "logs", "--service", "svc-1"].as_slice(),
+            ["rocm", "logs", "--service", "svc-1", "--follow"].as_slice(),
+        ] {
+            Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+        }
+
+        // The form the bug used. It parses, which is precisely why the defect
+        // was silent: it selects no service, so it cannot be recommended as a
+        // way to read one's log.
+        let parsed = Cli::try_parse_from(["rocm", "logs", "svc-1"])
+            .expect("the positional form parses as a search query");
+        assert!(
+            matches!(parsed.command, Some(Command::Logs { service: None, .. })),
+            "the positional form selects no service: {:?}",
+            parsed.command
+        );
     }
 
     /// ROCMAI-543: the clap doc comments are the largest single surface of

@@ -124,7 +124,17 @@ pub(crate) fn stop_managed_service_via(
     // stop's alone.
     if all_stopped {
         record.status = "stopped".to_owned();
-        record.stop_requested_unix_ms = None;
+        // Moved, not dropped — the same move `rocm services stop` makes on its
+        // confirmed path, and for the same reason. Since
+        // `managed_service_stop_was_requested` stopped accepting
+        // `status == "stopped"` as proof (a liveness reconciliation writes that
+        // for a record whose pids are merely gone), this marker is the *only*
+        // evidence a death was asked for. Clearing it here left a daemon- or
+        // `rocm dash`-initiated stop with no evidence at all, so it read as a
+        // crash and was stamped `failed` — the exact symptom ROCMAI-541 exists
+        // to remove, reintroduced through the one stop path that is not
+        // `rocm services stop`.
+        record.settled_stop_unix_ms = record.stop_requested_unix_ms.take();
         // Recorded PIDs go stale the instant their processes exit, and a stale
         // PID is exactly what the identity check exists to catch — so do not
         // leave one behind for the next stop to find. The same call
@@ -634,6 +644,23 @@ mod tests {
         assert_eq!(
             reloaded.stop_requested_unix_ms, None,
             "a confirmed stop must clear the deferred-cleanup marker"
+        );
+        // Cleared, but not lost: it moves to `settled_stop_unix_ms`, which is
+        // the only evidence left that this death was asked for.
+        // `managed_service_stop_was_requested` no longer accepts
+        // `status == "stopped"` as proof, because a liveness reconciliation
+        // writes that for a record whose pids are merely gone — so a daemon or
+        // `rocm dash` stop that dropped the marker here would be read as a
+        // crash and stamped `failed`. `rocm services stop` makes the same move;
+        // the two paths have to agree or one of them reports every stop as a
+        // crash.
+        // Presence, not the planted value: the stop re-stamps
+        // `stop_requested_unix_ms` with its own `requested_at` before
+        // signalling anything, so what lands here is that timestamp rather
+        // than the `Some(1)` seeded above.
+        assert!(
+            reloaded.settled_stop_unix_ms.is_some(),
+            "the marker must be moved, not dropped, or this stop reads as a crash"
         );
         Ok(())
     }
