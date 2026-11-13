@@ -21,8 +21,9 @@ e2e-test-hooks = [
 # mock-lane build (never by the release build), it compiles in a `rocm serve`
 # hook that simulates a managed vLLM launch, so the `rocm serve` summary can be
 # verified on a GPU-less CI host: one that OOM'd and never became ready (the
-# OOM guidance), or, in the hook's `ready` mode, one that became ready and then
-# fails its smoke test.
+# OOM guidance), or, in the hook's `ready` mode, one that became ready (the
+# hook only fabricates the ready record; a mock engine supplies the failure of
+# the post-launch smoke test).
 # See `e2e_simulate_oom_launch` / `simulate_oom_managed_launch` in
 # `service_launch/readiness.rs`.
 e2e-oom-fault-injection = []
