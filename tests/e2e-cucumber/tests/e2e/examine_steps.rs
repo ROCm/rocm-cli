@@ -3121,6 +3121,128 @@ async fn assert_the_gpu_lspci_printed_is_listed(world: &mut E2eWorld) {
     );
 }
 
+// ── Each GPU keeps the runtime's reading of itself, not another GPU's ──
+
+/// The two GPUs `examine-49` plants: `(PCI address, KFD location_id, KFD
+/// gfx_target_version, the gfx target that version decodes to)`. The
+/// `location_id` doubles as the `BDFID` the stand-in `rocminfo` prints for the
+/// second, since both use the kernel's `(bus << 8) | devfn` encoding.
+const HIDDEN_GPU: (&str, u32, u32, &str) = ("0000:03:00.0", 768, 110_000, "gfx1100");
+const VISIBLE_GPU: (&str, u32, u32, &str) = ("0000:04:00.0", 1024, 110_001, "gfx1101");
+const VISIBLE_GPU_MODEL: &str = "AMD Radeon RX 7800 XT";
+
+#[given("a machine with two AMD GPUs of which the ROCm runtime can see only the second")]
+async fn machine_whose_runtime_sees_only_the_second_of_two_gpus(world: &mut E2eWorld) {
+    // A simulated native Linux root: the GPU probes are skipped on WSL, so a
+    // runner that is a WSL host would otherwise never reach the planted GPUs.
+    plant_os_release(world, "ID=ubuntu\nVERSION_ID=\"24.04\"\n");
+    let nodes = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root/sys/class/kfd/kfd/topology/nodes");
+    let cpu = nodes.join("0");
+    std::fs::create_dir_all(&cpu).expect("failed to create the planted CPU node");
+    std::fs::write(
+        cpu.join("properties"),
+        "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+    )
+    .expect("failed to write the planted CPU node properties");
+    for (index, (_, location_id, version, _)) in [HIDDEN_GPU, VISIBLE_GPU].iter().enumerate() {
+        let node = nodes.join((index + 1).to_string());
+        std::fs::create_dir_all(&node).expect("failed to create a planted GPU node");
+        std::fs::write(
+            node.join("properties"),
+            format!(
+                "cpu_cores_count 0\nsimd_count 96\ngfx_target_version {version}\n\
+                 location_id {location_id}\ndomain 0\n"
+            ),
+        )
+        .expect("failed to write a planted GPU node's properties");
+    }
+    // `rocminfo` in the shape the real tool prints: a CPU agent with BDFID 0,
+    // then the one GPU agent the runtime exposes, with the visible card's BDFID.
+    let (_, visible_bdfid, _, visible_gfx) = VISIBLE_GPU;
+    let rocminfo = format!(
+        "#!/bin/sh\ncat <<'AGENTS'\n*******\nAgent 1\n*******\n  \
+         Name:                    AMD Ryzen 9 7950X\n  Device Type:             CPU\n  \
+         BDFID:                   0\n*******\nAgent 2\n*******\n  \
+         Name:                    {visible_gfx}\n  \
+         Marketing Name:          {VISIBLE_GPU_MODEL}\n  \
+         Device Type:             GPU\n  BDFID:                   {visible_bdfid}\nAGENTS\n"
+    );
+    put_fake_executables_on_path(
+        world,
+        &[("lspci", "#!/bin/sh\nexit 0\n"), ("rocminfo", &rocminfo)],
+    );
+}
+
+/// The `gpus[]` entry `examine --json` lists at `pci_id`.
+fn listed_gpu_at(json: &serde_json::Value, pci_id: &str) -> serde_json::Value {
+    json.pointer("/gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no `gpus` array:\n{json:#}"))
+        .iter()
+        .find(|gpu| gpu.pointer("/pci_id").and_then(serde_json::Value::as_str) == Some(pci_id))
+        .unwrap_or_else(|| panic!("no GPU is listed at {pci_id}:\n{json:#}"))
+        .clone()
+}
+
+#[then("the second GPU is reported with the model name and architecture the runtime gave it")]
+async fn assert_the_visible_gpu_has_the_runtimes_reading(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let (address, _, _, gfx) = VISIBLE_GPU;
+    let gpu = listed_gpu_at(&json, address);
+    assert_eq!(
+        gpu["name"],
+        serde_json::json!(VISIBLE_GPU_MODEL),
+        "{json:#}"
+    );
+    assert_eq!(gpu["gfx_target"], serde_json::json!(gfx), "{json:#}");
+    assert_eq!(gpu["is_apu"], serde_json::json!(false), "{json:#}");
+}
+
+#[then("the first GPU is reported with its own architecture and no model name")]
+async fn assert_the_hidden_gpu_keeps_its_own_reading(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let gpus = json["gpus"].as_array().map_or(0, Vec::len);
+    assert_eq!(gpus, 2, "one entry per planted GPU:\n{json:#}");
+    let (address, _, _, gfx) = HIDDEN_GPU;
+    let gpu = listed_gpu_at(&json, address);
+    assert_eq!(gpu["gfx_target"], serde_json::json!(gfx), "{json:#}");
+    assert_ne!(
+        gpu["name"],
+        serde_json::json!(VISIBLE_GPU_MODEL),
+        "the hidden GPU took the visible one's model name:\n{json:#}"
+    );
+    // "No model name" as the report spells it: the kernel-topology
+    // placeholder, which the notes explain as an unknown marketing name.
+    assert_eq!(
+        gpu["name"],
+        serde_json::json!(rocm_core::examine::KERNEL_TOPOLOGY_GPU_NAME),
+        "{json:#}"
+    );
+    assert_eq!(
+        gpu["is_apu"],
+        serde_json::Value::Null,
+        "nothing stated whether the hidden GPU is integrated:\n{json:#}"
+    );
+    let notes: Vec<&str> = json["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("1 GPU(s)") && note.contains("marketing name is unknown")),
+        "the one unnamed GPU must be explained exactly as one:\n{notes:#?}"
+    );
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]

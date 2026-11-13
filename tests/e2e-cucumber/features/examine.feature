@@ -732,3 +732,22 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
+
+  # ROCMAI-40. The ROCm runtime can be told to show only some of a machine's
+  # GPUs (a visibility mask, commonly used to hide an integrated GPU), and the
+  # GPUs it lists then have to be matched to the ones the machine has. They were
+  # matched by list position, so with the first GPU hidden its entry took the
+  # second GPU's model name, architecture and integrated/discrete verdict, and
+  # the second kept none. Each is now matched by its own PCI address. The machine
+  # is simulated: a native Linux root whose kernel topology has two GPUs, at
+  # 0000:03:00.0 (gfx1100) and 0000:04:00.0 (gfx1101), an `lspci` stand-in that
+  # lists an empty bus, and a `rocminfo` stand-in that lists only the second, as
+  # "AMD Radeon RX 7800 XT" with that card's `BDFID`. The other rows (no address
+  # from the runtime, counts that differ, an address in two PCI domains, a
+  # partitioned card) are the unit tests in `examine/linux_gpus.rs`.
+  @id:examine-each-gpu-keeps-its-own-reading @requires-os:linux
+  Scenario: examine-49 - A GPU the ROCm runtime cannot see does not borrow another GPU's identity
+    Given a machine with two AMD GPUs of which the ROCm runtime can see only the second
+    When the user inspects that machine in machine-readable form
+    Then the second GPU is reported with the model name and architecture the runtime gave it
+    And the first GPU is reported with its own architecture and no model name
