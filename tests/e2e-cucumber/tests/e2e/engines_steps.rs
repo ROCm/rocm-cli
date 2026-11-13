@@ -188,8 +188,13 @@ async fn plant_vllm_with_broken_extensions(world: &mut E2eWorld) {
 
 #[when("the user lists the engines of that install")]
 async fn list_engines_of_that_install(world: &mut E2eWorld) {
-    let (stdout, _, rc) = crate::run_rocm_with_scenario_env(world, &["engines", "list"]);
-    assert_eq!(rc, 0, "`rocm engines list` failed:\n{stdout}");
+    let args = ["engines", "list"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
     world.cli_output = Some(stdout);
 }
 
