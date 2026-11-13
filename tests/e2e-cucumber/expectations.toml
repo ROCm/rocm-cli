@@ -234,9 +234,11 @@ serve_timeout_secs = 90
 flaky = true
 
 # --- Lemonade 11.5.1 cannot align its llama.cpp backend to a ROCm 7.14.x SDK ---
+# These rows name the release they were observed on. When the weekly runtime
+# update moves the Lemonade pin, re-check them against the new release.
 # `rocm engines install lemonade` tries to align Lemonade's `llamacpp:rocm`
 # backend with the active ROCm SDK. Lemonade 11.5.1, the pin in
-# `runtime-deps.toml`, downloads the TheRock tarball it pairs with the backend
+# `runtimes/mise.toml`, downloads the TheRock tarball it pairs with the backend
 # only from https://repo.amd.com/rocm/tarball/, a path the 7.14.x tarballs are not
 # published to (AMD's 7.14 install guide uses /rocm/tarball-multi-arch/), so the
 # download answers HTTP 403 for `therock-dist-<os>-<family>-7.14.1.tar.gz`. The

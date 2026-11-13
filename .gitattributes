@@ -7,6 +7,17 @@
 /docs/** text eol=lf
 /engines/** text eol=lf
 /scripts/** text eol=lf
+# `cargo xtask deps check` compares each generated lock's header byte for
+# byte, so a Windows checkout must not rewrite these line endings.
+/runtimes/*.toml text eol=lf
+/runtimes/*.lock text eol=lf
+/runtimes/locks/** text eol=lf
+# The POSIX launcher is a bash script without a `.sh` extension, so it is
+# pinned here; bash fails on `set -eu\r`. The Windows launcher is checked out
+# with CRLF: cmd.exe can misread `goto` labels in a batch file with LF line
+# endings.
+/runtimes/bin/mise text eol=lf
+/runtimes/bin/mise.cmd text eol=crlf
 # The recorded `rocm` output the skill evals replay is compared byte for byte
 # by `cargo xtask eval-fixtures --check`, so a Windows checkout must not
 # rewrite its line endings.

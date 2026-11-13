@@ -584,6 +584,996 @@ mod tests {
         );
     }
 
+    /// Whether `block` has `line` as a whole line — so a commented-out copy,
+    /// or the same text inside an echo, does not count.
+    fn has_line(block: &str, line: &str) -> bool {
+        block.lines().any(|l| l == line)
+    }
+
+    /// [`has_line`], ignoring a trailing ` # comment` (the runner labels
+    /// carry one saying why they are pinned).
+    fn has_code_line(block: &str, line: &str) -> bool {
+        block.lines().any(|l| strip_comment(l).trim_end() == line)
+    }
+
+    /// A job's steps as `(name, step without comments)`; an unnamed step has
+    /// an empty name.
+    fn runtime_job_steps(text: &str, job: &str) -> Vec<(String, String)> {
+        let block = job_block(text, job);
+        let steps: Vec<(String, String)> = job_steps(block)
+            .unwrap_or_else(|| panic!("job `{job}` has steps"))
+            .into_iter()
+            .map(|(name, step)| (name, without_comments(&step)))
+            .collect();
+        // `job_steps` sees only `- key: …` items. Every list item at the step
+        // indent — a bare `-` followed by an indented mapping included — must
+        // be one of them, or a step could hide from every check here.
+        let items = block
+            .lines()
+            .skip_while(|l| strip_comment(l).trim() != "steps:")
+            .skip(1)
+            .filter(|l| indent_of(l) == 6 && l.trim_start().starts_with('-'))
+            .count();
+        assert_eq!(
+            items,
+            steps.len(),
+            "job `{job}` has a step `job_steps` cannot see"
+        );
+        steps
+    }
+
+    const HIDDEN_STEP: &str = "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:  # the job's steps\n      - name: Seen\n        run: echo seen\n      -\n        run: echo hidden\n";
+
+    #[test]
+    #[should_panic(expected = "has a step `job_steps` cannot see")]
+    fn a_bare_dash_step_is_caught() {
+        runtime_job_steps(HIDDEN_STEP, "j");
+    }
+
+    #[test]
+    fn a_job_without_bare_dash_steps_passes_the_guard() {
+        let plain = HIDDEN_STEP.replace("      -\n        run: echo hidden\n", "");
+        assert_eq!(step_names(&runtime_job_steps(&plain, "j")), ["Seen"]);
+    }
+
+    /// The step named `name`, asserting it runs unconditionally unless
+    /// `expected_if` says otherwise, and never with `continue-on-error`.
+    fn pinned_step<'a>(steps: &'a [(String, String)], name: &str, expected_if: &str) -> &'a str {
+        let step = &steps
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("no step named `{name}`"))
+            .1;
+        assert_eq!(
+            step_key(step, "if"),
+            expected_if,
+            "step `{name}` has an unexpected `if:`"
+        );
+        // An allow-list rather than a deny-list: `continue-on-error`, in any
+        // spelling (quoted keys included), is simply not on it.
+        for key in step_keys(step) {
+            assert!(
+                ["name", "id", "if", "run", "uses", "with", "env"].contains(&key.as_str()),
+                "step `{name}` has key `{key}`, which a pinned step may not carry"
+            );
+        }
+        step
+    }
+
+    /// An unnamed step may only `uses:` an action `with:` inputs.
+    fn assert_plain_action_step(step: &str) {
+        for key in step_keys(step) {
+            assert!(
+                ["uses", "with"].contains(&key.as_str()),
+                "unnamed step has key `{key}`: {step}"
+            );
+        }
+    }
+
+    /// The keys of a job, one level under its `<job>:` line, comments ignored.
+    fn job_keys(job: &str) -> Vec<String> {
+        job.lines()
+            .filter(|l| indent_of(l) == 4 && !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.trim().split_once(':').map(|(k, _)| k.trim().to_owned()))
+            .collect()
+    }
+
+    /// A step's `run:` script, one trimmed line each, single-line form included.
+    fn run_lines(step: &str) -> Vec<String> {
+        let single = step_key(step, "run");
+        if single == "|" {
+            block_scalar_lines(step, "run")
+        } else {
+            vec![single]
+        }
+    }
+
+    /// A step's `run: |` script exactly as the shell sees it: only the block's
+    /// own indent is removed, so the indentation inside it (which decides what
+    /// an embedded Python heredoc does) is compared too. Blank lines dropped.
+    fn run_script_dedented(step: &str) -> Vec<String> {
+        let mut lines = step.lines().skip_while(|l| l.trim() != "run: |");
+        let head = lines.next().expect("step has a `run: |` block");
+        let head_indent = indent_of(head);
+        let body: Vec<&str> = lines
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > head_indent)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let base = body.iter().map(|l| indent_of(l)).min().unwrap_or(0);
+        body.iter()
+            .map(|l| l[base..].trim_end().to_owned())
+            .collect()
+    }
+
+    /// A job that runs upstream code (uv builds AMD's `rocm` sdist): exactly
+    /// this environment, runner and limit, and no step that adds variables or
+    /// passes an action inputs other than the ones listed.
+    fn assert_relock_job_inputs(
+        job: &str,
+        steps: &[(String, String)],
+        timeout: &str,
+        upload_with: &[(&str, &str)],
+    ) {
+        assert_eq!(
+            step_env(job),
+            env_map(&[
+                (
+                    "MISE_TRUSTED_CONFIG_PATHS",
+                    "${{ github.workspace }}/runtimes"
+                ),
+                ("MISE_VERSION", ""),
+                ("GITHUB_TOKEN", "${{ github.token }}"),
+                ("UV_NO_CACHE", "1"),
+                ("UV_HTTP_TIMEOUT", "900"),
+            ]),
+            "the job's environment reaches the upstream code it runs"
+        );
+        assert!(has_code_line(job, "    runs-on: ubuntu-24.04"));
+        assert!(has_line(job, &format!("    timeout-minutes: {timeout}")));
+        for (name, step) in steps {
+            assert!(
+                step_env(step).is_empty(),
+                "step `{name}` sets env, which reaches the upstream code: {step}"
+            );
+            let uses = step_key(step, "uses");
+            let expected_with = if uses.starts_with("actions/checkout@") {
+                env_map(&[("persist-credentials", "false")])
+            } else if uses.starts_with("actions-rust-lang/setup-rust-toolchain@") {
+                env_map(&[("cache", "false")])
+            } else if uses.starts_with("actions/upload-artifact@") {
+                env_map(upload_with)
+            } else {
+                assert!(uses.is_empty(), "unexpected action {uses}");
+                assert!(!step_keys(step).contains(&"with".to_owned()), "{name}");
+                continue;
+            };
+            assert_eq!(mapping_under(step, "with"), expected_with, "{name} {uses}");
+        }
+    }
+
+    /// The entries of the mapping under a step's `key:`, comments ignored.
+    fn mapping_under(step: &str, key: &str) -> BTreeMap<String, String> {
+        let marker = format!("{key}:");
+        let mut lines = step.lines().skip_while(|l| l.trim() != marker);
+        let head = lines
+            .next()
+            .unwrap_or_else(|| panic!("step has `{marker}`"));
+        let indent = indent_of(head);
+        lines
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .take_while(|l| indent_of(l) > indent)
+            // Deeper lines belong to a value (a `|` block or a nested map),
+            // which then reads as `|` or empty and fails any pin it is not in.
+            .filter(|l| indent_of(l) == indent + 2)
+            .map(|l| {
+                let (k, v) = l.trim().split_once(':').expect("`key: value`");
+                (
+                    strip_quotes(k.trim()),
+                    strip_quotes(strip_comment(v).trim()),
+                )
+            })
+            .collect()
+    }
+
+    fn env_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn step_names(steps: &[(String, String)]) -> Vec<&str> {
+        steps.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// The `- '…'` entries of a `dorny/paths-filter` filter named `filter`.
+    fn paths_filter_entries(changes_job: &str, filter: &str) -> Vec<String> {
+        let marker = format!("{filter}:");
+        let mut lines = changes_job.lines().skip_while(|l| l.trim() != marker);
+        let head = lines
+            .next()
+            .unwrap_or_else(|| panic!("no `{filter}` paths filter"));
+        let indent = indent_of(head);
+        lines
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > indent)
+            .filter_map(|l| {
+                let entry = strip_comment(l).trim().strip_prefix("- ")?;
+                Some(strip_quotes(entry.trim()))
+            })
+            .collect()
+    }
+
+    /// Every action the runtime-lock workflows run is pinned to a full commit
+    /// SHA, never a tag: `open-pr` holds a write token, and a moved tag would
+    /// run new code with it.
+    #[test]
+    fn the_runtime_lock_workflows_pin_every_action_to_a_commit() {
+        let update = read_workflow("runtime-deps-update.yml");
+        let ci = read_workflow("ci.yml");
+        let locks = job_block(&ci, "runtime-locks");
+        // Each source is counted on its own, so an empty or wrong slice of one
+        // cannot hide behind the other's count. A line-based scan: it reads
+        // `uses:` as these files write it (one step key per line, unquoted,
+        // a `# vX.Y.Z` comment after it), not every YAML form.
+        for (label, text, expected) in [
+            ("runtime-deps-update.yml", update.as_str(), 7),
+            ("runtime-locks", locks, 3),
+        ] {
+            let mut seen = 0;
+            for line in without_comments(text).lines() {
+                let Some(value) = line.trim().trim_start_matches("- ").strip_prefix("uses:") else {
+                    continue;
+                };
+                // The reference itself, without the `# vX.Y.Z` comment after it.
+                let value = value.split_whitespace().next().unwrap_or_default();
+                seen += 1;
+                let pinned = value.split_once('@').is_some_and(|(_, sha)| {
+                    sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())
+                });
+                assert!(
+                    pinned,
+                    "{label}: `{value}` is not pinned to a full commit SHA"
+                );
+            }
+            assert_eq!(seen, expected, "{label}: `uses:` lines found");
+        }
+    }
+
+    /// The update refuses to reset its branch over a commit it did not make.
+    /// Its own commits are recognised by the bot's login, or, only when
+    /// GitHub leaves the commit's user unresolved, by the bot's commit email;
+    /// a maintainer's fixup is counted either way, even one carrying the
+    /// bot's email. Runs the workflow's own jq
+    /// filter on compare-API shaped input.
+    #[test]
+    #[cfg_attr(windows, ignore = "needs jq on PATH; covered on the Linux CI jobs")]
+    fn the_update_counts_only_commits_the_workflow_did_not_make() {
+        let workflow = read_workflow("runtime-deps-update.yml");
+        let filter = workflow
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("--jq '"))
+            .and_then(|l| l.strip_suffix("')"))
+            .expect("the ownership check passes a --jq filter");
+        let bot_email = "41898282+github-actions[bot]@users.noreply.github.com";
+        let commit = |login: Option<&str>, email: &str| {
+            serde_json::json!({
+                "author": login.map(|l| serde_json::json!({"login": l})),
+                "commit": {"author": {"email": email}},
+            })
+        };
+        for (commits, expected) in [
+            (vec![commit(Some("github-actions[bot]"), bot_email)], "0"),
+            // The login alone decides when GitHub resolved one.
+            (
+                vec![commit(Some("github-actions[bot]"), "x@example.com")],
+                "0",
+            ),
+            (vec![commit(Some("a-maintainer"), bot_email)], "1"),
+            // The email decides only when the author is unresolved.
+            (vec![commit(None, bot_email)], "0"),
+            (vec![commit(Some("a-maintainer"), "m@example.com")], "1"),
+            (vec![commit(None, "m@example.com")], "1"),
+            (
+                vec![
+                    commit(None, bot_email),
+                    commit(Some("a-maintainer"), "m@example.com"),
+                ],
+                "1",
+            ),
+        ] {
+            let input = serde_json::json!({ "commits": commits }).to_string();
+            let mut child = std::process::Command::new("jq")
+                .arg(filter)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("jq must be on PATH");
+            std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{input}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    /// Runs the commit step's own payload builder — the Python heredoc, taken
+    /// from the workflow — on a fixture, so what it commits and deletes is
+    /// checked as behaviour and not only as pinned text.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "needs python3 on PATH; covered on the Linux CI jobs"
+    )]
+    fn the_update_commit_replaces_the_pins_and_deletes_only_dropped_locks() {
+        let workflow = read_workflow("runtime-deps-update.yml");
+        let open_pr = runtime_job_steps(&workflow, "open-pr");
+        let script = run_script_dedented(pinned_step(
+            &open_pr,
+            "Commit to the update branch and open the pull request",
+            "",
+        ));
+        let start = script
+            .iter()
+            .position(|l| l == "python3 - \"$committed\" <<'PY' > payload.json")
+            .expect("the step builds its payload with a Python heredoc");
+        let end = start
+            + script[start..]
+                .iter()
+                .position(|l| l == "PY")
+                .expect("the heredoc ends");
+        let builder = script[start + 1..end].join("\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        let update = dir.path().join("update");
+        std::fs::create_dir_all(update.join("locks")).unwrap();
+        std::fs::write(update.join("mise.toml"), "toml").unwrap();
+        std::fs::write(update.join("mise.lock"), "lock").unwrap();
+        std::fs::write(update.join("locks/pylock.a-linux.toml"), "a").unwrap();
+        std::fs::write(update.join("locks/notes.txt"), "not a lock").unwrap();
+        std::fs::write(dir.path().join("builder.py"), builder).unwrap();
+        let output = std::process::Command::new("python3")
+            .arg("-I")
+            .arg("builder.py")
+            // One stray path per condition of the filter: a lock-named file
+            // that is not TOML, a TOML file not named like a lock, and a lock
+            // name one directory too deep.
+            .arg("runtimes/locks/pylock.a-linux.toml runtimes/locks/pylock.gone-linux.toml runtimes/locks/pylock.x.json runtimes/locks/other.toml runtimes/locks/pylock.x/nested.toml")
+            .current_dir(dir.path())
+            .env("REPO", "o/r")
+            .env("BRANCH", "runtime-deps/update")
+            .env("BASE_SHA", "abc123")
+            .output()
+            .expect("python3 must be on PATH");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let input = &payload["variables"]["input"];
+        assert_eq!(input["expectedHeadOid"], "abc123");
+        assert_eq!(input["branch"]["branchName"], "runtime-deps/update");
+        assert_eq!(input["branch"]["repositoryNameWithOwner"], "o/r");
+        let added: Vec<(&str, String)> = input["fileChanges"]["additions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                let contents = a["contents"].as_str().unwrap();
+                (
+                    a["path"].as_str().unwrap(),
+                    String::from_utf8(
+                        base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            contents,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            added,
+            [
+                ("runtimes/mise.toml", "toml".to_owned()),
+                ("runtimes/mise.lock", "lock".to_owned()),
+                ("runtimes/locks/pylock.a-linux.toml", "a".to_owned()),
+            ],
+            "the pins, their lock and every produced lock; nothing else"
+        );
+        assert_eq!(
+            input["fileChanges"]["deletions"],
+            serde_json::json!([{"path": "runtimes/locks/pylock.gone-linux.toml"}]),
+            "only the committed lock the update no longer produces"
+        );
+        assert!(
+            input["message"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("Signed-off-by: github-actions[bot]")
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "the pinned lines are the workflow's Python f-strings, not Rust format strings"
+    )]
+    fn runtime_deps_update_resolves_read_only_and_commits_only_validated_files() {
+        let workflow = read_workflow("runtime-deps-update.yml");
+        assert_eq!(top_level_block(&workflow, "permissions").trim(), "{}");
+        // No `defaults:` (a shell or working directory) or other top-level
+        // key can reach the jobs unpinned.
+        let top_level: Vec<&str> = workflow
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with([' ', '#']))
+            .filter_map(|l| l.split_once(':').map(|(key, _)| key))
+            .collect();
+        assert_eq!(
+            top_level,
+            ["name", "on", "permissions", "concurrency", "env", "jobs"]
+        );
+        let triggers: Vec<String> = top_level_block(&workflow, "on")
+            .lines()
+            .filter(|l| indent_of(l) == 2 && !l.trim_start().starts_with('#'))
+            .map(|l| l.trim().trim_end_matches(':').to_owned())
+            .collect();
+        assert_eq!(
+            triggers,
+            ["schedule", "workflow_dispatch"],
+            "only a schedule or a person may start it"
+        );
+
+        // `propose` runs upstream code (uv builds the `rocm` sdist): read-only
+        // token, no persisted credentials, no cache to poison, main only.
+        let propose_job = without_comments(job_block(&workflow, "propose"));
+        assert_eq!(
+            permission_mapping(&propose_job, "    permissions:"),
+            std::collections::BTreeMap::from([("contents".to_owned(), "read".to_owned())]),
+        );
+        assert!(has_line(
+            &propose_job,
+            "    if: github.ref == 'refs/heads/main'"
+        ));
+        assert!(has_line(&propose_job, "      MISE_VERSION: \"\""));
+        let propose = runtime_job_steps(&workflow, "propose");
+        assert_eq!(
+            step_names(&propose),
+            [
+                "",
+                "",
+                "Free disk space for wheel downloads",
+                "Update pins and re-lock",
+                "Summarise what moved",
+                "Upload the proposed update"
+            ]
+        );
+        assert!(step_key(&propose[0].1, "uses").starts_with("actions/checkout@"));
+        assert!(has_line(
+            &propose[0].1,
+            "          persist-credentials: false"
+        ));
+        assert!(step_key(&propose[1].1, "uses").contains("setup-rust-toolchain@"));
+        assert!(has_line(&propose[1].1, "          cache: false"));
+        assert_plain_action_step(&propose[0].1);
+        assert_plain_action_step(&propose[1].1);
+        assert_eq!(
+            job_keys(&propose_job),
+            [
+                "name",
+                "if",
+                "runs-on",
+                "timeout-minutes",
+                "permissions",
+                "outputs",
+                "env",
+                "steps"
+            ],
+            "propose's job-level keys (no continue-on-error, no needs)"
+        );
+        assert!(has_line(
+            &propose_job,
+            "      changed: ${{ steps.diff.outputs.changed }}"
+        ));
+        // The job's whole environment, runner and limits: an added variable
+        // (`UV_INDEX_URL`, `PYTHONPATH`) or a self-hosted runner would change
+        // what the upstream code it runs can reach.
+        assert_relock_job_inputs(
+            &propose_job,
+            &propose,
+            "240",
+            &[
+                ("name", "runtime-deps-update"),
+                ("path", "${{ runner.temp }}/update/"),
+                ("retention-days", "7"),
+            ],
+        );
+        assert_eq!(
+            job_ids(&workflow),
+            ["propose", "check", "open-pr"],
+            "no other job may run in this workflow"
+        );
+        assert_eq!(
+            step_env(&format!("env:{}", top_level_block(&workflow, "env"))),
+            env_map(&[
+                ("CARGO_TERM_COLOR", "always"),
+                ("RUSTFLAGS", "-D warnings"),
+                ("BRANCH", "runtime-deps/update"),
+            ])
+        );
+        assert_eq!(
+            without_comments(&top_level_block(&workflow, "concurrency")).trim(),
+            "group: runtime-deps-update\n  cancel-in-progress: false"
+        );
+        assert_eq!(
+            run_lines(pinned_step(
+                &propose,
+                "Free disk space for wheel downloads",
+                ""
+            )),
+            [
+                "sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL",
+                "df -h /"
+            ],
+            "the step runs in a job that runs upstream code; its script is pinned whole"
+        );
+        // Whether a pull request is opened at all hangs on this step's
+        // output, so its id and its script are pinned whole.
+        let summarise = pinned_step(&propose, "Summarise what moved", "");
+        assert_eq!(step_key(summarise, "id"), "diff");
+        assert_eq!(
+            run_lines(summarise),
+            [
+                "set -euo pipefail",
+                "git add -N runtimes",
+                "if git diff --quiet -- runtimes; then",
+                "echo \"Every runtime is current; nothing to propose.\"",
+                "echo \"changed=false\" >> \"$GITHUB_OUTPUT\"",
+                "exit 0",
+                "fi",
+                "mkdir -p \"$RUNNER_TEMP/update\"",
+                "cargo xtask deps diff --base HEAD > \"$RUNNER_TEMP/update/summary.md\"",
+                "cp -r runtimes/mise.toml runtimes/mise.lock runtimes/locks \"$RUNNER_TEMP/update/\"",
+                "cat \"$RUNNER_TEMP/update/summary.md\" >> \"$GITHUB_STEP_SUMMARY\"",
+                "echo \"changed=true\" >> \"$GITHUB_OUTPUT\"",
+            ]
+        );
+        assert_eq!(
+            run_lines(pinned_step(&propose, "Update pins and re-lock", "")),
+            ["runtimes/bin/mise run --cd runtimes update"]
+        );
+        let upload = pinned_step(
+            &propose,
+            "Upload the proposed update",
+            "steps.diff.outputs.changed == 'true'",
+        );
+        assert!(step_key(upload, "uses").starts_with("actions/upload-artifact@"));
+        assert!(has_line(upload, "          name: runtime-deps-update"));
+        assert!(has_line(
+            upload,
+            "          path: ${{ runner.temp }}/update/"
+        ));
+
+        // `check` runs this commit's own `deps check` against the artifact,
+        // read-only, before anything holds a write token.
+        let check_job = without_comments(job_block(&workflow, "check"));
+        assert_eq!(
+            permission_mapping(&check_job, "    permissions:"),
+            std::collections::BTreeMap::from([("contents".to_owned(), "read".to_owned())]),
+        );
+        assert_eq!(
+            job_keys(&check_job),
+            [
+                "name",
+                "needs",
+                "if",
+                "runs-on",
+                "timeout-minutes",
+                "permissions",
+                "steps"
+            ],
+        );
+        assert!(has_line(&check_job, "    needs: propose"));
+        assert!(has_line(&check_job, "    timeout-minutes: 30"));
+        assert!(has_line(
+            &check_job,
+            "    if: needs.propose.outputs.changed == 'true'"
+        ));
+        assert!(has_code_line(&check_job, "    runs-on: ubuntu-24.04"));
+        let check = runtime_job_steps(&workflow, "check");
+        assert_eq!(
+            step_names(&check),
+            [
+                "",
+                "",
+                "Download the proposed update",
+                "Check the update with this commit's code"
+            ]
+        );
+        for (name, step) in &check {
+            assert!(step_env(step).is_empty(), "{name}");
+        }
+        assert_plain_action_step(&check[0].1);
+        assert_plain_action_step(&check[1].1);
+        assert!(step_key(&check[0].1, "uses").starts_with("actions/checkout@"));
+        assert_eq!(
+            mapping_under(&check[0].1, "with"),
+            env_map(&[("persist-credentials", "false")])
+        );
+        assert!(
+            step_key(&check[1].1, "uses").starts_with("actions-rust-lang/setup-rust-toolchain@")
+        );
+        assert_eq!(
+            mapping_under(&check[1].1, "with"),
+            env_map(&[("cache", "false")])
+        );
+        let check_download = pinned_step(&check, "Download the proposed update", "");
+        assert!(step_key(check_download, "uses").starts_with("actions/download-artifact@"));
+        assert_eq!(
+            mapping_under(check_download, "with"),
+            env_map(&[
+                ("name", "runtime-deps-update"),
+                ("path", "${{ runner.temp }}/update")
+            ])
+        );
+        assert_eq!(
+            run_script_dedented(pinned_step(
+                &check,
+                "Check the update with this commit's code",
+                ""
+            )),
+            [
+                "set -euo pipefail",
+                "python3 -I scripts/validate_runtime_update.py \"$RUNNER_TEMP/update\" runtimes/mise.toml",
+                "cp \"$RUNNER_TEMP/update/mise.toml\" \"$RUNNER_TEMP/update/mise.lock\" runtimes/",
+                "rm -rf runtimes/locks",
+                "cp -r \"$RUNNER_TEMP/update/locks\" runtimes/locks",
+                "cargo xtask deps check",
+                "cargo xtask deps verify-downloads",
+                "cargo xtask deps diff --base HEAD | cmp - \"$RUNNER_TEMP/update/summary.md\"",
+            ],
+            "the check must validate the artifact, run deps check on it, and recompute its summary"
+        );
+
+        // `open-pr` holds the write token: exactly these three steps, none of
+        // which can run code from the artifact or a checkout.
+        let open_pr_job = without_comments(job_block(&workflow, "open-pr"));
+        assert_eq!(
+            permission_mapping(&open_pr_job, "    permissions:"),
+            std::collections::BTreeMap::from([
+                ("contents".to_owned(), "write".to_owned()),
+                ("pull-requests".to_owned(), "write".to_owned()),
+            ]),
+        );
+        assert_eq!(
+            job_keys(&open_pr_job),
+            [
+                "name",
+                "needs",
+                "if",
+                "runs-on",
+                "timeout-minutes",
+                "permissions",
+                "steps"
+            ],
+            "open-pr's job-level keys (no continue-on-error)"
+        );
+        assert!(has_line(&open_pr_job, "    needs: [propose, check]"));
+        assert!(has_code_line(&open_pr_job, "    runs-on: ubuntu-24.04"));
+        assert!(has_line(&open_pr_job, "    timeout-minutes: 20"));
+        assert!(has_line(
+            &open_pr_job,
+            "    if: needs.propose.outputs.changed == 'true'"
+        ));
+        let open_pr = runtime_job_steps(&workflow, "open-pr");
+        assert_eq!(
+            step_names(&open_pr),
+            [
+                "Download the proposed update",
+                "Validate the artifact",
+                "Commit to the update branch and open the pull request"
+            ],
+            "open-pr must run exactly its three steps, in this order"
+        );
+        let download = pinned_step(&open_pr, "Download the proposed update", "");
+        assert!(step_key(download, "uses").starts_with("actions/download-artifact@"));
+        // Its inputs whole: `run-id:` plus `github-token:` would fetch another
+        // run's artifact into the job that holds the write token.
+        assert_eq!(
+            mapping_under(download, "with"),
+            env_map(&[("name", "runtime-deps-update"), ("path", "update")])
+        );
+
+        let validate = pinned_step(&open_pr, "Validate the artifact", "");
+        assert_eq!(
+            step_env(validate),
+            env_map(&[
+                ("GH_TOKEN", "${{ github.token }}"),
+                ("REPO", "${{ github.repository }}"),
+                ("BASE_SHA", "${{ github.sha }}"),
+            ])
+        );
+        let sentinel = "^def validate(artifact: Path, base_config: Path) -> None:$";
+        assert_eq!(
+            run_lines(validate),
+            [
+                "set -euo pipefail".to_owned(),
+                "gh api \"repos/$REPO/contents/runtimes/mise.toml?ref=$BASE_SHA\" --jq .content | base64 -d > base-mise.toml".to_owned(),
+                "gh api \"repos/$REPO/contents/scripts/validate_runtime_update.py?ref=$BASE_SHA\" --jq .content | base64 -d > validate_runtime_update.py".to_owned(),
+                format!("grep -q '{sentinel}' validate_runtime_update.py"),
+                "python3 -I validate_runtime_update.py update base-mise.toml".to_owned(),
+            ]
+        );
+        // The sentinel and the CLI shape are matched across files: tie them.
+        let script =
+            std::fs::read_to_string(repo_root().join("scripts/validate_runtime_update.py"))
+                .unwrap();
+        let def_line = sentinel.trim_start_matches('^').trim_end_matches('$');
+        assert!(
+            has_line(&script, def_line),
+            "the workflow's grep sentinel must match the validator's `def validate` line"
+        );
+        assert!(
+            script.contains("    if len(argv) != 2:\n"),
+            "the workflow passes the validator exactly two arguments"
+        );
+
+        let commit = pinned_step(
+            &open_pr,
+            "Commit to the update branch and open the pull request",
+            "",
+        );
+        // The whole env, so no variable (a second token, a `PYTHONPATH`) can
+        // be slipped into the step that holds the write token.
+        assert_eq!(
+            step_env(commit),
+            env_map(&[
+                ("GH_TOKEN", "${{ github.token }}"),
+                ("REPO", "${{ github.repository }}"),
+                ("BASE", "main"),
+                ("BASE_SHA", "${{ github.sha }}"),
+            ])
+        );
+        // Pinned whole: the step holds the write token, and any line added
+        // to it (a plain `sh update/x.sh` included) must fail this test.
+        assert_eq!(
+            run_script_dedented(commit),
+            [
+                "set -euo pipefail",
+                "base_sha=\"$BASE_SHA\"",
+                "if head_sha=$(gh api \"repos/$REPO/git/ref/heads/$BRANCH\" --jq .object.sha 2>ref.err); then",
+                "  others=$(gh api \"repos/$REPO/compare/$base_sha...$head_sha\" \\",
+                "    --jq '[.commits[] | select((.author.login == \"github-actions[bot]\" or (.author == null and .commit.author.email == \"41898282+github-actions[bot]@users.noreply.github.com\")) | not)] | length')",
+                "  if [ \"$others\" != \"0\" ]; then",
+                "    echo \"::error::$BRANCH has $others commit(s) this workflow did not make. Merge its pull request (which deletes the branch), or close it and delete the branch, or move the fixups to main, before the next update.\"",
+                "    exit 1",
+                "  fi",
+                "else",
+                "  grep -q 'HTTP 404' ref.err || { cat ref.err >&2; exit 1; }",
+                "  head_sha=0000000000000000000000000000000000000000",
+                "fi",
+                "repo_id=$(gh api \"repos/$REPO\" --jq .node_id)",
+                "gh api graphql \\",
+                "  -f query='mutation($repo: ID!, $name: GitRefname!, $before: GitObjectID!, $after: GitObjectID!) { updateRefs(input: {repositoryId: $repo, refUpdates: [{name: $name, beforeOid: $before, afterOid: $after, force: true}]}) { clientMutationId } }' \\",
+                "  -f repo=\"$repo_id\" -f name=\"refs/heads/$BRANCH\" -f before=\"$head_sha\" -f after=\"$base_sha\" >/dev/null",
+                "if ! committed=$(gh api \"repos/$REPO/contents/runtimes/locks?ref=$base_sha\" --jq '.[].path' 2>listing.err); then",
+                "  grep -q 'HTTP 404' listing.err || { cat listing.err >&2; exit 1; }",
+                "  committed=\"\"",
+                "fi",
+                "python3 - \"$committed\" <<'PY' > payload.json",
+                "import base64, json, os, sys",
+                "from pathlib import Path",
+                "root = Path(\"update\")",
+                "additions = []",
+                "for name in (\"mise.toml\", \"mise.lock\"):",
+                "    additions.append({\"path\": f\"runtimes/{name}\",",
+                "                      \"contents\": base64.b64encode((root / name).read_bytes()).decode()})",
+                "produced = set()",
+                "for lock in sorted((root / \"locks\").glob(\"pylock.*.toml\")):",
+                "    path = f\"runtimes/locks/{lock.name}\"",
+                "    produced.add(path)",
+                "    additions.append({\"path\": path, \"contents\": base64.b64encode(lock.read_bytes()).decode()})",
+                "deletions = [{\"path\": p} for p in sys.argv[1].split()",
+                "             if p not in produced and p.startswith(\"runtimes/locks/pylock.\") and p.endswith(\".toml\")",
+                "             and p.count(\"/\") == 2]",
+                "print(json.dumps({",
+                "    \"query\": \"mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }\",",
+                "    \"variables\": {\"input\": {",
+                "        \"branch\": {\"repositoryNameWithOwner\": os.environ[\"REPO\"], \"branchName\": os.environ[\"BRANCH\"]},",
+                "        \"expectedHeadOid\": os.environ[\"BASE_SHA\"],",
+                "        \"message\": {",
+                "            \"headline\": \"build(deps): update runtime pins and locks\",",
+                "            \"body\": \"Generated by the runtime-deps-update workflow (`runtimes/bin/mise run --cd runtimes update`).\\n\\n\"",
+                "                    \"Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>\",",
+                "        },",
+                "        \"fileChanges\": {\"additions\": additions, \"deletions\": deletions},",
+                "    }},",
+                "}))",
+                "PY",
+                "gh api graphql --input payload.json >/dev/null",
+                "{",
+                "  echo \"Weekly update of the third-party runtimes rocm-cli installs, from \\`runtimes/bin/mise run --cd runtimes update\\`.\"",
+                "  echo",
+                "  cat update/summary.md",
+                "  echo",
+                "  echo \"Pull requests opened by this workflow do not trigger CI on their own: close and reopen this one to run the checks. The GPU lanes exercise a new Lemonade version; no installer reads the Python locks yet, so their changes are checked by \\`cargo xtask deps check\\` and the runtime-locks job only.\"",
+                "} > body.md",
+                "existing=$(gh pr list --repo \"$REPO\" --head \"$BRANCH\" --state open --json number --jq '.[0].number // empty')",
+                "if [ -n \"$existing\" ]; then",
+                "  gh pr edit \"$existing\" --repo \"$REPO\" --body-file body.md",
+                "else",
+                "  gh pr create --repo \"$REPO\" --base \"$BASE\" --head \"$BRANCH\" \\",
+                "    --title \"build(deps): update runtime pins and locks\" --body-file body.md",
+                "fi",
+            ],
+            "the commit step's script changed; review it as a privileged change and update this pin"
+        );
+
+        // The validator's own tests run in CI.
+        let ci = read_workflow("ci.yml");
+        let build = runtime_job_steps(&ci, "build-and-test");
+        let self_tests = pinned_step(
+            &build,
+            "Acceptance harness self-tests",
+            "needs.changes.outputs.heavy == 'true'",
+        );
+        assert!(
+            run_lines(self_tests)
+                .iter()
+                .any(|l| l == "python scripts/validate_runtime_update.py --self-test"),
+            "CI must run the validator's self-test"
+        );
+    }
+
+    /// Every filter a change under `runtimes/` (a Lemonade pin bump, a
+    /// re-lock) must trip, so the jobs that exercise it run on its pull
+    /// request: the Rust tests that check the locks, the heavy lanes, and the
+    /// self-hosted GPU lanes that run the pinned Lemonade. The update
+    /// validator is read by Linux-only xtask tests, so it sits in `rust` too.
+    #[test]
+    fn a_runtimes_change_trips_every_filter_that_tests_it() {
+        let ci = without_comments(job_block(&read_workflow("ci.yml"), "changes"));
+        let selfhosted =
+            without_comments(job_block(&read_workflow("e2e-selfhosted.yml"), "changes"));
+        for (workflow, job, filter, entry) in [
+            ("ci.yml", &ci, "rust", "runtimes/**"),
+            ("ci.yml", &ci, "heavy", "runtimes/**"),
+            ("ci.yml", &ci, "rust", "scripts/validate_runtime_update.py"),
+            ("e2e-selfhosted.yml", &selfhosted, "heavy", "runtimes/**"),
+            ("e2e-selfhosted.yml", &selfhosted, "serve", "runtimes/**"),
+        ] {
+            assert!(
+                paths_filter_entries(job, filter).iter().any(|e| e == entry),
+                "{workflow} `{filter}` filter must list `{entry}`"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_locks_job_is_read_only_and_runs_only_for_runtime_changes() {
+        let ci = read_workflow("ci.yml");
+        let changes = without_comments(job_block(&ci, "changes"));
+        assert!(
+            has_line(
+                &changes,
+                "      runtimes: ${{ steps.filter.outputs.runtimes == 'true' }}"
+            ),
+            "the runtimes output must not be forced true off pull requests: the job downloads every AMD wheel the locks name"
+        );
+        assert_eq!(
+            paths_filter_entries(&changes, "runtimes"),
+            [
+                "runtimes/**",
+                "xtask/src/deps/**",
+                "crates/rocm-deps/src/pins_gen.rs"
+            ],
+            "only a change that can alter a lock may trigger the full re-lock"
+        );
+
+        let job = without_comments(job_block(&ci, "runtime-locks"));
+        assert_eq!(
+            permission_mapping(&job, "    permissions:"),
+            std::collections::BTreeMap::from([("contents".to_owned(), "read".to_owned())]),
+        );
+        assert!(has_line(
+            &job,
+            "    if: needs.changes.outputs.runtimes == 'true'"
+        ));
+        assert!(has_line(&job, "    needs: changes"));
+        assert!(has_line(&job, "      MISE_VERSION: \"\""));
+        let steps = runtime_job_steps(&ci, "runtime-locks");
+        assert_relock_job_inputs(
+            &job,
+            &steps,
+            "180",
+            &[
+                ("name", "runtime-locks"),
+                ("path", "|"),
+                ("retention-days", "7"),
+            ],
+        );
+        assert_eq!(
+            step_names(&steps),
+            [
+                "",
+                "",
+                "Free disk space for wheel downloads",
+                "Re-lock at the committed pins",
+                "Check every locked download against the lock",
+                "Fail if any lock changed",
+                "Upload the re-locked files"
+            ]
+        );
+        assert_eq!(
+            run_lines(pinned_step(
+                &steps,
+                "Check every locked download against the lock",
+                ""
+            )),
+            ["cargo xtask deps verify-downloads"]
+        );
+        assert!(has_line(
+            &steps[0].1,
+            "          persist-credentials: false"
+        ));
+        assert!(has_line(&steps[1].1, "          cache: false"));
+        assert_plain_action_step(&steps[0].1);
+        assert_plain_action_step(&steps[1].1);
+        assert_eq!(
+            job_keys(&job),
+            [
+                "name",
+                "needs",
+                "if",
+                "runs-on",
+                "timeout-minutes",
+                "permissions",
+                "env",
+                "steps"
+            ],
+            "runtime-locks' job-level keys (no continue-on-error: the gate must be able to fail)"
+        );
+        assert_eq!(
+            run_lines(pinned_step(
+                &steps,
+                "Free disk space for wheel downloads",
+                ""
+            )),
+            [
+                "sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL",
+                "df -h /"
+            ],
+            "the step runs in a job that runs upstream code; its script is pinned whole"
+        );
+        assert_eq!(
+            run_lines(pinned_step(&steps, "Re-lock at the committed pins", "")),
+            ["runtimes/bin/mise run --cd runtimes lock"]
+        );
+        assert_eq!(
+            run_lines(pinned_step(&steps, "Fail if any lock changed", "")),
+            [
+                "git add -N runtimes",
+                "if ! git diff --exit-code --stat -- runtimes; then",
+                "echo \"::error::A runtime lock is missing or stale, or AMD published a new build of an AMD-only package (those are not held back by a lock's cutoff). Commit the files from the 'runtime-locks' artifact, or run 'runtimes/bin/mise run --cd runtimes lock'.\"",
+                "exit 1",
+                "fi",
+            ]
+        );
+        let upload = pinned_step(&steps, "Upload the re-locked files", "failure()");
+        assert!(step_key(upload, "uses").starts_with("actions/upload-artifact@"));
+        // The gate's error message tells people to commit this artifact.
+        assert!(has_line(upload, "          name: runtime-locks"));
+        assert_eq!(
+            block_scalar_lines(upload, "path"),
+            ["runtimes/mise.lock", "runtimes/locks/"],
+            "the runtime-locks artifact holds exactly what the gate regenerates"
+        );
+    }
+
     #[test]
     fn dependabot_pull_request_workflow_is_strictly_read_only() {
         let generator = read_workflow("dependabot-manifests.yml");
@@ -5296,6 +6286,40 @@ fi
         }
     }
 
+    /// Each file `forces_full_workspace` names as compiled into xtask by path
+    /// ([`crate::affected::XTASK_COMPILED_FILES`]) exists, is still included
+    /// by a `#[path]` attribute under xtask/src, and triggers the
+    /// `runtime-locks` job, whose lock check it feeds.
+    #[test]
+    fn xtask_compiled_files_are_included_and_trigger_the_lock_check() {
+        let root = repo_root();
+        let mut sources = String::new();
+        let mut dirs = vec![root.join("xtask/src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    sources.push_str(&std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+        let changes = without_comments(job_block(&read_workflow("ci.yml"), "changes"));
+        let runtimes_filter = paths_filter_entries(&changes, "runtimes");
+        for file in crate::affected::XTASK_COMPILED_FILES {
+            assert!(root.join(file).is_file(), "{file} does not exist");
+            assert!(
+                sources.contains(&format!("#[path = \"../../../{file}\"]")),
+                "{file} is no longer included by path under xtask/src"
+            );
+            assert!(
+                runtimes_filter.iter().any(|entry| entry == file),
+                "{file} is missing from ci.yml's `runtimes` paths filter"
+            );
+        }
+    }
+
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
@@ -6555,6 +7579,17 @@ fi
                 "windows-debug",
                 "Acceptance harness self-test (vLLM)",
                 &["vllm_therock_gpu_test.py --self-test"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Bootstrap mise through the Windows launcher",
+                &[
+                    "call runtimes\\bin\\mise.cmd --version > \"%RUNNER_TEMP%\\mise-version.txt\" || exit /b 1",
+                    "findstr /b /c:",
+                    "\"%RUNNER_TEMP%\\mise-version.txt\" || exit /b 1\n",
+                ],
                 &[],
                 HEAVY,
             ),

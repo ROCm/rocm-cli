@@ -1,0 +1,80 @@
+# Python runtime stacks rocm-cli installs, locked per OS with uv.
+#
+# `cargo xtask deps lock` compiles each profile below, once per OS it names,
+# into `locks/pylock.<profile>-<os>.toml` (PEP 751) using the indexes in
+# `uv.toml`; `cargo xtask deps check` verifies the result. Third-party
+# binaries are pinned in `mise.toml`, not here. See
+# docs/runtime-dependencies.md.
+#
+# Each requirement is `name[extras]==version` or `name[extras]==version.*`:
+# deliberately narrow, so `deps check` can decide on its own whether a lock
+# still satisfies its profile.
+
+[policy]
+uv-config = "runtimes/uv.toml"
+# Packages only AMD builds for ROCm. Two roles: `cargo xtask deps check`
+# refuses a lock that takes one of them from any other host, so a missing ROCm
+# build can never be silently replaced by a same-named package from PyPI; and
+# `deps lock` exempts them from its `exclude-newer` cutoff, since AMD's
+# indexes publish no upload times. An AMD-only dependency missing from this
+# list makes the weekly update fail; add it here.
+vendor-hosts = ["stable.repo.amd.com", "rocm.frameworks.amd.com"]
+vendor-packages = [
+  "rocm",
+  "rocm-bootstrap",
+  "rocm-sdk-*",
+  "amd-torch-device-*",
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "triton",
+  "vllm",
+  "flash-attn",
+  "amd-aiter",
+]
+
+# A profile is one runtime environment, locked once per OS: AMD's wheels for
+# one release do not declare the same dependencies on every OS (the Linux torch
+# wheel requires triton, the Windows one does not), so a single cross-platform
+# lock would be wrong for one of them. `platforms` maps an OS to the uv
+# `--python-platform` it is resolved for; `rocm` is the ROCm line every
+# `+rocm…` build in the lock must belong to.
+
+[profile.sdk-rocm10-1]
+rocm = "10.1.0"
+python = "3.14"
+requirements = [
+  # Every arch the 10.1 index publishes a device payload for, so one lock per
+  # OS serves every GPU that OS has a payload for (the Windows lock has no
+  # gfx942, gfx950 or gfx1250 rows); an installer takes the core plus its own
+  # arch's rows.
+  "rocm[libraries,device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==10.1.0",
+  "torch[device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==2.13.*",
+  "torchvision==0.28.*",
+  # Exact: 2.11.0 is a CPU-only rebuild; 2.11.0.2 is the HIP build confirmed
+  # against torch 2.13 (see engines/vllm/src/discover_builds.rs).
+  "torchaudio==2.11.0.2",
+]
+
+[profile.sdk-rocm10-1.platforms]
+linux = "x86_64-manylinux_2_28"
+windows = "x86_64-pc-windows-msvc"
+
+[profile.vllm-rocm10-1]
+rocm = "10.1.0"
+python = "3.14"
+requirements = [
+  "rocm[libraries]==10.1.0",
+  "torch==2.13.*",
+  # Pinned here: left to vLLM's own range, the resolver picks a
+  # `+rocm10.0.0` torchvision, which `deps check` rejects.
+  "torchvision==0.28.*",
+  "torchaudio==2.11.0.2",
+  "vllm==0.29.*",
+  "flash-attn==2.8.*",
+  "amd-aiter==0.1.*",
+]
+
+# AMD publishes vLLM ROCm wheels for Linux only.
+[profile.vllm-rocm10-1.platforms]
+linux = "x86_64-manylinux_2_28"
