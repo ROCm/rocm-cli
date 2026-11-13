@@ -52,9 +52,9 @@ const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
 /// [`REUSE_REFUSAL_MODEL`] picked it, so this aliases that constant rather than
 /// repeating the literal.
 const LEMONADE_SERVE_TARGET: &str = REUSE_REFUSAL_MODEL;
-/// Model id for the OOM-launch scenario, kept distinct from every other e2e
-/// serve model so its service records can never collide with another
-/// scenario's.
+/// Model id for the fabricated-launch scenarios (serve-41 and serve-55), kept
+/// distinct from every other e2e serve model so their service records can never
+/// collide with another scenario's.
 const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
@@ -2864,6 +2864,164 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
     );
 }
 
+/// A managed vLLM launch that became ready, whose engine (a mock) answers
+/// `/v1/models` but fails every chat request with HTTP 500. The launch is
+/// fabricated by the `ready` mode of the same test-only hook serve-41 arms; the
+/// mock's port is passed to `rocm serve` by the `When` below, which is how the
+/// fabricated record points the post-launch smoke test at it.
+#[given("a managed vLLM launch that becomes ready but whose engine fails its first chat request")]
+async fn plant_ready_launch_with_failing_engine(world: &mut E2eWorld) {
+    // An empty chat script means this engine always fails chat: `/v1/models`
+    // answers, and every chat request is "past the end of the script" and gets
+    // HTTP 500.
+    let mock = MockServer::start_with_chat_script(OOM_LAUNCH_MODEL, Vec::new()).await;
+    world.mock = Some(mock);
+    // Consumed by `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch/readiness.rs`; the name is spelled out on both
+    // sides because the binary's crate cannot depend on this harness.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "ready".into()));
+}
+
+#[when("the user opens the interactive serve summary against that engine")]
+async fn open_summary_against_failing_engine(world: &mut E2eWorld) {
+    let port = world
+        .mock
+        .as_ref()
+        .expect("no mock engine was started")
+        .port()
+        .to_string();
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-smoke-failure",
+            "--port",
+            &port,
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    // `wait_for_exit` requires exit code 0: a failed smoke test must not fail
+    // the launch.
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
+#[then("the deployment summary says the smoke test failed and does not call the service ready")]
+async fn assert_summary_reports_failed_smoke_test(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains("Deploymentsummary(smoketestfailed)"),
+        "the heading must say the smoke test failed:\n{screen}"
+    );
+    assert!(
+        flattened.contains("started,smoketestfailed"),
+        "the status row must not read `ready`:\n{screen}"
+    );
+    assert!(
+        !flattened.contains("statusready"),
+        "a failed smoke test must not leave `status ready` on screen:\n{screen}"
+    );
+}
+
+#[then("the deployment summary gives the engine's own reason")]
+async fn assert_summary_gives_engine_reason(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    let flattened = screen_without_whitespace(&screen);
+    // The exact reason the provider reports for the mock's answer, not just a
+    // `500` that the ephemeral port or a timestamp-based service id could also
+    // contain, and not the reason of some other failed outcome (for example "no
+    // ready managed service").
+    assert!(
+        flattened.contains("thesmoketestcouldnotcomplete")
+            && flattened.contains("localproviderreturnedHTTP/1.1500InternalServerError"),
+        "the note must carry the engine's HTTP 500 as the reason:\n{screen}"
+    );
+}
+
+#[then("the engine received exactly one chat request")]
+async fn assert_engine_received_one_chat_request(world: &mut E2eWorld) {
+    let received = world
+        .mock
+        .as_ref()
+        .expect("no mock engine was started")
+        .chat_requests()
+        .len();
+    assert_eq!(
+        received, 1,
+        "the smoke test must send exactly one chat request to the engine"
+    );
+}
+
+#[then("the deployment summary names the logs command for that service")]
+async fn assert_summary_names_logs_command(world: &mut E2eWorld) {
+    let service_id = launched_service_record(world)["service_id"]
+        .as_str()
+        .expect("the service record has no service_id")
+        .to_owned();
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains(&format!("check`rocmlogs--service{service_id}`")),
+        "the note must name `rocm logs --service {service_id}` in full:\n{screen}"
+    );
+}
+
+/// Hook hygiene, not a check of the fix: it holds the "launch stays best-effort,
+/// the service record is not changed" constraint, and passes with the fix
+/// reverted. The failure reaching the summary is what the steps above assert.
+#[then("the launch's service record is left as ready")]
+async fn assert_service_record_unchanged(world: &mut E2eWorld) {
+    assert_eq!(
+        launched_service_record(world)["status"],
+        "ready",
+        "a failed smoke test must not change the service record"
+    );
+}
+
+/// The one service record the fabricated launch wrote.
+fn launched_service_record(world: &E2eWorld) -> serde_json::Value {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let mut records: Vec<serde_json::Value> = std::fs::read_dir(&services)
+        .expect("the launch left no services directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| {
+            serde_json::from_slice(&std::fs::read(entry.path()).expect("record is readable"))
+                .expect("record is JSON")
+        })
+        .collect();
+    assert_eq!(records.len(), 1, "expected exactly the launched service");
+    records.remove(0)
+}
+
 /// Collapse a rendered PTY screen to its non-whitespace characters, so an
 /// assertion survives the terminal soft-wrapping a long line across grid rows
 /// (which inserts row breaks mid-phrase / mid-token). Only meaningful for
@@ -3452,9 +3610,12 @@ async fn serve_wait_refused(world: &mut E2eWorld) {
 }
 
 /// The discriminating assertion for the fabricated-launch daemon suppression.
+/// Hook hygiene, shared by serve-41 and serve-55: it checks the test seam, not
+/// the behaviour either scenario is about.
 ///
-/// `simulate_oom_managed_launch` writes a `starting` record for a process that
-/// never existed, so `ensure_background_helper_running_quiet` would leave a
+/// `simulate_oom_managed_launch` writes a record (`starting`, or `ready` in its
+/// `ready` mode) for a process that never existed, so
+/// `ensure_background_helper_running_quiet` would leave a
 /// `rocm daemon` supervising a pid that will never appear — and nothing in this
 /// scenario's teardown stops it. Observed in the wild as daemons outliving their
 /// e2e checkout by days.
@@ -3482,7 +3643,7 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
         assert_ne!(
             state.get("running").and_then(serde_json::Value::as_bool),
             Some(true),
-            "a fabricated OOM launch must not start the automation daemon, but \
+            "a fabricated launch must not start the automation daemon, but \
              {} says one is running:\n{text}",
             state_path.display()
         );
@@ -3491,7 +3652,7 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
     let claim_path = root.join("autostart.claim");
     assert!(
         !claim_path.is_file(),
-        "a fabricated OOM launch must not even claim a daemon autostart, but {} exists: {:?}",
+        "a fabricated launch must not even claim a daemon autostart, but {} exists: {:?}",
         claim_path.display(),
         std::fs::read_to_string(&claim_path).ok()
     );

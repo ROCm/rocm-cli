@@ -3849,7 +3849,8 @@ whether a scenario may run at all (see the comment at
 a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
-name on that route. Note also that `-n` matches the scenario *name*
+name on that route, nor any other `@requires-oom-fault-injection` scenario
+(serve-55 carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
@@ -3865,9 +3866,11 @@ host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
-log it owns, and never became ready. No process is spawned, and the seam
-compiles out entirely without the feature, so a build that does not enable it
-behaves exactly as the shipped binary does.
+log it owns, and never became ready. serve-55 arms the same hook with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
+ready, so a mock engine can then fail its smoke test. No process is spawned, and
+the seam compiles out entirely without the feature, so a build that does not
+enable it behaves exactly as the shipped binary does.
 
 Only `cargo xtask e2e` enables it, by building the binary under test with
 `--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and it is the
@@ -3880,7 +3883,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-41 to a reported **skip**, not a silent pass. It
+compiled out and resolves serve-41 and serve-55 to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -3890,10 +3893,74 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-41 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
-the scenario carries `@requires-os:linux`. On the GPU lanes it is
+serve-41 and serve-55 are never selected there at all: that lane runs
+`E2E_ONLY_LIFECYCLE` and the scenarios carry `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
+
+## Serve Smoke Test Failure
+
+After a fresh launch becomes ready, the `rocm serve` interactive summary sends
+one small chat request. When that request cannot complete the summary is headed
+`Deployment summary (smoke test failed)`, shows the status as
+`started, smoke test failed` instead of `ready`, and a hedged note gives the
+reason and names `rocm logs --service <id>`. See
+[the README](../README.md#model-serving) for the user-facing contract. The
+launch itself stays best-effort: exit code and service record do not change, and
+`--no-smoke-test` and an already-running service are unchanged.
+
+What is detected, and what is not:
+
+- Detected (the summary says the smoke test failed): a transport error or timeout,
+  an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
+  stream cut short.
+- Not detected (the summary reads as before, metrics `n/a`): an engine error sent
+  as a `data:` payload inside a `200` stream; a `200` answer with no `data:` line
+  at all (HTML, plain JSON, an empty body); a close-delimited stream cut after a
+  token; and a complete stream with no `content` token, which is deliberately not
+  a failure (a reasoning model can spend its whole small budget first, as the
+  readiness probe also allows for).
+- Known limitation: the reason shown is whatever the provider call reported, and
+  two of its errors are not the engine's. It re-lists `/v1/models` before the
+  request and can fail with "no ready managed service", and it writes an audit
+  event after the stream is consumed. Either turns into a failed smoke test, which
+  is why the note says the smoke test could not complete and only that the server
+  may not be able to serve requests.
+
+Focused unit coverage:
+
+```bash
+cargo test -p rocm --bin rocm serve_smoke_test
+cargo test -p rocm --bin rocm a_failed_smoke_test_is_not_presented_as_ready_and_says_why
+cargo test -p rocm --bin rocm a_passing_or_skipped_smoke_test_adds_no_failure_note
+cargo test -p rocm --bin rocm an_already_running_summary_ignores_a_smoke_failure
+cargo test -p rocm --bin rocm failure_reason_
+cargo test -p rocm --bin rocm the_commands_the_failure_note_names_exist_and_parse
+```
+
+The `serve_smoke_test` tests in [providers.rs](../apps/rocm/src/providers.rs)
+run the real smoke test against a local mock engine over a socket (an engine that
+dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, a
+complete stream with no content, a close-delimited stream cut after a token). Only
+the mid-stream-death test goes on to render the summary from the real outcome; the
+others assert on the outcome the smoke test returns.
+
+- serve-55, `@id:serve-smoke-failure-summary` — a launch that becomes ready
+  whose engine fails its first chat request is shown as a failed smoke test, with
+  the engine's own reason and the full `rocm logs --service <id>` command, and
+  the engine received exactly one chat request. It carries `@requires-no-gpu`,
+  `@requires-os:linux` and `@requires-oom-fault-injection`: it uses the same
+  test-only hook as serve-41 (see [Serve OOM Guidance](#serve-oom-guidance)) in its
+  `ready` mode, a ready record pointing at a mock engine whose chat requests all
+  fail with HTTP 500, so it has serve-41's gates: against a prebuilt
+  `ROCM_CLI_BINARY` the hook is compiled out and the harness reports it as a skip,
+  unless it is selected with `-n` or `--tags`, which bypasses that skip and makes
+  it fail for the wrong reason. Two of its steps are hook hygiene rather than checks of the
+  fix: the unchanged service record and the no-daemon step.
+
+```bash
+cargo xtask e2e -- -n "serve-55"
+```
 
 ## Windows Tool Notes
 

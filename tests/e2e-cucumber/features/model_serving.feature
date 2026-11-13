@@ -858,3 +858,19 @@ Feature: Model serving
     When the user sends a streaming request to the Anthropic messages endpoint
     Then the response is delivered as Anthropic-style server-sent events
     And the streamed content reassembles into a complete reply
+
+  # A launch that became ready but whose first chat request fails must not be
+  # shown as a healthy deployment (#523). Same test-only hook as serve-41, in its
+  # `ready` mode, pointed at a mock engine that fails every chat request. The
+  # unit and provider tests prove the rendering and the failure classes; this
+  # proves `serve()` carries the smoke test's failure into the summary.
+  @id:serve-smoke-failure-summary @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-55 - A launch whose first chat request fails is not presented as ready
+    Given a managed vLLM launch that becomes ready but whose engine fails its first chat request
+    When the user opens the interactive serve summary against that engine
+    Then the deployment summary says the smoke test failed and does not call the service ready
+    And the deployment summary gives the engine's own reason
+    And the engine received exactly one chat request
+    And the deployment summary names the logs command for that service
+    And the launch's service record is left as ready
+    And no background automation daemon was left behind

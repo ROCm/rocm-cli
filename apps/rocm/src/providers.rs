@@ -1673,22 +1673,16 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = spawn_local_provider_test_server(
-            listener,
-            "Qwen/Qwen3.5",
-            move |stream, _request| {
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                )?;
+        let server =
+            spawn_local_provider_test_server(listener, "Qwen/Qwen3.5", move |stream, _request| {
+                write_chunked_sse_head(stream)?;
                 let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
                 write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
                 let done = "data: [DONE]\n\n";
                 write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", done.len(), done)?;
                 stream.flush()?;
                 Ok(())
-            },
-        );
+            });
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -1751,34 +1745,41 @@ mod tests {
     fn ready_service_that_dies_mid_chunked_stream(
         name: &str,
     ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
-        ready_service_streaming_one_chunk_then_closing(
-            name,
-            "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n",
-        )
+        ready_service_answering_chat_with(name, answer_then_die_on_a_chunk_boundary)
     }
 
-    fn ready_service_streaming_one_chunk_then_closing(
+    /// Sends the chunked SSE head and one content chunk, then returns, which
+    /// drops the stream: the client sees EOF on a chunk boundary.
+    fn answer_then_die_on_a_chunk_boundary(stream: &mut TcpStream) -> Result<()> {
+        write_chunked_sse_head(stream)?;
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
+        write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    fn write_chunked_sse_head(stream: &mut TcpStream) -> Result<()> {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )?;
+        Ok(())
+    }
+
+    /// A ready local service whose engine answers the chat request with
+    /// `respond` (after answering any `/v1/models` listing itself).
+    fn ready_service_answering_chat_with(
         name: &str,
-        chunk: &'static str,
+        mut respond: impl FnMut(&mut TcpStream) -> Result<()> + Send + 'static,
     ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
         let (root, paths) = temp_app_paths(name);
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = spawn_local_provider_test_server(
-            listener,
-            "Qwen/Qwen3.5",
-            move |stream, _request| {
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                )?;
-                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
-                stream.flush()?;
-                // Returning drops the stream: the client sees EOF on a chunk boundary.
-                Ok(())
-            },
-        );
+        let server =
+            spawn_local_provider_test_server(listener, "Qwen/Qwen3.5", move |stream, _request| {
+                respond(stream)
+            });
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
@@ -1897,35 +1898,31 @@ mod tests {
     }
 
     /// `rocm serve`'s post-launch smoke test is the CLI's streaming consumer. An
-    /// engine that dies mid-answer must leave the deployment summary showing no
-    /// measurements (`n/a`) instead of hanging the command or reporting
-    /// throughput for an answer that never finished.
+    /// engine that dies mid-answer must make the smoke test fail, and the
+    /// deployment summary built from that outcome must say so (heading, status
+    /// and reason, metrics `n/a`) instead of hanging the command, presenting the
+    /// service as ready, or reporting throughput for an answer that never
+    /// finished.
     #[test]
-    fn serve_smoke_test_reports_no_metrics_when_engine_dies_mid_chunked_stream() -> Result<()> {
-        let (root, paths, server) =
-            ready_service_that_dies_mid_chunked_stream("serve-smoke-chunked-truncated")?;
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
-        });
-        let (outcome, served) = client_then_server(&receiver, server);
-        fs::remove_dir_all(root).ok();
-
-        let smoke = outcome.map_err(|_| {
-            anyhow::anyhow!(
-                "the serve smoke test never returned after the engine closed the connection"
-            )
-        })?;
-        // A failed outcome is also what a smoke test that never reached the
-        // engine returns, so this is what makes the assertion below mean
+    fn serve_smoke_test_fails_and_summary_says_so_when_engine_dies_mid_chunked_stream() -> Result<()>
+    {
+        // `smoke_outcome_against` also checks the engine side served its
+        // request: a failed outcome is also what a smoke test that never reached
+        // the engine returns, so that is what makes the assertion below mean
         // "the engine died mid-answer" rather than "nothing happened".
-        served.transpose()?;
+        let smoke = smoke_outcome_against(
+            "serve-smoke-chunked-truncated",
+            answer_then_die_on_a_chunk_boundary,
+        )?;
+        // The asserts below do not interpolate the outcome or the rendered
+        // summary: `DeploymentSummary` carries an API key field, and echoing it
+        // trips CodeQL's `rust/cleartext-logging`.
         let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke.clone() else {
-            anyhow::bail!("a stream that died mid-answer was reported as measured: {smoke:?}");
+            anyhow::bail!("a stream that died mid-answer was reported as measured");
         };
-        assert!(!reason.is_empty() && !reason.contains('\n'), "{reason:?}");
+        // The reason is the provider's own truncation message, not just any text.
+        assert!(reason.contains(LOCAL_STREAM_TRUNCATED));
         let (metrics, smoke_failure) = smoke.into_parts();
-        assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
         let rendered =
             crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {
                 engine: "vllm".to_owned(),
@@ -1941,31 +1938,23 @@ mod tests {
                 api_key: None,
                 notes: Vec::new(),
             });
-        assert!(
-            rendered.starts_with("Deployment summary (smoke test failed)\n"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("started, smoke test failed"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("  ready\n"), "{rendered}");
+        assert!(rendered.starts_with("Deployment summary (smoke test failed)\n"));
+        assert!(rendered.contains("started, smoke test failed"));
+        assert!(!rendered.contains("  ready\n"));
         assert!(rendered.contains("time to first token  n/a"));
         assert!(rendered.contains("throughput (approx)  n/a"));
-        assert!(rendered.contains(&reason), "{rendered}");
+        assert!(rendered.contains(&reason));
         assert!(rendered.contains("`rocm logs --service svc-ready`"));
         Ok(())
     }
 
-    /// A 200 stream that ends without ever carrying content (an engine that
-    /// accepts the request and answers with nothing) is a failed smoke test, not
-    /// a ready deployment with empty metrics.
-    #[test]
-    fn serve_smoke_test_fails_when_the_stream_carries_no_content() -> Result<()> {
-        let (root, paths, server) = ready_service_streaming_one_chunk_then_closing(
-            "serve-smoke-no-content",
-            "data: [DONE]\n\n",
-        )?;
+    /// Runs the smoke test against a ready service whose engine answers the chat
+    /// request with `respond`, and returns the outcome.
+    fn smoke_outcome_against(
+        name: &str,
+        respond: impl FnMut(&mut TcpStream) -> Result<()> + Send + 'static,
+    ) -> Result<crate::serve_summary::SmokeOutcome> {
+        let (root, paths, server) = ready_service_answering_chat_with(name, respond)?;
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
@@ -1974,10 +1963,141 @@ mod tests {
         fs::remove_dir_all(root).ok();
         let smoke = outcome.map_err(|_| anyhow::anyhow!("the smoke test never returned"))?;
         served.transpose()?;
+        Ok(smoke)
+    }
+
+    /// A chat request that completes without error is not a failed smoke test
+    /// just because no `content` token arrived: a reasoning model can spend its
+    /// small token budget on `reasoning_content` first, and the readiness probe
+    /// (`openai_chat_completion_probe`) already treats such a server as serving.
+    /// The metrics stay empty (`n/a`) and no failure is recorded.
+    #[test]
+    fn serve_smoke_test_is_not_a_failure_when_a_complete_stream_carries_no_content() -> Result<()> {
+        for (name, body) in [
+            (
+                "serve-smoke-reasoning-only",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+            ("serve-smoke-done-only", "data: [DONE]\n\n"),
+        ] {
+            let smoke = smoke_outcome_against(name, move |stream| {
+                write_chunked_sse_head(stream)?;
+                write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body)?;
+                stream.flush()?;
+                Ok(())
+            })?;
+            assert!(
+                smoke
+                    == crate::serve_summary::SmokeOutcome::Measured(
+                        crate::serve_summary::SmokeMetrics::default()
+                    ),
+                "a complete stream with no content token was not a measured, empty outcome"
+            );
+            let (metrics, smoke_failure) = smoke.into_parts();
+            assert!(smoke_failure.is_none());
+            assert!(metrics == crate::serve_summary::SmokeMetrics::default());
+        }
+        Ok(())
+    }
+
+    /// The reason in the summary is built from the engine's own words (here its
+    /// HTTP status line), so it must reach the terminal as one clean line: no
+    /// escape sequence, no control or format character, but still the status.
+    #[test]
+    fn serve_smoke_test_failure_reason_carries_no_terminal_control_sequences() -> Result<()> {
+        let smoke = smoke_outcome_against("serve-smoke-hostile-status", |stream| {
+            write!(
+                stream,
+                "HTTP/1.1 500 \u{1b}[31mBoom\u{7}\u{202e}x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )?;
+            stream.flush()?;
+            Ok(())
+        })?;
+        let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+            anyhow::bail!("an HTTP 500 was not reported as a failure");
+        };
+        assert!(reason.contains("500"));
+        assert!(reason.contains("Boom"));
         assert!(
-            matches!(&smoke, crate::serve_summary::SmokeOutcome::Failed(reason) if !reason.is_empty()),
-            "an empty stream was not reported as a failure: {smoke:?}"
+            !reason
+                .chars()
+                .any(rocm_core::terminal::is_control_or_format),
+            "the failure reason still carries a control or format character"
         );
+        Ok(())
+    }
+
+    /// An engine that dies *inside* a chunk leaves an error with a cause chain
+    /// (the truncation message wrapping the failed read). The summary's reason
+    /// must keep the cause, not just the outermost message.
+    #[test]
+    fn serve_smoke_test_failure_reason_keeps_the_cause_chain() -> Result<()> {
+        let smoke = smoke_outcome_against("serve-smoke-dies-inside-chunk", |stream| {
+            write_chunked_sse_head(stream)?;
+            // Promise 0x64 bytes, send three, close.
+            write!(stream, "64\r\nabc")?;
+            stream.flush()?;
+            Ok(())
+        })?;
+        let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+            anyhow::bail!("an engine that died inside a chunk was not reported as a failure");
+        };
+        assert!(reason.contains(LOCAL_STREAM_TRUNCATED));
+        assert!(
+            reason.contains("failed to read local provider SSE body"),
+            "the reason lost the cause behind the truncation message"
+        );
+        Ok(())
+    }
+
+    /// Any HTTP error status from the engine is a failed smoke test, with the
+    /// status in the reason: the check is stricter than the readiness probe's
+    /// "anything below 500", so a 4xx fails here too.
+    #[test]
+    fn serve_smoke_test_fails_on_any_non_200_status() -> Result<()> {
+        for (name, status_line, code) in [
+            ("serve-smoke-http-500", "500 Internal Server Error", "500"),
+            ("serve-smoke-http-401", "401 Unauthorized", "401"),
+            ("serve-smoke-http-404", "404 Not Found", "404"),
+        ] {
+            let smoke = smoke_outcome_against(name, move |stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )?;
+                stream.flush()?;
+                Ok(())
+            })?;
+            let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+                anyhow::bail!("an HTTP error status was not reported as a failure");
+            };
+            assert!(reason.contains(code), "the reason lost the status code");
+        }
+        Ok(())
+    }
+
+    /// A close-delimited stream (no chunking, no `Content-Length`) that ends
+    /// after some tokens is deliberately `Measured`: it has no framing to cut
+    /// short, so a clean close is indistinguishable from completion (see
+    /// `read_close_delimited_sse_body`). Pins `run_smoke_test`'s doc comment.
+    #[test]
+    fn serve_smoke_test_measures_a_close_delimited_stream_cut_after_a_token() -> Result<()> {
+        let smoke = smoke_outcome_against("serve-smoke-close-delimited", |stream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )?;
+            write!(
+                stream,
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n"
+            )?;
+            stream.flush()?;
+            Ok(())
+        })?;
+        let crate::serve_summary::SmokeOutcome::Measured(metrics) = smoke else {
+            anyhow::bail!("a close-delimited stream cut after a token was reported as failed");
+        };
+        assert!(metrics.ttft.is_some());
         Ok(())
     }
 

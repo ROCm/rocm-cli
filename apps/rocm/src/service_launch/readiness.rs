@@ -4,12 +4,13 @@
 
 //! Waiting on a launched or already-live managed service: the readiness budget,
 //! liveness of the tracked process, how a wait ends, and the end-to-end OOM
-//! fault-injection seam that fabricates a launch that never became ready.
+//! fault-injection seam that fabricates a launch: one that never became ready
+//! (it ran out of GPU memory), or, in the `ready` mode, one that became ready.
 
 // There is deliberately no `use std::fs`, `use std::thread` or
 // `use rocm_core::process_is_running` here: this file names them by full path.
 // Their use sites sit under different `cfg` combinations (the Linux-only zombie
-// probe, the OOM fault-injection seam, one Linux-only test), so any single import
+// probe, the fault-injection seam, one Linux-only test), so any single import
 // would be unused in some build, and a gate on it would have to be kept in step
 // with every use site. Keep the full paths. The tests module imports `fs` for
 // itself because its tests use it on every platform.
@@ -180,9 +181,22 @@ pub(super) fn record_wait_outcome(
 /// out-of-memory traceback to the log it owns, and never became ready — so the
 /// positive OOM-guidance summary path can be verified on a GPU-less CI host,
 /// where a real launch cannot run. See [`simulate_oom_managed_launch`].
+///
+/// The value `ready` selects the one other mode: the fabricated launch is a
+/// managed vLLM launch that *did* become ready (nothing to blame on memory), so a
+/// scenario can point its port at a mock engine and watch what the summary does
+/// when the post-launch smoke test then fails. Both values open the same seams
+/// (the GPU pre-flight waiver and the background-helper suppression).
 #[cfg(feature = "e2e-oom-fault-injection")]
 pub(crate) fn e2e_simulate_oom_launch() -> bool {
-    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "1")
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH")
+        .is_some_and(|value| value == "1" || value == "ready")
+}
+
+/// Whether the armed hook is in its `ready` mode (see [`e2e_simulate_oom_launch`]).
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn e2e_simulate_ready_launch() -> bool {
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "ready")
 }
 
 /// Release builds carry no fault-injection switch: the seam compiles out
@@ -193,12 +207,18 @@ pub(crate) const fn e2e_simulate_oom_launch() -> bool {
 }
 
 /// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
-/// managed vLLM launch that spawned, OOM'd, and never became ready, then return
-/// the launch report the summary path would see for it — `already_running: false`
-/// (this invocation launched it), `status: "starting"` (it failed to become
-/// ready), and a `log_path` whose contents carry a real allocator OOM signature.
-/// [`crate::serve_summary::append_oom_serve_note`] then renders the memory-knob guidance. No process is
-/// spawned. Compiled out of shipped binaries.
+/// managed vLLM launch, then return the launch report the summary path would see
+/// for it. `already_running` is false either way (this invocation launched it)
+/// and no process is spawned. Compiled out of shipped binaries.
+///
+/// - Default mode (`ROCM_E2E_SIMULATE_OOM_LAUNCH=1`): the launch OOM'd and never
+///   became ready — `status: "starting"` and a `log_path` whose contents carry a
+///   real allocator OOM signature.
+///   [`crate::serve_summary::append_oom_serve_note`] then renders the memory-knob
+///   guidance.
+/// - `ready` mode: the launch became ready — `status: "ready"`, the record marked
+///   inference-verified, and `log_path: None` (nothing failed to start), so the
+///   caller's smoke test runs against whatever answers on `host:port`.
 #[cfg(feature = "e2e-oom-fault-injection")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn simulate_oom_managed_launch(
@@ -231,6 +251,23 @@ pub(super) fn simulate_oom_managed_launch(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
+    if e2e_simulate_ready_launch() {
+        // The `ready` mode: a launch that came up. The record is what the local
+        // provider needs to send the smoke test to `host:port`; no log is written
+        // because nothing here failed to start.
+        record.status = "ready".to_owned();
+        record.inference_verified_at_unix_ms = Some(1);
+        record.write()?;
+        return Ok(ManagedLaunchReport {
+            service_id: service_id.to_owned(),
+            endpoint_url: format!("{}/v1", format_http_base_url(host, port)),
+            status: "ready".to_owned(),
+            already_running: false,
+            child_pid: None,
+            log_path: None,
+            manifest_path: Some(record.manifest_path),
+        });
+    }
     record.status = "starting".to_owned();
     record.write()?;
     // A real allocator OOM signature in the log this invocation owns, so the

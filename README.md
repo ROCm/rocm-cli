@@ -1171,11 +1171,12 @@ the running service, or stop it first to serve on the new port.
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). If the
-smoke test request fails, the summary is headed `(smoke test failed)`, shows the
-status as `started, smoke test failed` instead of `ready`, and a note gives the
-reason and points at `rocm logs --service <id>`; the launch itself is unchanged
-and the server keeps running. Control
+quick smoke test (time to first token and approximate tokens per second). On an
+interactive terminal, if the smoke test cannot complete, the summary is headed
+`(smoke test failed)`, shows the status as `started, smoke test failed` instead
+of `ready`, and a note gives the reason and points at
+`rocm logs --service <id>`. ROCm CLI does not stop the server, and the command
+still exits 0. Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 

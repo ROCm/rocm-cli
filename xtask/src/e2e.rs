@@ -106,8 +106,9 @@ pub fn run(args: &[String]) -> Result<()> {
     if binaries.build_release {
         let status = Command::new(&cargo)
             // `--features rocm/e2e-oom-fault-injection` compiles in the test-only
-            // `rocm serve` OOM-launch fault injection used by the positive
-            // `serve-oom-launch-memory-guidance` scenario. It is scoped to the
+            // `rocm serve` launch fault injection (an OOM launch, or a ready
+            // launch) used by every `@requires-oom-fault-injection` scenario
+            // (serve-41 and serve-55). It is scoped to the
             // `rocm` package (rocmd has no such feature) and to this e2e build
             // only — the release build never enables it, so shipped binaries
             // carry no fault-injection hook. It joins `rocm/e2e-test-hooks`

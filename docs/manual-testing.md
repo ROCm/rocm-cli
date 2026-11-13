@@ -1577,3 +1577,40 @@ anything.
 Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
 8192` prints the report with no model section, and stderr says that `--model,
 --context-size were ignored` and nothing about the model was fetched.
+
+## 13. Serve Smoke Test Failure
+
+Needs any engine `rocm serve` can start (the behaviour is not vLLM-specific) and
+an interactive terminal: the smoke test and its summary run only there. The
+behaviour under test is described in
+[the README](../README.md#model-serving); the automated coverage is listed in
+[testing.md](testing.md#serve-smoke-test-failure).
+
+The repeatable route is the E2E scenario, which needs no GPU:
+
+```bash
+cargo xtask e2e -- -n "serve-55"
+```
+
+By hand, a failing first chat request is hard to provoke (the engine has to pass
+its readiness probe and then fail or die on the first chat request), so check the
+points below when you see it, for example after an engine is killed right as it
+becomes ready:
+
+- The heading reads `Deployment summary (smoke test failed)`, not
+  `Deployment summary`.
+- The `status` row reads `started, smoke test failed`, not `ready`.
+- `time to first token` and `throughput (approx)` read `n/a`, and a `note:` line
+  gives a one-line reason and names `rocm logs --service <id>`.
+- The command exits 0 and ROCm CLI does not stop the server. If the engine died
+  there is no server left: `rocm logs --service <id>` still shows its output, and
+  the next `rocm services list` finds the engine gone and records the service as
+  `stopped`, so it drops out of the default list and shows only under
+  `rocm services list --all`. If the engine is still up and only the chat request
+  failed, the service stays listed and its recorded status stays `ready`.
+- `rocm serve <model> --no-smoke-test` prints the plain `Deployment summary` with
+  no smoke-test note, and re-running against an already-running service prints
+  the `(already running)` summary with no smoke-test note.
+- A reasoning model that spends its small token budget before emitting any
+  content is not a failure: the summary stays `ready` with the two metric rows
+  `n/a` and no smoke-test note.

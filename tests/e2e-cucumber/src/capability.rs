@@ -149,7 +149,7 @@ pub struct HostCapability {
     pub platform_slug: String,
     /// Whether the `rocm` binary under test carries the test-only
     /// `e2e-oom-fault-injection` hook, so `@requires-oom-fault-injection`
-    /// scenarios can simulate a GPU-less OOM launch. It is compiled out of the
+    /// scenarios (serve-41, serve-55) can simulate a GPU-less launch. It is compiled out of the
     /// shipping binary, and the harness cannot probe for it (no product command
     /// exposes it), so `xtask e2e` reports it via the [`OOM_FAULT_INJECTION_ENV`]
     /// environment variable — set only when xtask built the binary itself with
@@ -1442,8 +1442,8 @@ Local model engines
     /// `expectation.rs`'s `requires_oom_fault_injection_runs_only_when_the_hook_is_built_in`
     /// builds `HostCapability { oom_fault_injection: .. }` by hand and so never
     /// reaches this comparison; without this test, editing the literal on one
-    /// side of the producer/consumer pair would make serve-41 a permanent skip
-    /// with nothing red. The `"1"` asserted here is the same literal
+    /// side of the producer/consumer pair would make every
+    /// `@requires-oom-fault-injection` scenario a permanent skip with nothing red. The `"1"` asserted here is the same literal
     /// `xtask::e2e`'s `command.env(OOM_FAULT_INJECTION_ENV, "1")` writes, pinned
     /// by `release_build_resolves_and_exports_both_cli_binaries` on that side.
     #[test]
