@@ -76,6 +76,12 @@ const fn polls_managed_registry(focus: Option<Focus>, replay: bool, windows: boo
     windows && !replay && !should_skip_daemon(focus)
 }
 
+/// Logged when a registry read panics under `spawn_blocking`. Named so the
+/// test asserting the warning fires cannot pass against a message that was
+/// silently reworded or downgraded below WARN.
+const MANAGED_REGISTRY_PROBE_PANIC: &str =
+    "managed-service registry probe panicked; instance list not updated this poll";
+
 /// Read the managed-service registry every `period` and post the live
 /// services as `ClientMsg::ManagedInstances`. The probe does a blocking disk
 /// read, so it runs under `spawn_blocking` rather than on the event loop — a
@@ -94,9 +100,18 @@ fn spawn_managed_registry_poller(
         loop {
             ticker.tick().await;
             let probe = probe.clone();
-            let Ok(snapshot) = tokio::task::spawn_blocking(move || probe.snapshot()).await else {
-                // The probe panicked; keep polling rather than freezing the list.
-                continue;
+            let snapshot = match tokio::task::spawn_blocking(move || probe.snapshot()).await {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    // The probe panicked; keep polling rather than freezing the
+                    // list — but say so. A probe that panics every tick would
+                    // otherwise leave the instance list silently empty for the
+                    // whole session with nothing in the log to explain it.
+                    // Same shape as `client.rs`'s per-tick Windows
+                    // perf-counter failure.
+                    tracing::warn!(error = %e, "{MANAGED_REGISTRY_PROBE_PANIC}");
+                    continue;
+                }
             };
             if tx
                 .send(ClientMsg::ManagedInstances(snapshot.instances))
@@ -1147,6 +1162,15 @@ mod tests {
                 crate::registry_probe::ManagedRegistrySnapshot::default()
             }
         }
+
+        // This test reaches the poller's `warn!` callsite too, so it must warm
+        // the interest cache for the same reason
+        // `managed_registry_poller_warns_when_the_probe_panics` does — see
+        // `warm_tracing_interest_cache`. Without the call here, whichever of
+        // the two tests registers that callsite first decides whether it is
+        // ever enabled, and this one has no subscriber of its own.
+        warm_tracing_interest_cache();
+
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = spawn_managed_registry_poller(
             std::sync::Arc::new(PanicsOnce::default()),
@@ -1160,5 +1184,134 @@ mod tests {
             .expect("channel open");
         assert!(matches!(msg, ClientMsg::ManagedInstances(_)), "{msg:?}");
         handle.abort();
+    }
+
+    /// Minimal `tracing::Subscriber` recording each event's level and message
+    /// text, so a test can assert that a SPECIFIC diagnostic fired — not
+    /// merely that something was logged. Counting events alone would stay
+    /// green if the `warn!` were downgraded to `debug!` or its text removed.
+    /// `agent/clients.rs`'s `CapturedWarnEvents` does the same for that
+    /// module's warnings; it is private to that test module, so this is the
+    /// local equivalent rather than a shared helper.
+    #[derive(Default)]
+    struct CapturedWarnings(std::sync::Mutex<Vec<(tracing::Level, String)>>);
+
+    impl CapturedWarnings {
+        fn warned(&self, message: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(level, text)| *level == tracing::Level::WARN && text == message)
+        }
+    }
+
+    impl tracing::Subscriber for CapturedWarnings {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(Option<String>);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    // tracing wraps the message in an internal type whose
+                    // `Debug` forwards to `Display`, so `{value:?}` is the
+                    // message text itself, unquoted.
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Register one always-interested process-wide default subscriber before
+    /// any test can reach the poller's `warn!` callsite.
+    ///
+    /// tracing-core caches a callsite's `Interest` the first time that
+    /// callsite executes, by asking the dispatcher in scope on whichever
+    /// thread happens to get there first. Under threaded `cargo test` that is
+    /// a race between this module's two panicking-probe tests, and the other
+    /// one carries no subscriber — so without this, "never interested" can be
+    /// cached before the capturing test ever installs its own, and the
+    /// assertion below fails for a reason that has nothing to do with the
+    /// production code. A permanent global default whose `enabled()` is
+    /// always `true` makes "nobody is interested yet" impossible from the
+    /// first registration onward. Its own buffer is never read; only the
+    /// thread-local override installed in the test is. Same remedy, and same
+    /// reasoning, as `agent/clients.rs`'s `warm_tracing_interest_cache`.
+    fn warm_tracing_interest_cache() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(CapturedWarnings::default());
+        });
+    }
+
+    #[tokio::test]
+    async fn managed_registry_poller_warns_when_the_probe_panics() {
+        // Surviving the panic (above) is not enough: a probe that panics on
+        // every tick degrades this feature for a whole session, and without a
+        // log line the operator sees only a permanently empty instance list
+        // with nothing anywhere to explain it.
+        #[derive(Debug)]
+        struct AlwaysPanics;
+        impl crate::registry_probe::ManagedRegistryProbe for AlwaysPanics {
+            fn snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
+                panic!("registry read blew up");
+            }
+        }
+
+        // Thread-local, not global: `#[tokio::test]` runs a current-thread
+        // runtime, so the poller task is polled on this very thread and the
+        // `warn!` dispatches through this subscriber. The global default the
+        // warming installs is only there to keep the callsite's cached
+        // `Interest` from being decided by a subscriber-less thread.
+        warm_tracing_interest_cache();
+        let captured = std::sync::Arc::new(CapturedWarnings::default());
+        let guard = tracing::subscriber::set_default(captured.clone());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handle = spawn_managed_registry_poller(
+            std::sync::Arc::new(AlwaysPanics),
+            tx,
+            Duration::from_millis(20),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !captured.warned(MANAGED_REGISTRY_PROBE_PANIC) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a panicking probe must log {MANAGED_REGISTRY_PROBE_PANIC:?} at WARN, not fail silently"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+        drop(guard);
     }
 }

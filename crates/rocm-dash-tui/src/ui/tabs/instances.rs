@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::{
     Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
@@ -216,10 +216,23 @@ fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     };
     let inner = panel::bento(f, area, Some("Instances"), BoxRole::Neutral, false, theme);
+    // Wrapped, not one clipped line. An unwrapped `Paragraph` truncates at the
+    // panel's right edge rather than wrapping, and the longer branches here
+    // outrun the columns an 80-column terminal leaves usable inside this
+    // border: the in-process one (94 chars) stopped dead at
+    // "· vLLM containers ar", and the `Connected` one (79) is at the edge of
+    // the same cliff. The narrower the pane, the more of the remedy goes too.
+    // `Wrap { trim: false }` is what every other prose paragraph in this UI
+    // uses (`ui/tabs/pane.rs`, `ui/tabs/hardware.rs`, `ui/help_modal.rs`,
+    // `ui/warnings_modal.rs`, `ui/approval.rs`), so the empty state now
+    // behaves like the rest of them; shortening the string instead would have
+    // had to drop either the remedy or the vLLM explanation, and would only
+    // move the width at which the clipping returns.
     let p = Paragraph::new(Line::from(Span::styled(
         body,
         Style::default().fg(theme.muted),
-    )));
+    )))
+    .wrap(Wrap { trim: false });
     f.render_widget(p, inner);
 }
 
@@ -282,17 +295,26 @@ pub(in crate::ui) mod tests {
             host: "localhost".into(),
             version: ConnState::in_process_version("0.0.0"),
         };
-        // Wide enough to hold the whole line: the remedy half is what this test
-        // is really about, and 80 columns would truncate it away unasserted.
-        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        // 80 columns — a realistic terminal, the same width
+        // `ui/tabs/mod.rs`'s panel test uses — NOT a width picked to make the
+        // assertion pass. The message is 94 chars and the panel's border and
+        // padding narrow that further, so at 80 columns it survives only
+        // because `draw_empty` wraps: unwrapped, the render stops dead at
+        // "· vLLM containers ar" and the user is never told why the vLLM
+        // containers they are looking for cannot appear here.
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
             .unwrap();
         let grid = buffer_text(&term);
         // Asserted whole, tab digit included. `ActiveTab::from_digit` maps '3'
         // to Serving today; a tab reorder that left this line behind would send
         // the user to the wrong tab, and nothing else here would catch it.
+        // Read back through `flatten_wrapped_prose` because the message now
+        // occupies more than one row: asserting only the first row's worth
+        // would be the same mistake as widening the backend.
+        let flat = flatten_wrapped_prose(&grid);
         assert!(
-            grid.contains(
+            flat.contains(
                 "no managed services running · serve one from 3 Serving · vLLM containers aren't available here"
             ),
             "should say nothing is served AND where to serve one from instead, not claim a daemon could be started; got:\n{grid}"
@@ -301,6 +323,31 @@ pub(in crate::ui) mod tests {
             !grid.contains("start daemon"),
             "must not suggest starting a daemon that doesn't exist on this platform; got:\n{grid}"
         );
+    }
+
+    /// Read a rendered panel back as the one sentence the user reads.
+    ///
+    /// A wrapped `Paragraph` lays its prose across several buffer rows, each
+    /// padded to the terminal's width and fenced by the panel's box-drawing
+    /// border. Treating every border glyph and every run of blanks as a single
+    /// space rejoins the rows at exactly the single spaces the source string
+    /// had, so a wrapped message can still be asserted verbatim — and a
+    /// *clipped* one still cannot, because the clipped characters are simply
+    /// not in the buffer to rejoin. Only U+2500–U+257F (box drawing) is
+    /// blanked, so the message's own `·` (U+00B7) survives.
+    fn flatten_wrapped_prose(grid: &str) -> String {
+        grid.chars()
+            .map(|c| {
+                if matches!(u32::from(c), 0x2500..=0x257F) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
