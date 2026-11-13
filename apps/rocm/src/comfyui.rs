@@ -1608,8 +1608,9 @@ mod tests {
         Ok(())
     }
 
-    /// Truncated (cut off mid-write) and empty: the two shapes an interrupted
-    /// in-place write of the record leaves behind.
+    /// Truncated (cut off mid-write) and empty: the two shapes of a record
+    /// left by an older rocm-cli, which wrote it in place, or by something
+    /// else writing to it; `save_state` now replaces it atomically.
     pub(super) const UNREADABLE_RECORDS: [&str; 2] = ["{\"app_id\": \"comfy", ""];
 
     /// The default address as a check finds it with nothing listening there.

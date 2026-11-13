@@ -2014,18 +2014,31 @@ mod tests {
     /// where it belongs, which fails the read even as `root`) may still be an
     /// intact record of a running ComfyUI, so the reinstall guard does not
     /// treat it as "nothing running": the preview and the real run both stop
-    /// naming it, and nothing is downloaded or replaced.
+    /// naming it, and nothing is downloaded or replaced. The refusal comes
+    /// from the check before the download, which costs nothing: the download
+    /// starts by creating the `downloads` folder, and that folder never
+    /// appears. (The check just before the swap would raise the same error,
+    /// but only after the download.)
     #[test]
     fn a_reinstall_stops_on_a_saved_state_it_cannot_read() -> Result<()> {
         let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-unreadable-io")?;
         let source = source_path_from_app_root(&app_root);
         let state = state_path(&paths);
         fs::create_dir_all(state.join("inside"))?;
+        let downloads = app_root.join("downloads");
+        let downloads_before = downloads.exists();
 
         let preview = install(&paths, &config, reinstall_options(true));
         let run = install(&paths, &config, reinstall_options(false));
         let main_py = fs::read_to_string(source.join("main.py"));
+        let downloads_after = downloads.exists();
         remove_test_root(&paths);
+
+        assert!(!downloads_before, "the fixture starts with no downloads");
+        assert!(
+            !downloads_after,
+            "the refusal must come before the download is even started"
+        );
 
         let expected = format!("failed to read {}", state.display());
         for (what, outcome) in [("preview", preview), ("reinstall", run)] {
