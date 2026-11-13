@@ -231,7 +231,7 @@ passes — the GPU is AMD or no vendor was named.
 
    ```
    rocm fix <fix-id>            # prompts before changing anything
-   rocm fix <fix-id> --dry-run  # show the exact change, touch nothing
+   rocm fix <fix-id> --dry-run  # show the exact change, touch nothing (see the Windows exit 4 below)
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
@@ -259,6 +259,32 @@ passes — the GPU is AMD or no vendor was named.
      returns 0; there is no prompt, no `--dry-run` preview, and nothing is
      pinned. Once the user knows N, re-run with
      `rocm fix fix-9-igpu-dgpu --device-index N`.
+
+   If `rocm fix` exits 4, relay its stderr line and act on how it ends:
+
+   - `Could not read the current …; nothing was changed.` — on Windows,
+     `fix-2-unset-override`, `fix-6-path` and `fix-9-igpu-dgpu --device-index N`
+     read the variable they change before planning, and that read failed
+     (`--dry-run` included). Tell the user nothing was changed and relay the
+     cause the line states; once it is cleared (for example PowerShell starts
+     and answers in time), offer to re-run the same `rocm fix` command. Do not
+     present the printed catalog entry as a preview, and do not hand the user
+     its commands (such as `setx HIP_VISIBLE_DEVICES <dGPU-index>`) instead.
+   - `… NOT changed.` — the command ran and failed, or could not start.
+     Nothing was changed. The exception is a line saying `exited 124`, which
+     is how an older CLI reports a timed-out step: the change may or may not
+     have landed. Say so, have the user check (`id -nG <user>` for
+     `fix-4-render-group`; on Windows, in PowerShell,
+     `[Environment]::GetEnvironmentVariable('<VAR>','User')` with `<VAR>`
+     being `HSA_OVERRIDE_GFX_VERSION`, `PATH` or `HIP_VISIBLE_DEVICES` for
+     fix-2, fix-6 or fix-9), and offer to re-run the same `rocm fix` command
+     if it did not land.
+   - `… may or may not have changed. Check … then re-run …` — the command
+     timed out or was killed. Relay the check (on Windows, an expression to run
+     in PowerShell) and the `rocm fix` command to re-run; claim neither that
+     the fix was applied nor that nothing changed until the check has run.
+   - `Failed to write <file>: …` — the rc-file append failed; have the user
+     look at that file.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 
@@ -317,7 +343,8 @@ start of the reply, before relaying a multi-step plan.
 
 - Never invent a fix. If `rocm diagnose` returns no match, route upstream.
 - Never run a mutating fix without the user's explicit OK; prefer `--dry-run`
-  first. New failure modes are added to the CLI catalog, not improvised here.
+  first (on Windows that dry run can itself exit 4 when its read fails; see
+  step 3). New failure modes are added to the CLI catalog, not improvised here.
 
 Read [reference.md](reference.md) when `rocm fix` exits non-zero (its exit codes
 are listed there), before telling the user which platforms a fix id applies to,

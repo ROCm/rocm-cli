@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 /// the same defect this whole contract exists to remove, one level up.
 pub mod exit {
     /// Applied, previewed with `--dry-run`, printed, or listed. Nothing failed.
+    /// A `--dry-run` whose read of the current value fails is [`FAILED`], not
+    /// this.
     pub const OK: i32 = 0;
     /// The CLI is inconsistent with itself -- a recipe it says it can carry out,
     /// with nothing to carry it out with. Never a fault of the machine.
@@ -30,7 +32,14 @@ pub mod exit {
     /// Real, but not for this machine: wrong platform, or a precondition the
     /// host does not meet. Distinct from [`FAILED`], which means it was tried.
     pub const NOT_APPLICABLE: i32 = 3;
-    /// Attempted, and a command it ran failed.
+    /// Attempted, and a command it ran failed, could not start, or did not
+    /// finish.
+    ///
+    /// After a timeout the change may be partial. Also returned on Windows by
+    /// `fix-2-unset-override`, `fix-6-path` and `fix-9-igpu-dgpu` with a device
+    /// index when the read of the current value they plan from does not
+    /// complete -- under `--dry-run` too, with no plan shown and nothing
+    /// changed.
     pub const FAILED: i32 = 4;
     /// The user was asked and said no.
     pub const DECLINED: i32 = 5;
@@ -41,7 +50,9 @@ pub mod exit {
 pub struct FixOptions {
     /// Skip the interactive confirmation (the user already approved the plan).
     pub yes: bool,
-    /// Show the plan without changing anything.
+    /// Show the plan without changing anything. A Windows fix that reads the
+    /// current value first stops with [`exit::FAILED`] and no plan when that
+    /// read fails.
     pub dry_run: bool,
     /// For `fix-9-igpu-dgpu`: the discrete GPU index to pin.
     pub device_index: Option<i64>,

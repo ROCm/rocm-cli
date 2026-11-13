@@ -165,7 +165,8 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
             // carry it out with -> INTERNAL, not FAILED (which is reserved for
-            // "attempted, and the command failed"). Held by
+            // "attempted, and a command or the read it planned from failed").
+            // Held by
             // `a_recipe_that_acts_has_a_runner`.
             fail!("Internal error: a recipe the catalog says is applied here has no runner.");
             exit::INTERNAL
@@ -858,10 +859,12 @@ mod tests {
             "apply",
             "act_on",
             "run_render_group",
+            "render_group_with",
             "run_unset_override",
             "run_unset_override_linux",
             "report_persistent_override",
             "run_unset_override_windows",
+            "unset_override_windows_with",
             "report_and_clear_override_windows",
             "run_path_export",
             "run_path_export_linux",
@@ -871,6 +874,7 @@ mod tests {
             "run_hip_visible_devices_linux",
             "pin_device_in_rc_file",
             "run_hip_visible_devices_windows",
+            "hip_visible_devices_windows",
         ] {
             assert!(
                 scan.checked.iter().any(|name| name == runner),

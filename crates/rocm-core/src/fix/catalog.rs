@@ -153,6 +153,15 @@ impl FixRecipe {
     }
 }
 
+/// The ids of the recipes whose runners name themselves in a recovery line
+/// ("re-run `rocm fix <id>`"). One constant serves the catalog entry and the
+/// runner's message, so the command a stopped fix tells the user to re-run is
+/// always a recipe that exists.
+pub(super) const UNSET_OVERRIDE_ID: &str = "fix-2-unset-override";
+pub(super) const RENDER_GROUP_ID: &str = "fix-4-render-group";
+pub(super) const PATH_ID: &str = "fix-6-path";
+pub(super) const IGPU_DGPU_ID: &str = "fix-9-igpu-dgpu";
+
 /// The recipe registry. Mirrors the diagnosis catalog; only the small, safe
 /// fixes carry a `runner`, and what each one does can differ by platform.
 pub(super) const RECIPES: &[FixRecipe] = &[
@@ -187,7 +196,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-2-unset-override",
+        fix_id: UNSET_OVERRIDE_ID,
         title: "Unset HSA_OVERRIDE_GFX_VERSION",
         rationale: "HSA_OVERRIDE_GFX_VERSION is set, but your GPU now has a native wheel. The override hides the real gfx and causes page faults / OUT_OF_REGISTERS at runtime.",
         commands: &[
@@ -241,7 +250,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-4-render-group",
+        fix_id: RENDER_GROUP_ID,
         title: "Add user to render/video groups",
         rationale: "The current user can't open /dev/kfd because they aren't in the render group. Adding the user is the safe, standard fix.",
         commands: &["sudo usermod -a -G render,video \"$USER\""],
@@ -279,7 +288,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-6-path",
+        fix_id: PATH_ID,
         title: "Add the ROCm/HIP bin directory to PATH",
         rationale: "Linux: ROCm is installed but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
         commands: &[
@@ -366,7 +375,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-9-igpu-dgpu",
+        fix_id: IGPU_DGPU_ID,
         title: "Hide the iGPU with HIP_VISIBLE_DEVICES",
         rationale: "Both an APU iGPU and a discrete AMD GPU are visible. Pin the runtime to the dGPU so the iGPU doesn't destabilise it.",
         commands: &[
