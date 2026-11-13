@@ -363,7 +363,7 @@ Windows. The Vulkan driver version is not shown.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
+rocm diagnose [--symptom TEXT | --symptom-file PATH] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
@@ -380,7 +380,38 @@ position.
 
 `rocm diagnose` takes these flags:
 
-- `--symptom` takes raw error text to sharpen keyword scoring.
+- `--symptom` takes raw error text to sharpen keyword scoring. Your shell
+  reads that text first: quotes, `$(...)` and a leading `-` in a pasted error
+  can be changed, run, or taken as a flag.
+- `--symptom-file PATH` reads the same text from a file instead, or from
+  standard input when PATH is `-`, so no quoting is needed. It cannot be
+  combined with `--symptom`. The text that arrives is matched as `--symptom`
+  would match it, minus one trailing line break. A UTF-8 byte-order mark is
+  dropped and a UTF-16 file with a byte-order mark (what Windows PowerShell's
+  `>` writes) is decoded; anything else must be UTF-8. A file that cannot be
+  read, input that is not text, or input larger than 16 MiB is a usage error
+  (exit code 2). With nothing piped in, paste the error at the terminal and
+  end it with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+
+  ```bash
+  # bash (Linux, WSL): the quoted 'EOF' keeps the shell out of the paste
+  rocm diagnose --symptom-file - <<'EOF'
+  <paste the error here>
+  EOF
+  ```
+
+  ```powershell
+  # PowerShell: save the clipboard to a file first. Windows PowerShell 5.1
+  # pipes text to a program as ASCII, so `Get-Clipboard | rocm ...` would
+  # turn every non-ASCII character in the error into "?".
+  Get-Clipboard -Raw > error.txt
+  rocm diagnose --symptom-file error.txt
+  ```
+
+  ```bat
+  :: cmd.exe: save the error to a file first
+  rocm diagnose --symptom-file error.txt
+  ```
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such

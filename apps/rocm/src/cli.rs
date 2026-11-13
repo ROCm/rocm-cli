@@ -96,8 +96,29 @@ pub(crate) enum Command {
     /// takes the id, not the position.
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring.
-        #[arg(long)]
+        ///
+        /// A shell reads this text before `rocm` does, so quotes, `$(...)`
+        /// and a leading `-` in a pasted error can be changed, run, or taken
+        /// as a flag. Use `--symptom-file` to hand over a paste untouched.
+        #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
+        /// Read the error text from a file instead, or from standard input
+        /// when PATH is `-`, so no shell quoting is needed.
+        ///
+        /// The text that arrives is matched as `--symptom` would match it,
+        /// with one trailing line break removed (shells and editors add one).
+        /// A UTF-8 byte-order mark is dropped, and a file with a UTF-16
+        /// byte-order mark, as Windows PowerShell's `>` writes, is decoded;
+        /// anything else must be UTF-8. An unreadable file, input that is not
+        /// text, or input larger than 16 MiB is a usage error (exit code 2).
+        /// For example: `rocm diagnose --symptom-file error.txt`. In
+        /// PowerShell, save the clipboard first
+        /// (`Get-Clipboard -Raw > error.txt`): Windows PowerShell 5.1 pipes
+        /// text to a program as ASCII, turning any other character into `?`.
+        /// With nothing piped in, paste the text at the terminal and end it
+        /// with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+        #[arg(long, value_name = "PATH", conflicts_with = "symptom")]
+        symptom_file: Option<PathBuf>,
         /// Show at most this many matches (default 5).
         #[arg(long, default_value_t = 5)]
         top: usize,
@@ -1944,6 +1965,38 @@ mod tests {
         let mut argv = vec!["rocm", "diagnose"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv)
+    }
+
+    // `--symptom-file` exists because a pasted error does not survive the shell
+    // as an argument: one starting with `-` is not even accepted as
+    // `--symptom`'s value. The file form takes `-` (stdin) and any path, and
+    // the two sources cannot both be given.
+    #[test]
+    fn diagnose_takes_the_symptom_from_a_file_or_stdin_but_not_with_symptom() {
+        assert!(
+            parse_diagnose(&["--symptom", "-x HIP error"]).is_err(),
+            "a leading minus is read as a flag, which is what --symptom-file avoids"
+        );
+        for path in ["-", "error.txt"] {
+            match parse_diagnose(&["--symptom-file", path]) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Diagnose {
+                            symptom,
+                            symptom_file,
+                            ..
+                        }),
+                    ..
+                }) => {
+                    assert_eq!(symptom, None);
+                    assert_eq!(symptom_file, Some(PathBuf::from(path)));
+                }
+                other => panic!("expected diagnose for {path:?}, got {other:?}"),
+            }
+        }
+        let error = parse_diagnose(&["--symptom", "oom", "--symptom-file", "-"])
+            .expect_err("--symptom and --symptom-file are exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     // The context options describe the model being asked about, so without
