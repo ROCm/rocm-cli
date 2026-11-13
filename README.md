@@ -130,6 +130,39 @@ irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 As on Linux, this is the binary's channel only. The ROCm SDK channel is chosen
 separately with `rocm install sdk --channel`.
 
+### Try a pull request's build
+
+CI builds a bundle for each pull request that changes code, and the installers
+can install it by pull request number. The pull request's CI run shows the
+exact command on its summary page, under "Try this PR's build". This needs the
+[GitHub CLI](https://cli.github.com) signed in (`gh auth login`, or
+`GH_TOKEN` set), because GitHub only serves workflow artifacts to signed-in
+users.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- pr-1234
+```
+
+```powershell
+$env:ROCM_CLI_CHANNEL = "pr-1234"
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+Remove-Item Env:ROCM_CLI_CHANNEL
+```
+
+The installer installs the build of the pull request's latest commit and
+prints the commit and the CI run it came from, with the run's result. Whether
+a failed run still has a build depends on the platform: the Linux build is a
+separate job, so a failing test elsewhere in the run leaves it in place, but a
+failure in the lint or formatting checks that gate it leaves none, and the
+Windows build is packaged after that job's install lifecycle checks, so a
+failure there leaves none either. Builds are unsigned and unreviewed, so only the download's checksum is
+verified, and asking for a signature (`ROCM_CLI_REQUIRE_SIGNATURE=1`, or a
+signing key) fails instead of being skipped. They are kept for 7 days, so an
+older pull request needs a new push or a re-run. `ROCM_CLI_GITHUB_REPO` points
+the lookup at a fork. `ROCM_CLI_DOWNLOAD_BASE` cannot be combined with a pull
+request channel in either installer, nor can `ROCM_CLI_ARCHIVE` or
+`ROCM_CLI_DOWNLOAD_ONLY` in `install.sh`, the only one that has them.
+
 ### Verify the installation
 
 Open a new terminal so the updated `PATH` takes effect, then run:

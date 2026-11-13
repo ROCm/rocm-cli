@@ -66,6 +66,9 @@ pub struct LifecycleState {
     /// The fish config seeded before install, which uninstall must restore
     /// exactly.
     fish_config_before_install: Option<String>,
+    /// The directory `fake-gh` serves a pull request's CI builds from, and the
+    /// directory holding the planted `gh`; set by the pull request scenarios.
+    gh_stub_dir: Option<PathBuf>,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -261,20 +264,29 @@ fn run_installer_command(
 
 /// Build the platform-appropriate installer command (`sh install.sh release` on
 /// Unix; `pwsh -File install.ps1 release` on Windows).
-#[cfg(not(windows))]
 fn installer_command(root: &Path) -> Command {
+    installer_command_for(root, "release")
+}
+
+#[cfg(not(windows))]
+fn installer_command_for(root: &Path, channel: &str) -> Command {
     let mut cmd = Command::new("sh");
-    cmd.arg(root.join("install.sh")).arg("release");
+    cmd.arg(root.join("install.sh")).arg(channel);
     cmd
 }
 
 #[cfg(windows)]
-fn installer_command(root: &Path) -> Command {
-    powershell_installer_command(&root.join("install.ps1"))
+fn installer_command_for(root: &Path, channel: &str) -> Command {
+    powershell_installer_command_for(&root.join("install.ps1"), channel)
 }
 
 #[cfg(windows)]
 fn powershell_installer_command(installer: &Path) -> Command {
+    powershell_installer_command_for(installer, "release")
+}
+
+#[cfg(windows)]
+fn powershell_installer_command_for(installer: &Path, channel: &str) -> Command {
     // Prefer pwsh; fall back to Windows PowerShell.
     let shell = if which_ok("pwsh") {
         "pwsh"
@@ -284,7 +296,7 @@ fn powershell_installer_command(installer: &Path) -> Command {
     let mut cmd = Command::new(shell);
     cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(installer)
-        .arg("release");
+        .arg(channel);
     cmd
 }
 
@@ -545,6 +557,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         custom_profile: None,
         login_shell: None,
         fish_config_before_install: None,
+        gh_stub_dir: None,
     });
 }
 
@@ -2053,4 +2066,398 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         // themselves (`ROCM_CLI_*_DIR`), so uninstall removes each one whole.
         assert_missing(dir);
     }
+}
+
+// ── Pull request channel (`pr-<number>`) ───────────────────────────────
+//
+// The installers' `pr-<number>` channel installs the bundle CI built for a
+// pull request. The real thing needs a signed-in GitHub CLI and a live run, so
+// these scenarios plant the `fake-gh` stand-in (see `src/bin/fake-gh.rs`) in
+// front of `PATH`, and a bundle packaged unsigned, as CI packages it.
+
+/// The head commit the stand-in reports for the pull request.
+const PR_HEAD_COMMIT: &str = "53546b007a85445a2466b28447307992733829c9";
+
+/// The distribution name CI gives a pull request bundle on this platform.
+const fn pr_dist_name() -> &'static str {
+    if cfg!(windows) {
+        "rocm-cli-pr-windows-amd64"
+    } else {
+        "rocm-cli-pr-linux-amd64"
+    }
+}
+
+/// Package the pull request bundle unsigned, the way CI does, and return the
+/// directory holding the archive and its checksum sidecar: what a downloaded
+/// workflow artifact contains.
+fn package_pr_bundle(world: &E2eWorld) -> PathBuf {
+    let out_dir = root(world).join("pr-dist");
+    let mut cmd = xtask_command();
+    cmd.args(["package", pr_dist_name()])
+        .arg(&out_dir)
+        .current_dir(workspace_root())
+        .env("ROCM_BIN_DIR", release_bin_dir())
+        .env_remove("ROCM_CLI_REQUIRE_SIGNATURE")
+        .env_remove("ROCM_CLI_SIGNING_PRIVATE_KEY_PATH")
+        .env_remove("ROCM_CLI_SIGNING_PRIVATE_KEY_PEM");
+    let output = cmd.output().expect("failed to run xtask package");
+    assert!(
+        output.status.success(),
+        "packaging the pull request bundle failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifact = root(world).join("pr-artifact");
+    std::fs::create_dir_all(&artifact).expect("failed to create the artifact directory");
+    let archive = archive_name(pr_dist_name());
+    for name in [archive.clone(), format!("{archive}.sha256")] {
+        std::fs::copy(out_dir.join(&name), artifact.join(&name))
+            .unwrap_or_else(|e| panic!("packaged pull request bundle lacks {name}: {e}"));
+    }
+    artifact
+}
+
+/// A workflow run `fake-gh` reports for the pull request's head commit.
+struct CiRun {
+    id: u32,
+    /// Artifacts the run still has, and expired ones it also lists.
+    live: u32,
+    expired: u32,
+    /// The `<status> <conclusion>` it reports, `-` for no conclusion yet.
+    state: &'static str,
+    /// The workflow file the run belongs to.
+    workflow: &'static str,
+}
+
+const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+impl CiRun {
+    const fn ci(id: u32, live: u32, expired: u32, state: &'static str) -> Self {
+        Self {
+            id,
+            live,
+            expired,
+            state,
+            workflow: CI_WORKFLOW,
+        }
+    }
+}
+
+/// Plant `fake-gh` with the given runs, newest first, and the bundle
+/// `gh run download` hands out.
+fn plant_gh_stub(world: &mut E2eWorld, runs: &[CiRun], bundle: Option<&Path>) {
+    let stub = root(world).join("gh-stub");
+    let bin = stub.join("bin");
+    std::fs::create_dir_all(stub.join("bundle")).expect("failed to create the gh stub directory");
+    crate::install_fixture_binary("fake-gh", &installed_binary(&bin, "gh"));
+    std::fs::write(stub.join("head"), format!("{PR_HEAD_COMMIT}\n")).expect("write head");
+    let mut listing = String::new();
+    for run in runs {
+        let _ = writeln!(listing, "{} {} {}", run.id, run.state, run.workflow);
+    }
+    std::fs::write(stub.join("runs"), listing).expect("write runs");
+    for run in runs {
+        std::fs::write(
+            stub.join(format!("artifacts-{}", run.id)),
+            format!("{}\n", run.live),
+        )
+        .expect("write artifact count");
+        std::fs::write(
+            stub.join(format!("expired-{}", run.id)),
+            format!("{}\n", run.expired),
+        )
+        .expect("write expired count");
+    }
+    if let Some(bundle) = bundle {
+        for entry in std::fs::read_dir(bundle).expect("read the pull request artifact") {
+            let entry = entry.expect("artifact entry");
+            std::fs::copy(entry.path(), stub.join("bundle").join(entry.file_name()))
+                .expect("copy into the gh stub bundle");
+        }
+    }
+    state_mut(world).gh_stub_dir = Some(stub);
+}
+
+#[given("CI built a bundle for pull request 1048 whose newest run has expired")]
+async fn given_pr_bundle_newest_expired(world: &mut E2eWorld) {
+    let artifact = package_pr_bundle(world);
+    // Newest first. A newer run of another workflow has a live artifact, which
+    // only the workflow filter keeps out; the newest CI run's builds have
+    // expired, which only the expiry filter keeps out; the run that is used is
+    // still running (its build job is done), so it has no conclusion yet.
+    plant_gh_stub(
+        world,
+        &[
+            CiRun {
+                workflow: ".github/workflows/codeql.yml",
+                ..CiRun::ci(3500, 1, 0, "completed success")
+            },
+            CiRun::ci(3003, 0, 2, "completed failure"),
+            CiRun::ci(2002, 1, 0, "in_progress -"),
+            CiRun::ci(1001, 1, 0, "completed success"),
+        ],
+        Some(&artifact),
+    );
+}
+
+#[given("CI has only expired builds for pull request 1048")]
+async fn given_pr_builds_all_expired(world: &mut E2eWorld) {
+    plant_gh_stub(
+        world,
+        &[
+            CiRun::ci(4004, 0, 1, "completed success"),
+            CiRun::ci(3003, 0, 1, "completed failure"),
+        ],
+        None,
+    );
+}
+
+#[given("a GitHub CLI stand-in that knows no pull requests")]
+async fn given_pr_unknown(world: &mut E2eWorld) {
+    plant_gh_stub(world, &[], None);
+    let stub = state(world).gh_stub_dir.clone().expect("planted above");
+    std::fs::remove_file(stub.join("head")).expect("remove the head commit");
+}
+
+#[when("the checksum sidecar of the pull request bundle is corrupted")]
+async fn when_corrupt_pr_checksum(world: &mut E2eWorld) {
+    let stub = state(world)
+        .gh_stub_dir
+        .clone()
+        .expect("a CI stub must be planted first");
+    let sha = stub
+        .join("bundle")
+        .join(format!("{}.sha256", archive_name(pr_dist_name())));
+    std::fs::write(&sha, format!("{}\n", "0".repeat(64)))
+        .expect("failed to corrupt the checksum sidecar");
+}
+
+/// How a pull request channel install is asked to treat signatures.
+#[derive(Clone, Copy)]
+enum PrSignature {
+    /// Nothing asked: the channel must install on the checksum alone.
+    NotAsked,
+    /// `ROCM_CLI_REQUIRE_SIGNATURE=1`, with no key supplied.
+    Required,
+    /// The scenario's generated public key is supplied.
+    PublicKey,
+}
+
+#[when("the pull request channel pr-1048 is installed")]
+async fn when_install_pr_channel(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-1048", PrSignature::NotAsked);
+}
+
+#[when("the pull request channel pr-1048 is installed requiring a signature")]
+async fn when_install_pr_channel_requiring_signature(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-1048", PrSignature::Required);
+}
+
+#[when("the pull request channel pr-1048 is installed with the public key file")]
+async fn when_install_pr_channel_with_key(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-1048", PrSignature::PublicKey);
+}
+
+#[when("the channel pr-abc is installed")]
+async fn when_install_pr_channel_malformed(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-abc", PrSignature::NotAsked);
+}
+
+fn install_pr_channel(world: &mut E2eWorld, channel: &str, signature: PrSignature) {
+    let st = state(world);
+    let stub = st
+        .gh_stub_dir
+        .clone()
+        .expect("a CI stub must be planted first");
+    let install_dir = st.install_dir.clone();
+    let home = st.home_dir.clone();
+    let public_key = st.public_key.to_string_lossy().into_owned();
+    let mut cmd = installer_command_for(&workspace_root(), channel);
+    // The lookup goes to the default repository the stand-in serves, whatever
+    // the machine running the suite has set.
+    cmd.env_remove("ROCM_CLI_GITHUB_REPO")
+        .env_remove("FAKE_GH_REPO");
+    let mut path = vec![stub.join("bin")];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let extra = [
+        (
+            "PATH",
+            std::env::join_paths(path)
+                .expect("join PATH")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("FAKE_GH_DIR", stub.to_string_lossy().into_owned()),
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("ROCM_CLI_UPDATE_USER_PATH", "0".to_string()),
+        (
+            "ROCM_CLI_CONFIG_DIR",
+            home.join(".rocm").to_string_lossy().into_owned(),
+        ),
+        // The harness asks for a signature on every install; a pull request
+        // bundle is not signed, and the channel must not need one unless the
+        // scenario asks for it.
+        (
+            "ROCM_CLI_REQUIRE_SIGNATURE",
+            match signature {
+                PrSignature::Required => "1",
+                PrSignature::NotAsked | PrSignature::PublicKey => "0",
+            }
+            .to_string(),
+        ),
+    ];
+    let key_env: &[(&str, String)] = match signature {
+        PrSignature::PublicKey => &[("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH", public_key)],
+        PrSignature::NotAsked | PrSignature::Required => &[],
+    };
+    // No download base: the channel takes its build from CI and refuses one.
+    let (out, ok) = run_installer_command(
+        world,
+        cmd,
+        &workspace_root(),
+        &install_dir,
+        "",
+        key_env,
+        &extra,
+    );
+    let st = state_mut(world);
+    st.last_output = out;
+    st.last_rc = i32::from(!ok);
+}
+
+/// The stand-in's call log.
+fn gh_calls(world: &E2eWorld) -> String {
+    let stub = state(world)
+        .gh_stub_dir
+        .as_ref()
+        .expect("a CI stub was planted");
+    std::fs::read_to_string(stub.join("calls")).unwrap_or_default()
+}
+
+#[then("the installer names pull request 1048 and the CI run it installed from")]
+async fn then_pr_named(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    for expected in [
+        "channel: pr-1048",
+        "pull request: #1048 at 53546b0",
+        "CI run: 2002 (in_progress/-)",
+    ] {
+        assert!(
+            out.contains(expected),
+            "installer output lacks `{expected}`:\n{out}"
+        );
+    }
+}
+
+#[then("the installer says the build is unsigned and verifies no signature")]
+async fn then_pr_unsigned(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("unsigned build"),
+        "installer did not warn the build is unsigned:\n{out}"
+    );
+    assert!(
+        !out.contains("signature verified"),
+        "a pull request bundle was verified against a signing key:\n{out}"
+    );
+}
+
+#[then("only the newest unexpired run was downloaded")]
+async fn then_pr_downloaded_newest_unexpired(world: &mut E2eWorld) {
+    let calls = gh_calls(world);
+    let downloads: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.starts_with("downloaded "))
+        .collect();
+    assert_eq!(
+        downloads,
+        ["downloaded 2002"],
+        "expected one download, from run 2002:\n{calls}"
+    );
+}
+
+#[then("the install fails reporting no downloadable build for pull request 1048")]
+async fn then_pr_no_build(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    for expected in ["no downloadable", "build for pull request #1048", "7 days"] {
+        assert!(
+            st.last_output.contains(expected),
+            "installer output lacks `{expected}`:\n{}",
+            st.last_output
+        );
+    }
+}
+
+#[then("the install fails because a signature cannot be required for a pull request build")]
+async fn then_pr_signature_cannot_be_required(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("a signature cannot be required for the pr-1048 channel"),
+        "installer output lacks the refusal:\n{}",
+        st.last_output
+    );
+    // Naming a key would send the user to a second failure: CI signs nothing.
+    assert!(
+        !st.last_output.contains("ROCM_CLI_SIGNING_PUBLIC_KEY"),
+        "the refusal points at a key, which cannot help:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting that pull request 1048 could not be found")]
+async fn then_pr_unknown(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("could not look up pull request #1048"),
+        "installer output lacks the lookup failure:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting that pr-abc is not a pull request channel")]
+async fn then_pr_channel_malformed(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output.contains("invalid channel: pr-abc"),
+        "installer output lacks the malformed-channel refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("gh was never called")]
+async fn then_gh_never_called(world: &mut E2eWorld) {
+    let calls = gh_calls(world);
+    assert!(
+        calls.trim().is_empty(),
+        "the installer reached gh for a refused channel:\n{calls}"
+    );
+}
+
+#[then("the install fails because the pull request bundle has no signature")]
+async fn then_pr_bundle_unsigned(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("required signature sidecar is missing"),
+        "installer output lacks the missing-signature failure:\n{}",
+        st.last_output
+    );
+}
+
+#[then("nothing was downloaded from CI")]
+async fn then_pr_nothing_downloaded(world: &mut E2eWorld) {
+    let calls = gh_calls(world);
+    assert!(
+        !calls.contains("downloaded"),
+        "a build was downloaded:\n{calls}"
+    );
 }

@@ -256,7 +256,8 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
    [`tests/e2e.rs`](tests/e2e.rs) plants it (it needs the `rocm-core`
    dev-dependency the library target can't reach). See
    [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
-   and [`fake-tailscale`](src/bin/fake-tailscale.rs) for the pattern.
+   [`fake-tailscale`](src/bin/fake-tailscale.rs), and
+   [`fake-gh`](src/bin/fake-gh.rs) for the pattern.
 
 ## Design principles
 

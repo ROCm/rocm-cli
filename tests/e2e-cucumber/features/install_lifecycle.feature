@@ -468,3 +468,147 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the installed rocm and rocmd binaries are gone
     And the user's own fish completions are untouched
+
+  # ── Pull request channel: pr-<number> installs the bundle CI built ──────
+  # CI packages a bundle for each pull request unsigned, so the channel trusts
+  # its checksum alone and says so. `fake-gh` stands in for the signed-in GitHub
+  # CLI the real channel needs: it reports three CI runs for the pull request,
+  # the newest with an expired build, and serves the bundle packaged here.
+
+  @id:lifecycle-linux-pr-channel-installs-ci-build @lifecycle @requires-os:linux
+  Scenario: lifecycle-36 - Linux - the pr channel installs the newest unexpired CI build of a pull request on its checksum alone
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed
+    Then the installer names pull request 1048 and the CI run it installed from
+    And the installer says the build is unsigned and verifies no signature
+    And only the newest unexpired run was downloaded
+    And the installed rocm and rocmd binaries are present
+    And the install manifest is present
+    When the installed rocm version runs
+    Then the installed command exits successfully
+
+  @id:lifecycle-windows-pr-channel-installs-ci-build @lifecycle @requires-os:windows
+  Scenario: lifecycle-37 - Windows - the pr channel installs the newest unexpired CI build of a pull request on its checksum alone
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed
+    Then the installer names pull request 1048 and the CI run it installed from
+    And the installer says the build is unsigned and verifies no signature
+    And only the newest unexpired run was downloaded
+    And the installed rocm and rocmd binaries are present
+    And the install manifest is present
+    When the installed rocm version runs
+    Then the installed command exits successfully
+
+  # CI does not sign a pull request bundle, so asking for a signature anyway is
+  # refused rather than skipped, whether it is asked for as a requirement or by
+  # supplying a key to verify with. Nothing is installed either way.
+
+  @id:lifecycle-linux-pr-channel-refuses-required-signature @lifecycle @requires-os:linux
+  Scenario: lifecycle-38 - Linux - the pr channel refuses to skip a required signature, and installs nothing
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed requiring a signature
+    Then the install fails because a signature cannot be required for a pull request build
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-refuses-required-signature @lifecycle @requires-os:windows
+  Scenario: lifecycle-39 - Windows - the pr channel refuses to skip a required signature, and installs nothing
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed requiring a signature
+    Then the install fails because a signature cannot be required for a pull request build
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-pr-channel-refuses-bundle-without-signature @lifecycle @requires-os:linux
+  Scenario: lifecycle-40 - Linux - the pr channel refuses an unsigned bundle when a public key is supplied, and installs nothing
+    Given a freshly built release tree
+    And a generated signing keypair
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed with the public key file
+    Then the install fails because the pull request bundle has no signature
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-refuses-bundle-without-signature @lifecycle @requires-os:windows
+  Scenario: lifecycle-41 - Windows - the pr channel refuses an unsigned bundle when a public key is supplied, and installs nothing
+    Given a freshly built release tree
+    And a generated signing keypair
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed with the public key file
+    Then the install fails because the pull request bundle has no signature
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-pr-channel-refuses-expired-builds @lifecycle @requires-os:linux
+  Scenario: lifecycle-42 - Linux - the pr channel refuses a pull request whose CI builds have all expired, and installs nothing
+    Given a freshly built release tree
+    And CI has only expired builds for pull request 1048
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting no downloadable build for pull request 1048
+    And nothing was downloaded from CI
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-refuses-expired-builds @lifecycle @requires-os:windows
+  Scenario: lifecycle-43 - Windows - the pr channel refuses a pull request whose CI builds have all expired, and installs nothing
+    Given a freshly built release tree
+    And CI has only expired builds for pull request 1048
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting no downloadable build for pull request 1048
+    And nothing was downloaded from CI
+    And no binaries are activated in the target directory
+
+  # A bundle that does not match its checksum, a pull request GitHub does not
+  # know, and a channel that is not pr-<number> are each refused before anything
+  # is activated, and the last before the GitHub CLI is even called.
+
+  @id:lifecycle-linux-pr-channel-rejects-bad-checksum @lifecycle @requires-os:linux
+  Scenario: lifecycle-44 - Linux - the pr channel rejects a bundle whose checksum does not match, and installs nothing
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the checksum sidecar of the pull request bundle is corrupted
+    And the pull request channel pr-1048 is installed
+    Then the install fails reporting checksum verification failed
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-rejects-bad-checksum @lifecycle @requires-os:windows
+  Scenario: lifecycle-45 - Windows - the pr channel rejects a bundle whose checksum does not match, and installs nothing
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the checksum sidecar of the pull request bundle is corrupted
+    And the pull request channel pr-1048 is installed
+    Then the install fails reporting checksum verification failed
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-pr-channel-unknown-pull-request @lifecycle @requires-os:linux
+  Scenario: lifecycle-46 - Linux - the pr channel names a pull request GitHub does not know, and installs nothing
+    Given a freshly built release tree
+    And a GitHub CLI stand-in that knows no pull requests
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting that pull request 1048 could not be found
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-unknown-pull-request @lifecycle @requires-os:windows
+  Scenario: lifecycle-47 - Windows - the pr channel names a pull request GitHub does not know, and installs nothing
+    Given a freshly built release tree
+    And a GitHub CLI stand-in that knows no pull requests
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting that pull request 1048 could not be found
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-pr-channel-malformed-number @lifecycle @requires-os:linux
+  Scenario: lifecycle-48 - Linux - a channel that is not pr-<number> is refused before gh is called, and installs nothing
+    Given a freshly built release tree
+    And a GitHub CLI stand-in that knows no pull requests
+    When the channel pr-abc is installed
+    Then the install fails reporting that pr-abc is not a pull request channel
+    And gh was never called
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-malformed-number @lifecycle @requires-os:windows
+  Scenario: lifecycle-49 - Windows - a channel that is not pr-<number> is refused before gh is called, and installs nothing
+    Given a freshly built release tree
+    And a GitHub CLI stand-in that knows no pull requests
+    When the channel pr-abc is installed
+    Then the install fails reporting that pr-abc is not a pull request channel
+    And gh was never called
+    And no binaries are activated in the target directory
