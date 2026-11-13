@@ -131,6 +131,27 @@ impl LemondChild {
     }
 }
 
+impl crate::state::StartedServer for LemondChild {
+    fn reap(&mut self) -> Result<()> {
+        match self {
+            Self::Child(child) => child.wait().map(|_| ()).map_err(Into::into),
+            // Started by pid alone, so not this process's child: there is no
+            // exit to collect, and waiting by pid on a process that is gone
+            // could open whichever process has since taken the pid.
+            #[cfg(windows)]
+            Self::Pid(_) => Ok(()),
+        }
+    }
+
+    fn is_unreaped_child(&self) -> bool {
+        match self {
+            Self::Child(_) => true,
+            #[cfg(windows)]
+            Self::Pid(_) => false,
+        }
+    }
+}
+
 pub(crate) struct LemondExitStatus {
     success: bool,
     description: String,
@@ -706,6 +727,65 @@ mod tests {
     use crate::DEFAULT_MODEL;
     use rocm_engine_protocol::DevicePolicy;
     use serde_json::json;
+
+    /// A server started by pid alone is not this process's child, so reaping
+    /// it after a confirmed stop returns at once rather than waiting by pid on
+    /// whichever process may hold that pid now; pid 0 is never a user process.
+    #[cfg(windows)]
+    #[test]
+    fn reaping_a_server_started_by_pid_does_not_wait_on_the_pid() {
+        use crate::state::StartedServer;
+
+        let mut server = LemondChild::Pid(0);
+        assert!(
+            !server.is_unreaped_child(),
+            "a server started by pid holds no claim on its pid"
+        );
+        server
+            .reap()
+            .expect("nothing to collect for a server started by pid");
+    }
+
+    /// Reaping a spawned server collects its exit: on Linux its `/proc` entry,
+    /// which stays as a zombie until something reaps it, is gone afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaping_a_spawned_server_collects_its_exit() {
+        use crate::state::StartedServer;
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child");
+        let pid = child.id();
+        let mut server = LemondChild::Child(child);
+
+        server.reap().expect("reap the exited server");
+
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the server must have been reaped"
+        );
+    }
+
+    /// A server spawned as a child of this process holds its pid until reaped.
+    #[test]
+    fn a_spawned_server_is_an_unreaped_child() {
+        use crate::state::StartedServer;
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child");
+        let mut server = LemondChild::Child(child);
+        let owned = server.is_unreaped_child();
+        let _ = server.wait();
+        assert!(owned);
+    }
 
     fn test_manifest() -> LemonadeInstallManifest {
         LemonadeInstallManifest {
