@@ -663,12 +663,20 @@ ROCm distribution. Two install formats are supported:
 - **Wheel format** — Python wheel packages (`rocm`, `torch`, `torchvision`,
   `torchaudio`) are resolved from AMD-hosted PyPI-compatible indexes and
   installed via `uv` into a managed virtual environment. Release channel wheels
-  are served from `https://repo.amd.com/rocm/whl-multi-arch`. Nightly channel
-  wheels are served from `https://rocm.nightlies.amd.com/whl-multi-arch`.
+  are served from `https://stable.repo.amd.com/rocm/whl-next`. Nightly channel
+  wheels are served from `https://nightly.repo.amd.com/rocm/whl-next`. An
+  earlier ROCm 7 release is served from the earlier stream,
+  `https://repo.amd.com/rocm/whl-multi-arch`, and a nightly built before
+  2026-08-23 from `https://rocm.nightlies.amd.com/whl-multi-arch`; the CLI reads
+  those only when the install pins such a build.
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
   artifact storage. Release channel tarballs are served from
-  `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
-  `https://rocm.nightlies.amd.com/tarball/`. The metadata index files for
+  `https://stable.repo.amd.com/rocm/core/tarball/`. Nightly tarballs are served
+  from `https://nightly.repo.amd.com/rocm/core/tarball/`. The earlier streams,
+  `https://repo.amd.com/rocm/tarball/` and
+  `https://rocm.nightlies.amd.com/tarball/`, are read only when the install pins
+  a build that exists only there, and a tarball install can pin a version only
+  against the current catalogs. The metadata index files for
   tarball installs are optionally verified with an RSA/SHA-256 detached
   signature (controlled by `ROCM_CLI_METADATA_PUBLIC_KEY_PATH` /
   `ROCM_CLI_METADATA_PUBLIC_KEY_PEM`); the tarball binary itself is not
@@ -732,9 +740,9 @@ contributors and is part of the public source distribution.
 
 ### `scripts/` Directory
 
-The `scripts/` directory contains Python and shell scripts for local smoke
-testing, GPU integration tests, release packaging, and CI support. These are
-development tools, not shipped to end users.
+The `scripts/` directory contains Python and shell scripts for GPU integration
+tests, release packaging, and CI support. These are development tools, not
+shipped to end users. The local smoke test is `cargo xtask smoke`.
 
 ## Media Assets
 
