@@ -72,6 +72,7 @@ mod services_text;
 mod setup_cmd;
 mod shell_quote;
 mod storage;
+mod symptom_input;
 mod system_packages;
 #[cfg(test)]
 mod test_support;
@@ -659,6 +660,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose {
             symptom,
+            symptom_file,
             top,
             json,
             distro,
@@ -668,6 +670,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             report,
             send,
         }) => {
+            let symptom = symptom_input::resolve(symptom, symptom_file.as_deref())
+                .map_err(|error| clap_exit_code(symptom_input::usage_error(&error)))?;
             let model = model.map(|model_ref| {
                 diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
             });

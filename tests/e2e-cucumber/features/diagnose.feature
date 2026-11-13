@@ -867,3 +867,50 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine whose only GPU is a released one
     When the user asks the CLI what that machine's report would carry in machine-readable form
     Then the report names the CLI version that `rocm version` leads with
+
+  # A pasted error is hostile to every shell's argument parser: bash and
+  # PowerShell run a `$(...)` even inside double quotes, a stray quote ends the
+  # argument early, cmd.exe has no single quotes at all, and an error that
+  # starts with `-` is read as a flag. `--symptom-file -` takes the paste on
+  # standard input instead, so the shell only ever parses the fixed command.
+  # Each platform's own shells do the piping -- bash on Linux and WSL, cmd.exe
+  # and Windows PowerShell on Windows -- and each result is compared with the
+  # same text handed over as one argument with no shell involved. The paste
+  # matches a catalog entry that scores on every platform, so the comparison is
+  # between two real diagnoses rather than two empty ones; which entry it is,
+  # is not asserted (see the note at the top of this file). Nothing in the
+  # paste can run or be read as a flag: each shell only reads it from a file
+  # (cat, type, Get-Content) into the pipe and never parses it. That holds by
+  # how the paste is handed over, so it is stated here rather than asserted.
+  @id:diagnose-a-piped-paste-is-diagnosed-as-pasted
+  Scenario: diagnose-59 - A pasted error piped to the diagnosis is diagnosed the same as if it had been passed safely
+    Given a pasted error containing quotes, a command substitution and a leading minus sign
+    When the user pipes it to the diagnosis instead of passing it as an argument
+    Then the diagnosis matches the same failure modes as the same text passed safely as an argument
+
+  # Typing `rocm diagnose --symptom-file -` with nothing piped in leaves the CLI
+  # waiting on the terminal. It says so, and how to end the paste; the user
+  # pastes, ends it the way they were told, and the terminal then contains the
+  # whole report the same text passed as an argument gets, below the hint and
+  # the echoed paste. The step first requires that report to differ from the
+  # one without any symptom, so a paste that was read and then dropped cannot
+  # pass.
+  # @requires-os:linux like every other pseudo-terminal scenario in this suite:
+  # on Windows the step hangs under the harness's pseudo-console before the
+  # paste is diagnosed (not investigated further; the console is started with
+  # cursor inheritance, which waits on a reply the screen emulator does not
+  # send). That leaves the Windows half of the hint (Ctrl-Z then Enter) without
+  # an e2e check; docs/manual-testing.md section 13 covers it by hand.
+  @id:diagnose-a-paste-at-the-terminal-is-explained-and-diagnosed @requires-os:linux
+  Scenario: diagnose-60 - Pasting the error at the terminal is explained, and the paste is diagnosed when the user ends it
+    Given a pasted error containing quotes, a command substitution and a leading minus sign
+    When the user asks to paste the error at the terminal, pastes it and ends it as told
+    Then the CLI told the user how to end the paste
+    And the terminal shows the whole report the same text passed safely as an argument gets
+
+  @id:diagnose-an-unreadable-error-file-is-a-usage-error
+  Scenario: diagnose-61 - An error file that cannot be read, or is not text, is refused as a usage error
+    Given an error file that does not exist and one that is not text
+    When the user asks the CLI to diagnose the error in each file
+    Then each is refused as a usage error that names the file and says why
+    And nothing is diagnosed
