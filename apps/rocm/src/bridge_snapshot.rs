@@ -74,7 +74,7 @@ pub(crate) fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBr
 }
 
 /// The engine catalogue in the codex-bridge snapshot and the bridge's `engines`
-/// tool, built from [`builtin_engine_inventory`] with lemonade's note replaced
+/// tool, built from [`engine_inventory`] with lemonade's note replaced
 /// by `lemonade_engine_note` for the given support level.
 ///
 /// It takes the level rather than reading the static row because the stale
