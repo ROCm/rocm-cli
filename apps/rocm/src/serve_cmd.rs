@@ -456,6 +456,32 @@ fn reuse_pregate_opens<T>(
         .flatten()
 }
 
+/// Whether the deployment summary may spend a device probe, given what the
+/// launch report says happened.
+///
+/// `!already_running` is the load-bearing half, not a cosmetic echo of the
+/// smoke test's gate. A service that was already running is `"ready"` by
+/// definition, so keying on the status alone opens this on *every* repeat
+/// `rocm serve` of a live model — and the probe is not free: on a miss it costs
+/// `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` plus one in-flight probe, about 14s
+/// with Lemonade's 8s inference probe, paid sequentially before the summary's
+/// remaining waits. That is a long stall bought for a row this command cannot
+/// learn anything new for — the engine answered the same thing when the service
+/// was launched, and a *running* service's device is what `rocm services list`
+/// reads, with its own budget for exactly that.
+///
+/// `probe` is a closure rather than a value for that reason: on the reuse path
+/// the cost must not be paid at all, which is what the unit test pins.
+fn serve_device_probe_opens<T>(
+    already_running: bool,
+    status: &str,
+    probe: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    (!already_running && status == "ready")
+        .then(probe)
+        .flatten()
+}
+
 /// The no-usable-GPU bail's host precondition, read from the visibility-resolved
 /// set of usable AMD GPU ordinals.
 ///
@@ -1251,8 +1277,11 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Read what the engine actually selected rather than guessing from
             // the pre-launch GPU plan: `gpu_indices` above can be empty for a
             // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
-            // the server is running fine on it. Only meaningful once the
-            // server is ready to answer, same gate as the smoke test.
+            // the server is running fine on it.
+            //
+            // Only for a launch this command performed — see
+            // [`serve_device_probe_opens`] for why skipping the reuse path is
+            // the point rather than tidiness.
             //
             // Asked more than once, briefly: `engines/lemonade` answers
             // `"unknown"` until its own inference probe has come back, which is
@@ -1260,9 +1289,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // bounded (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is a
             // supported outcome — the summary then has no `device:` row, and
             // `rocm services list` shows it once the engine can say.
-            let device = (report.status == "ready")
-                .then(|| fetch_service_device_briefly(&paths, &selected_engine, &report.service_id))
-                .flatten();
+            let device = serve_device_probe_opens(report.already_running, &report.status, || {
+                fetch_service_device_briefly(&paths, &selected_engine, &report.service_id)
+            });
 
             let mut notes = collect_serve_notes(
                 cpu_only,
@@ -1490,6 +1519,63 @@ mod tests {
         // reachable `serve()` input — see the `cpu_only` binding in `serve`.
         assert!(
             reuse_pregate_opens(true, host_has_no_usable_gpu(Some(&[])), || Some(())).is_none()
+        );
+    }
+
+    /// Regression coverage for the device probe's gate (ROCMAI-550 review).
+    ///
+    /// The gate shipped as `report.status == "ready"` alone, under a comment
+    /// claiming it was "the same gate as the smoke test" — which it was not: the
+    /// smoke test and the Anthropic-endpoint wait beside it both also require
+    /// `!already_running`. A reused service is `"ready"` by definition, so the
+    /// omission made every repeat `rocm serve` of a live model pay the probe's
+    /// full retry budget (plus one in-flight probe, ~14s with Lemonade) before
+    /// printing a summary of a launch that did not happen.
+    ///
+    /// The probe is asserted *not consulted*, not merely that the row is absent:
+    /// the cost is the bug, and a gate that probed and then discarded the answer
+    /// would satisfy a value-only assertion.
+    #[test]
+    fn the_device_probe_is_not_spent_on_a_service_that_was_already_running() {
+        let mut probed = false;
+        assert!(
+            serve_device_probe_opens(true, "ready", || {
+                probed = true;
+                Some("gpu")
+            })
+            .is_none(),
+            "a reused service must not open the device probe: it is `ready` by \
+             definition, so the budget would be spent on every repeat `serve`"
+        );
+        assert!(
+            !probed,
+            "the probe must not even be called on the reuse path — the wall time \
+             is the regression, not the `device:` row"
+        );
+
+        // A launch that is not ready has nothing to ask the engine about yet.
+        let mut probed_starting = false;
+        assert!(
+            serve_device_probe_opens(false, "starting", || {
+                probed_starting = true;
+                Some("gpu")
+            })
+            .is_none()
+        );
+        assert!(!probed_starting);
+
+        // The row itself still works for the case it was added for: a fresh
+        // launch that reached ready, where the engine knows what it selected.
+        assert_eq!(
+            serve_device_probe_opens(false, "ready", || Some("gpu")),
+            Some("gpu"),
+            "a fresh ready launch must still read the engine's device, or the \
+             Vulkan-only `device:` row this PR adds is gone"
+        );
+        // `None` from the engine stays a supported answer: no row, no error.
+        assert_eq!(
+            serve_device_probe_opens(false, "ready", || Option::<&str>::None),
+            None
         );
     }
 
