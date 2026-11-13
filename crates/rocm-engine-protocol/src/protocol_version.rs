@@ -74,6 +74,10 @@ pub const INVALID_REQUEST_CODE: &str = "invalid_request";
 /// decode as that method's request.
 pub const INVALID_PAYLOAD_CODE: &str = "invalid_payload";
 
+/// The error code an engine answers with when its answer's payload cannot be
+/// serialized (see `EngineResponseEnvelope::success`).
+pub const RESPONSE_SERIALIZATION_FAILED_CODE: &str = "response_serialization_failed";
+
 /// Why two engine protocol versions cannot be used together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolMismatch {

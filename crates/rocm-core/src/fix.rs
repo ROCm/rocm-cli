@@ -93,14 +93,17 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 /// [`Plan::Unfixable`] from [`Plan::PrintSteps`], and the difference matters —
 /// the second tells the user to copy commands, which an unfixable entry does not
 /// have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `PartialEq`: `Run` carries a function pointer, whose comparison is not
+// meaningful. Tests match on the variant instead.
+#[derive(Debug, Clone, Copy)]
 enum Plan {
     /// The entry does not apply on the running OS.
     WrongMachine,
     /// No reliable fix exists. Name the problem and change nothing.
     Unfixable,
-    /// Hand off to the recipe's runner.
-    Run,
+    /// Hand off to the recipe's runner, carried here so [`act_on`] cannot
+    /// reach this arm without one.
+    Run(fn(&FixOptions) -> i32),
     /// The catalog says the CLI carries this out, and nothing can.
     MissingRunner,
     /// Print the steps for the user to carry out.
@@ -120,8 +123,8 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
     // real work to do there -- it reads the live value and scans five rc files
     // to name the ones that set it. Gating the runner on the class would throw
     // that away and print a generic "copy the commands above" in its place.
-    if recipe.runner.is_some() {
-        return Plan::Run;
+    if let Some(runner) = recipe.runner {
+        return Plan::Run(runner);
     }
     if platform.class.applies_itself() {
         return Plan::MissingRunner;
@@ -163,9 +166,7 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
             println!("The explanation above is the whole of what is known about it.");
             exit::OK
         }
-        Plan::Run => recipe
-            .runner
-            .expect("plan_of returns Run only when a runner is present")(opts),
+        Plan::Run(runner) => runner(opts),
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
             // carry it out with -> INTERNAL, not FAILED (which is reserved for
@@ -244,15 +245,16 @@ mod tests {
         // an assertion on the code would survive the unfixable arm being
         // disabled, and the user would be told to copy commands that do not
         // exist. This is the part that only holds while the arm is reached.
-        assert_eq!(
-            plan_of(&unfixable_recipe(FixClass::DiagnoseOnly)),
-            Plan::Unfixable,
+        assert!(
+            matches!(
+                plan_of(&unfixable_recipe(FixClass::DiagnoseOnly)),
+                Plan::Unfixable
+            ),
             "DIAGNOSE-ONLY must not fall through to the print-the-steps path"
         );
         for actionable in [FixClass::Auto, FixClass::NeedsArgument, FixClass::PrintOnly] {
-            assert_ne!(
-                plan_of(&unfixable_recipe(actionable)),
-                Plan::Unfixable,
+            assert!(
+                !matches!(plan_of(&unfixable_recipe(actionable)), Plan::Unfixable),
                 "{actionable:?} has something to offer and must not be treated as unfixable"
             );
         }
@@ -297,7 +299,8 @@ mod tests {
         // (`FixClass::applies_itself`); a runner-less `NeedsArgument` entry only
         // prints steps, so it is not this path.
         let recipe = unfixable_recipe(FixClass::Auto);
-        assert_eq!(plan_of(&recipe), Plan::MissingRunner);
+        let plan = plan_of(&recipe);
+        assert!(matches!(plan, Plan::MissingRunner), "{plan:?}");
         assert_eq!(
             act_on(&recipe, &FixOptions::default()),
             exit::INTERNAL,
