@@ -262,6 +262,18 @@ and GitHub step summary. Since ROCMAI-429 the report keys each column by
 release/nightly channel matrix renders two columns per platform instead of
 one channel's result silently overwriting the other.
 
+`e2e-report-nightly` also reads the shared queue's nightly (below), which runs
+R9700, MI350P, W7900 and the Instinct lanes of the queue's fleet. It fetches the
+`queue-run-results` artifact of the newest queue run that tested `main` and
+finished, and started, in the last 24 hours, and `cargo xtask e2e-queue-import`
+puts each lane's reports among the others, as `MI325X (queue) Linux (release)`
+and the like. A lane the queue does not block on is labelled `(queue, advisory)`
+and does not count towards the release-readiness verdict; a blocking lane that
+came back with no result is shown as `EMPTY` and does. The page opens with a
+`Queue lanes` table. A missing or late queue run never fails the report: the
+page says no queue lanes are in it. See
+[The support matrix and the wiki](nightly-on-the-queue.md#the-support-matrix-and-the-wiki).
+
 On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
 wiki, overwriting it each night (the page header names the run, commit and

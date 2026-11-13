@@ -1632,12 +1632,103 @@ jobs:
           pattern: '*-report'
           path: e2e-artifacts
 
+      # The shared GPU queue's nightly (docs/nightly-on-the-queue.md) runs R9700,
+      # MI350P, W7900 and the Instinct lanes of the queue's fleet on its own
+      # schedule, and its results are published as one `queue-run-results`
+      # artifact of that run, not as `*-report` artifacts of this one. So fetch
+      # the newest such artifact of a run on main that finished, and started, in
+      # the last 24 hours (a run still going, or one from an earlier night, is
+      # not today's), and the job log of that run, which is the only place the
+      # queue prints which branch it tested and which lanes it blocks on. The
+      # artifact is found by its name, not through the workflow that makes it:
+      # that workflow runs on a runner no other workflow may name or depend on.
+      # A conclusion of `failure` is no reason to skip it: a red lane fails the
+      # queue's run and the artifact is still uploaded. This step never fails the
+      # job and never stops the report: when there is nothing to import it
+      # records why, and the next step says so at the top of the page instead of
+      # leaving the queue's GPUs out without a word.
+      - name: Fetch the latest queue results
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p queue-results
+          absent() {
+            echo "$1" > queue-results/absent.txt
+            echo "::warning::No queue lanes in this report: $1"
+            exit 0
+          }
+          repo_id=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id) ||
+            absent "the repository could not be read"
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          found=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=queue-run-results&per_page=50" |
+            jq -r --arg since "$since" --argjson repo "$repo_id" '
+              [.artifacts[]
+               | select(.expired == false)
+               | select(.workflow_run.head_branch == "main" and .workflow_run.head_repository_id == $repo)
+               | select(.created_at >= $since)]
+              | sort_by(.created_at) | last // empty | .workflow_run.id') ||
+            absent "the queue results could not be listed"
+          [ -n "$found" ] ||
+            absent "no queue run on main finished in the last 24 hours (a run still going is not imported)"
+          # The run of main's workflow can have been asked to test another branch,
+          # and a run that started a day ago is not tonight's.
+          started=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${found}" --jq .run_started_at) ||
+            absent "when the newest queue run started could not be read"
+          started_at=$(date -u -d "$started" +%s 2>/dev/null) &&
+            [ "$started_at" -ge "$(date -u -d '24 hours ago' +%s)" ] ||
+            absent "the newest queue run started more than 24 hours ago"
+          echo "$started" > queue-results/started.txt
+          gh run download "$found" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results ||
+            absent "the queue results of run $found could not be downloaded"
+          # The log names the branch the run tested and which lanes the queue
+          # blocks on. Without it nothing is imported.
+          job=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${found}/jobs" --jq '.jobs[0].id') &&
+            gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log ||
+            rm -f queue-results/job.log
+          echo "$found" > queue-results/run-id.txt
+
+      # Turn the run's lanes into reports of this job's own kind, and write the
+      # status section for the top of the matrix (`cargo xtask e2e-queue-import`).
+      # A lane the queue marks advisory is labelled so and does not count towards
+      # the release-readiness verdict; a blocking lane with no result does.
+      - name: Add the queue lanes to the report
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p queue-results
+          if [ -s queue-results/run-id.txt ] && [ -d queue-results/results ]; then
+            run_id=$(cat queue-results/run-id.txt)
+            args=(--queue-dir queue-results/results
+              --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+              --run-started "$(cat queue-results/started.txt 2>/dev/null)")
+            [ -f queue-results/job.log ] && args+=(--log queue-results/job.log)
+          else
+            args=(--absent "$(cat queue-results/absent.txt 2>/dev/null || echo 'fetching the queue results did not complete')")
+          fi
+          cargo xtask e2e-queue-import "${args[@]}" \
+            --artifacts-dir e2e-artifacts \
+            --section-out queue-results/queue-lanes.md || {
+            # Half an import is worse than none, and none is said at the top of the page.
+            rm -rf e2e-artifacts/e2e-queue-* queue-results/queue-lanes.md
+            echo "::warning::The queue lanes could not be added to the report."
+            cargo xtask e2e-queue-import --absent "the queue lanes could not be imported" \
+              --artifacts-dir e2e-artifacts --section-out queue-results/queue-lanes.md || true
+          }
+
+      # The queue lanes' status leads the page. The matrix keeps its own first
+      # table, the one `release-readiness` reads its verdict from.
       - name: Build consolidated report + step summary
         run: |
           mkdir -p consolidated
           cargo xtask e2e-report \
             --artifacts-dir e2e-artifacts \
             --html-out consolidated/index.html > consolidated/support-matrix.md
+          if [ -f queue-results/queue-lanes.md ]; then
+            cat queue-results/queue-lanes.md consolidated/support-matrix.md > "$RUNNER_TEMP/with-queue.md"
+            mv "$RUNNER_TEMP/with-queue.md" consolidated/support-matrix.md
+          fi
           cat consolidated/support-matrix.md >> "$GITHUB_STEP_SUMMARY"
 
       # A lane that dies before writing report.json (preflight, build, a crash
