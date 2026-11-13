@@ -139,6 +139,7 @@ jobs:
             -e RUSTUP_HOME=/host-cargo/rustup \
             -e ROCM_CLI_RELEASE_REF="${STEPS_VERSION_OUTPUTS_VALUE}" \
             -e AWS_LC_SYS_USE_SYSTEM \
+            -e ROCM_CLI_REQUIRE_MPI_CXX_STUB \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -153,6 +154,12 @@ jobs:
             '
         env:
           STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
+          # crates/rocm-core/build.rs embeds a compiled libmpi_cxx.so.40 stub
+          # that lets torch import on OpenMPI 5.x hosts; without a C++ compiler
+          # it only warns and embeds an empty one. Release Linux binaries must
+          # carry the stub, so a missing compiler fails this build. Set on this
+          # step only, so builds on the runner host elsewhere do not need g++.
+          ROCM_CLI_REQUIRE_MPI_CXX_STUB: "1"
 
       # The tag shape of `rocm version` (`X.Y.Z (vX.Y.Z, <hash>)`) is otherwise
       # unit-tested only: every PR and nightly build resolves a branch, which

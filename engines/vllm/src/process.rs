@@ -968,8 +968,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn apply_therock_env_writes_libmpi_cxx_stub_when_needed() -> Result<()> {
         // Whether this host needs the `libmpi_cxx.so.40` stub depends on host
-        // state this test does not control: a real `libmpi_cxx.so*` already
-        // present, or no stub embedded at compile time (no C compiler on the
+        // state this test does not control: a real `libmpi_cxx.so.40` already
+        // present, or no stub embedded at compile time (no C++ compiler on the
         // build host). Use `ensure_mpi_cxx_compat` itself as the oracle,
         // against a throwaway directory so probing does not touch the
         // directory this test actually asserts on. When it answers `None`
@@ -1028,7 +1028,7 @@ mod tests {
 
         // Plant the leftover directly, bypassing `ensure_mpi_cxx_compat`:
         // this is what a prior launch leaves behind on a host that has since
-        // gained a real `libmpi_cxx.so*`.
+        // gained a real `libmpi_cxx.so.40`.
         let compat_dir = env.path().join("rocm-cli-lib-compat");
         fs::create_dir_all(&compat_dir)?;
         fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stale stub")?;

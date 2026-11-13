@@ -180,7 +180,7 @@ const STANDARD_LIB_DIRS: &[&str] = &[
 ];
 
 /// Scan [`LIBMPI_SCAN_DIRS`] for the first shared library whose file name starts
-/// with `name_prefix` (for example `libmpi.so` or `libmpi_cxx.so`).
+/// with `name_prefix` (for example `libmpi.so`).
 #[cfg(target_os = "linux")]
 fn scan_for_shared_lib(name_prefix: &str) -> Option<PathBuf> {
     scan_dirs_for_prefix(LIBMPI_SCAN_DIRS, name_prefix)
@@ -233,12 +233,24 @@ pub(crate) fn parse_ldconfig_libmpi(output: &str) -> Option<PathBuf> {
     None
 }
 
-/// Locate a real `libmpi_cxx.so*` (the legacy OpenMPI C++ bindings) on the host,
-/// if one is installed. Returns `None` when no such library exists, which is the
-/// case on OpenMPI 5.x (it removed the C++ bindings entirely).
+/// Soname of the legacy OpenMPI C++ bindings library that torch's
+/// `libtorch_global_deps.so` lists as `NEEDED`, and the file name the stub is
+/// written under.
 #[cfg(target_os = "linux")]
-fn find_libmpi_cxx() -> Option<PathBuf> {
-    scan_for_shared_lib("libmpi_cxx.so")
+const MPI_CXX_SONAME: &str = "libmpi_cxx.so.40";
+
+/// Locate a real `libmpi_cxx.so.40` (the OpenMPI 4.x C++ bindings) in `dirs`.
+///
+/// Only that exact file name counts. torch needs the `.so.40` soname, so a
+/// `libmpi_cxx.so.20` from an older OpenMPI or a bare `libmpi_cxx.so` dev
+/// symlink cannot satisfy it, and the stub is still required on such a host.
+/// Returns `None` when no such library exists, which is the case on OpenMPI 5.x
+/// (it removed the C++ bindings entirely).
+#[cfg(target_os = "linux")]
+fn find_libmpi_cxx_in<P: AsRef<Path>>(dirs: &[P]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.as_ref().join(MPI_CXX_SONAME))
+        .find(|candidate| candidate.exists())
 }
 
 /// Whether `link` already exists and resolves to `target`.
@@ -248,8 +260,9 @@ fn symlink_points_to(link: &Path, target: &Path) -> bool {
 }
 
 /// Prebuilt `libmpi_cxx.so.40` stub defining the legacy OpenMPI C++ binding
-/// symbols PyTorch references (see `build.rs`). Empty when the build host had no
-/// C compiler, in which case the shim is disabled.
+/// symbols PyTorch references, compiled from `mpi_cxx_stub.cpp` by `build.rs`.
+/// Empty when the build host had no C++ compiler, in which case the shim is
+/// disabled.
 #[cfg(target_os = "linux")]
 const MPI_CXX_STUB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libmpi_cxx_stub.so"));
 
@@ -292,28 +305,40 @@ fn write_compat_file(compat_dir: &Path, name: &str, bytes: &[u8]) -> Option<Path
 ///
 /// Those C++ symbols are never *called* in single-node serving (the C MPI API,
 /// resolved from the real `libmpi.so.40` that torch also `NEEDED`s, is what
-/// actually runs), so this materializes a tiny stub `libmpi_cxx.so.40` — built at
-/// compile time (see `build.rs`) and embedded — that merely *defines* the symbols
-/// so the dynamic loader can resolve torch.
+/// actually runs), so this materializes a tiny stub `libmpi_cxx.so.40` — compiled
+/// from C++ declarations of those members (`mpi_cxx_stub.cpp`, see `build.rs`)
+/// and embedded — that merely *defines* the symbols so the dynamic loader can
+/// resolve torch.
 ///
-/// Returns `None` (no-op) when a real `libmpi_cxx.so*` is already present
-/// (OpenMPI 4.x), when no stub was embedded (no C toolchain at build time), or
+/// Returns `None` (no-op) when a real `libmpi_cxx.so.40` is already present
+/// (OpenMPI 4.x), when no stub was embedded (no C++ compiler at build time), or
 /// when the stub cannot be written. Otherwise it writes `libmpi_cxx.so.40` inside
 /// `compat_dir` and returns `compat_dir` for the caller to add to the loader
 /// path. The operation is idempotent and replaces a stale symlink left by older
 /// rocm-cli versions.
 #[cfg(target_os = "linux")]
 pub fn ensure_mpi_cxx_compat(compat_dir: &Path) -> Option<PathBuf> {
+    ensure_mpi_cxx_compat_with(compat_dir, LIBMPI_SCAN_DIRS, MPI_CXX_STUB)
+}
+
+/// [`ensure_mpi_cxx_compat`] with the directories searched for a real library
+/// and the stub bytes passed in, so tests can drive every branch.
+#[cfg(target_os = "linux")]
+fn ensure_mpi_cxx_compat_with<P: AsRef<Path>>(
+    compat_dir: &Path,
+    scan_dirs: &[P],
+    stub: &[u8],
+) -> Option<PathBuf> {
     // A real C++ bindings library is present (OpenMPI 4.x); nothing to shim.
-    if find_libmpi_cxx().is_some() {
+    if find_libmpi_cxx_in(scan_dirs).is_some() {
         return None;
     }
-    // No stub embedded (build host lacked a C compiler); cannot synthesize the
+    // No stub embedded (build host lacked a C++ compiler); cannot synthesize the
     // C++ bindings here.
-    if MPI_CXX_STUB.is_empty() {
+    if stub.is_empty() {
         return None;
     }
-    write_compat_file(compat_dir, "libmpi_cxx.so.40", MPI_CXX_STUB)
+    write_compat_file(compat_dir, MPI_CXX_SONAME, stub)
 }
 
 /// Non-Linux hosts never need the OpenMPI C++ bindings shim.
@@ -1224,17 +1249,163 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Every symbol the stub must define: the ones `libtorch_cpu.so` from the
+    /// ROCm torch wheel leaves undefined that the OpenMPI 5.x `libmpi.so` does
+    /// not provide. To regenerate, run `nm -D --undefined-only` on that
+    /// `libtorch_cpu.so` and keep the `_ZN3MPI*` and `ompi_*` names that
+    /// `nm -D --defined-only` on the host's `libmpi.so.40` does not list.
+    #[cfg(target_os = "linux")]
+    const EXPECTED_MPI_CXX_STUB_SYMBOLS: &[&str] = &[
+        "_ZN3MPI3Win4FreeEv",
+        "_ZN3MPI4CommC1Ev",
+        "_ZN3MPI4CommC2Ev",
+        "_ZN3MPI8Datatype4FreeEv",
+        "ompi_mpi_cxx_op_intercept",
+        "ompi_op_set_cxx_callback",
+    ];
+
+    /// The stub's exported (global, defined) dynamic symbols, its soname, and
+    /// its `NEEDED` entries.
+    #[cfg(target_os = "linux")]
+    fn read_stub_dynamic_info(
+        data: &[u8],
+    ) -> (
+        std::collections::BTreeSet<String>,
+        Option<String>,
+        Vec<String>,
+    ) {
+        use object::read::elf::{Dyn as _, ElfFile64};
+        use object::{Object as _, ObjectSymbol as _};
+
+        let file = ElfFile64::<object::Endianness>::parse(data).expect("stub is an ELF64 object");
+        let symbols = file
+            .dynamic_symbols()
+            .filter(|symbol| symbol.is_definition() && symbol.is_global())
+            .map(|symbol| symbol.name().expect("symbol name").to_owned())
+            .collect();
+
+        let endian = file.endian();
+        let sections = file.elf_section_table();
+        // `dynamic` returns the entries with the index of their string table.
+        let (entries, strings_index) = sections
+            .dynamic(endian, data)
+            .expect("dynamic section readable")
+            .expect("stub has a dynamic section");
+        let strings = sections
+            .strings(endian, data, strings_index)
+            .expect("dynamic string table");
+        let mut soname = None;
+        let mut needed = Vec::new();
+        for entry in entries {
+            let tag = entry.tag32(endian);
+            if tag != Some(object::elf::DT_SONAME) && tag != Some(object::elf::DT_NEEDED) {
+                continue;
+            }
+            let value = String::from_utf8(entry.string(endian, strings).expect("string").to_vec())
+                .expect("utf-8 dynamic string");
+            if tag == Some(object::elf::DT_SONAME) {
+                soname = Some(value);
+            } else {
+                needed.push(value);
+            }
+        }
+        (symbols, soname, needed)
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn embedded_mpi_cxx_stub_is_valid_elf_with_cxx_symbols() {
-        // The build script writes an empty stub (disabling the shim) when no C
-        // toolchain is available, so the binary can still be built. Only assert
-        // the embedded bytes are a valid ELF object when a stub was produced;
-        // skip otherwise so `cargo test` passes on hosts without a C compiler.
+    fn embedded_mpi_cxx_stub_exports_exactly_the_symbols_torch_needs() {
+        // The build script embeds an empty stub (disabling the shim) when there
+        // is no C++ compiler, so `cargo test` still runs on such a host. CI
+        // always has one, so an empty stub there is a build regression.
         if MPI_CXX_STUB.is_empty() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "the libmpi_cxx stub is empty: build.rs found no C++ compiler on CI"
+            );
+            eprintln!("SKIPPED: no C++ compiler at build time, so the libmpi_cxx stub is empty");
             return;
         }
-        assert_eq!(&MPI_CXX_STUB[..4], b"\x7fELF", "stub is not an ELF object");
+
+        let (symbols, soname, needed) = read_stub_dynamic_info(MPI_CXX_STUB);
+        let expected: std::collections::BTreeSet<String> = EXPECTED_MPI_CXX_STUB_SYMBOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(symbols, expected, "exported symbols of the libmpi_cxx stub");
+        assert_eq!(soname.as_deref(), Some(MPI_CXX_SONAME));
+        assert!(
+            needed.is_empty(),
+            "stub must not need other libraries: {needed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpi_cxx_compat_skips_stub_when_real_library_present() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let compat = tempfile::tempdir().unwrap();
+        std::fs::write(lib_dir.path().join("libmpi_cxx.so.40"), b"real").unwrap();
+
+        assert_eq!(
+            ensure_mpi_cxx_compat_with(compat.path(), &[lib_dir.path()], b"STUB"),
+            None
+        );
+        assert!(!compat.path().join("libmpi_cxx.so.40").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpi_cxx_compat_writes_stub_when_no_library_present() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lib_dir = tempfile::tempdir().unwrap();
+        let compat = tempfile::tempdir().unwrap();
+        let compat_dir = compat.path().join("compat");
+
+        assert_eq!(
+            ensure_mpi_cxx_compat_with(&compat_dir, &[lib_dir.path()], b"STUB"),
+            Some(compat_dir.clone())
+        );
+        let written = compat_dir.join("libmpi_cxx.so.40");
+        assert_eq!(std::fs::read(&written).unwrap(), b"STUB");
+        assert_eq!(
+            std::fs::metadata(&written).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpi_cxx_compat_writes_stub_when_only_other_sonames_present() {
+        // Neither an older soname nor the unversioned dev symlink satisfies
+        // torch's `NEEDED` entry for `libmpi_cxx.so.40`.
+        let lib_dir = tempfile::tempdir().unwrap();
+        let compat = tempfile::tempdir().unwrap();
+        std::fs::write(lib_dir.path().join("libmpi_cxx.so.20"), b"old").unwrap();
+        std::fs::write(lib_dir.path().join("libmpi_cxx.so"), b"dev").unwrap();
+
+        assert_eq!(
+            ensure_mpi_cxx_compat_with(compat.path(), &[lib_dir.path()], b"STUB"),
+            Some(compat.path().to_path_buf())
+        );
+        assert_eq!(
+            std::fs::read(compat.path().join("libmpi_cxx.so.40")).unwrap(),
+            b"STUB"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpi_cxx_compat_is_disabled_when_stub_is_empty() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let compat = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            ensure_mpi_cxx_compat_with(compat.path(), &[lib_dir.path()], b""),
+            None
+        );
+        assert!(!compat.path().join("libmpi_cxx.so.40").exists());
     }
 
     #[cfg(target_os = "linux")]
