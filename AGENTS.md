@@ -101,7 +101,8 @@ definitions when no existing scenario already covers it:
 - if a scenario for the behavior already exists, say in the PR text which `@id:` it is
   and that the change makes it pass — do not silently rely on it
 - if the scenario can only run on a gated lane (`@requires-gpu`, `@nightly`), say so in
-  the PR text and name the lane that will exercise it
+  the PR text and name the lane that will exercise it; moving an existing scenario off the
+  blocking mock `e2e` job onto such a lane is justified as §8 says
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
@@ -129,6 +130,21 @@ different files, so nothing links them by construction. Where the printed line c
 derived from the same value the branch is taken on — as `preapproved_install_line` in
 `apps/rocm/src/therock/consent.rs` derives it from the approval source — prefer that: a
 message computed from the decision cannot disagree with it.
+
+**A comment or doc line that states how the code behaves is checked against that code,
+and one that is the reason for a decision also names where the code makes it true.** A
+decision such as narrowing a test's scope, documenting a limitation, choosing a design, or
+dropping a guard often rests on one sentence: a reviewer who accepts the sentence accepts
+the decision, and no test reads a comment. Before pushing, open the code each claim
+describes and confirm it. Where the claim is the reason for a decision, also name the
+place as a file and a function, constant or test
+([runner.rs](crates/rocm-dash-daemon/src/runner.rs)'s `cycle_timestamp`), never as a line
+number, which goes stale with the next edit above it. Where the decision rests on timing
+or ordering, the claim names where the mechanism that enforces it is defined, not only
+that one exists. State an invariant rather than a count: "every engine crate" survives a
+new engine, where "the three engine crates" silently stops being true. When a review
+finding makes you rewrite such a sentence, check the replacement the same way: a narrower
+claim is harder to doubt, not more likely to be right.
 
 **A new test is shown to fail when the code it covers is broken.** Before pushing, break
 the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
@@ -237,6 +253,14 @@ Keep docs and behavior claims in sync while editing:
   every review-fix commit: it lists every user-visible change (including ones on other
   platforms), names the lane that exercises the new behavior, and states the reason when
   there is no scenario
+- hold the branch's commit messages to the same bar: pull requests here are squash-merged
+  with the branch's commit messages as the default squash body, so each one lands in public
+  history. Each describes what its own commit does, in words still true at the branch
+  head. A message whose words a later commit made misleading — a cross-reference to a
+  section, item or name that a later commit changed — is reworded before merge; a commit
+  whose whole subject a later commit removed is folded into that commit or dropped
+  instead. Either rewrites pushed commits, which needs a force-push, which needs
+  approval (§1)
 
 ## 6) rocm-cli Architecture Guardrails
 
@@ -407,6 +431,18 @@ coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when 
 below it. If a drop is legitimate, re-bless with `cargo xtask coverage --bless` and say in
 the commit why — do not re-bless to clear a red check.
 
+Moving a scenario off the blocking mock `e2e` job is a deletion too, in any change
+including CI plumbing, and no coverage floor catches it. A tag that makes an existing
+scenario skip there (`@nightly`, `@requires-gpu`; the tag table in
+[the e2e README](tests/e2e-cucumber/README.md) says what
+each tag resolves to) removes its pre-merge coverage as surely as deleting it, though the
+diff shows only a tag. Justify it as a deletion: the PR text names, for each direction the
+behavior could be broken in (for a flag, hardcoded on and hardcoded off), which blocking
+check still fails. A scenario that is the only pre-merge guard for a seam no unit test
+reaches says so in a comment beside it, as
+`@id:therock-next-09-wheel-devel-adds-the-toolchain` does; when such a scenario slows or
+destabilizes a neighbor, fix the neighbor at its own layer instead of moving the guard.
+
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
 - focused Rust test groups for touched modules
@@ -452,6 +488,17 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - before resuming review-feedback work on a PR you authored, first check for review comments with no reply yet (same `in_reply_to_id` cross-reference technique below)
 - automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
+- when reviewing a revision that answers review feedback, diff it whole against the revision you last reviewed, the same way the author does (**Review-fix commits** below), not only the lines your finding named: a remediation is written in a narrow window, gets the least scrutiny, and is where new defects arrive
+- when reviewing, treat a comment or doc line in the diff that states how the code behaves as a claim to check against that code (§3), not as context; one that is the reason for a decision (§3 says which) is checked before you approve, including that it names where the code makes it true
+- when reviewing, before marking an objection blocking because it rests on a timing, ordering, concurrency or "this cannot happen" argument, name the mechanism it assumes and where that is defined (file and symbol); an objection whose mechanism you cannot locate is posted as a question, not a blocking finding
+- when reviewing, read the commit messages as well as the diff: they become the squash commit's body on `main` (§5)
+
+**Review-fix commits** — a commit answering review feedback is reviewed by its author as a whole change:
+
+- diff it against the head the reviewer saw (the `commit.oid` of the review it answers, from `gh pr view <pr> --json reviews`, §1), not only the lines the finding named, and say in the reply whether it changes behavior outside the finding
+- once the base has moved into the branch since the review, by a rebase or by merging the base in, `git diff <reviewed-head>..HEAD` also shows everything the base gained. Fetch the PR's base branch (for a stacked PR, the branch it depends on, not `main`) and diff with `git range-diff origin/<base> <reviewed-head> HEAD` instead, reading in full each commit it marks new or changed. A commit it marks removed is either the base's old history, where the base was force-pushed, or a commit dropped from the branch since the review, so check which before setting one aside. `git range-diff` skips merge commits, so read a merge that resolved conflicts with `git show <merge>`
+- once a force-push has taken the reviewed head off the branch, a clone that never had it fetches it by its full SHA first, while the host still retains it (`git fetch origin <reviewed-head>`)
+- a review-fix commit does not widen what a documented user-facing option means or authorizes (a `--yes` that starts granting a second consent); where widening is needed, it is its own commit, described as such in the PR body, that changes the option's help text and docs together with its behavior
 
 **Stacked and dependent PRs:**
 
@@ -472,8 +519,9 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
-After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
-of sequence or a clippy lint cost more than running them first.
+After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6
+and §11's review-fix commit rules before pushing. Round-trips spent on a scenario number
+out of sequence or a clippy lint cost more than running them first.
 
 ## 13) Upstream Pre-flight Checklist
 
@@ -495,6 +543,10 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
+17. Comments and doc lines stating how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
+18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
+19. Any existing scenario moved off the blocking mock `e2e` job justified as a deletion — *§8*
+20. Every commit message describes its own commit in words still true at the branch head — *§5*
 
 ## 14) Related Internal Workflows
 
