@@ -697,27 +697,18 @@ fn restart_internal_managed_service_inner(
             rocm_core::ManagedChildLiveness::from_child(child),
         )
     };
-    #[cfg(windows)]
-    thread::sleep(Duration::from_millis(200));
     // The Unix branch's `try_wait()` equivalent. Windows has no `Child` here
     // (the restart spawns detached), so the dead-already test is the liveness
     // probe instead — but the verdict and the writes are the same, and without
     // this the crash waited out the whole 45s readiness timeout.
     #[cfg(windows)]
-    if !liveness.is_running() {
-        if settle_restart_startup_death(paths, &record, &stopped_record)? {
-            bail!(
-                "managed engine for service `{}` was stopped while it was restarting",
-                record.service_id
-            );
-        }
-        // Empty status clause: the liveness probe has a yes/no answer, not an
-        // exit code, the same way `spawn.rs`'s Windows branch does it.
-        bail!(
-            "{}",
-            managed_engine_startup_failure_detail("", &record.log_path)
-        );
-    }
+    ensure_restarted_child_survives_startup(
+        &record.service_id,
+        &record.log_path,
+        || thread::sleep(Duration::from_millis(200)),
+        || liveness.is_running(),
+        || settle_restart_startup_death(paths, &record, &stopped_record),
+    )?;
     // Recorded before the readiness wait, so a stop issued during it finds the
     // new child rather than the processes already stopped.
     let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
@@ -753,6 +744,45 @@ fn restart_internal_managed_service_inner(
         || liveness.is_running(),
         stop_watch.stop_was_requested(),
     )
+}
+
+/// Windows restart-liveness check: wait out the startup window, then — when the
+/// restarted child is already gone — report it as the stop that asked for it, or
+/// as a startup failure carrying the service log. The wait, the liveness probe
+/// and the stop-vs-crash verdict are all injected, so a unit test drives every
+/// branch on every platform, including the Windows lane that actually calls it.
+///
+/// Mirrors `service_launch::spawn`'s `ensure_spawned_child_survives_startup` on
+/// the launch path, deliberately and for the same reason: the call site is
+/// `#[cfg(windows)]`, so without the extraction the control flow around
+/// `settle_restart_startup_death` — detecting the dead child at all, and
+/// choosing between the two bails — would be exercised by nothing but a real
+/// Windows CI restart, while the verdict function itself is already covered
+/// everywhere. Compiled on every platform (not `#[cfg(windows)]`) so the Linux
+/// lane runs those tests; only the call above is gated.
+///
+/// # Errors
+/// Fails when `is_running` reports the child dead — naming the stop when
+/// `settle_death` reports one, otherwise the startup-failure detail — or when
+/// `settle_death` itself cannot read or update the manifest.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ensure_restarted_child_survives_startup(
+    service_id: &str,
+    log_path: &std::path::Path,
+    settle: impl FnOnce(),
+    is_running: impl FnOnce() -> bool,
+    settle_death: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    settle();
+    if is_running() {
+        return Ok(());
+    }
+    if settle_death()? {
+        bail!("managed engine for service `{service_id}` was stopped while it was restarting");
+    }
+    // Empty status clause: the liveness probe has a yes/no answer, not an exit
+    // code, the same way `spawn.rs`'s Windows branch does it.
+    bail!("{}", managed_engine_startup_failure_detail("", log_path))
 }
 
 /// Whether a restarted child that is already gone was *asked* to go, recording
@@ -2433,6 +2463,88 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// The *control flow* around the verdict above, which the verdict's own
+    /// test does not reach: noticing that the restarted child is already gone,
+    /// and rendering the Windows-specific empty-status failure from the service
+    /// log. Its call site is `#[cfg(windows)]`, so before the extraction only a
+    /// real Windows CI restart ran it.
+    ///
+    /// Same shape as `spawn.rs`'s
+    /// `a_child_that_exited_during_the_startup_window_is_reported_with_its_log`,
+    /// the sibling on the launch path, including the alive arm at the end: the
+    /// verdict must not even be consulted for a child that is still running,
+    /// since `settle_restart_startup_death` writes `failed` to both files.
+    #[test]
+    fn a_restarted_child_lost_in_the_startup_window_is_reported_with_its_log() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("restart.log");
+        fs::write(&log, "boom: restarted engine could not start\n")?;
+        let settled = std::cell::Cell::new(false);
+        let error = ensure_restarted_child_survives_startup(
+            "svc-restart-liveness",
+            &log,
+            || settled.set(true),
+            || {
+                assert!(settled.get(), "liveness must be probed after the wait");
+                false
+            },
+            || Ok(false),
+        )
+        .expect_err("a dead restarted child must fail the restart");
+        assert!(settled.get(), "the startup window must elapse first");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("boom"),
+            "the failure must quote the engine's own log tail: {rendered}"
+        );
+        assert!(
+            !rendered.contains("was stopped while it was restarting"),
+            "a crash must not be reported as a deliberate stop: {rendered}"
+        );
+
+        ensure_restarted_child_survives_startup(
+            "svc-restart-liveness",
+            &log,
+            || {},
+            || true,
+            || panic!("a live child must never reach the death verdict"),
+        )?;
+        Ok(())
+    }
+
+    /// The control for the test above: the same dead child, with the verdict
+    /// reporting that a stop asked for it, must be named a stop and must not
+    /// render the crash text. Without this arm, "always bail with the startup
+    /// failure" would still pass the test above.
+    #[test]
+    fn a_restarted_child_the_verdict_calls_a_stop_is_not_reported_as_a_crash() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("restart.log");
+        fs::write(&log, "boom: restarted engine could not start\n")?;
+        let error = ensure_restarted_child_survives_startup(
+            "svc-restart-liveness-stop",
+            &log,
+            || {},
+            || false,
+            || Ok(true),
+        )
+        .expect_err("a stopped restart must still fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("`svc-restart-liveness-stop` was stopped while it was restarting"),
+            "a stop that landed in the window must be named as a stop: {rendered}"
+        );
+        assert!(
+            !rendered.contains("exited immediately"),
+            "a deliberate stop must not be rendered as a startup crash: {rendered}"
+        );
+        assert!(
+            !rendered.contains("boom"),
+            "nor may it quote the log tail as if it were a cause: {rendered}"
+        );
         Ok(())
     }
 

@@ -3957,7 +3957,7 @@ the no-GPU pre-flight and the self-managed-engine install that would otherwise
 refuse these on that lane.
 
 To run them on a host that *does* have a GPU, mask it so the harness resolves to
-its no-GPU premise — `HIP_VISIBLE_DEVICES="" cargo xtask e2e -- -n "serve-5[56]"`
+its no-GPU premise — `HIP_VISIBLE_DEVICES="" cargo xtask e2e -- -n "serve-5[78]"`
 — otherwise `@requires-no-gpu` skips them.
 
 ## Windows Tool Notes
