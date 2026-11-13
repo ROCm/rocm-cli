@@ -6,7 +6,7 @@
 
 use super::ExamineSummary;
 use super::os_facts::format_gib_value;
-use crate::gfx_target::{GpuSupportLevel, gpu_support_level};
+use crate::gfx_target::{GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level};
 
 impl ExamineSummary {
     /// The `rocm_support` line of the examine text.
@@ -39,9 +39,8 @@ impl ExamineSummary {
             // fallback below is unreachable; it keeps the arm total without a
             // panic path.
             GpuSupportLevel::VulkanOnly => format!(
-                "  rocm_support: GPU detected ({}) but not supported by ROCm; \
-                 the Vulkan backend can still be used - serve on it with \
-                 `rocm serve <model> --engine lemonade`\n",
+                "  rocm_support: GPU detected ({}) but {VULKAN_ONLY_SUPPORT_CLAIM} - \
+                 serve on it with `rocm serve <model> --engine lemonade`\n",
                 detected.unwrap_or_default()
             ),
             // The covering family is the fact; it is already printed on its own

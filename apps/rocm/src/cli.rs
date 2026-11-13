@@ -63,14 +63,14 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     ///
-    /// A `rocm_support` line is printed on **every** host, at one of three
+    /// A `rocm_support` line is printed on every host, at one of three
     /// levels: ROCm/HIP-supported, Vulkan-only, or unknown. Vulkan-only covers
     /// a GPU that is recognized but has no ROCm build at all (`gfx90c`, the
     /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs), which still
-    /// works through Lemonade's Vulkan backend. Unknown covers both a GPU
-    /// nothing detected and a target this build's catalog does not recognize:
-    /// those are detection gaps, not a verdict on the hardware, which is why
-    /// an empty `compatible_therock_family` does not read as a failed probe.
+    /// works through Lemonade's Vulkan backend. Unknown covers both no GPU
+    /// detected and a target this build's catalog does not recognize: those
+    /// are detection gaps, not a verdict on the hardware, which is why an
+    /// empty `compatible_therock_family` does not read as a failed probe.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -2679,5 +2679,69 @@ mod tests {
         }
 
         assert_ascii_help(&mut Cli::command(), "rocm");
+    }
+
+    /// Sibling of `every_help_text_in_the_command_tree_is_ascii`, for the same
+    /// reason one level down: clap renders a doc comment verbatim, with no
+    /// markdown processing anywhere in its pipeline, so `**every**` written in
+    /// a doc comment reaches the user's terminal as literal asterisks. Review
+    /// on #678 caught exactly that on `Examine`, which the ASCII test could
+    /// not see because `*` and `_` are ASCII.
+    ///
+    /// Only `**` and `__` are rejected, and only those: they have no honest
+    /// use in plain help text. A single `*` does (`gfx110*`, a glob in an
+    /// example), and backticks are the repo's deliberate house style for
+    /// quoting commands in help, so neither is banned here.
+    ///
+    /// The hidden `__engine-*` subcommands are a real `__` in rendered help —
+    /// their own usage lines print their names — so each command's internal
+    /// names are removed before the search rather than the check being
+    /// dropped. The list is read off the command tree, not hard-coded, so a
+    /// new hidden command does not make this fail spuriously.
+    #[test]
+    fn no_help_text_in_the_command_tree_contains_markdown_emphasis() {
+        fn assert_no_markdown_emphasis(cmd: &mut clap::Command, path: &str) {
+            let mut internal: Vec<String> = cmd
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .filter(|name| name.starts_with("__"))
+                .collect();
+            if cmd.get_name().starts_with("__") {
+                internal.push(cmd.get_name().to_owned());
+            }
+
+            // Both renderings, for the same reason as the ASCII test: `-h`
+            // truncates at the first paragraph, so emphasis in a later one is
+            // only visible in the long form.
+            for rendered in [cmd.render_help(), cmd.render_long_help()] {
+                let mut rendered = rendered.to_string();
+                for name in &internal {
+                    rendered = rendered.replace(name.as_str(), "");
+                }
+                for marker in ["**", "__"] {
+                    assert!(
+                        !rendered.contains(marker),
+                        "`{path} --help` must not contain markdown emphasis (`{marker}`); \
+                         clap renders doc comments verbatim, so the user sees the markup \
+                         itself: {rendered}"
+                    );
+                }
+            }
+            // Collect first: `find_subcommand_mut` needs a mutable borrow that
+            // cannot overlap the iterator borrowing `cmd`.
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .collect();
+            for name in names {
+                let child_path = format!("{path} {name}");
+                let child = cmd
+                    .find_subcommand_mut(&name)
+                    .expect("subcommand name was just enumerated from this command");
+                assert_no_markdown_emphasis(child, &child_path);
+            }
+        }
+
+        assert_no_markdown_emphasis(&mut Cli::command(), "rocm");
     }
 }
