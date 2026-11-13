@@ -888,6 +888,25 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
+  # ROCMAI-863: a Hugging Face repo named without a quantization variant has no
+  # GGUF file to serve, but serving started an engine for it anyway and left the
+  # objection to the background process — where, on Windows, nothing the user can
+  # see ever reports it: an empty log, a success exit, and a server recorded as
+  # stopped. The refusal now comes before anything starts. It also names no
+  # quantization of its own: nothing on this path reads the repository's files, so
+  # a suggested label is a guess, and following a guess fails a second time on a
+  # repo that ships no GGUF at all. @requires-gpu because a host with no usable
+  # GPU is turned away earlier, for that reason instead, and never reaches this
+  # one. No @requires-os deliberately — Windows is the lane the failure was silent
+  # on, so it is the one most worth watching.
+  @id:serve-missing-gguf-variant-refused @requires-gpu @requires-engine:lemonade
+  Scenario: serve-56 - Serving a Hugging Face repo with no quantization variant is refused
+    When the user serves a Hugging Face repo with no quantization variant on Lemonade
+    Then serving is refused before any engine starts
+    And the user is told the model needs an explicit GGUF variant
+    And no quantization is suggested for a repo the CLI has not inspected
+    And no local server was recorded
+
   # A managed engine is spawned detached, so if it dies on the way up there is no
   # terminal for it to report to: the child's own service log is the only account
   # of why. The launch fails naming that log, and leaves its record `stopped`
@@ -908,7 +927,7 @@ Feature: Model serving
   # hooks, so it cannot run this; the Windows watch itself is covered there by
   # `rocm-core`'s `watched_detached_spawn_*` unit tests.
   @id:serve-managed-engine-dies-at-startup
-  Scenario: serve-56 - An engine that dies at startup fails the serve and names its log
+  Scenario: serve-57 - An engine that dies at startup fails the serve and names its log
     Given the managed engine dies during startup
     When the user serves a model with Lemonade
     Then serving fails and names the engine's own log

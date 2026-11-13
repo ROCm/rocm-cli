@@ -2056,7 +2056,7 @@ supervisor identities, `running`) over the record on disk, and a failed launch's
 cleanup leaves the endpoint key of a record a restart took over.
 The `watched_detached_spawn_*` tests run on the required Windows lane.
 
-`serve-56` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
+`serve-57` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
 `e2e-test-hooks` build scripts the managed engine's death (the spawned `rocm`
 gets an argument it rejects), and the scenario checks that the serve fails naming
 the engine's own log, that the record left on disk reads `stopped` and names no
@@ -2066,7 +2066,7 @@ self-hosted Windows lane; the required `windows-build-and-test` lane builds
 without the hooks and does not. Run it locally with:
 
 ```bash
-cargo xtask e2e -- -n "serve-56 "
+cargo xtask e2e -- -n "serve-57 "
 ```
 
 Serve resolver focused tests:
