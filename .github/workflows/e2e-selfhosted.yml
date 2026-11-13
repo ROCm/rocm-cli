@@ -263,9 +263,22 @@ jobs:
       # workflow sets this unconditionally; here it lets a scoped dispatch confirm
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # On a pull request and in the merge queue (which this lane skips; the
+      # lanes that run there share this expression), of the scenarios that need
+      # a real GPU only the `@gpu-smoke` canaries (and, in the queue, the
+      # @merge-queue serves) run. Every GPU scenario that only needs the CLI to
+      # see a GPU runs on a simulated machine on the hosted `E2E tests` lane. Off
+      # those events the narrowing does not apply (the @nightly and @merge-queue
+      # gates still do). Keeps the GPU lanes, which set merge latency, short.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # A real GPU lane: run the `@requires-real-gpu` scenarios that a simulated
       # host cannot stand in for. See HardwareMode in src/expectation.rs.
       E2E_HARDWARE: real
+      # ...and ONLY those, on every event: everything that needs no GPU runs on
+      # the GitHub-hosted Linux and Windows lanes in ci.yml (`E2E tests`,
+      # `E2E tests (Windows)`), so a GPU runner's time is not spent on it. See
+      # restrict_to_lane in src/expectation.rs.
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -528,6 +541,7 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -687,8 +701,11 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -992,9 +1009,12 @@ jobs:
   # WSL2 works on these hosts; pin `--id Microsoft.WSL` in the install step so
   # a failed install can't report green; expect ~5min/job for distro install
   # since distros are unregistered between jobs by design; static TA runners
-  # are not needed for WSL coverage. Same suite as every other platform —
-  # scenarios the host cannot satisfy resolve to skip from the capability
-  # probe, so nothing is filtered out here.
+  # are not needed for WSL coverage. Unlike the GPU lanes, it sets no
+  # E2E_GPU_ONLY: scenarios the host cannot satisfy resolve to skip from the
+  # capability probe, the usual tag gates (@nightly, @merge-queue, @lifecycle,
+  # @requires-docker) apply as on every lane, and on a pull request and in the
+  # merge queue its real-GPU scenarios narrow to the smoke set
+  # (E2E_GPU_SMOKE_ONLY). Nothing is filtered out by hand.
   e2e-wsl:
     name: E2E tests (Strix Halo, WSL2, ${{ matrix.sdk_version }})
     # 120min: like the native pool lanes, every job here is cold (fresh distro,
@@ -1042,6 +1062,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
       # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
@@ -1489,7 +1511,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:E2E_HARDWARE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:GITHUB_EVENT_INPUTS_NAME_FILTER'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:E2E_GPU_SMOKE_ONLY:E2E_HARDWARE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:GITHUB_EVENT_INPUTS_NAME_FILTER'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1648,6 +1670,7 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

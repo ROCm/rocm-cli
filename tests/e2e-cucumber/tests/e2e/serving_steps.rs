@@ -994,8 +994,10 @@ async fn setup_background_model(world: &mut E2eWorld) {
     // never assert on real generation — only that a served model answers. So it
     // doesn't need a real GPU serve: on a real-hardware run with an AMD GPU we
     // still exercise the real `rocm serve --managed` path (extra real coverage
-    // where hardware exists), but everywhere else — a no-GPU host, or a simulated
-    // run on a GPU box — we back it with the in-process MockServer + a planted
+    // on the nightly GPU lanes, and on `e2e-wsl` when its GPU probe passes; the
+    // per-PR and push GPU lanes set E2E_GPU_ONLY and skip these untagged
+    // scenarios), but everywhere else — a no-GPU host, or a simulated run on a
+    // GPU box — we back it with the in-process MockServer + a planted
     // managed-service record. This lets the scenarios run on the GitHub-hosted
     // mock lane every PR, with no coverage loss. Real inference stays covered by
     // the `@requires-real-gpu` serve-*-inference scenarios.

@@ -1556,24 +1556,127 @@ jobs:
         );
     }
 
+    /// On a pull request and in the merge queue every self-hosted lane that runs
+    /// there narrows its real-GPU scenarios to the `@gpu-smoke` canaries, while
+    /// the heavy `@merge-queue` serves stay opted in for the merge queue alone.
+    /// Pushes, dispatches and nightly set neither, so no narrowing applies there.
     #[test]
-    fn self_hosted_wsl_enables_merge_queue_scenarios_only_for_merge_group() {
+    fn self_hosted_gpu_lanes_run_only_the_gpu_smoke_test_on_prs_and_in_the_merge_queue() {
+        const SMOKE_ONLY: &str = "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}";
+        const QUEUE_ONLY: &str = "${{ github.event_name == 'merge_group' && '1' || '' }}";
         let sh = read_workflow("e2e-selfhosted.yml");
-        let wsl = job_block(&sh, "e2e-wsl");
-        let env = job_mapping(wsl, "env");
-        assert_eq!(
-            env.get("E2E_MERGE_QUEUE").map(String::as_str),
-            Some("${{ github.event_name == 'merge_group' && '1' || '' }}"),
-            "e2e-wsl's job-level env must opt into @merge-queue scenarios for merge_group only"
-        );
+        // (lane, runs on pull_request, runs on merge_group). MI300X is skipped in
+        // the merge queue (`mi300x_lane_is_skipped_in_the_merge_queue`); Strix
+        // Ubuntu and W7900 run on neither event, only on push, dispatch and
+        // nightly. The gate below is checked against each job's own `if:` so
+        // this table cannot drift from it; the gates themselves are pinned by
+        // `mi300x_lane_is_skipped_in_the_merge_queue` (in full for Strix Ubuntu
+        // and W7900).
+        for (lane, on_pr, in_queue) in [
+            ("e2e-gpu", true, false),
+            ("e2e-gpu-strix-ubuntu", false, false),
+            ("e2e-gpu-strix-windows", true, true),
+            ("e2e-wsl", true, true),
+            ("e2e-gpu-w7900", false, false),
+        ] {
+            let block = job_block(&sh, lane);
+            let gate = {
+                let start = block
+                    .find("    if: >-\n")
+                    .unwrap_or_else(|| panic!("`{lane}` has a folded `if:` gate"));
+                normalized_whitespace(
+                    &block[start..]
+                        .lines()
+                        .skip(1)
+                        .take_while(|line| indent_of(line) > 4)
+                        .map(strip_comment)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            };
+            assert_eq!(
+                !gate.contains("github.event_name != 'pull_request'"),
+                on_pr,
+                "{lane}: the table says it runs on pull_request={on_pr}, its `if:` disagrees"
+            );
+            assert_eq!(
+                !gate.contains("github.event_name != 'merge_group'"),
+                in_queue,
+                "{lane}: the table says it runs on merge_group={in_queue}, its `if:` disagrees"
+            );
+            let env = job_mapping(block, "env");
+            // A lane that never runs on either event would only ever see the
+            // smoke switch unset; carrying it there reads as if it did.
+            assert_eq!(
+                env.get("E2E_GPU_SMOKE_ONLY").map(String::as_str),
+                (on_pr || in_queue).then_some(SMOKE_ONLY),
+                "{lane} must narrow its real-GPU scenarios to the smoke test on pull \
+                 requests and in the merge queue, and nowhere else"
+            );
+            assert_eq!(
+                env.get("E2E_MERGE_QUEUE").map(String::as_str),
+                in_queue.then_some(QUEUE_ONLY),
+                "{lane} must opt into the @merge-queue serves for merge_group only"
+            );
+            // A GPU lane leaves everything that needs no GPU to the hosted Linux
+            // and Windows lanes. The WSL lane's GPU access is advisory and
+            // probed per run, so it is the one self-hosted lane that must keep
+            // running those.
+            let gpu_only = env.get("E2E_GPU_ONLY").map(String::as_str);
+            if lane == "e2e-wsl" {
+                assert_eq!(
+                    gpu_only, None,
+                    "e2e-wsl's GPU is advisory, so it must keep running the non-GPU suite"
+                );
+            } else {
+                assert_eq!(
+                    gpu_only,
+                    Some("1"),
+                    "{lane} must run only its GPU scenarios"
+                );
+            }
+        }
 
         let nightly = read_workflow("nightly.yml");
         let nightly_wsl = job_block(&nightly, "e2e-wsl-nightly");
         let nightly_env = job_mapping(nightly_wsl, "env");
-        assert!(
-            !nightly_env.contains_key("E2E_MERGE_QUEUE"),
-            "the nightly WSL job cannot receive merge_group events and must not opt into @merge-queue scenarios"
-        );
+        for key in ["E2E_MERGE_QUEUE", "E2E_GPU_SMOKE_ONLY"] {
+            assert!(
+                !nightly_env.contains_key(key),
+                "the nightly WSL job takes no narrowing switch and must not set {key}"
+            );
+        }
+    }
+
+    /// The WSL lane runs the suite inside the distro, which sees only the
+    /// variables WSLENV names. One left out there is silently unset: dropping
+    /// `E2E_GPU_SMOKE_ONLY` would run the full GPU suite on every pull request,
+    /// dropping `E2E_HARDWARE` would skip every real-GPU scenario, and neither
+    /// would ever turn the lane red.
+    #[test]
+    fn wsl_lanes_forward_every_e2e_variable_into_the_distro() {
+        for (workflow, job) in [
+            ("e2e-selfhosted.yml", "e2e-wsl"),
+            ("nightly.yml", "e2e-wsl-nightly"),
+        ] {
+            let text = read_workflow(workflow);
+            let block = job_block(&text, job);
+            let forwarded: Vec<&str> = block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("$env:WSLENV = '"))
+                .and_then(|rest| rest.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("{workflow} job {job} sets no WSLENV"))
+                .split(':')
+                .collect();
+            for key in job_mapping(block, "env").keys() {
+                if key.starts_with("E2E_") {
+                    assert!(
+                        forwarded.contains(&key.as_str()),
+                        "{workflow} job {job} sets {key} but does not forward it through WSLENV"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5402,10 +5505,11 @@ fi
             "the E2E README must name every nightly self-hosted lane, in workflow order"
         );
 
-        // The README's CI job table is the per-PR view: the blocking mock job
-        // from ci.yml, then one row per self-hosted lane. Only the self-hosted
-        // rows are derivable, so the mock row is matched by workflow and the
-        // rest are compared against e2e-selfhosted.yml.
+        // The README's CI job table is the per-PR view: the two GitHub-hosted
+        // jobs from ci.yml (the blocking Linux mock job and the Windows one),
+        // then one row per self-hosted lane. Only the self-hosted rows are
+        // derivable, so the hosted rows are matched by workflow and the rest
+        // are compared against e2e-selfhosted.yml.
         let readme_rows = markdown_table_rows(&readme, "| Job | Workflow | Platform | Blocking |");
         let (mock_rows, self_hosted_rows): (Vec<_>, Vec<_>) = readme_rows
             .into_iter()
@@ -5415,8 +5519,8 @@ fi
                 .iter()
                 .map(|row| row[0].clone())
                 .collect::<Vec<_>>(),
-            vec!["`e2e`".to_owned()],
-            "the README CI job table must carry exactly one blocking mock row"
+            vec!["`e2e`".to_owned(), "`e2e-windows`".to_owned()],
+            "the README CI job table must carry exactly the two hosted E2E rows"
         );
         assert_eq!(
             self_hosted_rows
@@ -6046,8 +6150,10 @@ fi
 
     /// Jobs that are NOT part of the Windows build-and-test lane even though they
     /// are not on a Linux runner: each is a check of its own, so the aggregator
-    /// does not (and must not have to) wait on it.
-    const JOBS_OUTSIDE_THE_WINDOWS_LANE: &[&str] = &["powershell-lint"];
+    /// does not (and must not have to) wait on it. `e2e-windows` (`E2E tests
+    /// (Windows)`) is advisory until it has a green record, and is then made a
+    /// required check under its own name, not through the aggregator.
+    const JOBS_OUTSIDE_THE_WINDOWS_LANE: &[&str] = &["powershell-lint", "e2e-windows"];
 
     /// Every job in the Windows lane, other than the `windows-build-and-test`
     /// aggregator: any job not shown to run on `ubuntu-*` runners only, bar the

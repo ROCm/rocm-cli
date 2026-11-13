@@ -122,6 +122,7 @@ separate tier flag or tag filter to maintain.
 | Job | Workflow | Platform | Runner labels |
 |---|---|---|---|
 | `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` |
+| `e2e-windows` | `ci.yml` | Mock (no GPU) on Windows | GitHub-hosted `windows-latest` |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
@@ -191,12 +192,23 @@ resolve to skip here, and known bugs resolve to xfail from
 every scenario that plants a simulated machine (a WSL2 distribution, a
 bare-metal host, several Instinct GPUs; see [testing.md](testing.md)), so those
 premises no longer need the lane whose hardware they describe.
+`e2e-windows` runs the same suite on GitHub-hosted Windows, the platform where
+the non-GPU scenarios meet the Windows probes and paths; it is advisory until
+it has a record of being green.
 
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
-`e2e-wsl`, and `e2e-gpu-w7900`) run on AMD GPU systems, so they
-exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
-scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
-described below.
+`e2e-wsl`, and `e2e-gpu-w7900`) run on AMD GPU systems. All
+but `e2e-wsl` run ONLY the scenarios that need a real GPU (`E2E_GPU_ONLY=1`): live serving, SDK installs,
+and detection on the real machine. Everything else runs on the two hosted jobs
+above, so a GPU runner's time is not spent on it. On a pull request and in the
+merge queue, the lanes that run there narrow their real-GPU scenarios further
+to the `@gpu-smoke` canaries (plus, in the queue, the `@merge-queue` serves).
+Off those events the narrowing does not apply, and a lane takes every GPU
+scenario its other gates allow (`@nightly` scenarios still need
+`E2E_INCLUDE_NIGHTLY`, `@merge-queue` serves `E2E_MERGE_QUEUE`). `e2e-wsl` sets no `E2E_GPU_ONLY`, so it runs the whole non-GPU
+suite inside a real WSL2 distribution. GPU access in the WSL lane is advisory
+and probed per run, as described below; where it is unavailable, its real-GPU
+scenarios resolve to skip.
 
 `e2e-wsl` runs on the DevLab Dispatch pool. Its WSL2/Ubuntu-24.04 distro is
 built fresh inside every job (see above), so there is nothing of its own for
@@ -205,9 +217,12 @@ GPU from stray E2E processes` step, retained from when that lane ran on a
 static host rather than added for anything specific to the pool; both lanes
 now pin the same `devlab-dispatch` label, so whether that step still earns
 its place there is a separate, open question, not something this paragraph
-answers. Beyond that, `e2e-wsl` otherwise mirrors the Linux lane: GPU
-preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
-with no hand filtering. It covers WSL host detection, the
+answers. Beyond that, `e2e-wsl` follows the Linux GPU lane's steps: GPU
+preflight, toolchain bootstrap, shared-runtime pre-warm, then the suite.
+Unlike that lane it sets no `E2E_GPU_ONLY`, so it runs every scenario the host
+can satisfy and the usual tag gates (`@nightly`, `@merge-queue`, `@lifecycle`,
+`@requires-docker`) allow, smoke narrowing on a pull request and in the queue
+apart, with no hand filtering. It covers WSL host detection, the
 Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
 machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
 what the lane is proving out: where it is unavailable the capability probe
@@ -334,7 +349,7 @@ The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
 `e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
 `e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`,
 `e2e-gpu-w7900-n-1-report`, `e2e-gpu-w7900-n-2-report`,
-`e2e-gpu-w7900-report`, `e2e-report`) in `ci.yml` and
+`e2e-gpu-w7900-report`, `e2e-report`, `e2e-windows-report`) in `ci.yml` and
 `e2e-selfhosted.yml`, because the report derives each platform's name and OS
 from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
 of the per-PR `sdk_version` matrix (below, under "Triggers"); a `current`-leg

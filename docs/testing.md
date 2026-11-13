@@ -797,6 +797,19 @@ names it on any other line. To run them locally on a GPU host:
 E2E_HARDWARE=real cargo xtask e2e
 ```
 
+The self-hosted GPU lanes run only the scenarios that need their GPU
+(`E2E_GPU_ONLY=1`); everything else runs on the GitHub-hosted `E2E tests`
+(Linux) and `E2E tests (Windows)` jobs, and inside a real WSL2 distribution on
+the WSL lane. On a pull request and in the merge queue the lanes that run
+there, the WSL lane included, narrow their real-GPU scenarios further, to the
+cheap per-engine `@gpu-smoke` canaries (and, in the queue, the
+`@merge-queue` serves) with `E2E_GPU_SMOKE_ONLY=1`. Like `E2E_HARDWARE`, both
+switches abort the run on a value they do not recognise (anything but `1`,
+`0`, empty or unset). Off those events the
+narrowing does not apply, and a lane takes every GPU scenario its other gates
+allow (`@nightly` scenarios still need `E2E_INCLUDE_NIGHTLY`, `@merge-queue`
+serves `E2E_MERGE_QUEUE`).
+
 A scenario describes its machine with a Given step — `a machine with an AMD
 Instinct GPU`, `a machine with two AMD Instinct GPUs`, `a machine with eight AMD
 Instinct GPUs`, `a bare-metal Linux
@@ -3175,10 +3188,13 @@ The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 It carries `@requires-real-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
-the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
+the vLLM half falls to the Instinct lane. It does not run on a pull request:
+there the GPU lanes that run at all
 ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
-path filter matches) but none of their check names is a required status check,
-so the two unit tests above are the blocking per-PR coverage. The scenario
+path filter matches) narrow to the `@gpu-smoke` canaries, and none of their
+check names is a required status check either, so the two unit tests above are
+the blocking per-PR coverage; the scenario itself runs on pushes, dispatches
+and nightly. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
 unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
 their known serve failure there has not been observed, and a row claiming a
