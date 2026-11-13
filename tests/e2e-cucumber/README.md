@@ -200,7 +200,7 @@ table above as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-strix`,
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
 grid. R9700, MI350P and W7900 no longer have a self-hosted nightly lane in
 `nightly.yml`: they run on the queue ([nightly-on-the-queue.md](../../docs/nightly-on-the-queue.md)),
-whose results are not in that grid. The shared large-model scenario follows each lane's serve engine: it
+and the nightly report adds the queue's lanes to that grid. The shared large-model scenario follows each lane's serve engine: it
 serves `Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P),
 and the `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint (hardware-verified
 on Strix Halo) through Lemonade on every other lane (Strix Halo, R9700, W7900).

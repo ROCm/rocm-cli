@@ -28,10 +28,10 @@ The lane set is whatever GPU models the queue has. The 11-13 run
 the only scheduled coverage of that hardware, since `e2e-selfhosted.yml` no
 longer has a W7900 lane.
 
-**The remaining gap is native Windows and WSL.** The queue runs Linux pods, so
-the native Windows and WSL lanes stay on their dedicated runners, in `nightly.yml`
-and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml); nothing
-here replaces them. Which checks are required before merging is a repository
+**The remaining gap is Strix Halo.** The queue has no Strix lane and runs Linux
+pods, so the Strix Halo nightlies (Ubuntu, Windows and WSL) stay on the shared Strix pool,
+in `nightly.yml` and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml);
+nothing here replaces them. Which checks are required before merging is a repository
 setting, outside this page.
 
 This page is the **contract** between this repository and the queue side: what
@@ -140,8 +140,10 @@ self-hosted nightly jobs were removed from `nightly.yml`. The MI300X nightly
 job is still there, and the queue's `mi300x` lane is an additional signal to it.
 The lanes write only into the queue artifact, and the
 `e2e-gpu-<channel>-report` artifacts that `nightly.yml`'s consolidated report
-reads are not produced from them, so the consolidated report and the support
-matrix no longer have rows for R9700, MI350P or W7900 Linux.
+reads are not produced from them. The report fetches the queue's artifact
+itself instead, so the support matrix, the `E2E-Support-Matrix` and
+`Release-Readiness` wiki pages and the release-readiness verdict keep every
+GPU the queue tests: see [The support matrix and the wiki](#the-support-matrix-and-the-wiki).
 
 ## Output
 
@@ -194,6 +196,71 @@ that line is what counts: a blocking lane without a result fails the run.
 **incomplete** and **missing** fail the run because a blocking lane without a
 result is not a pass, but they point at queue capacity or infrastructure
 rather than at a regression.
+
+## The support matrix and the wiki
+
+`nightly.yml`'s `e2e-report-nightly` job builds the consolidated support
+matrix, which `publish-e2e-wiki` publishes as the `E2E-Support-Matrix` wiki page
+and `release-readiness-nightly` reads its GO/NO-GO verdict from (see
+[ci-hardware-testing.md](ci-hardware-testing.md)). It also reads the queue's
+lanes, from the queue's own results, so retiring a self-hosted nightly lane
+that the queue covers drops no GPU from either page, and a GPU that only the
+queue has (MI325X, MI350X, MI355X) is on them.
+
+- **Which run.** The newest `queue-run-results` artifact of a run on this
+  repository's `main` that finished, and started, in the last 24 hours,
+  whatever the run's conclusion was: a red lane fails the run, and its artifact
+  is still uploaded. The job finds the artifact by name, not through the
+  workflow that makes it, because no other workflow may name that one (see
+  below). The run also has to have tested `main`: a run started from `main` can
+  be asked to test another branch (the `branch` input), and the job log names
+  the branch it did. `queue-run.yml` starts at 02:17 UTC and the nightly
+  starts at 06:00 UTC, its report job after its GPU lanes have finished, so a
+  run that took under about three and a half hours is in the night's report. A
+  run that is still going, that started on an earlier day or that tested
+  another branch is not imported, and neither is a run published again by
+  `nightly-queue.yml`.
+- **Which lanes, and whether each blocks.** The artifact holds the lanes'
+  files and nothing else about the run, so the job reads the run's job log, whose
+  lane matrix is the only place the queue prints which lanes it ran and which of
+  them can fail the run (the `GATE` column). Only the tested branch and commit
+  and each lane's name, phase, exit status and gate are taken from it, each
+  checked against a strict pattern first. A lane whose name is not a plain
+  lowercase word (letters, digits and dashes, and not ending in `-advisory`,
+  `-release` or `-nightly`) is shown as `unnamed-1` and so on, as a blocking
+  lane with no result. Without the log nothing is imported.
+- **What is imported.** For each lane and channel,
+  `<lane>/<channel>/results/{report.json,platform.json,commands.jsonl}`, the
+  three files the report reads, as an artifact named
+  `e2e-queue-<lane>[-advisory]-<channel>-report`. The `lane.log`, the JUnit and
+  HTML output and the harness diagnostics are not copied, and nothing the
+  queue's scan withheld is brought back. The lane's `platform_slug` is replaced
+  by `queue-<lane>-<channel>`: the slug is the report's column identity, and
+  queue lanes of different models report the same one (an MI325X lane probes as
+  `mi300x`, an MI350X or MI355X lane as `mi350p`). The lane command therefore
+  has to keep writing those files to `/out/<channel>/results`, as
+  [`scripts/run-e2e-lane.sh`](../scripts/run-e2e-lane.sh) does.
+- **How it reads.** A queue row is labelled `MI325X (queue) Linux (release)`,
+  so it is not confused with the self-hosted MI300X lane, and a lane the queue
+  does not block on is `MI325X (queue, advisory) Linux (release)`. The page
+  opens with a `Queue lanes` table: one row per lane the queue ran, with its
+  gate, phase, exit status and the channels that reported.
+- **What counts towards the verdict.** The same as for the queue's own run. A
+  blocking lane's failures are in the `E2E` failure count. An advisory lane's are
+  shown but left out of it. A lane that came back with no result, or whose
+  channel is missing after it did not finish cleanly, is shown as `EMPTY` and
+  counts for a blocking lane, because a blocking lane without a result is not
+  a pass.
+- **When there is nothing to import.** No run in the window, a run of another
+  branch, an artifact or log that cannot be downloaded or an import that fails
+  never fails the nightly report: the page opens with a `Queue lanes` note
+  saying that no queue lanes are in it tonight and why, and the rest is built as
+  before. The verdict does not take that absence for a failure, so read the note
+  before reading a `GO`.
+
+What is public follows from the queue's own rules: the artifact is public and
+already scanned, only three of its files are used, and the log is the public job
+log.
 
 ## What the workflow requires
 

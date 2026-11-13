@@ -37,7 +37,7 @@ differs is when each runs and what hardware it covers.
 | Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
 |---|---|---|---|---|
 | Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below, except `e2e-gpu-strix-ubuntu`, which skips `pull_request` and `merge_group` (see below) | No — absent from the required-status-check list |
-| Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same self-hosted platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
+| Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | MI300X (`e2e-gpu-nightly`), Strix Halo Ubuntu (`e2e-gpu-nightly-strix`), Windows (`e2e-gpu-nightly-strix-windows`) and WSL2 (`e2e-wsl-nightly`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
 | Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The full self-hosted matrix: every platform in the table below, including `e2e-gpu-strix-ubuntu`, which skips `pull_request` and `merge_group` but runs on a `release/**` push | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
 
 R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125) and moved to
@@ -50,11 +50,14 @@ A pull request now runs on exactly one Linux GPU node and one Windows GPU
 pool: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
 the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu lane (`e2e-gpu-strix-ubuntu`) no longer starts on `pull_request` or in
-the merge queue; it keeps its `push`/dispatch triggers. There is no W7900 lane
-in `e2e-selfhosted.yml` any more: W7900 is covered only by the scheduled queue
-nightly's `w7900-dual` lane (below; advisory), not on `push`, `release/**` or
-dispatch. Its first run, the 11-13 queue nightly
-([run 43351651832](https://github.com/ROCm/rocm-cli/actions/runs/43351651832)), got capacity at once and finished `Done`, exit 0.
+the merge queue; it keeps its `push`/dispatch triggers and also runs nightly
+(`e2e-gpu-nightly-strix` on the same DevLab Dispatch pool labels). There is no
+W7900 lane in `e2e-selfhosted.yml` any more: W7900 is covered only by the
+scheduled queue nightly's `w7900-dual` lane (see
+[nightly-on-the-queue.md](nightly-on-the-queue.md)), not on `push`, `release/**`
+or dispatch. Its first run, the 11-13 queue nightly
+([run 43351651832](https://github.com/ROCm/rocm-cli/actions/runs/43351651832)),
+got capacity at once and passed (`Done`, exit 0).
 
 [`queue-run.yml`](../.github/workflows/queue-run.yml) runs GPU lanes on a
 shared GPU queue, one per GPU model, so no runner holds a GPU for the length
@@ -256,13 +259,26 @@ covers the mock platform;
 pull request runs only the MI300X and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
 platforms (it adds MI300X's `e2e-gpu-nightly` and the Strix Halo Ubuntu,
-Windows and WSL2 nightly lanes) with the `@nightly` scenarios included. The R9700, MI350P and
-W7900 nightlies run on the queue and are not in this report. Each joins its platforms'
+Windows and WSL2 nightly lanes) with the `@nightly` scenarios included. The
+R9700, MI350P and W7900 nightlies run on the queue, whose lanes the report reads
+separately (next paragraph). Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary. Since ROCMAI-429 the report keys each column by
 `(platform_slug, channel)` rather than platform alone, so `nightly.yml`'s
 release/nightly channel matrix renders two columns per platform instead of
 one channel's result silently overwriting the other.
+
+`e2e-report-nightly` also reads the shared queue's nightly (below), which runs
+R9700, MI350P, W7900 and the Instinct lanes of the queue's fleet. It fetches the
+`queue-run-results` artifact of the newest queue run that tested `main` and
+finished, and started, in the last 24 hours, and `cargo xtask e2e-queue-import`
+puts each lane's reports among the others, as `MI325X (queue) Linux (release)`
+and the like. A lane the queue does not block on is labelled `(queue, advisory)`
+and does not count towards the release-readiness verdict; a blocking lane that
+came back with no result is shown as `EMPTY` and does. The page opens with a
+`Queue lanes` table. A missing or late queue run never fails the report: the
+page says no queue lanes are in it. See
+[The support matrix and the wiki](nightly-on-the-queue.md#the-support-matrix-and-the-wiki).
 
 On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
@@ -330,15 +346,11 @@ The lane artifacts are named canonically (`e2e-gpu-n-1-report`, `e2e-gpu-n-2-rep
 `e2e-gpu-strix-ubuntu-n-2-report`, `e2e-gpu-strix-ubuntu-report`,
 `e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
 `e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
-`e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`,
-`e2e-gpu-w7900-report`, `e2e-report`) in `ci.yml` and
+`e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`, `e2e-report`) in `ci.yml` and
 `e2e-selfhosted.yml`, because the report derives each platform's name and OS
 from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
 of the per-PR `sdk_version` matrix (below, under "Triggers"); a `current`-leg
-artifact keeps its pre-matrix name unchanged. `rad3`, `mi350p` and `w7900`
-are uploaded only by `nightly.yml` (`e2e-selfhosted.yml` has no W7900 lane any
-more, and `rad3`/`mi350p` were nightly-only from the start, ROCMAI-125); they
-don't run that matrix, so they have no `-n-1`/`-n-2` entries. `nightly.yml`'s self-hosted lanes run a `channel:
+artifact keeps its pre-matrix name unchanged. `nightly.yml`'s self-hosted lanes run a `channel:
 [release, nightly]` matrix and append the channel as the final segment before
 the `-report` affix (e.g. `e2e-gpu-strix-windows-nightly-report`); the report
 strips that segment before matching, so the platform/OS derivation is
