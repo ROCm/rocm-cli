@@ -1205,7 +1205,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         // below, so the previous claim here, that the note "is computed before
         // it would have run", was backwards and could not have excused it.
         // The `no background automation daemon was left behind` step of serve-41
-        // and serve-56 is what holds the branch: deleting it left the scenario
+        // and serve-57 is what holds the branch: deleting it left the scenario
         // green with a `rocm daemon` still running.
         //
         // `e2e_simulate_oom_launch` is a `const fn` returning `false` without

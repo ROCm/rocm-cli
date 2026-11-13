@@ -52,7 +52,7 @@ const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
 /// [`REUSE_REFUSAL_MODEL`] picked it, so this aliases that constant rather than
 /// repeating the literal.
 const LEMONADE_SERVE_TARGET: &str = REUSE_REFUSAL_MODEL;
-/// Model id for the fabricated-launch scenarios (serve-41 and serve-56), kept
+/// Model id for the fabricated-launch scenarios (serve-41 and serve-57), kept
 /// distinct from every other e2e serve model so their service records can never
 /// collide with another scenario's.
 const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
@@ -1192,6 +1192,71 @@ async fn user_serves_with_automatic_port(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// ROCMAI-863: serve a real safetensors-only `owner/repo` rather than a made-up
+/// one, so the scenario covers the case users hit. There is no GGUF for Lemonade
+/// to serve under any variant — the refusal is the only correct outcome, and it
+/// must arrive on the terminal, not in a log nobody reads. `--managed` is what
+/// `rocm serve` does by default; naming it keeps the scenario on the path the
+/// report describes.
+///
+/// The id must be one the catalog has NO recipe for. The original report named
+/// `Qwen/Qwen2.5-1.5B-Instruct`, but #1044 gave that one a per-engine recipe
+/// resolving to `...-GGUF:Q4_K_M`, so the variant arrives from the catalog, the
+/// refusal correctly does not fire, and the scenario silently inverted — it
+/// served, exited 0, and only the GPU lane noticed. The assertion below keeps
+/// that from recurring quietly if this id ever gains a recipe too.
+const HF_REPO_WITHOUT_VARIANT: &str = "Qwen/Qwen2.5-3B-Instruct";
+
+#[when("the user serves a Hugging Face repo with no quantization variant on Lemonade")]
+async fn user_serves_hf_repo_without_variant(world: &mut E2eWorld) {
+    assert!(
+        !rocm_core::model_catalog::builtin_model_recipes()
+            .iter()
+            .any(|recipe| recipe.matches_ref(HF_REPO_WITHOUT_VARIANT)),
+        "{HF_REPO_WITHOUT_VARIANT} now has a catalog recipe, which supplies the \
+         quantization variant this scenario exists to see refused; pick an id \
+         the catalog has no recipe for"
+    );
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            HF_REPO_WITHOUT_VARIANT,
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The refusal has to say what would work, not just that this did not. The
+/// `owner/repo:<variant>` form is the way out, and it is what the user retypes.
+#[then("the user is told the model needs an explicit GGUF variant")]
+async fn assert_told_to_name_a_gguf_variant(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("`owner/repo:<variant>`"),
+        "expected the refusal to name the form that would work, got:\n{output}"
+    );
+}
+
+/// The discriminating assertion for the second half of ROCMAI-863. The old
+/// refusal offered `<model>:Q4_K_M`, a quantization nothing had looked for — on
+/// a safetensors-only repo that advice fails again, and the user is no better
+/// off than before. Asserted as an absence, because a wording pin would certify
+/// whatever text happened to be there rather than that it stopped guessing.
+#[then("no quantization is suggested for a repo the CLI has not inspected")]
+async fn assert_no_quantization_suggested(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("Q4_K_M") && !output.contains("Q4_0"),
+        "the refusal must not name a quantization this repo was never checked for, got:\n{output}"
+    );
 }
 
 #[when("the user sends a chat completion request")]
@@ -3676,7 +3741,7 @@ async fn serve_wait_refused(world: &mut E2eWorld) {
 }
 
 /// The discriminating assertion for the fabricated-launch daemon suppression.
-/// Hook hygiene, shared by serve-41 and serve-56: it checks the test seam, not
+/// Hook hygiene, shared by serve-41 and serve-57: it checks the test seam, not
 /// the behaviour either scenario is about.
 ///
 /// `simulate_oom_managed_launch` writes a record (`starting`, or `ready` in its

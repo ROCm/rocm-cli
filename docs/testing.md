@@ -3880,7 +3880,7 @@ a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
-(serve-56 carries the same tag). Note also that `-n` matches the scenario *name*
+(serve-57 carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
@@ -3896,7 +3896,7 @@ host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
-log it owns, and never became ready. serve-56 arms the same hook with
+log it owns, and never became ready. serve-57 arms the same hook with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
 ready, so a mock engine can then fail its smoke test. No process is spawned, and
 the seam compiles out entirely without the feature, so a build that does not
@@ -3913,7 +3913,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-41 and serve-56 to a reported **skip**, not a silent pass. It
+compiled out and resolves serve-41 and serve-57 to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -3923,7 +3923,7 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-41 and serve-56 are never selected there at all: that lane runs
+serve-41 and serve-57 are never selected there at all: that lane runs
 `E2E_ONLY_LIFECYCLE` and the scenarios carry `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
@@ -3981,7 +3981,7 @@ complete stream with no content, a close-delimited stream cut after a token). On
 the mid-stream-death test goes on to render the summary from the real outcome; the
 others assert on the outcome the smoke test returns.
 
-- serve-56, `@id:serve-smoke-failure-summary` — a launch that becomes ready
+- serve-57, `@id:serve-smoke-failure-summary` — a launch that becomes ready
   whose engine fails its first chat request is shown as a failed smoke test, with
   the engine's own reason and the full `rocm logs --service <id>` command, and
   the engine received exactly one chat request. It carries `@requires-no-gpu`,
@@ -3995,7 +3995,7 @@ others assert on the outcome the smoke test returns.
   fix: the unchanged service record and the no-daemon step.
 
 ```bash
-cargo xtask e2e -- -n "serve-56"
+cargo xtask e2e -- -n "serve-57"
 ```
 
 ## Windows Tool Notes
@@ -4503,6 +4503,65 @@ Windows:
 
 ```bash
 cargo xtask e2e -- -n '(diagnose-48)'
+```
+
+## Symptom From A File Or Standard Input
+
+`rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
+standard input when PATH is `-`, so a pasted error never passes through a
+shell's argument parser. How the bytes become the `--symptom` string (one
+trailing line break removed, a UTF-8 byte-order mark dropped, UTF-16 with a
+byte-order mark decoded, anything else UTF-8, and more than 16 MiB a usage
+error) is in [symptom_input.rs](../apps/rocm/src/symptom_input.rs), and its
+unit tests there pin each rule, including that a paste full of quotes,
+`$(...)`, a backtick and a leading `-` comes back byte for byte. They are the
+only tests that would fail if the trailing line break were kept: no scenario
+below depends on it, since a line break changes no cause. The clap rules (the
+two flags exclude each other, `-` is accepted as a path, a leading `-` is
+refused as `--symptom`'s value) are pinned by
+`diagnose_takes_the_symptom_from_a_file_or_stdin_but_not_with_symptom` in
+[cli.rs](../apps/rocm/src/cli.rs).
+
+```bash
+cargo nextest run -p rocm -E 'test(symptom)'
+```
+
+Three scenarios in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature), with their
+steps in
+[symptom_file_steps.rs](../tests/e2e-cucumber/tests/e2e/symptom_file_steps.rs),
+hold the behaviour end to end, GPU or not:
+
+- `diagnose-59` pipes a hostile paste through the platform's own shells (bash
+  on Linux and WSL; cmd.exe and Windows PowerShell on Windows) and requires
+  each diagnosis to equal the one for the same text passed as a single
+  argument with no shell in between: every cause, score and piece of
+  evidence, and every run exiting 0. The paste carries quotes, `$(...)` and a
+  leading `-`, but no shell parses it (each reads it from a file into the
+  pipe), so nothing in it can run by construction; the scenario asserts the
+  diagnosis, not the absence of something no shell could do. The paste is
+  ASCII: Windows PowerShell 5.1 pipes text as ASCII, which is why the docs
+  send PowerShell users through a file instead.
+- `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
+  scenario here; the Windows key is checked by hand in
+  [manual-testing.md](manual-testing.md) section 13) runs
+  `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
+  the whole exchange on screen (it has no scrollback), requires the hint
+  telling the user how to end the paste, then types the paste and Ctrl-D, the
+  Linux end-of-input key the hint names, and requires the screen, which also
+  holds the hint and the echoed paste, to contain the whole report the
+  argument form prints. It first requires that report to differ from the one
+  with no symptom, so a paste that was read and then dropped fails rather than
+  passing on a host where the host's own causes fill the report.
+- `diagnose-61` points the flag at a missing file and at one that is not
+  UTF-8, and requires a usage error (exit code 2) that names the file and the
+  reason, with nothing on stdout.
+
+None of them asserts which catalog entry matched, for the reason given at the
+top of that feature file: they compare two routes on the same host.
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(59|60|61) '
 ```
 
 ## Model Fit Preflight
