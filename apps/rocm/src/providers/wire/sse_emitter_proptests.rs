@@ -14,7 +14,8 @@
 //!   not: CRLF line endings (what Python SSE servers emit by default),
 //!   multi-byte UTF-8 content so that a split can land inside a UTF-8 sequence,
 //!   `data:` with no space before content, a role-only delta, a usage chunk with
-//!   empty `choices`, a `message.content` chunk, malformed JSON, Anthropic's
+//!   empty `choices`, a `message.content` chunk, malformed JSON, in-band OpenAI error payloads in each shape
+//!   servers send, Anthropic's
 //!   `message_start`, `content_block_start` and `error` events, a non-text
 //!   delta, a `[DONE]` line in an Anthropic stream, lines after the end of the
 //!   stream, and bodies whose last line is cut off before its terminator, so
@@ -28,7 +29,8 @@
 //!   which is a panic guard only: it asserts nothing about what a line parses
 //!   to. Its companion test checks that the generator keeps reaching every
 //!   field-reading branch, so the guard does not go quiet on one.
-//! - An ignored reproducer for #516 (in-band OpenAI error payloads).
+//! - A test that an in-band OpenAI error payload fails the stream rather than
+//!   ending it cleanly, and that nothing after it is read.
 //!
 //! The transport readers that `local_http`'s `proptests` module covers (chunked,
 //! `Content-Length` and close-delimited bodies) feed only the OpenAI emitter,
@@ -110,6 +112,52 @@ const OPENAI_FIXTURES: &[Fixture] = &[
         "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[\n\ndata: [DONE]\n\n",
         &[("ok", false)],
         Some("failed to parse local provider SSE data"),
+    ),
+    // A vLLM-style in-band error after some text, then the `[DONE]` that
+    // follows it: the error fails the stream with the server's message, the
+    // earlier text still reaches the caller, and neither the `[DONE]` nor the
+    // late chunk is read.
+    (
+        "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\ndata: {\"error\":{\"object\":\"error\",\"message\":\"CUDA out of memory\",\"type\":\"InternalServerError\",\"code\":500}}\n\ndata: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+        &[("par", false)],
+        Some("OpenAI-compatible provider stream failed: CUDA out of memory"),
+    ),
+    // The bare error object that older releases send, on a CRLF stream.
+    (
+        "data: {\"object\":\"error\",\"message\":\"engine died\",\"type\":\"InternalServerError\",\"code\":500}\r\n\r\ndata: [DONE]\r\n\r\n",
+        &[],
+        Some("OpenAI-compatible provider stream failed: engine died"),
+    ),
+    // An error with no `[DONE]` after it, the last line cut off before its
+    // terminator: `finish()` must still fail the stream, not end it.
+    (
+        "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\ndata: {\"error\":{\"message\":\"boom\"}}",
+        &[("par", false)],
+        Some("OpenAI-compatible provider stream failed: boom"),
+    ),
+    // `"error": null` beside normal content is not an error.
+    (
+        "data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        &[("ok", false), ("", true)],
+        None,
+    ),
+    // `error` as a bare string.
+    (
+        "data: {\"error\":\"model unloaded\"}\n\ndata: [DONE]\n\n",
+        &[],
+        Some("OpenAI-compatible provider stream failed: model unloaded"),
+    ),
+    // `error` with no message: a placeholder stands in for it.
+    (
+        "data: {\"error\":{}}\n\n",
+        &[],
+        Some("OpenAI-compatible provider stream failed: unknown OpenAI-compatible stream error"),
+    ),
+    // A payload that is JSON but not an object is no event and no error.
+    (
+        "data: 42\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        &[("ok", false), ("", true)],
+        None,
     ),
 ];
 
@@ -596,12 +644,12 @@ fn a_callback_error_stops_either_emitter() {
 /// `data: [DONE]` (and older releases yield the bare error object). Both shapes
 /// below are written from that handler, not captured from a live server.
 ///
-/// Today the error line parses to "no content" and is skipped, so the caller
-/// sees a normal, finished stream holding only the text produced before the
-/// failure: a truncated answer presented as a complete one. The fix for #516
-/// should un-ignore this.
+/// Such a payload fails the stream with the server's message, so the caller
+/// never mistakes the text produced before the failure for a complete answer;
+/// that text has already reached the caller's callback. Nothing after the error
+/// line is read, so the `[DONE]` that follows it does not turn the failure into
+/// a finish.
 #[test]
-#[ignore = "known gap: in-band SSE error payloads are dropped and the stream reports a clean finish (#516)"]
 fn in_band_stream_errors_are_not_reported_as_a_clean_finish() {
     for error_line in [
         "data: {\"error\":{\"object\":\"error\",\"message\":\"CUDA out of memory\",\"type\":\"InternalServerError\",\"code\":500}}\n\n",
@@ -611,9 +659,10 @@ fn in_band_stream_errors_are_not_reported_as_a_clean_finish() {
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}}}}]}}\n\n{error_line}data: [DONE]\n\n"
         );
         let (events, error) = openai_outcome(&[body.as_bytes()]);
-        assert!(
-            error.is_some(),
-            "stream with an in-band error finished cleanly with {events:?}"
+        assert_eq!(
+            error.as_deref(),
+            Some("OpenAI-compatible provider stream failed: CUDA out of memory"),
+            "stream with an in-band error did not fail with its message; events: {events:?}"
         );
         // The text produced before the failure still reaches the caller.
         assert_eq!(
@@ -623,5 +672,21 @@ fn in_band_stream_errors_are_not_reported_as_a_clean_finish() {
                 .collect::<String>(),
             "partial"
         );
+        assert!(events.iter().all(|e| !e.done));
     }
+}
+
+/// After an in-band error the emitter reads no further line, even in the same
+/// chunk: the caller's callback is not called again and a later error does not
+/// replace the first.
+#[test]
+fn lines_after_an_in_band_error_are_not_read() {
+    let (events, error) = openai_outcome(&[
+        b"data: {\"error\":{\"message\":\"first\"}}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: {\"error\":{\"message\":\"second\"}}\n\ndata: [DONE]\n\n",
+    ]);
+    assert!(events.is_empty(), "events after an error: {events:?}");
+    assert_eq!(
+        error.as_deref(),
+        Some("OpenAI-compatible provider stream failed: first")
+    );
 }
