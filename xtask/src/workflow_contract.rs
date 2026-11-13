@@ -2872,8 +2872,8 @@ jobs:
             }
         }
         assert_eq!(
-            delegating, 5,
-            "expected the five native Linux preflight lanes to delegate to \
+            delegating, 7,
+            "expected the seven native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
     }
@@ -2941,8 +2941,8 @@ jobs:
         }
         assert_eq!(
             bodies.len(),
-            5,
-            "expected five native Linux preflight bodies to compare, found {} — \
+            7,
+            "expected seven native Linux preflight bodies to compare, found {} — \
              if a lane was added or removed, update this count",
             bodies.len()
         );
@@ -4301,8 +4301,8 @@ fi
             }
         }
         assert_eq!(
-            delegating, 5,
-            "expected the 5 native Linux preflight lanes to delegate to \
+            delegating, 7,
+            "expected the 7 native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
         assert_eq!(

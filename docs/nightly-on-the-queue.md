@@ -22,10 +22,16 @@ GPU jobs of [`nightly.yml`](../.github/workflows/nightly.yml) do (see
 way those jobs' results are: the queue runs on the same infrastructure and under
 the same access as the self-hosted runners, and neither signs what it reports.
 
-**The remaining gap is Strix Halo.** The queue has no Strix lane and runs Linux
-pods, so the Strix Halo nightlies (Ubuntu, Windows and WSL) stay on the shared Strix pool,
-in `nightly.yml` and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml);
-nothing here replaces them. Which checks are required before merging is a repository
+The lane set is whatever GPU models the queue has. The 11-13 run
+([43351651832](https://github.com/ROCm/rocm-cli/actions/runs/43351651832)) discovered `mi300x`, `mi325x`, `mi350p`, `mi350x`,
+`mi355x`, `r9700s` and `w7900-dual`; `w7900-dual` (W7900) is advisory, and it is
+the only scheduled coverage of that hardware, since `e2e-selfhosted.yml` no
+longer has a W7900 lane.
+
+**The remaining gap is native Windows and WSL.** The queue runs Linux pods, so
+the native Windows and WSL lanes stay on their dedicated runners, in `nightly.yml`
+and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml); nothing
+here replaces them. Which checks are required before merging is a repository
 setting, outside this page.
 
 This page is the **contract** between this repository and the queue side: what
