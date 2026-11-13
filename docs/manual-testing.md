@@ -662,7 +662,7 @@ the scripted death, which makes the spawned engine reject its arguments:
 
 ```powershell
 cargo build -p rocm --features e2e-test-hooks
-$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"   # bash: export ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE=1
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"
 ./target/debug/rocm serve qwen --engine lemonade --managed
 ./target/debug/rocm services list --all
 ```
@@ -688,7 +688,11 @@ To see the stop-during-start case, run `rocm serve <model> --managed` in one
 terminal and, while it is still waiting for the server, `rocm services stop
 <service-id> --yes` from another. The serve exits non-zero with an error saying
 the managed service "was stopped while it was starting", and
-`rocm services list --all` shows the service as `stopped`.
+`rocm services list --all` shows the service as `stopped`. This is the usual
+result, not a certain one: the launch reads the record and writes its readiness
+verdict as two separate steps, and a stop takes no lock on the record, so a stop
+that lands between the two is overwritten by the verdict and the serve reports
+the server as it found it.
 
 #### Windows host check
 

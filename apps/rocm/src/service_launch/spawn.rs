@@ -652,6 +652,16 @@ fn launch_managed_engine_child_locked(
     // the launch lock, so it can settle the claim while the child is spawned.
     // Writing the held copy back would revive that service as `running`.
     //
+    // Only the fields this launch learned after its claim are applied: the engine
+    // and supervisor identities and the `running` status. Everything else is
+    // taken from the record on disk, which is the claim unless somebody wrote
+    // since — and a write that left the claim this launch's, such as the stop
+    // marker a stop records before its `stopped`, must survive the publish. So
+    // a field the launch sets on `record` after the claim write has to be added
+    // here, or it is dropped when `record` is replaced by what was published;
+    // `the_publish_applies_the_launch_s_own_fields_over_the_record_on_disk`
+    // pins which fields those are.
+    //
     // On any error here cleanup is the caller's job: `record.engine_pid` (set
     // above) is enough for `abandon_failed_managed_launch` to terminate this
     // child, which nothing on record names when the claim was taken away.
@@ -1478,19 +1488,27 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    /// A launch's claim written to disk, with the engine answer and port lease
+    /// `launch_managed_engine_child_locked` takes, for tests driving it through
+    /// the injected spawn.
     #[cfg(not(windows))]
-    fn a_stop_settled_while_the_engine_spawns_is_kept_and_the_engine_terminated() -> Result<()> {
-        let (root, paths) = test_paths("launch-stopped-during-spawn");
+    fn claimed_launch(
+        paths: &AppPaths,
+        service_id: &str,
+    ) -> Result<(
+        ManagedServiceRecord,
+        ResolveModelResponse,
+        rocm_core::LoopbackPortLease,
+    )> {
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
             .local_addr()?
             .port();
         let lease = rocm_core::lease_loopback_port(port)?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-stopped-during-spawn",
+        let record = ManagedServiceRecord::new(
+            paths,
+            service_id,
             "lemonade",
             "qwen",
             "qwen-canonical",
@@ -1519,6 +1537,93 @@ mod tests {
             engine_recipe: None,
             warnings: Vec::new(),
         };
+        Ok((record, resolve, lease))
+    }
+
+    /// The sleeper child the injected spawn starts in place of an engine.
+    #[cfg(not(windows))]
+    fn spawn_sleeper() -> io::Result<std::process::Child> {
+        ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg(sleeper_test_name())
+            .arg("--exact")
+            .arg("--ignored")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+
+    /// The publish writes the launch's own fields onto the record as it is on
+    /// disk, not the copy the launch holds: a write made since the claim that
+    /// left it the launch's (here the stop marker a stop records before its
+    /// `stopped`) survives, and the published record differs from the claim in
+    /// exactly the engine and supervisor identities and the status. The held
+    /// copy is replaced by what was published, so the two agree.
+    #[test]
+    #[cfg(not(windows))]
+    fn the_publish_applies_the_launch_s_own_fields_over_the_record_on_disk() -> Result<()> {
+        let (root, paths) = test_paths("launch-publish-fields");
+        let (mut record, resolve, lease) = claimed_launch(&paths, "lemonade-publish-fields")?;
+        let manifest_paths = paths.clone();
+        let service_id = record.service_id.clone();
+        let spawn_override: &dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> =
+            &|_command| {
+                let mut marked = ManagedServiceRecord::read_manifest(&manifest_paths, &service_id)
+                    .expect("claim on disk");
+                marked.stop_requested_unix_ms = Some(4_243);
+                marked.write().expect("write the stop marker");
+                spawn_sleeper()
+            };
+        let claim = serde_json::to_value(&record)?;
+
+        let result = launch_managed_engine_child_locked(
+            &paths,
+            &mut record,
+            lease,
+            "lemonade",
+            "lemonade-publish-fields",
+            &resolve,
+            "127.0.0.1",
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            Some(spawn_override),
+        );
+        if let Some(pid) = record.engine_pid {
+            let _ = rocm_core::terminate_process(pid);
+        }
+        let on_disk = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+        let _ = fs::remove_dir_all(root);
+        let child_pid = result?;
+        let on_disk = serde_json::to_value(on_disk?)?;
+
+        let mut expected = claim;
+        expected["stop_requested_unix_ms"] = serde_json::json!(4_243);
+        expected["engine_pid"] = serde_json::json!(child_pid);
+        expected["supervisor_pid"] = serde_json::json!(child_pid);
+        expected["engine_start_ticks"] = on_disk["engine_start_ticks"].clone();
+        expected["supervisor_start_ticks"] = on_disk["supervisor_start_ticks"].clone();
+        expected["status"] = serde_json::json!("running");
+        assert_eq!(
+            on_disk, expected,
+            "the publish changed a field it does not own"
+        );
+        assert_eq!(
+            serde_json::to_value(&record)?,
+            on_disk,
+            "the held copy disagrees"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_stop_settled_while_the_engine_spawns_is_kept_and_the_engine_terminated() -> Result<()> {
+        let (root, paths) = test_paths("launch-stopped-during-spawn");
+        let (mut record, resolve, lease) = claimed_launch(&paths, "lemonade-stopped-during-spawn")?;
         let manifest_paths = paths.clone();
         let service_id = record.service_id.clone();
         let spawn_override: &dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> =

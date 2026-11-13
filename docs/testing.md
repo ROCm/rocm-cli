@@ -2021,10 +2021,14 @@ Managed-launch startup-death and record-write focused tests:
 ```bash
 cargo test -p rocm --bin rocm service_launch::spawn::tests::a_child_that_exited_during_the_startup_window
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_signalled
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_handed
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_keeps_the_key
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_does_not_recreate_a_removed_record
 cargo test -p rocm --bin rocm service_launch::spawn::tests::a_stop_settled_while_the_engine_spawns
 cargo test -p rocm --bin rocm service_launch::readiness::tests::a_stop_settled_during_the_wait
-cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_keeps_what_changed
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_does_not_recreate
+cargo test -p rocm --bin rocm service_launch::spawn::tests::the_publish_applies
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::the_launch_does_not_publish_over
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_before
 cargo test -p rocm --bin rocm service_launch::spawn::tests::an_engine_that_dies_at_startup_keeps
@@ -2044,7 +2048,12 @@ stop marker, and a `rocm services remove` is not undone by re-creating the recor
 A serve whose server is stopped during its readiness wait fails (non-zero exit) saying
 the service was stopped while it was starting, instead of reporting a launch; one whose
 server exited on its own during the wait (a record settled without a stop marker) fails
-saying it exited and naming `rocm logs --service <id>`.
+saying it exited and naming `rocm logs --service <id>`. Each of those writes reads
+the record and then writes it, with no lock against a stop, so a stop landing
+between the two is still overwritten: the tests pin the narrowed race, not a
+closed one. The publish applies only the launch's own fields (engine and
+supervisor identities, `running`) over the record on disk, and a failed launch's
+cleanup leaves the endpoint key of a record a restart took over.
 The `watched_detached_spawn_*` tests run on the required Windows lane.
 
 `serve-55` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an

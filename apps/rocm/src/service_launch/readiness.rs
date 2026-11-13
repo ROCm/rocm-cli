@@ -19,6 +19,7 @@ use super::spawn::ManagedLaunchReport;
 use crate::device_policy_name;
 use crate::endpoint_keys;
 use crate::engine_runtime_select::wait_for_service_http_ready_with_progress;
+use crate::service_hints;
 use crate::status_for_readiness;
 #[cfg(feature = "e2e-oom-fault-injection")]
 use anyhow::Context;
@@ -130,7 +131,8 @@ pub(super) fn died_during_wait(
     }
     settle_exited_service(paths, service_id);
     let mut message = format!(
-        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
+        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `{}` for its output",
+        service_hints::service_logs_hint(service_id)
     );
     // A plain `serve` adds the memory guidance for a vLLM launch that ran out of
     // VRAM; the wait's failure is the same launch, so it gets the same note.
@@ -184,10 +186,27 @@ pub(super) fn record_wait_outcome(
             }
         },
     )?;
-    *held = match written {
-        Some(latest) => latest,
-        None if paths.service_manifest_path(&held.service_id).exists() => {
-            let settled = ManagedServiceRecord::read_manifest(paths, &held.service_id)?;
+    // Read once, not after an `exists()` check: a removal landing between the
+    // two would surface as a bare read error instead of the "removed" failure.
+    let settled = match written {
+        Some(latest) => {
+            *held = latest;
+            return Ok(());
+        }
+        None => match ManagedServiceRecord::read_manifest(paths, &held.service_id) {
+            Ok(settled) => Some(settled),
+            Err(error)
+                if error
+                    .downcast_ref::<rocm_core::ManagedServiceNotFound>()
+                    .is_some() =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        },
+    };
+    match settled {
+        Some(settled) => {
             *held = settled;
             // A stop leaves its marker; anything else that settled the record
             // (the liveness refresh demoting a dead engine, or the engine's own
@@ -204,10 +223,10 @@ pub(super) fn record_wait_outcome(
             }
             bail!(
                 "managed service `{}` exited while it was starting (its record now reads `{}`); \
-                 see `rocm logs --service {}` for its output",
+                 see `{}` for its output",
                 held.service_id,
                 held.status,
-                held.service_id
+                service_hints::service_logs_hint(&held.service_id)
             );
         }
         None => bail!(
@@ -215,8 +234,7 @@ pub(super) fn record_wait_outcome(
              no record of it left to report",
             held.service_id
         ),
-    };
-    Ok(())
+    }
 }
 
 /// Test-only fault-injection switch, off (`const false`) in shipped binaries:
@@ -615,8 +633,14 @@ mod tests {
             message.contains("exited before it became ready"),
             "{message}"
         );
+        // The hinted command parses with these flags:
+        // `advised_commands::every_advised_command_parses` reads the literal in
+        // `service_hints::service_logs_hint`.
         assert!(
-            message.contains(&format!("rocm logs --service {id}")),
+            message.contains(&format!(
+                "see `{}` for its output",
+                service_hints::service_logs_hint(&id)
+            )),
             "{message}"
         );
         assert_eq!(status(), "stopped");
@@ -723,8 +747,14 @@ mod tests {
                 "{message}"
             );
             assert!(!message.contains("was stopped"), "{message}");
+            // The hinted command parses with these flags:
+            // `advised_commands::every_advised_command_parses` reads the literal
+            // in `service_hints::service_logs_hint`.
             assert!(
-                message.contains(&format!("rocm logs --service {}", held.service_id)),
+                message.contains(&format!(
+                    "see `{}` for its output",
+                    service_hints::service_logs_hint(&held.service_id)
+                )),
                 "{message}"
             );
             assert_eq!(
