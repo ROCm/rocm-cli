@@ -103,7 +103,8 @@ pub(crate) enum Command {
         #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
         /// Read the error text from a file instead, or from standard input
-        /// when PATH is `-`, so no shell quoting is needed.
+        /// when PATH is `-`, so no shell quoting is needed. A file named `-`
+        /// is passed as `./-`.
         ///
         /// The text that arrives is matched as `--symptom` would match it,
         /// with one trailing line break removed (shells and editors add one).

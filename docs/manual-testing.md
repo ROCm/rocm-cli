@@ -1664,6 +1664,9 @@ Then, in an empty directory, hand it over in each shell you have:
   `rocm diagnose --symptom-file error.txt`.
 - Any shell, nothing piped in: `rocm diagnose --symptom-file -`, paste at the
   prompt, and end the input as the hint printed on the first line says.
+- A file named `-`: save the paste as `-` and run
+  `rocm diagnose --symptom-file ./-`. It reports the same causes; a bare `-`
+  would read standard input instead.
 
 Expected result:
 
