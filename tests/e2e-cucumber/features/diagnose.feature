@@ -229,10 +229,8 @@ Feature: Diagnosing failures and listing fixes
   # Linux-only for the same reason diagnose-08 is: the recipe under test
   # (`fix-9-igpu-dgpu`) only appends a shell rc file on Linux.
   #
-  # @requires-bare-metal for the same reason as diagnose-08: `fix-9-igpu-dgpu`
-  # does not apply on WSL2 (no per-device topology to collide over there), so
-  # the run stops at the wrong-platform refusal before the confirmation prompt
-  # is ever printed.
+  # @requires-bare-metal for the same reason as diagnose-08: this scenario has
+  # not been run on a WSL2 lane, so it stays a skip there until it has.
   @id:diagnose-fix-interactive-decline-reported @requires-os:linux @requires-bare-metal
   Scenario: diagnose-16 - Declining the confirmation prompt on a real terminal is reported the same way
     Given a user who has chosen a fix that would change the machine

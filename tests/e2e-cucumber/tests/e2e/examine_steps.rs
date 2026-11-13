@@ -1090,6 +1090,35 @@ fn host_has_lspci() -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("lspci").is_file()))
 }
 
+/// The WSL counterpart of `assert_gpus_match_kfd_nodes`.
+///
+/// There is no kernel topology to cross-check against here, so the assertion is
+/// the property that actually regressed: the list is populated at all, and
+/// everything in it is an AMD adapter. Counting would only restate the lane's
+/// hardware, which the suite deliberately does not hard-code.
+#[then("it lists every AMD GPU the Windows host reports")]
+async fn assert_wsl_gpus_listed(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let gpus = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .expect("`examine --json` did not report a gpus array");
+
+    assert!(
+        !gpus.is_empty(),
+        "a WSL host with an AMD GPU must list it; an empty array is the \
+         regression this guards:\n{json:#}"
+    );
+    for gpu in gpus {
+        assert_eq!(
+            gpu.get("is_amd").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the host inventory is filtered to AMD adapters, so a non-AMD \
+             entry means the filter stopped working:\n{gpu:#}"
+        );
+    }
+}
+
 #[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
 async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
     let Some(versions) = kfd_gpu_node_versions().filter(|versions| !versions.is_empty()) else {
