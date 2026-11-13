@@ -551,6 +551,16 @@ pub fn runtime_loader_path_entries_read_only(
     entries
 }
 
+/// Whether `python`'s runtime needs the amd-smi link ([`ensure_amd_smi_compat`])
+/// and does not have it: the SDK ships `libamd_smi.so.<n>` without the bare name,
+/// and the environment's shim directory holds no `libamd_smi.so`. Reads only. For a
+/// diagnostic, since a launch that could not make the link says nothing itself.
+pub fn amd_smi_link_missing(python: &Path, library_paths: &[PathBuf]) -> bool {
+    amd_smi_library_needing_bare_name(library_paths).is_some()
+        && runtime_compat_dir_for_python(python)
+            .is_some_and(|dir| !dir.join("libamd_smi.so").exists())
+}
+
 fn amd_smi_library_needing_bare_name(library_dirs: &[PathBuf]) -> Option<PathBuf> {
     // A bare name in any directory is found by the loader before the shim, which
     // sits last on the path, so no shim is needed whichever directory holds it.

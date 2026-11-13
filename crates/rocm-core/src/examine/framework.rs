@@ -78,6 +78,15 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
         &interpreter.python,
         &interpreter.library_paths,
     );
+    if crate::managed_runtime::amd_smi_link_missing(&interpreter.python, &interpreter.library_paths)
+    {
+        e.framework_notes.push(
+            "The runtime ships libamd_smi.so.<n> without the bare libamd_smi.so name and has no amd-smi link \
+             yet: a launch or install writes it. On a host with another ROCm installed, torch can report \
+             0 devices until the link exists."
+                .to_owned(),
+        );
+    }
     let env = runtime_library_path_env(e, &library_paths);
     let (rc, out, err) = run_with_env(
         &interpreter.python.display().to_string(),
@@ -465,6 +474,15 @@ mod tests {
             without.framework_notes
         );
         assert_eq!(without.framework_version, "");
+        // A runtime that needs the link and has none says so, since a launch that
+        // could not write it is silent; with the link there is nothing to say.
+        let link_note = |e: &Examination| {
+            e.framework_notes
+                .iter()
+                .any(|note| note.contains("has no amd-smi link yet"))
+        };
+        assert!(link_note(&without), "{:?}", without.framework_notes);
+        assert!(!link_note(&with), "{:?}", with.framework_notes);
         assert_eq!(with.framework_version, "2.11.0+rocm7.14.1");
     }
 

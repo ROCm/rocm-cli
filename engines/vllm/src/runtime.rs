@@ -1258,6 +1258,48 @@ mod tests {
         );
     }
 
+    /// The "a bare name already exists" rule reads the SDK's directories only, not
+    /// the compat directory itself: a link there left dangling or pointing at
+    /// another SDK is repaired, not taken for the SDK's own bare name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_existing_amd_smi_link_in_the_compat_dir_is_repaired_not_trusted() {
+        let env = tempfile::tempdir().unwrap();
+        let sdk_root = env.path().join("sdk");
+        let sdk_lib = sdk_root.join("lib");
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let other = env.path().join("other-sdk");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("libamd_smi.so.25"), b"other").unwrap();
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        let link = compat_dir.join("libamd_smi.so");
+        let runtime = VllmRuntime {
+            runtime_id: "release-wheel".to_owned(),
+            env_id: "release-wheel".to_owned(),
+            python_executable: Some(env.path().join("bin").join("python")),
+            sdk_root: Some(sdk_root),
+            sdk_library_paths: vec![sdk_lib.clone()],
+            ..VllmRuntime::for_test()
+        };
+
+        for stale_target in [env.path().join("gone"), other.join("libamd_smi.so.25")] {
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&stale_target, &link).unwrap();
+
+            let shim = ensure_therock_compat_shims(&runtime, |_| None);
+
+            assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                sdk_lib.join("libamd_smi.so.26"),
+                "a link to {} must be repointed",
+                stale_target.display()
+            );
+        }
+    }
+
     #[test]
     fn load_runtime_manifests_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
         // Both pairings of file name and runtime key, so a read-order pick is wrong
