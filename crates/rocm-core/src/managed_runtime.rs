@@ -279,6 +279,19 @@ pub(crate) fn managed_therock_environment_records(
         .collect()
 }
 
+/// The library directories of every managed runtime in the registry; a directory
+/// shared by two runtimes appears twice.
+///
+/// For checks that look at what a runtime ships on disk, such as
+/// [`crate::runtime_rocdxg`], rather than at the one runtime that is active.
+pub(crate) fn managed_runtime_library_dirs(paths: &AppPaths) -> Vec<PathBuf> {
+    let registry_dir = paths.data_dir.join("runtimes").join("registry");
+    managed_therock_environment_records(&registry_dir)
+        .iter()
+        .flat_map(|(_, record)| managed_therock_environment_from_record(record).library_entries)
+        .collect()
+}
+
 fn managed_therock_environment_from_record(
     record: &TheRockFamilyManifest,
 ) -> ManagedRuntimeEnvironment {
