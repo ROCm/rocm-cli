@@ -9,6 +9,12 @@
 //! planted as plain files in the layout the engine writes, so no scenario
 //! downloads anything; the refusal scenario reaches the engine's free-space
 //! check through the `rocm/e2e-test-hooks` override instead of a full drive.
+//!
+//! Also the steps of `runtime_setup.feature`'s runtime-33: a Lemonade backend
+//! that could not be aligned to the active ROCm version is not tried again by
+//! the next install. That one is not planted: it runs real installs on a GPU
+//! lane, and only the ROCm version the alignment targets comes from an
+//! `e2e-test-hooks` override.
 
 use std::path::PathBuf;
 
@@ -399,4 +405,110 @@ async fn assert_lemonade_record_cleared(world: &mut E2eWorld) {
         !report.contains(&runtime_tree(world).display().to_string()),
         "the removed copy must not be listed any more:\n{report}"
     );
+}
+
+/// A ROCm version Lemonade publishes no backend build for, so every alignment
+/// tier fails the same way on every lane. It reaches the engine through the
+/// `rocm/e2e-test-hooks` override of the version the alignment targets, rather
+/// than a planted runtime record, because the runtime tree this scenario installs
+/// into is shared with every other scenario on the runner.
+const UNPUBLISHED_ROCM_VERSION: &str = "7.99.0";
+
+/// The override applies to one command only (`run_rocm_with_scenario_env`
+/// consumes it), so each step that runs `rocm` sets it again first.
+fn target_unpublished_rocm_version(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION",
+        UNPUBLISHED_ROCM_VERSION.into(),
+    ));
+}
+
+const ALIGNMENT_FAILED_LINE: &str = "could not align Lemonade's ROCm backend to";
+
+#[given("the active ROCm version is one Lemonade publishes no backend build for")]
+async fn active_rocm_version_has_no_lemonade_build(world: &mut E2eWorld) {
+    target_unpublished_rocm_version(world);
+}
+
+/// `--reinstall` deletes and re-extracts the runtime tree, so this attempt starts
+/// from Lemonade's packaged pin with no record of an earlier failure, whatever an
+/// earlier run on this runner left. It is also the command the later notice
+/// names for trying again, so this step running the alignment is the evidence
+/// that the advice works.
+#[given("reinstalling Lemonade has already failed to align its backend to that version")]
+async fn lemonade_reinstall_failed_alignment(world: &mut E2eWorld) {
+    let args = ["engines", "install", "lemonade", "--reinstall"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    // Absent when the binary lacks `rocm/e2e-test-hooks` (the real SDK version is
+    // targeted instead), or on a host where Lemonade selects its Vulkan backend
+    // and the alignment is never attempted.
+    assert!(
+        stderr.contains(&format!(
+            "{ALIGNMENT_FAILED_LINE} {UNPUBLISHED_ROCM_VERSION}"
+        )),
+        "the reinstall did not try and fail to align the backend to \
+         {UNPUBLISHED_ROCM_VERSION}; was `rocm` built with `rocm/e2e-test-hooks`, and does \
+         Lemonade select its ROCm backend here?\n{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    target_unpublished_rocm_version(world);
+}
+
+/// No alignment tier ran and nothing was force-reinstalled: the install reused
+/// the backend already in place, and the pin still names the packaged version.
+#[then("the install reuses Lemonade's pinned backend without trying the alignment again")]
+async fn assert_pinned_backend_reused(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert_eq!(world.cli_rc, Some(0), "the install failed:\n{output}");
+    for attempt in [
+        ALIGNMENT_FAILED_LINE,
+        "could not install its pinned llama.cpp build",
+        "Aligned Lemonade's ROCm backend",
+        "Installing Lemonade llamacpp:",
+    ] {
+        assert!(
+            !output.contains(attempt),
+            "the install tried the alignment or reinstalled the backend again \
+             (`{attempt}`):\n{output}"
+        );
+    }
+    assert!(
+        output.contains("Using installed Lemonade llamacpp:rocm backend."),
+        "the install did not reuse the installed ROCm backend:\n{output}"
+    );
+    let env_path = stdout(world)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let pin_file = std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let pins: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&pin_file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", pin_file.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", pin_file.display()));
+    assert_ne!(
+        pins["therock"]["version"].as_str(),
+        Some(UNPUBLISHED_ROCM_VERSION),
+        "the pin names the version that could not be aligned to:\n{pins}"
+    );
+}
+
+#[then("the user is told the alignment failed and how to try it again")]
+async fn assert_alignment_retry_advice(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    for expected in [
+        format!("could not be aligned to ROCm {UNPUBLISHED_ROCM_VERSION}"),
+        "Run `rocm engines install lemonade --reinstall` to try again now".to_owned(),
+        "the alignment is tried again in".to_owned(),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "expected `{expected}` in the install output:\n{output}"
+        );
+    }
 }

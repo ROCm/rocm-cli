@@ -426,6 +426,24 @@ ROCm backend directory under `bin/llamacpp/`, and run
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
 
+To check that a failed backend alignment is not repeated (Windows or native
+Linux with a GPU Lemonade runs its ROCm backend on, and an active managed ROCm
+SDK): build with `cargo build -p rocm --features rocm/e2e-test-hooks`, set
+`ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION=7.99.0` (a ROCm version Lemonade
+publishes no backend for), and run `rocm engines install lemonade --reinstall`,
+then `rocm engines install lemonade`. Expected result:
+
+- The first install warns `could not align Lemonade's ROCm backend to 7.99.0;
+  reverting to the default pinned version`, exits 0, and leaves
+  `.rocm-cli-alignment-failed.json` in the Lemonade runtime tree.
+- The second install prints no alignment warning and does not download or
+  reinstall the backend (`Using installed Lemonade llamacpp:rocm backend.`). It
+  prints `Lemonade's ROCm backend could not be aligned to ROCm 7.99.0 less than
+  an hour ago; ...`, naming `rocm engines install lemonade --reinstall` and
+  when the alignment is tried again, and exits 0.
+- Running the first command again attempts the alignment again (the warning
+  is back), because `--reinstall` removed the record with the runtime tree.
+
 To check what a Lemonade install says about its size (no download needed for
 the refusal): with a debug build, set
 `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data

@@ -919,9 +919,12 @@ with the ROCm SDK in use, and rewrites the two pins it owns
 (`therock.version` and `llamacpp.rocm-stable` in `resources/backend_versions.json`)
 to do so. If installing an already-pinned backend fails, it restores those two
 pins from the cached Lemonade archive (it does not download), prints a warning,
-and installs once more; see
+and installs once more. When the backend cannot be aligned to the active ROCm
+version, the install keeps the backend Lemonade pins, and for the next 24 hours
+later installs reuse it without trying the alignment again;
+`rocm engines install lemonade --reinstall` tries it again sooner. See
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
-`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
+`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns all of this off.
 
 Before Lemonade writes a new install, whether from `rocm engines install
 lemonade` or the first `rocm serve` that needs it, it prints the folder it is
