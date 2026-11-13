@@ -407,6 +407,11 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 /// adds for platforms the Total row would otherwise read as having zero
 /// failures.
 ///
+/// A row for a shared-queue lane the queue does not block on (its platform
+/// cell carries [`e2e_report::ADVISORY_QUEUE_MARKER`]) counts for neither: the
+/// queue lets that lane fail, so the verdict does too. Its `Fail` cell is
+/// taken back out of the Total row, which sums every row.
+///
 /// Parsing the already-rendered rows, rather than re-deriving per-platform
 /// pass/fail here, keeps this in lockstep with that crate's known-bugs/xfail
 /// handling instead of duplicating it.
@@ -431,24 +436,31 @@ fn total_e2e_failures(markdown: &str) -> Option<u64> {
         .nth(5)
         .and_then(|cell| cell.trim().parse::<u64>().ok())?;
 
-    let silently_empty_platforms = lines[header_idx + 1..total_idx]
-        .iter()
-        .filter(|l| {
-            let t = l.trim_start();
-            t.starts_with('|') && !t.starts_with("|---")
-        })
-        .filter(|l| {
-            let cells: Vec<&str> = l.split('|').collect();
-            let status = cells.get(8).map(|c| c.trim());
-            let fail = cells
-                .get(5)
-                .and_then(|c| c.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            !matches!(status, Some("PASS") | None) && fail == 0
-        })
-        .count() as u64;
+    let mut advisory_fails = 0;
+    let mut silently_empty_platforms = 0;
+    for line in lines[header_idx + 1..total_idx].iter().filter(|l| {
+        let t = l.trim_start();
+        t.starts_with('|') && !t.starts_with("|---")
+    }) {
+        let cells: Vec<&str> = line.split('|').collect();
+        let fail = cells
+            .get(5)
+            .and_then(|c| c.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if cells
+            .get(1)
+            .is_some_and(|c| c.contains(e2e_report::ADVISORY_QUEUE_MARKER))
+        {
+            advisory_fails += fail;
+            continue;
+        }
+        let status = cells.get(8).map(|c| c.trim());
+        if !matches!(status, Some("PASS") | None) && fail == 0 {
+            silently_empty_platforms += 1;
+        }
+    }
 
-    Some(total_row_fails + silently_empty_platforms)
+    Some(total_row_fails.saturating_sub(advisory_fails) + silently_empty_platforms)
 }
 
 /// Neutralize markdown syntax in untrusted text (GitHub issue titles) before
@@ -739,6 +751,48 @@ mod tests {
                    | Windows | Windows | 0 | 0 | 0 | 0 | n/a | EMPTY |\n\
                    | **Total** | | 0 | 0 | 0 | 0 | 0 | |\n";
         assert_eq!(total_e2e_failures(md), Some(1));
+    }
+
+    #[test]
+    fn total_e2e_failures_leaves_out_the_queue_lanes_the_queue_lets_fail() {
+        // Real producer output, so the marker the parser looks for is the one the
+        // report writes: a failing advisory lane and an empty advisory lane add
+        // nothing, while the same lanes marked blocking add one failure and one
+        // silent failure.
+        fn report(status: &str) -> String {
+            format!(
+                r#"[{{"name":"F","uri":"f.feature","elements":[{{"name":"s","tags":[],"steps":[{{"keyword":"Given ","name":"x","result":{{"status":"{status}"}}}}]}}]}}]"#
+            )
+        }
+        let render = |advisory: bool| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let write = |name: &str, text: &str| {
+                let path = dir.path().join(name);
+                std::fs::create_dir_all(&path).expect("mkdir");
+                std::fs::write(path.join("report.json"), text).expect("write report");
+                (name.to_owned(), path.join("report.json"))
+            };
+            let failing = e2e_report::queue_artifact_name("mi325x", advisory, Some("release"));
+            let empty = e2e_report::queue_artifact_name("r9700s", advisory, None);
+            let inputs = vec![
+                write("e2e-gpu-report", &report("passed")),
+                write(&failing, &report("failed")),
+                write(&empty, "[]"),
+            ];
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&inputs))
+        };
+        let advisory = render(true);
+        assert!(
+            advisory.contains(e2e_report::ADVISORY_QUEUE_MARKER),
+            "{advisory}"
+        );
+        assert_eq!(total_e2e_failures(&advisory), Some(0), "{advisory}");
+        let blocking = render(false);
+        assert!(
+            !blocking.contains(e2e_report::ADVISORY_QUEUE_MARKER),
+            "{blocking}"
+        );
+        assert_eq!(total_e2e_failures(&blocking), Some(2), "{blocking}");
     }
 
     #[test]
