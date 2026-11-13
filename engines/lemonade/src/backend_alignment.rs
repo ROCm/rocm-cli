@@ -22,11 +22,10 @@ use crate::llamacpp_backend::{
     find_llama_server_binary_for_backend, install_best_llamacpp_backend,
 };
 #[cfg(target_os = "linux")]
-use crate::process::apply_lemonade_process_environment;
+use crate::process::apply_lemonade_process_environment_with_parent;
 #[cfg(target_os = "windows")]
 use crate::process::lemonade_process_environment_vars;
 use crate::process::{LemonadeProcessEnvironment, lemonade_process_environment};
-#[cfg(target_os = "windows")]
 use crate::runtime_dir::ParentRuntimeEnvironment;
 
 /// Resource file inside the extracted Lemonade embeddable pinning which
@@ -714,7 +713,13 @@ fn rocm_backend_resolves(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if apply_lemonade_process_environment(&mut command, process_env).is_err() {
+    if apply_lemonade_process_environment_with_parent(
+        &mut command,
+        process_env,
+        &ParentRuntimeEnvironment::current(),
+    )
+    .is_err()
+    {
         return false;
     }
     let Ok(output) = command.output() else {
@@ -874,7 +879,7 @@ const BACKEND_DIR_ASIDE_SUFFIX: &str = ".pre-alignment";
 /// build into its own build-numbered subdirectory rather than replacing one in place,
 /// so a tier that installs a different `therock.version`/llama.cpp tag than a prior
 /// attempt (or the pinned default) can otherwise leave two builds side by side --
-/// after which [`crate::direct_llama::find_binary_in`]'s directory-order fallback, used by both alignment
+/// after which [`crate::llamacpp_backend::find_binary_in`]'s directory-order fallback, used by both alignment
 /// verification and `rocm serve`, may resolve to whichever build a rejected tier
 /// installed instead of the one just verified.
 ///
@@ -914,7 +919,7 @@ fn set_aside_rocm_llamacpp_backend_dirs(
 /// actually asided) before moving each `aside` back into place: a failed install can
 /// land its output under a *different* ROCm-family name than the one that was
 /// asided (Lemonade extracts each release into its own build-numbered directory
-/// rather than replacing one in place), and [`crate::direct_llama::find_binary_in`]'s priority-ordered
+/// rather than replacing one in place), and [`crate::llamacpp_backend::find_binary_in`]'s priority-ordered
 /// lookup would otherwise let that stray, unverified directory shadow the good
 /// build this function just restored. Best-effort: a failure here just risks the
 /// same stale-directory ambiguity the aside exists to prevent, not the reinstall

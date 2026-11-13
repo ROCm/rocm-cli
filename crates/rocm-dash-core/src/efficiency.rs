@@ -150,8 +150,9 @@ impl NodeEfficiency {
 /// Aggregate generation throughput across instances.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NodeThroughput {
-    /// Σ `gen_tps` over the instances with a finite reading, in tokens/s. A real
-    /// zero counts: an idle node is zero throughput, not no data.
+    /// Σ `gen_tps` over the instances with a finite, live reading (a Lemonade
+    /// last-request rate is not live), in tokens/s. A real zero counts: an idle
+    /// node is zero throughput, not no data.
     pub tokens_per_sec: f64,
     /// Freshness of the throughput behind the sum, as for
     /// [`NodeEfficiency::freshness`]: instances at zero tok/s add nothing to the
@@ -167,8 +168,8 @@ impl NodeThroughput {
     }
 }
 
-/// Node throughput over `instances`, or `None` when no instance has a finite
-/// `gen_tps` (a single NaN/Inf must not poison the sum).
+/// Node throughput over `instances`, or `None` when no instance has a finite,
+/// live `gen_tps` (a single NaN/Inf must not poison the sum).
 ///
 /// This is the one place the node's throughput and its freshness are worked
 /// out, so every surface that shows the aggregate (the efficiency hero, the
@@ -176,6 +177,11 @@ impl NodeThroughput {
 /// instance at zero tok/s contributes nothing to the sum, so its freshness says
 /// nothing about the sum's either: a held idle instance must not mark a figure
 /// that comes from fresh ones as held.
+///
+/// Only live throughput counts: a Lemonade last-request rate (see
+/// [`Instance::live_gen_tps`]) stays unchanged while the server is idle, so it is
+/// left out of the sum and out of the freshness, and an idle Lemonade server on
+/// its own is no throughput reading at all.
 #[must_use]
 pub fn node_throughput<'a>(
     instances: impl IntoIterator<Item = &'a Instance>,
@@ -185,7 +191,7 @@ pub fn node_throughput<'a>(
     let mut held = false;
     let mut unknown = false;
     for inst in instances {
-        let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) else {
+        let Some(v) = inst.live_gen_tps() else {
             continue;
         };
         tokens_per_sec += v;
@@ -313,6 +319,32 @@ mod tests {
             }),
             ..Instance::default()
         }
+    }
+
+    /// An idle Lemonade server keeps reporting its last request's rate. Counted as
+    /// throughput it would hold the node figure up long after traffic stopped, and
+    /// mark it held while it lasted.
+    #[test]
+    fn node_efficiency_leaves_out_a_last_request_rate() {
+        let mut idle = serving("lemonade", Some(500.0), Some(ObservationFreshness::Held));
+        idle.gen_tps_last_request = true;
+        let live = serving("vllm", Some(30.0), Some(ObservationFreshness::Fresh));
+        let node = node_efficiency(&snap_with(
+            vec![idle.clone(), live],
+            vec![gpu("gpu-0", 100.0)],
+        ))
+        .expect("the live rate is traffic");
+        // Only the live 30 tok/s counts: 30 / 100 W, not 530 / 100 W.
+        assert!((node.tokens_per_watt - 0.3).abs() < 1e-9, "{node:?}");
+        assert!(
+            !node.held(),
+            "a held last-request rate must not mark the figure held"
+        );
+        // An idle Lemonade server alone is no traffic at all.
+        assert_eq!(
+            node_efficiency(&snap_with(vec![idle], vec![gpu("gpu-0", 100.0)])),
+            None
+        );
     }
 
     #[test]
