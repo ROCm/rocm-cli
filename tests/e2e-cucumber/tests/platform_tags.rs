@@ -143,6 +143,14 @@ const ALLOWED_ANY_OS: &[(&str, &str)] = &[
         "Lemonade serves on Linux and Windows; inference is checked over HTTP",
     ),
     (
+        "serve-missing-gguf-variant-refused",
+        "serve may install Lemonade first, but the variant check is OS-neutral code (no cfg \
+         branch) that refuses before any server starts; the steps assert the same on every \
+         OS, none conditionally: a non-zero exit with the `owner/repo:<variant>` advice that \
+         pins the refusal, neither `Q4_K_M` nor `Q4_0` named, and no record under the \
+         isolated data dir's `services/`",
+    ),
+    (
         "serve-stop-leaves-no-background-helper",
         "Lemonade serves on Linux and Windows; the step reads serve's output, the helper's \
          autostart claim and runtime state under the scenario's own data directory, and \
