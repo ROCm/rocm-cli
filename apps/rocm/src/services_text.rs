@@ -402,15 +402,15 @@ fn format_anthropic_endpoint_line(url: &str, responding: bool) -> String {
     }
 }
 
-/// `rocm services list`, and the chat `services` tool, which renders the same
-/// text.
+/// `rocm services list`, and `rocm chat`'s `services` command, which runs this
+/// in process and renders the same text. Not the MCP tool of the same name,
+/// which has its own renderer and no `device:` row.
 ///
 /// **No longer a pure local read.** Since ROCMAI-550 it makes one live
 /// `Healthcheck` RPC per *ready* service to fill the `device:` row, bounded in
 /// aggregate by `engine_ipc::SERVICE_DEVICE_PROBE_BUDGET` — see that constant
-/// for the arithmetic behind the ~18s worst case. The chat tool pays the same
-/// bound rather than render a device-less view, which would have the two
-/// surfaces disagree while claiming to show the same list.
+/// for the ~18s worst case and for which `services` surface pays it. The chat
+/// command pays it too, rather than show a device-less view of the same list.
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
     render_services_text_with_devices(paths, all, |ready| fetch_service_devices(paths, ready))
 }

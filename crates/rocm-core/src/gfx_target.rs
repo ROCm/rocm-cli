@@ -573,9 +573,34 @@ pub enum GpuSupportLevel {
     Unknown,
 }
 
+/// The one claim every [`GpuSupportLevel::VulkanOnly`] surface makes, written
+/// once.
+///
+/// `rocm examine`'s `rocm_support` line and `rocm install sdk`'s two refusals
+/// (`unsupported_host_gpu_message` / `unsupported_requested_target_message` in
+/// `apps/rocm/src/therock/family.rs`) all tell the user the same two things
+/// about a Vulkan-only GPU: ROCm will not run on it, and Vulkan will. They are
+/// three different sentences around it — each adds its own subject and its own
+/// next step, because what they may promise differs — but the claim itself is
+/// shared, so it lives here next to the classifier that decides when it is
+/// true rather than being retyped at each site.
+///
+/// Deliberately just the claim, with no leading subject and no trailing
+/// punctuation: a caller supplies both. Changing the wording here changes all
+/// three surfaces together, which is the point.
+pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
+    "not supported by ROCm; the Vulkan backend can still be used";
+
 /// Classify the host's GPU support level from the same two facts
 /// `ExamineSummary` and `resolve_family` already compute: the detected gfx
 /// target and whichever TheRock family (if any) covers it.
+///
+/// Not only for a *host*: `resolve_family` also asks this of a target the user
+/// named with `--family` or `ROCM_CLI_THEROCK_FAMILY`, to decide whether to
+/// refuse it. The two arguments are facts about a GPU target, not about this
+/// machine, so that is the same question. What differs is what the caller may
+/// then say — a requested target establishes nothing about the hardware here,
+/// which is why the two install refusals end differently.
 pub fn gpu_support_level(
     detected_gfx_target: Option<&str>,
     compatible_therock_family: Option<&str>,
@@ -677,6 +702,24 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx90a"),
             Some("gfx90a".to_owned())
+        );
+    }
+
+    /// The shared claim is user-visible text on three surfaces, so its wording
+    /// is pinned here rather than only asserted as "whatever the constant
+    /// says".
+    ///
+    /// `rocm examine`'s `rocm_support` line and both `rocm install sdk`
+    /// refusals now interpolate [`VULKAN_ONLY_SUPPORT_CLAIM`], which is what
+    /// stops them drifting — but it also means a careless edit to the constant
+    /// silently rewords all three at once, and their own tests would still
+    /// pass because they assert containment of the same constant. This test is
+    /// the one place that has to be changed deliberately.
+    #[test]
+    fn the_vulkan_only_claim_is_pinned_word_for_word() {
+        assert_eq!(
+            VULKAN_ONLY_SUPPORT_CLAIM,
+            "not supported by ROCm; the Vulkan backend can still be used"
         );
     }
 

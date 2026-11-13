@@ -132,7 +132,9 @@ pub use fix::{
     apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
     list_recipes as list_fix_recipes,
 };
-pub use gfx_target::{GpuSupportLevel, gpu_support_level, gpu_support_level_for_host_gpu};
+pub use gfx_target::{
+    GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level, gpu_support_level_for_host_gpu,
+};
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
     normalize_therock_family,

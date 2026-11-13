@@ -469,16 +469,28 @@ where
 /// is a *start* gate: it is tested before each probe, never inside one, so a
 /// probe begun at 9.99s still runs to its own timeout. The arithmetic is 10s
 /// of elapsed budget plus Lemonade's 8s `INFERENCE_PROBE_TIMEOUT`. That bound
-/// applies equally to the chat `services` tool, which renders through the same
+/// applies equally to `rocm chat` when its natural-language interpreter
+/// resolves a request to the `services` command: that path runs the real
+/// command in process (`chat::mcp_bridge`'s `run_rocm_read_only_in_process`)
+/// and so renders through the same
 /// [`crate::services_text::render_services_text`].
+///
+/// It does *not* apply to the structured MCP tool that is also named
+/// `services`. That one renders through `chat::mcp_bridge`'s
+/// `render_services_tool_result_text`, a different and older function with no
+/// `device:` row, so a bridge client calling the tool makes no probe and waits
+/// for nothing — unlike the sibling `engines` MCP tool, which ROCMAI-550 did
+/// make host-aware. The shared name is the trap, so this says which surface it
+/// means (review on #678); giving the tool the row is a change in its own
+/// right, not something this constant may be read as already covering.
 ///
 /// # The decision, recorded (review on #678)
 ///
-/// This is accepted rather than merely observed. `rocm services list` and the
-/// chat `services` tool can both block ~18s on a host whose engines are slow to
-/// answer, and for the duration the built-in probe holds the process-wide
-/// engine env lock [`with_scoped_builtin_engine_env`] takes, so a concurrent
-/// caller waits behind it.
+/// This is accepted rather than merely observed. `rocm services list` and
+/// `rocm chat`'s `services` command can both block ~18s on a host whose
+/// engines are slow to answer, and for the duration the built-in probe holds
+/// the process-wide engine env lock [`with_scoped_builtin_engine_env`] takes,
+/// so a concurrent caller waits behind it.
 ///
 /// Two cheaper options were considered and not taken. Moving the probe off the
 /// render path means the row stops reflecting the host at the moment it is
