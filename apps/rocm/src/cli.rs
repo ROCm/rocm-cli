@@ -233,6 +233,12 @@ pub(crate) enum Command {
     /// marked that way today: a GPU ROCm has no runtime build for is a fact
     /// about the hardware, not something to put right).
     /// Use `--dry-run` to see any fix's plan without changing anything.
+    ///
+    /// A fix whose command fails exits 4 and says why on stderr. A command that
+    /// does not finish within its time limit is stopped and also exits 4; the
+    /// change may then be partial, so the message names how to check it and the
+    /// `rocm fix` command to re-run. On Windows, a fix that cannot read the
+    /// variable it changes stops before changing anything, with exit 4.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,

@@ -43,13 +43,13 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// found". This one needs only `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 
-/// The recipe used to prove a failed helper command is explained on stderr with
-/// exit code 4. `fix-4-render-group` is the only AUTO recipe whose command-failure
-/// branch this suite can force deterministically: its helper (`usermod`, run
-/// directly as root or via `sudo` otherwise) is resolved off `$PATH`, so a
-/// scenario-controlled `$PATH` (see `command_fails_bin_dir`) can stand a fake
-/// `usermod`/`sudo` in for it, unconditionally failing, without needing real
-/// root or touching real group membership.
+/// The recipe used to prove a failed or timed-out helper command is explained
+/// on stderr with exit code 4. `fix-4-render-group` is the only AUTO recipe whose
+/// command-failure branch this suite can force deterministically: its helper
+/// (`usermod`, run directly as root or via `sudo` otherwise) is resolved off
+/// `$PATH`, so a scenario-controlled `$PATH` (see `command_fails_bin_dir`) can
+/// stand a fake `usermod`/`sudo` in for it, failing or never finishing, without
+/// needing real root or touching real group membership.
 const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
 /// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
@@ -267,6 +267,26 @@ fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
         .expect("no isolated root")
         .path()
         .join("fake-bin")
+}
+
+/// Where the fake `usermod`/`sudo` record each call, one `<name> <args>` line
+/// per call. Outside [`command_fails_bin_dir`] so it is not on the CLI's PATH.
+fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin-calls.log")
+}
+
+/// The `$USER` the render-group scenarios run the fix as.
+const RENDER_GROUP_USER: &str = "e2e-test-user";
+
+/// The line `fix-4-render-group` prints once the user was added. Built from
+/// the same user the scenario sets, and absent from every failure path.
+fn render_group_success_line() -> String {
+    format!("Added {RENDER_GROUP_USER} to render,video.")
 }
 
 // ── Given ──────────────────────────────────────────────────────────
@@ -518,23 +538,47 @@ async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
 
 #[given("a user who has approved a fix whose helper command will fail")]
 async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
+    plant_render_group_helpers(world, "exit 1");
+}
+
+#[given("a user who has approved a fix whose helper command never finishes")]
+async fn user_approved_fix_that_never_finishes(world: &mut E2eWorld) {
+    // `exec`, so the process `rocm` started *is* the sleep: the executor stops
+    // only its direct child, and a `sleep` left as the shell's own child would
+    // outlive the scenario by ten minutes. The absolute path because the
+    // scenario's PATH holds only the stand-ins.
+    plant_render_group_helpers(world, "exec /bin/sleep 600");
+}
+
+/// Stands fake `usermod`/`sudo` scripts in for the fix's helper on a `$PATH`
+/// holding nothing else. Each appends `<name> <args>` to
+/// [`render_group_helper_log`] and then runs `tail`, so a scenario can say
+/// both what the CLI reported and what it asked the helper to do.
+fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
     let bin_dir = command_fails_bin_dir(world);
     std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
+    let log = render_group_helper_log(world);
+    let log = log.to_str().expect("the scenario root is UTF-8");
+    assert!(
+        !log.contains('\''),
+        "the helper log path is single-quoted in the stand-in script: {log}"
+    );
     // `usermod` only has to exist for the `which` probe; the command actually run
     // -- `usermod` directly if already root, `sudo usermod ...` otherwise -- goes
-    // through one of these two scripts either way, and both fail unconditionally.
+    // through one of these two scripts either way.
     for name in ["usermod", "sudo"] {
         let script = bin_dir.join(name);
-        rocm_core::fake_executable::write_fake_executable(&script, "#!/bin/sh\nexit 1\n")
+        let body = format!("#!/bin/sh\necho \"{name} $*\" >> '{log}'\n{tail}\n");
+        rocm_core::fake_executable::write_fake_executable(&script, body)
             .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
     }
     // Restricting `$PATH` to only the fakes above also makes the recipe's
     // root-detection deterministic: it shells out to `id -u`, which is not on
     // this PATH, so the spawn itself fails and reads as "not root" regardless of
-    // who runs the suite -- the same `sudo usermod` branch fails on every host,
+    // who runs the suite -- the same `sudo usermod` branch runs on every host,
     // CI or developer machine, root or not.
     world.command_env.push(("PATH", bin_dir.into_os_string()));
-    world.command_env.push(("USER", "e2e-test-user".into()));
+    world.command_env.push(("USER", RENDER_GROUP_USER.into()));
     world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
@@ -574,16 +618,31 @@ async fn user_on_windows_with_hip_sdk_and_no_powershell(world: &mut E2eWorld) {
     world
         .command_env
         .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    deny_powershell(world);
+    world.model_name = Some(PATH_FIX_ID.to_string());
+}
+
+#[given("a Windows host where PowerShell cannot be found")]
+async fn windows_host_without_powershell(world: &mut E2eWorld) {
+    deny_powershell(world);
+}
+
+#[given("a user who has chosen the fix that hides the integrated GPU")]
+async fn user_chose_igpu_fix(world: &mut E2eWorld) {
+    world.model_name = Some(MUTATING_FIX_ID.to_string());
+}
+
+/// Gives the CLI an empty `PATH`, so its own PowerShell reads cannot start.
+fn deny_powershell(world: &mut E2eWorld) {
     // An empty child PATH means the CLI's own `Command::new("powershell")`
     // cannot resolve the binary at all -- `powershell.exe` lives under
     // `System32\WindowsPowerShell\v1.0`, which Windows does NOT search
     // unconditionally the way it does System32 itself, so this is a real
     // instance of the "PowerShell missing" cause `ps_env_scope`'s doc comment
-    // names, not a faked one. Nothing here touches the real machine's
-    // User-scope PATH, so no capture/restore is needed: the read never gets
-    // far enough to risk it.
+    // names, not a faked one. Every fix that reads a User-scope value stops
+    // at that read, so nothing on the real machine is touched and no
+    // capture/restore is needed.
     world.command_env.push(("PATH", std::ffi::OsString::new()));
-    world.model_name = Some(PATH_FIX_ID.to_string());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -675,6 +734,16 @@ async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
 async fn user_applies_approved_fix(world: &mut E2eWorld) {
     let fix_id = world.model_name.clone().expect("no fix id set");
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply the approved fix to the second GPU")]
+async fn user_applies_approved_fix_to_second_gpu(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--device-index", "1", "--yes"]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -1674,13 +1743,90 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
     );
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        stderr.contains("usermod exited") && stderr.contains("group membership NOT changed"),
+        stderr.contains("usermod exited 1; group membership NOT changed."),
         "the command-failure explanation must be on stderr:\n{stderr}"
     );
     let stdout = world.cli_output.as_deref().unwrap_or("");
     assert!(
         !stdout.contains("group membership NOT changed"),
         "the command-failure explanation must not also be on stdout:\n{stdout}"
+    );
+    // "NOT changed" is a claim about state: it holds only for a change that
+    // was asked for, refused, and not then reported as made.
+    assert!(
+        !stdout.contains(&render_group_success_line()),
+        "a failed helper must not be followed by the success line:\n{stdout}"
+    );
+    assert_render_group_helper_was_asked(world);
+}
+
+#[then(
+    "the CLI reports on stderr, with exit code 4, that the helper was stopped after a minute, how to check the change and which fix to re-run"
+)]
+async fn assert_command_timeout_reported_on_stderr(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a helper stopped at the deadline is a failed attempt, exit 4:\n{stdout}\n{stderr}"
+    );
+    // Not run as root (see `plant_render_group_helpers`), so the command is
+    // `sudo usermod`; the bound is the fix's own one-minute RUN_TIMEOUT.
+    let expected = format!(
+        "sudo usermod timed out after 60s and was stopped; group membership may or may not have \
+         changed. Check with `id -nG {RENDER_GROUP_USER}`, then re-run \
+         `rocm fix {COMMAND_FAILURE_FIX_ID}` if it did not."
+    );
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "expected the timeout line on stderr:\n  {expected}\ngot:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("timed out"),
+        "the timeout explanation must not also be on stdout:\n{stdout}"
+    );
+}
+
+#[then("the CLI claims neither that the change was made nor that nothing changed")]
+async fn assert_no_claim_about_the_unfinished_change(world: &mut E2eWorld) {
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    // The CLI stopped `sudo`, not `usermod`, so either claim could be false.
+    assert!(
+        !combined.contains("NOT changed"),
+        "a stopped helper may have made the change; the CLI must not say it did not:\n{combined}"
+    );
+    assert!(
+        !combined.contains(&render_group_success_line()),
+        "a stopped helper may not have made the change; the CLI must not say it did:\n{combined}"
+    );
+}
+
+#[then("the helper was asked to add the user to the render and video groups")]
+async fn assert_render_group_helper_asked(world: &mut E2eWorld) {
+    assert_render_group_helper_was_asked(world);
+}
+
+/// The stand-in's log shows the CLI asked to add [`RENDER_GROUP_USER`] to the
+/// render and video groups, via `sudo` or directly.
+fn assert_render_group_helper_was_asked(world: &E2eWorld) {
+    let log_path = render_group_helper_log(world);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!(
+            "the helper stand-in was never run ({}: {e}), so the reported outcome is about a \
+             command that did not happen",
+            log_path.display()
+        )
+    });
+    let asked = format!("usermod -a -G render,video {RENDER_GROUP_USER}");
+    assert!(
+        log.lines()
+            .any(|line| line == format!("sudo {asked}") || line == asked),
+        "expected the helper to be asked `{asked}`; it recorded:\n{log}"
     );
 }
 
@@ -1737,24 +1883,90 @@ async fn assert_path_fix_prepended_with_apostrophe_intact(world: &mut E2eWorld) 
 
 #[then("the CLI aborts the PATH fix with exit code 4 and changes nothing")]
 async fn assert_path_fix_aborts_on_unreadable_path(world: &mut E2eWorld) {
-    let output = world.cli_output.as_deref().unwrap_or("");
+    // Exit 4 -- the same code as a write failure -- rather than a failed read
+    // being silently treated as an empty PATH (ROCMAI-449).
+    assert_read_failure_stops_the_fix(
+        world,
+        "PATH",
+        &["Plan: prepend", "This only takes effect in NEW shells"],
+    );
+}
+
+#[then(
+    "the CLI stops with exit code 4, saying it could not read the saved override and that nothing was changed"
+)]
+async fn assert_override_fix_aborts_on_unreadable_scope(world: &mut E2eWorld) {
+    assert_read_failure_stops_the_fix(
+        world,
+        "HSA_OVERRIDE_GFX_VERSION",
+        &["Cleared from User scope"],
+    );
+}
+
+#[then("the CLI does not report the override as already gone")]
+async fn assert_override_not_reported_gone(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    for claim in ["No persistent HSA_OVERRIDE_GFX_VERSION", "You're done"] {
+        assert!(
+            !stdout.contains(claim),
+            "a value that could not be read must not be reported as absent ({claim:?}):\n{stdout}"
+        );
+    }
+}
+
+#[then(
+    "the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed"
+)]
+async fn assert_igpu_fix_aborts_on_unreadable_scope(world: &mut E2eWorld) {
+    assert_read_failure_stops_the_fix(
+        world,
+        "HIP_VISIBLE_DEVICES",
+        &["setx only takes effect in NEW shells"],
+    );
+}
+
+#[then("no plan to save a device setting is printed")]
+async fn assert_no_device_setting_plan(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    for line in [
+        "Plan: persist HIP_VISIBLE_DEVICES",
+        "already sets HIP_VISIBLE_DEVICES",
+    ] {
+        assert!(
+            !stdout.contains(line),
+            "a failed read must stop the fix before it plans or judges a write ({line:?}):\n{stdout}"
+        );
+    }
+}
+
+/// A Windows fix whose User-scope read of `var` could not complete exits 4
+/// with the one line that says so and that nothing was changed, and prints
+/// none of `after`, the lines only a fix that went on would print.
+fn assert_read_failure_stops_the_fix(world: &E2eWorld, var: &str, after: &[&str]) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert_eq!(
         world.cli_rc,
         Some(4),
-        "a failed PATH read must abort with exit code 4 -- the same code as a \
-         write failure -- rather than being silently treated as an empty PATH \
-         (ROCMAI-449):\n{output}\n{stderr}"
+        "a read that did not complete must stop the fix with exit 4:\n{stdout}\n{stderr}"
     );
-    let combined = format!("{output}\n{stderr}");
+    // How PowerShell failed to start is the host's to say (not found, or a
+    // spawn error), so the middle of the line is not pinned.
+    let start = format!("Could not read the current User {var}: PowerShell ");
+    let end = "; nothing was changed.";
     assert!(
-        combined.contains("Could not read the current User PATH"),
-        "expected the abort message naming the failed read:\n{combined}"
+        stderr
+            .lines()
+            .any(|line| line.starts_with(&start) && line.ends_with(end)),
+        "expected a stderr line `{start}...{end}`:\n{stderr}"
     );
-    assert!(
-        !combined.contains("Plan: prepend"),
-        "a failed read must abort before any write plan is printed:\n{combined}"
-    );
+    let combined = format!("{stdout}\n{stderr}");
+    for line in after {
+        assert!(
+            !combined.contains(line),
+            "a failed read must stop the fix before {line:?}:\n{combined}"
+        );
+    }
 }
 
 // ── `rocm diagnose --model` ────────────────────────────────────────

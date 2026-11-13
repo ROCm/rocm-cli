@@ -260,6 +260,12 @@ passes — the GPU is AMD or no vendor was named.
      pinned. Once the user knows N, re-run with
      `rocm fix fix-9-igpu-dgpu --device-index N`.
 
+   If `rocm fix` exits 4, the command it ran failed or did not finish in time.
+   Relay its stderr line. After a timeout that line says the change may or may
+   not have been made, and names a command to check it and the `rocm fix`
+   command to re-run; do not tell the user the fix was applied, or that nothing
+   changed, until that check has been run.
+
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 
 Use `rocm examine` (or `rocm examine --json`) when you only need the host state

@@ -858,10 +858,12 @@ mod tests {
             "apply",
             "act_on",
             "run_render_group",
+            "render_group_with",
             "run_unset_override",
             "run_unset_override_linux",
             "report_persistent_override",
             "run_unset_override_windows",
+            "unset_override_windows_with",
             "report_and_clear_override_windows",
             "run_path_export",
             "run_path_export_linux",
@@ -871,6 +873,7 @@ mod tests {
             "run_hip_visible_devices_linux",
             "pin_device_in_rc_file",
             "run_hip_visible_devices_windows",
+            "hip_visible_devices_windows",
         ] {
             assert!(
                 scan.checked.iter().any(|name| name == runner),

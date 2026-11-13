@@ -215,6 +215,11 @@ Feature: Diagnosing failures and listing fixes
   # `fix-4-render-group`'s `applies_on` does not include `wsl`, so on a WSL2
   # host the CLI refuses it as the wrong platform before ever invoking the
   # (faked) `usermod` — there is no command-failure branch to reach there.
+  #
+  # The Then step also holds the claim against the state: the stand-in records
+  # that it was asked to add the user to the groups, and the success line is
+  # absent, so "NOT changed" is said about a change that was attempted and
+  # refused, not about one that never ran or quietly went through.
   @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux @requires-bare-metal
   Scenario: diagnose-15 - A fix whose helper command fails explains why, on stderr, with exit code 4
     Given a user who has approved a fix whose helper command will fail
@@ -601,7 +606,8 @@ Feature: Diagnosing failures and listing fixes
   # `ps_env_scope`'s doc comment names -- "PowerShell missing") rather than
   # faking the read failing, so the abort this proves is a real one, not a
   # simulated one, and it never touches the real User PATH at all, so no
-  # capture/restore is needed here.
+  # capture/restore is needed here. diagnose-63 and diagnose-64 hold fix-2 and
+  # fix-9 to the same rule.
   @id:diagnose-fix-path-aborts-on-unreadable-user-path @requires-os:windows
   Scenario: diagnose-39 - A fix-6-path run that cannot read the real User PATH aborts instead of wiping it
     Given a Windows host with a HIP SDK install and no way to resolve PowerShell
@@ -914,3 +920,42 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose the error in each file
     Then each is refused as a usage error that names the file and says why
     And nothing is diagnosed
+
+  # The sibling of diagnose-15 the reported bug was about: the helper command
+  # never finishes. The CLI stops it at the fix's one-minute bound, but it can
+  # only stop the command it started (`sudo`), so the change may still have
+  # been made. Before ROCMAI-345 this was reported as "usermod exited 124;
+  # group membership NOT changed." -- naming no timeout and claiming a state
+  # nobody had checked. The stand-in records its arguments and then sleeps far
+  # past the bound, so the scenario waits out the real minute: there is no
+  # test-only way to shorten it, on purpose, so the bound under test is the one
+  # users get. Same lane as diagnose-15, for the same reasons.
+  @id:diagnose-fix-command-timeout-says-change-may-be-partial @requires-os:linux @requires-bare-metal
+  Scenario: diagnose-62 - A fix whose helper command never finishes says the change may be partial and how to check it
+    Given a user who has approved a fix whose helper command never finishes
+    When the user asks the CLI to apply the approved fix
+    Then the CLI reports on stderr, with exit code 4, that the helper was stopped after a minute, how to check the change and which fix to re-run
+    And the CLI claims neither that the change was made nor that nothing changed
+    And the helper was asked to add the user to the render and video groups
+
+  # A User-scope read that cannot complete used to be taken as "not set": with
+  # nothing in the Machine scope either, fix-2 printed that no persistent
+  # override was found and the user was done, and exited 0, on a machine that
+  # may still carry it. Same real "PowerShell missing" cause as diagnose-39.
+  @id:diagnose-fix-override-aborts-on-unreadable-user-scope @requires-os:windows
+  Scenario: diagnose-63 - Clearing the GPU override stops when the saved value cannot be read, instead of calling it gone
+    Given a Windows host where PowerShell cannot be found
+    And a user who has chosen the fix for the GPU override
+    When the user asks the CLI to apply the approved fix
+    Then the CLI stops with exit code 4, saying it could not read the saved override and that nothing was changed
+    And the CLI does not report the override as already gone
+
+  # The same failed read made fix-9 skip its "already set" guard and overwrite
+  # a User-scope device setting the user may have chosen on purpose.
+  @id:diagnose-fix-igpu-aborts-on-unreadable-user-scope @requires-os:windows
+  Scenario: diagnose-64 - Pinning the discrete GPU stops when the saved device setting cannot be read, before planning a write
+    Given a Windows host where PowerShell cannot be found
+    And a user who has chosen the fix that hides the integrated GPU
+    When the user asks the CLI to apply the approved fix to the second GPU
+    Then the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed
+    And no plan to save a device setting is printed

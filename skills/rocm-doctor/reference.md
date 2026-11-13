@@ -105,7 +105,7 @@ id is refused, and the refusal exits 1 (see the table). Exit codes:
 | 1 | internal error; also the refusal of `--json` together with a fix id |
 | 2 | usage error (incl. unknown fix-id) |
 | 3 | not applicable on this host (OS mismatch, negative `--device-index`) — nothing changed |
-| 4 | attempted but the command failed |
+| 4 | attempted but the command failed or timed out; after a timeout the change may be partial — the message names how to check it and what to re-run |
 | 5 | user declined at the prompt |
 
 Three ids are ever auto-applicable — never four, and `fix-9-igpu-dgpu` is not

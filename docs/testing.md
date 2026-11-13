@@ -2916,6 +2916,39 @@ catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 ([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
+When a fix's own command does not succeed, `rocm fix` exits 4 and prints one
+line on stderr, built from how the command ended
+(`Step` in [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs)):
+
+| How the command ended | What the line says |
+|---|---|
+| exited non-zero, or could not be started | it exited `N` (or could not be started), and the change was NOT made |
+| timed out (60s for a change), or was stopped by a signal or a failed wait | it was stopped, the change may or may not have been made, a command to check it, and the `rocm fix` command to re-run |
+| a Windows read of the current value did not complete (8s) | it could not read the current value, and nothing was changed; the fix stops before any plan or prompt |
+
+Each row for each runner is unit-tested with an injected command runner in
+[fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) and
+[fix/consent.rs](../crates/rocm-core/src/fix/consent.rs), on every host. The
+scenarios in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-62`
+(it never finishes) stand a fake `sudo` on a restricted `PATH` that records the
+arguments it was given, and assert the line together with the exit code, that
+the helper was asked to add the user to the groups, and that the success line is
+absent. `diagnose-62` waits out the real one-minute bound; there is no switch to
+shorten it. Both are `@requires-os:linux @requires-bare-metal`. On Windows,
+`diagnose-39` (fix-6), `diagnose-63` (fix-2) and `diagnose-64` (fix-9 with
+`--device-index 1`) give the CLI an empty `PATH`, so its PowerShell read cannot
+start, and assert exit 4, the read-failure line, and that the fix printed no plan
+and did not report the variable as absent. They run on the Windows lanes only;
+the Linux lanes compile them. No scenario times out a Windows `setx` or
+PowerShell write: those rows are covered by the unit tests. To run the two
+Linux scenarios on a bare-metal Linux host (`-n` skips the tag gates, so on WSL2
+they fail at the platform refusal instead):
+
+```bash
+cargo xtask e2e -- -n '(diagnose-15|diagnose-62) '
+```
+
 Provider audit focused test:
 
 ```bash

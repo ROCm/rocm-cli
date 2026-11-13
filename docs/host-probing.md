@@ -306,7 +306,7 @@ One pair per change. Each begins with a commit that adds a characterisation test
 
 The later steps of item 6, each its own change and all still open:
 
-- Retire the adapters site by site, as items 2 to 5 remove call sites: a probe that calls `run_bounded` directly reads the typed outcome, so "not installed" stays quiet and "timed out" becomes a `probe_failures` entry without parsing a message, which the adapters cannot do because they keep their return shapes.
+- Retire the adapters site by site, as items 2 to 5 remove call sites: a probe that calls `run_bounded` directly reads the typed outcome, so "not installed" stays quiet and "timed out" becomes a `probe_failures` entry without parsing a message, which the adapters cannot do because they keep their return shapes. The `rocm fix` runners' commands and their Windows env-scope reads already do: they run through `run_step` in [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs), so a timed-out step is reported as one, not as exit code `124`. The one other command the runners start, the `id -u` root check, still goes through `run`.
 - Move `wait_with_output_bounded` in [process.rs](../apps/rocm/src/therock/process.rs) of `apps/rocm` onto the executor, which is the last helper of [#623](https://github.com/ROCm/rocm-cli/issues/623) that still joins its readers with no limit, and decide where `rocmd`'s `parse_sandbox_child_output` quote is bounded.
 - Make the candidate loop of `capture_optional_command_with_timeout` stop on a timeout instead of starting the next spelling of a program that hung.
 - Decide whether the runners refuse to resolve a bare program name through an empty `PATH` entry, and whether the adapters take a per-call drain grace: two items of the open list below.

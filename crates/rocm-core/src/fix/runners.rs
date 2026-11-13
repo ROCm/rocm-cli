@@ -11,8 +11,10 @@
 //! the catalog in `fix/catalog.rs` names the entry point of each recipe's
 //! runner and the running OS decides which variant runs.
 
-use super::consent::{QUERY_TIMEOUT, RUN_TIMEOUT, confirm, fail, relay_output};
+use super::catalog::{IGPU_DGPU_ID, PATH_ID, RENDER_GROUP_ID, UNSET_OVERRIDE_ID};
+use super::consent::{QUERY_TIMEOUT, RUN_TIMEOUT, Step, confirm, fail, read_failure, run_step};
 use super::options::{FixOptions, exit};
+use crate::command_capture::{CommandCapture, CommandOutcome};
 use crate::probe_exec::{run, which};
 use crate::quoting::ps_single_quote_escape;
 #[cfg(test)]
@@ -22,6 +24,7 @@ use crate::rocm_install::{
 use crate::runtime_is_windows;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Environment helpers
@@ -82,26 +85,31 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
         fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
         return exit::NOT_APPLICABLE;
     }
-    let (program, args): (&str, Vec<String>) = if root {
-        (
-            "usermod",
-            vec![
-                "-a".into(),
-                "-G".into(),
-                "render,video".into(),
-                user.clone(),
-            ],
-        )
+    render_group_with(opts, &user, root, run_step, &mut std::io::stderr())
+}
+
+/// Does the plan/consent/run work for [`run_render_group`] once the user and
+/// the privilege route are known, with the command runner and the stderr sink
+/// injected so every way `usermod` can end is testable on any host.
+///
+/// A `usermod` stopped by the timeout is reported as such, not as an exit
+/// code: the executor stops only `sudo`, so `usermod` may still finish, and
+/// the line says how to find out (`id -nG`) and what to re-run.
+fn render_group_with(
+    opts: &FixOptions,
+    user: &str,
+    root: bool,
+    mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    err: &mut impl Write,
+) -> i32 {
+    let usermod_args = ["-a", "-G", "render,video", user];
+    let (program, label, args): (&str, &str, Vec<&str>) = if root {
+        ("usermod", "usermod", usermod_args.to_vec())
     } else {
         (
             "sudo",
-            vec![
-                "usermod".into(),
-                "-a".into(),
-                "-G".into(),
-                "render,video".into(),
-                user.clone(),
-            ],
+            "sudo usermod",
+            std::iter::once("usermod").chain(usermod_args).collect(),
         )
     };
     println!("Will run: {program} {}", args.join(" "));
@@ -112,12 +120,19 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
     if !confirm("Add user to render,video groups?", opts.yes) {
         return exit::DECLINED;
     }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (rc, out, err) = run(program, &arg_refs, RUN_TIMEOUT);
-    relay_output(&out, &err);
-    if rc != 0 {
-        fail!("usermod exited {rc}; group membership NOT changed.");
-        return exit::FAILED;
+    let check = format!("id -nG {user}");
+    let rerun = format!("rocm fix {RENDER_GROUP_ID}");
+    let step = Step {
+        program,
+        args: &args,
+        label,
+        what: "group membership",
+        check: &check,
+        rerun: &rerun,
+        timeout: RUN_TIMEOUT,
+    };
+    if let Err(code) = step.run(&mut run, err) {
+        return code;
     }
     println!("Added {user} to render,video.");
     println!(
@@ -201,23 +216,51 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
         println!("Note: clearing it in your Windows env scope does NOT affect this");
         println!("already-open shell -- close and reopen your terminal afterwards.");
     }
-    // A failed read here only affects this report-and-clear path, which never
-    // overwrites the whole variable (it only clears it via a dedicated
-    // `setx VAR ""`), so collapsing a failed read to "unset" preserves this
-    // function's existing behavior; it is `path_export_windows`'s
-    // read-then-overwrite-the-whole-value shape that made that collapse unsafe.
-    let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User").unwrap_or_default();
-    let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine").unwrap_or_default();
-    report_and_clear_override_windows(opts, &user_val, &machine_val, |prompt| {
-        confirm(prompt, opts.yes)
-    })
+    unset_override_windows_with(
+        opts,
+        run_step,
+        |prompt| confirm(prompt, opts.yes),
+        &mut std::io::stderr(),
+    )
 }
 
+/// Reads both env scopes through `run`, then hands over to
+/// [`report_and_clear_override_windows`].
+///
+/// A read that does not complete stops the fix before anything is printed as
+/// found or offered for clearing: read as "unset", it would report "No
+/// persistent HSA_OVERRIDE_GFX_VERSION found ... You're done" on a machine
+/// that still carries the override, which is the one thing this fix is for.
+fn unset_override_windows_with(
+    opts: &FixOptions,
+    mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    consent: impl FnOnce(&str) -> bool,
+    err: &mut impl Write,
+) -> i32 {
+    let mut values = [String::new(), String::new()];
+    for (value, scope) in values.iter_mut().zip(["User", "Machine"]) {
+        match ps_env_scope(&mut run, OVERRIDE_VAR, scope) {
+            Ok(read) => *value = read,
+            Err(failure) => {
+                let _ = writeln!(err, "{}", failure.line);
+                return failure.code;
+            }
+        }
+    }
+    let [user_val, machine_val] = values;
+    report_and_clear_override_windows(opts, &user_val, &machine_val, consent, run, err)
+}
+
+/// The variable fix-2 clears.
+const OVERRIDE_VAR: &str = "HSA_OVERRIDE_GFX_VERSION";
+
 /// Does the reporting/clearing work for [`run_unset_override_windows`], with
-/// the User/Machine scope values and the consent prompt taken as parameters
-/// rather than read from `ps_env_scope`/`confirm` directly. That's what makes
-/// the decline path testable without a real Windows host -- same reason
-/// [`pin_device_in_rc_file`] takes its consent as a closure.
+/// the User/Machine scope values, the consent prompt, the command runner and
+/// the stderr sink taken as parameters rather than read from
+/// `ps_env_scope`/`confirm`/`run_step` directly. That's what makes the
+/// decline and the `setx` failure paths testable without a real Windows
+/// host -- same reason [`pin_device_in_rc_file`] takes its consent as a
+/// closure.
 ///
 /// A decline must still exit `5`: `skills/rocm-doctor/reference.md` documents
 /// `5` as "user declined", and a caller (human or agent) relies on that to
@@ -232,6 +275,8 @@ fn report_and_clear_override_windows(
     user_val: &str,
     machine_val: &str,
     consent: impl FnOnce(&str) -> bool,
+    mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    err: &mut impl Write,
 ) -> i32 {
     if user_val.is_empty() && machine_val.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in either the User");
@@ -253,7 +298,7 @@ fn report_and_clear_override_windows(
         // 5.1 drops an empty argument, so pasting the line would not clear
         // anything; the plan above carries the line to paste. The text is built
         // from the argument list that is run, so the two cannot differ.
-        let setx_args = ["HSA_OVERRIDE_GFX_VERSION", ""];
+        let setx_args = [OVERRIDE_VAR, ""];
         let shown: Vec<String> = setx_args.iter().map(|a| format!("\"{a}\"")).collect();
         println!(
             "  The CLI runs (arguments, not a line to paste): setx {}",
@@ -262,11 +307,19 @@ fn report_and_clear_override_windows(
         if opts.dry_run {
             println!("  (dry-run; not executed)");
         } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
-            let (rc, out, err) = run("setx", &setx_args, RUN_TIMEOUT);
-            relay_output(&out, &err);
-            if rc != 0 {
-                fail!("setx exited {rc}; User scope NOT changed.");
-                return exit::FAILED;
+            let check = env_scope_query(OVERRIDE_VAR, "User");
+            let rerun = format!("rocm fix {UNSET_OVERRIDE_ID}");
+            let step = Step {
+                program: "setx",
+                args: &setx_args,
+                label: "setx",
+                what: "User-scope HSA_OVERRIDE_GFX_VERSION",
+                check: &check,
+                rerun: &rerun,
+                timeout: RUN_TIMEOUT,
+            };
+            if let Err(code) = step.run(&mut run, err) {
+                return code;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
         } else {
@@ -372,7 +425,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         return exit::NOT_APPLICABLE;
     }
     let bin_dir = bin_dir.to_string_lossy().into_owned();
-    path_export_windows(opts, &bin_dir, || ps_env_scope("PATH", "User"))
+    path_export_windows(opts, &bin_dir, run_step, &mut std::io::stderr())
 }
 
 /// The literal value that will replace User-scope PATH on a non-empty
@@ -396,12 +449,12 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
 }
 
 /// Does the read/plan/write work for [`run_path_export_windows`], with the
-/// User-scope PATH read taken as an injected closure rather than calling
-/// `ps_env_scope` directly. That's what makes the "read failed" branch
-/// testable on any host -- same reason [`report_and_clear_override_windows`]
-/// takes consent as a closure.
+/// command runner (both the User-scope PATH read and the write) and the stderr
+/// sink injected. That's what makes the "read failed" and "write stopped"
+/// branches testable on any host -- same reason
+/// [`report_and_clear_override_windows`] takes consent as a closure.
 ///
-/// A failed read (`None`) must never be treated as "PATH is empty": the
+/// A failed read must never be treated as "PATH is empty": the
 /// write below replaces the *entire* User PATH value, so collapsing a
 /// PowerShell failure into "nothing there" would wipe the user's real PATH
 /// down to just `bin_dir`. So a failed read aborts here, before the
@@ -411,11 +464,15 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
 fn path_export_windows(
     opts: &FixOptions,
     bin_dir: &str,
-    read_user_path: impl FnOnce() -> Option<String>,
+    mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    err: &mut impl Write,
 ) -> i32 {
-    let Some(user_path) = read_user_path() else {
-        fail!("Could not read the current User PATH; User PATH NOT changed.");
-        return exit::FAILED;
+    let user_path = match ps_env_scope(&mut run, "PATH", "User") {
+        Ok(user_path) => user_path,
+        Err(failure) => {
+            let _ = writeln!(err, "{}", failure.line);
+            return failure.code;
+        }
     };
     if !user_path.is_empty() && user_path.to_lowercase().contains(&bin_dir.to_lowercase()) {
         println!("User PATH already contains {bin_dir}; no change.");
@@ -442,15 +499,19 @@ fn path_export_windows(
     // normal-length PATH can hit even when the read above succeeded.
     let script =
         format!("[Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
-    let (rc, out, err) = run(
-        "powershell",
-        &["-NoProfile", "-Command", &script],
-        RUN_TIMEOUT,
-    );
-    relay_output(&out, &err);
-    if rc != 0 {
-        fail!("PowerShell exited {rc}; User PATH NOT changed.");
-        return exit::FAILED;
+    let check = env_scope_query("PATH", "User");
+    let rerun = format!("rocm fix {PATH_ID}");
+    let step = Step {
+        program: POWERSHELL,
+        args: &["-NoProfile", "-Command", &script],
+        label: "PowerShell",
+        what: "User PATH",
+        check: &check,
+        rerun: &rerun,
+        timeout: RUN_TIMEOUT,
+    };
+    if let Err(code) = step.run(&mut run, err) {
+        return code;
     }
     println!(
         "Added {bin_dir} to your User PATH. This only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
@@ -552,11 +613,28 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         );
         return exit::OK;
     };
-    // Out of scope for ROCMAI-449 (that fix is specific to fix-6-path's
-    // read-then-overwrite-the-whole-PATH-value shape): a failed read here
-    // only risks re-running `setx HIP_VISIBLE_DEVICES <idx>`, which sets a
-    // single unrelated variable rather than overwriting PATH.
-    let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User").unwrap_or_default();
+    hip_visible_devices_windows(opts, idx, run_step, &mut std::io::stderr())
+}
+
+/// Does the read/plan/write work for [`run_hip_visible_devices_windows`] once
+/// a device index is known, with the command runner and the stderr sink
+/// injected, as [`path_export_windows`] does.
+///
+/// A read that does not complete stops the fix: read as "unset", it would skip
+/// the guard below and overwrite a User-scope value the user set on purpose.
+fn hip_visible_devices_windows(
+    opts: &FixOptions,
+    idx: i64,
+    mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    err: &mut impl Write,
+) -> i32 {
+    let existing = match ps_env_scope(&mut run, "HIP_VISIBLE_DEVICES", "User") {
+        Ok(existing) => existing,
+        Err(failure) => {
+            let _ = writeln!(err, "{}", failure.line);
+            return failure.code;
+        }
+    };
     if !existing.is_empty() {
         println!(
             "User scope already sets HIP_VISIBLE_DEVICES={existing:?}; remove or update it manually rather than overwriting from this command."
@@ -572,15 +650,20 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     if !confirm("Set HIP_VISIBLE_DEVICES in the User scope?", opts.yes) {
         return exit::DECLINED;
     }
-    let (rc, out, err) = run(
-        "setx",
-        &["HIP_VISIBLE_DEVICES", &idx.to_string()],
-        RUN_TIMEOUT,
-    );
-    relay_output(&out, &err);
-    if rc != 0 {
-        fail!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
-        return exit::FAILED;
+    let idx_arg = idx.to_string();
+    let check = env_scope_query("HIP_VISIBLE_DEVICES", "User");
+    let rerun = format!("rocm fix {IGPU_DGPU_ID} --device-index {idx}");
+    let step = Step {
+        program: "setx",
+        args: &["HIP_VISIBLE_DEVICES", &idx_arg],
+        label: "setx",
+        what: "User-scope HIP_VISIBLE_DEVICES",
+        check: &check,
+        rerun: &rerun,
+        timeout: RUN_TIMEOUT,
+    };
+    if let Err(code) = step.run(&mut run, err) {
+        return code;
     }
     println!(
         "setx only takes effect in NEW shells -- close this terminal and reopen it before re-running your workload."
@@ -588,25 +671,46 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     exit::OK
 }
 
-/// Read a Windows environment variable from a given scope via PowerShell.
+/// The program the Windows runners read and write env scopes with.
+const POWERSHELL: &str = "powershell";
+
+/// The PowerShell expression that reads `var` from `scope`. Both the read and
+/// the "Check with" line of a stopped write use it, so the check a user is
+/// told to run is the read this fix itself trusts.
+fn env_scope_query(var: &str, scope: &str) -> String {
+    format!("[Environment]::GetEnvironmentVariable('{var}','{scope}')")
+}
+
+/// Read a Windows environment variable from a given scope via PowerShell,
+/// run through `run`.
 ///
-/// Returns `None` if the read itself failed -- PowerShell missing, blocked by
-/// execution policy, or the query timing out -- which must stay distinguishable
-/// from `Some(String::new())`, meaning the read succeeded and the variable is
+/// `Err` if the read itself did not complete -- PowerShell missing, blocked by
+/// execution policy, exiting non-zero, or timing out -- carrying the line and
+/// exit code to stop the fix with. That must stay distinguishable from
+/// `Ok(String::new())`, meaning the read succeeded and the variable is
 /// genuinely unset/empty in that scope. Collapsing both to `""` is what let a
 /// failed PATH read look like an empty PATH to a caller that then wrote the
-/// "empty" value back out, wiping the real one (ROCMAI-449).
-fn ps_env_scope(var: &str, scope: &str) -> Option<String> {
-    let script = format!("[Environment]::GetEnvironmentVariable('{var}','{scope}')");
-    let (rc, out, _) = run(
-        "powershell",
+/// "empty" value back out, wiping the real one (ROCMAI-449), and let fix-2
+/// and fix-9 act on a value they never read.
+fn ps_env_scope(
+    run: &mut impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    var: &str,
+    scope: &str,
+) -> Result<String, super::consent::StepFailure> {
+    let script = env_scope_query(var, scope);
+    let capture = run(
+        POWERSHELL,
         &["-NoProfile", "-Command", &script],
         QUERY_TIMEOUT,
     );
-    if rc == 0 {
-        Some(out.trim().to_owned())
-    } else {
-        None
+    match capture.outcome {
+        CommandOutcome::Exited(0) => Ok(capture.stdout.trim().to_owned()),
+        outcome => Err(read_failure(
+            &format!("the current {scope} {var}"),
+            "PowerShell",
+            outcome,
+            QUERY_TIMEOUT,
+        )),
     }
 }
 
@@ -890,6 +994,496 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ── Host commands: every way a step's command can end ──────────
+    //
+    // ROCMAI-345: the runners used to read the `probe_exec::run` adapter's
+    // collapsed integer, so a timed-out `usermod`/`setx`/PowerShell was
+    // reported as "exited 124; ... NOT changed." -- which named no timeout,
+    // gave no way to recover, and claimed a state nobody had checked (the
+    // executor stops only the direct child, so `usermod` under `sudo` can
+    // still finish). And the Windows reads folded a failed read into "unset",
+    // so fix-2 reported "You're done" and fix-9 skipped its guard and wrote.
+    // These drive each runner through `FakeHost` and assert the exit code, the
+    // commands that ran and the stderr line in the same test.
+
+    /// A stand-in for the host commands a runner runs. A PowerShell read
+    /// (`GetEnvironmentVariable`) answers `read` (or `machine_read` for the
+    /// Machine scope, when set); every other command ends with `write`. Each
+    /// call is recorded as its argv and the timeout it was run under.
+    struct FakeHost<'a> {
+        read: (CommandOutcome, &'a str),
+        machine_read: Option<(CommandOutcome, &'a str)>,
+        write: CommandOutcome,
+        calls: std::cell::RefCell<Vec<(Vec<String>, Duration)>>,
+    }
+
+    impl<'a> FakeHost<'a> {
+        fn new(read: (CommandOutcome, &'a str), write: CommandOutcome) -> Self {
+            Self {
+                read,
+                machine_read: None,
+                write,
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_machine_read(mut self, machine_read: (CommandOutcome, &'a str)) -> Self {
+            self.machine_read = Some(machine_read);
+            self
+        }
+
+        fn runner(&self) -> impl FnMut(&str, &[&str], Duration) -> CommandCapture + '_ {
+            move |program, args, timeout| {
+                let argv: Vec<String> = std::iter::once(program)
+                    .chain(args.iter().copied())
+                    .map(str::to_owned)
+                    .collect();
+                self.calls.borrow_mut().push((argv.clone(), timeout));
+                let (outcome, stdout) = if !is_read(&argv) {
+                    (self.write, "")
+                } else if argv.iter().any(|a| a.contains("'Machine'")) {
+                    self.machine_read.unwrap_or(self.read)
+                } else {
+                    self.read
+                };
+                CommandCapture::from_run(
+                    argv,
+                    outcome,
+                    None,
+                    stdout.as_bytes().to_vec(),
+                    Vec::new(),
+                    None,
+                )
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().iter().map(|(a, _)| a.clone()).collect()
+        }
+
+        /// The commands that were not reads, with the timeout each ran under.
+        fn writes_with_timeouts(&self) -> Vec<(Vec<String>, Duration)> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|(a, _)| !is_read(a))
+                .cloned()
+                .collect()
+        }
+
+        fn writes(&self) -> Vec<Vec<String>> {
+            self.writes_with_timeouts()
+                .into_iter()
+                .map(|(a, _)| a)
+                .collect()
+        }
+    }
+
+    fn is_read(argv: &[String]) -> bool {
+        argv.iter().any(|a| a.contains("GetEnvironmentVariable"))
+    }
+
+    const fn exited(code: i32) -> CommandOutcome {
+        CommandOutcome::Exited(code)
+    }
+
+    /// A read that succeeded and found the variable unset.
+    const fn unset() -> (CommandOutcome, &'static str) {
+        (CommandOutcome::Exited(0), "")
+    }
+
+    fn approved() -> FixOptions {
+        FixOptions {
+            yes: true,
+            ..FixOptions::default()
+        }
+    }
+
+    fn text(err: &[u8]) -> String {
+        String::from_utf8(err.to_vec()).expect("stderr is UTF-8")
+    }
+
+    // fix-4 ------------------------------------------------------------
+
+    const SUDO_USERMOD: [&str; 6] = ["sudo", "usermod", "-a", "-G", "render,video", "alice"];
+
+    fn render_group(write: CommandOutcome) -> (i32, Vec<Vec<String>>, Duration, String) {
+        let host = FakeHost::new(unset(), write);
+        let mut err = Vec::new();
+        let code = render_group_with(&approved(), "alice", false, host.runner(), &mut err);
+        let timeout = host
+            .writes_with_timeouts()
+            .first()
+            .map_or(Duration::ZERO, |(_, t)| *t);
+        (code, host.calls(), timeout, text(&err))
+    }
+
+    #[test]
+    fn render_group_success_runs_usermod_under_sudo_and_returns_0() {
+        let (code, calls, _, err) = render_group(exited(0));
+        assert_eq!(code, exit::OK);
+        assert_eq!(calls, [SUDO_USERMOD.to_vec()]);
+        assert_eq!(err, "", "a success prints no failure line");
+    }
+
+    #[test]
+    fn render_group_as_root_runs_usermod_directly() {
+        let host = FakeHost::new(unset(), exited(0));
+        let code = render_group_with(&approved(), "alice", true, host.runner(), &mut Vec::new());
+        assert_eq!(code, exit::OK);
+        assert_eq!(host.calls(), [SUDO_USERMOD[1..].to_vec()]);
+    }
+
+    #[test]
+    fn render_group_child_failure_says_nothing_changed_and_returns_4() {
+        let (code, calls, _, err) = render_group(exited(1));
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(calls, [SUDO_USERMOD.to_vec()]);
+        assert_eq!(
+            err,
+            "sudo usermod exited 1; group membership NOT changed.\n"
+        );
+    }
+
+    #[test]
+    fn render_group_timeout_says_timed_out_and_how_to_check_not_that_nothing_changed() {
+        let (code, calls, timeout, err) = render_group(CommandOutcome::TimedOut);
+        assert_eq!(code, exit::FAILED, "a timeout is still a failed attempt");
+        assert_eq!(calls, [SUDO_USERMOD.to_vec()]);
+        assert_eq!(
+            timeout, RUN_TIMEOUT,
+            "the line names the bound it ran under"
+        );
+        assert_eq!(
+            err,
+            "sudo usermod timed out after 60s and was stopped; group membership may or may not \
+             have changed. Check with `id -nG alice`, then re-run `rocm fix fix-4-render-group` \
+             if it did not.\n"
+        );
+    }
+
+    #[test]
+    fn render_group_missing_program_says_it_could_not_start() {
+        let (code, _, _, err) = render_group(CommandOutcome::NotFound);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(
+            err,
+            "sudo usermod could not be started: it was not found; group membership NOT changed.\n"
+        );
+    }
+
+    #[test]
+    fn render_group_dry_run_runs_nothing() {
+        let host = FakeHost::new(unset(), exited(0));
+        let opts = FixOptions {
+            dry_run: true,
+            ..approved()
+        };
+        let code = render_group_with(&opts, "alice", false, host.runner(), &mut Vec::new());
+        assert_eq!(code, exit::OK);
+        assert!(host.calls().is_empty());
+    }
+
+    // fix-2 (Windows) --------------------------------------------------
+
+    fn unset_override(host: &FakeHost<'_>) -> (i32, String) {
+        let mut err = Vec::new();
+        let code = unset_override_windows_with(&approved(), host.runner(), |_| true, &mut err);
+        (code, text(&err))
+    }
+
+    #[test]
+    fn unset_override_clears_a_user_scope_value_and_returns_0() {
+        let host = FakeHost::new((exited(0), "10.3.0\r\n"), exited(0)).with_machine_read(unset());
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::OK);
+        assert_eq!(host.writes(), [vec!["setx", OVERRIDE_VAR, ""]]);
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn unset_override_setx_failure_returns_4() {
+        let host = FakeHost::new((exited(0), "10.3.0"), exited(1)).with_machine_read(unset());
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(host.writes(), [vec!["setx", OVERRIDE_VAR, ""]]);
+        assert_eq!(
+            err,
+            "setx exited 1; User-scope HSA_OVERRIDE_GFX_VERSION NOT changed.\n"
+        );
+    }
+
+    #[test]
+    fn unset_override_setx_timeout_says_timed_out_and_how_to_check() {
+        let host = FakeHost::new((exited(0), "10.3.0"), CommandOutcome::TimedOut)
+            .with_machine_read(unset());
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(host.writes_with_timeouts()[0].1, RUN_TIMEOUT);
+        assert_eq!(
+            err,
+            "setx timed out after 60s and was stopped; User-scope HSA_OVERRIDE_GFX_VERSION may or \
+             may not have changed. Check with \
+             `[Environment]::GetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION','User')`, then \
+             re-run `rocm fix fix-2-unset-override` if it did not.\n"
+        );
+    }
+
+    #[test]
+    fn unset_override_setx_missing_says_it_could_not_start() {
+        let host = FakeHost::new((exited(0), "10.3.0"), CommandOutcome::NotFound)
+            .with_machine_read(unset());
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(
+            err,
+            "setx could not be started: it was not found; User-scope HSA_OVERRIDE_GFX_VERSION NOT \
+             changed.\n"
+        );
+    }
+
+    /// The reported bug's read half: a User-scope read that timed out used to
+    /// read as "unset", and with the Machine scope unset too the fix printed
+    /// "No persistent HSA_OVERRIDE_GFX_VERSION found ... You're done" and
+    /// exited 0 on a machine that still carried the override.
+    #[test]
+    fn unset_override_user_read_timeout_stops_before_anything_is_reported_or_cleared() {
+        let host =
+            FakeHost::new((CommandOutcome::TimedOut, ""), exited(0)).with_machine_read(unset());
+        let mut err = Vec::new();
+        let code = unset_override_windows_with(
+            &approved(),
+            host.runner(),
+            |_| panic!("a failed read must not reach the consent gate"),
+            &mut err,
+        );
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty(), "nothing may be written");
+        assert_eq!(
+            host.calls().len(),
+            1,
+            "the Machine scope is not read either"
+        );
+        assert_eq!(
+            text(&err),
+            "Could not read the current User HSA_OVERRIDE_GFX_VERSION: PowerShell timed out after \
+             8s and was stopped; nothing was changed.\n"
+        );
+    }
+
+    #[test]
+    fn unset_override_missing_powershell_stops_before_anything_is_cleared() {
+        let host = FakeHost::new((CommandOutcome::NotFound, ""), exited(0));
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty());
+        assert_eq!(
+            err,
+            "Could not read the current User HSA_OVERRIDE_GFX_VERSION: PowerShell could not be \
+             started: it was not found; nothing was changed.\n"
+        );
+    }
+
+    /// A Machine-scope read that fails must stop the fix too, even when the
+    /// User scope has a value to clear: the report would otherwise omit the
+    /// Machine-scope guidance for a value that may well be there.
+    #[test]
+    fn unset_override_machine_read_failure_stops_before_clearing_the_user_scope() {
+        let host = FakeHost::new((exited(0), "10.3.0"), exited(0))
+            .with_machine_read((CommandOutcome::TimedOut, ""));
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty(), "setx must not run");
+        assert_eq!(
+            err,
+            "Could not read the current Machine HSA_OVERRIDE_GFX_VERSION: PowerShell timed out \
+             after 8s and was stopped; nothing was changed.\n"
+        );
+    }
+
+    #[test]
+    fn unset_override_with_both_scopes_genuinely_unset_is_done_without_writing() {
+        let host = FakeHost::new(unset(), exited(0));
+        let (code, err) = unset_override(&host);
+        assert_eq!(code, exit::OK);
+        assert_eq!(host.calls().len(), 2, "both scopes are read");
+        assert!(host.writes().is_empty());
+        assert_eq!(err, "");
+    }
+
+    // fix-6 (Windows) --------------------------------------------------
+
+    fn path_export(host: &FakeHost<'_>) -> (i32, String) {
+        let mut err = Vec::new();
+        let code = path_export_windows(&approved(), r"C:\ROCm\bin", host.runner(), &mut err);
+        (code, text(&err))
+    }
+
+    #[test]
+    fn path_export_success_writes_the_prepended_path_and_returns_0() {
+        let host = FakeHost::new((exited(0), r"C:\Windows"), exited(0));
+        let (code, err) = path_export(&host);
+        assert_eq!(code, exit::OK);
+        let writes = host.writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0][..3], ["powershell", "-NoProfile", "-Command"]);
+        assert!(
+            writes[0][3].contains(r"'C:\ROCm\bin;C:\Windows'"),
+            "{:?}",
+            writes[0]
+        );
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn path_export_write_failure_returns_4() {
+        let host = FakeHost::new((exited(0), r"C:\Windows"), exited(1));
+        let (code, err) = path_export(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(host.writes().len(), 1);
+        assert_eq!(err, "PowerShell exited 1; User PATH NOT changed.\n");
+    }
+
+    #[test]
+    fn path_export_write_timeout_says_timed_out_and_how_to_check() {
+        let host = FakeHost::new((exited(0), r"C:\Windows"), CommandOutcome::TimedOut);
+        let (code, err) = path_export(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(host.writes_with_timeouts()[0].1, RUN_TIMEOUT);
+        assert_eq!(
+            err,
+            "PowerShell timed out after 60s and was stopped; User PATH may or may not have \
+             changed. Check with `[Environment]::GetEnvironmentVariable('PATH','User')`, then \
+             re-run `rocm fix fix-6-path` if it did not.\n"
+        );
+    }
+
+    #[test]
+    fn path_export_write_missing_powershell_says_it_could_not_start() {
+        let host = FakeHost::new((exited(0), r"C:\Windows"), CommandOutcome::NotFound);
+        let (code, err) = path_export(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(
+            err,
+            "PowerShell could not be started: it was not found; User PATH NOT changed.\n"
+        );
+    }
+
+    #[test]
+    fn path_export_read_timeout_stops_before_the_write_and_says_why() {
+        let host = FakeHost::new((CommandOutcome::TimedOut, ""), exited(0));
+        let (code, err) = path_export(&host);
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty());
+        assert_eq!(
+            err,
+            "Could not read the current User PATH: PowerShell timed out after 8s and was stopped; \
+             nothing was changed.\n"
+        );
+    }
+
+    // fix-9 (Windows) --------------------------------------------------
+
+    fn pin_device(host: &FakeHost<'_>) -> (i32, String) {
+        let mut err = Vec::new();
+        let code = hip_visible_devices_windows(&approved(), 1, host.runner(), &mut err);
+        (code, text(&err))
+    }
+
+    #[test]
+    fn pin_device_success_runs_setx_and_returns_0() {
+        let host = FakeHost::new(unset(), exited(0));
+        let (code, err) = pin_device(&host);
+        assert_eq!(code, exit::OK);
+        assert_eq!(host.writes(), [vec!["setx", "HIP_VISIBLE_DEVICES", "1"]]);
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn pin_device_setx_failure_returns_4() {
+        let host = FakeHost::new(unset(), exited(1));
+        let (code, err) = pin_device(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(host.writes().len(), 1);
+        assert_eq!(
+            err,
+            "setx exited 1; User-scope HIP_VISIBLE_DEVICES NOT changed.\n"
+        );
+    }
+
+    #[test]
+    fn pin_device_setx_timeout_says_timed_out_and_how_to_check() {
+        let host = FakeHost::new(unset(), CommandOutcome::TimedOut);
+        let (code, err) = pin_device(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(host.writes_with_timeouts()[0].1, RUN_TIMEOUT);
+        assert_eq!(
+            err,
+            "setx timed out after 60s and was stopped; User-scope HIP_VISIBLE_DEVICES may or may \
+             not have changed. Check with \
+             `[Environment]::GetEnvironmentVariable('HIP_VISIBLE_DEVICES','User')`, then re-run \
+             `rocm fix fix-9-igpu-dgpu --device-index 1` if it did not.\n"
+        );
+    }
+
+    #[test]
+    fn pin_device_setx_missing_says_it_could_not_start() {
+        let host = FakeHost::new(unset(), CommandOutcome::NotFound);
+        let (code, err) = pin_device(&host);
+        assert_eq!(code, exit::FAILED);
+        assert_eq!(
+            err,
+            "setx could not be started: it was not found; User-scope HIP_VISIBLE_DEVICES NOT \
+             changed.\n"
+        );
+    }
+
+    /// The reported bug's other read: a failed read used to read as "unset",
+    /// skip the "User scope already sets HIP_VISIBLE_DEVICES" guard and run
+    /// `setx` over whatever the user had set.
+    #[test]
+    fn pin_device_read_timeout_stops_before_setx() {
+        let host = FakeHost::new((CommandOutcome::TimedOut, ""), exited(0));
+        let (code, err) = pin_device(&host);
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty(), "setx must not run");
+        assert_eq!(
+            err,
+            "Could not read the current User HIP_VISIBLE_DEVICES: PowerShell timed out after 8s \
+             and was stopped; nothing was changed.\n"
+        );
+    }
+
+    #[test]
+    fn pin_device_read_with_missing_powershell_stops_before_setx() {
+        let host = FakeHost::new((CommandOutcome::NotFound, ""), exited(0));
+        let (code, _) = pin_device(&host);
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty(), "setx must not run");
+    }
+
+    #[test]
+    fn pin_device_leaves_an_existing_user_value_alone() {
+        let host = FakeHost::new((exited(0), "0"), exited(0));
+        let (code, _) = pin_device(&host);
+        assert_eq!(code, exit::OK);
+        assert!(
+            host.writes().is_empty(),
+            "an existing value is not overwritten"
+        );
+    }
+
+    /// Every "re-run `rocm fix <id>`" line names a recipe that exists and has
+    /// a runner, so the recovery it advises can actually be carried out.
+    #[test]
+    fn every_rerun_id_names_a_recipe_with_a_runner() {
+        for id in [RENDER_GROUP_ID, UNSET_OVERRIDE_ID, PATH_ID, IGPU_DGPU_ID] {
+            let recipe = super::super::catalog::find_recipe(id)
+                .unwrap_or_else(|| panic!("{id} is not in the catalog"));
+            assert!(recipe.runner.is_some(), "{id} has no runner to re-run");
+        }
+    }
+
     /// The Windows arm of fix-2 does mutate (it runs `setx` to clear the User
     /// scope), so unlike the Linux arm above, a decline has to come back as
     /// `5`, not `0` -- `skills/rocm-doctor/reference.md` documents `5` as
@@ -897,10 +1491,18 @@ mod tests {
     /// this way.
     #[test]
     fn windows_decline_on_user_scope_returns_5() {
-        let code =
-            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "", |_| false);
+        let host = FakeHost::new(unset(), exited(0));
+        let code = report_and_clear_override_windows(
+            &FixOptions::default(),
+            "10.3.0",
+            "",
+            |_| false,
+            host.runner(),
+            &mut Vec::new(),
+        );
 
         assert_eq!(code, 5, "a declined User-scope clear must exit 5, not 0");
+        assert!(host.writes().is_empty(), "a decline must not run setx");
     }
 
     /// Declining the User scope must not swallow the Machine-scope guidance:
@@ -912,26 +1514,37 @@ mod tests {
     /// would have to change this assertion to keep passing.
     #[test]
     fn windows_decline_with_machine_scope_also_set_still_returns_5() {
-        let code =
-            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "11.0.0", |_| {
-                false
-            });
+        let host = FakeHost::new(unset(), exited(0));
+        let code = report_and_clear_override_windows(
+            &FixOptions::default(),
+            "10.3.0",
+            "11.0.0",
+            |_| false,
+            host.runner(),
+            &mut Vec::new(),
+        );
 
         assert_eq!(code, 5);
+        assert!(host.writes().is_empty(), "a decline must not run setx");
     }
 
     #[test]
     fn windows_consent_granted_is_not_treated_as_a_decline() {
-        // `setx` isn't on this host, so a real run would report failure (`4`)
-        // -- the point here is only that the consent gate itself was
-        // reached and answered "yes", not routed as a decline.
-        let code =
-            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "", |_| true);
-
-        assert_ne!(
-            code, 5,
-            "granted consent must never be reported as declined"
+        let host = FakeHost::new(unset(), exited(0));
+        let code = report_and_clear_override_windows(
+            &FixOptions::default(),
+            "10.3.0",
+            "",
+            |_| true,
+            host.runner(),
+            &mut Vec::new(),
         );
+
+        assert_eq!(
+            code, 0,
+            "granted consent and a setx that exits 0 is success"
+        );
+        assert_eq!(host.writes(), [vec!["setx", OVERRIDE_VAR, ""]]);
     }
 
     #[test]
@@ -941,18 +1554,32 @@ mod tests {
             ..FixOptions::default()
         };
 
-        let code = report_and_clear_override_windows(&opts, "10.3.0", "", |_| {
-            panic!("dry-run must not reach the consent gate")
-        });
+        let host = FakeHost::new(unset(), exited(0));
+        let code = report_and_clear_override_windows(
+            &opts,
+            "10.3.0",
+            "",
+            |_| panic!("dry-run must not reach the consent gate"),
+            host.runner(),
+            &mut Vec::new(),
+        );
+        assert!(host.calls().is_empty(), "a dry-run runs nothing");
 
         assert_eq!(code, 0, "a dry-run preview is not a decline");
     }
 
     #[test]
     fn windows_nothing_persisted_in_either_scope_returns_0_without_prompting() {
-        let code = report_and_clear_override_windows(&FixOptions::default(), "", "", |_| {
-            panic!("nothing to clear means no consent gate at all")
-        });
+        let host = FakeHost::new(unset(), exited(0));
+        let code = report_and_clear_override_windows(
+            &FixOptions::default(),
+            "",
+            "",
+            |_| panic!("nothing to clear means no consent gate at all"),
+            host.runner(),
+            &mut Vec::new(),
+        );
+        assert!(host.calls().is_empty(), "nothing to clear runs nothing");
 
         assert_eq!(code, 0);
     }
@@ -964,18 +1591,10 @@ mod tests {
     /// `setx PATH "<bin_dir>"` -- replacing the user's entire real PATH with
     /// one entry.
     ///
-    /// `opts.dry_run = true` is the discriminator, not `opts.yes`: on a host
-    /// without a real `powershell`/`setx` (this Mac included), the actual
-    /// write fails regardless of whether it was ever reached, so asserting
-    /// against a "the write failed" code cannot tell "aborted before the
-    /// write" apart from "attempted the write and the write itself failed"
-    /// -- both land on the same non-zero code by coincidence of this host's
-    /// missing binary. Collapsing the failed read to `""` instead falls
-    /// through to the dry-run short-circuit (which returns `0`, "preview
-    /// printed, nothing to do"), while the fix aborts at the read itself and
-    /// never reaches that branch -- so this is the one assertion that is
-    /// both host-independent and still fails against the unfixed
-    /// collapse-to-empty behavior.
+    /// `opts.dry_run = true` is the discriminator: collapsing the failed read
+    /// to `""` falls through to the dry-run short-circuit (which returns `0`,
+    /// "preview printed, nothing to do"), while the fix aborts at the read
+    /// itself and never reaches that branch.
     #[test]
     fn windows_path_read_failure_aborts_before_plan_or_write() {
         let opts = FixOptions {
@@ -983,9 +1602,9 @@ mod tests {
             ..FixOptions::default()
         };
 
-        let code = path_export_windows(&opts, r"C:\ROCm\bin", || {
-            None // the read itself failed (PowerShell missing/blocked/timed out)
-        });
+        // The read itself failed (PowerShell missing/blocked/timed out).
+        let host = FakeHost::new((CommandOutcome::NotFound, ""), exited(0));
+        let code = path_export_windows(&opts, r"C:\ROCm\bin", host.runner(), &mut Vec::new());
 
         assert_ne!(
             code, 0,
@@ -995,6 +1614,7 @@ mod tests {
             code, 5,
             "a failed read was never offered a prompt to decline"
         );
+        assert!(host.writes().is_empty(), "a failed read writes nothing");
     }
 
     /// A genuinely empty User PATH (the read succeeded and returned `""`,
@@ -1095,9 +1715,14 @@ mod tests {
     #[test]
     fn windows_path_already_contains_bin_dir_short_circuits_with_no_change() {
         let bin_dir = r"C:\ROCm\bin";
-        let code = path_export_windows(&FixOptions::default(), bin_dir, || {
-            Some(format!(r"C:\Windows;{bin_dir}"))
-        });
+        let existing = format!(r"C:\Windows;{bin_dir}");
+        let host = FakeHost::new((CommandOutcome::Exited(0), &existing), exited(0));
+        let code = path_export_windows(
+            &FixOptions::default(),
+            bin_dir,
+            host.runner(),
+            &mut Vec::new(),
+        );
 
         assert_eq!(
             code, 0,
@@ -1116,7 +1741,9 @@ mod tests {
             ..FixOptions::default()
         };
 
-        let code = path_export_windows(&opts, r"C:\ROCm\bin", || Some(String::new()));
+        let host = FakeHost::new(unset(), exited(0));
+        let code = path_export_windows(&opts, r"C:\ROCm\bin", host.runner(), &mut Vec::new());
+        assert!(host.writes().is_empty(), "a dry-run writes nothing");
 
         assert_eq!(code, 0, "a dry-run preview is not a decline");
     }

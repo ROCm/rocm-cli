@@ -506,6 +506,14 @@ hardware, not something an install or a setting can put right.
   applies no fix and exits 0. Together with a fix id it is refused, with exit
   code 1.
 
+A fix that runs a command and fails exits 4 and says why on stderr. That
+includes a command that does not finish within its time limit (one minute):
+the CLI stops it and exits 4, but the change may have been made in part or may
+still finish, so the message names a command to check it with and the
+`rocm fix` command to re-run if it was not made. On Windows, a fix that cannot
+read the current value of the variable it changes stops before changing
+anything, also with exit 4.
+
 ### ROCm installation
 
 ```
