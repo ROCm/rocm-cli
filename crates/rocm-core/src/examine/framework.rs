@@ -74,7 +74,27 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
         "Probed torch with the active managed runtime's interpreter: {}",
         interpreter.python.display()
     ));
-    let env = runtime_library_path_env(e, &interpreter.library_paths);
+    let library_paths = crate::managed_runtime::runtime_loader_path_entries_read_only(
+        &interpreter.python,
+        &interpreter.library_paths,
+    );
+    // The note's claim that a launch or install writes the link is proven by the
+    // tests of those paths, which live in their own crates:
+    // `a_launch_carries_the_amd_smi_link_even_when_no_mpi_shim_is_due` (vLLM
+    // launch), `runtime_environment_carries_the_amd_smi_link_dir` (ComfyUI launch)
+    // and `the_device_probe_runs_with_the_amd_smi_link_on_its_loader_path` (the
+    // install device probe). That the note shows exactly when the link is absent
+    // is `the_framework_probe_picks_up_an_existing_amd_smi_link_and_never_writes_one`.
+    if crate::managed_runtime::amd_smi_link_missing(&interpreter.python, &interpreter.library_paths)
+    {
+        e.framework_notes.push(
+            "The runtime ships libamd_smi.so.<n> without the bare libamd_smi.so name and has no usable \
+             amd-smi link yet: a launch or install writes it. Until then torch can report 0 devices \
+             (seen beside a host ROCm install)."
+                .to_owned(),
+        );
+    }
+    let env = runtime_library_path_env(e, &library_paths);
     let (rc, out, err) = run_with_env(
         &interpreter.python.display().to_string(),
         &["-c", PYTORCH_PROBE],
@@ -391,6 +411,86 @@ mod tests {
         crate::test_support::assert_each_call_gets_its_own_root(|| {
             plant_fake_runtime_interpreter("same-label").0
         });
+    }
+
+    /// The torch probe runs with the amd-smi link's directory on its loader path
+    /// where an install or launch already made it, and never writes one: an
+    /// examination must not change the environment it reports on.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_framework_probe_picks_up_an_existing_amd_smi_link_and_never_writes_one() {
+        use crate::fake_executable::write_fake_executable;
+
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-amd-smi-{}",
+            crate::test_support::unique_suffix()
+        ));
+        let sdk_lib = root.join("sdk").join("lib");
+        let bin = root.join("env").join("bin");
+        let compat = root.join("env").join(crate::RUNTIME_COMPAT_DIR_NAME);
+        std::fs::create_dir_all(&sdk_lib).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let python = bin.join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\n\
+                 case \"${env}\" in\n\
+                 *{compat_name}*) printf '%s' '{ok}' ;;\n\
+                 *) printf '%s' '{broken}' ;;\n\
+                 esac\n",
+                env = RUNTIME_LIBRARY_PATH_ENV,
+                compat_name = crate::RUNTIME_COMPAT_DIR_NAME,
+                ok = RUNTIME_TORCH_OK_JSON,
+                broken = r#"{"ok":false,"error":"no amd-smi link on the loader path"}"#,
+            ),
+        )
+        .unwrap();
+        let interpreter = FrameworkInterpreter {
+            python,
+            library_paths: vec![sdk_lib.clone()],
+        };
+
+        let mut without = Examination::default();
+        probe_framework(&mut without, FrameworkProbe::PyTorch, Some(&interpreter));
+        let written = compat.exists();
+
+        std::fs::create_dir_all(&compat).unwrap();
+        std::os::unix::fs::symlink(
+            sdk_lib.join("libamd_smi.so.26"),
+            compat.join("libamd_smi.so"),
+        )
+        .unwrap();
+        let mut with = Examination::default();
+        probe_framework(&mut with, FrameworkProbe::PyTorch, Some(&interpreter));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(!written, "the probe wrote the shim directory");
+        // Without the link the fake interpreter fails with its one specific
+        // message, so the test goes red only for the missing link directory.
+        assert!(
+            without
+                .framework_notes
+                .iter()
+                .any(|note| note == "torch import failed: no amd-smi link on the loader path"),
+            "{:?}",
+            without.framework_notes
+        );
+        assert_eq!(without.framework_version, "");
+        // A runtime that needs the link and has none says so, since a launch that
+        // could not write it is silent; with the link there is nothing to say.
+        let link_note = |e: &Examination| {
+            e.framework_notes
+                .iter()
+                .any(|note| note.contains("has no usable amd-smi link yet"))
+        };
+        assert!(link_note(&without), "{:?}", without.framework_notes);
+        assert!(!link_note(&with), "{:?}", with.framework_notes);
+        assert_eq!(with.framework_version, "2.11.0+rocm7.14.1");
     }
 
     #[test]

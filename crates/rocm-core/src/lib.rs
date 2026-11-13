@@ -158,9 +158,11 @@ pub use log_tail::{
     tail_log_decoded,
 };
 pub use managed_runtime::{
-    FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
-    active_managed_therock_channel, active_managed_therock_environment,
-    active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
+    FrameworkInterpreter, ManagedRuntimeEnvironment, RUNTIME_COMPAT_DIR_NAME,
+    active_managed_framework_interpreter, active_managed_therock_channel,
+    active_managed_therock_environment, active_managed_therock_version, amd_smi_link_missing,
+    detect_managed_therock_family, ensure_amd_smi_compat, prepend_runtime_paths,
+    runtime_loader_path_entries, runtime_loader_path_entries_read_only,
 };
 use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
