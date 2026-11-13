@@ -22,8 +22,9 @@ use rocm_engine_protocol::{
     DetectResponse, DevicePolicy, EngineCapabilities, EngineDeviceAvailability, EngineMethod,
     EngineRecipeEndpointHint, EngineRecipeHint, EngineRecipeUnsupportedCombinationHint,
     EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, HealthcheckResponse,
-    LaunchRequest, LogsRequest, LogsResponse, ResolveModelRequest,
-    engine_id_from_plugin_binary_name, gpu_indices_to_csv, is_public_bind_host, launch_gpu_indices,
+    LaunchRequest, LogsRequest, LogsResponse, PRE_VERSIONING_PROTOCOL, ResolveModelRequest,
+    engine_id_from_plugin_binary_name, engine_protocol_compatible, gpu_indices_to_csv,
+    is_public_bind_host, launch_gpu_indices,
 };
 use std::collections::BTreeMap;
 
@@ -924,8 +925,79 @@ fn request_and_detect_documents_have_their_documented_wire_shape() {
 fn failure_envelope_has_its_documented_wire_shape() {
     assert_eq!(
         serde_json::to_value(EngineResponseEnvelope::failure("c", "m")).expect("encode"),
-        serde_json::json!({ "ok": false, "error": { "code": "c", "message": "m" } })
+        serde_json::json!({
+            "protocol_version": "0.1.0",
+            "ok": false,
+            "error": { "code": "c", "message": "m" }
+        })
     );
+}
+
+/// What a protocol version is, generated: readable `MAJOR.MINOR.PATCH`
+/// versions, near misses, and arbitrary text.
+fn protocol_version_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        (0_u64..4, 0_u64..4, 0_u64..20).prop_map(|(a, b, c)| format!("{a}.{b}.{c}")),
+        (0_u64..4, 0_u64..4).prop_map(|(a, b)| format!("{a}.{b}")),
+        "[ -~]{0,12}",
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(512),
+        ..ProptestConfig::default()
+    })]
+
+    /// The version field survives a round trip in both envelopes, whatever it
+    /// holds, so the reader judges what the writer wrote.
+    #[test]
+    fn protocol_version_roundtrips_in_both_envelopes(
+        version in prop::option::of(protocol_version_strategy()),
+    ) {
+        let mut request = EngineRequestEnvelope::new(EngineMethod::Stop, serde_json::json!({}));
+        request.protocol_version = version.clone();
+        let decoded: EngineRequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode"))
+                .expect("decode");
+        prop_assert_eq!(&decoded.protocol_version, &version);
+
+        let mut response = EngineResponseEnvelope::success(1);
+        response.protocol_version = version.clone();
+        let decoded: EngineResponseEnvelope =
+            serde_json::from_str(&serde_json::to_string(&response).expect("encode"))
+                .expect("decode");
+        prop_assert_eq!(&decoded.protocol_version, &version);
+    }
+
+    /// A missing version is judged exactly as `0.1.0`, the format from before
+    /// the field existed, against any version this side might speak.
+    #[test]
+    fn a_missing_version_is_read_as_the_pre_versioning_protocol(
+        ours in protocol_version_strategy(),
+    ) {
+        prop_assert_eq!(
+            engine_protocol_compatible(&ours, None).is_ok(),
+            engine_protocol_compatible(&ours, Some("0.1.0")).is_ok()
+        );
+        prop_assert_eq!(PRE_VERSIONING_PROTOCOL, "0.1.0");
+    }
+
+    /// Every readable version is compatible with itself, and the rule is
+    /// symmetric between two readable versions.
+    #[test]
+    fn compatibility_is_reflexive_and_symmetric(
+        a in (0_u64..4, 0_u64..4, 0_u64..20),
+        b in (0_u64..4, 0_u64..4, 0_u64..20),
+    ) {
+        let a = format!("{}.{}.{}", a.0, a.1, a.2);
+        let b = format!("{}.{}.{}", b.0, b.1, b.2);
+        prop_assert!(engine_protocol_compatible(&a, Some(&a)).is_ok());
+        prop_assert_eq!(
+            engine_protocol_compatible(&a, Some(&b)).is_ok(),
+            engine_protocol_compatible(&b, Some(&a)).is_ok()
+        );
+    }
 }
 
 /// The plugin binary naming rule, positively: the `rocm-engine-` prefix with

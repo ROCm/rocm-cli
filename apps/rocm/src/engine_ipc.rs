@@ -412,6 +412,64 @@ mod tests {
         }
     }
 
+    /// Every engine built into this binary answers in this build's protocol and
+    /// refuses a request made for one it cannot serve, whatever the method, so
+    /// the in-process path and `rocm __engine-stdio` (which `rocmd` reaches)
+    /// hold the same contract as a separately built engine. The answer goes
+    /// through the same `decode_engine_response` as a child's, which reports
+    /// the engine's refusal.
+    #[test]
+    fn every_built_in_engine_holds_the_protocol_contract() {
+        use rocm_engine_protocol::{ENGINE_PROTOCOL_VERSION, INCOMPATIBLE_PROTOCOL_CODE};
+        for engine in crate::cli::SUPPORTED_ENGINES {
+            let capabilities = builtin_engine_request(
+                engine,
+                &EngineRequestEnvelope::new(EngineMethod::Capabilities, serde_json::json!({})),
+            )
+            .unwrap_or_else(|| panic!("{engine} is not built in"));
+            assert!(capabilities.ok, "{engine}: {:?}", capabilities.error);
+            assert_eq!(
+                capabilities.protocol_version.as_deref(),
+                Some(ENGINE_PROTOCOL_VERSION),
+                "{engine}"
+            );
+            assert!(
+                decode_engine_response::<serde_json::Value>(capabilities).is_ok(),
+                "{engine}"
+            );
+
+            for method in [
+                EngineMethod::Detect,
+                EngineMethod::Install,
+                EngineMethod::Capabilities,
+                EngineMethod::ResolveModel,
+                EngineMethod::Launch,
+                EngineMethod::Healthcheck,
+                EngineMethod::Endpoint,
+                EngineMethod::Stop,
+                EngineMethod::Logs,
+            ] {
+                let mut request = EngineRequestEnvelope::new(method.clone(), serde_json::json!({}));
+                request.protocol_version = Some("9.0.0".to_owned());
+                let refusal = builtin_engine_request(engine, &request).expect("built in");
+                assert_eq!(
+                    refusal.error.as_ref().map(|error| error.code.as_str()),
+                    Some(INCOMPATIBLE_PROTOCOL_CODE),
+                    "{engine} {method:?}: {:?}",
+                    refusal.error
+                );
+                assert_eq!(
+                    decode_engine_response::<serde_json::Value>(refusal)
+                        .unwrap_err()
+                        .to_string(),
+                    "incompatible_protocol: this engine speaks engine protocol 0.1.0; the \
+                     request was made for protocol 9.0.0, which it cannot serve",
+                    "{engine} {method:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {
         let (root, paths) = test_paths("engine-plugin");
@@ -491,7 +549,7 @@ mod tests {
         const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
 
         fn envelope(method: EngineMethod, payload: serde_json::Value) -> EngineRequestEnvelope {
-            EngineRequestEnvelope { method, payload }
+            EngineRequestEnvelope::new(method, payload)
         }
 
         fn stop_request() -> EngineRequestEnvelope {
@@ -538,7 +596,8 @@ mod tests {
             assert_eq!(engine.argv(), ["stdio"]);
             assert_eq!(
                 engine.stdin(),
-                "{\"method\":\"stop\",\"payload\":{\"service_id\":\"svc\"}}\n"
+                "{\"protocol_version\":\"0.1.0\",\"method\":\"stop\",\
+                 \"payload\":{\"service_id\":\"svc\"}}\n"
             );
         }
 

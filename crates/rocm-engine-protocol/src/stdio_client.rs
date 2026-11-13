@@ -16,6 +16,20 @@
 //! unusable answer is reported as, and decoding the response. The few things
 //! the callers want differently are the fields of [`EngineStdioOptions`].
 //!
+//! It is also where the engine protocol version is enforced on the client side
+//! (the rule is in the `protocol_version` module). [`decode_engine_response`]
+//! checks an answer's `protocol_version` before anything else in it, and
+//! [`run_engine_stdio`], before an `install` or a `launch`, first sends a
+//! `capabilities` request through the same path and does not send the real one
+//! unless that answer is in a protocol this build can use. The other methods are
+//! sent once, as they are.
+//!
+//! The whole of an engine's stdout must be its one answer: an engine writes
+//! only its JSON answer to stdout and its logs to stderr. Output that is not
+//! exactly one envelope is refused, never salvaged, and the error says what was
+//! wrong with it (nothing printed, other output beside an answer, JSON that is
+//! not an envelope, not JSON) and quotes the start of it.
+//!
 //! The request and the child's lifetime are not bounded by a timeout: an engine
 //! install legitimately runs for minutes, and no caller has ever set one.
 //!
@@ -69,7 +83,7 @@
 //! thread, so an engine that fills it before draining a large request cannot
 //! deadlock the write.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -84,7 +98,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    ENDPOINT_API_KEY_FILE_ENV, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,
+    ENDPOINT_API_KEY_FILE_ENV, ENGINE_PROTOCOL_VERSION, EngineMethod, EngineRequestEnvelope,
+    EngineResponseEnvelope, ProtocolMismatch, engine_protocol_compatible,
 };
 
 /// Set to `1` on an engine child whose caller wants its progress lines on
@@ -135,11 +150,10 @@ pub fn engine_request_envelope<T: Serialize>(
     method: EngineMethod,
     request: &T,
 ) -> Result<EngineRequestEnvelope> {
-    Ok(EngineRequestEnvelope {
+    Ok(EngineRequestEnvelope::new(
         method,
-        payload: serde_json::to_value(request)
-            .context("failed to encode engine request payload")?,
-    })
+        serde_json::to_value(request).context("failed to encode engine request payload")?,
+    ))
 }
 
 /// The command [`run_engine_stdio`] runs: `program` with `args`, all three
@@ -190,6 +204,12 @@ where
 /// and the failing exit is not reported or logged anywhere, by design, because
 /// the answer is what the caller asked for.
 /// Every other failure names what went wrong and carries the child's stderr.
+///
+/// For a method that changes the machine
+/// ([`EngineMethod::requires_protocol_handshake`]), the engine is first asked
+/// for its capabilities, as a request of its own, and `envelope` is sent only
+/// when that answer is in a compatible protocol and is not an error; otherwise
+/// the error says `envelope` was not sent, and why.
 pub fn run_engine_stdio<I, S>(
     program: &Path,
     args: I,
@@ -224,6 +244,88 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+    if envelope.method.requires_protocol_handshake() {
+        check_protocol_before(program, &args, options, &envelope.method)?;
+    }
+    exchange(program, &args, options, envelope, forward)
+}
+
+/// Before a request that changes the machine (see
+/// [`EngineMethod::requires_protocol_handshake`]), ask the engine for its
+/// capabilities, through the same path, and check the protocol it answers in.
+/// The request itself is sent only when that answer is in a protocol this
+/// build can use; otherwise the error says it was not sent, and why.
+///
+/// Nothing is cached: an engine can be replaced between two requests, and the
+/// extra child is small next to the install or launch it guards. The
+/// capabilities child's stderr is not forwarded (it is in the error when the
+/// check fails), and it is not asked for progress.
+fn check_protocol_before(
+    program: &Path,
+    args: &[OsString],
+    options: &EngineStdioOptions<'_>,
+    method: &EngineMethod,
+) -> Result<()> {
+    let refused = format!("the {} request was not sent to the engine", method.name());
+    let handshake_options = EngineStdioOptions {
+        request_progress: false,
+        forward_stderr: false,
+        note_failing_exit_after_answer: false,
+        ..*options
+    };
+    let capabilities =
+        EngineRequestEnvelope::new(EngineMethod::Capabilities, serde_json::Value::Null);
+    let answer = exchange(
+        program,
+        args,
+        &handshake_options,
+        &capabilities,
+        None::<io::Stderr>,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "{refused}: its protocol could not be checked against this release's \
+             (engine protocol {ENGINE_PROTOCOL_VERSION}) because asking for its capabilities \
+             failed: {error:#}"
+        )
+    })?;
+    match engine_protocol_compatible(ENGINE_PROTOCOL_VERSION, answer.protocol_version.as_deref()) {
+        Ok(()) => {}
+        Err(ProtocolMismatch::Incompatible { ours, theirs }) => bail!(
+            "{refused}: the engine speaks engine protocol {theirs}, which this release \
+             (engine protocol {ours}) cannot use"
+        ),
+        Err(ProtocolMismatch::Unreadable { ours, theirs }) => bail!(
+            "{refused}: the engine named its protocol version {theirs:?}, which is not a \
+             MAJOR.MINOR.PATCH version, so this release (engine protocol {ours}) cannot tell \
+             whether it can use it"
+        ),
+    }
+    if !answer.ok {
+        bail!(
+            "{refused}: its protocol could not be checked against this release's \
+             (engine protocol {ENGINE_PROTOCOL_VERSION}) because it refused the capabilities \
+             request: {}",
+            engine_error_text(answer.error)
+        );
+    }
+    Ok(())
+}
+
+/// One request and its answer: start the child, write `envelope`, read what it
+/// printed. [`run_engine_stdio_forwarding`] is this plus the protocol check that
+/// goes before a request that changes the machine.
+fn exchange(
+    program: &Path,
+    args: &[OsString],
+    options: &EngineStdioOptions<'_>,
+    envelope: &EngineRequestEnvelope,
+    forward: Option<impl Write + Send + 'static>,
+) -> Result<EngineResponseEnvelope> {
     let mut child = engine_stdio_command(program, args, options)
         .spawn()
         .with_context(|| format!("failed to spawn engine stdio process {}", program.display()))?;
@@ -284,8 +386,8 @@ where
         }
         bail!("{exited}: {stderr}");
     }
-    let answer = serde_json::from_slice(&stdout)
-        .with_context(|| unparseable_answer_message(status, &stderr));
+    let answer = serde_json::from_slice::<EngineResponseEnvelope>(&stdout)
+        .map_err(|_| anyhow::anyhow!(unparseable_answer_message(status, &stdout, &stderr)));
     // The note says the answer was used, so it is only made for an answer that
     // parsed; an unparseable one is reported by the error above, with the status.
     if answer.is_ok() && !status.success() && options.note_failing_exit_after_answer {
@@ -326,16 +428,125 @@ fn exit_note(status: ExitStatus) -> String {
 
 /// The error for an answer that is not a response envelope. A child that also
 /// exited with a failing status says so, because that is often why the answer is
-/// cut short; the stderr it wrote follows when there is any.
-fn unparseable_answer_message(status: ExitStatus, stderr: &str) -> String {
+/// cut short; then what was wrong with what it printed ([`unreadable_stdout`]);
+/// the stderr it wrote follows when there is any.
+fn unparseable_answer_message(status: ExitStatus, stdout: &[u8], stderr: &str) -> String {
     let mut message = "failed to parse engine response envelope".to_owned();
     if !status.success() {
         message = format!("{message} ({})", exit_note(status));
     }
+    message = format!("{message}: {}", unreadable_stdout(stdout));
     if !stderr.is_empty() {
         message = format!("{message}; stderr: {stderr}");
     }
     message
+}
+
+/// What an engine's stdout must hold, said wherever it held something else.
+const STDOUT_RULE: &str = "an engine writes only its JSON answer to stdout; logs go to stderr";
+
+/// How much of an unreadable stdout an error quotes: its first non-blank line,
+/// cut to this many characters.
+const STDOUT_EXCERPT_CHARS: usize = 120;
+
+/// How many line starts [`answer_among_other_output`] tries an envelope at, so
+/// a large unreadable stdout costs a bounded amount of work to describe.
+const ENVELOPE_SEARCH_LINES: usize = 256;
+
+/// What is wrong with a stdout that does not parse as one response envelope,
+/// for the error that reports it.
+///
+/// The whole of stdout must be the answer, so nothing here salvages one: an
+/// answer found among other output is still refused, and only named as the
+/// reason. The cases, in the order they are told apart:
+/// - nothing (or only whitespace) was printed;
+/// - an envelope is there, but so is other output before or after it (a log
+///   line on the wrong stream);
+/// - the whole of it is JSON, but not an envelope;
+/// - it is not JSON.
+fn unreadable_stdout(stdout: &[u8]) -> String {
+    if stdout.iter().all(u8::is_ascii_whitespace) {
+        return "the engine printed no answer on stdout".to_owned();
+    }
+    let excerpt = stdout_excerpt(stdout);
+    if answer_among_other_output(stdout) {
+        return format!(
+            "the engine wrote other output to stdout alongside its answer, starting with \
+             `{excerpt}` ({STDOUT_RULE})"
+        );
+    }
+    match serde_json::from_slice::<serde_json::Value>(stdout) {
+        Ok(_) => {
+            let reason = serde_json::from_slice::<EngineResponseEnvelope>(stdout)
+                .err()
+                .map_or_else(String::new, |error| format!(" ({error})"));
+            format!(
+                "the engine's stdout is JSON but not an answer envelope{reason}, starting with \
+                 `{excerpt}` ({STDOUT_RULE})"
+            )
+        }
+        Err(error) => format!(
+            "the engine's stdout is not JSON ({error}), starting with `{excerpt}` \
+             ({STDOUT_RULE})"
+        ),
+    }
+}
+
+/// Whether a whole response envelope starts at the beginning of one of the
+/// first lines of `stdout` (leading whitespace aside), with other output before
+/// or after it. Engines pretty-print their answer over many lines, so only the
+/// start of the envelope is looked for at a line start; its end is wherever
+/// the JSON ends.
+fn answer_among_other_output(stdout: &[u8]) -> bool {
+    let mut line_start = 0;
+    for _ in 0..ENVELOPE_SEARCH_LINES {
+        let rest = &stdout[line_start..];
+        let indent = rest
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        if rest.get(indent) == Some(&b'{') {
+            let mut values = serde_json::Deserializer::from_slice(&rest[indent..])
+                .into_iter::<EngineResponseEnvelope>();
+            if let Some(Ok(_)) = values.next() {
+                let end = line_start + indent + values.byte_offset();
+                let before = &stdout[..line_start];
+                let after = &stdout[end..];
+                let blank = |bytes: &[u8]| bytes.iter().all(u8::is_ascii_whitespace);
+                return !blank(before) || !blank(after);
+            }
+        }
+        match rest.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => line_start += newline + 1,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The first non-blank line of `stdout`, cut to [`STDOUT_EXCERPT_CHARS`]
+/// characters, with control characters escaped so an engine's output cannot
+/// reshape the error (or the terminal) that quotes it.
+fn stdout_excerpt(stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stdout);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut excerpt = String::new();
+    for (index, ch) in line.chars().enumerate() {
+        if index == STDOUT_EXCERPT_CHARS {
+            excerpt.push_str("...");
+            break;
+        }
+        if ch.is_control() {
+            excerpt.extend(ch.escape_default());
+        } else {
+            excerpt.push(ch);
+        }
+    }
+    excerpt
 }
 
 /// `pipe` of `child`, or an error that also kills and reaps the child: a child
@@ -636,21 +847,51 @@ fn forward_best_effort(sink: &mut impl Write, bytes: &[u8]) {
 
 /// Turn an engine's answer into the response type the caller asked for: the
 /// engine's own error when it reported one, otherwise the decoded `data`.
+///
+/// The protocol the answer was written in is checked first, before `ok`: an
+/// answer in a protocol this build cannot use is refused whatever it says,
+/// and so is an engine's own error in such a protocol, because its meaning
+/// cannot be trusted either and the mismatch is the thing to fix.
 pub fn decode_engine_response<R>(envelope: EngineResponseEnvelope) -> Result<R>
 where
     R: DeserializeOwned,
 {
+    if let Err(mismatch) = engine_protocol_compatible(
+        ENGINE_PROTOCOL_VERSION,
+        envelope.protocol_version.as_deref(),
+    ) {
+        bail!("{}", incompatible_answer_message(&mismatch));
+    }
     if !envelope.ok {
-        let error = envelope.error.map_or_else(
-            || "unknown engine error".to_owned(),
-            |value| format!("{}: {}", value.code, value.message),
-        );
-        bail!("{error}");
+        bail!("{}", engine_error_text(envelope.error));
     }
     let data = envelope
         .data
         .context("engine response envelope did not contain data")?;
-    serde_json::from_value(data).context("failed to decode engine response payload")
+    serde_json::from_value(data)
+        .map_err(|error| anyhow::anyhow!("failed to decode engine response payload: {error}"))
+}
+
+/// The error for an answer in a protocol this build cannot use.
+fn incompatible_answer_message(mismatch: &ProtocolMismatch) -> String {
+    match mismatch {
+        ProtocolMismatch::Incompatible { ours, theirs } => format!(
+            "engine answered in engine protocol {theirs}, which this release \
+             (protocol {ours}) cannot use"
+        ),
+        ProtocolMismatch::Unreadable { ours, theirs } => format!(
+            "engine answered with protocol version {theirs:?}, which is not a \
+             MAJOR.MINOR.PATCH version this release (protocol {ours}) can read"
+        ),
+    }
+}
+
+/// An engine's own error, as `code: message`.
+fn engine_error_text(error: Option<crate::EngineErrorDetail>) -> String {
+    error.map_or_else(
+        || "unknown engine error".to_owned(),
+        |value| format!("{}: {}", value.code, value.message),
+    )
 }
 
 #[cfg(test)]
@@ -839,13 +1080,14 @@ mod tests {
         assert_eq!(envelope.payload, json!({"service_id": "svc"}));
         assert_eq!(
             serde_json::to_string(&envelope).unwrap(),
-            r#"{"method":"stop","payload":{"service_id":"svc"}}"#
+            r#"{"protocol_version":"0.1.0","method":"stop","payload":{"service_id":"svc"}}"#
         );
     }
 
     #[test]
     fn decode_engine_response_reports_each_way_an_answer_can_be_unusable() {
         let failed = EngineResponseEnvelope {
+            protocol_version: None,
             ok: false,
             data: None,
             error: Some(EngineErrorDetail {
@@ -857,6 +1099,7 @@ mod tests {
         assert_eq!(error.to_string(), "stop_failed: it broke");
 
         let unexplained = EngineResponseEnvelope {
+            protocol_version: None,
             ok: false,
             data: None,
             error: None,
@@ -865,6 +1108,7 @@ mod tests {
         assert_eq!(error.to_string(), "unknown engine error");
 
         let empty = EngineResponseEnvelope {
+            protocol_version: None,
             ok: true,
             data: None,
             error: None,
@@ -879,8 +1123,148 @@ mod tests {
         let error = decode_engine_response::<StopResponse>(wrong_shape).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "failed to decode engine response payload"
+            "failed to decode engine response payload: \
+             invalid type: string \"yes\", expected a boolean"
         );
+    }
+
+    /// An answer, as a client reads it, from an engine that wrote it in
+    /// `version` (`None`: before the field existed).
+    fn answer_in(version: Option<&str>, ok: bool) -> EngineResponseEnvelope {
+        let mut answer = if ok {
+            EngineResponseEnvelope::success(json!({"stopped": true, "graceful": true}))
+        } else {
+            EngineResponseEnvelope::failure("incompatible_protocol", "the engine's own refusal")
+        };
+        answer.protocol_version = version.map(str::to_owned);
+        answer
+    }
+
+    /// The answer's protocol is checked before anything else in it: a success
+    /// with perfectly good data is refused when it is in a protocol this
+    /// release cannot use, and an engine's own error in such a protocol is
+    /// reported as the mismatch, which is what has to be fixed.
+    #[test]
+    fn an_answer_in_an_incompatible_protocol_is_refused_whatever_it_says() {
+        for ok in [true, false] {
+            let error =
+                decode_engine_response::<StopResponse>(answer_in(Some("9.0.0"), ok)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine answered in engine protocol 9.0.0, which this release \
+                 (protocol 0.1.0) cannot use",
+                "ok: {ok}"
+            );
+            let error =
+                decode_engine_response::<StopResponse>(answer_in(Some("0.2.0"), ok)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine answered in engine protocol 0.2.0, which this release \
+                 (protocol 0.1.0) cannot use",
+                "ok: {ok}"
+            );
+            let error =
+                decode_engine_response::<StopResponse>(answer_in(Some("banana"), ok)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine answered with protocol version \"banana\", which is not a \
+                 MAJOR.MINOR.PATCH version this release (protocol 0.1.0) can read",
+                "ok: {ok}"
+            );
+        }
+    }
+
+    /// The same answer in this protocol, in a newer one with only additions,
+    /// or from an engine older than the field, is read as answered.
+    #[test]
+    fn an_answer_in_a_compatible_or_unnamed_protocol_is_read() {
+        for version in [Some("0.1.0"), Some("0.1.9"), None] {
+            let decoded = decode_engine_response::<StopResponse>(answer_in(version, true))
+                .unwrap_or_else(|error| panic!("{version:?}: {error:#}"));
+            assert!(decoded.stopped, "{version:?}");
+            let error =
+                decode_engine_response::<StopResponse>(answer_in(version, false)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "incompatible_protocol: the engine's own refusal",
+                "{version:?}"
+            );
+        }
+    }
+
+    /// Each way a stdout can fail to be one envelope is told apart, and none of
+    /// them is salvaged.
+    #[test]
+    fn an_unreadable_stdout_is_described_by_what_is_wrong_with_it() {
+        const RULE: &str = "(an engine writes only its JSON answer to stdout; logs go to stderr)";
+        let envelope = r#"{"protocol_version":"0.1.0","ok":true,"data":{"stopped":true}}"#;
+        let cases: Vec<(String, String)> = vec![
+            (
+                String::new(),
+                "the engine printed no answer on stdout".to_owned(),
+            ),
+            (
+                " \n\t\n".to_owned(),
+                "the engine printed no answer on stdout".to_owned(),
+            ),
+            (
+                format!("INFO loading model\n{envelope}\n"),
+                format!(
+                    "the engine wrote other output to stdout alongside its answer, starting \
+                     with `INFO loading model` {RULE}"
+                ),
+            ),
+            (
+                format!("{envelope}\ndone\n"),
+                format!(
+                    "the engine wrote other output to stdout alongside its answer, starting \
+                     with `{envelope}` {RULE}"
+                ),
+            ),
+            (
+                "loading {model}\n  {\n    \"ok\": true,\n    \"data\": {}\n  }\n".to_owned(),
+                format!(
+                    "the engine wrote other output to stdout alongside its answer, starting \
+                     with `loading {{model}}` {RULE}"
+                ),
+            ),
+            (
+                r#"{"status":"ok"}"#.to_owned(),
+                format!(
+                    "the engine's stdout is JSON but not an answer envelope (missing field `ok` \
+                     at line 1 column 15), starting with `{{\"status\":\"ok\"}}` {RULE}"
+                ),
+            ),
+            (
+                "not json".to_owned(),
+                format!(
+                    "the engine's stdout is not JSON (expected ident at line 1 column 2), \
+                     starting with `not json` {RULE}"
+                ),
+            ),
+            (
+                "\u{1b}[31mred\u{7}\n".to_owned(),
+                format!(
+                    "the engine's stdout is not JSON (expected value at line 1 column 1), \
+                     starting with `\\u{{1b}}[31mred\\u{{7}}` {RULE}"
+                ),
+            ),
+        ];
+        for (stdout, expected) in cases {
+            assert_eq!(unreadable_stdout(stdout.as_bytes()), expected, "{stdout:?}");
+        }
+    }
+
+    /// The quoted part of an unreadable stdout is its first non-blank line,
+    /// bounded, so a megabyte of output does not become a megabyte of error.
+    #[test]
+    fn the_stdout_excerpt_is_the_first_line_and_bounded() {
+        assert_eq!(stdout_excerpt(b"\n\n  first  \nsecond"), "first");
+        let long = "x".repeat(500);
+        let excerpt = stdout_excerpt(long.as_bytes());
+        assert_eq!(excerpt, format!("{}...", "x".repeat(STDOUT_EXCERPT_CHARS)));
+        let exact = "y".repeat(STDOUT_EXCERPT_CHARS);
+        assert_eq!(stdout_excerpt(exact.as_bytes()), exact);
     }
 
     /// A source fed by the test, one chunk per message, that says when it is
@@ -1193,7 +1577,8 @@ mod tests {
             assert_eq!(engine.argv(), ["stdio"]);
             assert_eq!(
                 engine.stdin(),
-                "{\"method\":\"stop\",\"payload\":{\"service_id\":\"svc\"}}\n"
+                "{\"protocol_version\":\"0.1.0\",\"method\":\"stop\",\
+                 \"payload\":{\"service_id\":\"svc\"}}\n"
             );
         }
 
@@ -1336,7 +1721,10 @@ mod tests {
                     assert_eq!(
                         outcome.unwrap_err().to_string(),
                         "failed to parse engine response envelope \
-                         (engine stdio process exited with code 7)"
+                         (engine stdio process exited with code 7): the engine's stdout \
+                         is not JSON (expected ident at line 1 column 2), starting with \
+                         `not json` (an engine writes only its JSON answer to stdout; logs \
+                         go to stderr)"
                     );
                 }
                 return;
@@ -1481,14 +1869,18 @@ mod tests {
             let error = run(&engine, &EngineStdioOptions::default()).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "failed to parse engine response envelope; stderr: oops"
+                "failed to parse engine response envelope: the engine's stdout is not JSON (expected ident at line 1 column 2), \
+                 starting with `not json` (an engine writes only its JSON answer to stdout; \
+                 logs go to stderr); stderr: oops"
             );
 
             let silent = FakeEngine::new("client-garbage-quiet", true, "printf 'not json'");
             let error = run(&silent, &EngineStdioOptions::default()).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "failed to parse engine response envelope"
+                "failed to parse engine response envelope: the engine's stdout is not JSON (expected ident at line 1 column 2), \
+                 starting with `not json` (an engine writes only its JSON answer to stdout; \
+                 logs go to stderr)"
             );
         }
 
@@ -1513,7 +1905,10 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "failed to parse engine response envelope \
-                 (engine stdio process was terminated by signal 9)"
+                 (engine stdio process was terminated by signal 9): the engine's stdout is \
+                 not JSON (EOF while parsing an object at line 1 column 5), starting with \
+                 `{\"ok\"` (an engine writes only its JSON answer to stdout; logs go to \
+                 stderr)"
             );
         }
 
@@ -1534,7 +1929,9 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "failed to parse engine response envelope \
-                 (engine stdio process exited with code 4); stderr: oops"
+                 (engine stdio process exited with code 4): the engine's stdout is not JSON (expected ident at line 1 column 2), \
+                 starting with `not json` (an engine writes only its JSON answer to stdout; \
+                 logs go to stderr); stderr: oops"
             );
 
             let silent = FakeEngine::new(
@@ -1546,14 +1943,18 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "failed to parse engine response envelope \
-                 (engine stdio process exited with code 5)"
+                 (engine stdio process exited with code 5): the engine's stdout is not JSON (expected ident at line 1 column 2), \
+                 starting with `not json` (an engine writes only its JSON answer to stdout; \
+                 logs go to stderr)"
             );
 
             let clean = FakeEngine::new("client-garbage-clean", true, "printf 'not json'\nexit 0");
             let error = run(&clean, &EngineStdioOptions::default()).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "failed to parse engine response envelope"
+                "failed to parse engine response envelope: the engine's stdout is not JSON (expected ident at line 1 column 2), \
+                 starting with `not json` (an engine writes only its JSON answer to stdout; \
+                 logs go to stderr)"
             );
         }
 
@@ -2047,6 +2448,273 @@ mod tests {
                 "SIGPIPE killed the process instead of surfacing as an error: {status:?}"
             );
             assert!(status.success(), "{status:?}");
+        }
+
+        /// What a well-behaved engine answers an `install` with, in this protocol.
+        const INSTALLED: &str =
+            r#"{"protocol_version":"0.1.0","ok":true,"data":{"installed":true}}"#;
+
+        /// A fake engine that answers `capabilities` by running
+        /// `capabilities_body` (shell; it must exit) and anything else with
+        /// [`INSTALLED`].
+        fn engine_answering_capabilities_with(label: &str, capabilities_body: &str) -> FakeEngine {
+            FakeEngine::new(
+                label,
+                true,
+                &format!(
+                    "if grep -q '\"method\":\"capabilities\"' \"$dir/stdin\"; then\n\
+                     {capabilities_body}\n\
+                     fi\n\
+                     printf '%s' '{INSTALLED}'"
+                ),
+            )
+        }
+
+        fn send(engine: &FakeEngine, method: EngineMethod) -> Result<Value> {
+            let envelope = engine_request_envelope(method, &json!({"runtime_id": "r"})).unwrap();
+            decode_engine_response(run_engine_stdio(
+                engine.path(),
+                ["stdio"],
+                &EngineStdioOptions::default(),
+                &envelope,
+            )?)
+        }
+
+        /// The capabilities answer that lets the request through: this
+        /// protocol, a newer one with only additions, or none at all (an engine
+        /// older than the field). Each time the engine is run twice, the
+        /// capabilities request first, and the install or launch reaches it.
+        #[test]
+        fn a_compatible_engine_is_checked_and_then_sent_the_request() {
+            for (row, capabilities) in [
+                (
+                    "same",
+                    r#"{"protocol_version":"0.1.0","ok":true,"data":{}}"#,
+                ),
+                (
+                    "additive",
+                    r#"{"protocol_version":"0.1.9","ok":true,"data":{}}"#,
+                ),
+                ("legacy", r#"{"ok":true,"data":{}}"#),
+            ] {
+                for method in [EngineMethod::Install, EngineMethod::Launch] {
+                    let engine = engine_answering_capabilities_with(
+                        &format!("handshake-ok-{row}"),
+                        &format!("printf '%s' '{capabilities}'\nexit 0"),
+                    );
+                    let answer = send(&engine, method.clone())
+                        .unwrap_or_else(|error| panic!("{row} {method:?}: {error:#}"));
+                    assert_eq!(answer, json!({"installed": true}), "{row}");
+                    assert_eq!(
+                        engine.methods(),
+                        ["capabilities", method.name()],
+                        "{row}: the request must follow the check"
+                    );
+                    assert_eq!(
+                        engine.requests()[0]["protocol_version"],
+                        ENGINE_PROTOCOL_VERSION,
+                        "{row}: the check is itself a versioned request"
+                    );
+                }
+            }
+        }
+
+        /// Every way the check can fail stops the request before it is sent:
+        /// the error says it was not sent and why, naming both versions where
+        /// the engine named one, and the engine was only ever asked for its
+        /// capabilities.
+        #[test]
+        fn a_request_that_changes_the_machine_is_not_sent_when_the_check_fails() {
+            const NOT_SENT: &str = "the install request was not sent to the engine";
+            const UNCHECKED: &str = "the install request was not sent to the engine: its \
+                 protocol could not be checked against this release's (engine protocol 0.1.0) \
+                 because";
+            let rows: [(&str, String, String); 8] = [
+                (
+                    "incompatible",
+                    r#"printf '%s' '{"protocol_version":"9.0.0","ok":true,"data":{}}'"#.to_owned(),
+                    format!(
+                        "{NOT_SENT}: the engine speaks engine protocol 9.0.0, which this release \
+                         (engine protocol 0.1.0) cannot use"
+                    ),
+                ),
+                (
+                    "incompatible-refusal",
+                    r#"printf '%s' '{"protocol_version":"0.2.0","ok":false,"error":{"code":"incompatible_protocol","message":"no"}}'"#
+                        .to_owned(),
+                    format!(
+                        "{NOT_SENT}: the engine speaks engine protocol 0.2.0, which this release \
+                         (engine protocol 0.1.0) cannot use"
+                    ),
+                ),
+                (
+                    "unreadable-version",
+                    r#"printf '%s' '{"protocol_version":"banana","ok":true,"data":{}}'"#.to_owned(),
+                    format!(
+                        "{NOT_SENT}: the engine named its protocol version \"banana\", which is \
+                         not a MAJOR.MINOR.PATCH version, so this release (engine protocol 0.1.0) \
+                         cannot tell whether it can use it"
+                    ),
+                ),
+                (
+                    "refused",
+                    r#"printf '%s' '{"protocol_version":"0.1.0","ok":false,"error":{"code":"broken","message":"no capabilities today"}}'"#
+                        .to_owned(),
+                    format!(
+                        "{UNCHECKED} it refused the capabilities request: broken: no capabilities \
+                         today"
+                    ),
+                ),
+                (
+                    "crashed",
+                    "echo 'engine exploded' >&2\nexit 3".to_owned(),
+                    format!(
+                        "{UNCHECKED} asking for its capabilities failed: engine stdio process \
+                         exited with code 3: engine exploded"
+                    ),
+                ),
+                (
+                    "silent",
+                    "exit 0".to_owned(),
+                    format!(
+                        "{UNCHECKED} asking for its capabilities failed: failed to parse engine \
+                         response envelope: the engine printed no answer on stdout"
+                    ),
+                ),
+                (
+                    "contaminated",
+                    r#"echo 'INFO starting'
+printf '%s' '{"protocol_version":"0.1.0","ok":true,"data":{}}'"#
+                        .to_owned(),
+                    format!(
+                        "{UNCHECKED} asking for its capabilities failed: failed to parse engine \
+                         response envelope: the engine wrote other output to stdout alongside its \
+                         answer, starting with `INFO starting` (an engine writes only its JSON \
+                         answer to stdout; logs go to stderr)"
+                    ),
+                ),
+                (
+                    "not-json",
+                    "printf 'not json'".to_owned(),
+                    format!(
+                        "{UNCHECKED} asking for its capabilities failed: failed to parse engine \
+                         response envelope: the engine's stdout is not JSON (expected ident at \
+                         line 1 column 2), starting with `not json` (an engine writes only its \
+                         JSON answer to stdout; logs go to stderr)"
+                    ),
+                ),
+            ];
+            for (row, capabilities_body, expected) in rows {
+                let engine = engine_answering_capabilities_with(
+                    &format!("handshake-refused-{row}"),
+                    &format!("{capabilities_body}\nexit 0"),
+                );
+                let error = send(&engine, EngineMethod::Install).unwrap_err();
+                assert_eq!(format!("{error:#}"), expected, "{row}");
+                assert_eq!(
+                    engine.methods(),
+                    ["capabilities"],
+                    "{row}: the install must never reach the engine"
+                );
+            }
+        }
+
+        /// The requests that do not change the machine are sent as they are,
+        /// once, and their answer's version is what is checked.
+        #[test]
+        fn a_request_that_changes_nothing_is_sent_without_a_check() {
+            for method in [
+                EngineMethod::Stop,
+                EngineMethod::Healthcheck,
+                EngineMethod::Detect,
+                EngineMethod::ResolveModel,
+                EngineMethod::Endpoint,
+                EngineMethod::Logs,
+                EngineMethod::Capabilities,
+            ] {
+                let engine = FakeEngine::answering("no-handshake", INSTALLED, 0);
+                send(&engine, method.clone()).unwrap();
+                assert_eq!(engine.methods(), [method.name()], "{method:?}");
+            }
+            let engine = FakeEngine::answering(
+                "no-handshake-incompatible",
+                r#"{"protocol_version":"9.0.0","ok":true,"data":{"stopped":true}}"#,
+                0,
+            );
+            let error = send(&engine, EngineMethod::Stop).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine answered in engine protocol 9.0.0, which this release \
+                 (protocol 0.1.0) cannot use"
+            );
+            assert_eq!(engine.methods(), ["stop"]);
+        }
+
+        /// What an engine leaves on stdout besides its answer makes the answer
+        /// unreadable, and the error says so; a pretty-printed answer over many
+        /// lines is still one answer.
+        #[test]
+        fn output_besides_the_answer_on_stdout_is_refused_and_named() {
+            let rule = "(an engine writes only its JSON answer to stdout; logs go to stderr)";
+            let logged = FakeEngine::new(
+                "contaminated-before",
+                true,
+                &format!("echo 'INFO loading model'\nprintf '%s' '{STOPPED}'"),
+            );
+            assert_eq!(
+                run(&logged, &EngineStdioOptions::default())
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "failed to parse engine response envelope: the engine wrote other output to \
+                     stdout alongside its answer, starting with `INFO loading model` {rule}"
+                )
+            );
+
+            let trailing = FakeEngine::new(
+                "contaminated-after",
+                true,
+                &format!("printf '%s\\n' '{STOPPED}'\necho done >&1\necho oops >&2"),
+            );
+            assert_eq!(
+                run(&trailing, &EngineStdioOptions::default())
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "failed to parse engine response envelope: the engine wrote other output to \
+                     stdout alongside its answer, starting with `{STOPPED}` {rule}; stderr: oops"
+                )
+            );
+
+            let not_an_envelope = FakeEngine::answering("not-an-envelope", r#"{"status":"ok"}"#, 0);
+            assert_eq!(
+                run(&not_an_envelope, &EngineStdioOptions::default())
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "failed to parse engine response envelope: the engine's stdout is JSON but \
+                     not an answer envelope (missing field `ok` at line 1 column 15), starting \
+                     with `{{\"status\":\"ok\"}}` {rule}"
+                )
+            );
+
+            let empty = FakeEngine::new("empty-stdout", true, "exit 0");
+            assert_eq!(
+                run(&empty, &EngineStdioOptions::default())
+                    .unwrap_err()
+                    .to_string(),
+                "failed to parse engine response envelope: the engine printed no answer on stdout"
+            );
+
+            let pretty = FakeEngine::new(
+                "pretty-printed",
+                true,
+                "printf '{\\n  \"protocol_version\": \"0.1.0\",\\n  \"ok\": true,\\n  \"data\": {\\n    \"stopped\": true\\n  }\\n}\\n'",
+            );
+            assert_eq!(
+                run(&pretty, &EngineStdioOptions::default()).unwrap(),
+                json!({"stopped": true})
+            );
         }
     }
 }

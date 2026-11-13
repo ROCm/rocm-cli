@@ -32,6 +32,57 @@ The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
 `llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
 unsupported. rocm-cli does not use a CPU fallback for this path.
 
+## The stdio protocol contract
+
+An adapter run as `rocm-engine-<engine> stdio` (and `rocm __engine-stdio
+<engine>`, which serves the built-in ones) reads one JSON request envelope on
+stdin, to its end, and writes one JSON response envelope on stdout. The client
+that sends it is [`stdio_client.rs`](../crates/rocm-engine-protocol/src/stdio_client.rs),
+shared by `rocm` and `rocmd`; the version rule is in
+[`protocol_version.rs`](../crates/rocm-engine-protocol/src/protocol_version.rs).
+
+**Every envelope names its protocol.** Requests and responses carry
+`protocol_version`, the `MAJOR.MINOR.PATCH` version of the engine protocol the
+side that wrote it speaks (`ENGINE_PROTOCOL_VERSION`, `0.1.0` today; `rocm
+examine` prints it as `protocol:`). An envelope without the field was written
+before it existed and is read as `0.1.0`, so an adapter or a daemon from an
+earlier release keeps working with this one.
+
+**Compatibility is the caret rule.** While the major is `0`, two versions are
+compatible when their major and minor match (`0.1.0` and `0.1.9` are, `0.1.0`
+and `0.2.0` are not); from `1.0.0` on, when their major matches. The patch never
+decides. A version that is not three dot-separated numbers is incompatible with
+everything.
+
+**When the version is raised.** An addition (a new optional field, a new method
+an older peer never sends) raises the patch. A removal or a type change (a field
+dropped, renamed, made required or given another type) raises the minor while
+the major is `0`, and the major after that.
+
+**What each side does with a mismatch.**
+
+- An adapter checks the request's version before it reads the payload. A request
+  it cannot serve gets an error envelope with code `incompatible_protocol`, and
+  nothing else happens.
+- The client checks a response's version before anything else in it, `ok`
+  included. An answer in a protocol it cannot use is an error that names both
+  versions, even when it reports success.
+- Before an `install` or a `launch`, the requests that change the machine, the
+  client first sends `capabilities` through the same path and checks the
+  version of that answer. The `install` or `launch` is sent only when that
+  answer is in a compatible protocol and is not an error; otherwise the error
+  says the request was not sent and why (the engine's version, or the reason
+  its capabilities could not be read). Nothing is cached: each such request
+  checks again. The other methods are sent as they are and only their answer is
+  checked.
+
+**Stdout holds only the answer.** The whole of stdout must parse as one
+response envelope, pretty-printed over many lines or not. Anything else there,
+such as a log line before the answer, makes the answer unreadable, and the
+error says so, quoting the start of what was written. An adapter writes its
+logs and progress to stderr, which the client collects and shows when a request
+fails.
+
 ## Lemonade backend alignment on engine install
 
 Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its

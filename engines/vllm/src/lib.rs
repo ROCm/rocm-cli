@@ -251,6 +251,11 @@ pub fn builtin_serve_http(
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    // Refuse a request made for a protocol this engine cannot serve before its
+    // payload is read: in another protocol the payload may mean something else.
+    if let Some(refusal) = rocm_engine_protocol::incompatible_request_response(&envelope) {
+        return refusal;
+    }
     match envelope.method {
         EngineMethod::Detect => {
             deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |_| {
@@ -448,36 +453,84 @@ mod tests {
         ];
 
         for (method, payload) in success_cases {
-            let response = handle_envelope(EngineRequestEnvelope { method, payload });
+            let response = handle_envelope(EngineRequestEnvelope::new(method, payload));
             assert!(
                 response.ok,
                 "expected protocol method to return a typed success envelope: {:?}",
                 response.error
             );
+            assert_eq!(
+                response.protocol_version.as_deref(),
+                Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+            );
         }
 
-        let endpoint = handle_envelope(EngineRequestEnvelope {
-            method: EngineMethod::Endpoint,
-            payload: json!({
+        let endpoint = handle_envelope(EngineRequestEnvelope::new(
+            EngineMethod::Endpoint,
+            json!({
                 "service_id": service_id.as_str()
             }),
-        });
+        ));
         assert!(!endpoint.ok);
+        assert_eq!(
+            endpoint.protocol_version.as_deref(),
+            Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+        );
         assert_eq!(
             endpoint.error.as_ref().map(|error| error.code.as_str()),
             Some("request_failed")
         );
 
         for method in [EngineMethod::Install, EngineMethod::Launch] {
-            let response = handle_envelope(EngineRequestEnvelope {
-                method,
-                payload: json!({}),
-            });
+            let response = handle_envelope(EngineRequestEnvelope::new(method, json!({})));
             assert!(!response.ok);
+            assert_eq!(
+                response.protocol_version.as_deref(),
+                Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+            );
             assert_eq!(
                 response.error.as_ref().map(|error| error.code.as_str()),
                 Some("invalid_payload")
             );
+        }
+    }
+    /// Every method, so a test over the protocol cannot miss one.
+    const ALL_METHODS: [EngineMethod; 9] = [
+        EngineMethod::Detect,
+        EngineMethod::Install,
+        EngineMethod::Capabilities,
+        EngineMethod::ResolveModel,
+        EngineMethod::Launch,
+        EngineMethod::Healthcheck,
+        EngineMethod::Endpoint,
+        EngineMethod::Stop,
+        EngineMethod::Logs,
+    ];
+
+    /// A request made for a protocol this engine cannot serve is refused with
+    /// `incompatible_protocol` before its payload is read: an empty `install`
+    /// or `launch` payload would otherwise be `invalid_payload`, and the rest
+    /// would be served.
+    #[test]
+    fn a_request_for_an_incompatible_protocol_is_refused_before_its_payload_is_read() {
+        for theirs in ["9.0.0", "0.2.0", "banana"] {
+            for method in ALL_METHODS {
+                let mut request = EngineRequestEnvelope::new(method.clone(), serde_json::json!({}));
+                request.protocol_version = Some(theirs.to_owned());
+                let response = handle_envelope(request);
+                assert!(!response.ok, "{method:?} for {theirs}");
+                assert_eq!(
+                    response.protocol_version.as_deref(),
+                    Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION),
+                    "{method:?} for {theirs}"
+                );
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code.as_str()),
+                    Some(rocm_engine_protocol::INCOMPATIBLE_PROTOCOL_CODE),
+                    "{method:?} for {theirs}: {:?}",
+                    response.error
+                );
+            }
         }
     }
 }

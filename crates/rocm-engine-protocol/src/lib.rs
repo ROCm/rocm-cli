@@ -5,6 +5,11 @@
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub mod fake_engine;
 
+mod protocol_version;
+pub use protocol_version::{
+    INCOMPATIBLE_PROTOCOL_CODE, PRE_VERSIONING_PROTOCOL, ProtocolMismatch,
+    engine_protocol_compatible, incompatible_request_response,
+};
 mod stdio_client;
 pub use stdio_client::{
     ENGINE_PROGRESS_STDERR_ENV, EngineStdioOptions, decode_engine_response,
@@ -18,6 +23,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The version of the engine stdio protocol this build speaks.
+///
+/// It is carried in every request and answer as `protocol_version`. See the
+/// `protocol_version` module for what a missing field means, the compatibility
+/// rule and when to raise it.
 pub const ENGINE_PROTOCOL_VERSION: &str = "0.1.0";
 pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
@@ -250,6 +260,34 @@ pub enum EngineMethod {
     Logs,
 }
 
+impl EngineMethod {
+    /// The method's name on the wire (`install`, `resolve_model`, ...).
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Detect => "detect",
+            Self::Install => "install",
+            Self::Capabilities => "capabilities",
+            Self::ResolveModel => "resolve_model",
+            Self::Launch => "launch",
+            Self::Healthcheck => "healthcheck",
+            Self::Endpoint => "endpoint",
+            Self::Stop => "stop",
+            Self::Logs => "logs",
+        }
+    }
+
+    /// Whether the client checks the engine's protocol version before sending
+    /// this request: the methods that change the machine (install a runtime,
+    /// start a server), which must never reach an engine that would misread
+    /// them. The others are answered in the engine's protocol and that answer's
+    /// version is checked instead.
+    #[must_use]
+    pub const fn requires_protocol_handshake(&self) -> bool {
+        matches!(self, Self::Install | Self::Launch)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DevicePolicy {
@@ -343,9 +381,26 @@ pub fn launch_gpu_indices(selection: Option<&GpuSelection>) -> Vec<u32> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRequestEnvelope {
+    /// The protocol the request was written in; absent means
+    /// [`PRE_VERSIONING_PROTOCOL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
     pub method: EngineMethod,
     #[serde(default)]
     pub payload: Value,
+}
+
+impl EngineRequestEnvelope {
+    /// A request for `method` with `payload`, written in this build's
+    /// [`ENGINE_PROTOCOL_VERSION`].
+    #[must_use]
+    pub fn new(method: EngineMethod, payload: Value) -> Self {
+        Self {
+            protocol_version: Some(ENGINE_PROTOCOL_VERSION.to_owned()),
+            method,
+            payload,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +411,10 @@ pub struct EngineErrorDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineResponseEnvelope {
+    /// The protocol the answer was written in; absent means
+    /// [`PRE_VERSIONING_PROTOCOL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
@@ -369,6 +428,7 @@ impl EngineResponseEnvelope {
         T: Serialize,
     {
         Self {
+            protocol_version: Some(ENGINE_PROTOCOL_VERSION.to_owned()),
             ok: true,
             data: Some(serde_json::to_value(data).expect("serializable response")),
             error: None,
@@ -377,6 +437,7 @@ impl EngineResponseEnvelope {
 
     pub fn failure(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            protocol_version: Some(ENGINE_PROTOCOL_VERSION.to_owned()),
             ok: false,
             data: None,
             error: Some(EngineErrorDetail {
@@ -865,14 +926,61 @@ mod tests {
 
     #[test]
     fn request_roundtrip_preserves_method() {
-        let envelope = EngineRequestEnvelope {
-            method: EngineMethod::Detect,
-            payload: serde_json::json!({ "runtime_id": "therock-release" }),
-        };
+        let envelope = EngineRequestEnvelope::new(
+            EngineMethod::Detect,
+            serde_json::json!({ "runtime_id": "therock-release" }),
+        );
 
         let serialized = serde_json::to_string(&envelope).unwrap();
         let parsed: EngineRequestEnvelope = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed.method, EngineMethod::Detect);
+        assert_eq!(
+            parsed.protocol_version.as_deref(),
+            Some(ENGINE_PROTOCOL_VERSION)
+        );
+    }
+
+    /// Every message this build writes names the protocol it was written in,
+    /// and a message from before the field existed still reads, with no version.
+    #[test]
+    fn envelopes_carry_this_builds_protocol_version_and_tolerate_its_absence() {
+        let request = serde_json::to_value(EngineRequestEnvelope::new(
+            EngineMethod::Stop,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        assert_eq!(request["protocol_version"], ENGINE_PROTOCOL_VERSION);
+        let success = serde_json::to_value(EngineResponseEnvelope::success(1)).unwrap();
+        assert_eq!(success["protocol_version"], ENGINE_PROTOCOL_VERSION);
+        let failure = serde_json::to_value(EngineResponseEnvelope::failure("c", "m")).unwrap();
+        assert_eq!(failure["protocol_version"], ENGINE_PROTOCOL_VERSION);
+
+        let legacy_request: EngineRequestEnvelope =
+            serde_json::from_str(r#"{"method":"stop","payload":{}}"#).unwrap();
+        assert_eq!(legacy_request.protocol_version, None);
+        let legacy_response: EngineResponseEnvelope =
+            serde_json::from_str(r#"{"ok":true,"data":{}}"#).unwrap();
+        assert_eq!(legacy_response.protocol_version, None);
+    }
+
+    #[test]
+    fn method_names_match_the_wire_spelling() {
+        for method in [
+            EngineMethod::Detect,
+            EngineMethod::Install,
+            EngineMethod::Capabilities,
+            EngineMethod::ResolveModel,
+            EngineMethod::Launch,
+            EngineMethod::Healthcheck,
+            EngineMethod::Endpoint,
+            EngineMethod::Stop,
+            EngineMethod::Logs,
+        ] {
+            assert_eq!(
+                serde_json::to_value(&method).unwrap(),
+                serde_json::json!(method.name())
+            );
+        }
     }
 
     #[test]
