@@ -605,25 +605,47 @@ required list.
 
 GitHub cancels a job that no runner has been assigned after 24 hours. The job
 concludes `cancelled`, which merge gates treat as neutral, and
-`timeout-minutes` does not apply because it counts from the job start. A
-self-hosted lane whose runners are all offline therefore drops out of coverage
-without a single red check.
+`timeout-minutes` does not apply because it counts from the job start. The
+report job does go red for a lane that was cancelled without uploading a
+report, so a lane whose runners are offline is not invisible, but that red
+arrives only after the full 24 hours and sits on the report job rather than on
+the lane.
 
-`e2e-selfhosted.yml` (`lane-queue-watchdog`) and `nightly.yml`
-(`e2e-nightly-queue-watchdog`) each run `scripts/lane-queue-watchdog.sh` on a
-GitHub-hosted runner. It polls the run's job list and, once any job on a
-self-hosted runner has been `queued` for longer than the budget, fails with an
-annotation naming the job and how long it waited. Jobs that were skipped, are
-running or have finished never count. The watchdog is advisory for the same
+[`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
+(`lane-queue-watchdog`) and [`nightly.yml`](../.github/workflows/nightly.yml)
+(`e2e-nightly-queue-watchdog`) each run
+[`scripts/lane-queue-watchdog.sh`](../scripts/lane-queue-watchdog.sh) on a
+GitHub-hosted runner. It polls the run's job list and fails as soon as any
+watched job that no runner has started has waited for at least the budget,
+with an annotation naming that job and how long it waited. The same red
+therefore arrives hours earlier and on the lane itself. Jobs that were skipped,
+are running or have finished never count. The watchdog is advisory for the same
 reason the lanes are: it is not a required check. It cannot make an offline
 runner appear; it makes the gap visible within hours instead of after a day.
 
-The jobs are matched on runner labels, not names: any job whose `runs-on`
-includes `self-hosted` is watched, so a new or renamed lane needs no change
-here. The budget is 300 minutes, set once per workflow in the watchdog job's
-`LANE_QUEUE_BUDGET_MINUTES`. Change that value to change the budget, and keep
-the job's `timeout-minutes` above it and at or below 360, the longest a
-GitHub-hosted job may run; the workflow contract tests check both.
+Only some lanes are watched. A job is watched when its `runs-on` carries a
+label in the workflow's `WATCH_LABELS`, which names the lanes whose normal wait
+is short or that are known to go offline: the Strix Halo lanes
+(`devlab-dispatch`, `strix-halo`) in both workflows, and in the nightly also the
+R9700 and MI350P lanes. The `mi300x` and `w7900` lanes are exempt. They queue
+routinely for 8 to 24 hours behind busy shared runners and then run, and a
+hosted job cannot watch for longer than 6 hours, so an in-run watchdog cannot
+tell them from a dead lane. A lane with a long normal queue needs a different
+mechanism, for example a scheduled scan that is not tied to one run; none exists
+yet.
+
+The workflow contract tests require every self-hosted lane in each workflow to
+carry a watched label or an exempt one, so a new lane that is neither fails the
+test until someone decides which it is. They also reject a lane that carries
+both kinds, and a generic label such as `self-hosted` in `WATCH_LABELS`, either
+of which would pull an exempt lane under the budget. The budget is set once per
+workflow in the watchdog job's `LANE_QUEUE_BUDGET_MINUTES`, and the tests pin its
+value (`WATCHDOG_BUDGET_MINUTES` in
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs)), so changing it is
+a deliberate edit to both. Keep the job's `timeout-minutes` above
+the budget and within the longest a GitHub-hosted job may run; the tests check
+that too. Only the jobs a run created are watched: lanes created later by
+"Re-run failed jobs" are not.
 
 ## Fork safety
 

@@ -424,16 +424,18 @@ mod tests {
     }
 
     fn job_scalar<'a>(block: &'a str, key: &str) -> &'a str {
+        job_scalar_opt(block, key).unwrap_or_else(|| panic!("job defines top-level scalar `{key}`"))
+    }
+
+    /// `job_scalar`, or `None` when the job has no such top-level key.
+    fn job_scalar_opt<'a>(block: &'a str, key: &str) -> Option<&'a str> {
         let marker = format!("{key}:");
-        block
-            .lines()
-            .find_map(|line| {
-                (indent_of(line) == 4)
-                    .then(|| line.trim().strip_prefix(&marker))
-                    .flatten()
-                    .map(str::trim)
-            })
-            .unwrap_or_else(|| panic!("job defines top-level scalar `{key}`"))
+        block.lines().find_map(|line| {
+            (indent_of(line) == 4)
+                .then(|| line.trim().strip_prefix(&marker))
+                .flatten()
+                .map(str::trim)
+        })
     }
 
     fn markdown_table_rows(text: &str, header: &str) -> Vec<Vec<String>> {
@@ -9997,6 +9999,9 @@ permissions:
     // pin that every self-hosted lane is covered by it and that the job is
     // schedulable, then run the script itself.
 
+    /// The queue budget both workflows give the watchdog, in minutes.
+    const WATCHDOG_BUDGET_MINUTES: u32 = 300;
+
     /// The longest a GitHub-hosted job may run, in minutes.
     const HOSTED_JOB_LIMIT_MINUTES: u32 = 360;
 
@@ -10004,9 +10009,19 @@ permissions:
     fn watchdog_labels(workflow: &str, job: &str) -> Vec<String> {
         let text = read_workflow(workflow);
         let block = job_block(&text, job);
-        assert!(
-            block.contains("scripts/lane-queue-watchdog.sh"),
-            "{workflow} `{job}` must run scripts/lane-queue-watchdog.sh:\n{block}"
+        // A comment mentioning the script must not satisfy this: the step's own
+        // command line has to hand the watched labels to the script.
+        let invocations: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.starts_with('#') && line.contains("scripts/lane-queue-watchdog.sh")
+            })
+            .collect();
+        assert_eq!(
+            invocations,
+            ["scripts/lane-queue-watchdog.sh ${WATCH_LABELS}"],
+            "{workflow} `{job}` must run `scripts/lane-queue-watchdog.sh ${{WATCH_LABELS}}`:\n{block}"
         );
         let values = flattened_values(block, "WATCH_LABELS");
         assert_eq!(
@@ -10017,37 +10032,170 @@ permissions:
         values[0].split_whitespace().map(str::to_owned).collect()
     }
 
-    /// Every self-hosted lane in `workflow` must carry a label the watchdog
-    /// watches, or a stuck lane in it would still fade to `cancelled` unseen.
+    /// Runner labels whose lanes the in-run watchdog deliberately does not watch,
+    /// each with the reason. These lanes queue for hours as a matter of course, so
+    /// a long wait there does not mean "no runner", and a hosted job cannot watch
+    /// past `HOSTED_JOB_LIMIT_MINUTES` anyway. Adding a label here is a decision
+    /// to leave those lanes to a different mechanism.
+    const WATCHDOG_EXEMPT_LABELS: &[(&str, &str)] = &[
+        (
+            "mi300x",
+            "routine queues of 8-24 h, beyond the hosted-job limit",
+        ),
+        (
+            "w7900",
+            "routine queues of 8-24 h, beyond the hosted-job limit",
+        ),
+    ];
+
+    /// The `lanes` (`(job id, runs-on)`) that carry neither a watched label nor an
+    /// exempt one: a lane nobody decided about. Derived from the workflow, so a new
+    /// lane is classified without anyone remembering to list it.
+    fn unclassified_lanes(
+        lanes: &[(String, String)],
+        watched: &[String],
+        exempt: &[(&str, &str)],
+    ) -> Vec<String> {
+        lanes
+            .iter()
+            .filter(|(_, runs_on)| {
+                let labels = flattened_list_items(runs_on);
+                !labels.iter().any(|label| {
+                    watched.contains(label) || exempt.iter().any(|(name, _)| name == label)
+                })
+            })
+            .map(|(lane, runs_on)| format!("{lane} (runs-on: {runs_on})"))
+            .collect()
+    }
+
+    /// Every self-hosted lane in `workflow` must either carry a label the watchdog
+    /// watches or an exempt one, so no lane is left unwatched by accident.
     fn assert_watchdog_covers_every_lane(workflow: &str, job: &str) {
         let watched = watchdog_labels(workflow, job);
         let text = read_workflow(workflow);
         let lanes = self_hosted_e2e_jobs(&text);
         assert!(!lanes.is_empty(), "{workflow} has self-hosted lanes");
-        for (lane, runs_on) in lanes {
-            let labels = flattened_list_items(&runs_on);
+        let unclassified = unclassified_lanes(&lanes, &watched, WATCHDOG_EXEMPT_LABELS);
+        assert!(
+            unclassified.is_empty(),
+            "{workflow} lanes {unclassified:?} carry none of the labels `{job}` watches \
+             ({watched:?}) and none of the exempt labels ({WATCHDOG_EXEMPT_LABELS:?}). Add \
+             the lane's label to WATCH_LABELS, or exempt it here with a reason: a lane \
+             nobody watches is cancelled after 24h with no early red check"
+        );
+        for (exempt, _) in WATCHDOG_EXEMPT_LABELS {
             assert!(
-                labels.iter().any(|label| watched.contains(label)),
-                "{workflow} lane `{lane}` (runs-on: {runs_on}) carries none of the labels \
-                 `{job}` watches ({watched:?}), so a lane with no runner would be cancelled \
-                 after 24h with no red check"
+                !watched.iter().any(|label| label == exempt),
+                "`{exempt}` is both watched and exempt in {workflow}"
+            );
+        }
+        // The script watches a job when ANY of its labels is watched, so a generic
+        // label would sweep in the exempt lanes, and a lane carrying both kinds
+        // would be watched despite its exemption.
+        for label in &watched {
+            assert!(
+                !GENERIC_LABELS.contains(&label.as_str()),
+                "{workflow} `{job}` watches the generic label `{label}`, which every \
+                 self-hosted lane carries, exempt ones included"
+            );
+        }
+        for (lane, runs_on) in &lanes {
+            let labels = flattened_list_items(runs_on);
+            let is_watched = labels.iter().any(|label| watched.contains(label));
+            let is_exempt = labels
+                .iter()
+                .any(|label| WATCHDOG_EXEMPT_LABELS.iter().any(|(name, _)| name == label));
+            assert!(
+                !(is_watched && is_exempt),
+                "{workflow} lane `{lane}` (runs-on: {runs_on}) carries both a watched and \
+                 an exempt label, so the watchdog would watch it despite the exemption"
+            );
+        }
+        let all_labels: Vec<String> = lanes
+            .iter()
+            .flat_map(|(_, runs_on)| flattened_list_items(runs_on))
+            .collect();
+        for label in &watched {
+            assert!(
+                all_labels.contains(label),
+                "{workflow} watches `{label}` but no self-hosted lane carries it"
             );
         }
         assert!(
-            !self_hosted_e2e_jobs(&text).iter().any(|(id, _)| id == job),
+            !lanes.iter().any(|(id, _)| id == job),
             "`{job}` must not itself wait for a self-hosted runner"
+        );
+    }
+
+    #[test]
+    fn a_new_lane_that_is_neither_watched_nor_exempt_is_reported() {
+        let lanes = vec![
+            (
+                "gpu-a".to_owned(),
+                "[self-hosted, linux, mi300x]".to_owned(),
+            ),
+            (
+                "gpu-b".to_owned(),
+                "[self-hosted, linux, strix-halo]".to_owned(),
+            ),
+            (
+                "gpu-new".to_owned(),
+                "[self-hosted, linux, brand-new-gpu]".to_owned(),
+            ),
+        ];
+        let watched = vec!["strix-halo".to_owned()];
+        assert_eq!(
+            unclassified_lanes(&lanes, &watched, WATCHDOG_EXEMPT_LABELS),
+            ["gpu-new (runs-on: [self-hosted, linux, brand-new-gpu])"]
         );
     }
 
     /// The watchdog job runs on a hosted runner and its timeout covers the budget
     /// without exceeding what GitHub allows a hosted job.
-    fn assert_watchdog_is_schedulable(workflow: &str, job: &str) {
+    fn assert_watchdog_is_schedulable(
+        workflow: &str,
+        job: &str,
+        needs: Option<&str>,
+        condition: Option<&str>,
+    ) {
         let text = read_workflow(workflow);
         let block = job_block(&text, job);
+        // `needs` and `if` decide whether and when the watchdog starts: a `needs`
+        // on a lane would hold it until the lane finished, and a false `if` would
+        // switch it off, either way without any other test noticing.
+        assert_eq!(
+            job_scalar_opt(block, "needs"),
+            needs,
+            "{workflow} `{job}` must not wait for the lanes it watches:\n{block}"
+        );
+        assert_eq!(
+            job_scalar_opt(block, "if"),
+            condition,
+            "{workflow} `{job}` runs on a condition other than the pinned one:\n{block}"
+        );
         assert!(
             runs_only_on_ubuntu(block),
             "{workflow} `{job}` must run on a GitHub-hosted runner, or it would queue \
              behind the same offline fleet it watches:\n{block}"
+        );
+        let budget_keys = block
+            .lines()
+            .filter(|line| {
+                !line.trim_start().starts_with('#') && line.contains("LANE_QUEUE_BUDGET_MINUTES")
+            })
+            .count();
+        assert_eq!(
+            budget_keys, 1,
+            "{workflow} `{job}` must set LANE_QUEUE_BUDGET_MINUTES exactly once (a step-level \
+             value would override the job-level one this test reads):\n{block}"
+        );
+        assert_eq!(
+            job_mapping(block, "permissions")
+                .get("actions")
+                .map(String::as_str),
+            Some("read"),
+            "{workflow} `{job}` needs `actions: read` to list the run's jobs, or every run \
+             would go red after the API retries:\n{block}"
         );
         let timeout: u32 = job_scalar(block, "timeout-minutes")
             .parse()
@@ -10071,6 +10219,67 @@ permissions:
             budget < 24 * 60,
             "a {budget}-minute budget outlasts GitHub's own 24h cancellation"
         );
+        assert_eq!(
+            budget, WATCHDOG_BUDGET_MINUTES,
+            "{workflow} `{job}` budget drifted from the value the watchdog is designed around; \
+             a much smaller one turns routine queues red, a larger one waits too long"
+        );
+    }
+
+    /// Nothing may quietly turn the watchdog's red into a pass or stop it
+    /// running: no `continue-on-error`, no step-level `if`, the checkout without
+    /// persisted credentials first, and the script step's env exactly the token
+    /// and the labels.
+    fn assert_watchdog_cannot_be_switched_off(workflow: &str, job: &str) {
+        let text = read_workflow(workflow);
+        let block = job_block(&text, job);
+        assert_eq!(
+            job_scalar_opt(block, "continue-on-error"),
+            None,
+            "{workflow} `{job}` must not set continue-on-error: it would read as a pass:\n{block}"
+        );
+        let steps = job_steps(block).unwrap_or_else(|| panic!("{workflow} `{job}` has steps"));
+        assert_eq!(
+            steps.len(),
+            2,
+            "{workflow} `{job}` is a checkout and the script step, nothing else:\n{block}"
+        );
+        for (name, step) in &steps {
+            for key in ["continue-on-error", "if"] {
+                assert!(
+                    step_key_line(step, key).is_none(),
+                    "{workflow} `{job}` step `{name}` must not set `{key}`:\n{step}"
+                );
+            }
+        }
+        let (_, checkout) = &steps[0];
+        assert!(
+            step_key(checkout, "uses").starts_with("actions/checkout@"),
+            "{workflow} `{job}` starts with a checkout:\n{checkout}"
+        );
+        assert!(
+            checkout
+                .lines()
+                .any(|line| line.trim() == "persist-credentials: false"),
+            "{workflow} `{job}` checkout must not persist credentials:\n{checkout}"
+        );
+        let (_, run) = &steps[1];
+        let env = step_env(run);
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["GH_TOKEN", "WATCH_LABELS"],
+            "{workflow} `{job}` script step env is exactly the token and the labels:\n{run}"
+        );
+        assert_eq!(
+            env["GH_TOKEN"], "${{ github.token }}",
+            "{workflow} `{job}` lists the run's jobs with the run's own token"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_jobs_cannot_be_switched_off() {
+        assert_watchdog_cannot_be_switched_off("e2e-selfhosted.yml", "lane-queue-watchdog");
+        assert_watchdog_cannot_be_switched_off("nightly.yml", "e2e-nightly-queue-watchdog");
     }
 
     #[test]
@@ -10080,7 +10289,12 @@ permissions:
 
     #[test]
     fn selfhosted_watchdog_is_schedulable() {
-        assert_watchdog_is_schedulable("e2e-selfhosted.yml", "lane-queue-watchdog");
+        assert_watchdog_is_schedulable(
+            "e2e-selfhosted.yml",
+            "lane-queue-watchdog",
+            Some("[changes]"),
+            Some("${{ always() && needs.changes.result == 'success' }}"),
+        );
     }
 
     #[test]
@@ -10090,7 +10304,32 @@ permissions:
 
     #[test]
     fn nightly_watchdog_is_schedulable() {
-        assert_watchdog_is_schedulable("nightly.yml", "e2e-nightly-queue-watchdog");
+        assert_watchdog_is_schedulable("nightly.yml", "e2e-nightly-queue-watchdog", None, None);
+    }
+
+    /// Whether the watchdog script can be run here. It needs `jq`; a skip reads as
+    /// a pass, so on CI a missing `jq` fails loudly instead.
+    #[cfg(unix)]
+    fn watchdog_can_run() -> bool {
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !has_jq {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`jq` is not on PATH, so the watchdog script's logic cannot be \
+                 exercised; install it on this runner"
+            );
+            eprintln!("skipping: no `jq` on PATH");
+        }
+        has_jq
+    }
+
+    /// How many times `needle` appears in `log`.
+    #[cfg(unix)]
+    fn count(log: &str, needle: &str) -> usize {
+        log.matches(needle).count()
     }
 
     /// 2026-01-01T00:00:00Z, the `created_at` every canned job carries.
@@ -10109,10 +10348,34 @@ permissions:
         .to_string()
     }
 
+    /// A canned job created `minutes_after_epoch` (under a day) after the epoch.
+    #[cfg(unix)]
+    fn canned_job_at(
+        name: &str,
+        status: &str,
+        labels: &[&str],
+        minutes_after_epoch: u64,
+    ) -> String {
+        serde_json::json!({
+            "name": name,
+            "status": status,
+            "labels": labels,
+            "created_at": format!(
+                "2026-01-01T{:02}:{:02}:00Z",
+                minutes_after_epoch / 60,
+                minutes_after_epoch % 60
+            ),
+        })
+        .to_string()
+    }
+
     /// What the stubbed `gh` does on its Nth call: print these jobs, or fail.
     #[cfg(unix)]
     enum Call<'a> {
+        /// One job per API page, as raw job objects.
         Jobs(&'a [String]),
+        /// Reply text printed as it is, bypassing the stub's own paging and filter.
+        Raw(&'a str),
         ApiError,
     }
 
@@ -10125,14 +10388,20 @@ permissions:
         age_minutes: u64,
         extra_env: &[(&str, &str)],
     ) -> (i32, String) {
-        let has_jq = std::process::Command::new("jq")
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success());
-        assert!(
-            has_jq,
-            "`jq` is not on PATH, so the watchdog script cannot be exercised; install it"
-        );
+        run_watchdog_with(&["strix-halo"], calls, age_minutes, extra_env)
+    }
+
+    /// `run_watchdog` with the label arguments chosen by the caller. The script
+    /// is killed after a wall-clock limit: its clock is frozen and its sleep is a
+    /// no-op, so a regression that stops it finishing would otherwise hang the
+    /// whole suite instead of failing it.
+    #[cfg(unix)]
+    fn run_watchdog_with(
+        labels: &[&str],
+        calls: &[Call<'_>],
+        age_minutes: u64,
+        extra_env: &[(&str, &str)],
+    ) -> (i32, String) {
         let dir = tempfile::tempdir().expect("temp dir");
         for (i, call) in calls.iter().enumerate() {
             let n = i + 1;
@@ -10141,6 +10410,12 @@ permissions:
                     std::fs::write(dir.path().join(format!("jobs-{n}")), jobs.join("\n") + "\n")
                         .expect("write canned jobs");
                 }
+                Call::Raw(text) => {
+                    std::fs::write(dir.path().join(format!("jobs-{n}")), "\n")
+                        .expect("write placeholder jobs");
+                    std::fs::write(dir.path().join(format!("raw-{n}")), text)
+                        .expect("write raw reply");
+                }
                 Call::ApiError => {
                     std::fs::write(dir.path().join(format!("fail-{n}")), "")
                         .expect("write failure marker");
@@ -10148,18 +10423,51 @@ permissions:
             }
         }
         std::fs::write(dir.path().join("last"), calls.len().to_string()).expect("write last");
-        // Answers call N from `jobs-N` or fails when `fail-N` exists; past the
-        // last scripted call it repeats the last answer.
+        // Behaves like `gh api` for the one call the script makes. Call N is
+        // answered from `jobs-N` (one job per page) or fails when `fail-N` exists;
+        // past the last scripted call it repeats the last answer. It rejects any
+        // other endpoint, serves each page as the API's `{"jobs":[...]}` object and
+        // applies the `--jq` it was given with real jq, so a wrong run, repo, page
+        // size or filter fails the run. Without `--paginate` only the first page
+        // is returned. Every call is logged as `[gh N] args`.
         let body = r#"#!/bin/bash
 n=$(( $(cat "$STUB_DIR/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$STUB_DIR/count"
+echo "[gh $n] $*" >&2
 last=$(cat "$STUB_DIR/last")
 [ "$n" -gt "$last" ] && n=$last
 if [ -e "$STUB_DIR/fail-$n" ]; then echo 'HTTP 502' >&2; exit 1; fi
-cat "$STUB_DIR/jobs-$n"
+if [ "$1" != api ]; then echo "stub gh: only 'api' is supported: $*" >&2; exit 64; fi
+shift
+paginate=0; path=""; filter=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --paginate) paginate=1 ;;
+    --jq) shift; filter="$1" ;;
+    *) path="$1" ;;
+  esac
+  shift
+done
+if [ "$path" != "repos/owner/repo/actions/runs/1/jobs?per_page=100" ]; then
+  echo "stub gh: unexpected endpoint: $path" >&2; exit 64
+fi
+if [ -z "$filter" ]; then echo "stub gh: missing --jq" >&2; exit 64; fi
+if [ -e "$STUB_DIR/raw-$n" ]; then cat "$STUB_DIR/raw-$n"; exit 0; fi
+while IFS= read -r job; do
+  if [ -n "$job" ]; then body="{\"jobs\":[$job]}"; else body='{"jobs":[]}'; fi
+  printf '%s' "$body" | jq -c "$filter" || exit 1
+  [ "$paginate" = 1 ] || break
+done < "$STUB_DIR/jobs-$n"
 "#;
         rocm_core::fake_executable::write_fake_executable(&dir.path().join("gh"), body)
             .expect("plant gh stub");
+        // Logs each sleep as `[sleep N]` instead of sleeping.
+        let sleep_stub = dir.path().join("sleep-stub");
+        rocm_core::fake_executable::write_fake_executable(
+            &sleep_stub,
+            "#!/bin/bash\necho \"[sleep $*]\" >&2\n",
+        )
+        .expect("plant sleep stub");
         let path = format!(
             "{}:{}",
             dir.path().display(),
@@ -10167,7 +10475,7 @@ cat "$STUB_DIR/jobs-$n"
         );
         let mut cmd = std::process::Command::new("bash");
         cmd.arg(repo_root().join("scripts/lane-queue-watchdog.sh"))
-            .args(["self-hosted"])
+            .args(labels)
             .env("PATH", path)
             .env("STUB_DIR", dir.path())
             .env("GITHUB_REPOSITORY", "owner/repo")
@@ -10178,34 +10486,56 @@ cat "$STUB_DIR/jobs-$n"
                 "LANE_QUEUE_NOW",
                 (WATCHDOG_JOB_EPOCH + age_minutes * 60).to_string(),
             )
-            // Never really sleep: the script's clock is `LANE_QUEUE_NOW`.
-            .env("LANE_QUEUE_SLEEP", "true");
+            // Never really sleep: the script's clock is `LANE_QUEUE_NOW` plus the
+            // time it asked to sleep.
+            .env("LANE_QUEUE_SLEEP", &sleep_stub);
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
-        let out = cmd.output().expect("running the watchdog script");
-        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
-        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        let out_path = dir.path().join("script-output");
+        let out_file = std::fs::File::create(&out_path).expect("create output file");
+        let mut child = cmd
+            .stdout(out_file.try_clone().expect("clone output file"))
+            .stderr(out_file)
+            .spawn()
+            .expect("running the watchdog script");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("polling the watchdog script") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("killing the watchdog script");
+                child.wait().expect("reaping the watchdog script");
+                let log = std::fs::read_to_string(&out_path).unwrap_or_default();
+                let skip = log.len().saturating_sub(2000);
+                let tail = String::from_utf8_lossy(&log.as_bytes()[skip..]).into_owned();
+                panic!("the watchdog script did not finish within 60s (it loops):\n{tail}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let log = std::fs::read_to_string(&out_path).expect("read script output");
         (
-            out.status
-                .code()
-                .expect("watchdog exited with a status code"),
+            status.code().expect("watchdog exited with a status code"),
             log,
         )
     }
 
     #[cfg(unix)]
-    const WATCHDOG_LANE: &[&str] = &["self-hosted", "linux", "mi300x"];
+    const WATCHDOG_LANE: &[&str] = &["self-hosted", "linux", "strix-halo"];
 
     #[test]
     #[cfg(unix)]
     fn watchdog_passes_when_every_lane_was_scheduled_or_skipped() {
+        if !watchdog_can_run() {
+            return;
+        }
         let jobs = [
-            canned_job("E2E tests (MI300X)", "in_progress", WATCHDOG_LANE),
+            canned_job("E2E tests (Strix Halo)", "in_progress", WATCHDOG_LANE),
             canned_job(
-                "E2E tests (Strix)",
+                "E2E tests (Strix Windows)",
                 "completed",
-                &["self-hosted", "windows"],
+                &["self-hosted", "windows", "strix-halo"],
             ),
             canned_job("changes", "completed", &["ubuntu-24.04"]),
         ];
@@ -10217,8 +10547,11 @@ cat "$STUB_DIR/jobs-$n"
     #[test]
     #[cfg(unix)]
     fn watchdog_fails_a_lane_queued_past_the_budget_and_names_it() {
+        if !watchdog_can_run() {
+            return;
+        }
         let jobs = [
-            canned_job("E2E tests (MI300X, current)", "queued", WATCHDOG_LANE),
+            canned_job("E2E tests (Strix Halo, current)", "queued", WATCHDOG_LANE),
             canned_job(
                 "E2E tests (W7900)",
                 "completed",
@@ -10229,12 +10562,12 @@ cat "$STUB_DIR/jobs-$n"
         assert_eq!(rc, 1, "{log}");
         assert!(
             log.contains(
-                "::error::E2E tests (MI300X, current) has been queued for 360 minutes (budget 300)"
+                "::error::E2E tests (Strix Halo, current) has been queued for 360 minutes (budget 300)"
             ),
             "{log}"
         );
         assert!(
-            log.contains("no runner picked it up; this lane provided no coverage"),
+            log.contains("past the budget; no runner picked it up"),
             "{log}"
         );
         assert!(
@@ -10246,9 +10579,12 @@ cat "$STUB_DIR/jobs-$n"
     #[test]
     #[cfg(unix)]
     fn watchdog_ignores_a_queued_job_that_is_not_on_a_self_hosted_runner() {
+        if !watchdog_can_run() {
+            return;
+        }
         let jobs = [
             canned_job("Build", "queued", &["ubuntu-24.04"]),
-            canned_job("E2E tests (MI300X)", "completed", WATCHDOG_LANE),
+            canned_job("E2E tests (Strix Halo)", "completed", WATCHDOG_LANE),
         ];
         let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 600, &[]);
         assert_eq!(rc, 0, "{log}");
@@ -10257,23 +10593,42 @@ cat "$STUB_DIR/jobs-$n"
     #[test]
     #[cfg(unix)]
     fn watchdog_waits_while_a_lane_is_queued_inside_the_budget() {
+        if !watchdog_can_run() {
+            return;
+        }
         // Queued at 10 minutes, picked up by the next poll: never a failure.
-        let queued = [canned_job("E2E tests (MI300X)", "queued", WATCHDOG_LANE)];
+        let queued = [canned_job(
+            "E2E tests (Strix Halo)",
+            "queued",
+            WATCHDOG_LANE,
+        )];
         let running = [canned_job(
-            "E2E tests (MI300X)",
+            "E2E tests (Strix Halo)",
             "in_progress",
             WATCHDOG_LANE,
         )];
         let (rc, log) = run_watchdog(&[Call::Jobs(&queued), Call::Jobs(&running)], 10, &[]);
         assert_eq!(rc, 0, "{log}");
         assert!(!log.contains("::error::"), "{log}");
+        // It looked, waited one poll interval, and looked again.
+        assert_eq!(count(&log, "[gh "), 2, "{log}");
+        assert_eq!(count(&log, "[sleep 60]"), 1, "{log}");
     }
 
     #[test]
     #[cfg(unix)]
     fn watchdog_fails_loudly_when_the_api_never_answers() {
+        if !watchdog_can_run() {
+            return;
+        }
         let (rc, log) = run_watchdog(&[Call::ApiError], 600, &[]);
         assert_eq!(rc, 1, "{log}");
+        assert_eq!(count(&log, "[gh "), 3, "three attempts by default:\n{log}");
+        assert_eq!(
+            count(&log, "[sleep 5]"),
+            2,
+            "a pause between attempts:\n{log}"
+        );
         assert!(
             log.contains("::error::could not list this run's jobs"),
             "{log}"
@@ -10283,13 +10638,21 @@ cat "$STUB_DIR/jobs-$n"
     #[test]
     #[cfg(unix)]
     fn watchdog_rides_out_a_transient_api_error() {
+        if !watchdog_can_run() {
+            return;
+        }
         let jobs = [canned_job(
-            "E2E tests (MI300X)",
+            "E2E tests (Strix Halo)",
             "in_progress",
             WATCHDOG_LANE,
         )];
         let (rc, log) = run_watchdog(&[Call::ApiError, Call::Jobs(&jobs)], 600, &[]);
         assert_eq!(rc, 0, "{log}");
+        assert_eq!(
+            count(&log, "[sleep 5]"),
+            1,
+            "one pause before the retry:\n{log}"
+        );
         assert!(
             log.contains("::warning::could not list this run's jobs"),
             "{log}"
@@ -10299,15 +10662,24 @@ cat "$STUB_DIR/jobs-$n"
     #[test]
     #[cfg(unix)]
     fn watchdog_tolerates_lanes_that_are_not_created_yet() {
+        if !watchdog_can_run() {
+            return;
+        }
         let no_jobs: [String; 0] = [];
         let running = [canned_job(
-            "E2E tests (MI300X)",
+            "E2E tests (Strix Halo)",
             "in_progress",
             WATCHDOG_LANE,
         )];
         // Absent at first, present at the second poll.
         let (rc, log) = run_watchdog(&[Call::Jobs(&no_jobs), Call::Jobs(&running)], 0, &[]);
         assert_eq!(rc, 0, "{log}");
+        assert!(
+            !log.contains("nothing to watch"),
+            "the script must wait for the lane, not give up at once:\n{log}"
+        );
+        assert_eq!(count(&log, "[gh "), 2, "{log}");
+        assert_eq!(count(&log, "[sleep 60]"), 1, "{log}");
         // Absent for the whole grace: nothing to watch, which is not a failure.
         let (rc, log) = run_watchdog(
             &[Call::Jobs(&no_jobs)],
@@ -10319,5 +10691,355 @@ cat "$STUB_DIR/jobs-$n"
             log.contains("::warning::no job with a watched runner label"),
             "{log}"
         );
+        // A 2-minute grace at 60-second polls: looks at 0, 60 and 120 seconds,
+        // and gives up on the third look, not before and not after.
+        assert_eq!(count(&log, "[gh "), 3, "{log}");
+        assert_eq!(count(&log, "[sleep 60]"), 2, "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_fails_on_one_over_budget_lane_while_another_is_inside_it() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // At minute 400: one lane queued since minute 0, one since minute 390.
+        let jobs = [
+            canned_job_at("E2E tests (Strix Halo)", "queued", WATCHDOG_LANE, 0),
+            canned_job_at("E2E tests (R9700)", "queued", WATCHDOG_LANE, 390),
+        ];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 400, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("::error::E2E tests (Strix Halo) has been queued for 400 minutes"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("R9700"),
+            "a lane still inside its budget is not blamed:\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_budget_boundary_is_inclusive_and_ages_round_down() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let queued = [canned_job(
+            "E2E tests (Strix Halo)",
+            "queued",
+            WATCHDOG_LANE,
+        )];
+        let running = [canned_job(
+            "E2E tests (Strix Halo)",
+            "in_progress",
+            WATCHDOG_LANE,
+        )];
+        let polls = [Call::Jobs(&queued), Call::Jobs(&running)];
+        // 299 minutes: still inside the 300-minute budget, so it waits.
+        let (rc, log) = run_watchdog(&polls, 299, &[]);
+        assert_eq!(rc, 0, "{log}");
+        // 299 minutes 30 seconds is 299 whole minutes, not 300.
+        let now = (WATCHDOG_JOB_EPOCH + 299 * 60 + 30).to_string();
+        let (rc, log) = run_watchdog(&polls, 0, &[("LANE_QUEUE_NOW", &now)]);
+        assert_eq!(rc, 0, "{log}");
+        // Exactly the budget: over.
+        let (rc, log) = run_watchdog(&polls, 300, &[]);
+        assert_eq!(rc, 1, "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_matches_any_of_several_labels() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let jobs = [canned_job(
+            "E2E tests (Strix Halo)",
+            "queued",
+            WATCHDOG_LANE,
+        )];
+        let (rc, log) = run_watchdog_with(
+            &["no-such-label", "strix-halo"],
+            &[Call::Jobs(&jobs)],
+            600,
+            &[],
+        );
+        assert_eq!(rc, 1, "a job matching the second label is watched:\n{log}");
+        let (rc, log) = run_watchdog_with(
+            &["no-such-label", "other-label"],
+            &[Call::Jobs(&jobs)],
+            600,
+            &[("LANE_QUEUE_GRACE_MINUTES", "0")],
+        );
+        assert_eq!(rc, 0, "{log}");
+        assert!(log.contains("nothing to watch"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_rejects_bad_usage_and_bad_numbers_with_exit_2() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let (rc, log) = run_watchdog_with(&[], &[], 0, &[]);
+        assert_eq!(rc, 2, "{log}");
+        assert!(log.contains("usage:"), "{log}");
+        let (rc, log) = run_watchdog(&[], 0, &[("LANE_QUEUE_BUDGET_MINUTES", "five hours")]);
+        assert_eq!(rc, 2, "{log}");
+        assert!(log.contains("is not a whole number"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_lists_every_page_of_jobs() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // The stub returns only the first job unless asked to paginate, so the
+        // over-budget lane is on "page 2" and only a paginated call sees it.
+        let jobs = [
+            canned_job("E2E tests (Strix)", "completed", WATCHDOG_LANE),
+            canned_job("E2E tests (Strix Halo)", "queued", WATCHDOG_LANE),
+        ];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 400, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert!(log.contains("::error::E2E tests (Strix Halo)"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_survives_a_job_with_no_labels() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let unlabelled = serde_json::json!({
+            "name": "odd job", "status": "queued", "labels": null,
+            "created_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string();
+        let running = canned_job("E2E tests (Strix Halo)", "in_progress", WATCHDOG_LANE);
+        let (rc, log) = run_watchdog(&[Call::Jobs(&[unlabelled, running])], 600, &[]);
+        assert_eq!(rc, 0, "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_gives_up_on_the_api_after_exactly_the_configured_attempts() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let jobs = [canned_job(
+            "E2E tests (Strix Halo)",
+            "in_progress",
+            WATCHDOG_LANE,
+        )];
+        let (rc, log) = run_watchdog(
+            &[Call::ApiError, Call::ApiError, Call::Jobs(&jobs)],
+            0,
+            &[("LANE_QUEUE_API_RETRIES", "2")],
+        );
+        assert_eq!(rc, 1, "two attempts were allowed, both failed:\n{log}");
+        assert_eq!(count(&log, "[gh "), 2, "{log}");
+        assert!(
+            log.contains("::error::could not list this run's jobs after 2 attempts"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_reports_a_queued_job_with_no_creation_time() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let no_time = serde_json::json!({
+            "name": "E2E tests (Strix Halo)", "status": "queued", "labels": WATCHDOG_LANE,
+        })
+        .to_string();
+        let (rc, log) = run_watchdog(&[Call::Jobs(&[no_time])], 0, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("::error::E2E tests (Strix Halo) is queued but has no creation time"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_fails_every_not_yet_started_status_past_the_budget() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // None of these may end the watch early or escape the budget.
+        for status in ["queued", "waiting", "pending", "requested"] {
+            let jobs = [canned_job("E2E tests (Strix Halo)", status, WATCHDOG_LANE)];
+            let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 400, &[]);
+            assert_eq!(rc, 1, "{status}:\n{log}");
+            assert!(
+                log.contains(&format!("has been {status} for 400 minutes")),
+                "{status}:\n{log}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_keeps_polling_a_waiting_job_until_it_starts() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let waiting = [canned_job(
+            "E2E tests (Strix Halo)",
+            "waiting",
+            WATCHDOG_LANE,
+        )];
+        let running = [canned_job(
+            "E2E tests (Strix Halo)",
+            "in_progress",
+            WATCHDOG_LANE,
+        )];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&waiting), Call::Jobs(&running)], 10, &[]);
+        assert_eq!(rc, 0, "{log}");
+        assert_eq!(count(&log, "[gh "), 2, "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_notices_a_lane_crossing_the_budget_between_polls() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // Queued for 299 minutes at the first look and still queued at the
+        // second, a poll interval later: that is 300, so it must fail then.
+        let queued = [canned_job(
+            "E2E tests (Strix Halo)",
+            "queued",
+            WATCHDOG_LANE,
+        )];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&queued)], 299, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert_eq!(count(&log, "[gh "), 2, "{log}");
+        assert_eq!(count(&log, "[sleep 60]"), 1, "{log}");
+        assert!(log.contains("has been queued for 300 minutes"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_names_every_over_budget_lane() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let jobs = [
+            canned_job("E2E tests (Strix Windows)", "queued", WATCHDOG_LANE),
+            canned_job("E2E tests (Strix Ubuntu)", "queued", WATCHDOG_LANE),
+            canned_job("E2E tests (R9700)", "queued", WATCHDOG_LANE),
+        ];
+        let (rc, log) = run_watchdog(&[Call::Jobs(&jobs)], 400, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert_eq!(count(&log, "::error::"), 3, "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_rejects_numbers_with_leading_zeros() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // `08` is a bad octal number to bash arithmetic: without validation the
+        // poll loop would fail the same way on every pass until the job timed out.
+        for key in [
+            "LANE_QUEUE_BUDGET_MINUTES",
+            "LANE_QUEUE_POLL_SECONDS",
+            "LANE_QUEUE_GRACE_MINUTES",
+            "LANE_QUEUE_API_RETRIES",
+            "LANE_QUEUE_NOW",
+        ] {
+            let (rc, log) = run_watchdog(&[], 0, &[(key, "08")]);
+            assert_eq!(rc, 2, "{key}=08:\n{log}");
+        }
+        let (rc, log) = run_watchdog(&[], 0, &[("LANE_QUEUE_GRACE_MINUTES", "0")]);
+        assert_ne!(rc, 2, "a plain 0 is a whole number:\n{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_annotates_a_failure_of_its_own_job_filter() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // A reply the filter cannot read must not escape as jq's bare exit status,
+        // which would look like the usage error of the same number.
+        let (rc, log) = run_watchdog(&[Call::Raw("{not json\n")], 0, &[]);
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("::error::could not read this run's job list"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_refuses_to_run_without_the_run_it_watches() {
+        if !watchdog_can_run() {
+            return;
+        }
+        for key in ["GITHUB_REPOSITORY", "GITHUB_RUN_ID"] {
+            let (rc, log) = run_watchdog(&[], 0, &[(key, "")]);
+            assert_ne!(rc, 0, "{key} empty:\n{log}");
+            assert!(log.contains(&format!("{key} is not set")), "{key}:\n{log}");
+            assert_eq!(count(&log, "[gh "), 0, "nothing is fetched:\n{log}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_rejects_a_zero_poll_interval() {
+        if !watchdog_can_run() {
+            return;
+        }
+        let (rc, log) = run_watchdog(&[], 0, &[("LANE_QUEUE_POLL_SECONDS", "0")]);
+        assert_eq!(rc, 2, "{log}");
+        assert!(log.contains("must be at least 1"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watchdog_fires_on_exactly_the_real_lanes_each_workflow_watches() {
+        if !watchdog_can_run() {
+            return;
+        }
+        // The workflows' own label sets against their own lanes' `runs-on`, every
+        // lane queued past the budget: the watched ones go red, the exempt ones
+        // never do.
+        for (workflow, job) in [
+            ("e2e-selfhosted.yml", "lane-queue-watchdog"),
+            ("nightly.yml", "e2e-nightly-queue-watchdog"),
+        ] {
+            let watched = watchdog_labels(workflow, job);
+            let watched_args: Vec<&str> = watched.iter().map(String::as_str).collect();
+            let lanes = self_hosted_e2e_jobs(&read_workflow(workflow));
+            let jobs: Vec<String> = lanes
+                .iter()
+                .map(|(id, runs_on)| {
+                    let labels = flattened_list_items(runs_on);
+                    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    canned_job(id, "queued", &labels)
+                })
+                .collect();
+            let (rc, log) = run_watchdog_with(&watched_args, &[Call::Jobs(&jobs)], 400, &[]);
+            assert_eq!(rc, 1, "{workflow}:\n{log}");
+            for (id, runs_on) in &lanes {
+                let is_watched = flattened_list_items(runs_on)
+                    .iter()
+                    .any(|label| watched.contains(label));
+                assert_eq!(
+                    log.contains(&format!("::error::{id} has been queued")),
+                    is_watched,
+                    "{workflow} lane `{id}` (runs-on: {runs_on}):\n{log}"
+                );
+            }
+        }
     }
 }
