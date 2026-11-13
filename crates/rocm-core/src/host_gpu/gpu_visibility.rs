@@ -184,7 +184,7 @@ fn windows_gpu_listing_from(adapters: usize, hip_mask: Option<String>) -> Window
 ///
 /// `None` only when NEITHER surface could be read (availability truly unknown).
 #[cfg(any(target_os = "linux", test))]
-fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
+pub(super) fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
     match kfd {
         // KFD is compute-authoritative: prefer it whenever it sees a GPU.
         Some(k) if k > 0 => Some(k),
@@ -305,9 +305,110 @@ fn usable_amd_gpu_indices_from(
     mask_tokens_within(hip_space, hip)
 }
 
+/// Whether any GPU visibility mask is set in the environment.
+///
+/// Linux-only, mirroring [`visibility_mask_from_env`]: no other platform has a
+/// mask reader here, so there is nothing for this to answer about.
+///
+/// A `bool` wrapper so callers outside this module can ask the question
+/// without `GpuVisibilityMask` — the mask's shape is this module's business,
+/// and exposing it only to answer "is one set?" would widen the type's
+/// visibility for nothing. Read by `pinned_gpu_name`, which refuses to name a
+/// GPU when a mask is in effect: the host probes answer for the primary
+/// adapter, and a mask can make the pinned ordinal refer to a different one.
+#[cfg(target_os = "linux")]
+pub(super) fn visibility_mask_in_effect() -> bool {
+    visibility_mask_from_env().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gfx_target::gfx_target_has_no_rocm_build;
+    use crate::test_support::temp_app_paths;
+    use std::fs;
+
+    /// ROCMAI-550, and the one claim the Lemonade remediation rests on: the host
+    /// that gets told `rocm serve <model> --engine lemonade` is a host
+    /// `rocm serve` will actually launch on.
+    ///
+    /// The shape is a Renoir/Cezanne laptop: the Vega iGPU is on the bus and
+    /// bound to `amdgpu`, but the kernel's KFD topology lists no compute node
+    /// for it, so `gfx90c` can only have been named by the DRM `ip_discovery`
+    /// read. `apps/rocm/src/therock/family.rs` prints
+    /// `unsupported_host_gpu_message` for exactly that target, and
+    /// `apps/rocm/src/serve_cmd.rs`'s `host_has_no_usable_gpu` —
+    /// `matches!(visible, Some([]))` over [`usable_amd_gpu_indices`] — decides
+    /// whether the command it names is refused. Both halves are driven here off
+    /// **one** planted `/sys`, so this is the composition and not two
+    /// independent claims: KFD contributes `Some(0)`, DRM contributes `Some(1)`,
+    /// and [`combine_amd_gpu_counts`]'s zero-KFD fallback is what turns that
+    /// into a usable ordinal. Delete that fallback and the detection half still
+    /// passes while the pre-flight half goes red, which is the failure the
+    /// reviewer asked to see ruled out.
+    ///
+    /// Planted rather than run on hardware because no CI lane has a gfx90c APU;
+    /// see `linux::linux_drm_amdgpu_card_count_in`.
+    #[test]
+    fn a_gfx90c_host_the_kernel_gives_no_compute_node_still_has_a_usable_gpu() {
+        let (root, _paths) = temp_app_paths("gfx90c-drm-only-host");
+        let drm = root.join("sys/class/drm");
+        let device = drm.join("card0/device");
+        fs::create_dir_all(&device).expect("plant the DRM card");
+        fs::write(device.join("vendor"), "0x1002\n").expect("plant the PCI vendor");
+        // GC 9.0.12 is the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo.
+        let gc = device.join("ip_discovery/die/0/GC/0");
+        fs::create_dir_all(&gc).expect("plant the GC IP block");
+        for (file, value) in [("major", "9"), ("minor", "0"), ("revision", "12")] {
+            fs::write(gc.join(file), value).expect("plant the GC IP version");
+        }
+        // A connector sub-node, which is not a card and must not be counted.
+        fs::create_dir_all(drm.join("card0-eDP-1")).expect("plant the DRM connector");
+        // The KFD topology is readable and lists only the CPU node: this host's
+        // iGPU has no compute node, which is the whole premise.
+        let nodes = root.join("sys/class/kfd/kfd/topology/nodes");
+        fs::create_dir_all(nodes.join("0")).expect("plant the KFD CPU node");
+        fs::write(
+            nodes.join("0").join("properties"),
+            "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n",
+        )
+        .expect("plant the KFD CPU node properties");
+
+        let detected = super::super::linux::detect_linux_drm_ip_discovery_gfx_target_in(&drm);
+        let kfd = super::super::linux::linux_kfd_gpu_node_count_in(&nodes);
+        let cards = super::super::linux::linux_drm_amdgpu_card_count_in(&drm);
+        fs::remove_dir_all(&root).ok();
+
+        // Half one: this is a host `unsupported_host_gpu_message` speaks for.
+        assert_eq!(
+            detected.as_deref(),
+            Some("gfx90c"),
+            "the DRM ip-discovery read is the only route left on a host with no \
+             KFD compute node; without it there is no detected target and the \
+             Lemonade advice is never printed"
+        );
+        assert!(gfx_target_has_no_rocm_build("gfx90c"));
+
+        // Half two: and `rocm serve`'s pre-flight does not refuse it.
+        assert_eq!(
+            (kfd, cards),
+            (Some(0), Some(1)),
+            "the kernel must report no compute node and the bus exactly one card"
+        );
+        let present = combine_amd_gpu_counts(kfd, cards);
+        let usable = usable_amd_gpu_indices_from(present.expect("GPU presence"), None);
+        assert_eq!(
+            usable,
+            Some(vec![0]),
+            "serve pins HIP ordinal 0 on this host"
+        );
+        assert!(
+            !matches!(usable.as_deref(), Some([])),
+            "`serve_cmd::host_has_no_usable_gpu` is `matches!(visible, Some([]))`; \
+             anything else here means the advised command is refused for the very \
+             condition it was printed to clear"
+        );
+    }
 
     fn wsl_summary(librocdxg_in_cache: bool, on_ld_library_path: bool) -> super::super::WslSummary {
         super::super::WslSummary {

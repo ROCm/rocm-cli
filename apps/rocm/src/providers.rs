@@ -1921,6 +1921,7 @@ mod tests {
                 anthropic_endpoint: None,
                 service_id: "svc-ready".to_owned(),
                 status: "ready".to_owned(),
+                device: None,
                 already_running: false,
                 metrics,
                 api_key: None,

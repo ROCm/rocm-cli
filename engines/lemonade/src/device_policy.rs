@@ -133,24 +133,40 @@ pub(crate) const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     }
 }
 
-/// The device string reported once a model is loaded. Reflects the backend that
-/// actually ran (`rocm`, `vulkan`, …) and the pinned GPU ordinal when known,
-/// rather than a hardcoded value, so the report matches observed execution.
+/// The device string reported once a model is loaded: the backend this service
+/// was launched on (`rocm`, `vulkan`, …), the pinned GPU ordinal when known, and
+/// the GPU name recorded at launch.
+///
+/// Read back from the service's own recorded `backend_requested` rather than
+/// from a hardcoded value — so it follows the backend selection this launch
+/// actually made, including a ROCm-to-Vulkan fallback. It is this engine's
+/// account of what it asked llama.cpp for, not an independent measurement of
+/// which device executed, which is why the CLI's docs say the row *reports* a
+/// device rather than naming the one observed.
+///
+/// Formatted by [`rocm_engine_protocol::format_reported_device`] so all three
+/// engines render one shape; see that function for why the ordinal-less row
+/// drops the `gpu` noun rather than printing a bare `vulkan gpu`. The ordinal
+/// is read by [`rocm_engine_protocol::first_gpu_index_from_state`] for the same
+/// reason — `engines/vllm` reads the same `gpu_indices` key out of a state file
+/// of the same shape, and kept a byte-identical copy of that read until it
+/// moved next to the formatter.
 pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
-    match state.and_then(first_gpu_index_from_state) {
-        Some(index) => format!("{backend} gpu {index}"),
-        None => format!("{backend} gpu"),
-    }
+    rocm_engine_protocol::format_reported_device(
+        backend,
+        state.and_then(rocm_engine_protocol::first_gpu_index_from_state),
+        state.and_then(gpu_name_from_state).as_deref(),
+    )
 }
 
-/// The first pinned GPU ordinal recorded in service state, if any.
-fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
-    state
-        .get("gpu_indices")
-        .and_then(Value::as_array)
-        .and_then(|indices| indices.first())
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
+/// The GPU name recorded in service state at launch, if any.
+///
+/// Read back rather than re-probed: `healthcheck_service` runs on the
+/// `rocm services list` render path (see `fetch_service_devices`), where an
+/// extra host probe per service is latency the row is not worth, and the launch
+/// host is the one whose GPU actually ran the server.
+fn gpu_name_from_state(state: &Value) -> Option<String> {
+    crate::state::value_string(state, "gpu_name")
 }
 
 #[cfg(test)]
@@ -207,11 +223,28 @@ mod tests {
     }
 
     #[test]
-    fn reported_device_reflects_backend_and_pinned_ordinal() {
-        let state = json!({ "gpu_indices": [1] });
-        assert_eq!(reported_device(Some(&state), "vulkan"), "vulkan gpu 1");
+    fn reported_device_reflects_backend_pinned_ordinal_and_gpu_name() {
+        let state = json!({ "gpu_indices": [1], "gpu_name": "AMD Instinct MI300X" });
+        assert_eq!(
+            reported_device(Some(&state), "vulkan"),
+            "vulkan gpu 1 (AMD Instinct MI300X)"
+        );
         // Without a recorded ordinal the backend is still reported truthfully.
-        assert_eq!(reported_device(None, "rocm"), "rocm gpu");
+        assert_eq!(reported_device(None, "rocm"), "rocm");
+    }
+
+    #[test]
+    fn reported_device_names_the_gpu_when_no_ordinal_was_pinned() {
+        let state = json!({ "gpu_indices": [], "gpu_name": "AMD Radeon(TM) Graphics" });
+        assert_eq!(
+            reported_device(Some(&state), "vulkan"),
+            "vulkan (AMD Radeon(TM) Graphics)"
+        );
+
+        // An older state file, written before `gpu_name` was recorded, still
+        // reports its backend rather than a dangling noun.
+        let legacy = json!({ "gpu_indices": [] });
+        assert_eq!(reported_device(Some(&legacy), "vulkan"), "vulkan");
     }
 
     #[test]

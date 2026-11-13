@@ -732,3 +732,23 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
+  # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
+  # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
+  # mock lane included, not only the Vulkan-only hosts the ticket started from.
+  # Other surfaces send people here for that answer (`lemonade_engine_note` in
+  # apps/rocm/src/main.rs tells an unclassifiable host to run `rocm examine`), so
+  # silence there is a dead end rather than a smaller report.
+  #
+  # Deliberately untagged: the line's content is keyed to what this host turns
+  # out to be, so the lanes disagreeing about their GPUs is the coverage rather
+  # than an obstacle to it. The assertion is a cross-check and not a tautology --
+  # the claim is held against `detected_gfx_target` and
+  # `compatible_therock_family` from the same report, so a line reading "full
+  # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
+  # fails here.
+  @id:examine-reports-this-hosts-rocm-support-level
+  Scenario: examine-49 - System inspection says whether this machine's GPU is supported by ROCm
+    When the user inspects the system
+    Then the inspection states this host's ROCm support level
+    And the support level agrees with the GPU the inspection detected
+    And the support level leaves a command that fits this host

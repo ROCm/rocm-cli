@@ -586,6 +586,80 @@ pub struct LaunchResponse {
     pub state_path: String,
 }
 
+/// The [`HealthcheckResponse::device`] string, in the one shape every engine
+/// reports and the `device:` row of `rocm serve` / `rocm services list` prints
+/// verbatim.
+///
+/// ROCMAI-550 asks those two surfaces for "the llama.cpp backend actually
+/// chosen (`vulkan`/`rocm`) **and the device name**", so both halves are named
+/// arguments here rather than text each engine formats for itself:
+///
+/// | backend | ordinal | name | rendered |
+/// | --- | --- | --- | --- |
+/// | `vulkan` | `Some(0)` | `Some("AMD Radeon Graphics")` | `vulkan gpu 0 (AMD Radeon Graphics)` |
+/// | `vulkan` | `Some(0)` | `None` | `vulkan gpu 0` |
+/// | `vulkan` | `None` | `Some("AMD Radeon Graphics")` | `vulkan (AMD Radeon Graphics)` |
+/// | `vulkan` | `None` | `None` | `vulkan` |
+///
+/// The last row deliberately drops the `gpu` noun rather than printing a
+/// dangling `vulkan gpu`. That bare form is not hypothetical: it is what the
+/// ticket's own host produces. `gpu_indices` comes from
+/// `engines/lemonade`'s `resolve_serve_gpu_indices`, whose probe
+/// (`rocm_core::usable_amd_gpu_indices`) returns `None` off Linux, so a default
+/// `rocm serve` on Windows pins no ordinal and records an empty list — and
+/// Windows on a gfx90c Vega iGPU is exactly the machine ROCMAI-550 was filed
+/// from. `device: vulkan gpu` would answer "which GPU?" with the word "gpu".
+///
+/// The name is whatever the engine recorded for the host at launch; it is not
+/// per-ordinal. On a multi-GPU host the ordinal is the precise half and the
+/// name is context, which is why the ordinal is never dropped in favour of it.
+#[must_use]
+pub fn format_reported_device(
+    backend: &str,
+    gpu_index: Option<u32>,
+    gpu_name: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut device = backend.to_owned();
+    if let Some(index) = gpu_index {
+        let _ = write!(device, " gpu {index}");
+    }
+    if let Some(name) = gpu_name.map(str::trim).filter(|name| !name.is_empty()) {
+        let _ = write!(device, " ({name})");
+    }
+    device
+}
+
+/// The first pinned GPU ordinal recorded in a service state file, if any.
+///
+/// The ordinal half of what [`format_reported_device`] renders, read from the
+/// state file every engine writes at launch. It lives beside that function for
+/// the same reason that one does: `rocm serve`'s `device:` row and
+/// `rocm services list` print whichever engine answered verbatim, so the two
+/// engines that pin ordinals (`engines/lemonade`, `engines/vllm`) have to agree
+/// on *which* ordinal they report, not only on how it is spelled. They had
+/// byte-identical private copies of this, which is one keystroke away from
+/// disagreeing silently — the same duplication `format_reported_device` was
+/// centralized to end.
+///
+/// `None` covers every shape that is not a usable ordinal: no `gpu_indices`
+/// key, a non-array value, an empty list (a launch that pinned nothing, which
+/// is the default on Windows — see `format_reported_device`), a non-integer
+/// entry, and a value too large for `u32`. Those are "no ordinal to report",
+/// not errors: state files are written by engine processes of possibly
+/// different versions, and a row that says less is better than one that
+/// invents an ordinal or refuses to render.
+#[must_use]
+pub fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
+    state
+        .get("gpu_indices")
+        .and_then(Value::as_array)
+        .and_then(|indices| indices.first())
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthcheckResponse {
     /// Engine-reported service state. `ready` is reserved for a service that has
@@ -666,6 +740,94 @@ pub struct LogsResponse {
 
 #[cfg(test)]
 mod tests {
+    /// The `device:` row has to carry a device, not the word "gpu".
+    ///
+    /// The ordinal-less case is the one ROCMAI-550 was filed about: on Windows
+    /// `rocm_core::usable_amd_gpu_indices` cannot probe, so a default
+    /// `rocm serve` records an empty `gpu_indices` and the old formatting
+    /// rendered a bare `vulkan gpu`. The name is what makes that row answer the
+    /// question; with neither, the noun goes too rather than dangling.
+    #[test]
+    fn reported_device_never_renders_a_dangling_gpu_noun() {
+        assert_eq!(
+            super::format_reported_device("vulkan", Some(0), Some("AMD Radeon Graphics")),
+            "vulkan gpu 0 (AMD Radeon Graphics)"
+        );
+        assert_eq!(
+            super::format_reported_device("vulkan", None, Some("AMD Radeon Graphics")),
+            "vulkan (AMD Radeon Graphics)"
+        );
+        assert_eq!(
+            super::format_reported_device("rocm", Some(1), None),
+            "rocm gpu 1"
+        );
+        // The regression this exists to stop: nothing known beyond the backend
+        // must not be padded out with a noun that names no device.
+        assert_eq!(
+            super::format_reported_device("vulkan", None, None),
+            "vulkan"
+        );
+    }
+
+    /// A name the host probe could not fill in arrives as `Some("")` or
+    /// `Some("  ")` just as easily as `None` (the Windows display-adapter probe
+    /// and the Linux DRM read both build it from scraped text), and
+    /// `vulkan ()` is worse than no parenthetical at all.
+    #[test]
+    fn reported_device_treats_a_blank_gpu_name_as_absent() {
+        assert_eq!(
+            super::format_reported_device("vulkan", Some(0), Some("")),
+            "vulkan gpu 0"
+        );
+        assert_eq!(
+            super::format_reported_device("vulkan", None, Some("   ")),
+            "vulkan"
+        );
+        assert_eq!(
+            super::format_reported_device("rocm", Some(2), Some("  MI300X  ")),
+            "rocm gpu 2 (MI300X)"
+        );
+    }
+
+    /// Every shape a state file can carry in `gpu_indices` resolves to "an
+    /// ordinal" or "no ordinal", never to a panic or an invented value.
+    ///
+    /// This used to be two byte-identical private helpers in `engines/lemonade`
+    /// and `engines/vllm`, neither of which tested the shapes below; only the
+    /// happy path was reachable from either engine's own tests. Centralizing it
+    /// is what makes the edge cases testable in one place for both callers.
+    #[test]
+    fn the_first_pinned_ordinal_is_read_and_every_other_shape_is_absent() {
+        use serde_json::json;
+
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": [1, 2]})),
+            Some(1),
+            "the first pinned ordinal is the one reported"
+        );
+        // A launch that pinned nothing — the default on Windows, which is the
+        // host ROCMAI-550 was filed from.
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": []})),
+            None
+        );
+        assert_eq!(super::first_gpu_index_from_state(&json!({})), None);
+        // A state file written by some other version of an engine must degrade
+        // to "no ordinal", not to a wrong one.
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": "0"})),
+            None
+        );
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": [-1]})),
+            None
+        );
+        assert_eq!(
+            super::first_gpu_index_from_state(&json!({"gpu_indices": [u64::from(u32::MAX) + 1]})),
+            None
+        );
+    }
+
     fn resolve_response(served: Option<&str>) -> ResolveModelResponse {
         ResolveModelResponse {
             canonical_model_id: "image:tag".to_owned(),

@@ -311,7 +311,10 @@ checks, which cannot be made anywhere else:
   `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
   detected but not supported by ROCm and that the Vulkan backend can still be
   used. A `<unknown>` target, or a missing `rocm_support` line, means detection
-  regressed.
+  regressed. That line is printed on **every** host, at one of three levels —
+  ROCm/HIP-supported, Vulkan-only (this case), or unknown — so on a supported
+  card or a machine with no GPU it must still be there, saying the level that
+  host's hardware implies rather than being absent.
 - A plain `rocm install sdk`, with no `--family`, gives the same refusal with
   the wording for a *detected* GPU rather than a requested one.
 - `rocm diagnose` reports `info-20-gpu-no-rocm-support`, naming `gfx90c` and
@@ -367,8 +370,24 @@ rocm serve qwen --engine lemonade --device gpu_required --foreground --port 1143
 
 Expected result:
 
-- The engine uses ROCm GPU execution.
-- The run does not fall back to CPU or Vulkan.
+- The engine uses ROCm GPU execution. The deployment summary's `device:` row
+  is the engine's own account of the backend it was launched on (Lemonade reads
+  back the `backend_requested` it recorded), so check it by reading that row
+  rather than inferring it from the absence of a fallback warning. Every engine
+  reports it in the same `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect
+  something like `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted
+  when the launch pinned none (no `--gpu`, nothing recorded in the engine's
+  `gpu_indices`) and the name omitted when the host probe could not read one or
+  the machine has more than one AMD GPU (where naming one could name the wrong
+  one). `rocm services` shows the same `device` while it runs. The first word is
+  the half that decides this check.
+- The whole `device:` row may be missing from the deployment summary, and that
+  is not a failure of this check: the engine reports no device until it has
+  verified it can serve, which a model still loading its weights has not. Run
+  `rocm services list` and read the row there instead — the check is on what the
+  row says, not on which surface said it first.
+- The run does not fall back to CPU or Vulkan — a `device:` whose first word is
+  `vulkan` fails this check even though the serve itself succeeds.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 - `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.

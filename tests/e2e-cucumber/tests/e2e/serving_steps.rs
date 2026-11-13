@@ -220,6 +220,7 @@ async fn serve_and_wait(
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
+        world.serve_summary = Some(stdout.clone());
         return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
@@ -671,6 +672,7 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
+            world.serve_summary = Some(stdout);
             return;
         }
         // `serve_failure_evidence` reads and copies out the log BEFORE it stops
@@ -1438,12 +1440,7 @@ fn docker_call_log(world: &E2eWorld) -> std::path::PathBuf {
 /// by `e2e-test-hooks` builds) so the family the CLI detects does not depend on the
 /// runner's hardware. `gfx_target_version` is the kernel's decimal encoding.
 fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
-    let host_root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path()
-        .join("host-root");
+    let host_root = planted_host_root(world);
     let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
     std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
     // `cpu_cores_count 0` with a nonzero `simd_count` makes the node a GPU.
@@ -1452,9 +1449,7 @@ fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
         format!("cpu_cores_count 0\nsimd_count 56\ngfx_target_version {gfx_target_version}\n"),
     )
     .expect("failed to write the planted KFD node properties");
-    world
-        .command_env
-        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+    use_planted_host_root(world);
 }
 
 /// gfx942, TheRock family `gfx94X-dcgpu`.
@@ -1467,6 +1462,119 @@ async fn host_with_an_mi300x(world: &mut E2eWorld) {
 #[given("a host whose only GPU is an AMD Radeon PRO W7900")]
 async fn host_with_a_w7900(world: &mut E2eWorld) {
     plant_single_gpu(world, 110_000);
+}
+
+/// A Renoir/Cezanne laptop, planted under the simulated host root: the Vega
+/// iGPU is on the PCI bus and bound to `amdgpu`, and the kernel's KFD topology
+/// lists **only a CPU node** for it.
+///
+/// Not `plant_single_gpu`: that writes a KFD GPU node, which is precisely the
+/// thing this host does not have. With no compute node the target can only be
+/// named by the DRM `ip_discovery` read (GC 9.0.12 -> `gfx90c`), and the usable
+/// GPU count can only come from `combine_amd_gpu_counts`' zero-KFD fallback to
+/// the DRM card count. Both are driven off this one directory, which is what
+/// makes the scenario a statement about one host rather than two.
+fn plant_gfx90c_apu_without_a_kfd_node(world: &mut E2eWorld) {
+    let host_root = planted_host_root(world);
+    let device = host_root.join("sys/class/drm/card0/device");
+    std::fs::create_dir_all(&device).expect("failed to create the planted DRM card");
+    std::fs::write(device.join("vendor"), "0x1002\n").expect("failed to write the planted vendor");
+    let gc = device.join("ip_discovery/die/0/GC/0");
+    std::fs::create_dir_all(&gc).expect("failed to create the planted GC IP block");
+    for (file, value) in [("major", "9"), ("minor", "0"), ("revision", "12")] {
+        std::fs::write(gc.join(file), value).expect("failed to write the planted GC IP version");
+    }
+    let cpu_node = host_root.join("sys/class/kfd/kfd/topology/nodes/0");
+    std::fs::create_dir_all(&cpu_node).expect("failed to create the planted KFD node");
+    std::fs::write(
+        cpu_node.join("properties"),
+        "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n",
+    )
+    .expect("failed to write the planted KFD node properties");
+    use_planted_host_root(world);
+}
+
+/// Where a scenario's simulated `/` lives, by the same convention
+/// [`plant_single_gpu`] uses.
+fn planted_host_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("host-root")
+}
+
+/// Point the *next* `rocm` invocation at the planted host.
+///
+/// Needed once per invocation: `run_rocm_with_scenario_env` takes
+/// `world.command_env` by `mem::take`, so a step that runs two commands would
+/// silently run the second one against the real machine — which for this
+/// scenario would mean asserting the serve pre-flight's answer for the runner's
+/// own hardware instead of for the host the refusal was printed on.
+fn use_planted_host_root(world: &mut E2eWorld) {
+    let host_root = planted_host_root(world);
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+#[given("a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for")]
+async fn host_with_a_kfd_less_gfx90c(world: &mut E2eWorld) {
+    plant_gfx90c_apu_without_a_kfd_node(world);
+}
+
+/// Take the route the CLI itself sends this host down: let the SDK install
+/// refuse, then run the command that refusal names.
+///
+/// Both halves run against the same planted host, in order, so the scenario
+/// cannot pass by printing the advice on one machine and testing it on another.
+/// `--gpu 99` is what makes the result readable: it is validated *after* the
+/// no-usable-GPU pre-flight and reports the ordinals that pre-flight resolved,
+/// turning "the host was accepted" into something the output states rather than
+/// something inferred from the absence of a refusal. The model ref is arbitrary
+/// and nothing is launched: both bails are reached before any runtime or engine
+/// work.
+#[when("the user is told to serve on Lemonade because this GPU has no ROCm build")]
+async fn user_follows_the_lemonade_advice(world: &mut E2eWorld) {
+    let (install_stdout, install_stderr, install_rc) =
+        crate::run_rocm_with_scenario_env(world, &["install", "sdk", "--dry-run"]);
+    let refusal = format!("{install_stdout}\n{install_stderr}");
+    assert_ne!(
+        install_rc, 0,
+        "a gfx90c host has no ROCm SDK build to install:\n{refusal}"
+    );
+    assert!(
+        refusal.contains("gfx90c") && refusal.contains("rocm serve <model> --engine lemonade"),
+        "the planted host must be detected as gfx90c and advised to serve on \
+         Lemonade; without that this scenario is testing nothing:\n{refusal}"
+    );
+
+    use_planted_host_root(world);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["serve", "some-model", "--engine", "lemonade", "--gpu", "99"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("serving got past the no-GPU pre-flight and reported this host's usable GPU")]
+async fn assert_serve_accepted_the_drm_only_gpu(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("no usable AMD GPU"),
+        "`rocm install sdk` told this host to run `rocm serve --engine lemonade`, \
+         and serve's pre-flight refused it for having no GPU - advice that cannot \
+         clear the condition it was printed for:\n{output}"
+    );
+    assert!(
+        output.contains("--gpu index 99 is not present on this host")
+            && output.contains("usable GPU indices: [0]"),
+        "the pre-flight must have resolved exactly the iGPU's ordinal, and said \
+         so where `--gpu` is validated:\n{output}"
+    );
 }
 
 fn run_serve_aim(world: &mut E2eWorld, args: &[&str]) {
@@ -3090,6 +3198,176 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
         stdout.contains("127.0.0.1"),
         "endpoint not in services list:\n{stdout}"
     );
+}
+
+/// The `device:` value as `rocm serve` / `rocm services list` print it, split
+/// into the backend it names and the GPU ordinal it pinned, if any.
+///
+/// Every engine renders it through
+/// `rocm_engine_protocol::format_reported_device`, so the grammar is
+/// `<backend>`, then an optional ` gpu <n>`, then an optional ` (<gpu name>)`.
+/// `None` for anything else, which is what makes a hardcoded or malformed value
+/// fail rather than pass.
+fn parse_device_row(value: &str) -> Option<(&str, Option<u32>)> {
+    // The name is the only part that may contain spaces, and it is always last
+    // and parenthesised. Split on the FIRST " (" so a name with its own
+    // parentheses ("AMD Radeon (TM) Graphics") still leaves the head intact.
+    let head = match value.split_once(" (") {
+        Some((head, name)) if name.ends_with(')') => head,
+        Some(_) => return None,
+        None => value,
+    };
+    let mut parts = head.split_whitespace();
+    let backend = parts.next()?;
+    let ordinal = match parts.next() {
+        Some("gpu") => Some(parts.next()?.parse().ok()?),
+        // A bare `gpu` with no ordinal is the shape ROCMAI-550 removed; so is
+        // any other trailing word.
+        Some(_) => return None,
+        None => None,
+    };
+    parts.next().is_none().then_some((backend, ordinal))
+}
+
+/// How long the `device:` row may take to show up after the serve returned.
+///
+/// It is not available the instant a service is recorded `ready`:
+/// `engines/lemonade` reports `"unknown"` until its own `inference_verified`
+/// probe has come back, and `fetch_service_device` drops `"unknown"` rather
+/// than printing it. So there is a real window in which a correct
+/// implementation has no row yet, and failing on the first look would make
+/// this step flake on timing rather than on behavior.
+const DEVICE_ROW_DEADLINE: Duration = Duration::from_secs(90);
+
+/// The value of the first `device:` row in `text`, trimmed.
+fn device_row_value(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.trim_start().strip_prefix("device:"))
+        .map(str::trim)
+}
+
+/// ROCMAI-550: `rocm services list` must show the backend/device the engine
+/// actually selected (read live from its `Healthcheck` RPC), not just that a
+/// service exists. Reuses `assert_service_in_list`'s model-name match so this
+/// only checks the row for the service this scenario just started.
+///
+/// It asserts the VALUE, not merely the presence of the row. A row whose value
+/// were empty, malformed, or nailed to a constant would satisfy "starts with
+/// `device:`" while reporting nothing real, so this parses it and holds it to
+/// three independent facts:
+///
+/// 1. it has the `<backend> [gpu <n>] [(<name>)]` shape every engine reports;
+/// 2. the backend is one this engine can actually have selected - only
+///    Lemonade has a Vulkan path, so `vulkan` from `vllm` or `aim` is wrong,
+///    and `unknown` is wrong from any of them;
+/// 3. it equals what the `rocm serve` deployment summary printed for the same
+///    service — *when* that summary printed a device row at all, which is a
+///    documented maybe rather than a promise (see the comment at that
+///    comparison, and `serve_summary::DeploymentSummary::device`).
+/// The row is polled rather than read once: see [`DEVICE_ROW_DEADLINE`] for
+/// the window in which a correct implementation legitimately has no row yet.
+/// Running out of that window is an assertion naming what was last seen, not a
+/// panic on the first look.
+#[then("the services list reports the engine's actual backend device")]
+async fn assert_services_list_reports_device(world: &mut E2eWorld) {
+    let model = world.model_name.clone().unwrap_or_default();
+    let deadline = Instant::now() + DEVICE_ROW_DEADLINE;
+    // The last thing looked at, so a timeout can show it rather than just
+    // saying it timed out: the service's own block when there was one, else the
+    // whole listing (which is the evidence for the service having gone missing).
+    let mut last_seen;
+    let device = loop {
+        let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+        match stdout
+            .split("\n- ")
+            .find(|block| block.to_lowercase().contains(&model.to_lowercase()))
+        {
+            Some(block) => {
+                last_seen = block.to_owned();
+                if let Some(device) = device_row_value(&last_seen) {
+                    break device.to_owned();
+                }
+            }
+            None => last_seen = stdout,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after {}s `rocm services list` still reports no `device:` line for \
+             {model} - the engine's Healthcheck RPC should report the backend it \
+             actually selected once the service is serving:\n{last_seen}",
+            DEVICE_ROW_DEADLINE.as_secs()
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    };
+    let block = last_seen.as_str();
+    let (backend, _ordinal) = parse_device_row(&device).unwrap_or_else(|| {
+        panic!(
+            "`device: {device}` is not the `<backend> [gpu <n>] [(<name>)]` shape \
+             every engine reports, so it cannot be the engine's own answer:\n{block}"
+        )
+    });
+
+    let engine = block
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("engine:"))
+        .map_or_else(
+            || panic!("services-list entry for {model} has no engine:\n{block}"),
+            str::trim,
+        );
+    // Only Lemonade has a Vulkan llama.cpp backend; vLLM and AIM are ROCm-only,
+    // so `vulkan` from either would mean the row is not coming from the engine
+    // that served. `unknown` is the engines' own "I have no state for this",
+    // which `fetch_service_device` is supposed to drop rather than print.
+    let allowed: &[&str] = match engine {
+        "lemonade" => &["rocm", "vulkan"],
+        _ => &["rocm"],
+    };
+    assert!(
+        allowed.contains(&backend),
+        "`device: {device}` names backend `{backend}`, which the `{engine}` \
+         engine cannot have selected (expected one of {allowed:?}):\n{block}"
+    );
+
+    // The same fact, read from the other surface. `rocm serve` printed this row
+    // at launch; nothing else in these scenarios inspects that summary, so
+    // without this the summary half of ROCMAI-550 has no live assertion at all.
+    //
+    // Only when the summary HAS the row. Its absence is not a defect and must
+    // not be asserted against, in either direction:
+    //
+    // * `serve` asks the engine once the launch reports `ready` and retries
+    //   only within `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` (~6s), because the
+    //   row is informational and the alternative is holding a terminal;
+    // * `engines/lemonade` answers `"unknown"` until its own
+    //   `inference_verified` probe returns, which for a model still loading can
+    //   be far longer than that - which is exactly why the Given step then
+    //   polls `/v1/models` for up to minutes;
+    // * so a correct `rocm serve` can print `status ready` with no `device:`
+    //   row, while `rocm services list` - asked later, after this step has
+    //   waited - has one.
+    //
+    // An earlier revision asserted that a `ready` summary must carry the row.
+    // That is the exact false failure this note describes, and it was invisible
+    // only because serve-07 is xfail'd on lemonade+linux (see the comment on
+    // that scenario in model_serving.feature). What remains asserted is the
+    // half that is a real invariant: the two surfaces read one engine over one
+    // RPC, so where both speak they must say the same thing.
+    // And only when a summary was recorded at all. The backend assertion above
+    // is this step's real invariant and has already run; the cross-surface
+    // comparison is an extra that needs a Given which captured `rocm serve`'s
+    // own output. serve-05 and serve-07 both have one today, but panicking here
+    // would fail any future scenario reusing this Then for the backend check
+    // alone — a failure about the fixture rather than about the product.
+    let Some(summary) = world.serve_summary.as_deref() else {
+        return;
+    };
+    if let Some(summary_device) = device_row_value(summary) {
+        assert_eq!(
+            summary_device, device,
+            "`rocm serve` and `rocm services list` must report the same device \
+             for one service; they read it from the same Healthcheck RPC"
+        );
+    }
 }
 
 #[then("the list reports the attempt and how to look at it")]

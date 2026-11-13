@@ -52,13 +52,14 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, ENGINE_ENVS_ROOT_ENV, engine_binary_path, engine_plugin_dirs};
 use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EnginePluginDescriptor, EngineRecipeHint, EngineRequestEnvelope,
-    EngineResponseEnvelope, EngineStdioOptions, decode_engine_response, engine_request_envelope,
-    optional_arg, run_engine_stdio,
+    EngineResponseEnvelope, EngineStdioOptions, HealthcheckRequest, HealthcheckResponse,
+    decode_engine_response, engine_request_envelope, optional_arg, run_engine_stdio,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -120,11 +121,55 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
+    engine_request_with_scoped_env(paths, engine, method, request, env_root, None)
+}
+
+/// [`engine_request_with_env_root`], additionally handing a **built-in** engine
+/// the 0600 endpoint key file for one service via `ROCM_SERVE_API_KEY_FILE`.
+///
+/// An engine that probes its own server's HTTP endpoint while answering a
+/// request reads that variable to authenticate
+/// (`rocm_engine_protocol::resolve_endpoint_api_key`, reached from
+/// `engines/lemonade`'s and `engines/vllm`'s `/v1/models` probes). Without it,
+/// a public or `--require-api-key` service answers 401 and the engine reports
+/// the service as not listed - indistinguishable, from the CLI's side, from a
+/// server that is simply down. It is threaded per call rather than per process
+/// because the key is per service id.
+///
+/// **External plugin children are not given it.** The built-in engines run
+/// in-process, so the variable is set and restored around one call
+/// ([`with_scoped_builtin_engine_env`]); a plugin is a third-party binary this
+/// process spawns, and a variable put in its environment is readable from
+/// `/proc/<pid>/environ` and inherited by every grandchild it starts. That is
+/// more exposure than an informational `device:` row is worth — the only caller
+/// that passes a key file is [`fetch_service_device`]. The cost is that a
+/// plugin-backed service with endpoint auth reports no device; it is a row the
+/// summary already declares optional.
+///
+/// This is a reduction in incidental exposure, not a security boundary: a
+/// plugin child is handed `ROCM_CLI_DATA_DIR` by [`apply_app_path_env`] and the
+/// key file's location under it is a documented, deterministic convention
+/// (`rocm_engine_protocol::endpoint_key_file_path`), so a plugin that wants the
+/// key can still derive the path. What changes is that it must go looking.
+fn engine_request_with_scoped_env<T, R>(
+    paths: Option<&AppPaths>,
+    engine: &str,
+    method: EngineMethod,
+    request: &T,
+    env_root: Option<&Path>,
+    endpoint_key_file: Option<&Path>,
+) -> Result<R>
+where
+    T: Serialize,
+    R: DeserializeOwned,
+{
     let stream_progress = matches!(&method, EngineMethod::Install);
     let envelope = engine_request_envelope(method, request)?;
-    if let Some(envelope) = with_scoped_builtin_engine_env(paths, env_root, || {
-        builtin_engine_request(engine, &envelope)
-    }) {
+    if let Some(envelope) =
+        with_scoped_builtin_engine_env(paths, env_root, endpoint_key_file, || {
+            builtin_engine_request(engine, &envelope)
+        })
+    {
         return decode_engine_response(envelope);
     }
 
@@ -217,9 +262,10 @@ impl Drop for ScopedEnvVar {
 fn with_scoped_builtin_engine_env<R>(
     paths: Option<&AppPaths>,
     env_root: Option<&Path>,
+    endpoint_key_file: Option<&Path>,
     f: impl FnOnce() -> R,
 ) -> R {
-    if paths.is_none() && env_root.is_none() {
+    if paths.is_none() && env_root.is_none() && endpoint_key_file.is_none() {
         return f();
     }
     let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
@@ -232,6 +278,12 @@ fn with_scoped_builtin_engine_env<R>(
     }
     if let Some(env_root) = env_root {
         vars.push(ScopedEnvVar::set_path(ENGINE_ENVS_ROOT_ENV, env_root));
+    }
+    if let Some(endpoint_key_file) = endpoint_key_file {
+        vars.push(ScopedEnvVar::set_path(
+            rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV,
+            endpoint_key_file,
+        ));
     }
     let result = f();
     drop(vars);
@@ -263,6 +315,271 @@ pub(crate) fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
         .with_context(|| format!("engine `{engine}` is not built into this rocm binary"))?;
     print!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Best-effort query of the backend/device a running managed service actually
+/// selected (e.g. `"vulkan gpu 0"` / `"rocm gpu 0"`), via the same
+/// `Healthcheck` RPC every engine plugin already answers
+/// (`engines/lemonade` reads it back from its own `backend_requested` state;
+/// `engines/vllm` and `engines/aim` report the ROCm device they pinned). Read
+/// from the engine, never guessed from the launch-time GPU selection, so it
+/// reflects what the server is actually running on. `None` on any failure -
+/// this is informational text, not worth failing `serve`/`services list` over.
+///
+/// How long one call can take, since `rocm services list` makes one per ready
+/// service: [`engine_request`] itself imposes no deadline, so the bound comes
+/// from the engine. The three built-in engines answer in-process and every
+/// endpoint probe they make is timeout-bounded (`engines/vllm`'s
+/// `HEALTHCHECK_TIMEOUT_MS`, `engines/lemonade`'s
+/// `rocm_core::INFERENCE_PROBE_TIMEOUT`), so a stalled server costs seconds,
+/// not forever. An *external* plugin is a spawned child that
+/// `engine_request` waits on unbounded, exactly as every other engine call
+/// site in the CLI does. [`fetch_service_devices`] is what keeps a list of
+/// services from multiplying that cost by the number of services.
+pub(crate) fn fetch_service_device(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Option<String> {
+    // Hand the engine this service's 0600 key file. Both built-in engines
+    // authenticate their own `/v1/models` probe from
+    // `ROCM_SERVE_API_KEY_FILE`, so without it a public or `--require-api-key`
+    // service answers 401, the engine reports it as not listed, and the device
+    // comes back `"unknown"` - the row would vanish for exactly the services
+    // that are protected. `None` for a loopback service, which has no key file
+    // and needs none.
+    let endpoint_key_file = crate::endpoint_keys::endpoint_key_file_if_present(paths, service_id);
+    let response: HealthcheckResponse = engine_request_with_scoped_env(
+        Some(paths),
+        engine,
+        EngineMethod::Healthcheck,
+        &HealthcheckRequest {
+            service_id: service_id.to_owned(),
+        },
+        None,
+        endpoint_key_file.as_deref(),
+    )
+    .ok()?;
+    device_worth_reporting(response.device)
+}
+
+/// The engine's reported device, or `None` when it said nothing usable.
+///
+/// `"unknown"` is the engines' own device value when no state is on disk for
+/// this service id yet (see `engines/vllm/src/state.rs` and
+/// `engines/lemonade/src/lib.rs`), and it is not more informative than showing
+/// nothing — a `device: unknown` row claims the CLI asked and learned
+/// something, which is the opposite of what happened.
+///
+/// A named function rather than an inline `then_some` because the only caller
+/// is an RPC to a live engine: in default CI that call never succeeds, so the
+/// filter is unreachable there and deleting it would be invisible until a
+/// freshly-launched Lemonade service printed `device: unknown` on a GPU lane.
+fn device_worth_reporting(device: String) -> Option<String> {
+    (!device.trim().is_empty() && device != "unknown").then_some(device)
+}
+
+/// How long `rocm serve`'s deployment summary may keep asking the engine which
+/// device it selected, and how long it waits between asks.
+///
+/// A managed launch reports `ready` as soon as its server answers, but
+/// `engines/lemonade` reports `device: "unknown"` until its own
+/// `inference_verified` probe has come back — so asking once, immediately,
+/// loses the row on exactly the Vulkan case ROCMAI-550 is about. One retry
+/// window closes the common case: the default smoke test has just put a real
+/// completion through the server, so the engine's own probe is a cache hit.
+///
+/// **It cannot close every case, and is not meant to.** A server that reported
+/// `ready` while weights are still loading can stay unverified for minutes, and
+/// waiting that out would hold the terminal hostage for an informational row
+/// that `rocm services list` will show as soon as it exists. So the row is
+/// *optional by contract* — see [`crate::serve_summary::DeploymentSummary`]'s
+/// `device` field, `docs/manual-testing.md` and README.md, which all say it can
+/// be absent.
+///
+/// The budget is a start gate, like [`SERVICE_DEVICE_PROBE_BUDGET`]: it is
+/// tested before each attempt, never inside one, so the worst-case addition to
+/// `rocm serve` is this budget plus one in-flight probe — about 14s with
+/// Lemonade's 8s `rocm_core::INFERENCE_PROBE_TIMEOUT`, and only on a launch
+/// that was going to have no row at all.
+const SERVE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(6);
+/// Pause between the attempts [`SERVE_DEVICE_PROBE_BUDGET`] allows. Short
+/// enough that the common case (the engine is a second away from verifying)
+/// resolves quickly, long enough not to spin on an engine that answers
+/// instantly.
+const SERVE_DEVICE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// [`fetch_service_device`], retried briefly, for `rocm serve`'s one-shot
+/// deployment summary.
+///
+/// `None` is a legitimate answer and must stay cheap to get: see
+/// [`SERVE_DEVICE_PROBE_BUDGET`] for why the wait is bounded and why the
+/// summary prints no `device:` row rather than blocking on one.
+pub(crate) fn fetch_service_device_briefly(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Option<String> {
+    let started = Instant::now();
+    retry_service_device(
+        || started.elapsed(),
+        || fetch_service_device(paths, engine, service_id),
+        std::thread::sleep,
+    )
+}
+
+/// The retry loop of [`fetch_service_device_briefly`], with the clock, the
+/// probe and the wait injected.
+///
+/// Split out for the same reason as [`collect_service_devices`]: driving this
+/// against the live clock would mean a test that really sleeps out
+/// [`SERVE_DEVICE_PROBE_BUDGET`] against a real engine. What has to be
+/// guaranteed is not just that a late answer is reported but that the loop
+/// *stops* — an unbounded retry here would hang every `rocm serve` whose engine
+/// never verifies.
+fn retry_service_device<C, P, S>(mut elapsed: C, mut probe: P, mut wait: S) -> Option<String>
+where
+    C: FnMut() -> Duration,
+    P: FnMut() -> Option<String>,
+    S: FnMut(Duration),
+{
+    loop {
+        if let Some(device) = probe() {
+            return Some(device);
+        }
+        if elapsed() >= SERVE_DEVICE_PROBE_BUDGET {
+            return None;
+        }
+        wait(SERVE_DEVICE_PROBE_INTERVAL);
+    }
+}
+
+/// How long [`fetch_service_devices`] may spend on live `Healthcheck` RPCs in
+/// total, across however many services were listed.
+///
+/// `rocm services list` was pure local I/O before the `device:` row; the row is
+/// worth a short wait but not an unbounded one, and the cost has to stay flat
+/// in the number of services rather than growing with it. Sized to let a
+/// couple of healthy engines answer (`engines/lemonade`'s endpoint probe is
+/// the slowest at `rocm_core::INFERENCE_PROBE_TIMEOUT`, 8s worst case, and
+/// only on a miss) while still bounding the whole render.
+///
+/// **Worst-case wall time for `rocm services list` is this budget plus one
+/// in-flight probe, i.e. ~18s** with the built-in engines, not 10s. The budget
+/// is a *start* gate: it is tested before each probe, never inside one, so a
+/// probe begun at 9.99s still runs to its own timeout. The arithmetic is 10s
+/// of elapsed budget plus Lemonade's 8s `INFERENCE_PROBE_TIMEOUT`. That bound
+/// applies equally to `rocm chat` when its natural-language interpreter
+/// resolves a request to the `services` command: that path runs the real
+/// command in process (`chat::mcp_bridge`'s `run_rocm_read_only_in_process`)
+/// and so renders through the same
+/// [`crate::services_text::render_services_text`].
+///
+/// It does *not* apply to the structured MCP tool that is also named
+/// `services`. That one renders through `chat::mcp_bridge`'s
+/// `render_services_tool_result_text`, a different and older function with no
+/// `device:` row, so a bridge client calling the tool makes no probe and waits
+/// for nothing — unlike the sibling `engines` MCP tool, which ROCMAI-550 did
+/// make host-aware. The shared name is the trap, so this says which surface it
+/// means (review on #678); giving the tool the row is a change in its own
+/// right, not something this constant may be read as already covering.
+///
+/// # The decision, recorded (review on #678)
+///
+/// This is accepted rather than merely observed. `rocm services list` and
+/// `rocm chat`'s `services` command can both block ~18s on a host whose
+/// engines are slow to answer, and for the duration the built-in probe holds
+/// the process-wide engine env lock [`with_scoped_builtin_engine_env`] takes,
+/// so a concurrent caller waits behind it.
+///
+/// Two cheaper options were considered and not taken. Moving the probe off the
+/// render path means the row stops reflecting the host at the moment it is
+/// printed, which is the whole reason ROCMAI-550 added it — the `device:` row
+/// exists to answer "what is this actually running on *now*". Probing once and
+/// printing nothing for the rest makes the output depend on service ordering,
+/// which reads as a bug to anyone who lists twice and sees different rows.
+///
+/// Both remain reasonable calls and this one is reversible: it is a constant and
+/// a start gate, not a structural choice. If a maintainer prefers a 10s hard
+/// cap, the change is a per-probe deadline, which needs a cancellable probe
+/// (see below) rather than a smaller number here.
+///
+/// Why not a per-probe deadline that would hold the total at 10s: the probe is
+/// `engine_request`, which for a built-in engine is a synchronous in-process
+/// call and for an external plugin is a `wait()` on a spawned child. Neither
+/// can be cancelled from here without either a thread per probe (ruled out by
+/// the process-wide env/mutex scoping `fetch_service_devices` documents) or a
+/// kill path for a child mid-RPC. Both are larger changes than the row is
+/// worth; the start gate is what keeps the cost flat in the number of
+/// services, which is the growth that actually matters.
+pub(crate) const SERVICE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Devices for several services at once, keyed by service id, under one shared
+/// time budget.
+///
+/// The probes run sequentially on purpose. They cannot usefully be run in
+/// parallel: [`engine_request`] routes the built-in engines through
+/// [`with_scoped_builtin_engine_env`], which takes a process-wide mutex *and*
+/// mutates process-wide `ROCM_CLI_*` env vars for the duration, so concurrent
+/// callers would serialize on that lock anyway and racing them would be
+/// unsound. What this does instead is cap the aggregate: once
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] is spent, the remaining services are left
+/// without a `device:` row rather than each adding its own wait. The row is
+/// informational, so dropping it is strictly better than making
+/// `rocm services list --all` hang behind one unresponsive server.
+///
+/// The budget is checked between probes, not inside one: a single external
+/// plugin that never exits still blocks, because `engine_request` waits on its
+/// child unbounded. That is the pre-existing behavior of every engine call
+/// site in the CLI and is not made worse here. See
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] for what that makes the worst-case wall
+/// time of a `rocm services list`.
+pub(crate) fn fetch_service_devices<'a, I>(
+    paths: &AppPaths,
+    services: I,
+) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let started = Instant::now();
+    collect_service_devices(
+        services,
+        || started.elapsed(),
+        |service_id, engine| fetch_service_device(paths, engine, service_id),
+    )
+}
+
+/// The budget loop of [`fetch_service_devices`], with the clock and the probe
+/// injected.
+///
+/// Split out so the budget-exhausted exit has a test. In the real function the
+/// clock is `Instant::elapsed` and the probe is a live engine RPC, so covering
+/// that branch would otherwise mean making a test wait out
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] against real engines — which is both slow
+/// and exactly the timing-dependent shape that flakes. What the branch has to
+/// guarantee is not just that later services lack a `device:` row but that
+/// they were never *probed*, since the whole point is to stop paying; only an
+/// injected probe can observe that.
+fn collect_service_devices<'a, I, C, P>(
+    services: I,
+    mut elapsed: C,
+    mut probe: P,
+) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+    C: FnMut() -> Duration,
+    P: FnMut(&str, &str) -> Option<String>,
+{
+    let mut devices = std::collections::HashMap::new();
+    for (service_id, engine) in services {
+        if elapsed() >= SERVICE_DEVICE_PROBE_BUDGET {
+            break;
+        }
+        if let Some(device) = probe(service_id, engine) {
+            devices.insert(service_id.to_owned(), device);
+        }
+    }
+    devices
 }
 
 pub(crate) fn builtin_engine_available(engine: &str) -> bool {
@@ -388,6 +705,27 @@ mod tests {
     use super::*;
     use crate::tests::test_paths;
 
+    /// The `unknown` filter, which nothing else can reach: its caller is an RPC
+    /// to a live engine, so in default CI it never runs and deleting it stays
+    /// green.
+    #[test]
+    fn a_device_the_engine_does_not_know_is_not_reported_as_one() {
+        for nothing in ["unknown", "", "   "] {
+            assert_eq!(
+                device_worth_reporting(nothing.to_owned()),
+                None,
+                "`{nothing}` is the engine saying it has no answer yet, and a \
+                 `device:` row would claim otherwise"
+            );
+        }
+        for device in ["rocm gpu 0", "vulkan (AMD Radeon Graphics)"] {
+            assert_eq!(
+                device_worth_reporting(device.to_owned()),
+                Some(device.to_owned())
+            );
+        }
+    }
+
     /// `rocm` must actually ASK for the withholding, not merely be able to.
     ///
     /// The protocol crate's own test proves the flag causes the clearing; this
@@ -410,6 +748,200 @@ mod tests {
                 "and it must never hand one over either"
             );
         }
+    }
+
+    /// The endpoint key file reaches a built-in engine through the process
+    /// environment, and is gone again afterwards.
+    ///
+    /// Both halves matter and neither was covered. Without the variable a
+    /// `--require-api-key` service's own `/v1/models` probe answers 401, the
+    /// engine reports the service as unlisted, and the `device:` row silently
+    /// vanishes for exactly the protected services. Without the restore, one
+    /// service's key would leak into the next service's probe in the same
+    /// `rocm services list` — `with_scoped_builtin_engine_env` mutates
+    /// process-wide state, which is why the probes are serialized in the first
+    /// place.
+    #[test]
+    fn the_endpoint_key_file_is_scoped_to_one_builtin_engine_call() {
+        let key = rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV;
+        // SAFETY-adjacent: the scoped setter takes the same process-wide lock
+        // this test observes through, so no other engine call can interleave.
+        let before = std::env::var_os(key);
+        let seen = with_scoped_builtin_engine_env(
+            None,
+            None,
+            Some(Path::new("/tmp/rocm-e2e-endpoint-key")),
+            || std::env::var_os(key),
+        );
+        assert_eq!(
+            seen.as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/rocm-e2e-endpoint-key")),
+            "the engine must be able to read the key file path it was given"
+        );
+        assert_eq!(
+            std::env::var_os(key),
+            before,
+            "the key must not outlive the call it was scoped to"
+        );
+
+        // And nothing is set when no key file was supplied: a loopback service
+        // has none, and inventing one would point the engine at a file that
+        // does not exist.
+        assert_eq!(
+            with_scoped_builtin_engine_env(None, None, None, || std::env::var_os(key)),
+            before
+        );
+    }
+
+    /// Every service inside the budget is probed and reported.
+    #[test]
+    fn service_device_probes_run_while_the_budget_holds() {
+        let mut probed = Vec::new();
+        let devices = collect_service_devices(
+            [("svc-a", "lemonade"), ("svc-b", "vllm")],
+            || Duration::ZERO,
+            |service_id, engine| {
+                probed.push(service_id.to_owned());
+                Some(format!("{engine}-device"))
+            },
+        );
+
+        assert_eq!(probed, ["svc-a", "svc-b"]);
+        assert_eq!(
+            devices.get("svc-a").map(String::as_str),
+            Some("lemonade-device")
+        );
+        assert_eq!(
+            devices.get("svc-b").map(String::as_str),
+            Some("vllm-device")
+        );
+    }
+
+    /// Once [`SERVICE_DEVICE_PROBE_BUDGET`] is spent the remaining services are
+    /// *not probed at all*, and what was already learned is still rendered.
+    ///
+    /// This is the branch that keeps `rocm services list` — and the chat
+    /// `services` tool, which renders through the same
+    /// `render_services_text` — from scaling its wall time with the number of
+    /// services. Dropping the later rows is only half of it; the point is to
+    /// stop paying for them, so the probe counter below is the real assertion.
+    /// Asserting it against the live clock and live engines would mean a test
+    /// that waits out ten real seconds, which is why the loop takes both
+    /// injected.
+    #[test]
+    fn service_device_probes_stop_once_the_budget_is_exhausted() {
+        let mut probed = Vec::new();
+        // Inside the budget for the first service, over it from then on.
+        let mut tick = 0;
+        let devices = collect_service_devices(
+            [
+                ("svc-fast", "lemonade"),
+                ("svc-hung", "vllm"),
+                ("svc-never-reached", "aim"),
+            ],
+            || {
+                tick += 1;
+                if tick <= 1 {
+                    Duration::ZERO
+                } else {
+                    SERVICE_DEVICE_PROBE_BUDGET
+                }
+            },
+            |service_id, _engine| {
+                probed.push(service_id.to_owned());
+                Some("rocm gpu 0".to_owned())
+            },
+        );
+
+        assert_eq!(
+            probed,
+            ["svc-fast"],
+            "the budget must stop further probing, not merely hide its results"
+        );
+        assert_eq!(
+            devices.get("svc-fast").map(String::as_str),
+            Some("rocm gpu 0"),
+            "what was learned before the budget ran out is still reported"
+        );
+        assert!(
+            !devices.contains_key("svc-hung") && !devices.contains_key("svc-never-reached"),
+            "an unprobed service must get no `device:` row: {devices:?}"
+        );
+    }
+
+    /// The serve summary asks again when the first answer is `None`: the
+    /// engine can be seconds from verifying its own inference probe, which is
+    /// the `device: "unknown"` window `engines/lemonade` has right after a
+    /// launch reports ready.
+    #[test]
+    fn the_serve_summary_probe_waits_for_a_device_that_is_not_ready_yet() {
+        let mut attempts = 0;
+        let mut waited = Duration::ZERO;
+        let device = retry_service_device(
+            || Duration::ZERO,
+            || {
+                attempts += 1;
+                (attempts > 2).then(|| "vulkan gpu 0".to_owned())
+            },
+            |interval| waited += interval,
+        );
+
+        assert_eq!(device.as_deref(), Some("vulkan gpu 0"));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            waited,
+            SERVE_DEVICE_PROBE_INTERVAL * 2,
+            "the retries must pace themselves rather than spin"
+        );
+    }
+
+    /// And it gives up. A lemonade service whose weights are still loading can
+    /// stay `unknown` for minutes; the summary prints no `device:` row rather
+    /// than holding the terminal, which is why the row is documented as
+    /// optional.
+    #[test]
+    fn the_serve_summary_probe_gives_up_within_its_budget() {
+        let mut attempts = 0;
+        // Inside the budget for the first attempt, past it from then on.
+        let mut tick = 0;
+        let device = retry_service_device(
+            || {
+                tick += 1;
+                if tick <= 1 {
+                    Duration::ZERO
+                } else {
+                    SERVE_DEVICE_PROBE_BUDGET
+                }
+            },
+            || {
+                attempts += 1;
+                None
+            },
+            |_| {},
+        );
+
+        assert_eq!(device, None);
+        assert_eq!(
+            attempts, 2,
+            "the budget must end the retries, not merely discard their results"
+        );
+    }
+
+    /// A service whose engine cannot answer costs its own probe and nothing
+    /// more: it is skipped, and the services after it are still probed.
+    #[test]
+    fn a_service_whose_probe_fails_does_not_suppress_the_rest() {
+        let devices = collect_service_devices(
+            [("svc-quiet", "lemonade"), ("svc-ok", "vllm")],
+            || Duration::ZERO,
+            |service_id, _engine| (service_id == "svc-ok").then(|| "rocm gpu 1".to_owned()),
+        );
+
+        assert!(!devices.contains_key("svc-quiet"), "{devices:?}");
+        assert_eq!(
+            devices.get("svc-ok").map(String::as_str),
+            Some("rocm gpu 1")
+        );
     }
 
     #[test]
@@ -597,7 +1129,7 @@ mod tests {
                 let done = Arc::clone(&done);
                 std::thread::spawn(move || {
                     while !done.load(Ordering::Relaxed) {
-                        with_scoped_builtin_engine_env(Some(&paths), None, || {
+                        with_scoped_builtin_engine_env(Some(&paths), None, None, || {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         });
                         // Outside the lock, so the test's own turn is not starved.

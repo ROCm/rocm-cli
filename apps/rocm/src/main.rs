@@ -1023,6 +1023,85 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     bare
 }
 
+/// The inventory note to print for `engine`, given the row `catalog_note` the
+/// static catalogue carries for it and what this host actually supports.
+///
+/// The one place the lemonade substitution lives. All three host-aware
+/// inventory renderers — [`render_engine_inventory_text_for_host`]
+/// (`rocm engines`), [`append_examine_engine_inventory`] (`rocm examine`) and
+/// [`builtin_codex_bridge_engine_inventory`] (the codex bridge and its
+/// `engines` MCP tool) — route their note through this, so the three cannot
+/// drift into disagreeing about the same host. Tests exercise the renderers
+/// rather than this function: asserting on it directly would only restate the
+/// condition below instead of proving a surface prints it.
+pub(crate) fn engine_inventory_note(
+    engine: &str,
+    catalog_note: &'static str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> &'static str {
+    if engine == "lemonade" {
+        lemonade_engine_note(gpu_support_level)
+    } else {
+        catalog_note
+    }
+}
+
+/// The lemonade engine note shown in `rocm examine`, `rocm engines` and the
+/// codex-bridge engine inventory, adjusted for whether this host's detected GPU
+/// can actually use the ROCm llama.cpp backend.
+///
+/// All three of those have a live `GpuSupportLevel` in scope. The two places
+/// that still print the note statically — the dashboard TUI's engine-manager
+/// pane and `rocmd`'s own `rocmd_engine_inventory` in
+/// `apps/rocmd/src/host_snapshot.rs` — keep the
+/// unconditional ROCm wording, and that is deliberate rather than an oversight:
+/// the TUI pane renders a hard-coded descriptive list with no probe behind it,
+/// and `rocmd` is the daemon answering for whichever host a client asks about,
+/// not necessarily the one it runs on. Both are their own change if they ever
+/// need to be host-aware.
+///
+/// The match is exhaustive rather than a catch-all on purpose. `Unknown` is
+/// "no GPU detected yet, or a gfx target this catalog does not recognize", and
+/// folding it into the ROCm arm reproduced the exact bug ROCMAI-550 exists to
+/// fix - asserting ROCm support on a host where nothing establishes it, just
+/// on the hosts where the CLI knows least. It does not get the Vulkan wording
+/// either: that is a confirmed absence, and a detection gap is not one. So it
+/// claims no backend and names the command that can answer. A new
+/// `GpuSupportLevel` variant now has to be classified here rather than
+/// silently inheriting the ROCm claim.
+///
+/// What the `Unknown` arm promises is bounded by what the named command
+/// delivers. It used to say `rocm examine` would show "which llama.cpp backend
+/// this GPU uses", and examine showed no such thing — it printed a
+/// `rocm_support` line only for `VulkanOnly`, so on exactly the hosts that got
+/// this note it printed nothing at all. `ExamineSummary::rocm_support_line`
+/// now answers for every level, and this says what that answer is: the support
+/// level, not the backend. The backend is settled by launching one, which that
+/// line in turn points at.
+const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
+    match level {
+        rocm_core::GpuSupportLevel::VulkanOnly => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, so it runs on the Vulkan llama.cpp backend"
+        }
+        rocm_core::GpuSupportLevel::RocmHip => {
+            "default embedded Lemonade server with ROCm llama.cpp backend"
+        }
+        rocm_core::GpuSupportLevel::Unknown => {
+            "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
+        }
+    }
+}
+
+/// This host's GPU support level from the cheap host probe, for the call sites
+/// that need it without gathering a whole [`ExamineSummary`].
+///
+/// The same two inputs `rocm examine` derives it from, read through
+/// `detect_host_gpu_summary` rather than the full examine gather — exactly what
+/// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
+pub(crate) fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
+    rocm_core::gpu_support_level_for_host_gpu(&rocm_core::detect_host_gpu_summary(paths))
+}
+
 fn refresh_startup_update_check_quietly() {
     let Ok(paths) = AppPaths::discover() else {
         return;

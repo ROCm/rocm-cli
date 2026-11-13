@@ -80,6 +80,14 @@ pub struct E2eWorld {
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
     pub model_name: Option<String>,
+    /// Stdout of the `rocm serve` that this scenario's Given step launched,
+    /// kept so a Then can assert on the deployment summary it printed.
+    ///
+    /// Separate from `cli_output`, which belongs to the scenario's When step:
+    /// these serves happen in a *precondition*, and overwriting `cli_output`
+    /// from a Given would change what every existing Then on those scenarios
+    /// reads. `None` when the scenario served nothing.
+    pub serve_summary: Option<String>,
     pub chat_response: Option<serde_json::Value>,
     /// The reply to a request sent to the served model's Anthropic-compatible
     /// `/v1/messages` endpoint.
@@ -371,6 +379,7 @@ impl Default for E2eWorld {
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
+            serve_summary: None,
             chat_response: None,
             anthropic_response: None,
             anthropic_stream: None,
