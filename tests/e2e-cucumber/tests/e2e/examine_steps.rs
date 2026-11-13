@@ -3350,6 +3350,28 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
             "rocm serve <model>",
             &["rocm install sdk", "--engine lemonade"],
         ),
+        // The two probed Vulkan tiers land here too, and neither owes `--engine
+        // lemonade`: on both, nothing has established a backend that can serve
+        // this GPU, so naming an engine would promise a run the evidence does
+        // not support. A driver is what clears either condition.
+        //
+        // Split out because the catch-all below demands `--engine lemonade`,
+        // which neither tier's text contains. No lane reaches that assertion
+        // today only because none carries a detected, ROCm-unsupported GPU in
+        // these tiers; dropping these arms again makes the first such runner
+        // red rather than failing here. This arm has been lost to a merge once
+        // already.
+        //
+        // Told apart by each tier's own wording, as the catalog arm above is:
+        // `VulkanUnconfirmed` says the probe could not settle it, `NoGpuBackend`
+        // says it looked and found nothing.
+        (Some(_), None, _) if line.contains("could not confirm") => (
+            "install a Vulkan driver",
+            &["rocm install sdk", "--engine lemonade"],
+        ),
+        (Some(_), None, _) if line.contains("no Vulkan GPU driver was found") => {
+            ("install one", &["rocm install sdk", "--engine lemonade"])
+        }
         (Some(_), None, _) => (
             "rocm serve <model> --engine lemonade",
             &["rocm install sdk"],

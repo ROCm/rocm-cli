@@ -1095,11 +1095,18 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         // `append_examine_engine_inventory`, and told its reader to run the
         // command they were already reading. It names the thing that would
         // actually settle the question instead.
+        //
+        // That thing is NOT "install `vulkaninfo`", for the reason the matching
+        // arm in `host_gpu::render` spells out: on a real driverless Linux host
+        // the tool is already installed, prints "Found no drivers!" and exits 1,
+        // which is exactly what lands here. Both strings appear in the same
+        // `rocm examine` report, so advising that install would contradict the
+        // `rocm_support:` line a few lines above it.
         rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
-             Vulkan driver is present could not be determined - install `vulkaninfo` to check, \
-             or a Vulkan driver (Mesa RADV on Linux, the AMD display driver on Windows) to run \
-             models on this GPU"
+             Vulkan driver is present could not be determined - install a Vulkan driver (Mesa \
+             RADV on Linux, the AMD display driver on Windows) to run models on this GPU, and \
+             run `vulkaninfo` yourself to see what it says"
         }
         rocm_core::GpuSupportLevel::NoGpuBackend => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"

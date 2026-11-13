@@ -307,14 +307,23 @@ checks, which cannot be made anywhere else:
     `rocm serve <model> --engine lemonade` — the point of the claim is that it
     is true, and this is the only place it can be confirmed against real
     hardware.
-  - With the driver removed but `vulkaninfo` still installed, the line says no
-    Vulkan driver was found and tells you to install one. It must **not** still
-    name a driver.
-  - With neither installed, the line says the check could not be made and names
-    `vulkaninfo` as the way to settle it. It must **not** say the driver is
-    absent — that is the Windows-laptop case ROCMAI-550 came from, and
-    declaring absence there is the regression `VulkanUnconfirmed` exists to
-    prevent.
+  - With the driver removed but `vulkaninfo` still installed, expect the
+    *could-not-confirm* wording on Linux rather than a confirmed absence, and it
+    must **not** still name a driver. This is the known gap recorded on
+    examine-53, measured rather than assumed: a real `vulkaninfo` with no
+    reachable driver prints "Found no drivers!" and exits **1**, and the probe
+    counts only an exit-0 run as having answered, so the host is classed
+    inconclusive. Telling "no drivers" apart from "the tool is broken" needs the
+    loader's own message, which the shared capture discards. Seeing "could not
+    confirm" here is correct, not a regression.
+  - With neither installed, the line says the check could not be made — the same
+    level as the bullet above — and tells you to install a Vulkan driver, while
+    pointing at running `vulkaninfo` yourself to see what it reports. It must
+    **not** say the driver is absent, and it must **not** tell you to *install*
+    `vulkaninfo`: on the host above, that tool is already there, so that advice
+    could never clear the state. The absence claim is the Windows-laptop case
+    ROCMAI-550 came from, and declaring absence there is the regression
+    `VulkanUnconfirmed` exists to prevent.
 
   A software rasteriser (`lavapipe`, `swiftshader`) must never be reported as a
   GPU path in any of the three.
