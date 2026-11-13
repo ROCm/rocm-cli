@@ -2833,7 +2833,7 @@ jobs:
     #[test]
     fn every_native_linux_preflight_delegates_to_the_shared_script() {
         // What the deduplication (#294) actually bought, and the only thing
-        // keeping the next #446 from landing eight times: the eight native Linux
+        // keeping the next #446 from landing seven times: the seven native Linux
         // preflights are now one script plus a floor. The drift test below can no
         // longer catch a block left behind, because a block left behind would
         // carry its own body and simply not be compared against anything.
@@ -2872,8 +2872,8 @@ jobs:
             }
         }
         assert_eq!(
-            delegating, 8,
-            "expected the eight native Linux preflight lanes to delegate to \
+            delegating, 7,
+            "expected the seven native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
     }
@@ -2885,7 +2885,7 @@ jobs:
         // where re-inlining drift grows back: a lane that keeps the delegation
         // and adds a line of its own above it — one more `pkill -f`, a lane-local
         // retry, a second floor — satisfies `step.contains(SHARED_PREFLIGHT)`
-        // and the floor check and leaves that test green, while the eight bodies
+        // and the floor check and leaves that test green, while the seven bodies
         // are no longer one body. That is how the original six inline copies
         // diverged from their PowerShell mirrors: nothing compared them to each
         // other, only to a substring.
@@ -2894,8 +2894,8 @@ jobs:
         // not_drift` and `both_wsl_lanes_settle_the_clock_before_running_the_
         // suite` pin their pairs, and then pin the shape they agree on: a single
         // `bash <script>` line and nothing else. Equality alone would be
-        // satisfied by eight identically re-inlined copies; the shape assertion
-        // alone would not notice seven of eight.
+        // satisfied by seven identically re-inlined copies; the shape assertion
+        // alone would not notice six of seven.
         //
         // The per-lane floor's VALUE is deliberately not part of this
         // comparison — 8 and 16 are the one intended difference — but
@@ -2917,7 +2917,7 @@ jobs:
                 let name = format!("{workflow} GPU preflight #{i}");
                 let body = preflight_shell_script(step)
                     .unwrap_or_else(|| panic!("{name} carries no `run: |` body"));
-                // Pinned per lane as well as compared across them: eight lanes
+                // Pinned per lane as well as compared across them: seven lanes
                 // that ALL grew `continue-on-error: true` would still agree
                 // with each other.
                 assert_eq!(
@@ -2933,7 +2933,7 @@ jobs:
                     ["GPU_PREFLIGHT_MIN_FREE_GIB"],
                     "{name} sets step environment beyond its floor; a lane-local \
                      ceiling or marker is a second gate configured where the shared \
-                     script cannot see it, and the next fix to it lands eight times again"
+                     script cannot see it, and the next fix to it lands seven times again"
                 );
                 shapes.push((name.clone(), preflight_step_shape(step)));
                 bodies.push((name, body));
@@ -2941,8 +2941,8 @@ jobs:
         }
         assert_eq!(
             bodies.len(),
-            8,
-            "expected eight native Linux preflight bodies to compare, found {} — \
+            7,
+            "expected seven native Linux preflight bodies to compare, found {} — \
              if a lane was added or removed, update this count",
             bodies.len()
         );
@@ -2966,7 +2966,7 @@ jobs:
             "the native Linux GPU preflight bodies agree with each other but are no \
              longer a lone delegation to {SHARED_PREFLIGHT}; whatever they now also \
              do is a second gate living in the workflows, where the next fix to it \
-             has to land eight times again"
+             has to land seven times again"
         );
         let (first_name, first) = shapes
             .first()
@@ -2978,7 +2978,7 @@ jobs:
                     "the native Linux GPU preflights agree on their bodies but no longer \
                      on the step AROUND the body — one lane runs {SHARED_PREFLIGHT} under \
                      conditions, error handling or environment the other seven do not, so \
-                     the eight are one gate in name only; {diff}"
+                     the seven are one gate in name only; {diff}"
                 );
             }
         }
@@ -4301,8 +4301,8 @@ fi
             }
         }
         assert_eq!(
-            delegating, 8,
-            "expected the 8 native Linux preflight lanes to delegate to \
+            delegating, 7,
+            "expected the 7 native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
         assert_eq!(
@@ -4312,7 +4312,7 @@ fi
              left inline across both workflows — if a lane was added or removed, update \
              this count"
         );
-        // The shared script once, standing in for all eight delegating lanes: they
+        // The shared script once, standing in for all seven delegating lanes: they
         // run the same bytes, and its loop is the one that has to poll.
         lanes.push((
             format!("shared {SHARED_PREFLIGHT}"),
@@ -7576,7 +7576,7 @@ jobs:
             condition: lane_if(extra, "", platform),
             matrix_lane: true,
         };
-        // Strix Ubuntu and W7900 are off `pull_request` and `merge_group`.
+        // Strix Ubuntu is off `pull_request` and `merge_group`.
         let off_pr_lane = |job, platform: &str| PinnedIf {
             job,
             condition: lane_if(
@@ -7596,7 +7596,6 @@ jobs:
             off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
-            off_pr_lane("e2e-gpu-w7900", "w7900"),
             // Skips because the `serve` output of a skipped `changes` is empty.
             PinnedIf {
                 job: "e2e-report",
@@ -7717,38 +7716,33 @@ jobs:
             );
         }
         // A pull request runs one Linux node (MI300X) and one Windows pool (the
-        // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND
-        // merge_group (W7900 is one runner on borrowed quota; 35% of Strix
-        // Ubuntu's merge-queue jobs hit the 45 min cap; neither check is required
-        // and the queue does not wait for it) but still run on push and dispatch.
+        // Strix Halo pool). Strix Ubuntu is off pull_request AND merge_group (35%
+        // of its merge-queue jobs hit the 45 min cap; the check is not required
+        // and the queue does not wait for it) but still runs on push and dispatch.
         // Pin the WHOLE gate, not a substring: the event exclusions must sit in the
         // non-dispatch branch (so a dispatch can still select the lane) and nothing
         // else about the event may be named, so a gate that dropped push some other
         // way fails too.
-        for (job, platform) in [
-            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
-            ("e2e-gpu-w7900", "w7900"),
-        ] {
-            let expected = format!(
-                "always() && needs.changes.result == 'success' && ( \
-                 (github.event_name != 'workflow_dispatch' \
-                 && github.event_name != 'pull_request' \
-                 && github.event_name != 'merge_group' \
-                 && needs.changes.outputs.serve == 'true') \
-                 || (github.event_name == 'workflow_dispatch' \
-                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
-            );
-            assert_eq!(
-                normalized_whitespace(&gate(job)),
-                normalized_whitespace(&expected),
-                "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
-                 the non-dispatch branch only)"
-            );
-            assert!(
-                !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
-                "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
-            );
-        }
+        let (job, platform) = ("e2e-gpu-strix-ubuntu", "strix-ubuntu");
+        let expected = format!(
+            "always() && needs.changes.result == 'success' && ( \
+             (github.event_name != 'workflow_dispatch' \
+             && github.event_name != 'pull_request' \
+             && github.event_name != 'merge_group' \
+             && needs.changes.outputs.serve == 'true') \
+             || (github.event_name == 'workflow_dispatch' \
+             && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+        );
+        assert_eq!(
+            normalized_whitespace(&gate(job)),
+            normalized_whitespace(&expected),
+            "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
+             the non-dispatch branch only)"
+        );
+        assert!(
+            !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
+            "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
     }
 
     /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
