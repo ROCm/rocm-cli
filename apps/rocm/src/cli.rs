@@ -551,6 +551,9 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
         /// Skip the post-startup inference smoke test (time-to-first-token, tokens/sec).
+        ///
+        /// When the smoke test runs and cannot complete, the summary says so
+        /// and does not report the service as ready; ROCm CLI does not stop the server.
         #[arg(long)]
         no_smoke_test: bool,
         /// Allow binding to a non-local address.

@@ -3880,7 +3880,8 @@ whether a scenario may run at all (see the comment at
 a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
-name on that route. Note also that `-n` matches the scenario *name*
+name on that route, nor any other `@requires-oom-fault-injection` scenario
+(`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
@@ -3891,14 +3892,16 @@ passing an id to it silently selects nothing.
 
 ### The OOM fault-injection capability
 
-serve-41 needs a managed launch that really failed on VRAM, which a GPU-less CI
+The `@id:serve-oom-launch-memory-guidance` scenario needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
-log it owns, and never became ready. No process is spawned, and the seam
-compiles out entirely without the feature, so a build that does not enable it
-behaves exactly as the shipped binary does.
+log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
+ready, so a mock engine can then fail its smoke test. No process is spawned, and
+the seam compiles out entirely without the feature, so a build that does not
+enable it behaves exactly as the shipped binary does.
 
 Only `cargo xtask e2e` enables it, by building the binary under test with
 `--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and it is the
@@ -3911,7 +3914,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-41 to a reported **skip**, not a silent pass. It
+compiled out and resolves both of those scenarios to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -3921,10 +3924,98 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-41 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
-the scenario carries `@requires-os:linux`. On the GPU lanes it is
+both scenarios are never selected there at all: that lane runs
+`E2E_ONLY_LIFECYCLE` and the scenarios carry `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
+
+## Serve Smoke Test Failure
+
+After a fresh launch becomes ready, the `rocm serve` interactive summary sends
+one small chat request. When that request cannot complete the summary is headed
+`Deployment summary (smoke test failed)`, shows the status as
+`started, smoke test failed` instead of `ready`, and a hedged note gives the
+reason and names `rocm logs --service <id>`. See
+[the README](../README.md#model-serving) for the user-facing contract. The
+launch itself stays best-effort: exit code and service record do not change, and
+`--no-smoke-test` and an already-running service are unchanged.
+
+What is detected, and what is not:
+
+- Detected (the summary says the smoke test failed): a transport error or timeout,
+  an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
+  stream cut short.
+- Not detected (no failure is reported and the status reads `ready`): an engine
+  error sent as a `data:` payload inside a `200` stream; a `200` answer with no
+  `data:` line at all (HTML, plain JSON, an empty body); a close-delimited stream
+  cut after a token; and a complete stream with no `content` token, which is
+  deliberately not a failure (a reasoning model can spend its whole small budget
+  first, as the readiness probe also allows for). The metric rows read `n/a` when
+  no content token arrived first; tokens that did arrive (the close-delimited cut,
+  or an in-band `data:` error after content) are measured.
+- Known limitation: the reason shown is whatever the provider call reported, and
+  some of its errors are not the engine's, for example the `/v1/models` re-list
+  before the request ("no ready managed service"), an unreadable services-directory
+  entry, a rejected endpoint URL, and the audit event written after the stream is
+  consumed. Each turns into a failed smoke test, which is why the note says the
+  smoke test could not complete and only that the server may not be able to serve
+  requests.
+- Known limitation: the smoke request is routed by model name, not to the launched
+  service. The newest ready service serving the model is used, so normally the one
+  just launched. If the new service fails the 2 s `/v1/models` listing probe (for
+  example the engine was killed just as it became ready) it is filtered out: an
+  older ready service with the same model then answers, and the summary shows
+  `ready` with that service's metrics and no note, a false pass on a dead launch.
+  With no older service the reason shown is rocm's "no ready managed service", not
+  the engine's.
+
+Focused unit coverage:
+
+```bash
+cargo test -p rocm --bin rocm serve_smoke_test
+cargo test -p rocm --bin rocm a_failed_smoke_test_is_not_presented_as_ready_and_says_why
+cargo test -p rocm --bin rocm a_passing_or_skipped_smoke_test_adds_no_failure_note
+cargo test -p rocm --bin rocm an_already_running_summary_ignores_a_smoke_failure
+cargo test -p rocm --bin rocm failure_reason_
+cargo test -p rocm --bin rocm the_commands_the_failure_note_names_exist_and_parse
+```
+
+The `serve_smoke_test` tests in [providers.rs](../apps/rocm/src/providers.rs)
+run the real smoke test against a local mock engine over a socket (an engine that
+dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, a
+complete stream with no content, a close-delimited stream cut after a token). Only
+the mid-stream-death test goes on to render the summary from the real outcome; the
+others assert on the outcome the smoke test returns.
+
+- `@id:serve-smoke-failure-summary` (serve-57) — a launch that becomes ready
+  whose engine fails its first chat request is shown as a failed smoke test, with
+  the engine's own reason and the full `rocm logs --service <id>` command, and
+  the engine received exactly one chat request. It carries `@requires-no-gpu`,
+  `@requires-os:linux` and `@requires-oom-fault-injection`: it uses the same
+  test-only hook as `@id:serve-oom-launch-memory-guidance` (see [Serve OOM Guidance](#serve-oom-guidance)) in its
+  `ready` mode, a ready record pointing at a mock engine whose chat requests all
+  fail with HTTP 500, so it has that scenario's gates: against a prebuilt
+  `ROCM_CLI_BINARY` the hook is compiled out and the harness reports it as a skip,
+  unless it is selected with `-n` or `--tags`, which bypasses that skip and makes
+  it fail for the wrong reason. Some of its steps are not checks of the fix, so say
+  plainly what they prove:
+  - The exit code 0 is asserted in the `When` step (`wait_for_exit`), not in a
+    `Then` step.
+  - "the engine received exactly one chat request" passes with the fix reverted
+    (the smoke request was already sent); it shows the request was not retried.
+  - "the engine's own reason" matches rocm's wording of the status line around the
+    engine's HTTP status, so it pins that phrasing as well.
+  - "the launch's service record is left as ready" passes with the fix reverted;
+    it is the only assertion behind the "ROCm CLI does not stop the server"
+    promise in the README and `rocm serve --help`.
+  - "no background automation daemon was left behind" is hygiene only: it records
+    that no daemon was started but does not discriminate the
+    `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs`, because no watcher is
+    enabled in the isolated config and the helper starts only when one is.
+
+```bash
+cargo xtask e2e -- -n "serve-57"
+```
 
 ## Windows Tool Notes
 

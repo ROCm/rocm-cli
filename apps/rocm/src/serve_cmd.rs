@@ -864,8 +864,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
-    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
-    // not have.
+    // E2E-only launch fault injection (either mode) likewise stands in for the
+    // GPU it does not have.
     //
     // The scripted free-space override opens the same waiver: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
@@ -1193,20 +1193,23 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         };
         let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
-        // writes a `starting` record for a process that never existed, so the
-        // helper would be left watching a pid that will never appear, with
-        // nothing in the scenario's teardown to stop it: observed as `rocm
-        // daemon` processes outliving their e2e checkout by days, still
-        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // writes a record (`starting`, or `ready` in its `ready` mode) for a
+        // process that never existed, so the helper would be left watching a pid
+        // that will never appear, with nothing in the scenario's teardown to stop
+        // it: observed as `rocm daemon` processes outliving their e2e checkout by
+        // days, still carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
         // supervising a real spawned server, and there is none here.
         //
         // That — not ordering — is the whole justification. This suppression
         // runs *before* the OOM note is computed in the `summary_mode` block
         // below, so the previous claim here, that the note "is computed before
         // it would have run", was backwards and could not have excused it.
-        // serve-40's `no background automation daemon was left behind` is what
-        // holds the branch: deleting it left the scenario green with a `rocm
-        // daemon` still running.
+        // The `no background automation daemon was left behind` step of the
+        // `@id:serve-oom-launch-memory-guidance` and
+        // `@id:serve-smoke-failure-summary` scenarios records that none was
+        // started but does not discriminate this branch: the helper starts only
+        // when a watcher is enabled, and the isolated config those scenarios use
+        // enables none, so removing the branch leaves them green.
         //
         // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
         // the test-only feature, so this branch folds away in shipped builds.
@@ -1236,16 +1239,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Best-effort inference smoke test, on by default (opt out with
             // `--no-smoke-test`). Only meaningful for a freshly-ready server we
             // just launched; skipped when metrics could not be shown anyway.
-            let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
-                spinner.set_label("Running smoke test…");
-                // The local provider resolves the endpoint key from the per-service
-                // 0600 key file by service id, so the smoke test authenticates
-                // against a protected public endpoint without threading the secret
-                // through here.
-                serve_summary::run_smoke_test(&paths, resolve.served_model_name())
-            } else {
-                serve_summary::SmokeMetrics::default()
-            };
+            let (metrics, smoke_failure) =
+                if !no_smoke_test && !report.already_running && report.status == "ready" {
+                    spinner.set_label("Running smoke test…");
+                    // The local provider resolves the endpoint key from the per-service
+                    // 0600 key file by service id, so the smoke test authenticates
+                    // against a protected public endpoint without threading the secret
+                    // through here.
+                    serve_summary::run_smoke_test(&paths, resolve.served_model_name()).into_parts()
+                } else {
+                    (serve_summary::SmokeMetrics::default(), None)
+                };
             spinner.clear();
 
             let mut notes = collect_serve_notes(
@@ -1314,6 +1318,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 status: report.status.clone(),
                 already_running: report.already_running,
                 metrics,
+                smoke_failure,
                 api_key: launched_key,
                 notes,
             };
