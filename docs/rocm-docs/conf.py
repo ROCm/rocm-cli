@@ -80,6 +80,6 @@ exclude_patterns = []
 # -- Sphinx setup ----------------------------------------------------------
 
 
-def setup(app):
+def setup(_app):
     """Sphinx setup"""
     return {"parallel_read_safe": True, "parallel_write_safe": True}
