@@ -167,6 +167,15 @@ impl Profiles {
         for requirement in requirements {
             hasher.update(format!("requirement={requirement}\n"));
         }
+        // Both shape the lock too: `rocm` is the line every `+rocm` build
+        // must belong to, and `vendor-packages` decides which packages are
+        // exempt from the cutoff, so an edit to either makes the lock stale.
+        hasher.update(format!("rocm={}\n", profile.rocm.as_deref().unwrap_or("")));
+        let mut vendor_packages = self.policy.vendor_packages.clone();
+        vendor_packages.sort();
+        for pattern in vendor_packages {
+            hasher.update(format!("vendor-package={pattern}\n"));
+        }
         // Line endings normalised, so a CRLF checkout digests the same.
         hasher.update(format!("uv.toml=\n{}", uv_config.replace("\r\n", "\n")));
         hasher

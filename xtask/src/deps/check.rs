@@ -105,8 +105,9 @@ pub(crate) fn lock_problems(
         ))
     {
         out.push(
-            "was locked from other inputs: the profile's python, platform or \
-             requirements, or uv.toml, changed since"
+            "was locked from other inputs: the profile's python, platform, \
+             requirements or ROCm line, the policy's vendor packages, or \
+             uv.toml, changed since"
                 .to_owned(),
         );
     }
@@ -469,8 +470,9 @@ linux = "x86_64-manylinux_2_28"
     fn a_lock_resolved_from_other_inputs_is_reported() {
         let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com");
         assert!(problems_of(&text).is_empty());
-        let stale = "was locked from other inputs: the profile's python, platform or \
-                     requirements, or uv.toml, changed since";
+        let stale = "was locked from other inputs: the profile's python, platform, \
+                     requirements or ROCm line, the policy's vendor packages, or \
+                     uv.toml, changed since";
         for (what, profiles_text, uv) in [
             (
                 "an added extra",
@@ -495,6 +497,19 @@ linux = "x86_64-manylinux_2_28"
             (
                 "a loosened pin the lock still satisfies",
                 PROFILES.replace("torch==2.13.*", "torch==2.*"),
+                UV.to_owned(),
+            ),
+            (
+                "another ROCm line",
+                PROFILES.replace("rocm = \"10.1.0\"", "rocm = \"10.2.0\""),
+                UV.to_owned(),
+            ),
+            (
+                "another vendor package",
+                PROFILES.replace(
+                    "vendor-packages = [\"rocm\", \"torch\"]",
+                    "vendor-packages = [\"rocm\", \"torch\", \"triton\"]",
+                ),
                 UV.to_owned(),
             ),
             (

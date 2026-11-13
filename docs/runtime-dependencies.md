@@ -140,10 +140,10 @@ mise's own `pypi` backend was evaluated for these stacks and cannot lock them
 ### What `deps check` enforces on a Python lock
 
 - it starts with the header `cargo xtask deps lock` writes (no hand edits);
-- that header's inputs digest matches the profile's `python`, platform and
-  requirements and the text of `uv.toml` as they are now, so a lock left stale
-  by an edit to any of them is caught offline, even where it still happens to
-  satisfy the requirements;
+- that header's inputs digest matches the profile's `python`, platform,
+  requirements and `rocm` line, the policy's `vendor-packages`, and the text of
+  `uv.toml` as they are now, so a lock left stale by an edit to any of them is
+  caught offline, even where it still happens to satisfy the requirements;
 - that header records the `exclude-newer` cutoff the lock was resolved at,
   which is what lets a re-lock reproduce it (AMD-only packages aside, see
   *Cooldown*);
