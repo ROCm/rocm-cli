@@ -1783,14 +1783,16 @@ do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
 Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
 exits with code 0. Any other answer cancels the same way, after a line saying
 that the answer was not understood and is treated as no. Use `--dry-run` to only
-list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
-is a separate opt-in for development builds. At a terminal, a dry run that finds
+list, and `--yes` to skip the confirmation. There is no `--force`: passing it is refused,
+ending with a `Try:` line that repeats your command with `--yes` in its place.
+`--force-dev-binaries` is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
 (its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
 with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
 nothing to remove. Outside an interactive terminal, when there is something to
-remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
+remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`;
+the refusal ends with a `Try:` line that is the same command with `--yes` added.
 Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
