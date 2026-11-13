@@ -26,6 +26,7 @@ mod e2e_report;
 mod engine_stdio_client_contract;
 mod env_mutation_contract;
 mod eval_fixtures;
+mod host_baseline_contract;
 mod lychee;
 mod manifest;
 mod module_size;

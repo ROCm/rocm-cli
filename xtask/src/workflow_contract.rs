@@ -3285,6 +3285,27 @@ if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_FAILS:-0}" = 1 ]; then
 fi
 "#;
 
+    /// Stands in for `.github/scripts/host-baseline.sh`, which the shared
+    /// preflight runs before either GPU gate. These cases are about the GPU
+    /// gates, so it passes unless `HOST_BASELINE_RC` says otherwise; what the
+    /// real script decides is `host_baseline_contract.rs`'s to drive.
+    ///
+    /// `BASELINE_COUNTER` names a file it appends one line to per call, so a
+    /// case can count how often the preflight ran it. `HOST_BASELINE_HANGS`
+    /// makes it never return, for the `timeout` bound on that call; `exec`
+    /// for the reason `RECLAIM_STUB` gives.
+    #[cfg(unix)]
+    const HOST_BASELINE_STUB: &str = r#"#!/bin/sh
+echo "host-baseline.sh stub called"
+if [ -n "${BASELINE_COUNTER:-}" ]; then echo call >> "$BASELINE_COUNTER"; fi
+if [ "${HOST_BASELINE_HANGS:-0}" = 1 ]; then exec sleep 60; fi
+rc="${HOST_BASELINE_RC:-0}"
+if [ "$rc" != 0 ]; then
+  echo "::error::host baseline not met: stubbed shortfall"
+fi
+exit "$rc"
+"#;
+
     /// What a lane logs when it reached the step that names what holds the GPU.
     #[cfg(unix)]
     const REPORTED_HOLDERS: &str = "reclaim-gpu.sh stub called: --report-holders";
@@ -3350,6 +3371,14 @@ fi
         std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
         std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), reclaim)
             .expect("write reclaim-gpu.sh");
+        // …and the host baseline the shared script runs first, named the same
+        // way.
+        std::fs::create_dir_all(dir.path().join(".github/scripts")).expect("baseline dir");
+        std::fs::write(
+            dir.path().join(".github/scripts/host-baseline.sh"),
+            HOST_BASELINE_STUB,
+        )
+        .expect("write host-baseline.sh");
 
         let path = format!(
             "{}:{}",
@@ -4096,6 +4125,211 @@ fi
                  leaked process was holding the GPU and 'listed above'; nothing is listed \
                  above, so the lane fails pointing at a process that was never found. \
                  Logged:\n{log}"
+            );
+        }
+    }
+
+    /// A runner below the product's glibc/libstdc++ floor fails the shared
+    /// preflight at once, before `rocm-smi` is asked anything.
+    ///
+    /// The GPU here is healthy and empty, so nothing but the baseline can fail
+    /// this run. The passing half shows the baseline runs FIRST, ahead of the
+    /// first GPU reading, rather than merely somewhere. That it is not retried
+    /// is `preflight_runs_the_host_baseline_once_however_many_polls_it_takes`.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_fails_a_host_below_the_baseline_without_querying_the_gpu() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let counter = dir.path().join("smi-calls");
+        let counter_arg = counter.to_str().expect("utf-8 temp path").to_owned();
+
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[("HOST_BASELINE_RC", "1"), ("COUNTER", counter_arg.as_str())],
+        );
+        assert_eq!(code, 1, "a host below the baseline passed; logged:\n{log}");
+        assert!(
+            log.contains("::error::host baseline not met: stubbed shortfall"),
+            "the baseline's own verdict is missing from the log:\n{log}"
+        );
+        assert!(
+            !counter.exists(),
+            "the preflight queried rocm-smi {} time(s) after the host baseline failed; \
+             it must stop at once. Logged:\n{log}",
+            std::fs::read_to_string(&counter).unwrap_or_default().trim()
+        );
+        assert!(
+            !log.contains("could not be run"),
+            "a baseline that ran and said no was reported as one that never ran:\n{log}"
+        );
+
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[],
+        );
+        assert_eq!(
+            code, 0,
+            "a host meeting the baseline failed; logged:\n{log}"
+        );
+        let baseline = log.find("host-baseline.sh stub called");
+        let pools = log.find("rocm-smi pools (used/total bytes)");
+        assert!(
+            matches!((baseline, pools), (Some(b), Some(p)) if b < p),
+            "the host baseline must run before the first GPU reading; logged:\n{log}"
+        );
+    }
+
+    /// The baseline runs once per preflight, however long the GPU wait goes
+    /// on: the floor describes the host, not the moment, so re-asking it each
+    /// poll would only spend the ceiling.
+    ///
+    /// The GPU stays busy (1 GiB of GTT free against the 8 GiB floor) for the
+    /// whole 7s ceiling, so the loop polls at least twice — the ceiling
+    /// arithmetic is that of
+    /// `apu_preflight_verdict_reflects_the_last_completed_reading` — and a
+    /// baseline moved inside the loop would be counted once per poll. The
+    /// poll count is asserted too, so a ceiling that stopped buying a second
+    /// poll fails here instead of passing vacuously.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_runs_the_host_baseline_once_however_many_polls_it_takes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let smi_counter = dir.path().join("smi-calls");
+        let baseline_counter = dir.path().join("baseline-calls");
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[
+                ("COUNTER", smi_counter.to_str().expect("utf-8 temp path")),
+                (
+                    "BASELINE_COUNTER",
+                    baseline_counter.to_str().expect("utf-8 temp path"),
+                ),
+                ("GPU_PREFLIGHT_CEILING_SECS", "7"),
+            ],
+        );
+        assert_eq!(code, 1, "a GPU that never freed up passed; logged:\n{log}");
+        let polls = log.matches("waiting: 1 GiB GTT free (< 8 GiB)").count();
+        assert!(
+            polls >= 2,
+            "the wait polled {polls} time(s); this case needs two or more to show anything. \
+             Logged:\n{log}"
+        );
+        let baseline_calls = std::fs::read_to_string(&baseline_counter)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            baseline_calls, 1,
+            "the host baseline ran {baseline_calls} time(s) across {polls} polls; it must run \
+             exactly once. Logged:\n{log}"
+        );
+    }
+
+    /// A baseline check that never returns is cut off at its 15s bound and
+    /// fails the preflight, naming the bound.
+    ///
+    /// The stub sleeps 60s, so the elapsed time separates "the bound cut it
+    /// short" from "it happened to return"; unbounded, this case takes a full
+    /// minute.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_bounds_a_host_baseline_that_never_returns() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let counter = dir.path().join("smi-calls");
+        let started = std::time::Instant::now();
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[
+                ("HOST_BASELINE_HANGS", "1"),
+                ("COUNTER", counter.to_str().expect("utf-8 temp path")),
+            ],
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            code, 1,
+            "a baseline that never returned passed; logged:\n{log}"
+        );
+        assert!(
+            log.contains(
+                "the host baseline check (.github/scripts/host-baseline.sh) could not be run \
+                 — it exited 124 (124 is the 15s bound"
+            ),
+            "the preflight did not report the baseline as cut off at its bound:\n{log}"
+        );
+        assert!(
+            !counter.exists(),
+            "rocm-smi was queried after the baseline timed out; logged:\n{log}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(45),
+            "the preflight took {elapsed:?} against a 15s bound and a stub that sleeps 60s: \
+             the bound did not cut the baseline short"
+        );
+    }
+
+    /// A baseline check that could not be run has shown nothing about the
+    /// host, so it fails the preflight with a message of its own rather than
+    /// passing or borrowing the baseline's "not met" verdict.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_fails_when_the_host_baseline_could_not_be_run() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        for rc in ["2", "127"] {
+            let (code, log) = run_preflight(
+                &shared_preflight_script(),
+                PreflightShell::DefaultRunStep,
+                &fixture,
+                &[("HOST_BASELINE_RC", rc)],
+            );
+            assert_eq!(
+                code, 1,
+                "baseline exited {rc} and the preflight passed:\n{log}"
+            );
+            assert!(
+                log.contains(&format!(
+                    "the host baseline check (.github/scripts/host-baseline.sh) could not be \
+                     run — it exited {rc}"
+                )),
+                "baseline exited {rc} and the preflight did not say it never ran:\n{log}"
             );
         }
     }
