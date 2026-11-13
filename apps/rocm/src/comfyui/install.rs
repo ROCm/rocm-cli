@@ -96,7 +96,7 @@ pub(crate) fn install(
             )?;
             // The real run checks the same thing and refuses.
             let mut warnings = Vec::new();
-            if let Some(state) = running_from(paths, &source_path, &mut warnings) {
+            if let Some(state) = running_from(paths, &source_path, &mut warnings)? {
                 writeln!(
                     output,
                     "  note: {}; a reinstall is refused until then",
@@ -161,22 +161,23 @@ pub(crate) fn install(
     // just before the code is replaced, so a `rocm comfyui start` during a
     // long download is caught. `start` takes no lock, so one that begins
     // during the swap itself is not; it refuses once the swap's marker exists.
+    let mut first_warnings = Vec::new();
     if replaces_existing {
-        let mut warnings = Vec::new();
-        let running = running_from(paths, &source_path, &mut warnings);
-        for warning in warnings {
+        let running = running_from(paths, &source_path, &mut first_warnings)?;
+        for warning in &first_warnings {
             println!("Note: {warning}");
         }
         refuse_while_running(&source_path, running)?;
     }
-    let recheck_running = || -> Result<()> {
-        if !replaces_existing {
-            return Ok(());
-        }
-        // Any warning about the saved state was printed above.
-        refuse_while_running(
+    // `comfyui-12` (e2e, Linux) is what proves this wiring: it starts a
+    // ComfyUI during the download and expects this check to refuse.
+    let recheck_running = || {
+        recheck_before_swap(
+            paths,
             &source_path,
-            running_from(paths, &source_path, &mut Vec::new()),
+            replaces_existing,
+            &first_warnings,
+            &mut io::stdout(),
         )
     };
 
@@ -353,6 +354,33 @@ fn swap_changes_summary(swap: &source_swap::SwapReport) -> Option<String> {
         parts.push(format!("set aside: {}", renamed.join(", ")));
     }
     (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// The check a reinstall makes again just before it replaces the code: it
+/// refuses for a ComfyUI started during the download, and fails on a saved
+/// state that cannot be read at all. An install that replaces nothing checks
+/// nothing. Each warning it finds is written to `out` as a `Note:` line,
+/// unless the first check already printed it, so a record that became
+/// unparseable during the download is still reported.
+fn recheck_before_swap(
+    paths: &AppPaths,
+    source_path: &Path,
+    replaces_existing: bool,
+    already_printed: &[String],
+    out: &mut dyn IoWrite,
+) -> Result<()> {
+    if !replaces_existing {
+        return Ok(());
+    }
+    let mut warnings = Vec::new();
+    let running = running_from(paths, source_path, &mut warnings)?;
+    for warning in warnings
+        .iter()
+        .filter(|warning| !already_printed.contains(warning))
+    {
+        writeln!(out, "Note: {warning}")?;
+    }
+    refuse_while_running(source_path, running)
 }
 
 /// Downloads (if not already cached) and unpacks the ComfyUI source archive
@@ -1838,9 +1866,10 @@ mod tests {
         Ok(())
     }
 
-    /// A saved state that cannot be read does not block a reinstall, which
-    /// says so: `stop` cannot read it either, so nothing would clear a
-    /// refusal.
+    /// A saved state that cannot be parsed does not block a reinstall, which
+    /// says so: it names no process, so `stop` cannot tell which one to stop
+    /// either (`process`'s
+    /// `stop_sets_an_unreadable_record_aside_and_stops_no_process`).
     #[test]
     fn a_reinstall_proceeds_over_an_unreadable_saved_state() -> Result<()> {
         let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-corrupt-state")?;
@@ -1854,14 +1883,22 @@ mod tests {
         let state = state_path(&paths);
         fs::create_dir_all(state.parent().context("state path has no parent")?)?;
         fs::write(&state, "{\"app_id\": \"comfy")?;
-        assert!(
-            stop(&paths).is_err(),
-            "the premise: `stop` cannot clear this state"
-        );
 
         let preview = install(&paths, &config, reinstall_options(true))?;
         assert!(
-            preview.contains(&format!("  note: failed to parse {}", state.display())),
+            preview.contains(&format!(
+                "  note: rocm-cli's record of the ComfyUI it started cannot be parsed ({}: ",
+                state.display()
+            )),
+            "{preview}"
+        );
+        assert!(
+            preview.contains(&format!(
+                "so whether that ComfyUI is running is unknown; it names no process `rocm comfyui \
+                 stop` could stop, so the reinstall of {} is not refused for it, and a ComfyUI \
+                 still running from there may have its code replaced under it\n",
+                source_path_from_app_root(&app_root).display()
+            )),
             "{preview}"
         );
         let error = install(&paths, &config, reinstall_options(false))
@@ -1871,6 +1908,147 @@ mod tests {
             "an unreadable state must not block the reinstall: {error:#}"
         );
         remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// The check just before the swap, which the real install runs between
+    /// the download and the swap: nothing saved lets it through; a ComfyUI
+    /// that started from the folder in the meantime, or a saved state that
+    /// can no longer be read at all, stops it.
+    #[test]
+    fn the_check_before_the_swap_refuses_what_appeared_during_the_download() -> Result<()> {
+        let (paths, _config, app_root) = reinstall_fixture("comfyui-recheck-before-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        let state = state_path(&paths);
+
+        let nothing_saved = recheck_before_swap(&paths, &source, true, &[], &mut io::sink());
+        // This test's own process stands in for a ComfyUI started from the
+        // folder during the download.
+        save_state(
+            &paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: "http://127.0.0.1:9".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 9,
+                pid: std::process::id(),
+                source_path: source.clone(),
+                python_executable: paths.data_dir.join("python"),
+                log_path: paths.data_dir.join("start.log"),
+                started_at_unix_ms: 1,
+            },
+        )?;
+        let started = recheck_before_swap(&paths, &source, true, &[], &mut io::sink());
+        // A plain install replaces no code, so it is not refused for it.
+        let plain = recheck_before_swap(&paths, &source, false, &[], &mut io::sink());
+        fs::remove_file(&state)?;
+        fs::create_dir_all(state.join("inside"))?;
+        let unreadable = recheck_before_swap(&paths, &source, true, &[], &mut io::sink());
+        remove_test_root(&paths);
+
+        nothing_saved?;
+        plain?;
+        let started = format!("{:#}", started.expect_err("a running ComfyUI is refused"));
+        assert!(started.contains("`rocm comfyui stop`"), "{started}");
+        assert!(started.contains("Nothing was changed"), "{started}");
+        let unreadable = format!("{:#}", unreadable.expect_err("a failed read stops it"));
+        assert!(
+            unreadable.contains(&format!("failed to read {}", state.display())),
+            "{unreadable}"
+        );
+        Ok(())
+    }
+
+    /// The check before the swap reports a warning about the saved state
+    /// only when the first check did not already print it: a record that
+    /// became unparseable during the download gets its note, and a repeat of
+    /// one already printed is dropped.
+    #[test]
+    fn the_check_before_the_swap_prints_only_warnings_not_printed_before() -> Result<()> {
+        let (paths, _config, app_root) = reinstall_fixture("comfyui-recheck-warnings")?;
+        let source = source_path_from_app_root(&app_root);
+        let state = state_path(&paths);
+        fs::create_dir_all(state.parent().context("state path has no parent")?)?;
+        fs::write(&state, "{\"app_id\": \"comfy")?;
+        let outcome = (|| -> Result<_> {
+            let mut warnings = Vec::new();
+            running_from(&paths, &source, &mut warnings)?;
+            let mut repeated = Vec::new();
+            recheck_before_swap(&paths, &source, true, &warnings, &mut repeated)?;
+            let mut beside_another = Vec::new();
+            recheck_before_swap(
+                &paths,
+                &source,
+                true,
+                &["an unrelated earlier note".to_owned()],
+                &mut beside_another,
+            )?;
+            let mut new = Vec::new();
+            recheck_before_swap(&paths, &source, true, &[], &mut new)?;
+            Ok((warnings, repeated, beside_another, new))
+        })();
+        remove_test_root(&paths);
+        let (warnings, repeated, beside_another, new) = outcome?;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            repeated.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&repeated)
+        );
+        let expected = format!(
+            "Note: rocm-cli's record of the ComfyUI it started cannot be parsed ({}: EOF while \
+             parsing a string at line 1 column 17), so whether that ComfyUI is running is \
+             unknown; it names no process `rocm comfyui stop` could stop, so the reinstall of \
+             {} is not refused for it, and a ComfyUI still running from there may have its code \
+             replaced under it\n",
+            state.display(),
+            source.display()
+        );
+        assert_eq!(String::from_utf8(beside_another)?, expected);
+        assert_eq!(String::from_utf8(new)?, expected);
+        Ok(())
+    }
+
+    /// A saved state that cannot be read at all (here a directory stands
+    /// where it belongs, which fails the read even as `root`) may still be an
+    /// intact record of a running ComfyUI, so the reinstall guard does not
+    /// treat it as "nothing running": the preview and the real run both stop
+    /// naming it, and nothing is downloaded or replaced. The refusal comes
+    /// from the check before the download, which costs nothing: the download
+    /// starts by creating the `downloads` folder, and that folder never
+    /// appears. (The check just before the swap would raise the same error,
+    /// but only after the download.)
+    #[test]
+    fn a_reinstall_stops_on_a_saved_state_it_cannot_read() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-unreadable-io")?;
+        let source = source_path_from_app_root(&app_root);
+        let state = state_path(&paths);
+        fs::create_dir_all(state.join("inside"))?;
+        let downloads = app_root.join("downloads");
+        let downloads_before = downloads.exists();
+
+        let preview = install(&paths, &config, reinstall_options(true));
+        let run = install(&paths, &config, reinstall_options(false));
+        let main_py = fs::read_to_string(source.join("main.py"));
+        let downloads_after = downloads.exists();
+        remove_test_root(&paths);
+
+        assert!(!downloads_before, "the fixture starts with no downloads");
+        assert!(
+            !downloads_after,
+            "the refusal must come before the download is even started"
+        );
+
+        let expected = format!("failed to read {}", state.display());
+        for (what, outcome) in [("preview", preview), ("reinstall", run)] {
+            let error = outcome.expect_err(what);
+            assert!(
+                format!("{error:#}").contains(&expected),
+                "{what}: {error:#}"
+            );
+        }
+        assert_eq!(main_py?, "old main", "the installed code is untouched");
         Ok(())
     }
 

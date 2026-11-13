@@ -1425,6 +1425,63 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
+`comfyui-20` and `comfyui-21` cover what `status`, the plain-words status
+answer, `logs` and `stop` do when rocm-cli's saved record of the ComfyUI it
+started (`apps/comfyui/state/running.json` under the data directory) is
+truncated, so it cannot be parsed. `status` and the answer say the running
+state is unknown and name the file; `logs` still shows the run log. With
+nothing answering on ComfyUI's default address (`comfyui-20`), `status`
+advises `rocm comfyui stop`, and that
+command, run as printed, moves the record aside to `running.json.unreadable`
+without stopping any process, after which `status` no longer reports it. With
+something answering there (`comfyui-21`, a listener the scenario holds),
+`status` advises stopping it first, and `stop` keeps the record, says only that
+address was checked and exits non-zero; once the listener is gone the same
+`stop` goes through. Both scenarios point the default address at a port they
+choose through `ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`, which only an
+`e2e-test-hooks` build reads (see [release-trust.md](release-trust.md)), so a
+ComfyUI the host runs itself cannot change the outcome. No GPU is needed. The
+unit tests `status_over_an_unreadable_record_*`,
+`chat_status_answer_over_an_unreadable_record_*`,
+`logs_over_an_unreadable_record_*`,
+`stop_sets_an_unreadable_record_aside_and_stops_no_process` and
+`stop_over_an_unreadable_record_keeps_it_while_something_answers` cover the
+same over an empty record too (the last also the record moved aside by hand);
+`stop_reports_an_unreadable_record_it_cannot_move_aside` a record `stop` cannot
+move; `stop_over_an_unreadable_record_already_moved_says_so_and_succeeds` a
+second `stop` racing the first;
+`only_a_record_that_cannot_be_parsed_counts_as_unreadable`,
+`something_other_than_a_file_at_the_record_is_an_error_not_no_record`, the
+Unix-only `a_dangling_link_at_the_record_is_an_error_not_no_record`,
+`logs_over_a_record_that_cannot_be_read_fails_naming_it`,
+`a_reinstall_stops_on_a_saved_state_it_cannot_read` and
+`the_check_before_the_swap_refuses_what_appeared_during_the_download` (which
+also refuses a ComfyUI started during the download; comfyui-12 proves the
+install runs that check) that a failed read
+(permission denied, a directory at the path) is an error rather than an
+unreadable record or no record, for `status`, `stop`, `logs` and the reinstall
+guard;
+`with_no_record_status_and_the_chat_answer_report_what_answers_on_the_default_address`
+what `status` and the answer say with no record, whether or not something
+answers on the default address;
+`the_check_before_the_swap_prints_only_warnings_not_printed_before` that a
+record which became unparseable during the download still gets its note;
+`the_default_address_check_finds_a_listener_and_only_a_listener` and
+`the_default_address_port_override_is_a_port_or_an_error` the real check and
+the test-only port override; `a_stop_that_did_not_stop_prints_its_report_then_fails`
+the non-zero exit, `a_stop_that_failed_is_audited_and_returned_without_a_report`
+a stop that failed outright, and
+`a_stop_is_audited_even_when_its_report_cannot_be_written` the audit record;
+and the Unix-only
+`saving_the_run_record_replaces_the_file_rather_than_rewriting_it_in_place` and
+`saving_the_manifest_replaces_the_file_rather_than_rewriting_it_in_place` that
+both files are replaced atomically:
+
+```bash
+cargo xtask e2e -- -n "comfyui-2[01]"
+cargo test -p rocm --bin rocm comfyui
+```
+
 `comfyui-15` to `comfyui-19` cover which runtime `rocm comfyui install` uses
 when none is chosen: it recovers the runtime `rocm setup` created before
 counting the ready ones, as `rocm serve` does, so a runtime whose registry entry

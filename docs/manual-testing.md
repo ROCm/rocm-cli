@@ -1337,6 +1337,25 @@ Expected result:
   `apps/comfyui/state/running.json` under rocm-cli's data folder containing
   only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
   is running, and goes ahead.
+- With the same one-character `running.json` in place and nothing listening on
+  port 8188, `rocm comfyui status` succeeds, shows `status: unknown` under `Running` with a note naming the file,
+  and names `rocm comfyui stop` as the next step; `rocm comfyui logs` still
+  shows the saved logs; `rocm comfyui stop` prints `status: unknown`, says it
+  moved the file to `running.json.unreadable` beside it, stopped no process
+  and checked only `http://127.0.0.1:8188` (so a ComfyUI started on another
+  address is not covered), names where the record is kept, and exits 0.
+  `running.json` is gone afterwards and `rocm comfyui status` no longer
+  reports it.
+- With the same file in place and something listening on
+  `http://127.0.0.1:8188` (a ComfyUI started outside rocm-cli, or
+  `python -m http.server 8188`), `rocm comfyui status` says something answers
+  there and advises stopping it first, or moving `running.json` aside by hand
+  if what answers is not ComfyUI; `rocm comfyui stop` leaves `running.json` in
+  place and exits non-zero. Once the listener is stopped, `rocm comfyui stop`
+  moves the file aside as above.
+- With a directory created at `running.json` instead, `rocm comfyui status`,
+  `rocm comfyui stop` and `rocm comfyui install --reinstall --dry-run` fail
+  naming `failed to read …/running.json` rather than reporting no record.
 - If the reinstall fails after the new code is in place (on a host where the
   AMD GPU check fails, say), the error names what was replaced or set aside
   and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
