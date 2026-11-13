@@ -908,7 +908,8 @@ Feature: Model serving
     And no local server was recorded
 
   # A launch that became ready but whose first chat request fails must not be
-  # shown as a healthy deployment (#523). Same test-only hook as serve-41, in its
+  # shown as a healthy deployment (#523). Same test-only hook as
+  # @id:serve-oom-launch-memory-guidance, in its
   # `ready` mode, pointed at a mock engine that fails every chat request. The
   # unit and provider tests prove the rendering and the failure classes; this
   # proves `serve()` carries the smoke test's failure into the summary.

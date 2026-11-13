@@ -256,6 +256,8 @@ pub(super) fn simulate_oom_managed_launch(
         // provider needs to send the smoke test to `host:port`; no log is written
         // because nothing here failed to start.
         record.status = "ready".to_owned();
+        // Load-bearing: without it the smoke test's `/v1/models` listing probe
+        // fails and the reason becomes "no ready managed service".
         record.inference_verified_at_unix_ms = Some(1);
         record.write()?;
         return Ok(ManagedLaunchReport {

@@ -1693,6 +1693,8 @@ and WSL only (`@requires-os:linux`):
 cargo xtask e2e -- -n "serve-57"
 ```
 
+(`@id:serve-smoke-failure-summary`.)
+
 By hand, a failing first chat request is hard to provoke (the engine has to pass
 its readiness probe and then fail or die on the first chat request), so check the
 points below when you see it, for example after an engine is killed right as it
@@ -1706,7 +1708,7 @@ becomes ready:
 - The command exits 0 and ROCm CLI does not stop the server. If the engine died
   there is no server left: `rocm logs --service <id>` still shows its output, and
   the next `rocm services list` finds the engine gone and records the service as
-  `stopped`, so it drops out of the default list and shows only under
+  `stopped` (or `failed` for AIM), so it drops out of the default list and shows only under
   `rocm services list --all`. If the engine is still up and only the chat request
   failed, the service stays listed and its recorded status stays `ready`.
 - `rocm serve <model> --no-smoke-test` prints the plain `Deployment summary` with

@@ -1204,9 +1204,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         // runs *before* the OOM note is computed in the `summary_mode` block
         // below, so the previous claim here, that the note "is computed before
         // it would have run", was backwards and could not have excused it.
-        // The `no background automation daemon was left behind` step of serve-41
-        // and serve-57 is what holds the branch: deleting it left the scenario
-        // green with a `rocm daemon` still running.
+        // The `no background automation daemon was left behind` step of the
+        // `@id:serve-oom-launch-memory-guidance` and
+        // `@id:serve-smoke-failure-summary` scenarios records that none was
+        // started but does not discriminate this branch: the helper starts only
+        // when a watcher is enabled, and the isolated config those scenarios use
+        // enables none, so removing the branch leaves them green.
         //
         // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
         // the test-only feature, so this branch folds away in shipped builds.

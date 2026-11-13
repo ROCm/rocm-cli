@@ -52,7 +52,8 @@ const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
 /// [`REUSE_REFUSAL_MODEL`] picked it, so this aliases that constant rather than
 /// repeating the literal.
 const LEMONADE_SERVE_TARGET: &str = REUSE_REFUSAL_MODEL;
-/// Model id for the fabricated-launch scenarios (serve-41 and serve-57), kept
+/// Model id for the fabricated-launch scenarios (`@id:serve-oom-launch-memory-guidance`
+/// and `@id:serve-smoke-failure-summary`), kept
 /// distinct from every other e2e serve model so their service records can never
 /// collide with another scenario's.
 const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
@@ -2981,7 +2982,8 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
 
 /// A managed vLLM launch that became ready, whose engine (a mock) answers
 /// `/v1/models` but fails every chat request with HTTP 500. The launch is
-/// fabricated by the `ready` mode of the same test-only hook serve-41 arms; the
+/// fabricated by the `ready` mode of the same test-only hook that
+/// `@id:serve-oom-launch-memory-guidance` arms; the
 /// mock's port is passed to `rocm serve` by the `When` below, which is how the
 /// fabricated record points the post-launch smoke test at it.
 #[given("a managed vLLM launch that becomes ready but whose engine fails its first chat request")]
@@ -3052,6 +3054,9 @@ async fn assert_summary_reports_failed_smoke_test(world: &mut E2eWorld) {
     );
 }
 
+/// Matches rocm's own wording of the status line (`the smoke test could not
+/// complete`, `local provider returned ...`) around the engine's HTTP status, so
+/// it pins that phrasing as well as the engine's reason.
 #[then("the deployment summary gives the engine's own reason")]
 async fn assert_summary_gives_engine_reason(world: &mut E2eWorld) {
     let screen = world
@@ -3071,6 +3076,9 @@ async fn assert_summary_gives_engine_reason(world: &mut E2eWorld) {
     );
 }
 
+/// Passes with the fix reverted: the smoke request was sent before the fix too.
+/// It proves only that the summary's request reached the mock once and was not
+/// retried, so the failure the summary shows is that one request's.
 #[then("the engine received exactly one chat request")]
 async fn assert_engine_received_one_chat_request(world: &mut E2eWorld) {
     let received = world
@@ -3103,9 +3111,11 @@ async fn assert_summary_names_logs_command(world: &mut E2eWorld) {
     );
 }
 
-/// Hook hygiene, not a check of the fix: it holds the "launch stays best-effort,
-/// the service record is not changed" constraint, and passes with the fix
-/// reverted. The failure reaching the summary is what the steps above assert.
+/// The only assertion behind the "ROCm CLI does not stop the server" promise
+/// (README and `rocm serve --help`): a failed smoke test leaves the service
+/// record `ready`. It passes with the fix reverted, so it does not check the
+/// summary change; the steps above do. The exit code 0 is asserted in the `When`
+/// step (`wait_for_exit`).
 #[then("the launch's service record is left as ready")]
 async fn assert_service_record_unchanged(world: &mut E2eWorld) {
     assert_eq!(
@@ -3740,9 +3750,12 @@ async fn serve_wait_refused(world: &mut E2eWorld) {
     );
 }
 
-/// The discriminating assertion for the fabricated-launch daemon suppression.
-/// Hook hygiene, shared by serve-41 and serve-57: it checks the test seam, not
-/// the behaviour either scenario is about.
+/// Hook hygiene, shared by the `@id:serve-oom-launch-memory-guidance` and
+/// `@id:serve-smoke-failure-summary` scenarios: it records that no daemon was
+/// started, and it does NOT discriminate the `if !e2e_simulate_oom_launch()`
+/// guard in `serve_cmd.rs`. `ensure_background_helper_running_with` returns early
+/// unless a watcher is enabled, and the isolated config these scenarios run in
+/// enables none, so removing the guard leaves both scenarios green.
 ///
 /// `simulate_oom_managed_launch` writes a record (`starting`, or `ready` in its
 /// `ready` mode) for a process that never existed, so
@@ -3751,12 +3764,11 @@ async fn serve_wait_refused(world: &mut E2eWorld) {
 /// scenario's teardown stops it. Observed in the wild as daemons outliving their
 /// e2e checkout by days.
 ///
-/// Without this step the suppression was untested: deleting the
-/// `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs` left serve-41 green,
-/// because every other assertion here is about the summary text. Both artefacts
-/// the autostart path can leave are checked, since the daemon publishes its
-/// runtime-state only after it is up — a spawn caught in the window before that
-/// shows up as a claim and nothing else.
+/// The guard would only matter in a config with a watcher enabled, which no
+/// scenario here sets up; this step would catch a daemon in that case. Both
+/// artefacts the autostart path can leave are checked, since the daemon
+/// publishes its runtime-state only after it is up — a spawn caught in the
+/// window before that shows up as a claim and nothing else.
 #[then("no background automation daemon was left behind")]
 async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
     let root = world

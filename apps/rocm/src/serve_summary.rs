@@ -1344,6 +1344,21 @@ mod tests {
     }
 
     #[test]
+    fn failure_reason_cap_holds_at_its_boundary() {
+        // Exactly the cap is kept whole; one more is cut and marked.
+        let at_cap = "y".repeat(SMOKE_FAILURE_MAX_CHARS);
+        assert!(
+            one_line_reason(&at_cap) == at_cap,
+            "a reason of exactly the cap must be kept unchanged"
+        );
+        let over = "y".repeat(SMOKE_FAILURE_MAX_CHARS + 1);
+        assert!(
+            one_line_reason(&over) == format!("{at_cap}..."),
+            "a reason one character over the cap must be cut to the cap plus an ellipsis"
+        );
+    }
+
+    #[test]
     fn failure_reason_cannot_add_a_backtick_quoted_command_to_the_note() {
         // A chunk-size line the engine sent is quoted in the provider's error.
         let reason = one_line_reason("invalid local provider chunk size `run `rocm stop` now`");
