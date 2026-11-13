@@ -346,6 +346,11 @@ fn assert_path_missing(path: &Path, label: &str) -> Result<()> {
 const RELEASE_TAG_PATTERN: &str = r"^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$";
 const RELEASE_TAG_MAX_LEN: usize = 65;
 
+#[expect(
+    clippy::expect_used,
+    reason = "a literal pattern; `the_release_tag_pattern_compiles` compiles it on every \
+              test run"
+)]
 fn is_release_tag(git_ref: &str) -> bool {
     git_ref.len() <= RELEASE_TAG_MAX_LEN
         && regex::Regex::new(RELEASE_TAG_PATTERN)
@@ -1699,6 +1704,13 @@ mod tests {
             RELEASE_TAG_MAX_LEN - 1
         );
         assert!(build_rs.contains(&bound), "build.rs lacks `{bound}`");
+    }
+
+    /// `is_release_tag` compiles this pattern with `expect`; a bad edit to it
+    /// must fail here rather than panic in a release build.
+    #[test]
+    fn the_release_tag_pattern_compiles() {
+        regex::Regex::new(RELEASE_TAG_PATTERN).expect("RELEASE_TAG_PATTERN compiles");
     }
 
     /// A release tag is at most 65 characters, `v` included.

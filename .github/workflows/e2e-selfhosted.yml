@@ -146,7 +146,8 @@ jobs:
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
-            # Same `heavy` set as ci.yml: anything that can affect the E2E suite.
+            # Based on ci.yml's `heavy` set; `clippy.toml` is left out because a
+            # lint config cannot change E2E behaviour.
             heavy:
               - '**/*.rs'
               - '**/Cargo.toml'

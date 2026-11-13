@@ -152,6 +152,7 @@ fn forces_full_workspace(file: &str) -> bool {
         || file == "Cargo.toml" // workspace root manifest
         || XTASK_READ_DOCS.contains(&file)
         || file.starts_with("rust-toolchain")
+        || file == "clippy.toml" // configures the lints for every crate
         || file.starts_with(".github/workflows/")
 }
 
@@ -580,9 +581,22 @@ mod tests {
             Selection::Workspace
         );
         assert_eq!(
+            select(&["clippy.toml".to_string()], &g),
+            Selection::Workspace
+        );
+        assert_eq!(
             select(&[".github/workflows/ci.yml".to_string()], &g),
             Selection::Workspace
         );
+    }
+
+    /// `clippy.toml` configures the lints of every crate. As an unattributed
+    /// root file it already selects the whole workspace through the fallback in
+    /// [`select_with_proptest_sources`]; naming it keeps that so if root-level
+    /// config files are ever made ignorable.
+    #[test]
+    fn clippy_config_is_a_named_full_workspace_input() {
+        assert!(forces_full_workspace("clippy.toml"));
     }
 
     #[test]

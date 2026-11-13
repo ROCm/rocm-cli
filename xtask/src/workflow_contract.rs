@@ -6098,11 +6098,18 @@ fi
     /// an exact `rust:` line (not a prefix match) so this doesn't also pick up
     /// the unrelated `rust: ${{ … }}` job output a few lines above it.
     fn rust_paths_filter_entries(ci: &str) -> Vec<String> {
+        paths_filter_entries(ci, "rust")
+    }
+
+    /// The literal glob entries of ci.yml's `bucket:` paths-filter bucket, read
+    /// the same way as [`rust_paths_filter_entries`].
+    fn paths_filter_entries(ci: &str, bucket: &str) -> Vec<String> {
         let lines: Vec<&str> = ci.lines().collect();
+        let key = format!("{bucket}:");
         let start = lines
             .iter()
-            .position(|line| line.trim() == "rust:")
-            .unwrap_or_else(|| panic!("ci.yml declares a `rust:` paths-filter bucket"));
+            .position(|line| line.trim() == key)
+            .unwrap_or_else(|| panic!("ci.yml declares a `{key}` paths-filter bucket"));
         let key_indent = indent_of(lines[start]);
         let end = lines[start + 1..]
             .iter()
@@ -6134,6 +6141,44 @@ fi
                  alone skips the rust-gated jobs entirely instead of running the \
                  test that reads it"
             );
+        }
+    }
+
+    /// `clippy.toml` sets which lints fire, so a change to it alone must still
+    /// run clippy: in CI through the `rust` filter (the `clippy` job) and the
+    /// `heavy` filter (the Windows lane's clippy steps), and before a push
+    /// through the two clippy hooks' `files:` patterns.
+    #[test]
+    fn a_clippy_toml_only_change_still_runs_clippy() {
+        let ci = read_workflow("ci.yml");
+        for bucket in ["rust", "heavy"] {
+            assert!(
+                paths_filter_entries(&ci, bucket)
+                    .iter()
+                    .any(|entry| entry == "clippy.toml"),
+                "ci.yml's `{bucket}` paths-filter bucket must list `clippy.toml`, or an edit \
+                 to it alone skips the clippy it configures"
+            );
+        }
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        for id in ["cargo-clippy", "cargo-clippy-e2e"] {
+            let block = hook_block(&config, id);
+            let files = block
+                .lines()
+                .find_map(|line| strip_comment(line).trim().strip_prefix("files:"))
+                .map_or_else(
+                    || panic!("hook `{id}` sets a `files:` pattern:\n{block}"),
+                    |value| strip_quotes(value.trim()),
+                );
+            let pattern = regex::Regex::new(&files).expect("the `files:` pattern compiles");
+            for path in ["clippy.toml", "crates/rocm-core/src/lib.rs"] {
+                assert!(
+                    pattern.is_match(path),
+                    "hook `{id}`'s `files: {files}` must match `{path}`"
+                );
+            }
         }
     }
 

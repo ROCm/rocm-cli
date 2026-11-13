@@ -256,6 +256,13 @@ pub fn answer_engine_request(
 /// built-in stdio verb) are held to the same list rather than to three
 /// hand-copied ones.
 #[cfg(any(test, feature = "test-support"))]
+// Compiled only for tests (directly or through `test-support`), but outside a
+// `#[cfg(test)]` item, so clippy cannot tell it is test code.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-support contract check; a broken contract must panic the engine test running it"
+)]
 pub mod engine_contract {
     use super::{
         ENGINE_PROTOCOL_VERSION, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,

@@ -19,6 +19,12 @@
 //! AppState configuration (tab + modal + theme). Cells get run-length
 //! coalesced per row so the SVG stays compact (~30-80 KB / view).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "developer tool that renders documentation assets, never shipped: a failure should stop it with its message"
+)]
+
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::PathBuf;

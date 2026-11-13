@@ -17,6 +17,36 @@ also what the `windows-debug` job of the required `windows-build-and-test` lane
 does. See [Tests that touch the environment](#tests-that-touch-the-environment)
 before writing a test that sets an environment variable.
 
+Production code must not call `unwrap` or `expect`: the workspace
+[Cargo.toml](../Cargo.toml) enables clippy's `unwrap_used` and `expect_used`, and
+[clippy.toml](../clippy.toml) allows both in tests, where a failure should panic.
+Where production code relies on an invariant, the form depends on what the invariant
+is about:
+
+- Data compiled into the binary, such as the embedded model catalog or a literal regex
+  pattern, and a value whose type cannot fail, such as serializing a report whose fields
+  all serialize, keep their `expect` where there is no error path to return through.
+  Mark it `#[expect(clippy::expect_used, reason = "...")]`, with a reason that names the
+  test exercising the call on every run. Inside a function that already returns a
+  `Result`, such a call should take `?` instead. Use `expect` rather than `allow`, so clippy
+  flags the attribute once the call is gone, and do not hide the panic behind
+  `unwrap_or_else(|| panic!(..))`.
+- A control-flow invariant (a branch an earlier check rules out, a pipe that was
+  requested, a lock another thread may have poisoned) returns an error with `?` or takes
+  a fallback, so a later edit that breaks the invariant degrades instead of crashing.
+
+Clippy only treats an item as test code when it carries the literal `#[cfg(test)]` (or
+`#[test]`). Under a compound gate such as `#[cfg(all(test, unix))]`, a `#[test]` fn is
+still exempt, but a helper outside one is linted as production; where such a helper
+unwraps, split the gate into two attributes, `#[cfg(test)]` and then `#[cfg(unix)]`.
+Integration-test, example and build-script crates opt out with a crate-level
+`#![allow(..., reason = "...")]`. Test-support code that clippy cannot see as test code,
+such as a module compiled under `#[cfg(any(test, feature = "test-support"))]` or a file
+gated by an inner `#![cfg(all(test, unix))]`, carries the same `allow` on that module or
+item where it unwraps. It is `allow` rather than `expect` because that code is expected
+to keep unwrapping, at the cost that clippy will not report the attribute if it ever
+stops.
+
 ### Source file size
 
 No source file may exceed 1,500 production lines. Production lines leave out test-gated
@@ -1133,7 +1163,7 @@ cargo xtask affected --base origin/main
 which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
 or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
-file, the workspace root manifest, CI config, or a doc an xtask test reads —
+file, the workspace root manifest, `clippy.toml`, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
 `tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
 the proptest seed guard and which no other crate depends on: a changed file under
@@ -1177,8 +1207,9 @@ A step that has nothing to check says so and exits successfully. A step whose af
 cannot be determined (the pushed range's base is not available locally, the range lists no
 changed files at all, or `cargo metadata` fails) runs over the whole workspace and prints why, so
 narrowing never replaces a check with silence. An empty list counts as undeterminable because the
-hook only fires for a push that contains a Rust file, so an empty list means the range is wrong. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
-filter, as before, including a lockfile-only push.
+hook only fires for a push that contains a Rust file (or, for the two clippy hooks, `clippy.toml`),
+so an empty list means the range is wrong. Pushes that change neither still skip the cargo hooks
+through their file filters, as before, including a lockfile-only push.
 
 The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
 job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates

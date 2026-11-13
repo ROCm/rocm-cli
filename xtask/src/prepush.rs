@@ -285,9 +285,9 @@ pub fn resolve_selection(
     let resolved = changed_files()
         .context("could not list the changed files")
         .and_then(|files| {
-            // The hook only runs when the push contains a Rust file, so a range
-            // that lists no changed files means the range is wrong, not that
-            // nothing changed.
+            // The hook only runs when the push contains a Rust file (or, for the
+            // two clippy hooks, `clippy.toml`), so a range that lists no changed
+            // files means the range is wrong, not that nothing changed.
             if files.is_empty() {
                 bail!("the pushed range lists no changed files");
             }
@@ -710,9 +710,10 @@ mod tests {
         assert_eq!(selection, Selection::Empty);
     }
 
-    /// The hook fires only for a push that contains a Rust file, so an empty
-    /// list of changed files is a wrong range (a base that is not an ancestor, a
-    /// from-ref equal to the pushed commit), not a clean push. Skipping all three
+    /// The hook fires only for a push that contains a Rust file (or, for the
+    /// two clippy hooks, `clippy.toml`), so an empty list of changed files is a
+    /// wrong range (a base that is not an ancestor, a from-ref equal to the
+    /// pushed commit), not a clean push. Skipping all three
     /// steps on it would turn a bad range into a silent pass.
     #[test]
     fn an_empty_list_of_changed_files_falls_back_to_the_whole_workspace_and_says_why() {
@@ -784,6 +785,7 @@ mod tests {
             "Cargo.lock",
             "Cargo.toml",
             "rust-toolchain.toml",
+            "clippy.toml",
             ".github/workflows/ci.yml",
         ] {
             let (selection, fallback) =

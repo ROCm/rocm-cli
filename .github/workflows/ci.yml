@@ -135,6 +135,9 @@ jobs:
               # changes what `eval-fixtures --check` expects.
               - 'tests/remote-ssh/examination.json'
               - 'rust-toolchain*'
+              # Configures which lints fire in tests; an edit to it alone
+              # changes what clippy reports.
+              - 'clippy.toml'
               # clippy runs `cargo xtask manifest --check` against this file;
               # pinned_tool_versions_match_across_docs_and_workflows (xtask)
               # also reads its cargo-about pin.
@@ -191,6 +194,8 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
+              # The Windows lane's clippy steps gate on this filter.
+              - 'clippy.toml'
               - 'runtime-deps.toml'
               - 'scripts/**'
               - 'xtask/**'

@@ -154,6 +154,11 @@ fn newest_final_releases(listings: &[String]) -> Vec<String> {
     // post-releases (`7.14.0.post1`) leave no `-`/`.tar`/`.whl` after the
     // digits. Post-releases are skipped on purpose: they patch a release the
     // list already names, and counting one would make n-2 the same release as n-1.
+    #[expect(
+        clippy::expect_used,
+        reason = "a literal pattern; `the_three_newest_final_releases_span_both_layouts` \
+                  compiles it on every test run"
+    )]
     let package_file = PACKAGE_FILE.get_or_init(|| {
         Regex::new(r"(?:^|[^A-Za-z0-9_-])rocm-(\d+\.\d+\.\d+)(?:%2[Bb][^\s/\x22<>-]*)?(?:-|\.tar\.gz|\.whl)")
             .expect("static regex is valid")
