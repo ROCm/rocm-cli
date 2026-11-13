@@ -78,6 +78,13 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
         &interpreter.python,
         &interpreter.library_paths,
     );
+    // The note's claim that a launch or install writes the link is proven by the
+    // tests of those paths, which live in their own crates:
+    // `a_launch_carries_the_amd_smi_link_even_when_no_mpi_shim_is_due` (vLLM
+    // launch), `runtime_environment_carries_the_amd_smi_link_dir` (ComfyUI launch)
+    // and `the_device_probe_runs_with_the_amd_smi_link_on_its_loader_path` (the
+    // install device probe). That the note shows exactly when the link is absent
+    // is `the_framework_probe_picks_up_an_existing_amd_smi_link_and_never_writes_one`.
     if crate::managed_runtime::amd_smi_link_missing(&interpreter.python, &interpreter.library_paths)
     {
         e.framework_notes.push(

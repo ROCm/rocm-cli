@@ -411,6 +411,11 @@ pub(super) fn runtime_environment_assignments(
     // The amd-smi link a managed runtime's torch needs to count devices (see
     // `rocm_core::ensure_amd_smi_compat`), after the recorded directories. Linux
     // only, like the `LD_LIBRARY_PATH` it goes on: other platforms never write it.
+    // A failure to write the link is deliberately not an error here. The link only
+    // repairs torch's device count beside a host ROCm; without it ComfyUI starts
+    // as it did before this change, and a launch should not be refused for a
+    // best-effort shim. The failure is not lost: `rocm examine` reports a runtime
+    // that needs the link and lacks it (see `amd_smi_link_missing`).
     let mut library_entries = env.library_entries.clone();
     if runtime_is_linux()
         && let Some(shim) = env.venv_root.as_ref().and_then(|venv_root| {

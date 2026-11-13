@@ -316,6 +316,22 @@ pub fn ensure_mpi_cxx_compat(compat_dir: &Path) -> Option<PathBuf> {
     write_compat_file(compat_dir, "libmpi_cxx.so.40", MPI_CXX_STUB)
 }
 
+/// Whether the host has a real `libmpi_cxx.so*`.
+///
+/// That makes the stub [`ensure_mpi_cxx_compat`] writes unnecessary. It tells that
+/// case apart from the other reasons that function answers `None` (no stub
+/// embedded, stub not writable), where an existing stub may still be in use.
+#[cfg(target_os = "linux")]
+pub fn real_libmpi_cxx_present() -> bool {
+    find_libmpi_cxx().is_some()
+}
+
+/// Non-Linux hosts have no stub to tell apart.
+#[cfg(not(target_os = "linux"))]
+pub const fn real_libmpi_cxx_present() -> bool {
+    false
+}
+
 /// Non-Linux hosts never need the OpenMPI C++ bindings shim.
 #[cfg(not(target_os = "linux"))]
 pub const fn ensure_mpi_cxx_compat(_compat_dir: &std::path::Path) -> Option<PathBuf> {
