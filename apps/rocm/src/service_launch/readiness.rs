@@ -481,7 +481,7 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 ///
 /// The term could not simply be dropped, because a *confirmed* stop used to
 /// clear its own marker and the status was then the only trace it left:
-/// removing it turned `serve-scripted-external-stop-while-attached` (serve-57)
+/// removing it turned `serve-scripted-external-stop-while-attached` (serve-58)
 /// red, which also meant that scenario was passing on the unsound term and so
 /// could not tell a stop from a crash at all.
 ///

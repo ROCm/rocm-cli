@@ -888,6 +888,25 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
+  # ROCMAI-863: a Hugging Face repo named without a quantization variant has no
+  # GGUF file to serve, but serving started an engine for it anyway and left the
+  # objection to the background process — where, on Windows, nothing the user can
+  # see ever reports it: an empty log, a success exit, and a server recorded as
+  # stopped. The refusal now comes before anything starts. It also names no
+  # quantization of its own: nothing on this path reads the repository's files, so
+  # a suggested label is a guess, and following a guess fails a second time on a
+  # repo that ships no GGUF at all. @requires-gpu because a host with no usable
+  # GPU is turned away earlier, for that reason instead, and never reaches this
+  # one. No @requires-os deliberately — Windows is the lane the failure was silent
+  # on, so it is the one most worth watching.
+  @id:serve-missing-gguf-variant-refused @requires-gpu @requires-engine:lemonade
+  Scenario: serve-56 - Serving a Hugging Face repo with no quantization variant is refused
+    When the user serves a Hugging Face repo with no quantization variant on Lemonade
+    Then serving is refused before any engine starts
+    And the user is told the model needs an explicit GGUF variant
+    And no quantization is suggested for a repo the CLI has not inspected
+    And no local server was recorded
+
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the
@@ -904,7 +923,7 @@ Feature: Model serving
   # specifically — the only possible outcome of a scripted/CI `--verbose`
   # session, per that function's own doc comment.
   @id:serve-scripted-death-after-startup @requires-no-gpu
-  Scenario: serve-56 - A managed engine that dies after startup fails loudly
+  Scenario: serve-57 - A managed engine that dies after startup fails loudly
     Given the scripted engine is armed to die shortly after startup
     When the user serves a model expecting the engine to crash after startup
     Then serving fails with a non-zero exit and names the crash
@@ -914,13 +933,13 @@ Feature: Model serving
   # externally triggered stop in the same post-startup window must NOT be
   # treated as the crash above. `rocm services stop` run from a second
   # invocation kills the pid the attached `--verbose` session is watching,
-  # landing in the identical `AttachOutcome::ServerExited` arm serve-56
+  # landing in the identical `AttachOutcome::ServerExited` arm serve-57
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
   # Before ROCMAI-541 this made a clean, intentional, externally-triggered
-  # stop fail exactly like serve-56's crash.
+  # stop fail exactly like serve-57's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
-  Scenario: serve-57 - An externally stopped attached serve exits cleanly, not as a crash
+  Scenario: serve-58 - An externally stopped attached serve exits cleanly, not as a crash
     Given the scripted engine is armed to run until stopped
     When the user attaches to the scripted serve in the background
     And another shell stops that service while it is attached
