@@ -65,6 +65,12 @@ flate2 = "1"
 syn = { version = "3", features = ["full", "visit"] }
 tar = "0.4"
 tempfile = "3"
+# Reads the dynamic symbol table and dynamic section of the embedded
+# `libmpi_cxx.so.40` stub (`openmpi.rs` tests), so the test checks the exported
+# symbols, soname and `NEEDED` entries without shelling out to binutils
+# (`unaligned`: `include_bytes!` data carries no alignment guarantee).
+# Test-only; already in the lockfile through the `backtrace` crate.
+object = { version = "0.37", default-features = false, features = ["read_core", "elf", "std", "unaligned"] }
 # `report_trend` writes its own civil calendar so the shipped crate needs no date
 # library; a test checks it against this for every day from 2000 to 2100.
 chrono.workspace = true

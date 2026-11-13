@@ -1192,9 +1192,12 @@ jobs:
 
       - name: Build release binaries
         # Same as release.yml: the downloadable bundle must not link an
-        # AWS-LC the build container happens to provide (aws-lc-sys 0.46+).
+        # AWS-LC the build container happens to provide (aws-lc-sys 0.46+),
+        # and must carry the libmpi_cxx stub crates/rocm-core/build.rs compiles
+        # (fail instead of embedding an empty one when no C++ compiler is found).
         env:
           AWS_LC_SYS_USE_SYSTEM: "0"
+          ROCM_CLI_REQUIRE_MPI_CXX_STUB: "1"
         run: |
           mkdir -p "$HOME/.cargo"
           docker run --rm -v "$PWD":/work -w /work quay.io/pypa/manylinux2014_x86_64 /bin/bash -lc '
@@ -1204,7 +1207,7 @@ jobs:
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo -e RUSTUP_HOME=/host-cargo/rustup \
-            -e AWS_LC_SYS_USE_SYSTEM \
+            -e AWS_LC_SYS_USE_SYSTEM -e ROCM_CLI_REQUIRE_MPI_CXX_STUB \
             -v "$HOME/.cargo":/host-cargo -v "$PWD":/work -w /work \
             quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '

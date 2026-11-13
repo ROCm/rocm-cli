@@ -137,6 +137,7 @@ jobs:
             -e RUSTUP_HOME=/host-cargo/rustup \
             -e ROCM_CLI_RELEASE_REF="${GITHUB_REF_NAME}" \
             -e AWS_LC_SYS_USE_SYSTEM \
+            -e ROCM_CLI_REQUIRE_MPI_CXX_STUB \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -149,6 +150,13 @@ jobs:
               export PATH="/host-cargo/bin:$PATH"
               cargo build --release -p rocm -p rocmd -p xtask
             '
+        env:
+          # crates/rocm-core/build.rs embeds a compiled libmpi_cxx.so.40 stub
+          # that lets torch import on OpenMPI 5.x hosts; without a C++ compiler
+          # it only warns and embeds an empty one. Nightly Linux binaries must
+          # carry the stub, so a missing compiler fails this build. Set on this
+          # step only, so builds on the runner host elsewhere do not need g++.
+          ROCM_CLI_REQUIRE_MPI_CXX_STUB: "1"
 
       - name: Set nightly metadata
         id: meta

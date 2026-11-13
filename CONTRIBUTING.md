@@ -38,6 +38,8 @@ fix/vram-probe-fallback
 
 Prerequisites: Rust (see `rust-toolchain.toml` for the pinned version) and [uv](https://github.com/astral-sh/uv) (for `prek` and the scripts).
 
+On Linux you also need a C++ compiler (`g++` or `clang++`; `CXX` selects another). `crates/rocm-core/build.rs` compiles with it a small `libmpi_cxx.so.40` stub that lets vLLM's PyTorch import on hosts with OpenMPI 5.x. Without a compiler the build still succeeds, prints a warning and leaves that stub out. Set `ROCM_CLI_REQUIRE_MPI_CXX_STUB=1` to make the missing compiler a build error instead; the release, nightly and pull-request Linux bundle builds set it.
+
 ```bash
 git clone https://github.com/ROCm/rocm-cli
 cd rocm-cli
