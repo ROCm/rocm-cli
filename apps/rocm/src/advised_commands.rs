@@ -1730,9 +1730,7 @@ fn service_action_retry_advice_parses_for_generated_ids() {
             let error = run_approved_service_action(&paths, tool, &id, false)
                 .expect_err("an action without --yes is refused")
                 .to_string();
-            let advised = error
-                .lines()
-                .find_map(|line| line.strip_prefix("Try: "))
+            let advised = rocm_core::recovery_hint::try_command(&error)
                 .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
             let argv = split_words(advised);
             assert_eq!(
@@ -1910,9 +1908,7 @@ fn runtime_restart_retry_advice_parses_and_clears_the_refusal() {
             let error = ensure_runtime_service_restart_approved(&refused)
                 .expect_err("--restart-services without --yes is refused")
                 .to_string();
-            let advised = error
-                .lines()
-                .find_map(|line| line.strip_prefix("Try: "))
+            let advised = rocm_core::recovery_hint::try_command(&error)
                 .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
             let retry = split_words(advised);
             assert_eq!(

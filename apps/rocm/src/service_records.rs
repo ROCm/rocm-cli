@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use rocm_core::recovery_hint::with_try;
 use rocm_core::{AppPaths, ManagedServiceRecord, ProcessProbe};
 
 use crate::managed_service_status::{
@@ -279,21 +280,27 @@ pub(crate) fn remove_managed_service_record_with(
         let forceable = forceable_unqueryable_pids(&record, &probe);
         match (force, forceable) {
             (true, Some(pids)) => forced_over = Some(pids),
-            (false, Some(pids)) => bail!(
-                "local server `{service_id}` cannot be removed: {} it recorded could not be queried, so `rocm` cannot tell whether it is still running.\n\nTry: {}",
-                named_processes(&pids),
-                service_hints::service_forced_remove_hint(service_id)
-            ),
-            (true, None) => bail!(
-                "--force removes a record only when none of its recorded processes is confirmed running, at least one could not be queried, and a stop was requested. Local server `{service_id}` is {} and does not meet that.\n\nTry: {}",
-                record.status,
-                service_hints::service_stop_hint(service_id)
-            ),
-            (false, None) => bail!(
-                "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
-                record.status,
-                service_hints::service_stop_hint(service_id)
-            ),
+            (false, Some(pids)) => bail!(with_try(
+                format_args!(
+                    "local server `{service_id}` cannot be removed: {} it recorded could not be queried, so `rocm` cannot tell whether it is still running.",
+                    named_processes(&pids)
+                ),
+                &service_hints::service_forced_remove_hint(service_id)
+            )),
+            (true, None) => bail!(with_try(
+                format_args!(
+                    "--force removes a record only when none of its recorded processes is confirmed running, at least one could not be queried, and a stop was requested. Local server `{service_id}` is {} and does not meet that.",
+                    record.status
+                ),
+                &service_hints::service_stop_hint(service_id)
+            )),
+            (false, None) => bail!(with_try(
+                format_args!(
+                    "local server `{service_id}` is {} and cannot be removed while it is running.",
+                    record.status
+                ),
+                &service_hints::service_stop_hint(service_id)
+            )),
         }
     }
     if !yes {
@@ -305,7 +312,10 @@ pub(crate) fn remove_managed_service_record_with(
         } else {
             service_hints::service_action_hint("remove", service_id)
         };
-        bail!("Removing local server record `{service_id}` requires --yes.\n\nTry: {hint}");
+        bail!(with_try(
+            format_args!("Removing local server record `{service_id}` requires --yes."),
+            &hint
+        ));
     }
 
     let artifacts = service_record_artifacts(paths, &record.service_id, &record.engine)?;
@@ -2307,7 +2317,11 @@ mod tests {
         let _ = fs::remove_dir_all(root);
 
         assert!(message.contains("requires --yes"), "{message}");
-        assert!(message.contains(&format!("Try: {named}")), "{message}");
+        assert_eq!(
+            rocm_core::recovery_hint::try_command(&message),
+            Some(named.as_str()),
+            "{message}"
+        );
         assert_eq!(left_before, 3, "the refusal removed nothing");
         assert!(completed.forced);
         assert_eq!(left_after, 0, "the command it named cleared the record");
