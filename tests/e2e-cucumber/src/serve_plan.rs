@@ -92,10 +92,10 @@ mod tests {
 
     #[test]
     fn a_printed_plan_names_its_resolved_model() {
-        let plan = "serve plan\n  requested model: qwen2.5\n  resolved model: Qwen/Qwen2.5-1.5B-Instruct\n  engine: lemonade\n";
+        let plan = "serve plan\n  requested model: qwen2.5\n  resolved model: Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M\n  engine: lemonade\n";
         assert_eq!(
             attempt("lemonade", plan, "", 0).resolved_model(),
-            Some("Qwen/Qwen2.5-1.5B-Instruct")
+            Some("Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M")
         );
     }
 

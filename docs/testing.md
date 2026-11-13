@@ -1473,20 +1473,19 @@ install.
 `serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
 restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
-per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
-the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
-and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
-is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
-dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
-cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
-they stay reachable when the opt-in is set.
+Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
+them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
+i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
+`E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
+`include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
+gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
+the tagging and that they stay reachable when the opt-in is set.
 
-Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
-every nightly run, and only a manual `include_nightly` dispatch on a host with
-Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
-is reachable ("Report whether Docker is reachable"); check that line before
-relying on this coverage.
+Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
+logs whether Docker is reachable ("Report whether Docker is reachable").
+`serve-27`'s known failure on the Strix Halo pool is an xfail row in
+`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
+means the row is stale.
 
 ### Lemonade managed-serve failure evidence
 
@@ -3046,6 +3045,37 @@ tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
 blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
 same module; `serve-53` is the real-engine check.
 
+A recipe may publish a different build of the same model per engine, through the
+`model_id_override` on its `engine_recipes` entry: Lemonade serves GGUF with an
+explicit quantization variant, vLLM serves the safetensors repo. The resolution
+is pinned on every host by `serve_small_assistant_resolves_the_gguf_build_on_lemonade`
+and, catalog-wide, by `every_lemonade_catalog_recipe_resolves_to_a_servable_ref`
+in [serve_cmd.rs](../apps/rocm/src/serve_cmd.rs) — the second fails for any
+recipe that *lists* Lemonade whose resolved ref is a Hugging Face `owner/repo`
+with no `:variant`, which the engine refuses only after it has already been
+launched. A recipe that lists no Lemonade entry is still handed its canonical
+id when Lemonade is reached some other way (an explicit `--engine`, a
+configured default, the platform default), and that is deliberate: such a
+recipe has no GGUF build to substitute.
+
+```bash
+cargo test -p rocm --bin rocm every_lemonade_catalog_recipe_resolves_to_a_servable_ref
+```
+
+The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
+`rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
+It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
+engine is the CLI's to pick here — so the lane that exercises the Lemonade half
+is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
+the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
+([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
+path filter matches) but none of their check names is a required status check,
+so the two unit tests above are the blocking per-PR coverage. The scenario
+carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
+unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
+their known serve failure there has not been observed, and a row claiming a
+known bug before one is seen would say something untrue.
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -3850,7 +3880,7 @@ a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
-(serve-55 carries the same tag). Note also that `-n` matches the scenario *name*
+(serve-56 carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
@@ -3866,7 +3896,7 @@ host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
-log it owns, and never became ready. serve-55 arms the same hook with
+log it owns, and never became ready. serve-56 arms the same hook with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
 ready, so a mock engine can then fail its smoke test. No process is spawned, and
 the seam compiles out entirely without the feature, so a build that does not
@@ -3883,7 +3913,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-41 and serve-55 to a reported **skip**, not a silent pass. It
+compiled out and resolves serve-41 and serve-56 to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -3893,7 +3923,7 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-41 and serve-55 are never selected there at all: that lane runs
+serve-41 and serve-56 are never selected there at all: that lane runs
 `E2E_ONLY_LIFECYCLE` and the scenarios carry `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
@@ -3945,7 +3975,7 @@ complete stream with no content, a close-delimited stream cut after a token). On
 the mid-stream-death test goes on to render the summary from the real outcome; the
 others assert on the outcome the smoke test returns.
 
-- serve-55, `@id:serve-smoke-failure-summary` — a launch that becomes ready
+- serve-56, `@id:serve-smoke-failure-summary` — a launch that becomes ready
   whose engine fails its first chat request is shown as a failed smoke test, with
   the engine's own reason and the full `rocm logs --service <id>` command, and
   the engine received exactly one chat request. It carries `@requires-no-gpu`,
@@ -3959,7 +3989,7 @@ others assert on the outcome the smoke test returns.
   fix: the unchanged service record and the no-daemon step.
 
 ```bash
-cargo xtask e2e -- -n "serve-55"
+cargo xtask e2e -- -n "serve-56"
 ```
 
 ## Windows Tool Notes
@@ -4909,13 +4939,13 @@ generated. It was recorded once from a real older build and lives in
 
 A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
 `examine-fails`. The stub then answers `rocm examine --json`, and a case without a
-`host` still refuses it. The reply is the recorded examination with only the fields
-the host implies changed (`is_wsl`, `has_amd_gpu` and, for `amd-found`, one GPU), and
-its `status` is recomputed by `Examination::compute_status`, the rule the probe uses,
-so a recording cannot say a status the other fields contradict. The real command prints
-those fields plus a `summary` object that only the `rocm` binary can build, so the
-replay leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in
-it. Some fields are typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+`host` still refuses it. The reply is the recorded examination with the fields the host
+implies set, whatever the recording held for them, and its `status` is recomputed by
+`Examination::compute_status`, the rule the probe uses, so a recording cannot say a
+status the other fields contradict. The real command prints those fields plus a
+`summary` object that only the `rocm` binary can build, so the replay leaves `summary`
+out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
+typed, not probed: the one GPU of `amd-found`, and the WSL facts of
 `wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
 with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
 exits 1 with a fixed message on stderr, which is what the case pins.
@@ -4958,3 +4988,26 @@ always keep the stub first on `PATH`, so a machine that has a `rocm` installed (
 developer's, not a grading runner) may show the real CLI's output and miss the pins. A
 miss on the `logs_contain` pin with the agent otherwise behaving as expected is that,
 not a regression.
+
+## Dashboard Chat Request Timeout
+
+A dashboard chat message is cut off after a fixed wait so a hung backend ends the
+turn instead of freezing the pane. The wait is 2 minutes by default and
+`ROCM_DASH_CHAT_TIMEOUT_SECS` (whole seconds, 1 to 3600) changes it; an unset,
+empty, non-numeric or out-of-range value keeps the default.
+
+The behavior is covered by unit tests in
+[mod.rs](../crates/rocm-dash-tui/src/agent/mod.rs) (how the variable is read) and
+[clients.rs](../crates/rocm-dash-tui/src/agent/clients.rs) (a request that outlives
+its budget times out and names that budget, a slow reply inside it is returned, and
+the real request path takes its budget from the variable):
+
+```bash
+cargo test -p rocm-dash-tui --lib request_timeout
+cargo test -p rocm-dash-tui --lib agent::clients
+```
+
+There is no Gherkin scenario: the timeout is a dashboard (TUI) behavior that no
+`rocm` command output exposes, and driving it end to end needs a model that
+answers slower than the wait. The manual check is in
+[manual-testing.md](manual-testing.md#4d-dashboard-chat-request-timeout).

@@ -181,6 +181,11 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
 | `e2e-gpu-w7900` | `e2e-selfhosted.yml` | Radeon PRO W7900 (self-hosted) | no |
 
+`e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900` skip `pull_request` (one Linux GPU
+node and one Windows GPU pool per PR); they also skip `merge_group` and still run on `push`,
+dispatch and nightly. The merge queue therefore has no native Linux GPU lane
+(MI300X skips it too); it runs only Windows Strix and WSL2.
+
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
 consolidates its own platforms: `ci.yml`'s `e2e-report` the mock platform,

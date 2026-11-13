@@ -37,10 +37,21 @@
       "device_policy": "gpu_required",
       "min_gpu_mem_gb": 6,
       "recommended_system_ram_gb": 8,
-      "quantization": "none; recommended small assistant recipe",
-      "artifact_hint": "Lemonade model id; resolved internally to a GGUF build of this model",
+      "quantization": "Q4_K_M GGUF on Lemonade; bfloat16 safetensors on vLLM",
+      "artifact_hint": "Lemonade serves the Q4_K_M build from the companion GGUF repo; vLLM serves the safetensors repo under this id",
       "artifacts": [],
       "engine_recipes": [
+        {
+          "engine": "lemonade",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "this id publishes safetensors only, so Lemonade is pointed at the companion GGUF repo with an explicit quantization variant"
+          ],
+          "model_id_override": "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"
+        },
         {
           "engine": "vllm",
           "required_flags": ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
