@@ -840,51 +840,129 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lemonade_serve_failures_track_rocmai_898_without_xfailing_mock_or_windows() {
-        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        for id in [
-            "bench-load-real-serve",
-            "chat-tool-definitions-accepted",
-            "chat-end-to-end-local-model",
-            "serve-lemonade-inference",
+    /// The scenario ids whose `ROCMAI-898` rows were deleted once the Linux
+    /// Lemonade serve fix (#963) had them passing on every Linux lane that runs
+    /// them with lemonade, with the feature file that declares each.
+    const LEMONADE_LINUX_SERVE_IDS: [(&str, &str); 11] = [
+        (
+            "serve-default-engine-working-endpoint",
+            MODEL_SERVING_FEATURE,
+        ),
+        ("serve-default-engine-inference", MODEL_SERVING_FEATURE),
+        ("serve-readiness-contract", MODEL_SERVING_FEATURE),
+        ("serve-anthropic-messages-inference", MODEL_SERVING_FEATURE),
+        ("serve-anthropic-messages-tool-use", MODEL_SERVING_FEATURE),
+        ("serve-anthropic-messages-streaming", MODEL_SERVING_FEATURE),
+        ("serve-lemonade-inference", MODEL_SERVING_FEATURE),
+        (
             "serve-stop-leaves-no-background-helper",
-        ] {
-            let scenario = decl(&[&format!("id:{id}")]);
-            assert!(
-                matches!(
-                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
-                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCMAI-898"
-                ),
-                "{id}"
-            );
+            MODEL_SERVING_FEATURE,
+        ),
+        ("chat-tool-definitions-accepted", CHAT_FEATURE),
+        ("chat-end-to-end-local-model", CHAT_FEATURE),
+        ("bench-load-real-serve", BENCH_FEATURE),
+    ];
+    const MODEL_SERVING_FEATURE: &str = include_str!("../features/model_serving.feature");
+    const CHAT_FEATURE: &str = include_str!("../features/chat.feature");
+    const BENCH_FEATURE: &str = include_str!("../features/bench.feature");
+
+    /// The ROCMAI-898 rows (Lemonade managed serve never exposing the model on
+    /// Linux) are gone: after #963 every one of these scenarios passed on the
+    /// Strix Halo Ubuntu lanes, and serve-07 and serve-40, which pin lemonade,
+    /// passed on MI300X too. This guards against a silent regression — each
+    /// scenario resolves expect-pass from its REAL tag line on those hosts, so
+    /// re-adding a row (or a broader one that happens to match) has to be a
+    /// deliberate decision with fresh evidence rather than a copy-paste.
+    #[test]
+    fn lemonade_linux_serve_scenarios_have_no_xfail_after_rocmai_898() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let in_merge_queue = Included {
+            merge_queue: true,
+            ..Included::default()
+        };
+        for (id, feature) in LEMONADE_LINUX_SERVE_IDS {
+            let scenario = ScenarioDecl::from_tags(&feature_tags(feature, id));
             assert_eq!(
-                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
-                Some(90),
-                "{id}",
+                resolve(&scenario, &cap("strix-ubuntu"), &m, in_merge_queue),
+                Expectation::ExpectPass,
+                "{id} on Strix Halo Ubuntu",
             );
-            for platform in ["mock", "strix-windows"] {
+            if scenario.requires_engine.as_deref() == Some("lemonade") {
                 assert_eq!(
-                    resolve(&scenario, &cap(platform), &matrix, Included::default()),
+                    resolve(&scenario, &cap("mi300x"), &m, in_merge_queue),
                     Expectation::ExpectPass,
-                    "{id} on {platform}",
+                    "{id} on MI300X",
                 );
             }
         }
+        // serve-07 and serve-40 are the two the MI300X half covers; losing their
+        // `@requires-engine:lemonade` pin would quietly drop it.
+        let pinned = LEMONADE_LINUX_SERVE_IDS
+            .iter()
+            .filter(|(id, feature)| {
+                ScenarioDecl::from_tags(&feature_tags(feature, id))
+                    .requires_engine
+                    .as_deref()
+                    == Some("lemonade")
+            })
+            .count();
+        assert_eq!(pinned, 2);
     }
 
-    /// The rows that carry `therock_family` and `has_amd_gpu` exist so that the
-    /// no-GPU lane, where the same scenarios run against MockServer instead of a
-    /// real Lemonade serve, stays expect-pass. `cap("mock")` cannot prove that:
-    /// its `os_family` is `other`, so the `os = "linux"` condition excludes it
-    /// before either GPU guard is consulted. These hosts are Linux, so each guard
-    /// is the only thing standing between them and an xfail. The two partial
-    /// hosts isolate the guards from each other: dropping `has_amd_gpu` from a row
-    /// fails the host that reports only a gfx target, and dropping `therock_family`
-    /// fails the host that reports only a GPU.
+    /// serve-50 and serve-52 still fail now and then on Linux lemonade hosts, but
+    /// with a different symptom from ROCMAI-898: the serve becomes ready and
+    /// `services list` then shows no `anthropic endpoint:` row. Their rows name
+    /// that ticket, stay `flaky` (both pass in most runs, and a non-flaky row
+    /// would turn each pass into a stale-row failure), set no shortened serve wait
+    /// (the serve itself succeeds), and leave Windows expect-pass.
     #[test]
-    fn real_gpu_lemonade_rows_do_not_xfail_linux_hosts_without_a_usable_gpu() {
-        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+    fn anthropic_endpoint_listing_rows_track_rocmai_1023() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        for id in [
+            "serve-anthropic-endpoint-advertised",
+            "serve-anthropic-endpoint-readiness",
+        ] {
+            let scenario = ScenarioDecl::from_tags(&feature_tags(MODEL_SERVING_FEATURE, id));
+            assert!(
+                matches!(
+                    resolve(&scenario, &cap("strix-ubuntu"), &m, Included::default()),
+                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCMAI-1023"
+                ),
+                "{id} on Strix Halo Ubuntu",
+            );
+            assert_eq!(
+                resolve(&scenario, &cap("strix-windows"), &m, Included::default()),
+                Expectation::ExpectPass,
+                "{id} on Strix Halo Windows",
+            );
+            let entries = m.entries_for(id);
+            assert_eq!(entries.len(), 1, "{id}");
+            assert_eq!(entries[0].serve_timeout_secs, None, "{id}");
+        }
+    }
+
+    /// A row carrying `therock_family` and `has_amd_gpu` must leave a Linux host
+    /// without a usable GPU expect-pass (the no-GPU lane runs chat and bench
+    /// scenarios against MockServer). `cap("mock")` cannot prove that: its
+    /// `os_family` is `other`, so `os = "linux"` excludes it before either GPU
+    /// guard is consulted. These hosts are Linux, so each guard is the only thing
+    /// standing between them and an xfail. The two partial hosts isolate the
+    /// guards from each other: a matcher that ignored `has_amd_gpu` fails the host
+    /// that reports only a gfx target, and one that ignored `therock_family` fails
+    /// the host that reports only a GPU.
+    #[test]
+    fn gpu_guards_in_a_condition_each_exclude_a_linux_host_on_their_own() {
+        let m = Expectations::parse(
+            r#"
+[["chat-end-to-end-local-model"]]
+when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
+bug = "EAI-0001"
+reason = "Applies only when the scenario uses a real Lemonade GPU serve."
+flaky = true
+"#,
+        )
+        .unwrap();
+        let id = "chat-end-to-end-local-model";
         let linux_lemonade = cap("strix-ubuntu");
         let hosts = [
             (
@@ -912,28 +990,19 @@ mod tests {
                 },
             ),
         ];
-        for id in [
-            "bench-load-real-serve",
-            "chat-tool-definitions-accepted",
-            "chat-end-to-end-local-model",
-        ] {
-            let scenario = decl(&[&format!("id:{id}")]);
-            for (label, host) in &hosts {
-                assert_eq!(
-                    resolve(&scenario, host, &matrix, Included::default()),
-                    Expectation::ExpectPass,
-                    "{id} on {label}",
-                );
-            }
-            // The full real-GPU host is the one that must still be xfailed.
-            assert!(
-                matches!(
-                    resolve(&scenario, &linux_lemonade, &matrix, Included::default()),
-                    Expectation::ExpectXfail { bug, .. } if bug == "ROCMAI-898"
-                ),
-                "{id} on a real GPU host",
+        let scenario = decl(&[&format!("id:{id}")]);
+        for (label, host) in &hosts {
+            assert_eq!(
+                resolve(&scenario, host, &m, Included::default()),
+                Expectation::ExpectPass,
+                "{label}",
             );
         }
+        // The full real-GPU host is the one the row still matches.
+        assert!(matches!(
+            resolve(&scenario, &linux_lemonade, &m, Included::default()),
+            Expectation::ExpectXfail { bug, .. } if bug == "EAI-0001"
+        ));
     }
 
     fn decl(tags: &[&str]) -> ScenarioDecl {
@@ -2392,56 +2461,43 @@ flaky = true
         );
     }
 
-    /// serve-40 serves through the same lemonade managed serve as the other
-    /// lemonade serve rows, so its row is scoped the same way: xfail on a
-    /// lemonade Linux host, with a 90s serve wait, and not an expected failure
-    /// on native Windows. The row must stay `flaky` (a fixed ROCMAI-898 would
-    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name ROCMAI-898.
-    #[test]
-    fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
-        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        let id = "serve-stop-leaves-no-background-helper";
-        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
-        assert_eq!(
-            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
-            Some(90)
-        );
-        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade"));
-        let entries = m.entries_for(id);
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].flaky);
-        assert_eq!(entries[0].bug, "ROCMAI-898");
-    }
-
-    /// The row's 90s only matters if the harness hands it to the serve steps:
-    /// the `before` hook stores `serve_timeout_override(decl, cap)` on the world
-    /// and `serve_and_wait` waits that long instead of the 300s/600s default.
-    /// Resolve it from serve-40's REAL tag line, so dropping the `@id:` or the
-    /// `@requires-engine:lemonade` pin from the feature file fails here rather
-    /// than silently restoring the full wait. The pin also decides the engine on
-    /// a host whose default is another engine (MI300X serves vLLM by default).
-    #[test]
-    fn serve_40_gets_the_shortened_serve_window_from_its_own_tags() {
-        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        let tags = feature_tags(
-            include_str!("../features/model_serving.feature"),
-            "serve-stop-leaves-no-background-helper",
-        );
-        let decl = ScenarioDecl::from_tags(&tags);
-        assert_eq!(
-            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
-            Some(90)
-        );
-        assert_eq!(m.serve_timeout_override(&decl, &cap("mi300x")), Some(90));
-        assert_eq!(m.serve_timeout_override(&decl, &cap("strix-windows")), None);
-    }
-
+    /// The serve window the `before` hook hands the serve steps
+    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): the
+    /// matching row's `serve_timeout_secs` when the scenario has no
+    /// `@serve-timeout` tag — with the engine taken from a `@requires-engine` pin,
+    /// so it matches on a host whose default engine is another one — a tag over
+    /// the row, and nothing without an `@id:` to look the row up by.
     #[test]
     fn serve_timeout_override_prefers_the_tag_and_needs_an_id() {
-        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        // The row says 90s on this host; a `@serve-timeout` tag lengthens it.
+        let m = Expectations::parse(
+            r#"
+[["serve-pinned"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-0001"
+reason = "test row"
+serve_timeout_secs = 90
+"#,
+        )
+        .unwrap();
+        // No tag: the row's 90s applies, on MI300X too, whose default engine is
+        // vLLM, because the pin decides the engine.
+        let pinned = decl(&["id:serve-pinned", "requires-engine:lemonade"]);
+        assert_eq!(
+            m.serve_timeout_override(&pinned, &cap("strix-ubuntu")),
+            Some(90)
+        );
+        assert_eq!(m.serve_timeout_override(&pinned, &cap("mi300x")), Some(90));
+        // Without the pin MI300X serves vLLM and the row does not match.
+        let unpinned = decl(&["id:serve-pinned"]);
+        assert_eq!(m.serve_timeout_override(&unpinned, &cap("mi300x")), None);
+        // Native Windows is outside the row: the step default stays.
+        assert_eq!(
+            m.serve_timeout_override(&pinned, &cap("strix-windows")),
+            None
+        );
+        // A `@serve-timeout` tag wins over the row.
         let tagged = decl(&[
-            "id:serve-stop-leaves-no-background-helper",
+            "id:serve-pinned",
             "requires-engine:lemonade",
             "serve-timeout:2400",
         ]);

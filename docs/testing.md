@@ -1580,8 +1580,13 @@ is the `kill/reap failed` branch, which needs an operating system that refuses t
 kill a child it just started.
 
 Use the evidence to distinguish backend startup, download, and router readiness
-failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
-as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+failures. The diagnostics were added for the Strix Halo Ubuntu Lemonade serve
+failures of ROCMAI-898 (first tracked as
+[issue #897](https://github.com/ROCm/rocm-cli/issues/897)), which [#963](https://github.com/ROCm/rocm-cli/pull/963) fixed;
+the scenarios it kept as expected failures in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml) now run expect-pass,
+and `lemonade_linux_serve_scenarios_have_no_xfail_after_rocmai_898` in
+[expectation.rs](../tests/e2e-cucumber/src/expectation.rs) keeps them that way. A
 backend's ready line does not establish that the router serves the requested
 model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
 managed-launch contract or imply a backend fix.
@@ -3007,12 +3012,8 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper; on a Linux host
-that runs it with lemonade it is an expected failure in
-[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
-not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
-the row also matches other Linux lemonade hosts, where a pass is tolerated).
+(GPU lane: serving with no watcher enabled starts no helper; it is pinned to
+lemonade and expected to pass on every GPU lane that runs it, Linux and Windows).
 
 Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
 its HTTP front are tested in

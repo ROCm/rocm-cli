@@ -83,10 +83,10 @@ Feature: Model serving
   # bypasses Lemonade's model router and runs a packaged llama-server directly
   # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
   # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
-  # managed-lemonade fallback would mask the identical failure behind the
-  # ROCMAI-898 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
-  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
-  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  # managed-lemonade fallback could mask the identical failure. Reuses the same
+  # small Qwen3-0.6B-GGUF checkpoint as `serve-lemonade-inference` (cache-shared,
+  # no extra download) so this stays a fast per-PR canary rather than needing
+  # the @nightly large-checkpoint path.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
