@@ -556,8 +556,16 @@ fn run_command(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run {}", program.display()))?;
-    let stdout = OutputPipe::read(child.stdout.take().expect("stdout is piped"));
-    let stderr = OutputPipe::read(child.stderr.take().expect("stderr is piped"));
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "{label}: {} was started without piped output",
+            program.display()
+        );
+    };
+    let stdout = OutputPipe::read(stdout);
+    let stderr = OutputPipe::read(stderr);
     let combined = |stdout: &OutputPipe, stderr: &OutputPipe| {
         let mut text = stdout.text();
         text.push_str(&stderr.text());
