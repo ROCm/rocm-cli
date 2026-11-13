@@ -9677,28 +9677,54 @@ permissions:
         );
     }
 
-    /// The job's time limit, the lanes' wait limit and what the doc and the
-    /// workflow comment say of them move together: the limit must leave the
-    /// 30 minutes finishing and publishing a run can take after the longest wait.
+    /// The job's time limit, the lanes' wait and run limits and what the doc and
+    /// the workflow comment say of them move together: a lane may wait its whole
+    /// wait limit and then run its whole run limit, and the job's limit must
+    /// leave the 30 minutes finishing and publishing a run can take after both.
     #[test]
-    fn the_queue_run_timeout_covers_the_wait_limit_the_doc_gives() {
+    fn the_queue_run_timeout_covers_the_wait_and_run_limits_the_doc_gives() {
         let doc = docs_nightly_on_the_queue();
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
-        // The limit as the run inputs give it: "at most N seconds".
+        // The wait limit as the run inputs give it: the bullet "- the wait — ...
+        // at most N seconds", anchored on the bullet's own opening like the run
+        // limit below, so no earlier "at most N" in the doc can be picked up.
         let wait_secs: u64 = flat
-            .split("at most ")
-            .find_map(|rest| rest.split(" seconds").next()?.parse().ok())
-            .expect("the doc's run inputs give the wait limit as `at most N seconds`");
+            .split("- the wait — ")
+            .nth(1)
+            .and_then(|rest| rest.split("at most ").nth(1))
+            .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect("the doc's run inputs give the wait limit as a bullet `- the wait — ... at most N seconds`");
         assert!(
             flat.contains(&format!("({wait_secs} s")),
             "the doc's start section must give the same wait limit"
         );
         let wait_text = format!("{} h {} min", wait_secs / 3600, wait_secs % 3600 / 60);
         assert!(flat.contains(&wait_text), "the doc must say {wait_text}");
+        // The run limit as the run inputs give it: the bullet "- the run time — ...
+        // at most N seconds". Anchored on the bullet's own opening, so that the
+        // phrase "the run time" appearing earlier in the doc cannot be picked up.
+        let run_secs: u64 = flat
+            .split("- the run time — ")
+            .nth(1)
+            .and_then(|rest| rest.split("at most ").nth(1))
+            .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect(
+                "the doc's run inputs give the run limit as a bullet `- the run time — ... at most N seconds`",
+            );
+        assert!(
+            flat.contains(&format!("({run_secs} s")),
+            "the doc's start section must give the same run limit"
+        );
+        let run_text = format!("{} h", run_secs / 3600);
+        assert_eq!(run_secs % 3600, 0, "the run limit is whole hours");
         let text = read_workflow("queue-run.yml");
         assert!(
             text.contains(&format!("{wait_secs} s ({wait_text})")),
             "queue-run.yml's comment must give the wait as {wait_secs} s ({wait_text})"
+        );
+        assert!(
+            text.contains(&format!("{run_text} counted from its start")),
+            "queue-run.yml's comment must give the run limit as {run_text}"
         );
         let timeout_minutes: u64 = text
             .lines()
@@ -9708,8 +9734,12 @@ permissions:
             .parse()
             .expect("timeout-minutes is a number");
         assert!(
-            timeout_minutes * 60 >= wait_secs + 30 * 60,
-            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait"
+            timeout_minutes * 60 >= wait_secs + run_secs + 30 * 60,
+            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait and a {run_secs} s run"
+        );
+        assert!(
+            text.contains(&format!(": {timeout_minutes} min.")),
+            "queue-run.yml's comment must give the timeout as {timeout_minutes} min"
         );
     }
 
@@ -9757,9 +9787,14 @@ permissions:
         apt_install_failures: u32,
         curl_failures: u32,
         /// How often `cargo --version` (the toolchain download) and
-        /// `cargo fetch --locked` fail first, each with status 7.
+        /// `cargo fetch --locked --target <host>` fail first, each with
+        /// status 7.
         version_failures: u32,
         fetch_failures: u32,
+        /// Whether `cargo -vV` prints a `host:` line.
+        host_line: bool,
+        /// A `CARGO_BUILD_TARGET` in the lane's environment, if any.
+        build_target: Option<&'static str>,
         suite_rc: i32,
         nightly_rc: Option<i32>,
         channels: Option<&'static str>,
@@ -9782,6 +9817,8 @@ permissions:
                 curl_failures: 0,
                 version_failures: 0,
                 fetch_failures: 0,
+                host_line: true,
+                build_target: None,
                 suite_rc: 0,
                 nightly_rc: None,
                 channels: None,
@@ -9923,13 +9960,20 @@ permissions:
             ),
         )
         .expect("stub sha256sum");
+        let host_triple = format!("{}-unknown-linux-gnu", case.machine);
+        let host_reply = if case.host_line {
+            format!("echo \"host: {host_triple}\"")
+        } else {
+            "echo \"release: 1.96.0\"".to_owned()
+        };
         write_fake_executable(
             &cargo_bin.join("cargo"),
             format!(
                 "#!/bin/bash\necho \"cargo $*\"\n\
                  case \"$*\" in\n\
                  \"--version\") {version};;\n\
-                 \"fetch --locked\") {fetch};;\n\
+                 \"-vV\") {host};;\n\
+                 \"fetch --locked --target {triple}\") {fetch};;\n\
                  \"xtask e2e-prewarm\"*) echo \"prewarm HF_HOME=$HF_HOME UV_CACHE_DIR=$UV_CACHE_DIR\";;\n\
                  \"xtask e2e\")\n\
                  echo \"suite E2E_INCLUDE_NIGHTLY=${{E2E_INCLUDE_NIGHTLY-unset}} \
@@ -9947,6 +9991,8 @@ permissions:
                 // own status.
                 version = fail_first("cargo-version", case.version_failures, 7).replace('\n', "; "),
                 fetch = fail_first("cargo-fetch", case.fetch_failures, 7).replace('\n', "; "),
+                triple = host_triple,
+                host = host_reply,
                 rc = case.suite_rc,
                 nightly = case.nightly_rc.unwrap_or(case.suite_rc)
             ),
@@ -9962,6 +10008,9 @@ permissions:
             .env("E2E_LANE_WORK", dir.path().join("work"));
         if let Some(channels) = case.channels {
             lane.env("E2E_CHANNELS", channels);
+        }
+        if let Some(target) = case.build_target {
+            lane.env("CARGO_BUILD_TARGET", target);
         }
         let output = lane.output().expect("running the lane script");
         let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -10010,7 +10059,8 @@ permissions:
                 "preflight ran\n".to_owned(),
                 // The toolchain and the crates, fetched before the build.
                 "cargo --version\n".to_owned(),
-                "cargo fetch --locked\n".to_owned(),
+                // `cargo -vV` answers the host triple to the script, so it is not logged.
+                "cargo fetch --locked --target x86_64-unknown-linux-gnu\n".to_owned(),
                 "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks\n"
                     .to_owned(),
             ];
@@ -10402,7 +10452,10 @@ permissions:
     fn a_lane_rides_out_a_failed_toolchain_or_crate_fetch_and_never_builds_without_one() {
         for (fetch, command) in [
             ("version", "cargo --version"),
-            ("fetch", "cargo fetch --locked"),
+            (
+                "fetch",
+                "cargo fetch --locked --target x86_64-unknown-linux-gnu",
+            ),
         ] {
             let case = |failures| LaneCase {
                 version_failures: if fetch == "version" { failures } else { 0 },
@@ -10429,5 +10482,60 @@ permissions:
             assert!(!log.contains("cargo build"), "{log}");
             assert!(!out.exists());
         }
+    }
+
+    /// A cargo that reports no host triple stops the lane before any fetch or
+    /// build, rather than passing an empty `--target`.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_stops_when_cargo_reports_no_host_triple() {
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            host_line: false,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("cargo did not report its host triple"),
+            "{log}"
+        );
+        assert!(!log.contains("cargo fetch"), "{log}");
+        assert!(!log.contains("cargo build"), "{log}");
+        assert!(!out.exists());
+    }
+
+    /// The fetch covers only the host's crates, so a build target set from
+    /// outside is refused up front, and a non-x86_64 host's triple is the one
+    /// the fetch is scoped to.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_refuses_a_build_target_and_scopes_the_fetch_to_the_reported_host() {
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            build_target: Some("aarch64-apple-darwin"),
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(log.contains("CARGO_BUILD_TARGET is set"), "{log}");
+        assert!(!log.contains("cargo fetch"), "{log}");
+        assert!(!out.exists());
+
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            machine: "aarch64",
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        assert!(
+            log.contains("cargo fetch --locked --target aarch64-unknown-linux-gnu\n"),
+            "{log}"
+        );
     }
 }

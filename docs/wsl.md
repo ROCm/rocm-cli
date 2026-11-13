@@ -189,7 +189,7 @@ Eight entries that are not WSL-specific also run on WSL: `fix-1-arch`,
 `fix-2-unset-override`, `fix-6-path`, `fix-8-wheel-rocm`, `fix-16-vllm-oom`,
 `fix-17-torch-dlpack`, `fix-18-comgr-conflict`, and `fix-19-shm-too-small`.
 `fix-16-vllm-oom` and `fix-17-torch-dlpack` are driven by the error text you
-pass with `--symptom` and read nothing from the environment or the ROCm
+pass with `--symptom` (or `--symptom-file`) and read nothing from the environment or the ROCm
 install. `fix-18-comgr-conflict` and
 `fix-19-shm-too-small` apply when you run `rocm diagnose` inside the distro. A
 `--distro` run skips both (see

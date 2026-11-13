@@ -640,6 +640,13 @@ fn split_shell_list(text: &str) -> Vec<String> {
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
+            // `<<` starts a heredoc, a redirection, not a `<placeholder>`:
+            // taken whole, so neither `<` opens one.
+            '<' if next == Some('<') => {
+                current.push_str("<<");
+                index += 2;
+                continue;
+            }
             // `<` opens a placeholder only at a word start and before a
             // non-space: ` < file` is a redirection.
             '<' if at_word_start && next.is_some_and(|c| !c.is_whitespace()) => closers.push('>'),
@@ -677,7 +684,7 @@ pub(crate) fn command_parts(raw: &str) -> Vec<String> {
         }
         let mut command = command.to_owned();
         for marker in [
-            " >> ", " > ", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
+            " >> ", " > ", " <<", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
         ] {
             if let Some(position) = command.find(marker) {
                 command.truncate(position);
@@ -2107,6 +2114,45 @@ fn every_command_in_a_shell_list_is_checked() {
         command_parts("rocm serve <a | b> [--x | --y] && rocm examine"),
         vec!["rocm serve <a | b> [--x | --y]", "rocm examine"]
     );
+}
+
+/// A heredoc is a redirection like ` < file`: `rocm diagnose --symptom-file -
+/// <<'EOF'` hands the command a paste on standard input, so the `<<` and its
+/// delimiter are not arguments.
+#[test]
+fn a_heredoc_ends_the_command() {
+    for raw in [
+        "rocm diagnose --symptom-file - <<'EOF'",
+        "rocm diagnose --symptom-file - <<\"EOF\"",
+        "rocm diagnose --symptom-file - << EOF",
+        "rocm diagnose --symptom-file - <<EOF",
+    ] {
+        assert_eq!(
+            command_parts(raw),
+            vec!["rocm diagnose --symptom-file -"],
+            "{raw}"
+        );
+        assert!(
+            findings(&[fixture(raw, Surface::CommandLine)]).is_empty(),
+            "{raw}"
+        );
+    }
+    // A heredoc's `<<` is not a `<placeholder>`, so a command after it in the
+    // same list is still split off and checked.
+    for raw in [
+        "rocm diagnose --symptom-file - <<'EOF' && rocm frobnicate --x",
+        "rocm diagnose --symptom-file - <<EOF; rocm frobnicate --x",
+        "rocm diagnose --symptom-file - << EOF || rocm frobnicate --x",
+    ] {
+        assert_eq!(
+            command_parts(raw),
+            vec!["rocm diagnose --symptom-file -", "rocm frobnicate --x"],
+            "{raw}"
+        );
+        let found = findings(&[fixture(raw, Surface::CommandLine)]);
+        assert_eq!(found.len(), 1, "{raw}: {}", render_findings(&found));
+        assert_eq!(found[0].argv[1], "frobnicate", "{raw}");
+    }
 }
 
 /// Prose may follow a command after an em dash, an en dash or an arrow
