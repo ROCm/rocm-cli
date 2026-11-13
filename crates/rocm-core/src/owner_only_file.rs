@@ -55,16 +55,27 @@ pub fn owner_only_sddl(user_sid: &str) -> String {
     format!("D:P(A;;FA;;;{user_sid})")
 }
 
+/// The create itself, before the mode is set again on the handle: mode 0600
+/// as the file comes into existence, narrowed further by the umask but never
+/// widened. Its own function so a test can observe the file as created.
 #[cfg(unix)]
-fn create_new_owner_only(path: &Path) -> io::Result<File> {
-    use std::fs::{OpenOptions, Permissions};
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+fn create_new_at_owner_only_mode(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
+        .open(path)
+}
+
+#[cfg(unix)]
+fn create_new_owner_only(path: &Path) -> io::Result<File> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let file = create_new_at_owner_only_mode(path)?;
     // The umask can only have removed bits from 0600, never added any, so
     // nobody else can open the file even before this call. Setting the mode on
     // the handle makes it exactly 0600 whatever the umask was, so the owner can
@@ -563,6 +574,49 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("ROCM_TEST_OWNER_ONLY_UMASK_DIR", &root)
+                .status()
+                .expect("re-exec the test in a child process");
+        let created = root.join("secret").exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(created, "the child did not run the test arm");
+        assert!(status.success(), "{status:?}");
+    }
+
+    /// Nobody else can open the file even before its mode is set again on the
+    /// handle: the create itself asks for 0600. Checked in a re-executed child
+    /// under umask 0, where nothing narrows the requested mode, so what the
+    /// create asked for is exactly what this sees.
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)] // libc::umask, in the re-executed child only
+    fn the_file_is_owner_only_as_created_before_its_mode_is_set_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if let Some(dir) = std::env::var_os("ROCM_TEST_OWNER_ONLY_CREATE_DIR") {
+            // SAFETY: `umask` only swaps this process's file-creation mask;
+            // this child process runs only this one test.
+            let previous = unsafe { libc::umask(0) };
+            let path = PathBuf::from(dir).join("secret");
+            let created = create_new_at_owner_only_mode(&path);
+            // SAFETY: as above; restored before anything else creates a file.
+            unsafe {
+                libc::umask(previous);
+            }
+            drop(created.unwrap());
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "mode as created under umask 0 was {mode:o}");
+            return;
+        }
+
+        let root = scratch_dir("as-created");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "owner_only_file::tests::the_file_is_owner_only_as_created_before_its_mode_is_set_again",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("ROCM_TEST_OWNER_ONLY_CREATE_DIR", &root)
                 .status()
                 .expect("re-exec the test in a child process");
         let created = root.join("secret").exists();

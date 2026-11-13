@@ -262,9 +262,9 @@ pub fn staged_destination_name(file_name: &str) -> Option<&str> {
 /// the directory cannot be read.
 ///
 /// A writer that is still running has its staged file listed too, so remove
-/// these only when the destination itself is being removed. Removing one under
-/// a live writer is fail-closed by design: that writer's publish then fails
-/// with an error instead of recreating a secret its owner just deleted.
+/// these only when the destination itself is being removed. The result is a
+/// snapshot taken when the directory is read; it does not exclude a concurrent
+/// writer.
 pub fn staged_siblings(path: &Path) -> Vec<PathBuf> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Vec::new();

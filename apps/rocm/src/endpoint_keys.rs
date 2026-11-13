@@ -63,9 +63,9 @@ pub(crate) fn endpoint_key_file_if_present(paths: &AppPaths, service_id: &str) -
 
 /// Remove the stored key for `service_id`, with any staged copy a store killed
 /// before publishing left beside it. Idempotent and best-effort: a missing file
-/// is not an error, so this is safe to call unconditionally when any service
-/// stops. A store for the same service still in flight loses its staged copy
-/// and fails to publish; that is deliberate, so a cleared key stays cleared.
+/// is not an error, and a file that cannot be removed is left without being
+/// reported, so this is safe to call unconditionally when any service stops.
+/// It does not exclude a concurrent store for the same service.
 pub(crate) fn clear_endpoint_api_key(paths: &AppPaths, service_id: &str) {
     rocm_engine_protocol::remove_endpoint_key_files(paths, service_id);
 }
