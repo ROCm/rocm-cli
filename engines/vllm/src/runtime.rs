@@ -747,9 +747,11 @@ fn compat_dir_has_shims(compat_dir: &Path) -> bool {
         .is_ok_and(|mut entries| entries.next().is_some())
 }
 /// Materializes the runtime-owned OpenMPI compatibility shims that
-/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call it
 /// from the launch path, before building the environment a server is spawned
-/// with — never from running-state payload assembly, which only needs the
+/// with, and from the extension probe's environment (`apply_therock_env`, which
+/// `detect` and so `rocm engines list` reach) — never from running-state
+/// payload assembly, which only needs the
 /// path list `therock_library_path_entries` derives, not the shims
 /// themselves. Returns the `libmpi_cxx` compat dir when a shim is needed for
 /// *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to

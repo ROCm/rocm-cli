@@ -20,8 +20,9 @@
 //! `render_engine_inventory_text_with_paths`, `append_examine_runtime_state`,
 //! `append_examine_engine_inventory`, `append_engine_detect_summary`,
 //! `friendly_engine_runtime_kind`, `friendly_engine_detect_notes`,
-//! `friendly_engine_detect_note_fallback`, `engine_runtime_status_label` and
-//! `runtime_status_label_for`). `DEFAULT_ENGINE_MARKER` is shared by both
+//! `friendly_engine_detect_note_fallback`, `engine_runtime_status_label`,
+//! `runtime_status_label_with_extension_check`, `engine_reports_unusable_device`
+//! and `runtime_status_label_for`). `DEFAULT_ENGINE_MARKER` is shared by both
 //! engine-inventory renderers so the two copies cannot drift apart.
 //!
 //! Callers: `examine_cmd.rs`'s `examine()`, which the `Command::Examine` arm
@@ -42,7 +43,7 @@
 //! This module reaches three items that live at the crate root because they
 //! have other callers: `engine_inventory()` (the built-in engine list, also
 //! read from `update_cmd.rs` and `bridge_snapshot.rs`), `PlatformRuleOut`
-//! (which `engine_runtime_status_label` matches on) and
+//! (which `runtime_status_label_with_extension_check` matches on) and
 //! `engine_ruled_out_by_platform` (both defined in `model_fit.rs` and
 //! re-imported in `main.rs`) — all reached via `use crate::{...};`.
 //!
@@ -554,6 +555,8 @@ fn friendly_engine_detect_note_fallback(note: &str) -> String {
 /// same decision `rocm serve` and `rocm engines install` refuse on
 /// (`ensure_engine_allowed_on_platform`), so the inventory cannot call an
 /// engine unsupported while those commands go ahead with it, or the reverse.
+/// An installed vLLM whose detect reports an unusable device (its compiled
+/// extensions do not import) is labelled `installed, not usable`, not `ready`.
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
     runtime_status_label_with_extension_check(engine, detect, engine_ruled_out_by_platform(engine))
 }
@@ -586,10 +589,10 @@ fn engine_reports_unusable_device(detect: &DetectResponse) -> bool {
         .any(|device| !device.available && device.reason.is_some())
 }
 
-/// [`engine_runtime_status_label`] with the platform decision passed in rather
-/// than re-derived, so every platform branch is unit-testable on any host (the
-/// same seam as `unsupported_here_for` and `platform_refusal`). The vLLM
-/// extension branch sits one level up, in
+/// The installed / native-Windows / not-found labels, with the platform
+/// decision passed in rather than re-derived, so every platform branch is
+/// unit-testable on any host (the same seam as `unsupported_here_for` and
+/// `platform_refusal`). The vLLM extension branch sits one level up, in
 /// [`runtime_status_label_with_extension_check`].
 fn runtime_status_label_for(installed: bool, ruled_out: PlatformRuleOut) -> &'static str {
     if installed {

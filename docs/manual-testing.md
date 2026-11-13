@@ -775,6 +775,13 @@ installs are skipped. If the
 vLLM, that runtime has it; `--reinstall` is the flag that forces a reinstall
 when the engine already exists.
 
+`rocm engines list` runs an extension-import probe in the runtime's Python for an
+installed vLLM (a vLLM with no known Python is not probed), which can take up to a
+minute. If the vLLM wheel was built against a
+different torch than the runtime's, the list shows `runtime: installed, not usable`
+with the failing extension in the notes, and `rocm serve` exits before starting
+vLLM, and `rocm logs` for the service shows why, rather than failing during engine start-up.
+
 **Start from runtime A.** Make it the active runtime and start a server on it.
 `--runtime-id` names the runtime explicitly, so the server's recorded runtime
 does not depend on any saved engine preference:
