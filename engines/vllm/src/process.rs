@@ -127,22 +127,76 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     })
 }
 
+/// Tear down a server that never became ready: stop its process tree, reap it,
+/// and record the service as `failed`. A state file that cannot be written is
+/// reported on stderr rather than returned, so the readiness failure stays the
+/// error the caller reports.
+///
+/// A server still held unreaped is stopped with [`stop_spawned_server`] and
+/// [`STOP_GRACE`]. When that stop is not confirmed, the reason is written to
+/// stderr and the server is killed (`SIGKILL`): this process owns it and has not
+/// reaped it, so its PID cannot belong to anyone else. That kill is what bounds
+/// the wait after an `Unverified` stop, which signals nothing. The wait that
+/// follows is therefore bounded on every path but one: a server that survives
+/// `SIGKILL`, such as one in uninterruptible sleep in the kernel, is waited on
+/// until it leaves that state. A process under a server whose stop was not
+/// confirmed is not reached by the kill.
+///
+/// The readiness poll may already have reaped the server, because it exited
+/// before becoming ready. Its PID may then belong to an unrelated process, so
+/// nothing is signalled, and any worker it left running is not reached either:
+/// a reaped process can no longer be walked for its children.
+fn fail_unready_server(child: &mut std::process::Child, state_path: &Path) {
+    fail_unready_server_with(child, state_path, |pid| {
+        stop_spawned_server(pid, STOP_GRACE)
+    });
+}
+
+/// [`fail_unready_server`] with the stop supplied by the caller, so a test can
+/// drive an outcome a real process cannot be made to produce on demand.
+fn fail_unready_server_with(
+    child: &mut std::process::Child,
+    state_path: &Path,
+    stop: impl FnOnce(u32) -> rocm_core::TerminationOutcome,
+) {
+    let already_reaped = matches!(child.try_wait(), Ok(Some(_)));
+    if !already_reaped {
+        let outcome = stop(child.id());
+        if let Some(reason) = outcome.unconfirmed_reason() {
+            eprintln!(
+                "Warning: process {} was not confirmed stopped: {reason}. Killing it; processes under it are not reached by that kill.",
+                child.id()
+            );
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+    if let Err(error) = crate::state::write_terminal_state(state_path, "failed") {
+        eprintln!(
+            "Warning: could not record the vLLM service as failed in {}: {error:#}",
+            state_path.display()
+        );
+    }
+}
+
 /// Force-stop the server tree this process spawned and still holds as an
-/// unreaped child, and report whether it is confirmed gone.
+/// unreaped child.
 ///
 /// `SIGTERM` to the whole tree, then `SIGKILL` for whatever outlives `grace`, so
-/// the call returns within about twice `grace` and a following `child.wait()`
-/// does not hang on a server that ignores `SIGTERM`. The identity is captured
+/// the call returns within about twice `grace`. That alone does not bound a
+/// following `child.wait()`: an `Unverified` outcome means nothing was signalled,
+/// and a server that survives `SIGKILL` outlives the stop (`TimedOut`), so the
+/// caller handles both ([`fail_unready_server_with`]). The identity is captured
 /// here, which is safe only while the caller holds the unreaped child: until it
-/// is reaped its PID cannot be reused.
-fn stop_spawned_server(pid: u32, grace: Duration) -> bool {
+/// is reaped its PID cannot be reused. [`fail_unready_server_with`] checks
+/// that before calling it.
+fn stop_spawned_server(pid: u32, grace: Duration) -> rocm_core::TerminationOutcome {
     rocm_core::terminate_verified(
         &rocm_core::ProcessIdentity::capture(pid),
         STOP_SCOPE,
         grace,
         true,
     )
-    .stopped()
 }
 
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
@@ -162,10 +216,11 @@ pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     ) {
         // Terminate the whole vLLM process tree so the EngineCore worker (which
         // holds the GPU allocation) does not survive and leak device memory, and
-        // escalate so the `wait` below cannot hang on a server ignoring SIGTERM.
-        let _ = stop_spawned_server(child.id(), STOP_GRACE);
-        let _ = child.wait();
-        crate::state::write_terminal_state(&request.state_path, "failed")?;
+        // escalate so a server ignoring SIGTERM is killed rather than waited on.
+        // The teardown still blocks on a server that survives SIGKILL, such as
+        // one in uninterruptible sleep in the kernel. A server that already
+        // exited is not signalled; see `fail_unready_server`.
+        fail_unready_server(&mut child, &request.state_path);
         return Err(e);
     }
 
@@ -1225,21 +1280,13 @@ mod tests {
         Ok(())
     }
 
-    /// The readiness-failure teardown: a server that ignores `SIGTERM`, and a
-    /// worker under it that does too, must both be gone once the helper returns,
-    /// so the `child.wait()` after it cannot hang.
+    /// Spawn `sh -c script`, which prints one line once it is ready, and return
+    /// the child with that line.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn stop_spawned_server_kills_a_tree_that_ignores_sigterm() {
+    fn spawn_ready(script: &str) -> (std::process::Child, String) {
         use std::io::BufRead;
-        use std::os::unix::process::ExitStatusExt;
-        // Both shells ignore SIGTERM (`SIG_IGN` survives `exec`); the inner one
-        // prints its PID once it runs, which is after the outer trap is set.
         let mut child = ProcessCommand::new("sh")
-            .args([
-                "-c",
-                r#"trap '' TERM; sh -c "echo \$\$; exec sleep 300" & wait"#,
-            ])
+            .args(["-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -1248,32 +1295,282 @@ mod tests {
         std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
             .read_line(&mut line)
             .expect("read readiness line");
-        let worker = rocm_core::ProcessIdentity::capture(line.trim().parse().expect("worker pid"));
+        (child, line.trim().to_owned())
+    }
+
+    /// `SIGKILL` `identity` if it is still that process, so a failing test does
+    /// not leave a stray process behind.
+    #[cfg(target_os = "linux")]
+    fn kill_if_running(identity: &rocm_core::ProcessIdentity) {
+        if rocm_core::identity_state(identity) == rocm_core::IdentityState::Matches {
+            let _ = ProcessCommand::new("kill")
+                .args(["-KILL", &identity.pid.to_string()])
+                .status();
+        }
+    }
+
+    /// The `sh` script for a server that ignores `SIGTERM` and has a worker that
+    /// ignores it too (`SIG_IGN` survives `exec`). The inner shell prints its
+    /// PID once it runs, which is after the outer trap is set.
+    #[cfg(target_os = "linux")]
+    const TRAPPING_TREE: &str = r#"trap '' TERM; sh -c "echo \$\$; exec sleep 300" & wait"#;
+
+    /// Run `teardown` on a fresh [`TRAPPING_TREE`] in a thread, bounded so a
+    /// teardown that hangs fails the test instead, and return the reaped server's
+    /// exit status, whether the worker is gone, and how long the teardown took.
+    #[cfg(target_os = "linux")]
+    fn tear_down_trapping_tree(
+        bound: Duration,
+        teardown: impl FnOnce(&mut std::process::Child) + Send + 'static,
+    ) -> (std::process::ExitStatus, bool, Duration) {
+        let (mut child, worker_pid) = spawn_ready(TRAPPING_TREE);
+        let worker = rocm_core::ProcessIdentity::capture(worker_pid.parse().expect("worker pid"));
         let server = rocm_core::ProcessIdentity::capture(child.id());
-        let kill_if_running = |identity: &rocm_core::ProcessIdentity| {
-            if rocm_core::identity_state(identity) == rocm_core::IdentityState::Matches {
-                let _ = ProcessCommand::new("kill")
-                    .args(["-KILL", &identity.pid.to_string()])
-                    .status();
-            }
-        };
-
-        let stopped = stop_spawned_server(child.id(), Duration::from_millis(500));
-        let status = child.try_wait().expect("try_wait");
-        let worker_state = rocm_core::identity_state(&worker);
-
+        let (done, finished) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            teardown(&mut child);
+            let _ = done.send(started.elapsed());
+            child
+        });
+        let elapsed = finished.recv_timeout(bound);
+        if elapsed.is_err() {
+            // Unblock the teardown's `wait` so the test fails rather than hangs.
+            kill_if_running(&worker);
+            kill_if_running(&server);
+        }
+        let mut child = thread.join().expect("teardown thread");
+        let worker_gone = matches!(
+            rocm_core::identity_state(&worker),
+            rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
+        );
         kill_if_running(&worker);
-        kill_if_running(&server);
-        let _ = child.wait();
-        assert!(stopped, "a forced stop must report the server stopped");
-        let status = status.expect("the server must have exited before wait is called");
+        let elapsed =
+            elapsed.unwrap_or_else(|_| panic!("the teardown did not return within {bound:?}"));
+        let status = child
+            .try_wait()
+            .expect("try_wait")
+            .expect("the teardown reaps the server");
+        (status, worker_gone, elapsed)
+    }
+
+    /// The readiness-failure teardown with a real stop and a short grace: a
+    /// server that ignores `SIGTERM`, and its worker, are killed, the teardown
+    /// returns within about twice the grace period, and the service is recorded
+    /// as failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_kills_a_tree_that_ignores_sigterm_and_records_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let grace = Duration::from_millis(500);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let thread_state_path = state_path.clone();
+
+        let (status, worker_gone, _) =
+            // The margin is wide: the bound only turns a hang into a failure, and a
+            // loaded host can be slow to run the stop.
+            tear_down_trapping_tree(grace * 2 + Duration::from_secs(10), move |child| {
+                fail_unready_server_with(child, &thread_state_path, |pid| {
+                    stop_spawned_server(pid, grace)
+                });
+            });
+
         assert_eq!(status.signal(), Some(9), "{status}");
         assert!(
-            matches!(
-                worker_state,
-                rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
-            ),
-            "the worker under the server must be stopped too, got {worker_state:?}"
+            worker_gone,
+            "the worker under the server must be stopped too"
+        );
+        let state = crate::state::read_service_state(&state_path).expect("state");
+        assert_eq!(state["status"], "failed");
+    }
+
+    /// `fail_unready_server` itself, as `serve_http` calls it: the production
+    /// grace passes before the escalation, then the tree is killed and the
+    /// service recorded as failed. Takes about [`STOP_GRACE`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_escalates_after_the_stop_grace() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let thread_state_path = state_path.clone();
+
+        let (status, worker_gone, elapsed) =
+            tear_down_trapping_tree(STOP_GRACE * 2 + Duration::from_secs(5), move |child| {
+                fail_unready_server(child, &thread_state_path);
+            });
+
+        assert!(
+            elapsed >= STOP_GRACE,
+            "the server must get the whole stop grace before SIGKILL: {elapsed:?}"
+        );
+        assert_eq!(status.signal(), Some(9), "{status}");
+        assert!(
+            worker_gone,
+            "the worker under the server must be stopped too"
+        );
+        let state = crate::state::read_service_state(&state_path).expect("state");
+        assert_eq!(state["status"], "failed");
+    }
+
+    /// A server the readiness poll already reaped is not signalled: its PID may
+    /// belong to another process by now.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_does_not_signal_a_server_the_readiness_poll_reaped() {
+        let mut child = ProcessCommand::new("true")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let mut signalled = Vec::new();
+
+        fail_unready_server_with(&mut child, &state_path, |pid| {
+            signalled.push(pid);
+            rocm_core::TerminationOutcome::Forced
+        });
+
+        assert!(
+            signalled.is_empty(),
+            "a reaped server's PID must not be signalled: {signalled:?}"
+        );
+        let state = crate::state::read_service_state(&state_path).expect("state");
+        assert_eq!(state["status"], "failed");
+    }
+
+    /// What `fail_unready_server` writes to stderr, read from the real stderr of
+    /// a process running it, together with the state it describes. The test
+    /// re-runs itself in a child process (selected by an environment variable),
+    /// because a warning on this process's stderr cannot be read back here.
+    ///
+    /// - A stop that sends nothing and reports `Unverified` is warned about, and
+    ///   the server is then killed and reaped rather than waited on.
+    /// - A state file that cannot be written is warned about, and the teardown
+    ///   still completes.
+    /// - A confirmed stop is not warned about and is not followed by a kill, and
+    ///   the server is reaped before the teardown returns.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_reports_on_stderr_and_kills_a_server_it_could_not_confirm_stopped() {
+        use std::os::unix::process::ExitStatusExt;
+        const ARM: &str = "ROCM_TEST_VLLM_UNREADY_TEARDOWN_ARM";
+        if let Some(dir) = std::env::var_os(ARM) {
+            let dir = std::path::PathBuf::from(dir);
+            // Bounded, so a teardown that fails to kill it ends within 30 s
+            // instead of hanging the parent.
+            let (mut child, _) = spawn_ready("echo ready; exec sleep 30");
+            let pid = child.id();
+            let state_path = dir.join("state.json");
+            fail_unready_server_with(&mut child, &state_path, |_| {
+                rocm_core::TerminationOutcome::Unverified
+            });
+            let signal = child
+                .try_wait()
+                .expect("try_wait")
+                .and_then(|status| status.signal());
+            // On lines of their own: the harness has already printed the test's
+            // name without a line break.
+            println!("\nunverified={pid} signal={signal:?}");
+
+            // A state path that is a directory cannot be written as a file.
+            let (mut child, _) = spawn_ready("echo ready; exec sleep 30");
+            let unwritable = dir.join("unwritable");
+            std::fs::create_dir(&unwritable).expect("create the unwritable path");
+            fail_unready_server_with(&mut child, &unwritable, |pid| {
+                stop_spawned_server(pid, Duration::from_millis(500))
+            });
+            println!(
+                "\nunwritable reaped={}",
+                child.try_wait().expect("try_wait").is_some()
+            );
+
+            // A confirmed stop that leaves the server to exit by itself, with a
+            // status only that exit produces: a kill would end it with signal 9,
+            // and a teardown that did not wait would return while it still runs.
+            let (mut child, _) = spawn_ready("echo ready; sleep 1; exit 7");
+            let pid = child.id();
+            fail_unready_server_with(&mut child, &dir.join("confirmed.json"), |_| {
+                rocm_core::TerminationOutcome::Graceful
+            });
+            let status = child
+                .try_wait()
+                .expect("try_wait")
+                .map(|status| (status.code(), status.signal()));
+            println!("\nconfirmed={pid} status={status:?}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = ProcessCommand::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "process::tests::fail_unready_server_reports_on_stderr_and_kills_a_server_it_could_not_confirm_stopped",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(ARM, dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("re-run the test arm in a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        let pid: u32 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("unverified="))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("no unverified= line in: {stdout}"));
+
+        assert!(
+            stdout.contains(&format!("unverified={pid} signal=Some(9)")),
+            "a server whose stop was not confirmed is killed: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "Warning: process {pid} was not confirmed stopped: its identity could not be \
+                 confirmed, so it was not signalled. Killing it; processes under it are not \
+                 reached by that kill."
+            )),
+            "{stderr}"
+        );
+        let state =
+            crate::state::read_service_state(&dir.path().join("state.json")).expect("state");
+        assert_eq!(state["status"], "failed");
+
+        let confirmed: u32 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("confirmed="))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("no confirmed= line in: {stdout}"));
+        assert!(
+            stdout.contains(&format!(
+                "confirmed={confirmed} status=Some((Some(7), None))"
+            )),
+            "a confirmed stop is neither followed by a kill nor left unreaped: {stdout}"
+        );
+        assert!(
+            !stderr.contains(&format!("process {confirmed} was not confirmed stopped")),
+            "a confirmed stop must not warn: {stderr}"
+        );
+        let state =
+            crate::state::read_service_state(&dir.path().join("confirmed.json")).expect("state");
+        assert_eq!(state["status"], "failed");
+
+        assert!(stdout.contains("unwritable reaped=true"), "{stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "Warning: could not record the vLLM service as failed in {}",
+                dir.path().join("unwritable").display()
+            )),
+            "{stderr}"
         );
     }
 }
