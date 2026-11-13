@@ -282,13 +282,20 @@ pub(in crate::ui) mod tests {
             host: "localhost".into(),
             version: ConnState::in_process_version("0.0.0"),
         };
-        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        // Wide enough to hold the whole line: the remedy half is what this test
+        // is really about, and 80 columns would truncate it away unasserted.
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
         term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
             .unwrap();
         let grid = buffer_text(&term);
+        // Asserted whole, tab digit included. `ActiveTab::from_digit` maps '3'
+        // to Serving today; a tab reorder that left this line behind would send
+        // the user to the wrong tab, and nothing else here would catch it.
         assert!(
-            grid.contains("no managed services running"),
-            "should say nothing is served, not claim a daemon could be started; got:\n{grid}"
+            grid.contains(
+                "no managed services running · serve one from 3 Serving · vLLM containers aren't available here"
+            ),
+            "should say nothing is served AND where to serve one from instead, not claim a daemon could be started; got:\n{grid}"
         );
         assert!(
             !grid.contains("start daemon"),

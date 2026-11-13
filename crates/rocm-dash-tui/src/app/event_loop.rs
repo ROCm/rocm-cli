@@ -1091,14 +1091,32 @@ mod tests {
         // The first poll must not wait a full period: a service already
         // running when the dashboard opens is listed at once, not after
         // "Nothing running" has been on screen for a second.
+        //
+        // The period is deliberately much longer than the first read's deadline
+        // (1s vs 250ms), because the deadline only discriminates if one period
+        // does not fit inside it: with a period as short as the bound, a poller
+        // that slept a full period before its first read would clear it anyway
+        // and the test would pass on the very bug it exists to catch.
+        const PERIOD: Duration = Duration::from_secs(1);
+        const FIRST_READ_DEADLINE: Duration = Duration::from_millis(250);
+
         let (probe, expected) = probe_with(&["svc-a"]);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = spawn_managed_registry_poller(probe, tx, Duration::from_millis(20));
+        let handle = spawn_managed_registry_poller(probe, tx, PERIOD);
 
-        for _ in 0..2 {
-            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        // Poll 0 is the immediate one and gets the tight bound; poll 1 only has
+        // to prove the loop repeats, so it is allowed a full period plus slack.
+        for poll in 0..2 {
+            let deadline = if poll == 0 {
+                FIRST_READ_DEADLINE
+            } else {
+                PERIOD + FIRST_READ_DEADLINE
+            };
+            let msg = tokio::time::timeout(deadline, rx.recv())
                 .await
-                .expect("a poll arrived")
+                .unwrap_or_else(|_| {
+                    panic!("poll {poll} did not arrive within {deadline:?} (period {PERIOD:?})")
+                })
                 .expect("channel open");
             let ClientMsg::ManagedInstances(got) = msg else {
                 panic!("unexpected message: {msg:?}");

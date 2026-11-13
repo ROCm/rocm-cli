@@ -793,11 +793,30 @@ mod tests {
             "a registry-sourced instance must be offered for stopping on quit"
         );
 
+        // Shrink the list out from under a selection that points past the new
+        // end. `instance_sel` has to be nonzero first, or the clamp inside
+        // `set_managed_instances` is unobservable — with the selector already
+        // at its default 0 the call could be dropped entirely and every
+        // assertion below would still hold.
+        let second = Instance {
+            container_id: "lemonade-llama".to_string(),
+            status: InstanceStatus::Ready,
+            port: Some(11437),
+            ..Default::default()
+        };
+        s.set_managed_instances(vec![served, second]);
+        s.instance_sel = 1;
+
         s.set_managed_instances(Vec::new());
 
         assert!(
             s.instances.is_empty(),
             "a service the registry no longer reports must drop off"
+        );
+        assert_eq!(
+            s.instance_sel, 0,
+            "the row selection must be clamped to the shrunken list, not left \
+             pointing past its end"
         );
     }
 
