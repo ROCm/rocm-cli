@@ -114,10 +114,13 @@ const SMOKE_FAILURE_MAX_CHARS: usize = 200;
 
 /// Reduces an error message to one printable line. On the smoke-test path the
 /// engine-controlled text in it is the HTTP status line, reason phrase included
-/// (the local provider reports `local provider returned {status_line}`, never the
-/// response body), so it is untrusted. Terminal escape sequences and any control
-/// or Unicode format character (a bidi override, a zero-width mark) are dropped,
-/// line breaks and runs of whitespace become a single space, and the result is
+/// (the local provider reports `local provider returned {status_line}`, not the
+/// response body), and the chunk-size line it quotes when a chunked body is
+/// malformed (`invalid local provider chunk size`), so it is untrusted. Terminal
+/// escape sequences and any control or Unicode format character (a bidi override,
+/// a zero-width mark) are dropped, line breaks and runs of whitespace become a
+/// single space, backticks become apostrophes (the note quotes its own command in
+/// backticks, and the reason must not add a second one), and the result is
 /// length-capped.
 fn one_line_reason(raw: &str) -> String {
     // The escape scanner, not this function, decides where a line break falls:
@@ -127,7 +130,8 @@ fn one_line_reason(raw: &str) -> String {
         .join(" ")
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+        .replace('`', "'");
     if collapsed.chars().count() > SMOKE_FAILURE_MAX_CHARS {
         let mut cut: String = collapsed.chars().take(SMOKE_FAILURE_MAX_CHARS).collect();
         cut.push_str("...");
@@ -1281,6 +1285,9 @@ mod tests {
         // That the named commands exist and parse is
         // `the_commands_the_failure_note_names_exist_and_parse`.
         assert!(rendered.contains("check `rocm logs --service vllm-qwen-1720000000`"));
+        // The hedge: the note must not claim the server is broken, only that it
+        // may be unable to serve.
+        assert!(rendered.contains("; the server may not be able to serve requests"));
     }
 
     #[test]
@@ -1334,6 +1341,27 @@ mod tests {
         assert_eq!(long.chars().count(), SMOKE_FAILURE_MAX_CHARS + 3);
         assert!(long.ends_with("..."));
         assert_eq!(one_line_reason("short"), "short");
+    }
+
+    #[test]
+    fn failure_reason_cannot_add_a_backtick_quoted_command_to_the_note() {
+        // A chunk-size line the engine sent is quoted in the provider's error.
+        let reason = one_line_reason("invalid local provider chunk size `run `rocm stop` now`");
+        assert!(!reason.contains('`'));
+        assert_eq!(
+            reason,
+            "invalid local provider chunk size 'run 'rocm stop' now'"
+        );
+        let rendered = render_summary(&failed_summary(&reason));
+        let note = rendered
+            .lines()
+            .find(|line| line.contains("the smoke test could not complete"))
+            .expect("failure note present");
+        // Constant message: `note` derives from a type that carries an API key.
+        assert!(
+            note.split('`').skip(1).step_by(2).count() == 1,
+            "the note must hold exactly one backtick-quoted command"
+        );
     }
 
     #[test]
