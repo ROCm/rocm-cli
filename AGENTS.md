@@ -253,6 +253,14 @@ Keep docs and behavior claims in sync while editing:
   every review-fix commit: it lists every user-visible change (including ones on other
   platforms), names the lane that exercises the new behavior, and states the reason when
   there is no scenario
+- hold the branch's commit messages to the same bar: pull requests here are squash-merged
+  with the branch's commit messages as the default squash body, so each one lands in public
+  history. Each describes what its own commit does, in words still true at the branch
+  head. A message whose words a later commit made misleading — a cross-reference to a
+  section, item or name that a later commit changed — is reworded before merge; a commit
+  whose whole subject a later commit removed is folded into that commit or dropped
+  instead. Either rewrites pushed commits, which needs a force-push, which needs
+  approval (§1)
 
 ## 6) rocm-cli Architecture Guardrails
 
@@ -483,6 +491,7 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - when reviewing a revision that answers review feedback, diff it whole against the revision you last reviewed, the same way the author does (**Review-fix commits** below), not only the lines your finding named: a remediation is written in a narrow window, gets the least scrutiny, and is where new defects arrive
 - when reviewing, treat a comment or doc line in the diff that states how the code behaves as a claim to check against that code (§3), not as context; one that is the reason for a decision (§3 says which) is checked before you approve, including that it names where the code makes it true
 - when reviewing, before marking an objection blocking because it rests on a timing, ordering, concurrency or "this cannot happen" argument, name the mechanism it assumes and where that is defined (file and symbol); an objection whose mechanism you cannot locate is posted as a question, not a blocking finding
+- when reviewing, read the commit messages as well as the diff: they become the squash commit's body on `main` (§5)
 
 **Review-fix commits** — a commit answering review feedback is reviewed by its author as a whole change:
 
@@ -537,6 +546,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 17. Comments and doc lines stating how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
 18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
 19. Any existing scenario moved off the blocking mock `e2e` job justified as a deletion — *§8*
+20. Every commit message describes its own commit in words still true at the branch head — *§5*
 
 ## 14) Related Internal Workflows
 

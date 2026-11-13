@@ -131,6 +131,10 @@ git config --global commit.gpgsign true
 
 See [Commit signatures](https://github.com/ROCm/rocm-cli/blob/main/docs/commit-signatures.md) for GPG signing, GitHub "Verified" status, and troubleshooting.
 
+### Commit messages are public history
+
+Pull requests are squash-merged, and by default the squash commit's message is built from the messages of the branch's commits. Once merged it is public history that is not rewritten, so commit messages are reviewed for accuracy on the same footing as the diff: each describes what its own commit does in words still true at the branch head, and one whose words a later commit on the branch made misleading is corrected before the pull request merges. AGENTS.md section 5 states the rule for contributors and section 11 for reviewers.
+
 ### What reviewers look for
 
 - Tests cover the new behavior
