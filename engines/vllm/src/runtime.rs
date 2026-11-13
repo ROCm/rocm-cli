@@ -803,7 +803,21 @@ pub(crate) fn ensure_therock_compat_shims(
     // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
     // the install/preflight.
     remove_stale_numa_shim(&compat_dir);
+    // The directory now reaches the loader path for the amd-smi link alone, so a
+    // `libmpi_cxx.so.40` stub an earlier run wrote, before the host gained a real
+    // `libmpi_cxx`, would shadow the real one there. Remove it when this launch
+    // does not need it.
+    if mpi_cxx_shim.is_none() {
+        remove_stale_mpi_cxx_stub(&compat_dir);
+    }
     mpi_cxx_shim.or(amd_smi_shim)
+}
+
+/// Remove a leftover `libmpi_cxx.so.40` stub from `compat_dir`: one written while
+/// the host had no real `libmpi_cxx`, which would shadow the real library once the
+/// directory is on the loader path. No-op when absent.
+fn remove_stale_mpi_cxx_stub(compat_dir: &Path) {
+    let _ = fs::remove_file(compat_dir.join("libmpi_cxx.so.40"));
 }
 /// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
 /// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
@@ -1208,6 +1222,39 @@ mod tests {
         assert!(
             position(&sdk_lib).unwrap() < position(&compat_dir).unwrap(),
             "the link directory must come after the SDK's: {entries:?}"
+        );
+    }
+
+    /// The amd-smi link puts the compat directory on the loader path even when
+    /// the host has a real `libmpi_cxx`; a stub an earlier run left there must not
+    /// ride along and shadow it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_amd_smi_link_does_not_carry_a_leftover_mpi_cxx_stub_onto_the_path() {
+        let env = tempfile::tempdir().unwrap();
+        let sdk_root = env.path().join("sdk");
+        let sdk_lib = sdk_root.join("lib");
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stale stub").unwrap();
+        let runtime = VllmRuntime {
+            runtime_id: "release-wheel".to_owned(),
+            env_id: "release-wheel".to_owned(),
+            python_executable: Some(env.path().join("bin").join("python")),
+            sdk_root: Some(sdk_root),
+            sdk_library_paths: vec![sdk_lib],
+            ..VllmRuntime::for_test()
+        };
+
+        let shim = ensure_therock_compat_shims(&runtime, |_| None);
+
+        assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
+        assert!(compat_dir.join("libamd_smi.so").exists());
+        assert!(
+            !compat_dir.join("libmpi_cxx.so.40").exists(),
+            "the stub would shadow the host's real libmpi_cxx on the loader path"
         );
     }
 
