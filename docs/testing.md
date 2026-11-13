@@ -1041,8 +1041,9 @@ an earlier ROCm 7 release because an unpinned install now reads the newest layou
 A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later, a
 nightly built since 2026-08-23, or any install with no pin, which now reads that
 layout) is held to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
-is the one step that chooses the `torch` and `torchvision` versions (the CLI
-picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+is the one step that chooses the `torch` and `torchvision` versions within the
+series the vLLM discover table pairs for that line (the CLI picks the ROCm
+version, the torchaudio pin and that series bound), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
 previous install left) and, with none, stops before that step. It then prints
 what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
