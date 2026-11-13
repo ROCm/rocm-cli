@@ -655,7 +655,8 @@ pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
 /// belongs on the loader path.
 enum CompatDirSignal {
     /// `ensure_therock_compat_shims`'s answer is not passed in to this
-    /// derivation (the running-state payload path, which never calls it).
+    /// derivation (the running-state payload path and the read-only extension
+    /// probe, which never call it).
     /// Falls back to a read-only directory listing of whatever is already on
     /// disk: not authoritative, but the best available signal without
     /// performing a write.

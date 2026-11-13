@@ -409,8 +409,9 @@ pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRunt
 /// Same as [`apply_therock_env`], with the `libmpi_cxx` probe
 /// [`ensure_therock_compat_shims`] takes injectable, so a test can exercise
 /// the whole "no shim needed" hand-off into `LD_LIBRARY_PATH` without
-/// depending on this host's own OpenMPI/compiler state. Production code
-/// always goes through [`apply_therock_env`].
+/// depending on this host's own OpenMPI/compiler state. The launch path always
+/// goes through [`apply_therock_env`]; the read-only form is
+/// [`apply_therock_env_read_only`].
 fn apply_therock_env_with(
     command: &mut ProcessCommand,
     runtime: &VllmRuntime,
@@ -470,7 +471,8 @@ fn apply_therock_env_using(
     }
     Ok(())
 }
-/// Imports vLLM's compiled extensions the way the server will, after torch.
+/// Imports vLLM's compiled extensions the way the server will (after torch, and
+/// in the serve gate in the server's own environment, see [`ProbeEnv`]).
 ///
 /// `import torch` first: the extensions link against libtorch and fail to load
 /// without it, which would blame vLLM for a missing import order. A torch that
@@ -508,8 +510,25 @@ const VLLM_EXTENSION_PROBE_TIMEOUT: Duration = Duration::from_mins(1);
 /// symbols; the server then dies deep in engine start-up with an unrelated
 /// `AttributeError`. This surfaces the cause up front. Best-effort: any trouble
 /// running the probe yields `None`, never a false alarm.
+///
+/// This is the read-only form `detect` uses (see [`ProbeEnv`]).
 pub(crate) fn vllm_extension_import_problem(runtime: &VllmRuntime) -> Option<String> {
-    extension_import_problem_within(runtime, VLLM_EXTENSION_PROBE_TIMEOUT)
+    extension_import_problem_within(runtime, VLLM_EXTENSION_PROBE_TIMEOUT, ProbeEnv::ReadOnly)
+}
+
+/// Which environment the extension probe runs in.
+#[derive(Clone, Copy)]
+enum ProbeEnv {
+    /// `detect`, which `rocm engines list` and the assistant's read-only
+    /// engines tool reach: nothing in the runtime is written. A compat stub that
+    /// was not written can make `import torch` fail, which the probe reports as
+    /// nothing, so a listing can read `ready` for a broken wheel until the first
+    /// launch has written the shims.
+    ReadOnly,
+    /// The serve gate, which is about to run the same shim step in
+    /// `apply_therock_env` anyway: the probe sees the environment the server will
+    /// see, so it cannot pass on a torch that only imports once the shims exist.
+    Launch,
 }
 
 /// `rocm serve` refuses to launch a vLLM that cannot load its extensions.
@@ -517,13 +536,17 @@ fn require_importable_extensions(runtime: &VllmRuntime) -> Result<()> {
     if cfg!(windows) {
         return Ok(());
     }
-    match vllm_extension_import_problem(runtime) {
+    match extension_import_problem_within(runtime, VLLM_EXTENSION_PROBE_TIMEOUT, ProbeEnv::Launch) {
         Some(problem) => bail!("{problem}"),
         None => Ok(()),
     }
 }
 
-fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> Option<String> {
+fn extension_import_problem_within(
+    runtime: &VllmRuntime,
+    timeout: Duration,
+    env: ProbeEnv,
+) -> Option<String> {
     let python = absolute_probe_python(runtime.python_executable.as_ref()?);
     let mut command = ProcessCommand::new(&python);
     command.arg("-c").arg(VLLM_EXTENSION_PROBE_SCRIPT);
@@ -534,10 +557,13 @@ fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> 
     if let Some(dir) = python.parent().filter(|dir| dir.is_dir()) {
         command.current_dir(dir);
     }
-    // Read-only: `rocm engines list` and the assistant's engines tool reach this
-    // and promise not to change the runtime. A missing compat stub only makes
-    // `import torch` fail, which the probe reports as nothing.
-    apply_therock_env_read_only(&mut command, runtime).ok()?;
+    // Python writes `__pycache__` for what it imports unless told not to.
+    command.env("PYTHONDONTWRITEBYTECODE", "1");
+    match env {
+        ProbeEnv::ReadOnly => apply_therock_env_read_only(&mut command, runtime),
+        ProbeEnv::Launch => apply_therock_env(&mut command, runtime),
+    }
+    .ok()?;
     let output = rocm_core::process::run_with_timeout(command, timeout, "vLLM extension probe")
         .ok()
         .filter(|output| output.status.success())?;
@@ -1199,7 +1225,8 @@ mod tests {
         assert_eq!(
             extension_import_problem_within(
                 &test_vllm_runtime(Some(python), None),
-                Duration::from_secs(20)
+                Duration::from_secs(20),
+                ProbeEnv::Launch
             ),
             None
         );
@@ -1216,6 +1243,7 @@ mod tests {
         let problem = extension_import_problem_within(
             &test_vllm_runtime(Some(python), None),
             Duration::from_secs(20),
+            ProbeEnv::Launch,
         )
         .expect("trailing blank lines do not hide the result");
         assert!(problem.contains("vllm._C: x"), "{problem}");
@@ -1241,6 +1269,7 @@ mod tests {
         let problem = extension_import_problem_within(
             &test_vllm_runtime(Some(python), None),
             Duration::from_millis(200),
+            ProbeEnv::Launch,
         );
         assert_eq!(problem, None);
         assert!(
@@ -1365,26 +1394,69 @@ mod tests {
     fn the_extension_probe_changes_nothing_in_the_runtime() -> Result<()> {
         // `rocm engines list` and the assistant's read-only engines tool reach the
         // probe, so it must not run the compat-shim step, which removes a stale
-        // numa symlink from the runtime.
-        let env = tempfile::tempdir()?;
-        let bin = env.path().join("bin");
+        // numa symlink and may write a `libmpi_cxx` stub in the runtime.
+        let (_guard, runtime, compat_dir, stale_shim) = probe_runtime_with_stale_shim()?;
+        let before = dir_names(&compat_dir)?;
+        let problem = vllm_extension_import_problem(&runtime);
+        // The stand-in fails only when the SDK's lib dir reached `LD_LIBRARY_PATH`,
+        // so a probe that never ran, or ran without that path, reads as `None`.
+        assert!(problem.is_some(), "the probe saw no SDK library path");
+        assert!(
+            stale_shim.symlink_metadata().is_ok(),
+            "the probe ran the compat-shim step"
+        );
+        assert_eq!(dir_names(&compat_dir)?, before);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_serve_gate_runs_in_the_launch_environment() -> Result<()> {
+        // The gate is about to run the shim step anyway, and must probe in the
+        // environment the server gets: the step ran when the stale shim is gone.
+        let (_guard, runtime, _compat_dir, stale_shim) = probe_runtime_with_stale_shim()?;
+        let _ = require_importable_extensions(&runtime);
+        assert!(
+            stale_shim.symlink_metadata().is_err(),
+            "the serve gate did not run in the launch environment"
+        );
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn dir_names(dir: &Path) -> Result<Vec<String>> {
+        let mut names = fs::read_dir(dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+    /// A runtime whose compat dir holds a stale `libnuma.so.1` symlink, and whose
+    /// stand-in interpreter reports a failure only when `<sdk>/lib` is on
+    /// `LD_LIBRARY_PATH`.
+    #[cfg(target_os = "linux")]
+    fn probe_runtime_with_stale_shim() -> Result<(tempfile::TempDir, VllmRuntime, PathBuf, PathBuf)>
+    {
+        let guard = tempfile::tempdir()?;
+        let env = guard.path().to_path_buf();
+        let bin = env.join("bin");
         fs::create_dir_all(&bin)?;
-        let python = stand_in_python(&bin, r#"echo '{"failures": []}'"#)?;
-        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        let sdk = env.join("sdk");
+        let python = stand_in_python(
+            &bin,
+            &format!(
+                r#"case "$LD_LIBRARY_PATH" in *"{}"*) echo '{{"failures": [{{"module": "vllm._C", "error": "x"}}]}}';; *) echo '{{"failures": []}}';; esac"#,
+                sdk.join("lib").display()
+            ),
+        )?;
+        let compat_dir = env.join("rocm-cli-lib-compat");
         fs::create_dir_all(&compat_dir)?;
         let stale_shim = compat_dir.join("libnuma.so.1");
         std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
         let runtime = VllmRuntime {
             python_executable: Some(python),
-            sdk_root: Some(env.path().join("sdk")),
+            sdk_root: Some(sdk),
             ..VllmRuntime::for_test()
         };
-        assert_eq!(vllm_extension_import_problem(&runtime), None);
-        assert!(
-            stale_shim.symlink_metadata().is_ok(),
-            "the probe ran the compat-shim step"
-        );
-        Ok(())
+        Ok((guard, runtime, compat_dir, stale_shim))
     }
     #[cfg(unix)]
     #[test]
