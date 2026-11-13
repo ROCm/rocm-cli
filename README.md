@@ -682,7 +682,12 @@ always right: the index has published a CPU-only torchaudio under the same
 requested version publishes no torchaudio for this Python and platform.
 
 It then asks `uv` to resolve Torch and torchvision from their published
-dependency metadata alongside the pinned torchaudio. Before it creates or
+dependency metadata alongside the pinned torchaudio. For a ROCm line the vLLM
+ROCm 10.x install also supports (10.0 and 10.1), the request is bounded to the
+Torch and torchvision series that install pairs for that line (for 10.1, torch
+2.13 and torchvision 0.28), because the newest torch on the index can pair with
+a torchvision that fails to import. The `version_resolution_specs:` line in the
+plan shows the bound. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 

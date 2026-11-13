@@ -39,6 +39,15 @@ pub fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'static st
     wheel_builds::verified_torchaudio_release(rocm_sdk_version)
 }
 
+/// The `(torch, torchvision)` series the vLLM discover table pairs for
+/// `rocm_sdk_version`'s ROCm `major.minor` line, if it has a row.
+///
+/// Like [`verified_torchaudio_release`], read by `rocm install sdk` so the SDK
+/// and its vLLM install share one table instead of two copies of the pairing.
+pub fn verified_torch_stack_series(rocm_sdk_version: &str) -> Option<(&'static str, &'static str)> {
+    wheel_builds::verified_torch_stack_series(rocm_sdk_version)
+}
+
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 
 #[derive(Parser, Debug)]

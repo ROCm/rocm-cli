@@ -577,9 +577,11 @@ const fn therock_sdk_extras(include_devel: bool) -> &'static str {
 /// The requirement lines handed to `uv pip compile` to pick a mutually
 /// installable version set on the ROCm 10 (`next`) layout.
 ///
-/// torch and torchvision are unversioned on purpose: choosing those versions is
-/// what the resolve is for, and their published metadata depends on the exact
-/// `rocm` build, so the `rocm` pin carries them to the matching `+rocm<build>`.
+/// torch and torchvision carry no exact version on purpose: choosing those
+/// versions is what the resolve is for, and their published metadata depends on
+/// the exact `rocm` build, so the `rocm` pin carries them to the matching
+/// `+rocm<build>`. A line with a vLLM discover row additionally bounds both to
+/// that row's series (`torch==2.13.*`), the pairing verified on hardware.
 /// torchaudio's metadata names no `rocm` build, so left unversioned it resolves
 /// to the newest build on the index — which is a different ROCm build for every
 /// pin but the newest — and the caller pins it to `torchaudio_version`, already
@@ -597,13 +599,23 @@ pub(super) fn published_pip_requirements(
     include_devel: bool,
 ) -> Vec<String> {
     let device_extra = format!("device-{device_target}");
+    // Left to `uv`, torch resolves to the newest build on the index while
+    // torchvision's metadata names no exact torch, so the pair can be one whose
+    // torchvision cannot load (`operator torchvision::nms does not exist`). The
+    // vLLM discover table already records which series pair for this line; pin
+    // to it so the SDK and the engine install settle on the same torch.
+    let (torch_series, torchvision_series) =
+        match rocm_engine_vllm::verified_torch_stack_series(rocm_version) {
+            Some((torch, torchvision)) => (format!("=={torch}.*"), format!("=={torchvision}.*")),
+            None => (String::new(), String::new()),
+        };
     vec![
         format!(
             "rocm[{},{device_extra}]=={rocm_version}",
             therock_sdk_extras(include_devel)
         ),
-        format!("torch[{device_extra}]"),
-        format!("torchvision[{device_extra}]"),
+        format!("torch[{device_extra}]{torch_series}"),
+        format!("torchvision[{device_extra}]{torchvision_series}"),
         format!("torchaudio=={torchaudio_version}"),
     ]
 }
@@ -1884,11 +1896,38 @@ mod tests {
         assert_eq!(
             runtime_only[1..],
             [
-                "torch[device-gfx1200]".to_owned(),
-                "torchvision[device-gfx1200]".to_owned(),
+                "torch[device-gfx1200]==2.12.*".to_owned(),
+                "torchvision[device-gfx1200]==0.27.*".to_owned(),
                 "torchaudio==2.11.0.2+rocm10.0.0".to_owned(),
             ]
         );
+    }
+
+    /// Regression: with torch unconstrained, `uv` took the newest torch on the
+    /// index (2.14.0) next to torchvision 0.28.0, whose metadata accepts any
+    /// torch. That pair cannot register `torchvision::nms`, so every vLLM serve
+    /// on the runtime failed at import. The vLLM discover table pairs torch 2.13
+    /// with torchvision 0.28 for ROCm 10.1; the SDK has to ask for that pair, and
+    /// a line with no row stays unconstrained.
+    #[test]
+    fn version_resolution_pins_the_torch_pair_the_discover_table_verified() {
+        let rocm_10_1 =
+            published_pip_requirements("10.1.0", "2.11.0.2+rocm10.1.0", "gfx942", false);
+        assert_eq!(rocm_10_1[1], "torch[device-gfx942]==2.13.*");
+        assert_eq!(rocm_10_1[2], "torchvision[device-gfx942]==0.28.*");
+
+        // A nightly build of the same line resolves through the same row.
+        let nightly = published_pip_requirements(
+            "10.1.0a20260822",
+            "2.11.0.2+rocm10.1.0a20260822",
+            "gfx942",
+            false,
+        );
+        assert_eq!(nightly[1], "torch[device-gfx942]==2.13.*");
+
+        let no_row = published_pip_requirements("10.2.0", "2.12.0+rocm10.2.0", "gfx942", false);
+        assert_eq!(no_row[1], "torch[device-gfx942]");
+        assert_eq!(no_row[2], "torchvision[device-gfx942]");
     }
 
     /// Resolution and composition are two code paths reading one flag, and the
@@ -2359,8 +2398,8 @@ mod tests {
             unresolved.version_resolution_specs,
             [
                 "rocm[libraries,device-gfx1200]==10.0.0",
-                "torch[device-gfx1200]",
-                "torchvision[device-gfx1200]",
+                "torch[device-gfx1200]==2.12.*",
+                "torchvision[device-gfx1200]==0.27.*",
                 "torchaudio==2.9.1+rocm10.0.0",
             ]
         );
@@ -2583,7 +2622,7 @@ sdk install
   resolution_note: no uv is installed, so a real install would fetch it and run `uv pip compile` to choose the torch and torchvision versions and to check that the published packages install together, which this preview did not do; the package specs, runtime key, install folder, manifest and command depend on those versions and are not resolved here
   python_wheel_tag: cp314
   platform_wheel_tags: linux_x86_64,any
-  version_resolution_specs: rocm[libraries,device-gfx1200]==10.0.0 torch[device-gfx1200] torchvision[device-gfx1200] torchaudio==2.9.1+rocm10.0.0
+  version_resolution_specs: rocm[libraries,device-gfx1200]==10.0.0 torch[device-gfx1200]==2.12.* torchvision[device-gfx1200]==0.27.* torchaudio==2.9.1+rocm10.0.0
   torchaudio_selection: {pin}
   package_specs: not resolved by this preview
   package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction
