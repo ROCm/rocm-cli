@@ -536,11 +536,21 @@ so a working machine can land there, and it has not earned a confirmed "no".
 older `rocm remote doctor` summary that predates it reads as unknown rather
 than as a false "no Vulkan".
 
-The probe runs on `rocm examine` only. `rocm engines` and the `rocm diagnose`
-finding `info-20-gpu-no-rocm-support` still speak from the gfx table alone, so
-they can name Vulkan on a host where `rocm examine` would say otherwise;
-spawning `vulkaninfo` (and PowerShell on Windows) was judged too expensive for
-a plain listing command.
+The probe runs wherever the full host summary is gathered, not on `rocm examine`
+alone: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the
+free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'s
+host snapshot, MCP and sandbox paths. Each of those pays one `vulkaninfo` (or, on
+Windows, one registry read) per gather.
+
+It does not run on the lean scope, `ExamineSummary::gather_without_driver_facts`,
+which the runtime-install finalizer uses to read the GPU target: that leaves
+`vulkan` as `None`, meaning "not probed", which reads as unknown rather than as a
+false "no Vulkan".
+
+`rocm engines` and the `rocm diagnose` finding `info-20-gpu-no-rocm-support` still
+speak from the gfx table alone, so they can name Vulkan on a host where `rocm
+examine` would say otherwise; spawning `vulkaninfo` (and PowerShell on Windows)
+was judged too expensive for a plain listing command.
 
 #### Compiler toolchain (--devel)
 

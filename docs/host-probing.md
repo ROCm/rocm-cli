@@ -188,6 +188,23 @@ Proposal: the summary stack's inventory survives and `probe_gpus_windows` builds
 
 Hosts: this pair is native Windows only; on WSL `gpus[]` is already empty (see the host table), so rebuilding it from the inventory changes nothing there. The characterisation test covers an inventory that answers with one AMD adapter, with an AMD and an NVIDIA adapter, with an NVIDIA adapter only, with no adapter, that fails, and that times out, because `None` in the summary and an empty `gpus[]` with a `probe_failures` entry in the examination are different answers to "no adapter" and "could not ask", and the convergence must keep that distinction.
 
+## Vulkan support
+
+Verdict: not a duplicate — only the summary stack reads it — but it is a spawned process on a path that several commands reach, so it belongs in this note.
+
+`detect_vulkan_support` in [vulkan.rs](../crates/rocm-core/src/host_gpu/vulkan.rs) answers two questions: which ICD manifests the loader would find, and which devices actually enumerate.
+
+| | Linux | Windows |
+|---|---|---|
+| ICDs | the manifest directories, read from the filesystem | `powershell` over the Khronos `Drivers` registry keys |
+| Devices | `vulkaninfo --summary` | the same registry read; `vulkaninfo` is rarely on PATH |
+| Timeout | 1.5 s (`OPTIONAL_COMMAND_TIMEOUT`), per candidate spelling | the same 1.5 s, which a cold PowerShell start can exceed |
+| Failure | `None` from `capture_optional_command`, which does not distinguish "not installed" from "timed out" | the same |
+
+Who pays it. The probe runs once per full gather, so every caller of `ExamineSummary::gather` pays one: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'s host snapshot, MCP and sandbox paths. It is deliberately *not* run by the lean scope, `gather_without_driver_facts`, which the runtime-install finalizer uses to read the GPU target and nothing else; that scope leaves `vulkan` as `None` and `vulkan_status` reports `Unknown`. `the_summary_without_driver_facts_does_not_probe_vulkan` pins that, so restoring an unconditional probe fails a test rather than quietly adding a process to the install path.
+
+What a user can see: on a Windows host whose PowerShell start is slower than 1.5 s, the probe times out and the host reads Vulkan-unconfirmed rather than Vulkan-capable — the same answer it gives a host with no ICD at all. That collapse is in `capture_optional_command`, not in the parser, and it is the gap called out in the review of #1036: the Windows branch has no unit coverage of its failure and timeout cases.
+
 ## Marketing name to gfx target
 
 Verdict: confirmed duplicate, but not equivalent. The two cover different names.
