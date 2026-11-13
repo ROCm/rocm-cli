@@ -63,8 +63,10 @@ pub enum VulkanStatus {
     /// The probe looked and found no GPU Vulkan driver. A software rasteriser
     /// alone lands here, not in [`Self::Available`].
     Absent,
-    /// The probe looked and came away with nothing either way: no ICD manifest,
-    /// no enumerated device, and no `vulkaninfo` to ask.
+    /// The probe came away with nothing either way: no ICD manifest, no
+    /// enumerated device, and at least one of the two sources that never
+    /// answered — `vulkaninfo` missing or failing, or (on Windows) a registry
+    /// listing that could not be run.
     ///
     /// Distinct from [`Self::Unknown`], which is a platform that cannot be
     /// probed at all. The difference decides what the host is told: an
@@ -163,18 +165,24 @@ impl VulkanSupport {
             .find(|device| device.is_amd() && device.is_hardware())
             .and_then(|device| device.driver_name.clone())
             .or_else(|| {
-                // Filtered the same way `classify_vulkan_support` filters its
-                // own driver naming. Without this, an `Available` host whose AMD
-                // device omitted the optional `driverName`, on a machine that
-                // also has lavapipe installed, would be told the software
-                // rasteriser is the driver behind the GPU path it was just
-                // promised — contradicting this module's "a software rasteriser
-                // never counts as a GPU path" invariant in the one place the
-                // user actually reads a driver name.
+                // Restricted to AMD-branded manifests, because this fallback
+                // only ever runs once an AMD hardware device has *already* been
+                // confirmed: whatever it names is read as the driver behind
+                // that device. "Not a known software rasteriser" was too weak a
+                // filter for that job — `detect_icds` sorts alphabetically on
+                // Linux, so a dual-vendor host carrying both `nvidia_icd.json`
+                // and `radeon_icd.x86_64.json` had the NVIDIA manifest win the
+                // `find_map` and a confirmed AMD Vulkan path was attributed to
+                // NVIDIA's driver.
+                //
+                // Narrowing to AMD subsumes the software-rasteriser exclusion
+                // this replaces (lavapipe and SwiftShader are not AMD labels),
+                // so the "a software rasteriser never counts as a GPU path"
+                // invariant still holds in the one place the user actually
+                // reads a driver name.
                 self.icds
                     .iter()
-                    .filter(|icd| icd_is_gpu_driver(icd))
-                    .find_map(|icd| icd_driver_label(icd))
+                    .find_map(|icd| amd_icd_driver_label(icd))
                     .map(str::to_owned)
             })
     }
@@ -211,6 +219,20 @@ pub fn icd_driver_label(icd: &str) -> Option<&'static str> {
         return Some("Intel");
     }
     None
+}
+
+/// The driver an ICD manifest's file name implies **when that driver is AMD's**,
+/// and `None` for every other vendor (software rasterisers included — none of
+/// them is AMD).
+///
+/// The vendor test lives here, beside the one table that maps a file name to a
+/// label, rather than being spelled out at each call site: a caller that must
+/// not name another vendor's driver asks this instead of re-deriving which
+/// prefixes are AMD's. It reads the label rather than the file name for the same
+/// reason [`icd_is_gpu_driver`] does — one table, one place to extend.
+#[must_use]
+pub fn amd_icd_driver_label(icd: &str) -> Option<&'static str> {
+    icd_driver_label(icd).filter(|label| matches!(*label, "Mesa RADV" | "AMDVLK"))
 }
 
 /// Whether an ICD manifest names a driver that runs on a GPU.
@@ -296,9 +318,16 @@ pub fn parse_windows_vulkan_icd_listing(output: &str) -> Vec<String> {
 #[cfg(any(windows, test))]
 pub(super) const WINDOWS_VULKAN_ICD_SCRIPT: &str = r#"foreach ($key in 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers','HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers') { if (Test-Path $key) { foreach ($name in (Get-Item $key).GetValueNames()) { "ICD`t$name" } } }"#;
 
-/// Every Vulkan ICD manifest this host's loader would read.
+/// Every Vulkan ICD manifest this host's loader would read, and whether the
+/// lookup **ran** — the ICD-side counterpart of `enumerated`.
+///
+/// On Linux the lookup is a read of a fixed list of manifest directories, and
+/// there is no step in it that can fail in a way distinguishable from an honest
+/// "nothing is installed here": a directory that does not exist is exactly what
+/// a host with no Vulkan driver looks like. So the flag is unconditionally
+/// `true` — the lookup always happens — rather than a placeholder.
 #[cfg(target_os = "linux")]
-fn detect_icds() -> Vec<String> {
+fn detect_icds() -> (Vec<String>, bool) {
     let mut icds = Vec::new();
     for dir in LINUX_ICD_DIRS {
         let Ok(entries) = std::fs::read_dir(host_path(dir)) else {
@@ -315,12 +344,19 @@ fn detect_icds() -> Vec<String> {
     }
     icds.sort();
     icds.dedup();
-    icds
+    (icds, true)
 }
 
+/// On Windows the lookup is a PowerShell read of the Khronos registry keys, and
+/// that genuinely can fail: `capture_optional_command` yields `None` for a
+/// missing `powershell`, a non-zero exit **and** a timeout alike. Collapsing
+/// that `None` into the empty `Vec` an empty registry key produces made a flaky
+/// PowerShell on a host with a working AMD driver read identically to a host
+/// with no driver at all, which is the conflation `enumerated` exists to prevent
+/// on the `vulkaninfo` side.
 #[cfg(windows)]
-fn detect_icds() -> Vec<String> {
-    capture_optional_command(
+fn detect_icds() -> (Vec<String>, bool) {
+    windows_icds_from_capture(capture_optional_command(
         "powershell",
         &[
             "-NoLogo",
@@ -329,14 +365,32 @@ fn detect_icds() -> Vec<String> {
             "-Command",
             WINDOWS_VULKAN_ICD_SCRIPT,
         ],
-    )
-    .map(|output| parse_windows_vulkan_icd_listing(&output))
-    .unwrap_or_default()
+    ))
 }
 
+/// Nothing here can be read on a platform that is neither Linux nor Windows, so
+/// the flag says the lookup did not run. The classifier never sees it today —
+/// `vulkan_is_probeable()` is false there and returns [`VulkanStatus::Unknown`]
+/// first — but it must not claim a lookup happened where none exists.
 #[cfg(not(any(target_os = "linux", windows)))]
-const fn detect_icds() -> Vec<String> {
-    Vec::new()
+const fn detect_icds() -> (Vec<String>, bool) {
+    (Vec::new(), false)
+}
+
+/// The pure half of the Windows [`detect_icds`]: the manifests the capture
+/// named, and whether PowerShell actually **answered**.
+///
+/// Compiled on every platform, not just Windows, so the Linux lanes can test the
+/// failure path at all — the registry read itself has no gate but CI's
+/// `windows-build-and-test` job. `Some` means the script exited 0 and its stdout
+/// is in hand, so an empty list from it is a real "the key holds no ICD"; `None`
+/// is the un-run lookup that must not be reported as one.
+#[must_use]
+pub fn windows_icds_from_capture(captured: Option<String>) -> (Vec<String>, bool) {
+    captured.map_or_else(
+        || (Vec::new(), false),
+        |output| (parse_windows_vulkan_icd_listing(&output), true),
+    )
 }
 
 /// The devices `vulkaninfo --summary` reports, or an empty list when the tool
@@ -376,17 +430,30 @@ const fn vulkan_is_probeable() -> bool {
 /// What this host offers for Vulkan.
 #[must_use]
 pub fn detect_vulkan_support() -> VulkanSupport {
+    let (icds, icds_listed) = detect_icds();
     let (devices, enumerated) = detect_vulkan_devices();
-    classify_vulkan_support(detect_icds(), devices, vulkan_is_probeable(), enumerated)
+    classify_vulkan_support(
+        icds,
+        devices,
+        vulkan_is_probeable(),
+        icds_listed,
+        enumerated,
+    )
 }
 
 /// The pure decision behind [`detect_vulkan_support`], split out so every
 /// combination of evidence can be tested without a Vulkan install.
+///
+/// `icds_listed` and `enumerated` are the two "did this source answer at all"
+/// flags, one per source, and they are what keep "could not look" apart from
+/// "looked and found nothing". Both must be true before an empty result may be
+/// reported as a confirmed absence.
 #[must_use]
 pub fn classify_vulkan_support(
     icds: Vec<String>,
     devices: Vec<VulkanDevice>,
     probeable: bool,
+    icds_listed: bool,
     enumerated: bool,
 ) -> VulkanSupport {
     if !probeable {
@@ -440,14 +507,38 @@ pub fn classify_vulkan_support(
         // or is too old for `--summary` is not — it answered nothing, so it
         // cannot be the evidence that turns an empty result into a confirmed
         // absence.
-        if icds.is_empty() && devices.is_empty() && !enumerated {
+        //
+        // `icds_listed` is the same question asked of the other source, and it
+        // is why an empty `icds` alone proves nothing: on Windows the listing is
+        // a PowerShell registry read that can be missing, fail or time out, and
+        // all three arrive here as the same empty `Vec` a genuinely empty
+        // registry key produces. Both sources must have answered before an empty
+        // result may be called an absence.
+        if icds.is_empty() && devices.is_empty() && !(icds_listed && enumerated) {
+            // Which source went unread decides the sentence: a host is owed the
+            // reason nothing could be concluded about it, and "no Vulkan driver
+            // was found" is a claim only a lookup that ran may make.
+            let detail = match (icds_listed, enumerated) {
+                // The lookup ran and found no manifest; only `vulkaninfo` is
+                // missing. (`(true, true)` cannot reach here — it is the
+                // confirmed absence handled below.)
+                (true, _) => {
+                    "no Vulkan driver was found, and `vulkaninfo` could not confirm that either \
+                     (not installed, or it failed to run), so nothing here confirms one is absent"
+                }
+                (false, true) => {
+                    "`vulkaninfo` ran and listed no device, but the installed Vulkan drivers could \
+                     not be listed on this host, so nothing here confirms a driver is absent"
+                }
+                (false, false) => {
+                    "the installed Vulkan drivers could not be listed on this host, and \
+                     `vulkaninfo` could not confirm anything either (not installed, or it failed \
+                     to run), so nothing here shows whether a driver is present"
+                }
+            };
             return VulkanSupport {
                 status: VulkanStatus::Inconclusive,
-                detail: Some(
-                    "no Vulkan driver was found, and `vulkaninfo` could not confirm that either (not \
-                     installed, or it failed to run), so nothing here confirms one is absent"
-                        .to_owned(),
-                ),
+                detail: Some(detail.to_owned()),
                 icds,
                 devices,
             };
@@ -475,6 +566,9 @@ pub fn classify_vulkan_support(
                 devices,
             };
         }
+        // Reaching the first arm means `icds` is empty *and* both sources
+        // answered (the branch above returned otherwise), so this is the only
+        // place entitled to deny the driver outright.
         let detail = if icds.is_empty() {
             "no Vulkan driver found".to_owned()
         } else {
@@ -488,9 +582,17 @@ pub fn classify_vulkan_support(
         };
     }
 
+    // An AMD manifest wins over any other vendor's, for the same reason
+    // `driver_label` restricts its fallback: this sentence is the justification
+    // the host is handed for being offered a Vulkan path for its AMD GPU, and on
+    // a dual-vendor box the alphabetical sort would otherwise open it with
+    // "NVIDIA is installed". A non-AMD label is still used when it is the only
+    // one there, because the status beside it claims nothing about AMD — it says
+    // a driver is installed and no AMD device was confirmed.
     let named = gpu_icds
         .iter()
-        .find_map(|icd| icd_driver_label(icd))
+        .find_map(|icd| amd_icd_driver_label(icd))
+        .or_else(|| gpu_icds.iter().find_map(|icd| icd_driver_label(icd)))
         .map_or_else(
             || "a Vulkan driver is installed".to_owned(),
             |label| format!("{label} is installed"),
@@ -590,7 +692,7 @@ GPU0:
     fn a_real_renoir_host_reports_vulkan_available_and_names_its_driver() {
         let devices = parse_vulkaninfo_summary(RENOIR_WINDOWS_SUMMARY);
 
-        let support = classify_vulkan_support(Vec::new(), devices, true, true);
+        let support = classify_vulkan_support(Vec::new(), devices, true, true, true);
 
         assert_eq!(support.status, VulkanStatus::Available);
         assert!(support.status.is_usable());
@@ -620,8 +722,13 @@ GPU0:
         assert_eq!(devices.len(), 1);
         assert!(!devices[0].is_hardware());
 
-        let support =
-            classify_vulkan_support(vec!["lvp_icd.x86_64.json".to_owned()], devices, true, true);
+        let support = classify_vulkan_support(
+            vec!["lvp_icd.x86_64.json".to_owned()],
+            devices,
+            true,
+            true,
+            true,
+        );
 
         assert_eq!(
             support.status,
@@ -645,6 +752,7 @@ GPU0:
             Vec::new(),
             true,
             true,
+            true,
         );
 
         assert_eq!(support.status, VulkanStatus::Absent);
@@ -664,6 +772,7 @@ GPU0:
         let asked = classify_vulkan_support(
             vec!["radeon_icd.x86_64.json".to_owned()],
             Vec::new(),
+            true,
             true,
             true,
         );
@@ -691,6 +800,7 @@ GPU0:
             vec!["radeon_icd.x86_64.json".to_owned()],
             Vec::new(),
             true,
+            true,
             false,
         );
 
@@ -717,7 +827,7 @@ GPU0:
     fn no_evidence_either_way_is_not_reported_as_a_confirmed_absence() {
         // `vulkaninfo` absent: nothing could have found a driver, so nothing
         // may claim there is none.
-        let unasked = classify_vulkan_support(Vec::new(), Vec::new(), true, false);
+        let unasked = classify_vulkan_support(Vec::new(), Vec::new(), true, true, false);
         assert_eq!(
             unasked.status,
             VulkanStatus::Inconclusive,
@@ -734,7 +844,7 @@ GPU0:
 
         // `vulkaninfo` present and it found nothing: that IS the answer, and
         // it is the shape a host genuinely without a driver takes.
-        let nothing = classify_vulkan_support(Vec::new(), Vec::new(), true, true);
+        let nothing = classify_vulkan_support(Vec::new(), Vec::new(), true, true, true);
         assert_eq!(
             nothing.status,
             VulkanStatus::Absent,
@@ -748,12 +858,15 @@ GPU0:
             Vec::new(),
             true,
             true,
+            true,
         );
         assert_eq!(software_only.status, VulkanStatus::Absent);
 
         // macOS and friends: no evidence either way, which must not read as
         // "no Vulkan" any more than it reads as "Vulkan works".
-        let unprobeable = classify_vulkan_support(Vec::new(), Vec::new(), false, false);
+        // An unprobeable platform is the one place `icds_listed` is false
+        // without a failure: the `cfg` stub there has nothing it could read.
+        let unprobeable = classify_vulkan_support(Vec::new(), Vec::new(), false, false, false);
         assert_eq!(unprobeable.status, VulkanStatus::Unknown);
         assert!(!unprobeable.status.is_usable());
     }
@@ -768,6 +881,7 @@ GPU0:
         let support = classify_vulkan_support(
             vec!["some_new_vendor_icd.x86_64.json".to_owned()],
             Vec::new(),
+            true,
             true,
             true,
         );
@@ -788,8 +902,13 @@ GPU1:
 \tdeviceName   = AMD Radeon RX 7900 XTX
 \tdriverName   = radv
 ";
-        let support =
-            classify_vulkan_support(Vec::new(), parse_vulkaninfo_summary(mixed), true, true);
+        let support = classify_vulkan_support(
+            Vec::new(),
+            parse_vulkaninfo_summary(mixed),
+            true,
+            true,
+            true,
+        );
 
         assert_eq!(support.status, VulkanStatus::Available);
         assert_eq!(support.driver_label().as_deref(), Some("radv"));
@@ -824,6 +943,7 @@ GPU0:
             parse_vulkaninfo_summary(nvidia),
             true,
             true,
+            true,
         );
 
         // The driver is installed and is not software, so the status stops short
@@ -854,7 +974,7 @@ GPU0:
             "a run that produced no output did not look at this host"
         );
         assert_eq!(
-            classify_vulkan_support(Vec::new(), devices, true, enumerated).status,
+            classify_vulkan_support(Vec::new(), devices, true, true, enumerated).status,
             VulkanStatus::Inconclusive,
             "so it must not be reported as a confirmed absence"
         );
@@ -867,7 +987,7 @@ GPU0:
             "an empty answer is still an answer"
         );
         assert_eq!(
-            classify_vulkan_support(Vec::new(), devices, true, enumerated).status,
+            classify_vulkan_support(Vec::new(), devices, true, true, enumerated).status,
             VulkanStatus::Absent,
             "and that one has earned the confirmed absence"
         );
@@ -888,8 +1008,13 @@ GPU0:
 ";
         // No ICD manifest at all, so the pre-fix code fell to "no Vulkan driver
         // found" despite the enumeration above.
-        let support =
-            classify_vulkan_support(Vec::new(), parse_vulkaninfo_summary(nvidia), true, true);
+        let support = classify_vulkan_support(
+            Vec::new(),
+            parse_vulkaninfo_summary(nvidia),
+            true,
+            true,
+            true,
+        );
 
         let detail = support.detail.as_deref().unwrap_or_default();
         assert!(
@@ -969,5 +1094,215 @@ GPU0:
     fn a_vulkaninfo_report_with_no_devices_yields_none() {
         assert!(parse_vulkaninfo_summary("Vulkan Instance Version: 1.3.301\n").is_empty());
         assert!(parse_vulkaninfo_summary("").is_empty());
+    }
+
+    /// The ICD side of "could not look" versus "looked and found nothing" — the
+    /// same distinction `enumerated` draws for `vulkaninfo`, which the ICD
+    /// source had no signal for.
+    ///
+    /// On Windows the listing is a PowerShell registry read, and
+    /// `capture_optional_command` reports a missing binary, a non-zero exit and
+    /// a timeout as one `None`, which `unwrap_or_default()` then turned into the
+    /// very empty `Vec` an empty Khronos key produces. Asserting that the two
+    /// details *differ*, rather than asserting each alone, is what keeps the
+    /// claim tied to the evidence: collapsing them back together has to fail
+    /// here.
+    #[test]
+    fn a_failed_icd_lookup_is_not_reported_as_a_host_without_a_driver() {
+        // Nothing read the registry, and `vulkaninfo` did not answer either.
+        let unread = classify_vulkan_support(Vec::new(), Vec::new(), true, false, false);
+        // Same host, except the lookup ran and genuinely found no manifest.
+        let read = classify_vulkan_support(Vec::new(), Vec::new(), true, true, false);
+
+        assert_eq!(unread.status, VulkanStatus::Inconclusive);
+        assert_eq!(read.status, VulkanStatus::Inconclusive);
+        let unread_detail = unread.detail.clone().expect("a detail is always set here");
+        let read_detail = read.detail.clone().expect("a detail is always set here");
+        assert!(
+            !unread_detail.contains("no Vulkan driver was found"),
+            "the driver list was never read, so nothing here may report it empty: {unread:?}"
+        );
+        assert!(
+            unread_detail.contains("could not be listed"),
+            "the host is owed the reason nothing could be concluded about it: {unread:?}"
+        );
+        assert!(
+            read_detail.contains("no Vulkan driver was found"),
+            "a lookup that ran and found nothing is entitled to say so: {read:?}"
+        );
+        assert_ne!(
+            unread_detail, read_detail,
+            "`icds_listed` is the difference between a lookup that never ran and one that ran \
+             and came back empty; a host whose PowerShell failed must not be told what a host \
+             with a genuinely empty registry key is told"
+        );
+
+        // `Absent` is the confirmed claim, and it takes *both* sources having
+        // answered. A `vulkaninfo` that ran and listed nothing is not enough on
+        // its own while the driver list went unread.
+        let only_vulkaninfo_answered =
+            classify_vulkan_support(Vec::new(), Vec::new(), true, false, true);
+        assert_eq!(
+            only_vulkaninfo_answered.status,
+            VulkanStatus::Inconclusive,
+            "one source of two is not an exhaustive look: {only_vulkaninfo_answered:?}"
+        );
+        assert!(
+            only_vulkaninfo_answered
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("could not be listed")),
+            "{only_vulkaninfo_answered:?}"
+        );
+        assert_eq!(
+            classify_vulkan_support(Vec::new(), Vec::new(), true, true, true).status,
+            VulkanStatus::Absent,
+            "both sources answered and both came back empty: that one has earned the claim"
+        );
+    }
+
+    /// The Windows seam itself, at the only level a Linux lane can reach it: the
+    /// pure half of `detect_icds`. The registry read behind it is exercised
+    /// nowhere but CI's `windows-build-and-test`, so the failure and timeout
+    /// paths — all of which arrive here as `None` — are covered through this.
+    #[test]
+    fn a_powershell_that_never_answered_is_not_an_empty_registry_key() {
+        // Missing `powershell`, a non-zero exit, or a timeout: all one `None`.
+        let (icds, listed) = windows_icds_from_capture(None);
+        assert!(
+            icds.is_empty() && !listed,
+            "a run that produced no output did not read the registry"
+        );
+        assert_eq!(
+            classify_vulkan_support(icds, Vec::new(), true, listed, false).status,
+            VulkanStatus::Inconclusive,
+            "so it must not be reported as a confirmed absence"
+        );
+
+        // Exit 0 with no `ICD` row: the key really is empty, and that answer is
+        // what a host with no Vulkan driver installed looks like.
+        let (icds, listed) = windows_icds_from_capture(Some(String::new()));
+        assert!(
+            icds.is_empty() && listed,
+            "an empty answer is still an answer"
+        );
+        assert_eq!(
+            classify_vulkan_support(icds, Vec::new(), true, listed, true).status,
+            VulkanStatus::Absent,
+            "and that one has earned the confirmed absence"
+        );
+
+        let (icds, listed) = windows_icds_from_capture(Some(
+            "ICD\tC:\\Windows\\System32\\amdvlk64.json\n".to_owned(),
+        ));
+        assert!(listed);
+        assert_eq!(icds.len(), 1, "{icds:?}");
+        assert_eq!(amd_icd_driver_label(&icds[0]), Some("AMDVLK"));
+    }
+
+    /// A confirmed AMD Vulkan path must never be attributed to another vendor's
+    /// driver. `detect_icds` sorts alphabetically on Linux, so on a host with
+    /// both manifests installed `nvidia_icd.json` came first and won the old
+    /// "any manifest that is not a software rasteriser" fallback — naming NVIDIA
+    /// as the driver behind an AMD device the probe had already confirmed.
+    #[test]
+    fn a_dual_vendor_host_names_the_amd_driver_behind_a_confirmed_amd_device() {
+        // The AMD entry omits the optional `driverName`, which is the only
+        // reason the ICD fallback runs at all.
+        let dual_vendor = "\
+GPU0:
+\tvendorID     = 0x10de
+\tdeviceType   = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+\tdeviceName   = NVIDIA GeForce GTX 1050 Ti
+\tdriverName   = NVIDIA
+GPU1:
+\tvendorID     = 0x1002
+\tdeviceType   = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+\tdeviceName   = AMD Radeon RX 7900 XTX
+";
+        let devices = parse_vulkaninfo_summary(dual_vendor);
+        assert_eq!(devices.len(), 2, "{devices:?}");
+        assert!(
+            devices[1].is_amd() && devices[1].driver_name.is_none(),
+            "{devices:?}"
+        );
+
+        let support = classify_vulkan_support(
+            // Alphabetical, as `detect_icds` returns them on Linux.
+            vec![
+                "nvidia_icd.json".to_owned(),
+                "radeon_icd.x86_64.json".to_owned(),
+            ],
+            devices,
+            true,
+            true,
+            true,
+        );
+
+        assert_eq!(support.status, VulkanStatus::Available);
+        assert_eq!(
+            support.driver_label().as_deref(),
+            Some("Mesa RADV"),
+            "the confirmed device is AMD's, so only an AMD manifest may name its driver: \
+             {support:?}"
+        );
+
+        // The sibling instance: the sentence that justifies offering a host a
+        // Vulkan path when no AMD device was confirmed at all.
+        let unconfirmed = classify_vulkan_support(
+            vec![
+                "nvidia_icd.json".to_owned(),
+                "radeon_icd.x86_64.json".to_owned(),
+            ],
+            Vec::new(),
+            true,
+            true,
+            false,
+        );
+        let unconfirmed_detail = unconfirmed.detail.as_deref().unwrap_or_default();
+        assert!(
+            unconfirmed_detail.starts_with("Mesa RADV is installed"),
+            "the AMD manifest must open the sentence an AMD GPU is routed on: {unconfirmed:?}"
+        );
+        assert!(!unconfirmed_detail.contains("NVIDIA"), "{unconfirmed:?}");
+
+        // A host where NVIDIA genuinely is all there is still gets named it:
+        // that status claims nothing about AMD. But `driver_label` — which only
+        // ever speaks for a confirmed AMD device — must stay silent.
+        let nvidia_only = classify_vulkan_support(
+            vec!["nvidia_icd.json".to_owned()],
+            Vec::new(),
+            true,
+            true,
+            false,
+        );
+        assert!(
+            nvidia_only
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("NVIDIA is installed")),
+            "naming the only driver there is remains correct: {nvidia_only:?}"
+        );
+        assert_eq!(
+            nvidia_only.driver_label(),
+            None,
+            "no AMD device, no AMD manifest: there is no AMD driver to name: {nvidia_only:?}"
+        );
+
+        assert_eq!(
+            amd_icd_driver_label("radeon_icd.x86_64.json"),
+            Some("Mesa RADV")
+        );
+        assert_eq!(amd_icd_driver_label("amdvlk64.json"), Some("AMDVLK"));
+        assert_eq!(amd_icd_driver_label("amd_icd64.json"), Some("AMDVLK"));
+        assert_eq!(amd_icd_driver_label("nvidia_icd.json"), None);
+        assert_eq!(amd_icd_driver_label("intel_icd.x86_64.json"), None);
+        assert_eq!(
+            amd_icd_driver_label("lvp_icd.x86_64.json"),
+            None,
+            "a software rasteriser is never an AMD GPU driver, so narrowing to AMD keeps the \
+             exclusion the old filter provided"
+        );
+        assert_eq!(amd_icd_driver_label("some_new_vendor_icd.json"), None);
     }
 }

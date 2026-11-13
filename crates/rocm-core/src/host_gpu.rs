@@ -75,9 +75,9 @@ pub use linux::is_amdgpu_device;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
 pub use vulkan::{
-    VulkanDevice, VulkanStatus, VulkanSupport, classify_vulkan_support, detect_vulkan_support,
-    icd_driver_label, icd_is_gpu_driver, parse_vulkaninfo_summary,
-    parse_windows_vulkan_icd_listing,
+    VulkanDevice, VulkanStatus, VulkanSupport, amd_icd_driver_label, classify_vulkan_support,
+    detect_vulkan_support, icd_driver_label, icd_is_gpu_driver, parse_vulkaninfo_summary,
+    parse_windows_vulkan_icd_listing, windows_icds_from_capture,
 };
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
