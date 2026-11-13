@@ -370,9 +370,9 @@ pub(crate) enum Command {
         /// That job already fails if any E2E lane that ran didn't upload its
         /// `report.json` (preflight failure, timeout, runner loss), which would
         /// otherwise just vanish from the consolidated E2E report's totals,
-        /// reading as zero failures. Gating on this job's result (rather than
-        /// each lane job's own `continue-on-error`-masked result, which is
-        /// always `success`) covers every lane, present and future, for free.
+        /// reading as zero failures. Gating on this job's result covers every
+        /// lane, present and future, with no second copy of the lane list. The
+        /// lane jobs' own results are not read (see docs/ci-hardware-testing.md).
         /// Caveat: a re-run can pass on an earlier attempt's artifact, so this
         /// can miss a lane.
         #[arg(long)]

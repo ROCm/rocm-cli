@@ -249,18 +249,17 @@ without the passthrough runs the non-GPU suite and reports the GPU scenarios as
 not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
-covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
-pull request runs only the MI300X and Windows Strix Halo pool lanes among them);
-`nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
-platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
-per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
-included. Each joins its platforms'
-reports — including partial or failed runs — by scenario id into one HTML report
-and GitHub step summary. Since ROCMAI-429 the report keys each column by
+covers the mock platform; `e2e-selfhosted.yml`'s `e2e-report` covers its
+self-hosted GPU platforms (a pull request runs only the MI300X and Windows Strix
+Halo pool lanes among them); `nightly.yml`'s `e2e-report-nightly` covers a
+strict superset of those platforms (it also runs `e2e-gpu-nightly-rad3` and
+`e2e-gpu-nightly-mi350p`, demoted from per-PR to nightly-only per ROCMAI-125)
+with the `@nightly` scenarios included. Each joins its platforms' reports —
+including partial or failed runs — by scenario id into one HTML report and
+GitHub step summary. Since ROCMAI-429 the report keys each column by
 `(platform_slug, channel)` rather than platform alone, so `nightly.yml`'s
-release/nightly channel matrix renders two columns per platform instead of
-one channel's result silently overwriting the other.
+release/nightly channel matrix renders two columns per platform instead of one
+channel's result silently overwriting the other.
 
 On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
@@ -309,7 +308,10 @@ via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
 build results, the consolidated E2E failure total, and the `e2e-report-nightly`
 job's own result (so a lane that dies before uploading a report still fails
 the gate), and buckets commits since the last release tag into
-features/fixes/breaking changes. Unlike the wiki-publish jobs above, the
+features/fixes/breaking changes. It reads `e2e-report-nightly`'s result and
+the report's failure total, not the lane jobs' own results, so it can read GO
+while a lane is red for a reason the report does not record as a failure.
+Unlike the wiki-publish jobs above, the
 `release-readiness-nightly` and `release-readiness-narrative` jobs have no
 `main`/repo guard — they run on any branch this workflow is dispatched on.
 The narrative job drafts prose from those facts via `actions/ai-inference`
@@ -577,15 +579,42 @@ The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
 `e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-w7900` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
-it reports. Four of them run with `continue-on-error: false`, so a real
+it reports. In `e2e-selfhosted.yml`, four of them run with
+`continue-on-error: false`, so a real
 regression shows red instead of always green; `e2e-gpu-w7900` runs with
 `continue-on-error: true` while that hardware is being proven out, and should
 be flipped to `false` once it has a track record. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
-job, naming the lane, rather than silently dropping out of the grid; on a
+job, naming the lane, rather than silently dropping out of the grid; on the
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
+
+No E2E lane in [`nightly.yml`](../.github/workflows/nightly.yml) sets
+`continue-on-error`, on the job or on any step, `e2e-gpu-nightly-w7900` and
+`e2e-gpu-nightly-mi350p` included, so a leg that fails turns its lane and the
+whole Nightly run red. (Two non-lane jobs, `release-readiness-narrative` and
+`publish-release-readiness-wiki`, still use it.) Job-level
+`continue-on-error: true` would instead make the failed lane read `success`,
+both in `needs.<lane>.result` and in the run's conclusion, and a step-level one
+would let the failing step pass the job. In `e2e-selfhosted.yml`,
+`e2e-gpu-w7900` (which no longer runs on pull requests) stays masked only while that hardware is proven out (see the header of
+[`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)); its nightly
+counterpart runs unmasked. Nightly gates no merge or tag either way. On a red
+night the consolidated report and release-readiness jobs still run, and the E2E
+wiki page is updated only when `e2e-report-nightly` succeeded and
+`publish-e2e-wiki`'s other guards hold; the report job fails, for example, when
+a lane that ran uploaded no report, and then the previous page stays in place.
+`e2e_lanes_do_not_mask_failures_with_continue_on_error` in
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs) enforces this with a
+line scan of every self-hosted lane in both workflows that is fail-closed for
+the spellings it reads: outside comments, any line mentioning
+`continue-on-error` that is not exactly `continue-on-error: false` (or
+`- continue-on-error: false`) marks the lane masked, even inside a `run:`
+script. Its limits (each line is cut at ` #`, the match is case-sensitive, and
+merge keys from outside the job are not followed) are listed in the
+`continue_on_error_lines` doc comment. The masked set must be empty for nightly
+and exactly `e2e-gpu-w7900` in `e2e-selfhosted.yml`.
 
 ### Timeouts on the Strix lanes
 

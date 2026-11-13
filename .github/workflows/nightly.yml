@@ -404,13 +404,19 @@ jobs:
   # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Like every nightly lane, it sets no `continue-on-error`: a failing leg fails
+  # this job and the Nightly run, and `needs` downstream reads `failure`. The
+  # report and release-readiness jobs below still run on such a night. The E2E
+  # wiki page is updated only when e2e-report-nightly succeeded (it fails, for
+  # example, when a lane that ran uploaded no report) and the other guards in
+  # publish-e2e-wiki's `if:` hold; otherwise the previous page stays in place.
+  # Nightly gates no merge or tag, so a red run blocks nothing; it only reports.
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
     # `mi300x`, not `amd-gpu` — see the same pin on e2e-selfhosted.yml's e2e-gpu.
     runs-on: [self-hosted, linux, mi300x]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -506,16 +512,17 @@ jobs:
           name: e2e-gpu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
-  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, shared uv
-  # cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
-  # the report crate asserts the nightly lanes publish the same platforms as the
-  # per-PR lanes.
+  # rad3 R9700 counterpart to e2e-gpu-nightly (r9700 label, shared uv cache, GPU
+  # preflight), with @nightly scenarios enabled. Nightly-only: the per-PR R9700
+  # lane was demoted per ROCMAI-125, so e2e-selfhosted.yml has no counterpart to
+  # keep in step with. xtask's
+  # `the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes` asserts
+  # only that nightly covers every platform e2e-selfhosted.yml publishes,
+  # which this lane adds to.
   e2e-gpu-nightly-rad3:
     name: E2E tests (rad3 R9700, incl. nightly-only)
     timeout-minutes: 90
     runs-on: [self-hosted, linux, r9700]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -543,8 +550,8 @@ jobs:
       # leftover serve, low enough that a clean pod passes on the first poll; do
       # NOT scale it down for a smaller part. On a 32GB card it still only trips
       # past 16 GiB held, so the floor alone would miss a leftover serve holding
-      # less than that; the process gate is what catches it (#446). Same as the
-      # per-PR rad3 lane. See .github/scripts/gpu-preflight.sh.
+      # less than that; the process gate is what catches it (#446). See
+      # .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
         env:
           GPU_PREFLIGHT_MIN_FREE_GIB: 16
@@ -596,7 +603,6 @@ jobs:
     name: E2E tests (MI350P, incl. nightly-only)
     timeout-minutes: 90
     runs-on: [self-hosted, linux, mi350p]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -619,11 +625,11 @@ jobs:
         run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
-      # process survives. Floor matches the per-PR MI350P lane and the other
-      # Instinct lane — low enough that a clean pod passes on the first poll,
-      # and against a pool this size it only trips near exhaustion, so the
-      # process gate is what actually catches a leftover serve (#446). See
-      # .github/scripts/gpu-preflight.sh.
+      # process survives. Floor matches the other Instinct lane (there is no
+      # per-PR MI350P lane, ROCMAI-125) — low enough that a clean pod passes on
+      # the first poll, and against a pool this size it only trips near
+      # exhaustion, so the process gate is what actually catches a leftover
+      # serve (#446). See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
         env:
           GPU_PREFLIGHT_MIN_FREE_GIB: 16
@@ -674,8 +680,10 @@ jobs:
   # W7900 counterpart to e2e-gpu-nightly. Mirrors the e2e-gpu-w7900 lane (which
   # no longer runs on pull_request) in e2e-selfhosted.yml (w7900 label, shared
   # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in
-  # step: the report crate asserts the nightly lanes publish the same platforms
-  # as the lanes in e2e-selfhosted.yml.
+  # step. xtask's
+  # `the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes` asserts
+  # only that nightly covers every platform e2e-selfhosted.yml publishes, not
+  # that the lanes agree.
   e2e-gpu-nightly-w7900:
     name: E2E tests (W7900, incl. nightly-only)
     timeout-minutes: 90
@@ -684,7 +692,6 @@ jobs:
       fail-fast: false
       matrix:
         channel: [release, nightly]
-    continue-on-error: true
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -775,7 +782,6 @@ jobs:
     # the 12h run cap and the lane never ran. Pool hosts are cold,
     # so there are no host-specific HOME or cache-dir overrides.
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -862,7 +868,6 @@ jobs:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -1129,7 +1134,6 @@ jobs:
     # conservative starting budget, tune down after a measured run.
     timeout-minutes: 120
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -1572,8 +1576,8 @@ jobs:
           # `error` makes that a failed step here, in the lane that owns the
           # copy, where default `warn` would upload nothing without a word.
           # The consolidated report job's missing-report check flags the absent
-          # artifact too, and is the only signal on a `continue-on-error` lane:
-          # a failed step there does not turn the lane's check red. Only the
+          # artifact too, so the gap is named in the consolidated report job as
+          # well as here, where the failed step turns this lane red. Only the
           # WSL lanes need this guard: every other lane writes report.json
           # directly in-job, with no guest-to-host copy step that can fail on
           # its own.
@@ -1603,9 +1607,9 @@ jobs:
       - e2e-gpu-nightly-strix-windows
       - e2e-wsl-nightly
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
-    # filter to consult on a schedule, and the lanes are `continue-on-error`, so
-    # a failed lane must still be reported. A nightly that broke is precisely
-    # when the grid is worth reading.
+    # filter to consult on a schedule, and a failed lane fails its job, which
+    # would skip a job with the default `success()` condition. A nightly that
+    # broke is precisely when the grid is worth reading.
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1643,9 +1647,10 @@ jobs:
       # A lane that dies before writing report.json (preflight, build, a crash
       # before results exist) uploads nothing, and `discover()` can only render
       # the reports that arrived, so that lane would drop out of the grid with
-      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
-      # either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # no row and no FAIL. The lane's own job is red, but nothing in the grid
+      # would say which report is absent. So check it here: every lane that ran
+      # (any `needs` result but `skipped`) must have uploaded its report
+      # artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1656,9 +1661,9 @@ jobs:
       # checked explicitly, comma-separated, rather than reading one leg as a
       # stand-in for the whole lane. LANE_REPORTS, and this script's behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
-      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
-      # `success` even though the lane failed, so the absent artifact is the
-      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # lane's `needs` result verbatim, but the absent artifact is the signal,
+      # not that value: a lane whose other leg failed reads `failure` whether or
+      # not this leg uploaded. `!cancelled()`, not `always()`: a run
       # superseded mid-flight cuts lanes off before upload, which is not a gap.
       - name: Check every lane that ran uploaded its report
         if: ${{ !cancelled() }}
