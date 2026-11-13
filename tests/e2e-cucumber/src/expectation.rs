@@ -379,14 +379,17 @@ impl Expectations {
 
     /// The serve-readiness window a scenario runs with on this host, as the
     /// harness's `before` hook hands it to the serve steps
-    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): a
-    /// `@serve-timeout:<secs>` tag on an expected-pass scenario wins, else the
-    /// shortest matching xfail `serve_timeout_secs`. `None` for a scenario with
-    /// no `@id:` tag or with neither, which keeps the step default.
+    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): the
+    /// shortest matching xfail `serve_timeout_secs` wins, else the
+    /// `@serve-timeout:<secs>` tag. A row means the serve is a known bug on this
+    /// host, so it must fail fast even when the scenario carries a long tag for
+    /// the hosts where it passes; the tag only lengthens an expected-pass serve.
+    /// `None` for a scenario with no `@id:` tag or with neither, which keeps the
+    /// step default.
     pub fn serve_timeout_override(&self, decl: &ScenarioDecl, cap: &HostCapability) -> Option<u64> {
         let id = decl.id.as_deref()?;
-        decl.serve_timeout_secs
-            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap)))
+        self.serve_timeout_for(id, cap, decl.effective_engine(cap))
+            .or(decl.serve_timeout_secs)
     }
 
     /// Whether any declared condition for this scenario matches this host — the
@@ -2359,9 +2362,9 @@ flaky = true
     /// The two rows for Lemonade 11.5.1's failed backend alignment apply to native
     /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
     /// default engine is vLLM, where the engine named is what decides), and they are not
-    /// `flaky` (an XPASS means the cause is gone and the row is stale). Neither sets
-    /// `serve_timeout_secs`: serve-06's own `@serve-timeout` tag takes precedence over a
-    /// row, so one would change nothing.
+    /// `flaky` (an XPASS means the cause is gone and the row is stale). Only serve-06's
+    /// row sets `serve_timeout_secs`, so the known-bad Windows serve stops waiting out the
+    /// scenario's 2400s tag.
     #[test]
     fn lemonade_alignment_rows_apply_only_to_native_windows_with_lemonade() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
@@ -2378,16 +2381,25 @@ flaky = true
             let entries = m.entries_for(id);
             assert_eq!(entries.len(), 1, "{id}");
             assert!(!entries[0].flaky, "{id} is deterministic");
-            assert_eq!(entries[0].serve_timeout_secs, None, "{id}");
         }
-        // The row cannot shorten serve-06's wait: its own tag wins, so the harness
-        // still hands the 2400s the feature file asks for.
+        assert_eq!(
+            m.entries_for("runtime-lemonade-backend-alignment-reported")[0].serve_timeout_secs,
+            None
+        );
+        // serve-06's row shortens the wait on the failing host and nowhere else: the
+        // harness hands the row's window on native Windows, and still the 2400s the
+        // feature file asks for on a host where the scenario is expected to pass.
         let tags = feature_tags(
             include_str!("../features/model_serving.feature"),
             "serve-large-model-inference",
         );
+        let decl = ScenarioDecl::from_tags(&tags);
         assert_eq!(
-            m.serve_timeout_override(&ScenarioDecl::from_tags(&tags), &cap("strix-windows")),
+            m.serve_timeout_override(&decl, &cap("strix-windows")),
+            Some(600)
+        );
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
             Some(2400)
         );
     }
@@ -2437,9 +2449,10 @@ flaky = true
     }
 
     #[test]
-    fn serve_timeout_override_prefers_the_tag_and_needs_an_id() {
+    fn serve_timeout_override_prefers_the_row_and_needs_an_id() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        // The row says 90s on this host; a `@serve-timeout` tag lengthens it.
+        // The row says 90s on this host; a `@serve-timeout` tag must not lengthen a
+        // known-bug serve back to the full window.
         let tagged = decl(&[
             "id:serve-stop-leaves-no-background-helper",
             "requires-engine:lemonade",
@@ -2447,6 +2460,11 @@ flaky = true
         ]);
         assert_eq!(
             m.serve_timeout_override(&tagged, &cap("strix-ubuntu")),
+            Some(90)
+        );
+        // Where no row matches the host, the tag is what lengthens the wait.
+        assert_eq!(
+            m.serve_timeout_override(&tagged, &cap("strix-windows")),
             Some(2400)
         );
         // No `@id:` tag, nothing to look up: the step default stays.
