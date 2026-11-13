@@ -928,3 +928,19 @@ Feature: Interactive dashboard
     When the user quits the first dashboard
     Then the first dashboard exits successfully
     And the second dashboard is connected to its telemetry daemon again
+
+  # A dashboard whose telemetry daemon cannot start says so once it closes,
+  # on the terminal it gives back, rather than inside the dashboard where the
+  # message would be drawn over. Something that is not a socket at the socket
+  # path is one such case: the daemon refuses to replace it, and the dashboard
+  # must say which path and why, and leave it alone. Same simulated GPU-less
+  # host as dash-37; Unix only, as there is no daemon socket on Windows.
+  @id:dash-reports-unusable-telemetry-socket-on-exit @requires-os:linux
+  Scenario: dash-53 - A dashboard whose telemetry daemon could not start says why after it closes
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place

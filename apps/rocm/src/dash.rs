@@ -345,7 +345,7 @@ pub fn resolved_args(
 /// is open, and the only source of truth at all on Windows, where
 /// `rocm_dash_tui::client`'s `#[cfg(windows)]` arm does connect and stream
 /// live GPU/CPU/memory every tick but — by design, there being no
-/// `rocmdashd` unix socket to source one from (`maybe_spawn_embedded_daemon`
+/// `rocmdashd` unix socket to source one from (`dash_daemon::spawn_keeper`
 /// is unix-only) — never sends an instance snapshot, so
 /// `AppState::instances` never gets a first one there.
 ///
@@ -1009,13 +1009,20 @@ async fn run_async(
     // Stop this dashboard's keeper before the runtime goes. If it owned the
     // daemon, that removes the daemon's socket so another open dashboard can
     // take over; if it did not, the owner's socket is left alone.
-    if let Some(handle) = keeper {
-        crate::dash_daemon::stop_keeper(handle).await;
+    if let Some(keeper) = keeper
+        && let Some(failure) = crate::dash_daemon::stop_keeper(keeper).await
+    {
+        // The TUI has left the alternate screen by now, so this lands on the
+        // terminal instead of inside the dashboard.
+        eprintln!(
+            "{}",
+            crate::dash_daemon::failure_report(&failure, &paths.client_log_dir())
+        );
     }
     result
 }
 
-/// Whether `run_async` should auto-start the embedded telemetry daemon: only for
+/// Whether `run_async` should run the embedded telemetry daemon's keeper: only for
 /// a live, non-replay FULL dashboard. A focused host (`args.focus.is_some()`)
 /// draws no telemetry and streams its own job via the job-bridge, so it needs no
 /// daemon — and must not re-surface the socket-crash class for a flow that never

@@ -3870,20 +3870,49 @@ a live daemon from a build without the lock (`an_answering_socket_without_a_lock
 a lock holder whose socket does not answer (`a_lock_holder_keeps_the_path_even_when_its_socket_looks_stale`),
 a stale socket from a dead daemon (`a_stale_socket_from_a_dead_daemon_is_replaced`),
 a path that is not a socket (`a_path_that_is_not_a_socket_is_never_removed`),
-a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`)
+a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`),
+a bind lost to a daemon without the lock (`a_bind_lost_to_a_listener_without_the_lock_is_reported_in_use`),
+a busy or slow listener (`a_busy_or_slow_listener_counts_as_answering_not_stale`),
+a probe that stays for the greeting (`the_probe_waits_for_the_greeting_before_hanging_up`),
+a serving daemon whose socket is replaced (`a_daemon_whose_socket_is_replaced_gives_up_the_path`)
+or briefly cannot be checked (`a_daemon_keeps_serving_while_its_path_briefly_cannot_be_checked`)
+or stays unreadable (`a_daemon_gives_its_path_up_when_it_stays_unreadable`; run as root,
+both print a skip line and count as passed),
+a file appearing before the bind (`a_file_that_appears_before_the_bind_is_refused_as_not_a_socket`),
+a stopped daemon's clients and runner (`a_stopped_daemon_closes_its_clients_connections`,
+`a_stopped_daemon_closes_its_clients_even_while_its_channel_lives`,
+`a_stopped_daemons_runner_stops_with_it`), a runner that stops
+(`a_daemon_stops_when_its_runner_does`), finished clients being released
+(`finished_client_tasks_are_released`), how many unreadable path checks give
+the path up (`only_five_unreadable_path_checks_in_a_row_give_the_path_up`)
 and several daemons racing (`exactly_one_of_several_concurrent_daemons_binds`).
 The dashboard's keeper, in [dash_daemon.rs](../apps/rocm/src/dash_daemon.rs):
-a surviving dashboard takes over when the owner leaves, and closing one that
-never owned the daemon leaves it alone. All of these are unix only.
+a surviving dashboard takes over when the owner leaves, closing one that never
+owned the daemon leaves it alone, a daemon refused its path is retried and
+reported after the dashboard closes (naming the log only when the warning
+reached it), a keeper that panicked is reported (`a_keeper_that_panicked_is_reported`),
+a daemon that recovered or found another daemon serving is not reported
+(`a_failure_ends_when_another_daemon_serves_the_socket`), a failed daemon does not
+hold the dashboard up, the retry waits
+(`a_failing_daemon_backs_off_and_finding_an_owner_resets_it`), and a non-unix
+target starts no keeper. All of these are unix only. The dashboard's own side
+of a reconnect, holding each benchmark row once, is
+`benchmark_rows_are_held_once_across_a_reconnect` in
+[app/mod.rs](../crates/rocm-dash-tui/src/app/mod.rs). It calls `on_connected`
+directly; no test drives the event loop's handling of a `Connected` message,
+which is a one-line call to it.
 
-End to end, `dash-52` in
-[dash.feature](../tests/e2e-cucumber/features/dash.feature) opens two
-dashboards in one pseudo-terminal environment, quits the first and requires the
-second to show the connected header again. It runs on the Linux no-GPU lane
-with a simulated GPU-less host, like `dash-37`:
+End to end, in [dash.feature](../tests/e2e-cucumber/features/dash.feature),
+`dash-52` opens two dashboards in one pseudo-terminal environment, quits the
+first and requires the second to show the connected header again, and
+`dash-53` puts a regular file where the socket goes and requires the dashboard
+to say, after it closes, that it could not use that file and where the
+warning was logged (and the log to hold it), and to leave the file in place. Both carry only `@requires-os:linux`, so they run on every Linux lane,
+GPU or not, and are skipped on Windows; each simulates a GPU-less host itself
+(as `dash-37` does), so the runner's GPU does not change the outcome:
 
 ```bash
-cargo xtask e2e -- -n "dash-52"
+cargo xtask e2e -- -n "dash-5[23]"
 ```
 
 ## Windows Tool Notes

@@ -265,7 +265,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 match maybe_msg {
                     Some(ClientMsg::Connecting) => state.conn = ConnState::Connecting,
                     Some(ClientMsg::Connected { host, daemon_version }) => {
-                        state.conn = ConnState::Connected { host, version: daemon_version };
+                        state.on_connected(host, daemon_version);
                     }
                     Some(ClientMsg::Disconnected { reason }) => {
                         state.conn = ConnState::Disconnected { reason };

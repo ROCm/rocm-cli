@@ -177,8 +177,9 @@ pub struct TuiSession {
     is_chat: bool,
     scenario: Option<String>,
     argv: Vec<String>,
-    /// Exit code observed by [`deliver_signal_and_wait`], read back by the
-    /// signal scenarios' `Then` steps once the child has been reaped.
+    /// Exit code observed by [`deliver_signal_and_wait`],
+    /// [`press_ctrl_c_and_wait`] or [`quit_and_wait`], read back by a
+    /// scenario's `Then` steps once the child has been reaped.
     observed_exit_code: Option<i32>,
 }
 
@@ -1048,6 +1049,7 @@ impl TuiSession {
                 let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                 self.finished = true;
                 self.record_once(code);
+                self.observed_exit_code = Some(code);
                 return Some(code);
             }
             if Instant::now() >= deadline {
@@ -1247,9 +1249,10 @@ impl TuiSession {
     }
 
     /// The exit code recorded by the most recent
-    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) or
-    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait), read back by the
-    /// scenario's `Then` step to assert the expected `128 + signo` value.
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait),
+    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait) or
+    /// [`quit_and_wait`](Self::quit_and_wait), read back by the scenario's
+    /// `Then` step (the expected `128 + signo` value, or 0 after a quit).
     #[must_use]
     pub const fn observed_exit_code(&self) -> Option<i32> {
         self.observed_exit_code

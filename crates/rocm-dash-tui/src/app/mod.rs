@@ -92,8 +92,9 @@ pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolReq
 /// history before the oldest samples start falling off the left.
 pub const HISTORY_CAP: usize = 600;
 
-/// How many benchmark rows to keep client-side for the bench panel.
-pub const BENCH_CAP: usize = 200;
+/// How many benchmark rows to keep client-side for the bench panel: the same
+/// cap the daemon replays on subscribe, so clearing on reconnect loses nothing.
+pub const BENCH_CAP: usize = rocm_dash_core::bench_schema::BENCH_HISTORY_CAP;
 
 pub struct AppState {
     pub connect: String,
@@ -650,6 +651,20 @@ impl AppState {
         self.clamp_selectors();
     }
 
+    /// A connection to a daemon was (re-)established.
+    ///
+    /// A daemon sends a new client its benchmark history when it subscribes,
+    /// and a daemon that has just taken over from one that stopped re-reads
+    /// the whole benchmark CSV, so rows this dashboard already holds would
+    /// arrive again. The list starts over from what the daemon sends. Chart
+    /// history is kept (the daemon's replay of its recent snapshots is
+    /// appended to it, as before).
+    pub(crate) fn on_connected(&mut self, host: String, version: String) {
+        self.conn = ConnState::Connected { host, version };
+        self.bench_rows.clear();
+        self.clamp_selectors();
+    }
+
     /// Wipe state derived from past events so a backward replay seek can
     /// repopulate from scratch. Preserves UI scaffolding (theme, tabs,
     /// selectors, modal) so the user's frame of reference doesn't jump.
@@ -890,6 +905,37 @@ mod tests {
         assert!(s.latest.is_none());
         assert!(s.bench_rows.is_empty());
         assert!(s.instances.is_empty());
+    }
+
+    /// A dashboard that reconnects -- to the same daemon, or to the one that
+    /// took over when the previous one stopped -- is sent the benchmark rows
+    /// it already holds again, and must hold each of them once.
+    #[test]
+    fn benchmark_rows_are_held_once_across_a_reconnect() {
+        let rows: Vec<BenchmarkRow> = (0..3)
+            .map(|i| BenchmarkRow {
+                cell: format!("c{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let mut s = st();
+        s.on_connected("host".into(), "1".into());
+        s.apply_event(Event::BenchmarkRowsAppended { rows: rows.clone() });
+        s.bench_sel = 2;
+        s.conn = ConnState::Disconnected {
+            reason: "closed".into(),
+        };
+
+        s.on_connected("host".into(), "1".into());
+        assert_eq!(
+            s.bench_sel, 0,
+            "the selection must not point past the cleared list"
+        );
+        s.apply_event(Event::BenchmarkRowsAppended { rows });
+
+        let held: Vec<_> = s.bench_rows.iter().map(|r| r.cell.clone()).collect();
+        assert_eq!(held, ["c0", "c1", "c2"], "each row must be held once");
+        assert!(matches!(s.conn, ConnState::Connected { .. }));
     }
 
     #[test]

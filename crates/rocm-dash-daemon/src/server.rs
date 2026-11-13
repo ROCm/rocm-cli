@@ -33,22 +33,44 @@ const BROADCAST_CAP: usize = 64;
 #[cfg(unix)]
 const RING_CAP: usize = 30;
 
-/// Benchmark-row history kept for late-joining clients (matches TUI `BENCH_CAP`).
+/// Benchmark-row history kept for late-joining clients; the same cap the
+/// dashboard holds (see `BENCH_HISTORY_CAP`).
 #[cfg(unix)]
-const BENCH_RING_CAP: usize = 200;
+const BENCH_RING_CAP: usize = rocm_dash_core::bench_schema::BENCH_HISTORY_CAP;
 
 /// Start the daemon on `listen` (e.g. `unix:/run/user/1000/rocmdashd.sock`).
 ///
 /// Access control is enforced by filesystem permissions: the Unix socket is
 /// created with mode `0o600` so only the owning user can connect. The parent
 /// directory is created if it does not exist.
+///
+/// One daemon owns a socket path at a time (see `SocketClaim`): this returns
+/// [`SocketInUse`] at once, removing or replacing nothing at the socket path,
+/// when another daemon holds the path's `<socket>.lock` or something already
+/// answers at the path. A path that exists but is not a socket is refused and
+/// left in place. A stale socket nobody answers on is replaced. While serving,
+/// the daemon stops with [`SocketReplaced`] if its socket is removed or
+/// replaced, so the path can be claimed again, and with an error if its
+/// telemetry runner stops. When it returns or is aborted, the runner task and
+/// the client tasks it started here are aborted with it; a task the runner
+/// itself spawns (its background GPU detection) is not tracked.
 pub async fn run(listen: &str, opts: RunnerOptions) -> anyhow::Result<()> {
+    run_with_ready(listen, opts, || {}).await
+}
+
+/// [`run`], calling `ready` once the daemon has bound its socket and is about
+/// to accept clients -- the moment it is serving rather than failing.
+pub async fn run_with_ready(
+    listen: &str,
+    opts: RunnerOptions,
+    ready: impl FnOnce() + Send,
+) -> anyhow::Result<()> {
     let (scheme, target) = listen
         .split_once(':')
         .ok_or_else(|| anyhow!("listen must be `unix:/path` or `tcp:host:port`"))?;
 
     match scheme {
-        "unix" => run_unix(PathBuf::from(target), opts).await,
+        "unix" => run_unix(PathBuf::from(target), opts, ready).await,
         "tcp" => Err(anyhow!("tcp listener not implemented in scaffold")),
         other => Err(anyhow!("unknown listen scheme: {other}")),
     }
@@ -157,26 +179,130 @@ fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
 pub struct SocketInUse {
     /// The socket path that is already served.
     pub path: PathBuf,
+    /// Who serves it, which says how soon it may be worth trying again.
+    pub holder: SocketHolder,
+}
+
+/// Who holds a socket path a daemon found in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketHolder {
+    /// Another daemon holds the path's ownership lock. It releases the path
+    /// when it stops, however it stops.
+    LockHolder,
+    /// Something answers at the path without holding the lock: a daemon from
+    /// a build that predates the lock, or another program. Nothing announces
+    /// when it goes away.
+    UnlockedListener,
 }
 
 impl std::fmt::Display for SocketInUse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "another telemetry daemon already serves {}",
-            self.path.display()
-        )
+        match self.holder {
+            SocketHolder::LockHolder => write!(
+                f,
+                "another telemetry daemon already serves {}",
+                self.path.display()
+            ),
+            SocketHolder::UnlockedListener => write!(
+                f,
+                "a listener without the ownership lock (an older telemetry daemon or \
+                 another program) already serves {}",
+                self.path.display()
+            ),
+        }
     }
 }
 
 impl std::error::Error for SocketInUse {}
 
+/// Returned by [`run`] when a serving daemon found its socket path removed or
+/// replaced. It stopped and released the path, so a retry can claim it again
+/// at once; this is not a failure to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketReplaced {
+    /// The socket path that no longer names this daemon's socket.
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for SocketReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} no longer names this daemon's socket (it was removed or replaced); \
+             stopping so the path can be claimed again",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for SocketReplaced {}
+
 /// How long the stale-socket probe waits for an existing socket to accept a
-/// connection. A listener that is alive but too busy to accept within this is
-/// treated as alive: replacing a live daemon is the failure being prevented,
-/// and a wrong "in use" only delays a takeover until the next attempt.
+/// connection and send its greeting. A listener that is alive but too busy
+/// within this is treated as alive: replacing a live daemon is the failure
+/// being prevented, and a wrong "in use" only delays a takeover until the next
+/// attempt.
 #[cfg(unix)]
 const STALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often a serving daemon checks that its socket path still names the
+/// socket it bound.
+#[cfg(unix)]
+const PATH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What the stale-socket probe found at an existing socket path.
+#[cfg(unix)]
+#[derive(Debug)]
+enum ProbeVerdict {
+    /// Something is listening: it answered, was too busy to answer in time
+    /// (timed out), or its backlog is full (`WouldBlock` from a non-blocking
+    /// connect). A unix-socket connect does not pend on Linux, so the last is
+    /// how a busy listener shows up there.
+    Answered,
+    /// Nobody listens (`ECONNREFUSED`): the socket is left over.
+    Stale,
+    /// The path went away between the check and the connect.
+    Vanished,
+    /// Anything else: report it and leave the path alone.
+    Failed(std::io::Error),
+}
+
+/// Classify a probe's outcome; `None` means it did not finish in time.
+#[cfg(unix)]
+fn probe_verdict(outcome: Option<std::io::Result<()>>) -> ProbeVerdict {
+    use std::io::ErrorKind;
+
+    match outcome {
+        None | Some(Ok(())) => ProbeVerdict::Answered,
+        Some(Err(e)) => match e.kind() {
+            ErrorKind::WouldBlock => ProbeVerdict::Answered,
+            ErrorKind::ConnectionRefused => ProbeVerdict::Stale,
+            ErrorKind::NotFound => ProbeVerdict::Vanished,
+            _ => ProbeVerdict::Failed(e),
+        },
+    }
+}
+
+/// Connect to an existing socket and, if it answers, read its first line
+/// before hanging up. A daemon greets every client at once, so leaving before
+/// the greeting would have it write to a closed connection and log an error
+/// for every probe.
+#[cfg(unix)]
+async fn probe_socket(path: &std::path::Path) -> Option<std::io::Result<()>> {
+    use tokio::io::AsyncBufReadExt;
+
+    tokio::time::timeout(STALE_PROBE_TIMEOUT, async {
+        let stream = tokio::net::UnixStream::connect(path).await?;
+        let mut greeting = Vec::new();
+        // What it says, or whether it says anything, does not matter here.
+        let _ = BufReader::new(stream)
+            .read_until(b'\n', &mut greeting)
+            .await;
+        Ok(())
+    })
+    .await
+    .ok()
+}
 
 /// The lock file that says which daemon owns `socket`: the socket path with
 /// `.lock` appended, in the same (private) directory.
@@ -187,11 +313,16 @@ fn socket_lock_path(socket: &std::path::Path) -> PathBuf {
     PathBuf::from(lock)
 }
 
+/// What the refusal of a path that is not a socket says about it, right after
+/// the path. The dashboard's end-to-end check (dash-53 in `dash_steps.rs`)
+/// matches this text; it cannot import it.
+pub const NOT_A_SOCKET: &str = "exists and is not a socket";
+
 /// Why an existing path that is not a socket is left alone.
 #[cfg(unix)]
 fn not_a_socket_refusal(path: &std::path::Path) -> String {
     format!(
-        "{} exists and is not a socket, so the telemetry daemon will not replace it. \
+        "{} {NOT_A_SOCKET}, so the telemetry daemon will not replace it. \
          Move or remove it, or point the dashboard at another socket path",
         path.display()
     )
@@ -257,6 +388,7 @@ impl SocketClaim {
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(SocketInUse {
                     path: path.to_path_buf(),
+                    holder: SocketHolder::LockHolder,
                 }
                 .into());
             }
@@ -289,22 +421,23 @@ impl SocketClaim {
         if !meta.file_type().is_socket() {
             return Err(anyhow!(not_a_socket_refusal(path)));
         }
-        let probe =
-            tokio::time::timeout(STALE_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await;
-        match probe {
-            // Answered, or alive but slow: a daemon that predates the lock.
-            Ok(Ok(_)) | Err(_) => Err(SocketInUse { path: path.clone() }.into()),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                match std::fs::remove_file(path) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => {
-                        Err(e).with_context(|| format!("removing stale socket {}", path.display()))
-                    }
-                }
+        match probe_verdict(probe_socket(path).await) {
+            // We hold the lock, so whatever answers is not a daemon of this
+            // build: an older one, or another program.
+            ProbeVerdict::Answered => Err(SocketInUse {
+                path: path.clone(),
+                holder: SocketHolder::UnlockedListener,
             }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Ok(Err(e)) => {
+            .into()),
+            ProbeVerdict::Stale => match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => {
+                    Err(e).with_context(|| format!("removing stale socket {}", path.display()))
+                }
+            },
+            ProbeVerdict::Vanished => Ok(()),
+            ProbeVerdict::Failed(e) => {
                 Err(e).with_context(|| format!("probing existing socket {}", path.display()))
             }
         }
@@ -315,10 +448,31 @@ impl SocketClaim {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let path = &self.path;
-        let listener = tokio::net::UnixListener::bind(path)
-            .with_context(|| format!("binding {}", path.display()))?;
-        // Record the identity before anything else can fail, so drop still
-        // removes the socket if the chmod below does.
+        let listener = match tokio::net::UnixListener::bind(path) {
+            Ok(listener) => listener,
+            // Something bound the path between the probe and here without
+            // taking the lock (a daemon of an older build): it is in use.
+            // Unless what appeared there is not a socket at all.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                use std::os::unix::fs::FileTypeExt;
+
+                let is_socket = std::fs::symlink_metadata(path)
+                    .map_or(true, |meta| meta.file_type().is_socket());
+                if !is_socket {
+                    return Err(anyhow!(not_a_socket_refusal(path)));
+                }
+                return Err(SocketInUse {
+                    path: path.clone(),
+                    holder: SocketHolder::UnlockedListener,
+                }
+                .into());
+            }
+            Err(e) => return Err(e).with_context(|| format!("binding {}", path.display())),
+        };
+        // Record the identity before the chmod, so drop still removes the
+        // socket if the chmod fails. If this stat itself fails, the socket is
+        // left behind; nobody answers on it once the listener is dropped, so
+        // the next claim replaces it as stale.
         let meta = std::fs::symlink_metadata(path)
             .with_context(|| format!("inspecting bound socket {}", path.display()))?;
         self.bound = Some((meta.dev(), meta.ino()));
@@ -328,22 +482,140 @@ impl SocketClaim {
     }
 }
 
+/// What a claim's socket path names now.
 #[cfg(unix)]
-impl Drop for SocketClaim {
-    fn drop(&mut self) {
+#[derive(Debug)]
+enum PathState {
+    /// The socket this claim bound.
+    Ours,
+    /// Nothing, or something else: the socket was removed or replaced.
+    Gone,
+    /// The path could not be checked (a permission or I/O error); that says
+    /// nothing about whose socket it is.
+    Unknown(std::io::Error),
+}
+
+#[cfg(unix)]
+impl SocketClaim {
+    /// What the path names now, compared with the socket this claim bound.
+    fn path_state(&self) -> PathState {
         use std::os::unix::fs::MetadataExt;
 
-        let Some(bound) = self.bound else { return };
-        let still_ours = std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|meta| (meta.dev(), meta.ino()) == bound);
-        if still_ours {
-            let _ = std::fs::remove_file(&self.path);
+        let Some(bound) = self.bound else {
+            return PathState::Gone;
+        };
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if (meta.dev(), meta.ino()) == bound => PathState::Ours,
+            Ok(_) => PathState::Gone,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathState::Gone,
+            Err(e) => PathState::Unknown(e),
         }
     }
 }
 
 #[cfg(unix)]
-async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
+impl Drop for SocketClaim {
+    fn drop(&mut self) {
+        if matches!(self.path_state(), PathState::Ours) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// How many path checks in a row may fail to read the path before a serving
+/// daemon gives it up as lost.
+#[cfg(unix)]
+const PATH_CHECK_UNKNOWN_LIMIT: u32 = 5;
+
+/// The unreadable path checks in a row after one more check, or `None` once
+/// they reach [`PATH_CHECK_UNKNOWN_LIMIT`]. A readable check starts over.
+#[cfg(unix)]
+const fn unreadable_streak(streak: u32, readable: bool) -> Option<u32> {
+    if readable {
+        return Some(0);
+    }
+    if streak + 1 >= PATH_CHECK_UNKNOWN_LIMIT {
+        None
+    } else {
+        Some(streak + 1)
+    }
+}
+
+/// The parts of a daemon its telemetry runner is started with.
+#[cfg(unix)]
+struct RunnerParts {
+    tx: broadcast::Sender<Event>,
+    ring: Arc<Mutex<SnapshotRing>>,
+    bench_ring: Arc<Mutex<BenchRing>>,
+    persist: Option<Arc<Mutex<SessionWriter>>>,
+    opts: RunnerOptions,
+}
+
+/// The production runner: [`runner::run_loop`], which runs until aborted.
+#[cfg(unix)]
+fn start_run_loop(parts: RunnerParts) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(runner::run_loop(
+        None,
+        parts.tx,
+        parts.ring,
+        parts.bench_ring,
+        parts.persist,
+        parts.opts,
+    ))
+}
+
+/// Starts a daemon's telemetry runner.
+#[cfg(unix)]
+type StartRunner = Box<dyn FnOnce(RunnerParts) -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// What can be swapped in a serving daemon for a test.
+#[cfg(unix)]
+struct ServeSeams {
+    start_runner: StartRunner,
+    /// Set to the number of client tasks still held after every event the
+    /// accept loop handles.
+    client_tasks: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// How often the socket path is checked.
+    path_check_interval: std::time::Duration,
+}
+
+#[cfg(unix)]
+impl ServeSeams {
+    fn production() -> Self {
+        Self {
+            start_runner: Box::new(start_run_loop),
+            client_tasks: None,
+            path_check_interval: PATH_CHECK_INTERVAL,
+        }
+    }
+}
+
+/// Why a daemon stopped because its runner did.
+#[cfg(unix)]
+fn runner_stopped_error(outcome: Result<(), tokio::task::JoinError>) -> anyhow::Error {
+    match outcome {
+        Ok(()) => anyhow!("the telemetry runner stopped; restarting the daemon"),
+        Err(e) if e.is_panic() => anyhow!("the telemetry runner panicked: {e}"),
+        Err(e) => anyhow!("the telemetry runner was cancelled: {e}"),
+    }
+}
+
+#[cfg(unix)]
+async fn run_unix(
+    path: PathBuf,
+    opts: RunnerOptions,
+    ready: impl FnOnce() + Send,
+) -> anyhow::Result<()> {
+    serve_unix(path, opts, ready, ServeSeams::production()).await
+}
+
+#[cfg(unix)]
+async fn serve_unix(
+    path: PathBuf,
+    opts: RunnerOptions,
+    ready: impl FnOnce() + Send,
+    seams: ServeSeams,
+) -> anyhow::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     // The lock file lives in the socket's directory, so that directory has to
     // exist before the claim. It is tightened (or refused) only after the claim
@@ -359,9 +631,9 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
     if let Some(parent) = parent {
         prepare_socket_dir(parent)?;
     }
-    // `claim` lives to the end of this function, including when the task
-    // running it is aborted, so the socket is removed only when this daemon
-    // stops serving it.
+    // `claim` is dropped when this function returns or the task running it
+    // is aborted -- that is, when this daemon stops serving -- and removes the
+    // socket only if it is still the one bound here.
     let listener = claim.bind()?;
     info!(socket = %path.display(), "listening");
 
@@ -384,34 +656,79 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
         None => None,
     };
 
-    // Runner task — produces snapshots and (optionally) bench rows.
-    let runner_tx = snap_tx.clone();
-    let runner_ring = ring.clone();
-    let runner_bench_ring = bench_ring.clone();
-    let runner_persist = persist.clone();
-    let runner_opts = opts.clone();
-    tokio::spawn(async move {
-        runner::run_loop(
-            None,
-            runner_tx,
-            runner_ring,
-            runner_bench_ring,
-            runner_persist,
-            runner_opts,
-        )
-        .await;
-    });
+    // The runner and every client task live in these sets, which abort what
+    // they hold when dropped -- when this function returns or the task running
+    // it is aborted. Abort takes effect at each task's next await point.
+    let mut runner_task = tokio::task::JoinSet::new();
+    let mut clients = tokio::task::JoinSet::new();
 
+    // Runner task — produces snapshots and (optionally) bench rows.
+    runner_task.spawn((seams.start_runner)(RunnerParts {
+        tx: snap_tx.clone(),
+        ring: ring.clone(),
+        bench_ring: bench_ring.clone(),
+        persist: persist.clone(),
+        opts: opts.clone(),
+    }));
+    ready();
+
+    let mut path_check = tokio::time::interval(seams.path_check_interval);
+    path_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut unknown_checks = 0;
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let rx = snap_tx.subscribe();
-        let client_ring = ring.clone();
-        let client_bench_ring = bench_ring.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, rx, client_ring, client_bench_ring).await {
-                warn!(error = %e, "client task ended with error");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let rx = snap_tx.subscribe();
+                let client_ring = ring.clone();
+                let client_bench_ring = bench_ring.clone();
+                clients.spawn(async move {
+                    if let Err(e) = handle_client(stream, rx, client_ring, client_bench_ring).await {
+                        warn!(error = %e, "client task ended with error");
+                    }
+                });
             }
-        });
+            // A daemon whose runner stopped would greet clients and never
+            // send them anything; stop, so the caller can start it again.
+            Some(outcome) = runner_task.join_next() => {
+                return Err(runner_stopped_error(outcome));
+            }
+            // Reap finished client tasks so the set does not grow.
+            Some(outcome) = clients.join_next() => {
+                if let Err(e) = outcome
+                    && e.is_panic()
+                {
+                    warn!(error = %e, "client task panicked");
+                }
+            }
+            _ = path_check.tick() => {
+                let unreadable = match claim.path_state() {
+                    PathState::Ours => None,
+                    // Serving an inode nobody can reach would hold the lock,
+                    // and so the path, forever.
+                    PathState::Gone => return Err(SocketReplaced { path }.into()),
+                    PathState::Unknown(e) => {
+                        warn!(socket = %path.display(), error = %e, "could not check the socket path");
+                        Some(e)
+                    }
+                };
+                let readable = unreadable.is_none();
+                match (unreadable_streak(unknown_checks, readable), unreadable) {
+                    (Some(streak), _) => unknown_checks = streak,
+                    (None, e) => {
+                        return Err(anyhow!(
+                            "checking socket {} failed {PATH_CHECK_UNKNOWN_LIMIT} times in a \
+                             row: {}",
+                            path.display(),
+                            e.map_or_else(String::new, |e| e.to_string())
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(count) = &seams.client_tasks {
+            count.store(clients.len(), std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -419,7 +736,11 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
 // Mirrors the signature of the `cfg(unix)` arm, which callers `.await`;
 // dropping `async` here would not compile on Windows.
 #[allow(clippy::unused_async)]
-async fn run_unix(_path: PathBuf, _opts: RunnerOptions) -> anyhow::Result<()> {
+async fn run_unix(
+    _path: PathBuf,
+    _opts: RunnerOptions,
+    _ready: impl FnOnce() + Send,
+) -> anyhow::Result<()> {
     Err(anyhow!(
         "rocm-dash daemon requires Unix domain sockets; not supported on Windows yet"
     ))
@@ -692,7 +1013,10 @@ mod tests {
     use rocm_dash_core::protocol::Event;
     use tokio::io::BufReader;
 
-    use super::{SocketClaim, SocketInUse, not_a_socket_refusal, socket_lock_path};
+    use super::{
+        ProbeVerdict, ServeSeams, SocketClaim, SocketHolder, SocketInUse, SocketReplaced,
+        not_a_socket_refusal, probe_verdict, serve_unix, socket_lock_path,
+    };
     use crate::runner::RunnerOptions;
     use crate::transport::read_line;
 
@@ -777,9 +1101,32 @@ mod tests {
             .expect("pin the inode with a hard link");
     }
 
+    /// Claim `path` once a dropped claim's lock is really gone. Another test in
+    /// this process can be starting a subprocess at the moment a claim is
+    /// dropped; until that child execs it shares the lock file's descriptor,
+    /// and so the lock, for a few milliseconds.
+    async fn claim_once_released(path: &Path) -> SocketClaim {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            match SocketClaim::claim(path).await {
+                Ok(claim) => return claim,
+                Err(e) => assert!(
+                    in_use_holder(&e) == Some(SocketHolder::LockHolder)
+                        && tokio::time::Instant::now() < deadline,
+                    "the path's lock was not released: {e:#}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn in_use_path(e: &anyhow::Error) -> Option<&Path> {
         e.downcast_ref::<SocketInUse>()
             .map(|in_use| in_use.path.as_path())
+    }
+
+    fn in_use_holder(e: &anyhow::Error) -> Option<SocketHolder> {
+        e.downcast_ref::<SocketInUse>().map(|in_use| in_use.holder)
     }
 
     /// The reported bug's second half: a second daemon used to unlink the live
@@ -801,6 +1148,7 @@ mod tests {
             Some(path.as_path()),
             "a second daemon must report the path as in use, got: {refusal:#}"
         );
+        assert_eq!(in_use_holder(&refusal), Some(SocketHolder::LockHolder));
         assert_eq!(inode(&path), before, "the live socket must not be replaced");
         welcome_from(&path)
             .await
@@ -813,8 +1161,10 @@ mod tests {
         let _ = first.await;
     }
 
-    /// A live daemon from a build without the lock is detected by its answer
-    /// and left serving.
+    /// A live daemon from a build without the lock is left serving. This one
+    /// accepts the probe's connection only when the test accepts it and never
+    /// greets, so the probe gives up after its 500 ms limit -- the path a busy
+    /// or silent listener takes -- and still counts it as in use.
     #[tokio::test]
     async fn an_answering_socket_without_a_lock_holder_is_left_in_place() {
         let dir = tempfile::tempdir().unwrap();
@@ -826,6 +1176,11 @@ mod tests {
         let refusal = run_expecting_refusal(&path).await;
 
         assert_eq!(in_use_path(&refusal), Some(path.as_path()), "{refusal:#}");
+        assert_eq!(
+            in_use_holder(&refusal),
+            Some(SocketHolder::UnlockedListener),
+            "{refusal:#}"
+        );
         assert_eq!(
             inode(&path),
             before,
@@ -940,7 +1295,7 @@ mod tests {
         );
 
         std::fs::remove_file(&path).unwrap();
-        let mut own = SocketClaim::claim(&path).await.unwrap();
+        let mut own = claim_once_released(&path).await;
         let listener = own.bind().unwrap();
         assert!(path.exists());
         drop(listener);
@@ -984,6 +1339,445 @@ mod tests {
         for daemon in running {
             daemon.abort();
             let _ = daemon.await;
+        }
+    }
+
+    /// Every way the probe can end, including the two that only a busy
+    /// listener produces: a timeout, and a full backlog (`WouldBlock`, which
+    /// is what a non-blocking unix connect returns on Linux instead of
+    /// pending). Neither may be read as stale.
+    #[test]
+    fn a_busy_or_slow_listener_counts_as_answering_not_stale() {
+        use std::io::{Error, ErrorKind};
+
+        let verdict = |outcome| format!("{:?}", probe_verdict(outcome));
+        assert_eq!(verdict(None), "Answered", "a probe that timed out");
+        assert_eq!(verdict(Some(Ok(()))), "Answered");
+        assert_eq!(
+            verdict(Some(Err(Error::from(ErrorKind::WouldBlock)))),
+            "Answered",
+            "a full backlog"
+        );
+        assert_eq!(
+            verdict(Some(Err(Error::from(ErrorKind::ConnectionRefused)))),
+            "Stale"
+        );
+        assert_eq!(
+            verdict(Some(Err(Error::from(ErrorKind::NotFound)))),
+            "Vanished"
+        );
+        assert!(matches!(
+            probe_verdict(Some(Err(Error::from(ErrorKind::PermissionDenied)))),
+            ProbeVerdict::Failed(_)
+        ));
+    }
+
+    /// The probe of an answering daemon stays for its greeting, so the daemon
+    /// is never left writing to a closed connection -- which it logs as a
+    /// client error, once per probe, several times a second.
+    #[tokio::test]
+    async fn the_probe_waits_for_the_greeting_before_hanging_up() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let older = tokio::net::UnixListener::bind(&path).unwrap();
+        let greeter = tokio::spawn(async move {
+            let (mut stream, _) = older.accept().await.unwrap();
+            // A daemon greets at once; the delay makes a probe that hung up
+            // straight after connecting show as a failed write.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream.write_all(b"{\"greeting\":true}\n").await
+        });
+
+        let refusal = run_expecting_refusal(&path).await;
+
+        assert_eq!(
+            in_use_holder(&refusal),
+            Some(SocketHolder::UnlockedListener),
+            "{refusal:#}"
+        );
+        greeter
+            .await
+            .unwrap()
+            .expect("the greeting must reach a probe that is still connected");
+    }
+
+    /// Losing the race to bind against a daemon without the lock is the same
+    /// "in use" as finding it there, not a failure to report.
+    #[tokio::test]
+    async fn a_bind_lost_to_a_listener_without_the_lock_is_reported_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let mut claim = SocketClaim::claim(&path).await.unwrap();
+        let _older = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let theirs = inode(&path);
+
+        let refusal = claim.bind().expect_err("the path is taken");
+
+        assert_eq!(in_use_path(&refusal), Some(path.as_path()), "{refusal:#}");
+        assert_eq!(
+            in_use_holder(&refusal),
+            Some(SocketHolder::UnlockedListener)
+        );
+        drop(claim);
+        assert_eq!(inode(&path), theirs, "their socket must stay");
+    }
+
+    /// A daemon stopped mid-session closes its clients' connections, so they
+    /// see it go and reconnect, instead of holding a connection to a daemon
+    /// that no longer exists.
+    #[tokio::test]
+    async fn a_stopped_daemon_closes_its_clients_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let daemon = start_daemon(&path);
+        let mut attached = wait_until_serving(&path).await;
+
+        daemon.abort();
+        let _ = daemon.await;
+
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(DEADLINE, attached.read_to_end(&mut rest))
+            .await
+            .expect("the client connection must be closed when the daemon stops");
+        assert!(read.is_ok(), "the connection must end cleanly: {read:?}");
+    }
+
+    /// A daemon whose socket path is taken from under it would otherwise hold
+    /// the lock -- and so the path -- while serving an inode nobody can reach.
+    #[tokio::test]
+    async fn a_daemon_whose_socket_is_replaced_gives_up_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let daemon = start_daemon(&path);
+        let _attached = wait_until_serving(&path).await;
+
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let replacement = inode(&path);
+
+        let outcome = tokio::time::timeout(DEADLINE, daemon)
+            .await
+            .expect("the daemon must stop once its socket is replaced")
+            .unwrap();
+        let error = outcome.expect_err("stopping for this is an error");
+        assert_eq!(
+            error.downcast_ref::<SocketReplaced>(),
+            Some(&SocketReplaced { path: path.clone() }),
+            "{error:#}"
+        );
+        assert_eq!(inode(&path), replacement, "the replacement must stay");
+        // Waits out the subprocess window `claim_once_released` describes.
+        let lock = std::fs::File::open(socket_lock_path(&path)).unwrap();
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while lock.try_lock().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon must have released the path's lock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The runner a stopped daemon started stops with it: nothing more is
+    /// written to that daemon's session recording afterwards.
+    #[tokio::test]
+    async fn a_stopped_daemons_runner_stops_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let recordings = dir.path().join("telemetry");
+        let listen = format!("unix:{}", path.display());
+        let opts = RunnerOptions {
+            persist_dir: Some(recordings.clone()),
+            ..RunnerOptions::default()
+        };
+        let daemon = tokio::spawn(async move { super::run(&listen, opts).await });
+        let recorded = || -> u64 {
+            std::fs::read_dir(&recordings).map_or(0, |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+        };
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while recorded() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon recorded nothing within {DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        daemon.abort();
+        let _ = daemon.await;
+        let at_stop = recorded();
+        // The runner records a snapshot every second; three would land in
+        // this window if it were still running.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert_eq!(
+            recorded(),
+            at_stop,
+            "the recording grew after the daemon stopped: its runner is still running"
+        );
+    }
+
+    /// Serve `path` with `seams`, in a task the test can abort.
+    fn start_serving(
+        path: &Path,
+        seams: ServeSeams,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let path = path.to_path_buf();
+        tokio::spawn(serve_unix(path, RunnerOptions::default(), || {}, seams))
+    }
+
+    /// A runner that never sends anything and never stops.
+    fn idle_runner() -> super::StartRunner {
+        Box::new(|_parts| Box::pin(std::future::pending::<()>()))
+    }
+
+    /// A daemon whose runner stops would greet clients and never send them
+    /// anything again; it stops instead, so its keeper starts it over.
+    #[tokio::test]
+    async fn a_daemon_stops_when_its_runner_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let returned: super::StartRunner = Box::new(|_| Box::pin(async {}));
+        let panicked: super::StartRunner = Box::new(|_| Box::pin(async { panic!("runner bug") }));
+        for (name, start_runner) in [("returned", returned), ("panicked", panicked)] {
+            let path = dir.path().join(format!("{name}.sock"));
+            let seams = ServeSeams {
+                start_runner,
+                client_tasks: None,
+                path_check_interval: super::PATH_CHECK_INTERVAL,
+            };
+            let outcome = tokio::time::timeout(DEADLINE, start_serving(&path, seams))
+                .await
+                .unwrap_or_else(|_| panic!("a daemon whose runner {name} kept serving"))
+                .unwrap();
+            let error = format!("{:#}", outcome.expect_err("a stopped runner is an error"));
+            assert!(error.contains("telemetry runner"), "{name}: {error}");
+            if name == "panicked" {
+                assert!(error.contains("panicked"), "{error}");
+            }
+            assert!(!path.exists(), "{name}: the daemon must remove its socket");
+        }
+    }
+
+    /// A stopped daemon closes its clients' connections itself, not only
+    /// because its broadcast channel went away: here the channel outlives it.
+    #[tokio::test]
+    async fn a_stopped_daemon_closes_its_clients_even_while_its_channel_lives() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let keep = std::sync::Arc::clone(&kept);
+        let seams = ServeSeams {
+            start_runner: Box::new(move |parts| {
+                *keep.lock().unwrap() = Some(parts.tx);
+                Box::pin(std::future::pending::<()>())
+            }),
+            client_tasks: None,
+            path_check_interval: super::PATH_CHECK_INTERVAL,
+        };
+        let daemon = start_serving(&path, seams);
+        let mut attached = wait_until_serving(&path).await;
+
+        daemon.abort();
+        let _ = daemon.await;
+        assert!(
+            kept.lock().unwrap().is_some(),
+            "the channel must still be alive"
+        );
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(DEADLINE, attached.read_to_end(&mut rest))
+            .await
+            .expect("the client connection must be closed when the daemon stops")
+            .expect("the connection must end cleanly");
+    }
+
+    /// Finished client tasks are released, so a long-running daemon does not
+    /// hold one for every client it ever had.
+    #[tokio::test]
+    async fn finished_client_tasks_are_released() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let seams = ServeSeams {
+            start_runner: idle_runner(),
+            client_tasks: Some(std::sync::Arc::clone(&count)),
+            path_check_interval: super::PATH_CHECK_INTERVAL,
+        };
+        let daemon = start_serving(&path, seams);
+        let held = |n: usize| {
+            let count = std::sync::Arc::clone(&count);
+            async move {
+                let deadline = tokio::time::Instant::now() + DEADLINE;
+                while count.load(Ordering::SeqCst) != n {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the daemon still holds {} client tasks, expected {n}",
+                        count.load(Ordering::SeqCst)
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        let client = wait_until_serving(&path).await;
+        held(1).await;
+        drop(client);
+        held(0).await;
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// Gives a directory its mode back however a test ends, so the temporary
+    /// directory can be removed.
+    struct Restore<'a>(&'a Path);
+
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// A path that cannot be checked for a moment says nothing about whose
+    /// socket it is: the daemon keeps serving through it.
+    #[tokio::test]
+    async fn a_daemon_keeps_serving_while_its_path_briefly_cannot_be_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("private");
+        std::fs::create_dir(&socket_dir).unwrap();
+        let path = socket_dir.join("rocmdashd.sock");
+        let daemon = start_serving(
+            &path,
+            ServeSeams {
+                start_runner: idle_runner(),
+                client_tasks: None,
+                path_check_interval: super::PATH_CHECK_INTERVAL,
+            },
+        );
+        let _attached = wait_until_serving(&path).await;
+
+        let restore = Restore(&socket_dir);
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(&path).is_ok() {
+            drop(restore);
+            eprintln!("skip: this user can read a mode-000 directory (root?)");
+            daemon.abort();
+            let _ = daemon.await;
+            return;
+        }
+        // Long enough for at least one path check to fail to read the path.
+        tokio::time::sleep(super::PATH_CHECK_INTERVAL + Duration::from_millis(500)).await;
+        drop(restore);
+
+        assert!(
+            !daemon.is_finished(),
+            "a daemon must not give its path up over one unreadable check"
+        );
+        welcome_from(&path)
+            .await
+            .expect("the daemon must still serve its path");
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// A path that stays unreadable is given up after five checks in a row,
+    /// so the daemon stops and its keeper can claim the path again.
+    #[tokio::test]
+    async fn a_daemon_gives_its_path_up_when_it_stays_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("private");
+        std::fs::create_dir(&socket_dir).unwrap();
+        let path = socket_dir.join("rocmdashd.sock");
+        let daemon = start_serving(
+            &path,
+            ServeSeams {
+                start_runner: idle_runner(),
+                client_tasks: None,
+                path_check_interval: Duration::from_millis(20),
+            },
+        );
+        let _attached = wait_until_serving(&path).await;
+
+        let restore = Restore(&socket_dir);
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(&path).is_ok() {
+            drop(restore);
+            eprintln!("skip: this user can read a mode-000 directory (root?)");
+            daemon.abort();
+            let _ = daemon.await;
+            return;
+        }
+        // Well under five checks at the production interval (10 s), so this
+        // fails if the test interval is not the one the loop uses.
+        let outcome = tokio::time::timeout(Duration::from_secs(3), daemon)
+            .await
+            .expect("a daemon whose path stays unreadable must stop")
+            .unwrap();
+        drop(restore);
+
+        let error = format!("{:#}", outcome.expect_err("giving the path up is an error"));
+        assert!(
+            error.contains(&format!(
+                "failed {} times in a row",
+                super::PATH_CHECK_UNKNOWN_LIMIT
+            )),
+            "{error}"
+        );
+    }
+
+    /// Something other than a socket appearing at the path between the probe
+    /// and the bind is refused as not a socket, not taken for a daemon.
+    #[tokio::test]
+    async fn a_file_that_appears_before_the_bind_is_refused_as_not_a_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let mut claim = SocketClaim::claim(&path).await.unwrap();
+        std::fs::write(&path, "keep me").unwrap();
+
+        let refusal = claim.bind().expect_err("the path is taken");
+
+        assert!(in_use_path(&refusal).is_none(), "{refusal:#}");
+        assert!(
+            format!("{refusal:#}").contains(&not_a_socket_refusal(&path)),
+            "{refusal:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    /// Unreadable path checks give the path up only five in a row; a check
+    /// that reads the path starts the count over.
+    #[test]
+    fn only_five_unreadable_path_checks_in_a_row_give_the_path_up() {
+        use super::unreadable_streak;
+
+        let mut streak = 0;
+        for _ in 0..4 {
+            streak = unreadable_streak(streak, false).expect("fewer than five");
+        }
+        assert_eq!(unreadable_streak(streak, false), None, "the fifth gives up");
+        assert_eq!(
+            unreadable_streak(streak, true),
+            Some(0),
+            "a good check resets"
+        );
+
+        let mut streak = 0;
+        for readable in [false, false, false, false, true, false, false, false, false] {
+            streak = unreadable_streak(streak, readable).expect("never five in a row");
         }
     }
 }

@@ -1059,14 +1059,41 @@ Expected result:
   `disconnected` for a moment, then reads `connected · ... · rocm daemon` again
   within a few seconds, and its figures keep updating. A second dashboard that
   stays `disconnected` is the bug this checks for.
+- Expected costs of the hand-off, not bugs: the second dashboard's GPU
+  figures can stay empty for a while after it reconnects -- up to about 15
+  seconds, the daemon's 5 s `amd-smi` detection limit plus its 10 s limit on
+  the first system query -- because the daemon that took over detects the GPU
+  from scratch. Its charts keep the history they had: the new daemon starts
+  with nothing to replay, so nothing is added twice. Its benchmark list is
+  rebuilt from the benchmark CSV, so each row appears once. A dashboard opened
+  after the hand-off gets only what the new daemon has recorded since it took
+  over (it keeps the last 30 snapshots, about 30 seconds). `rocm dash` records
+  sessions unless the session file cannot be opened (then it logs a warning
+  and records nothing), so the daemon that took over starts a new
+  `session-*.ndjson` file in `telemetry` under the data directory.
+- Not part of the hand-off, a known issue: a dashboard that reconnects to the
+  *same* daemon gets that daemon's up to 30 most recent snapshots replayed and
+  appends them, so a few recent chart points can appear twice.
 - The same holds when the first dashboard is killed instead of quit
   (`kill -9 <pid>` from a third terminal).
 - Quitting the second dashboard as well leaves no `rocmdashd.sock` in the
   socket directory (`$XDG_RUNTIME_DIR` when it is set); the
   `rocmdashd.sock.lock` file beside it is expected to stay.
 - Opening a dashboard while a regular file sits at the socket path leaves the
-  file in place; the header reads `disconnected` and the client log names the
-  path and says it is not a socket.
+  file in place; the dashboard opens at once (it does not wait for a daemon
+  that has already failed) and the header reads `disconnected`. After
+  quitting, `rocm dash` prints, below the restored terminal, that its
+  telemetry daemon could not start because that path is not a socket (with
+  the number of failed attempts in a row, when it has retried), and names the
+  log directory (`logs` under the data directory: `~/.rocm/logs`, unless
+  `ROCM_CLI_DATA_DIR` is set or `config.json` records a managed root, which
+  then holds the data directory), whose `rocm-cli.log.<date>` files hold one
+  warning per failed attempt. With `RUST_LOG`
+  set to drop warnings, the line about the log is left out. Opened from the
+  bare `rocm` launcher instead, the dashboard writes the same lines to the
+  main screen once it has restored the terminal, and the launcher then
+  switches back to its own alternate screen, a separate buffer, so the lines
+  are seen when the launcher itself exits.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

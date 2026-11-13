@@ -239,8 +239,13 @@ The full-screen telemetry dashboard shows every instrument and action on one scr
 On Linux it runs its telemetry daemon inside the dashboard itself, with no
 separate service to start. Several dashboards open at once share one daemon,
 and when the dashboard running it closes, one that is still open takes it
-over, so the others reconnect. It presents
-five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+over, so the others reconnect and keep their chart history. After that
+hand-off the GPU figures can stay empty for a while (up to about 15 seconds on
+some hosts) while the new daemon detects the GPU again. A dashboard that
+reconnects to the same daemon can show up to about 30 recent chart points
+twice, a known issue. If the daemon cannot start at all, the dashboard says
+why after you quit it, however you opened it (`rocm dash`, interactive
+`rocm chat`, or the bare `rocm` launcher). The dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 
 | Tab | What it shows |
 |---|---|

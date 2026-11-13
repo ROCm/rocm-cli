@@ -195,8 +195,11 @@ pub(super) fn write_restore_sequences<W: io::Write>(out: &mut W) -> io::Result<(
 /// as the intended behavior: (1) an in-flight focused install/serve child is
 /// left to the OS rather than reaped via `kill_on_drop`, matching the
 /// pre-existing default disposition and avoiding truncating a mid-write child on
-/// the way out; and (2) `run_async`'s embedded-daemon socket is not unlinked
-/// here, but the daemon unlinks a stale socket on its next bind, so it self-heals.
+/// the way out; and (2) `run_async`'s embedded daemon does not remove its socket
+/// here. The OS releases the socket's ownership lock as the process exits, so
+/// the next daemon to claim the path -- another dashboard still open, which
+/// takes over within a poll, or the next one started -- finds nobody answering
+/// on the left-over socket and replaces it.
 ///
 /// More than one watcher can be live at once — bare `rocm` escalates from the
 /// hub into a dashboard session, so the hub's process-lifetime watcher and
