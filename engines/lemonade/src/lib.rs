@@ -61,7 +61,7 @@ const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTAL
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
-const STOP_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Lemonade state identifies the actual llama-server process directly.
 const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Single;
 

@@ -256,6 +256,29 @@ impl TerminationOutcome {
         )
     }
 
+    /// Why a stop that is not [`stopped`](Self::stopped) is unconfirmed, worded
+    /// to complete "process N was not confirmed stopped: …". `None` exactly
+    /// when [`stopped`](Self::stopped) is `true`, so a warning built from it
+    /// cannot disagree with the decision it reports.
+    #[must_use]
+    pub const fn unconfirmed_reason(self) -> Option<&'static str> {
+        match self {
+            Self::TimedOut => {
+                Some("it, or a process under it, was still running when the stop ended")
+            }
+            Self::Unverified => {
+                Some("its identity could not be confirmed, so it was not signalled")
+            }
+            Self::DescendantsUnconfirmed => {
+                Some("it is gone, but a process under it may still be running")
+            }
+            Self::ExitedBeforeTreeKill => Some(
+                "it exited before the processes under it were stopped, and they may still be running",
+            ),
+            Self::AlreadyGone | Self::IdentityMismatch | Self::Graceful | Self::Forced => None,
+        }
+    }
+
     /// A stable, log-friendly label for the outcome.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -1121,6 +1144,51 @@ mod tests {
     fn parse_start_ticks_rejects_malformed() {
         assert_eq!(parse_start_ticks("no parens here"), None);
         assert_eq!(parse_start_ticks("123 (short) S 1 2 3"), None);
+    }
+
+    #[test]
+    fn unconfirmed_reason_is_given_exactly_for_an_unconfirmed_stop() {
+        // The match has no wildcard, so a new variant fails to compile here until
+        // its reason is pinned; add it to the list below in the same edit.
+        let expected = |outcome: TerminationOutcome| match outcome {
+            TerminationOutcome::TimedOut => {
+                Some("it, or a process under it, was still running when the stop ended")
+            }
+            TerminationOutcome::Unverified => {
+                Some("its identity could not be confirmed, so it was not signalled")
+            }
+            TerminationOutcome::DescendantsUnconfirmed => {
+                Some("it is gone, but a process under it may still be running")
+            }
+            TerminationOutcome::ExitedBeforeTreeKill => Some(
+                "it exited before the processes under it were stopped, and they may still be running",
+            ),
+            TerminationOutcome::AlreadyGone
+            | TerminationOutcome::IdentityMismatch
+            | TerminationOutcome::Graceful
+            | TerminationOutcome::Forced => None,
+        };
+        for outcome in [
+            TerminationOutcome::AlreadyGone,
+            TerminationOutcome::IdentityMismatch,
+            TerminationOutcome::Unverified,
+            TerminationOutcome::Graceful,
+            TerminationOutcome::Forced,
+            TerminationOutcome::TimedOut,
+            TerminationOutcome::DescendantsUnconfirmed,
+            TerminationOutcome::ExitedBeforeTreeKill,
+        ] {
+            assert_eq!(
+                outcome.unconfirmed_reason(),
+                expected(outcome),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                outcome.unconfirmed_reason().is_some(),
+                !outcome.stopped(),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
