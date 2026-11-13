@@ -165,7 +165,8 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
             // carry it out with -> INTERNAL, not FAILED (which is reserved for
-            // "attempted, and the command failed"). Held by
+            // "attempted, and a command or the read it planned from failed").
+            // Held by
             // `a_recipe_that_acts_has_a_runner`.
             fail!("Internal error: a recipe the catalog says is applied here has no runner.");
             exit::INTERNAL

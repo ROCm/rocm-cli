@@ -109,10 +109,32 @@ pub(super) struct Step<'a> {
     pub(super) what: &'a str,
     /// A command the user can run to see whether the change was made.
     pub(super) check: &'a str,
+    /// Where `check` runs, which the line names when it is not a plain shell.
+    pub(super) check_in: CheckIn,
     /// The `rocm fix` invocation that makes the change if it was not made.
     pub(super) rerun: &'a str,
     /// The bound the command runs under; also the number the timeout line names.
     pub(super) timeout: Duration,
+}
+
+/// Where a [`Step`]'s `check` command is run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CheckIn {
+    /// Any shell: "Check with `id -nG alice`".
+    Shell,
+    /// A PowerShell expression, which `cmd` cannot run: "Check in PowerShell
+    /// with `[Environment]::GetEnvironmentVariable(...)`".
+    PowerShell,
+}
+
+impl CheckIn {
+    /// The words before the backticked command.
+    const fn lead(self) -> &'static str {
+        match self {
+            Self::Shell => "Check with",
+            Self::PowerShell => "Check in PowerShell with",
+        }
+    }
 }
 
 /// A failed step: the line to print on stderr and the exit code to return,
@@ -132,8 +154,11 @@ impl Step<'_> {
         let phrase = outcome_phrase(self.label, outcome, self.timeout);
         let line = if may_have_acted(outcome) {
             format!(
-                "{phrase}; {} may or may not have changed. Check with `{}`, then re-run `{}` if it did not.",
-                self.what, self.check, self.rerun
+                "{phrase}; {} may or may not have changed. {} `{}`, then re-run `{}` if it did not.",
+                self.what,
+                self.check_in.lead(),
+                self.check,
+                self.rerun
             )
         } else {
             format!("{phrase}; {} NOT changed.", self.what)
@@ -269,6 +294,7 @@ mod tests {
         label: "setx",
         what: "User-scope X",
         check: "check-x",
+        check_in: CheckIn::Shell,
         rerun: "rocm fix fix-x",
         timeout: RUN_TIMEOUT,
     };
@@ -342,6 +368,24 @@ mod tests {
     fn run_step_reports_a_missing_program_as_not_found() {
         let capture = run_step("rocm-fix-no-such-program-345", &[], QUERY_TIMEOUT);
         assert_eq!(capture.outcome, CommandOutcome::NotFound);
+    }
+
+    /// A PowerShell expression is not something `cmd` can run, so the line
+    /// says where to run it; a plain shell command keeps "Check with".
+    #[test]
+    fn a_powershell_check_says_to_run_it_in_powershell() {
+        let step = Step {
+            check_in: CheckIn::PowerShell,
+            ..STEP
+        };
+        let line = step
+            .failure(CommandOutcome::TimedOut)
+            .expect("a failure")
+            .line;
+        assert!(
+            line.contains(" Check in PowerShell with `check-x`, then re-run"),
+            "{line}"
+        );
     }
 
     #[test]

@@ -942,6 +942,9 @@ Feature: Diagnosing failures and listing fixes
   # nothing in the Machine scope either, fix-2 printed that no persistent
   # override was found and the user was done, and exited 0, on a machine that
   # may still carry it. Same real "PowerShell missing" cause as diagnose-39.
+  # Applied for real: should the guard regress, both reads would read as unset
+  # and fix-2 would find nothing to clear, so the runner's User environment is
+  # never written.
   @id:diagnose-fix-override-aborts-on-unreadable-user-scope @requires-os:windows
   Scenario: diagnose-63 - Clearing the GPU override stops when the saved value cannot be read, instead of calling it gone
     Given a Windows host where PowerShell cannot be found
@@ -951,11 +954,20 @@ Feature: Diagnosing failures and listing fixes
     And the CLI does not report the override as already gone
 
   # The same failed read made fix-9 skip its "already set" guard and overwrite
-  # a User-scope device setting the user may have chosen on purpose.
+  # a User-scope device setting the user may have chosen on purpose. Previewed
+  # rather than applied: the empty PATH hides PowerShell but not setx.exe, so
+  # an applied fix-9 whose guard regressed would set HIP_VISIBLE_DEVICES on the
+  # runner itself, with nothing to restore it. The preview reads the setting
+  # before planning, the same way the apply does, and a preview never runs
+  # setx. So this holds the stop and what the preview prints: the catalog entry
+  # still appears, the change it would make does not. That an applied fix-9
+  # writes nothing after a failed read is held by the unit tests in
+  # fix/runners.rs (`pin_device_read_timeout_stops_before_setx`,
+  # `a_read_that_exits_non_zero_stops_every_windows_fix_without_writing`).
   @id:diagnose-fix-igpu-aborts-on-unreadable-user-scope @requires-os:windows
-  Scenario: diagnose-64 - Pinning the discrete GPU stops when the saved device setting cannot be read, before planning a write
+  Scenario: diagnose-64 - A dry run of the discrete-GPU pin that cannot read the saved device setting stops with exit code 4 and previews no change
     Given a Windows host where PowerShell cannot be found
     And a user who has chosen the fix that hides the integrated GPU
-    When the user asks the CLI to apply the approved fix to the second GPU
+    When the user previews that fix for the second GPU
     Then the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed
-    And no plan to save a device setting is printed
+    And the fix's catalog entry is printed, but not the device setting it would save

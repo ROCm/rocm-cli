@@ -2923,8 +2923,8 @@ line on stderr, built from how the command ended
 | How the command ended | What the line says |
 |---|---|
 | exited non-zero, or could not be started | it exited `N` (or could not be started), and the change was NOT made |
-| timed out (60s for a change), or was stopped by a signal or a failed wait | it was stopped, the change may or may not have been made, a command to check it, and the `rocm fix` command to re-run |
-| a Windows read of the current value did not complete (8s) | it could not read the current value, and nothing was changed; the fix stops before any plan or prompt |
+| timed out (60s for a change), or was stopped by a signal or a failed wait | it was stopped, the change may or may not have been made, how to check it (`Check with` a shell command on Linux, `Check in PowerShell with` an expression on Windows), and the `rocm fix` command to re-run |
+| a Windows read of the current value did not complete (8s) | it could not read the current value, and nothing was changed; the runner stops before its preview of the change or any prompt, under `--dry-run` too; the catalog entry printed before it still appears |
 
 Each row for each runner is unit-tested with an injected command runner in
 [fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) and
@@ -2934,16 +2934,41 @@ run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-62`
 (it never finishes) stand a fake `sudo` on a restricted `PATH` that records the
 arguments it was given, and assert the line together with the exit code, that
 the helper was asked to add the user to the groups, and that the success line is
-absent. `diagnose-62` waits out the real one-minute bound; there is no switch to
-shorten it. Both are `@requires-os:linux @requires-bare-metal`. On Windows,
-`diagnose-39` (fix-6), `diagnose-63` (fix-2) and `diagnose-64` (fix-9 with
-`--device-index 1`) give the CLI an empty `PATH`, so its PowerShell read cannot
-start, and assert exit 4, the read-failure line, and that the fix printed no plan
-and did not report the variable as absent. They run on the Windows lanes only;
-the Linux lanes compile them. No scenario times out a Windows `setx` or
-PowerShell write: those rows are covered by the unit tests. To run the two
-Linux scenarios on a bare-metal Linux host (`-n` skips the tag gates, so on WSL2
-they fail at the platform refusal instead):
+absent. Both are `@requires-os:linux @requires-bare-metal`. `diagnose-62`
+waits out the real one-minute bound; there is no switch to shorten it. The step
+waits for the CLI on a blocking thread (`run_rocm_with_scenario_env_off_executor`
+in [e2e.rs](../tests/e2e-cucumber/tests/e2e.rs)): the whole suite is polled on
+one thread, so a synchronous wait would stall every concurrent scenario for that
+minute and push the TUI scenarios past their wall-clock caps.
+
+On Windows, `diagnose-39` (fix-6), `diagnose-63` (fix-2) and `diagnose-64`
+(fix-9 with `--device-index 1`, run as a `--dry-run`) give the CLI an empty
+`PATH`, so its PowerShell read cannot start. They assert exit 4 and the
+read-failure line, and that the runner went no further: no `Plan: ...` preview
+of the change for fix-6 and fix-9, and no report that fix-2's variable is
+absent. The catalog entry `rocm fix` prints before the runner still appears. The
+empty `PATH` denies PowerShell only: Rust's `Command` looks for a bare program
+name in the CLI's own directory, System32 and the Windows directory before
+`PATH`, so `setx.exe` (in System32) is still found, while `powershell.exe` (in a
+System32 subdirectory) is not. None of the three can write the runner's real
+User environment even if the read guard regressed: fix-6 writes through
+PowerShell, which cannot start; fix-2 would read both scopes as unset and find
+nothing to clear, so it never reaches its `setx`; and `diagnose-64` is a dry
+run, which never runs `setx`. The fix-9 path that does write is held by the unit
+tests. These three run only on the self-hosted Strix Halo Windows lanes, neither
+of which is a required check: `E2E tests (Strix Halo, Windows, <sdk>)`
+(`e2e-gpu-strix-windows` in
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), on a pull request
+that touches its `serve` paths, on pushes and in the merge queue) and `E2E tests
+(Strix Halo, Windows, incl. nightly-only)` (`e2e-gpu-nightly-strix-windows` in
+[nightly.yml](../.github/workflows/nightly.yml)). The required hosted Windows
+lane (`windows-release` in [ci.yml](../.github/workflows/ci.yml), behind
+`windows-build-and-test`) runs only `@lifecycle` scenarios and the ids in its
+`E2E_ALSO_RUN_IDS`, which do not include them. The Linux lanes compile them. No
+scenario times out a Windows `setx` or PowerShell write: those rows are covered
+by the unit tests. To run the two Linux scenarios on a bare-metal Linux host
+(`-n` skips the tag gates, so on WSL2 they fail at the platform refusal
+instead):
 
 ```bash
 cargo xtask e2e -- -n '(diagnose-15|diagnose-62) '

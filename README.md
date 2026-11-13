@@ -493,7 +493,13 @@ hardware, not something an install or a setting can put right.
 
 `rocm fix` takes these flags:
 
-- `--dry-run` shows any fix's plan without changing anything.
+- `--dry-run` shows a fix's plan without changing anything. On Windows,
+  `fix-2-unset-override`, `fix-6-path` and `fix-9-igpu-dgpu --device-index N`
+  read the current value of the variable they change before planning, so a dry
+  run whose read fails stops with exit 4 and shows no plan. It still prints the
+  fix's catalog entry, which describes the fix in general terms (for
+  `fix-9-igpu-dgpu`, a `setx HIP_VISIBLE_DEVICES <dGPU-index>` template) and is
+  not a preview of the change on this machine.
 - `--yes` skips the interactive confirmation once you've reviewed it. Without
   it, a fix that changes files or settings asks `[y/N]` (default: no). When
   stdin is not a terminal it prints the plan and refuses with exit code 5,
@@ -509,10 +515,12 @@ hardware, not something an install or a setting can put right.
 A fix that runs a command and fails exits 4 and says why on stderr. That
 includes a command that does not finish within its time limit (one minute):
 the CLI stops it and exits 4, but the change may have been made in part or may
-still finish, so the message names a command to check it with and the
-`rocm fix` command to re-run if it was not made. On Windows, a fix that cannot
-read the current value of the variable it changes stops before changing
-anything, also with exit 4.
+still finish, so the message says how to check it (on Windows, an expression
+to run in PowerShell) and names the `rocm fix` command to re-run if it was not
+made. On Windows, when one of those three fixes cannot read the current value
+of the variable it changes, it stops before changing anything, also with exit 4;
+under `--dry-run` it stops the same way, before showing the change it would
+make.
 
 ### ROCm installation
 

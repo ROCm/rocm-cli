@@ -633,15 +633,25 @@ async fn user_chose_igpu_fix(world: &mut E2eWorld) {
 }
 
 /// Gives the CLI an empty `PATH`, so its own PowerShell reads cannot start.
+///
+/// It denies PowerShell only. The CLI starts both programs by bare name, and
+/// on Windows Rust's `Command` looks for a bare name in the CLI's own
+/// directory, then the system directory (System32), then the Windows
+/// directory, and only then in the CLI's `PATH` (empty here). `setx.exe` is in
+/// System32, so it is still found; `powershell.exe` is in a subdirectory of
+/// System32 that only `PATH` reaches, so it is not. What keeps each
+/// scenario off the runner's real User environment, should the read guard
+/// regress, is the scenario's own: fix-6 (diagnose-39) writes through
+/// PowerShell, which cannot start; fix-2 (diagnose-63) would read both scopes
+/// as unset and find nothing to clear; fix-9 (diagnose-64) is only previewed.
 fn deny_powershell(world: &mut E2eWorld) {
     // An empty child PATH means the CLI's own `Command::new("powershell")`
     // cannot resolve the binary at all -- `powershell.exe` lives under
     // `System32\WindowsPowerShell\v1.0`, which Windows does NOT search
     // unconditionally the way it does System32 itself, so this is a real
     // instance of the "PowerShell missing" cause `ps_env_scope`'s doc comment
-    // names, not a faked one. Every fix that reads a User-scope value stops
-    // at that read, so nothing on the real machine is touched and no
-    // capture/restore is needed.
+    // names, not a faked one. No capture/restore is needed: see above for why
+    // none of the three scenarios can write the real User environment.
     world.command_env.push(("PATH", std::ffi::OsString::new()));
 }
 
@@ -733,17 +743,25 @@ async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
 #[when("the user asks the CLI to apply the approved fix")]
 async fn user_applies_approved_fix(world: &mut E2eWorld) {
     let fix_id = world.model_name.clone().expect("no fix id set");
-    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--yes"]);
+    // Off the executor: in diagnose-62 the fix waits out its one-minute
+    // timeout, which would otherwise stall every concurrent scenario.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env_off_executor(world, &["fix", &fix_id, "--yes"]).await;
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
-#[when("the user asks the CLI to apply the approved fix to the second GPU")]
-async fn user_applies_approved_fix_to_second_gpu(world: &mut E2eWorld) {
+#[when("the user previews that fix for the second GPU")]
+async fn user_previews_fix_for_second_gpu(world: &mut E2eWorld) {
     let fix_id = world.model_name.clone().expect("no fix id set");
-    let (stdout, stderr, rc) =
-        crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--device-index", "1", "--yes"]);
+    // `--dry-run` and no `--yes`: even a fix that wrongly went past its read
+    // would stop at the preview, and failing that, at the consent gate (stdin
+    // is piped), before running `setx` on the runner.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["fix", &fix_id, "--device-index", "1", "--dry-run"],
+    );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -1918,19 +1936,33 @@ async fn assert_override_not_reported_gone(world: &mut E2eWorld) {
     "the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed"
 )]
 async fn assert_igpu_fix_aborts_on_unreadable_scope(world: &mut E2eWorld) {
-    assert_read_failure_stops_the_fix(
-        world,
-        "HIP_VISIBLE_DEVICES",
-        &["setx only takes effect in NEW shells"],
-    );
+    // Nothing after the read is listed here: this is a dry run, so the lines a
+    // fix that went on would print are the preview, which the next step checks.
+    assert_read_failure_stops_the_fix(world, "HIP_VISIBLE_DEVICES", &[]);
 }
 
-#[then("no plan to save a device setting is printed")]
+#[then("the fix's catalog entry is printed, but not the device setting it would save")]
 async fn assert_no_device_setting_plan(world: &mut E2eWorld) {
     let stdout = world.cli_output.as_deref().unwrap_or("");
+    // `rocm fix` prints the catalog entry before the runner reads anything,
+    // so a stopped dry run still shows it; the docs say exactly that. The
+    // `Fix:` line is the one `print_recipe` opens the entry with.
+    let fix_id = world.model_name.as_deref().expect("no fix id set");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("Fix:") && line.contains(fix_id)),
+        "the catalog entry for {fix_id} must still be printed on stdout:\n{stdout}"
+    );
+    // The runner's own preview, whatever its heading says: the concrete
+    // `setx` for the index the When step passed and the dry-run marker. The
+    // catalog entry's `Commands:` lists `setx HIP_VISIBLE_DEVICES <dGPU-index>`,
+    // a template, so only the concrete index is forbidden.
     for line in [
         "Plan: persist HIP_VISIBLE_DEVICES",
         "already sets HIP_VISIBLE_DEVICES",
+        "setx HIP_VISIBLE_DEVICES 1",
+        "(dry-run; not executed)",
     ] {
         assert!(
             !stdout.contains(line),

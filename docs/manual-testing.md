@@ -1713,7 +1713,9 @@ only and start `rocm.exe` by its full path:
 $rocm = (Get-Command rocm).Source
 $env:Path = ''
 & $rocm fix fix-2-unset-override --yes; "exit $LASTEXITCODE"
-& $rocm fix fix-9-igpu-dgpu --device-index 1 --yes; "exit $LASTEXITCODE"
+& $rocm fix fix-9-igpu-dgpu --device-index 1 --dry-run; "exit $LASTEXITCODE"
+& $rocm fix fix-2-unset-override --dry-run; "exit $LASTEXITCODE"
+& $rocm fix fix-6-path --dry-run; "exit $LASTEXITCODE"
 ```
 
 Expected result:
@@ -1722,6 +1724,16 @@ Expected result:
   PowerShell could not be started: it was not found; nothing was changed.` on
   stderr and exits 4. It does not print `No persistent HSA_OVERRIDE_GFX_VERSION
   found` or `You're done`.
-- fix-9 prints the same line for `HIP_VISIBLE_DEVICES`, exits 4, and prints no
-  `Plan: persist HIP_VISIBLE_DEVICES` line; the User-scope value is unchanged.
+- fix-9, a dry run here, prints the same line for `HIP_VISIBLE_DEVICES`, exits
+  4, and prints no `Plan: persist HIP_VISIBLE_DEVICES` line (the catalog entry
+  that starts `Fix:` is still printed before it). It is run as a dry
+  run because the empty `PATH` hides PowerShell but not `setx.exe`: a fix-9 that
+  wrongly went on would set your real User-scope value.
+- The fix-2 dry run stops the same way: exit 4 and the read-failure line, after
+  the catalog entry, with no `The CLI runs (arguments, not a line to paste)`
+  line.
+- fix-6 (needs a HIP SDK install; without one it exits 3 before reading)
+  prints `Could not read the current User PATH: PowerShell
+  could not be started: it was not found; nothing was changed.`, exits 4, and
+  prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
