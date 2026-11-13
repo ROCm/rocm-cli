@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn a_rocdxg_beside_the_runtime_is_not_reported_as_unlinked() {
         // The ROCM-30386 layout: a TheRock tarball keeps librocdxg.so beside
-        // libhsa-runtime64, which opens it through its own `$ORIGIN` runpath.
+        // libhsa-runtime64, which opens it through its own `$ORIGIN` search path.
         let mut e = wsl_base();
         let w = e.wsl.as_mut().expect("wsl facts");
         w.ldconfig_librocdxg = Some(false);

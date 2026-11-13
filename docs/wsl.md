@@ -314,11 +314,31 @@ below.
   entry
 - whether `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`
   (`wsl_librocdxg_beside_runtime`). The runtime opens `librocdxg.so` by name and
-  carries `RUNPATH $ORIGIN`, so a TheRock tarball under `/opt/rocm-<version>`,
+  searches its own directory (`$ORIGIN`; the wheel runtimes' `libhsa-runtime64.so.1`
+  carries it as a `DT_RPATH`, per `readelf -d`), so a TheRock tarball under `/opt/rocm-<version>`,
   which keeps the two side by side and registers nothing with `ldconfig`, loads
   with neither the cache nor the variable. `driver_status` is
   `wsl_rocdxg_ready` when any of the three sources finds the library, and
   `wsl_rocdxg_missing` only when none does
+- a managed wheel runtime whose own `librocdxg.so.1` its runtime does not load
+  (`wsl_runtime_librocdxg` in the text form, `summary.unlinked_runtime_librocdxg`
+  in `--json`; printed only when there is one). The wheel ships
+  `librocdxg.so.1` beside `libhsa-runtime64`, but the runtime opens
+  `librocdxg.so`, which the wheel does not ship, so it loads the host's copy.
+  A host `rocdxg-roct` older than the runtime expects then fails at first GPU
+  use, for example ROCm 10.2 and 10.3 nightly runtimes against `rocdxg-roct`
+  1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`, then a segmentation
+  fault), while `driver_status` still reads `wsl_rocdxg_ready`, which describes
+  the host's plumbing. Wheel runtime installs and updates (`rocm install sdk`, `rocm update --apply`)
+  link `librocdxg.so` to the runtime's own copy on WSL (tarballs ship both
+  names, and an adopted runtime is never linked); for a runtime installed earlier the line names the
+  `ln -s librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same.
+  The mechanism (the unversioned open skipping the runtime's directory and
+  landing on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2
+  nightly; which component requests `hsaKmtSetPersistingCacheSize` is not
+  identified. The line is a pointer, not a verdict: it appears for every such runtime,
+  including ones that work with the host's copy, because the files alone do not
+  say which symbols the runtime needs
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)

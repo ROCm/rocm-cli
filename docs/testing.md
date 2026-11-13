@@ -4175,7 +4175,7 @@ the probe finds.
 
 `examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
 library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
-own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
+own `$ORIGIN` search path, so `driver_status` is `wsl_rocdxg_ready` with neither the
 cache nor the variable involved, which is the layout of a TheRock tarball
 (ROCM-30386). Its control is `examine-33`, which plants the library alone and
 stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
@@ -4191,6 +4191,20 @@ RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-48 '
+```
+
+`examine-49` to `examine-52` cover the managed-runtime `librocdxg` finding on WSL (see [wsl.md](wsl.md)). `examine-49` to `examine-51` plant the WSL machine of `examine-32` (`examine-52` plants a host that is not WSL) plus a managed wheel runtime in the registry whose library directory holds `libhsa-runtime64.so.1` and `librocdxg.so.1`.
+
+`examine-49` has no `librocdxg.so` beside them, so `rocm examine --json` lists that `librocdxg.so.1` in `summary.unlinked_runtime_librocdxg` while `driver_status` stays `wsl_rocdxg_ready`. `examine-50` is the control: the same runtime with `librocdxg.so` present, and nothing is listed. `examine-51` reads the text form, runs the `ln -s` command its `wsl_runtime_librocdxg` line advises, and inspects again, so the advice is shown to exist, to clear the finding and to make `librocdxg.so` read as the runtime's own copy. `examine-52` is the same runtime on a machine that is not WSL, where nothing is listed. Each run sets `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, because a registered runtime would otherwise start the update check, which needs the network and prints ahead of the JSON.
+
+The install side (`rocm install sdk` linking the name on WSL) has no scenario, because it needs a real wheel download; the helper unit tests in `runtime_rocdxg.rs` cover it against a temporary directory (the link is made and resolves to the runtime's copy, and only in the probe's library paths, nothing happens off WSL, a refused link is reported with the manual command, and a dangling `librocdxg.so` is left alone).
+
+The entry point the install calls reads the WSL gate itself, and `the_install_entry_point_reads_the_wsl_gate_from_the_host` drives it on a simulated WSL host and a simulated native one through `ROCM_CLI_TEST_HOST_ROOT`; it runs only with the hooks feature, so run it with `cargo test -p rocm-core --lib --features e2e-test-hooks -- runtime_rocdxg`.
+
+Deleting the call in `install_wheel_runtime` is caught by the dead-code lint under `cargo clippy --workspace --all-targets -- -D warnings` (the required lint job), not by a test: with the call removed, clippy reports `function report_runtime_librocdxg_link is never used` (and the two helpers only it uses), while `cargo test -p rocm --bin rocm therock::` stays green with one warning. A wrong gate or directory list passed through the one-line wrapper is covered by the tests of the shared helpers (`the_install_report_links_only_the_probes_library_directories_when_wsl`, driven with the gate true and false on every Unix host, and the hooks-lane test of the real gate), but a different list passed to the core entry from inside the wrapper is not caught by any test. The install side has no scenario because `rocm install sdk` on WSL needs a real wheel download and a WSL host, and no default lane has one: the post-probe step is covered by the unit tests above, and the call site is protected by the dead-code lint under `clippy -D warnings`. A possible follow-up, not done here: the gated `runtime-01` scenario (`@requires-gpu @nightly`) could assert the `librocdxg.so` link after its real install when it runs on WSL. The scenarios run on the Linux lanes and need no GPU.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-(49|50|51|52) '
 ```
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.

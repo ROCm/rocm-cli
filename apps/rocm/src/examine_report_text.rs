@@ -614,6 +614,7 @@ mod tests {
             wsl: None,
             managed_runtime_count,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),
