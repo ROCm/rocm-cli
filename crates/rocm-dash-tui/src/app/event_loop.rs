@@ -67,6 +67,62 @@ fn seed_registry_probe_and_hosting(
     state.launcher_hosted = launcher_hosted;
 }
 
+/// Whether the dashboard polls the managed-service registry for its instance
+/// list. Only Windows has no daemon to send instances; a focused host draws no
+/// instance list, and `--demo`/`--replay` (`replay`) must never show this
+/// host's real services. `windows` is a parameter rather than a `cfg!` so the
+/// gate itself is unit-tested on every platform.
+const fn polls_managed_registry(focus: Option<Focus>, replay: bool, windows: bool) -> bool {
+    windows && !replay && !should_skip_daemon(focus)
+}
+
+/// Logged when a registry read panics under `spawn_blocking`. Named so the
+/// test asserting the warning fires cannot pass against a message that was
+/// silently reworded or downgraded below WARN.
+const MANAGED_REGISTRY_PROBE_PANIC: &str =
+    "managed-service registry probe panicked; instance list not updated this poll";
+
+/// Read the managed-service registry every `period` and post the live
+/// services as `ClientMsg::ManagedInstances`. The probe does a blocking disk
+/// read, so it runs under `spawn_blocking` rather than on the event loop — a
+/// slow or antivirus-scanned services directory then delays only the next
+/// poll, never a frame. The first poll is immediate, so a running service is
+/// listed as soon as the dashboard opens. Ends when the receiver is dropped.
+fn spawn_managed_registry_poller(
+    probe: crate::registry_probe::SharedManagedRegistryProbe,
+    tx: mpsc::UnboundedSender<ClientMsg>,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(period);
+        // A slow read must not queue a burst of catch-up polls behind it.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let probe = probe.clone();
+            let snapshot = match tokio::task::spawn_blocking(move || probe.snapshot()).await {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    // The probe panicked; keep polling rather than freezing the
+                    // list — but say so. A probe that panics every tick would
+                    // otherwise leave the instance list silently empty for the
+                    // whole session with nothing in the log to explain it.
+                    // Same shape as `client.rs`'s per-tick Windows
+                    // perf-counter failure.
+                    tracing::warn!(error = %e, "{MANAGED_REGISTRY_PROBE_PANIC}");
+                    continue;
+                }
+            };
+            if tx
+                .send(ClientMsg::ManagedInstances(snapshot.instances))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     // Install the termination-signal watcher BEFORE switching the terminal into
     // raw/alternate-screen mode. A signal that arrives during startup must find
@@ -243,6 +299,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Both `--demo` (a generated session replayed) and `--replay <file>` present
     // non-live data, so mark the session simulated for the honesty chrome.
     state.simulated = state.replay.is_some();
+    if polls_managed_registry(args.focus, state.simulated, cfg!(windows))
+        && let Some(probe) = args.managed_registry_probe.clone()
+    {
+        spawn_managed_registry_poller(probe, chat_tx.clone(), Duration::from_secs(1));
+    }
 
     let mut chat = ChatRuntime::start(&mut state, args, &chat_tx).await;
 
@@ -273,6 +334,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     }
                     Some(ClientMsg::Event(ev)) => state.apply_event(*ev),
                     Some(ClientMsg::HostGpuSnapshot(snap)) => state.push_host_gpu_snapshot(*snap),
+                    Some(ClientMsg::ManagedInstances(live)) => state.set_managed_instances(live),
                     Some(ClientMsg::ReplaySeek) => state.reset_for_seek(),
                     Some(ClientMsg::ReplayPosition { elapsed_s, total_s }) => {
                         if let Some(r) = state.replay.as_mut() {
@@ -978,6 +1040,7 @@ mod tests {
             std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
                 has_live_service: true,
                 managed_ids: std::iter::once("svc-a".to_string()).collect(),
+                ..Default::default()
             }));
         seed_registry_probe_and_hosting(&mut s, Some(probe.clone()), true);
 
@@ -988,5 +1051,267 @@ mod tests {
                 .map(|p| std::sync::Arc::ptr_eq(p, &probe)),
             Some(true)
         );
+    }
+
+    #[test]
+    fn polls_managed_registry_state_matrix() {
+        // The only caller is `event_loop`, which only the Linux e2e lane
+        // drives, and the Windows arm is the one that matters. `windows` is
+        // injected so every row runs on every platform's CI job.
+        assert!(
+            polls_managed_registry(None, false, true),
+            "Windows dashboard polls"
+        );
+        assert!(
+            !polls_managed_registry(None, false, false),
+            "Linux has a daemon"
+        );
+        assert!(
+            !polls_managed_registry(None, true, true),
+            "--demo/--replay must not show this host's real services"
+        );
+        for focus in [Focus::Setup, Focus::Serve, Focus::Examine] {
+            assert!(
+                !polls_managed_registry(Some(focus), false, true),
+                "a focused host draws no instance list: {focus:?}"
+            );
+        }
+    }
+
+    fn probe_with(
+        ids: &[&str],
+    ) -> (
+        crate::registry_probe::SharedManagedRegistryProbe,
+        Vec<rocm_dash_core::metrics::Instance>,
+    ) {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        let instances: Vec<_> = ids
+            .iter()
+            .map(|id| rocm_dash_core::metrics::Instance {
+                container_id: (*id).to_string(),
+                status: rocm_dash_core::metrics::InstanceStatus::Ready,
+                port: Some(11_400),
+                ..Default::default()
+            })
+            .collect();
+        let probe = std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
+            instances: instances.clone(),
+            ..Default::default()
+        }));
+        (probe, instances)
+    }
+
+    #[tokio::test]
+    async fn managed_registry_poller_posts_the_registry_list_immediately_and_repeatedly() {
+        // The first poll must not wait a full period: a service already
+        // running when the dashboard opens is listed at once, not after
+        // "Nothing running" has been on screen for a second.
+        //
+        // The period is deliberately much longer than the first read's deadline
+        // (1s vs 250ms), because the deadline only discriminates if one period
+        // does not fit inside it: with a period as short as the bound, a poller
+        // that slept a full period before its first read would clear it anyway
+        // and the test would pass on the very bug it exists to catch.
+        const PERIOD: Duration = Duration::from_secs(1);
+        const FIRST_READ_DEADLINE: Duration = Duration::from_millis(250);
+
+        let (probe, expected) = probe_with(&["svc-a"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_managed_registry_poller(probe, tx, PERIOD);
+
+        // Poll 0 is the immediate one and gets the tight bound; poll 1 only has
+        // to prove the loop repeats, so it is allowed a full period plus slack.
+        for poll in 0..2 {
+            let deadline = if poll == 0 {
+                FIRST_READ_DEADLINE
+            } else {
+                PERIOD + FIRST_READ_DEADLINE
+            };
+            let msg = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("poll {poll} did not arrive within {deadline:?} (period {PERIOD:?})")
+                })
+                .expect("channel open");
+            let ClientMsg::ManagedInstances(got) = msg else {
+                panic!("unexpected message: {msg:?}");
+            };
+            assert_eq!(got.len(), expected.len());
+            assert_eq!(got[0].container_id, "svc-a");
+        }
+
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the poller stops once the receiver is gone")
+            .expect("poller did not panic");
+    }
+
+    #[tokio::test]
+    async fn managed_registry_poller_survives_a_panicking_probe() {
+        // A probe panic (under `spawn_blocking`) must not end the poll loop and
+        // freeze the instance list for the rest of the session.
+        #[derive(Debug, Default)]
+        struct PanicsOnce(std::sync::atomic::AtomicBool);
+        impl crate::registry_probe::ManagedRegistryProbe for PanicsOnce {
+            fn snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
+                assert!(
+                    self.0.swap(true, std::sync::atomic::Ordering::SeqCst),
+                    "first read fails"
+                );
+                crate::registry_probe::ManagedRegistrySnapshot::default()
+            }
+        }
+
+        // This test reaches the poller's `warn!` callsite too, so it must warm
+        // the interest cache for the same reason
+        // `managed_registry_poller_warns_when_the_probe_panics` does — see
+        // `warm_tracing_interest_cache`. Without the call here, whichever of
+        // the two tests registers that callsite first decides whether it is
+        // ever enabled, and this one has no subscriber of its own.
+        warm_tracing_interest_cache();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_managed_registry_poller(
+            std::sync::Arc::new(PanicsOnce::default()),
+            tx,
+            Duration::from_millis(20),
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a later poll arrived")
+            .expect("channel open");
+        assert!(matches!(msg, ClientMsg::ManagedInstances(_)), "{msg:?}");
+        handle.abort();
+    }
+
+    /// Minimal `tracing::Subscriber` recording each event's level and message
+    /// text, so a test can assert that a SPECIFIC diagnostic fired — not
+    /// merely that something was logged. Counting events alone would stay
+    /// green if the `warn!` were downgraded to `debug!` or its text removed.
+    /// `agent/clients.rs`'s `CapturedWarnEvents` does the same for that
+    /// module's warnings; it is private to that test module, so this is the
+    /// local equivalent rather than a shared helper.
+    #[derive(Default)]
+    struct CapturedWarnings(std::sync::Mutex<Vec<(tracing::Level, String)>>);
+
+    impl CapturedWarnings {
+        fn warned(&self, message: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(level, text)| *level == tracing::Level::WARN && text == message)
+        }
+    }
+
+    impl tracing::Subscriber for CapturedWarnings {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(Option<String>);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    // tracing wraps the message in an internal type whose
+                    // `Debug` forwards to `Display`, so `{value:?}` is the
+                    // message text itself, unquoted.
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Register one always-interested process-wide default subscriber before
+    /// any test can reach the poller's `warn!` callsite.
+    ///
+    /// tracing-core caches a callsite's `Interest` the first time that
+    /// callsite executes, by asking the dispatcher in scope on whichever
+    /// thread happens to get there first. Under threaded `cargo test` that is
+    /// a race between this module's two panicking-probe tests, and the other
+    /// one carries no subscriber — so without this, "never interested" can be
+    /// cached before the capturing test ever installs its own, and the
+    /// assertion below fails for a reason that has nothing to do with the
+    /// production code. A permanent global default whose `enabled()` is
+    /// always `true` makes "nobody is interested yet" impossible from the
+    /// first registration onward. Its own buffer is never read; only the
+    /// thread-local override installed in the test is. Same remedy, and same
+    /// reasoning, as `agent/clients.rs`'s `warm_tracing_interest_cache`.
+    fn warm_tracing_interest_cache() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(CapturedWarnings::default());
+        });
+    }
+
+    #[tokio::test]
+    async fn managed_registry_poller_warns_when_the_probe_panics() {
+        // Surviving the panic (above) is not enough: a probe that panics on
+        // every tick degrades this feature for a whole session, and without a
+        // log line the operator sees only a permanently empty instance list
+        // with nothing anywhere to explain it.
+        #[derive(Debug)]
+        struct AlwaysPanics;
+        impl crate::registry_probe::ManagedRegistryProbe for AlwaysPanics {
+            fn snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
+                panic!("registry read blew up");
+            }
+        }
+
+        // Thread-local, not global: `#[tokio::test]` runs a current-thread
+        // runtime, so the poller task is polled on this very thread and the
+        // `warn!` dispatches through this subscriber. The global default the
+        // warming installs is only there to keep the callsite's cached
+        // `Interest` from being decided by a subscriber-less thread.
+        warm_tracing_interest_cache();
+        let captured = std::sync::Arc::new(CapturedWarnings::default());
+        let guard = tracing::subscriber::set_default(captured.clone());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handle = spawn_managed_registry_poller(
+            std::sync::Arc::new(AlwaysPanics),
+            tx,
+            Duration::from_millis(20),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !captured.warned(MANAGED_REGISTRY_PROBE_PANIC) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a panicking probe must log {MANAGED_REGISTRY_PROBE_PANIC:?} at WARN, not fail silently"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+        drop(guard);
     }
 }

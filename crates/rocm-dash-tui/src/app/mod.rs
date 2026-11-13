@@ -608,12 +608,32 @@ impl AppState {
     /// charts/history exactly like a real snapshot, but deliberately leaves
     /// `instances` and `has_received_snapshot` untouched. The Windows
     /// in-process ticker (`client.rs`) always sends an empty `instances`
-    /// stand-in (no instance-registry daemon exists there yet), so treating
-    /// it as authoritative the way `push_snapshot` does would permanently
-    /// blind the issue #145 quit-confirm prompt to models actually being
-    /// served — see `has_live_instance_with`'s Windows note.
+    /// stand-in (it has no daemon to discover them), so treating it as
+    /// authoritative the way `push_snapshot` does would blind the issue #145
+    /// quit-confirm prompt to models actually being served — see
+    /// `has_live_instance_with`'s Windows note. Instances arrive separately,
+    /// from the managed-service registry, through
+    /// [`set_managed_instances`](Self::set_managed_instances).
     pub(crate) fn push_host_gpu_snapshot(&mut self, snap: Snapshot) {
         self.push_history_and_latest(snap);
+    }
+
+    /// Replace `instances` with the managed services the registry poller
+    /// (`event_loop::spawn_managed_registry_poller`, Windows only) last read,
+    /// delivered as `ClientMsg::ManagedInstances`. `has_received_snapshot`
+    /// stays untouched, so the issue #145 quit-confirm gate keeps reading the
+    /// registry live too.
+    ///
+    /// The map is refilled in place rather than rebuilt: a fresh `HashMap`
+    /// gets a fresh random hasher, so the iteration order — which picks the
+    /// Home tile's model — would change on every poll.
+    pub(crate) fn set_managed_instances(&mut self, live: Vec<rocm_dash_core::metrics::Instance>) {
+        self.instances.clear();
+        self.instances.extend(
+            live.into_iter()
+                .map(|inst| (inst.container_id.clone(), inst)),
+        );
+        self.clamp_selectors();
     }
 
     /// Shared tail of [`push_snapshot`](Self::push_snapshot) and
@@ -730,6 +750,102 @@ mod tests {
             "host/GPU metrics must still land for charts/history"
         );
         assert_eq!(s.history.len(), 1);
+    }
+
+    /// Windows has no daemon to discover instances, so the registry poller's
+    /// list is what fills `instances`: a served model appears when the poll
+    /// reports it and drops off once a later poll no longer does.
+    #[test]
+    fn set_managed_instances_follows_the_polled_registry_list() {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        let served = Instance {
+            container_id: "lemonade-qwen".to_string(),
+            model_name: "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M".to_string(),
+            status: InstanceStatus::Ready,
+            port: Some(11436),
+            ..Default::default()
+        };
+        let mut s = st();
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: std::iter::once(served.container_id.clone()).collect(),
+                instances: vec![served.clone()],
+            },
+        )));
+
+        s.set_managed_instances(vec![served.clone()]);
+
+        assert_eq!(s.instances.len(), 1);
+        let inst = &s.instances["lemonade-qwen"];
+        assert_eq!(inst.model_name, served.model_name);
+        assert_eq!(inst.port, Some(11436));
+        assert!(
+            !s.has_received_snapshot,
+            "the registry poll must not flip has_received_snapshot"
+        );
+        let snap = s.live_registry_snapshot();
+        assert!(s.has_live_instance_with(&snap));
+        assert!(
+            s.has_stoppable_managed_instance_with(&snap),
+            "a registry-sourced instance must be offered for stopping on quit"
+        );
+
+        // Shrink the list out from under a selection that points past the new
+        // end. `instance_sel` has to be nonzero first, or the clamp inside
+        // `set_managed_instances` is unobservable — with the selector already
+        // at its default 0 the call could be dropped entirely and every
+        // assertion below would still hold.
+        let second = Instance {
+            container_id: "lemonade-llama".to_string(),
+            status: InstanceStatus::Ready,
+            port: Some(11437),
+            ..Default::default()
+        };
+        s.set_managed_instances(vec![served, second]);
+        s.instance_sel = 1;
+
+        s.set_managed_instances(Vec::new());
+
+        assert!(
+            s.instances.is_empty(),
+            "a service the registry no longer reports must drop off"
+        );
+        assert_eq!(
+            s.instance_sel, 0,
+            "the row selection must be clamped to the shrunken list, not left \
+             pointing past its end"
+        );
+    }
+
+    /// The Home tile shows the first serving instance in `instances`'
+    /// iteration order, so applying the same registry contents poll after
+    /// poll must not reorder them — otherwise the tile alternates models.
+    #[test]
+    fn set_managed_instances_keeps_instance_order_stable_across_polls() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        let polled = || -> Vec<Instance> {
+            (0..8)
+                .map(|n| Instance {
+                    container_id: format!("svc-{n}"),
+                    status: InstanceStatus::Ready,
+                    port: Some(11_400 + n),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let mut s = st();
+
+        s.set_managed_instances(polled());
+        let first: Vec<String> = s.instances.keys().cloned().collect();
+        for _ in 0..5 {
+            s.set_managed_instances(polled());
+            let again: Vec<String> = s.instances.keys().cloned().collect();
+            assert_eq!(again, first, "instance order changed between polls");
+        }
     }
 
     #[test]

@@ -38,7 +38,9 @@ impl AppState {
     /// there either — the live read stays authoritative for the entire
     /// session rather than only a brief startup window — the registry read is
     /// cheap and re-run every time this is called, so there is no staleness
-    /// to outlive. Once a snapshot lands
+    /// to outlive. (`instances` itself is refilled from the same registry by
+    /// a background poller once a second — `set_managed_instances` — so it
+    /// can trail this live read by about a second.) Once a snapshot lands
     /// on a host where the daemon does connect, `instances` is authoritative
     /// and the read's *result* is no longer consulted for THIS question (a
     /// model that legitimately stops later in the session is still reflected

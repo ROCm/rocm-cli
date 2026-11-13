@@ -321,10 +321,15 @@ fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
         .iter()
         .map(|inst| inst.container_id.clone())
         .collect();
+    // No `instances` here: that field feeds the Windows registry poller
+    // (`app::event_loop::spawn_managed_registry_poller`), which reads the
+    // bin-injected live probe rather than this static one, and the launcher
+    // fills `state.instances` directly on the next line anyway.
     state.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
         ManagedRegistrySnapshot {
             has_live_service,
             managed_ids,
+            ..Default::default()
         },
     )));
     state.instances = serving
@@ -892,6 +897,7 @@ mod tests {
             ManagedRegistrySnapshot {
                 has_live_service: true,
                 managed_ids: std::collections::HashSet::from(["vllm-1".to_string()]),
+                ..Default::default()
             },
         )));
         s.open_quit_confirm();
