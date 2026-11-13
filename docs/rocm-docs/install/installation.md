@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 # Installing ROCm CLI
 
-ROCm CLI ships as a single prebuilt binary. Platform support:
+ROCm CLI ships as prebuilt binaries (`rocm` and `rocmd`). Platform support:
 
 ```{include} ../../../README.md
 :start-after: "<!-- platform-support-table-start -->"
@@ -16,8 +16,8 @@ ROCm CLI ships as a single prebuilt binary. Platform support:
 For WSL2 setup and diagnosis, see [ROCm CLI on WSL2](wsl.md).
 
 Live dashboard GPU/CPU/memory telemetry works on Windows too; the
-serving-instance registry view is Linux/WSL2 only, since there's no
-`rocmdashd` unix socket on Windows (see
+serving-instance registry view is Linux and WSL2 only, because there's no
+`rocmdashd` Unix socket on Windows (see
 [Interactive interfaces](../getting-started.md#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see
 [vLLM adapter](../engines/vllm.md)).
