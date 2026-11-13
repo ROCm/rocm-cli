@@ -648,6 +648,11 @@ impl ServeStartupStop {
 /// "serving" still means an inference request came back. Once the model is
 /// listed, the inference request is spaced by the policy's
 /// [`InferenceProbeBackoff`] rather than sent every poll.
+///
+/// The probe runs inline, so a poll that sends one can take up to the probe
+/// timeout: the spinner does not tick and an engine failure is not read until
+/// it returns. The backoff bounds how often that happens; it is not moved off
+/// the polling thread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wait_for_serve_startup(
     engine_name: &str,

@@ -2,12 +2,12 @@ Feature: Model serving
 
   # Interactive `rocm serve` (a terminal, not --verbose or --foreground) follows
   # download, load, and health on the status line until the server is ready or
-  # the startup wait fails. There is no scenario for it yet: the harness can
-  # drive a PTY (download_progress_pty.feature), but interactive `rocm serve`
-  # needs a live engine, and the no-GPU mock lane stubs the HTTP endpoint
-  # without running `rocm serve`, so one would be `@requires-gpu`. The state matrix is
-  # covered without a GPU by `decide_serve_startup` and `wait_for_serve_startup`
-  # in apps/rocm/src/serve_progress.rs.
+  # the startup wait fails. Scenario serve-55 drives it under a real PTY; it
+  # needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes
+  # only. The stall, deadline and engine-failed branches need a controllable
+  # engine, so the no-GPU lane cannot reach them; `decide_serve_startup` and
+  # `wait_for_serve_startup` in apps/rocm/src/serve_progress.rs are their
+  # state matrix.
 
   # Per-platform expectations (pass / xfail / skip) are resolved at runtime from
   # the host capability probe + expectations.toml, keyed by the @id tag — not by
@@ -867,3 +867,15 @@ Feature: Model serving
     When the user sends a streaming request to the Anthropic messages endpoint
     Then the response is delivered as Anthropic-style server-sent events
     And the streamed content reassembles into a complete reply
+
+  # Interactive `rocm serve` under a real terminal: while it waits it names the
+  # command that follows the engine's log, then it exits 0 once the endpoint
+  # lists the model. The named command is run, not just read: a hint that
+  # points at a command that does not work would still pass a string check.
+  @id:serve-interactive-startup-progress @requires-gpu
+  Scenario: serve-55 - Interactive serve shows how to follow startup and exits when the model is served
+    Given a managed runtime is active
+    When the user serves a model on GPU under a real terminal
+    Then the terminal names the command that follows the server's log
+    And the named log command runs successfully
+    And the serve exits cleanly and the endpoint lists the model

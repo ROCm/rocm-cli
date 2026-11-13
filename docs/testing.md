@@ -2057,10 +2057,11 @@ guidance (a `--wait` that sees the server exit now records the event too);
 when the engine failed but its process is still up, the message names the
 stop command. Only a stall or the
 deadline leaves the server running for the background helper to supervise.
-There is no Gherkin scenario for this yet. The harness can drive a PTY
-(`download_progress_pty.feature`), but interactive `rocm serve` needs a live
-engine: the no-GPU mock lane stubs the HTTP endpoint and never runs
-`rocm serve`, so a scenario would be `@requires-gpu`. `decide_serve_startup` and `wait_for_serve_startup` in
+Scenario `serve-55` in `model_serving.feature` drives it under a PTY. It
+needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
+it checks the wait line, that the named `rocm logs --service` command runs,
+and that the serve exits 0 with the model listed. The stall, deadline and
+engine-failed branches need a controllable engine, so `decide_serve_startup` and `wait_for_serve_startup` in
 [serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
 covered by:
 

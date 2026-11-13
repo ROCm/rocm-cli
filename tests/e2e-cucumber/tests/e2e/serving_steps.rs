@@ -613,6 +613,79 @@ fn claim_relaunch() -> bool {
         .is_ok()
 }
 
+#[when("the user serves a model on GPU under a real terminal")]
+async fn user_serves_gpu_model_under_pty(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    // Same free-port precondition as `serve_gpu_model`: a leaked server from a
+    // prior scenario would answer for this one.
+    let _ = ensure_serve_port_free().await;
+    // Summary mode (the interactive status line) is `stdout is a terminal` and
+    // neither `--verbose` nor `--foreground`, so the PTY is the whole setup.
+    let session = TuiSession::spawn(world, &["serve", model, "--engine", engine, "--managed"])
+        .unwrap_or_else(|e| panic!("failed to spawn `rocm serve` under a pty: {e}"));
+    world.tui = Some(session);
+}
+
+/// The id the wait line's `rocm logs --service <id> --follow` names.
+fn followed_service_id(screen: &str) -> Option<String> {
+    let rest = screen.split("rocm logs --service ").nth(1)?;
+    let id = rest.split_whitespace().next()?;
+    Some(id.trim_matches('\'').to_owned())
+}
+
+#[then("the terminal names the command that follows the server's log")]
+async fn terminal_names_log_command(world: &mut E2eWorld) {
+    let timeout = Duration::from_secs(serve_timeout_for(world));
+    let session = world.tui.as_mut().expect("no pty session for `rocm serve`");
+    session
+        .wait_for_screen("rocm logs --service ", timeout)
+        .await
+        .unwrap_or_else(|e| panic!("the wait line never named a log command: {e}"));
+    let screen = session.screen_text();
+    assert!(
+        screen.contains("Ctrl-C stops waiting"),
+        "the wait line does not say Ctrl-C stops waiting, not the server:\n{screen}"
+    );
+    followed_service_id(&screen)
+        .unwrap_or_else(|| panic!("no service id after `rocm logs --service`:\n{screen}"));
+}
+
+#[then("the named log command runs successfully")]
+async fn named_log_command_runs(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no pty session for `rocm serve`")
+        .screen_text();
+    let id = followed_service_id(&screen)
+        .unwrap_or_else(|| panic!("no service id after `rocm logs --service`:\n{screen}"));
+    // Without `--follow`, which never returns. The same id and subcommand the
+    // hint names, so a hint that points at nothing fails here.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--service", &id]);
+    assert_eq!(
+        rc, 0,
+        "`rocm logs --service {id}` failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[then("the serve exits cleanly and the endpoint lists the model")]
+async fn serve_exits_and_endpoint_lists_model(world: &mut E2eWorld) {
+    let timeout = Duration::from_secs(serve_timeout_for(world));
+    let (_, _, ready_substr) = host_serve_target();
+    world
+        .tui
+        .as_mut()
+        .expect("no pty session for `rocm serve`")
+        .assert_exits_cleanly("the interactive serve", timeout)
+        .await;
+    assert!(
+        model_is_ready(&MODELS_URL, Some(ready_substr), 30).await,
+        "serve exited 0 but {} does not list {ready_substr}",
+        MODELS_URL.as_str()
+    );
+    world.endpoint = Some(SERVE_BASE_URL.to_string());
+}
+
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
     serve_gpu_model(world).await;
