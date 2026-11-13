@@ -7,6 +7,13 @@
 ## loader, which pushes any header out of hawkeye's detection window, and the
 ## folder is vendored verbatim into the amd/skills catalog, whose skills carry
 ## no headers. The licence is stated in the skill's own skill-card.md instead.
+##
+## Three docs-site pages are excluded by path: `docs/rocm-docs/index.md`,
+## `release-notes.md`, and `release.md`. They open with a MyST front matter
+## block (page description, keywords, and `orphan` for `release.md`), which
+## MyST only reads from the first line, so the header cannot go above it and
+## hawkeye does not detect it below it. Each file carries the header directly
+## after its front matter. Add any new page that needs front matter here.
 
 [header]
 text = """
@@ -30,6 +37,9 @@ excludes = [
   ".tmp-*/**",
   "third_party/**",
   "skills/rocm-doctor/**",
+  "docs/rocm-docs/index.md",
+  "docs/rocm-docs/release-notes.md",
+  "docs/rocm-docs/release.md",
 ]
 
 [[rules]]

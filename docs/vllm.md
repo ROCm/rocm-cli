@@ -252,9 +252,9 @@ multiple GPUs is not supported.
 
 ## GPU memory
 
-vLLM claims a fixed fraction of each GPU's **total** VRAM for weights plus KV
-cache. The fraction is not based on the free VRAM, and it is not scaled to the
-model. On a large card, a small model therefore still reserves a large slice.
+vLLM claims a fixed fraction of each GPU's **total** video RAM (VRAM) for
+weights plus KV cache. The fraction is not based on the free VRAM, and it is not
+scaled to the model. On a large card, a small model therefore still reserves a large slice.
 
 ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
 applies unless a value comes from somewhere else: either a model's catalog
@@ -291,14 +291,14 @@ a tiny model. ROCm CLI helps in three ways:
 - **The serve summary warns on low free VRAM.** When the selected GPU is already
   heavily used, `rocm serve` prints a note. The note appears before launch on
   the plain path, or in the post-readiness summary in the default interactive
-  mode. For vLLM, the note also points at `--gpu-memory-utilization` as the fix.
-- **OOM failures hint the workaround.** When a startup failure log shows an
+  mode. For vLLM, the note also points to `--gpu-memory-utilization` as the fix.
+- **Out-of-memory (OOM) failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
-  reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
-  with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
-  for the full conditional remediation (busy GPU vs. a model that does not fit).
-  "Shows an out-of-memory error" means a line carrying an allocator-shaped
-  signature — `HIP out of memory`, `CUDA out of memory`, `hipErrorOutOfMemory`,
+  reservation, such as `--gpu-memory-utilization 0.5`, or targeting a less busy
+  GPU with `--gpu <index>`. It also points to `rocm diagnose --symptom '<the
+  error>'` for the full conditional remediation (busy GPU versus a model that
+  does not fit). "Shows an out-of-memory error" means a line carrying an allocator-shaped
+  signature: `HIP out of memory`, `CUDA out of memory`, `hipErrorOutOfMemory`,
   or a `torch.OutOfMemoryError` corroborated by an allocator message. A bare
   `HIP error: out of memory`, a kernel OOM-killer line, or vLLM's generic
   `EngineCore` wrapper deliberately gets no memory hint: each of those also
@@ -308,25 +308,25 @@ a tiny model. ROCm CLI helps in three ways:
 
   The printed command quotes your actual failing line when it can be rendered as
   one intact single-quoted argument; a line carrying an apostrophe or terminal
-  control bytes falls back to the canonical symptom below rather than handing you
+  control bytes falls back to the canonical symptom below instead of handing you
   a command whose quoting the log text broke. The `rocm serve` summary's
   out-of-memory note applies that same guard, from the same shared helper, to the
-  same engine log — so neither surface can hand you a half-quoted command the
+  same engine log, so neither surface can hand you a half-quoted command the
   other would reject.
 
   Sharing the guard is not the same as the two always printing the *same*
-  command, and for a **colourised** line they do not. The engine reads the log
+  command, and for a **colorized** line they do not. The engine reads the log
   first, refuses the raw escape-bearing line, and prints the canonical symptom.
   Its failure message then echoes the log tail back into that same shared file as
-  the rows a terminal would have drawn, and the serve summary reads afterwards —
+  the rows a terminal would have drawn, and the serve summary reads afterwards,
   so the note quotes that rendered row instead. Both arguments are sound: the row
   is text the terminal really printed, it carries no control bytes, and anything
   the guard accepts is diagnosable. They are two reads of a file that changed in
   between, not a disagreement about the rule. Lines rocm-cli wrote into that log
   itself are skipped when picking the line, so the note quotes *your* error
-  rather than the hint printed above it: the supervisor and the engine share one
-  log file, and the engine's failure — hint included — is appended to it after
-  the error that caused it.
+  instead of the hint printed above it: the supervisor and the engine share one
+  log file, and the engine's failure (hint included) is appended to it after the
+  error that caused it.
 
 Explicitly, the workaround for an OOM on a shared card is:
 
@@ -362,16 +362,16 @@ the memory hint above. If a failure matches both, both paragraphs are printed,
 the memory hint first.
 
 The printed command quotes the failing line when it can be rendered as one
-intact single-quoted argument and `rocm diagnose` recognises it. Otherwise it
+intact single-quoted argument and `rocm diagnose` recognizes it. Otherwise it
 quotes the canonical import symptom,
 `OSError: libtorch_cuda.so: cannot open shared object file`. A line with an
 apostrophe falls back this way. So does a frame that does not score on its own,
 such as `... in <module>`, which names only the shim module and scores below the
 match threshold. A loader frame that ends in `in load_torch_c_dlpack_extension`
 also names the extension, so it scores on its own and is quoted as it is. When a
-frame alone does not score, the command quotes a canonical symptom that the
-user's log did not contain. The command then always reports a cause, and the
-user's own line stays visible in the message above it.
+frame alone does not score, the command quotes a canonical symptom that your
+log did not contain. The command then always reports a cause, and your own line
+stays visible in the message above it.
 
 The command only reports. On Linux and WSL it matches the conditional
 engine-reinstall remediation (`fix-17-torch-dlpack`), which `rocm fix` prints
