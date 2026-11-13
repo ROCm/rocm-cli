@@ -54,6 +54,64 @@ pub(crate) fn spawn_lemond(
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<LemondChild> {
+    #[cfg(target_os = "linux")]
+    return spawn_lemond_on(
+        &crate::host_libraries::probe_host_libraries(),
+        manifest,
+        host,
+        port,
+        log_path,
+        process_env,
+    );
+    #[cfg(not(target_os = "linux"))]
+    spawn_lemond_unchecked(manifest, host, port, log_path, process_env)
+}
+
+/// [`spawn_lemond`] on Linux, with the host's libraries given so a test can
+/// drive the refusal on a host whose libraries are new.
+#[cfg(target_os = "linux")]
+fn spawn_lemond_on(
+    host_libraries: &crate::host_libraries::HostLibraries,
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<LemondChild> {
+    refuse_lemond_on_too_old_host(manifest, host_libraries)?;
+    spawn_lemond_unchecked(manifest, host, port, log_path, process_env)
+}
+
+/// Refuse to start the pinned Linux `lemond` on a host whose glibc or OpenSSL
+/// is older than it needs (see [`crate::host_libraries`]), rather than let it
+/// exit with a loader error that reads as a readiness timeout.
+///
+/// Applies only to a tree of the pinned version: the recorded needs belong to
+/// that archive, and a tree left by an older pin is replaced by the next
+/// install, which runs the same check before downloading.
+#[cfg(target_os = "linux")]
+fn refuse_lemond_on_too_old_host(
+    manifest: &LemonadeInstallManifest,
+    host_libraries: &crate::host_libraries::HostLibraries,
+) -> Result<()> {
+    if manifest.version != rocm_deps::LEMONADE_VERSION {
+        return Ok(());
+    }
+    crate::host_libraries::refuse_if_host_too_old(
+        &manifest.version,
+        &crate::install::LINUX_LEMOND_NEEDS,
+        host_libraries,
+        "Lemonade was not started.",
+    )
+}
+
+fn spawn_lemond_unchecked(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<LemondChild> {
     #[cfg(windows)]
     if let Some(log_path) = log_path {
         let args = vec![
@@ -718,6 +776,130 @@ mod tests {
             backend_name: "rocm".to_owned(),
             installed_at_unix_ms: 0,
         }
+    }
+
+    /// A `lemond` stand-in that records it was started, in a fresh directory.
+    #[cfg(target_os = "linux")]
+    fn marker_lemond(version: &str) -> (tempfile::TempDir, LemonadeInstallManifest, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let lemond = dir.path().join("lemond");
+        fs::write(
+            &lemond,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&lemond, fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = LemonadeInstallManifest {
+            version: version.to_owned(),
+            runtime_dir: dir.path().to_path_buf(),
+            lemond,
+            ..test_manifest()
+        };
+        (dir, manifest, marker)
+    }
+
+    /// Start the stand-in through `spawn_lemond`'s Linux path, with the host's
+    /// libraries given rather than probed.
+    ///
+    /// A script written a moment ago can fail to exec with `ETXTBSY` when
+    /// another test thread forks while the write handle is still open; that,
+    /// and only that, is retried.
+    #[cfg(target_os = "linux")]
+    fn start_on(
+        manifest: &LemonadeInstallManifest,
+        host_libraries: &crate::host_libraries::HostLibraries,
+    ) -> Result<()> {
+        let mut attempts = 0;
+        let mut child = loop {
+            match spawn_lemond_on(
+                host_libraries,
+                manifest,
+                "127.0.0.1",
+                1,
+                None,
+                &LemonadeProcessEnvironment::default(),
+            ) {
+                Err(error)
+                    if attempts < 50
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .and_then(std::io::Error::raw_os_error)
+                                == Some(libc::ETXTBSY)
+                        }) =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => break result?,
+            }
+        };
+        child.wait()?;
+        Ok(())
+    }
+
+    /// Host libraries as a test writes them: a version, or `missing` for a
+    /// library the loader cache does not list.
+    #[cfg(target_os = "linux")]
+    fn libraries(glibc: &str, openssl: &str) -> crate::host_libraries::HostLibraries {
+        use crate::host_libraries::{HostLibrary, LibVersion};
+        let library = |text: &str| match text {
+            "missing" => HostLibrary::Missing,
+            text => HostLibrary::Version(LibVersion::parse(text).unwrap()),
+        };
+        crate::host_libraries::HostLibraries {
+            glibc: library(glibc),
+            openssl: library(openssl),
+        }
+    }
+
+    /// On a host older than the pinned `lemond` needs (Ubuntu 20.04: glibc 2.31
+    /// and OpenSSL 1.1 only), the refusal names what each short library needs
+    /// and what the host has, says `lemond` was not started, and it really was
+    /// not: the stand-in never ran.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pinned_lemond_is_not_started_on_a_host_with_too_old_libraries() {
+        let (_dir, manifest, marker) = marker_lemond(rocm_deps::LEMONADE_VERSION);
+        let error = start_on(&manifest, &libraries("2.31", "missing"))
+            .expect_err("a host older than the pinned lemond needs is refused")
+            .to_string();
+        let needs = &crate::install::LINUX_LEMOND_NEEDS;
+        for expected in [
+            format!("glibc {} or newer (this host has glibc 2.31)", needs.glibc),
+            format!(
+                "OpenSSL {} or newer (this host's loader cache has no libssl.so.3)",
+                needs.openssl
+            ),
+            format!("the Lemonade {} server", rocm_deps::LEMONADE_VERSION),
+        ] {
+            assert!(error.contains(&expected), "missing `{expected}`: {error}");
+        }
+        assert!(error.ends_with("Lemonade was not started."), "{error}");
+        assert!(!marker.exists(), "lemond ran despite the refusal");
+    }
+
+    /// The other rows: a host that meets the needs starts `lemond`, and so does
+    /// a tree of another version, whose needs this pin does not record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lemond_starts_on_a_new_enough_host_and_for_a_tree_of_another_version() {
+        let needs = &crate::install::LINUX_LEMOND_NEEDS;
+        let (_dir, manifest, marker) = marker_lemond(rocm_deps::LEMONADE_VERSION);
+        start_on(&manifest, &libraries(needs.glibc, needs.openssl)).unwrap();
+        assert!(
+            marker.exists(),
+            "lemond did not start on a host meeting its needs"
+        );
+
+        let (_dir, manifest, marker) = marker_lemond("0.0.1");
+        start_on(&manifest, &libraries("2.31", "missing")).unwrap();
+        assert!(
+            marker.exists(),
+            "a tree of another version was refused by this pin's needs"
+        );
     }
 
     /// Build the real backend-install command for a console state and report

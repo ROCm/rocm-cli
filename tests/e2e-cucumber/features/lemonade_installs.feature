@@ -16,7 +16,8 @@ Feature: Lemonade installs on disk
   # None downloads anything or needs a GPU, so all run on the mock lane every PR.
   # lemonade-installs-01 and -02 need the `rocm/e2e-test-hooks` build
   # `cargo xtask e2e` makes, to report a nearly full drive without filling a
-  # real one.
+  # real one; lemonade-installs-07 needs it to report old host libraries on a
+  # host whose libraries are new.
 
   @id:lemonade-installs-refused-without-space
   Scenario: lemonade-installs-01 - A Lemonade install the drive cannot hold is refused before downloading
@@ -62,3 +63,21 @@ Feature: Lemonade installs on disk
     Then the report does not say that copy is removed with its ROCm install
     When the user uninstalls the ROCm install holding Lemonade
     Then that Lemonade copy is still on disk
+
+  # The pinned Linux Lemonade server links against a minimum glibc and OpenSSL.
+  # On an older host it used to exit with a loader error that reached the user
+  # only as "Lemonade server did not become ready"; the install now refuses
+  # first and names, for each library, what it needs and what the host has. The
+  # host reported is Ubuntu 20.04-like: glibc 2.31, and OpenSSL 1.1 only, so no
+  # libssl.so.3. Linux only: Windows has no such floor.
+  #
+  # The same refusal also guards starting the Lemonade server itself. No
+  # scenario reaches that one: `rocm serve` runs this install check first, a
+  # Linux serve with a packaged llama-server never starts the Lemonade server,
+  # and the mock lane has no GPU for serve to resolve. The unit tests in
+  # engines/lemonade/src/process.rs cover it.
+  @id:lemonade-installs-refused-on-too-old-host-libraries @requires-os:linux
+  Scenario: lemonade-installs-07 - A Lemonade install on a host with too old a glibc and no OpenSSL 3 is refused before downloading
+    Given this host's glibc is older than the pinned Lemonade server needs and it has no OpenSSL 3
+    When the user installs the Lemonade engine
+    Then the Lemonade install is refused for the host's libraries before anything is downloaded

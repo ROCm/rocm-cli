@@ -83,12 +83,13 @@ use windows_inventory::{
 };
 #[cfg(target_os = "linux")]
 use wsl::detect_wsl_windows_display_probe_text;
+pub use wsl::ldconfig_cache;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
 pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
-    ldconfig_cache, ldconfig_lists_librocdxg,
+    ldconfig_lists_librocdxg,
 };
 use wsl::{detect_wsl_windows_display_gfx_target_fast, wsl_driver_summary};
 

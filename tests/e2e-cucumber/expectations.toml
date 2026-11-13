@@ -224,10 +224,10 @@ reason = "Lemonade managed serve never exposes the model: observed backend argum
 serve_timeout_secs = 90
 flaky = true
 
-# --- Lemonade 11.5.1 cannot align its llama.cpp backend to a ROCm 7.14.x SDK ---
+# --- Lemonade 11.5.1 could not align its llama.cpp backend to a ROCm 7.14.x SDK ---
 # `rocm engines install lemonade` tries to align Lemonade's `llamacpp:rocm`
-# backend with the active ROCm SDK. Lemonade 11.5.1, the pin in
-# `runtime-deps.toml`, downloads the TheRock tarball it pairs with the backend
+# backend with the active ROCm SDK. Lemonade 11.5.1, which `runtime-deps.toml`
+# pinned when these rows were written, downloads the TheRock tarball it pairs with the backend
 # only from https://repo.amd.com/rocm/tarball/, a path the 7.14.x tarballs are not
 # published to (AMD's 7.14 install guide uses /rocm/tarball-multi-arch/), so the
 # download answers HTTP 403 for `therock-dist-<os>-<family>-7.14.1.tar.gz`. The
@@ -250,15 +250,22 @@ flaky = true
 # `serve_timeout_secs`: serve-06's own `@serve-timeout:2400` tag takes precedence
 # over a row, so a shorter wait here would have no effect, and the failing
 # serve-06 still holds the Windows lane for the full 2400s wait.
+#
+# The pin is now Lemonade 2026.44.1, which fetches TheRock from AMD's whl-next
+# wheel index or its core tarball location, and whose pinned llama.cpp build
+# (b11580) ships a ROCm 7.14 archive. So both rows may now XPASS. That has not
+# been observed yet: both scenarios are `@nightly`, which pull-request lanes do
+# not run. A stale XPASS on the first Windows nightly run after the 2026.44.1 pin
+# lands means the cause is gone, and the row is deleted then.
 [["runtime-lemonade-backend-alignment-reported"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-899"
-reason = "Lemonade 11.5.1 fetches TheRock only from repo.amd.com/rocm/tarball/, where 7.14.x is not published (HTTP 403), so its backend cannot be aligned to a 7.14.x SDK and the install reverts to the pinned 7.13 backend."
+reason = "Observed with Lemonade 11.5.1, which fetched TheRock only from repo.amd.com/rocm/tarball/, where 7.14.x is not published (HTTP 403), so its backend could not be aligned to a 7.14.x SDK and the install reverted to the pinned 7.13 backend. Not yet re-checked with the 2026.44.1 pin, which fetches TheRock elsewhere; delete this row if the Windows nightly lane reports it as a stale XPASS."
 
 [["serve-large-model-inference"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-900"
-reason = "The Windows large-model serve crashes in the SDK's Tensile library on the first inference request; the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
+reason = "The Windows large-model serve crashed in the SDK's Tensile library on the first inference request while Lemonade 11.5.1 was pinned: its ROCm 7.13 backend ran against the 7.14.1 SDK because 11.5.1 could not align it (suspected cause, not reproduced off Windows). Not yet re-checked with the 2026.44.1 pin; delete this row if the Windows nightly lane reports it as a stale XPASS."
 
 # Scoped to native Linux Strix Halo, the only place it has been seen (evidence is
 # in the tracking issue); `is_wsl = false` keeps WSL2, which also reports

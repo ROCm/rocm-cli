@@ -1757,6 +1757,20 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
   disk that nothing was downloaded. That variable also waives serve's no-GPU
   refusal, as serve-18's failure hook does.
+- `lemonade-installs-07` (Linux) reaches the refusal of a host whose glibc
+  or OpenSSL falls short of what the pinned `lemond` needs. It reports an
+  Ubuntu 20.04-like host through `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and
+  `ROCM_E2E_LEMONADE_HOST_OPENSSL=missing` (same `rocm/e2e-test-hooks` build):
+  glibc 2.31, and no `libssl.so.3` in the loader cache because only OpenSSL 1.1
+  is installed. It checks that the message names what each library needs and
+  what the host has, and that nothing was downloaded. The probe itself,
+  including a planted `ldconfig -p` that lists `libc.so.6` but no
+  `libssl.so.3`, and refusing to start `lemond` on such a host are unit-tested
+  in [host_libraries.rs](../engines/lemonade/src/host_libraries.rs) and
+  [process.rs](../engines/lemonade/src/process.rs). No scenario reaches the
+  start-time refusal: `rocm serve` runs the install check first, a Linux serve
+  with a packaged `llama-server` never starts `lemond`, and the mock lane has
+  no GPU for serve to resolve.
 - `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
   and checks `rocm storage report` lists both and flags the unused one.
 - `lemonade-installs-04` uninstalls that runtime and checks the install record
@@ -2201,6 +2215,27 @@ has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
 lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
+
+Lemonade backend selection and alignment focused tests (reading the
+`llamacpp` rows out of `lemonade backends` when other recipes have indented
+rows of their own, and the second alignment attempt choosing the newest
+`lemonade-sdk/llama.cpp` release that ships the archive for the active ROCm
+version rather than the newest release, and reading Lemonade's
+`update_required`/`update_available` backend states):
+
+```bash
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::parse
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::another_recipes_backend
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::update_states
+cargo test -p rocm-engine-lemonade backend_alignment::tests::tier2
+cargo test -p rocm-engine-lemonade backend_alignment::tests::align_falls_through_to_tier2
+cargo test -p rocm-engine-lemonade backend_alignment::tests::llamacpp_asset_name
+```
+
+They run on fixtures: the `lemonade backends` table Lemonade 2026.44.1 prints,
+and a release listing shaped like the real one. The live paths (a real
+`lemond`, the GitHub listing, a real backend install) run only on the gated
+Lemonade GPU lanes.
 
 Engine recipe adapter contract focused tests:
 
