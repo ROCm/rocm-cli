@@ -1193,20 +1193,20 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         };
         let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
-        // writes a `starting` record for a process that never existed, so the
-        // helper would be left watching a pid that will never appear, with
-        // nothing in the scenario's teardown to stop it: observed as `rocm
-        // daemon` processes outliving their e2e checkout by days, still
-        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // writes a record (`starting`, or `ready` in its `ready` mode) for a
+        // process that never existed, so the helper would be left watching a pid
+        // that will never appear, with nothing in the scenario's teardown to stop
+        // it: observed as `rocm daemon` processes outliving their e2e checkout by
+        // days, still carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
         // supervising a real spawned server, and there is none here.
         //
         // That — not ordering — is the whole justification. This suppression
         // runs *before* the OOM note is computed in the `summary_mode` block
         // below, so the previous claim here, that the note "is computed before
         // it would have run", was backwards and could not have excused it.
-        // serve-40's `no background automation daemon was left behind` is what
-        // holds the branch: deleting it left the scenario green with a `rocm
-        // daemon` still running.
+        // The `no background automation daemon was left behind` step of serve-41
+        // and serve-55 is what holds the branch: deleting it left the scenario
+        // green with a `rocm daemon` still running.
         //
         // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
         // the test-only feature, so this branch folds away in shipped builds.

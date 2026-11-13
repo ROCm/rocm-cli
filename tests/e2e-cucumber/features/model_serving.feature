@@ -17,7 +17,7 @@ Feature: Model serving
   # This discriminates nothing yet: the scenario is an expected failure on every
   # host while its xfail row stands, and the vLLM run stops before printing a
   # plan, so the step panics there whatever the lemonade half did. It becomes
-  # regression coverage when that row is narrowed. serve-55 and the unit tests in
+  # regression coverage when that row is narrowed. serve-60 and the unit tests in
   # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
   Scenario: serve-02 - Every engine expands a short name rather than serving it
@@ -963,3 +963,19 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a model that requires an API key
     Then the server's API key is kept where only that user can read it
+
+  # A launch that became ready but whose first chat request fails must not be
+  # shown as a healthy deployment (#523). Same test-only hook as serve-41, in its
+  # `ready` mode, pointed at a mock engine that fails every chat request. The
+  # unit and provider tests prove the rendering and the failure classes; this
+  # proves `serve()` carries the smoke test's failure into the summary.
+  @id:serve-smoke-failure-summary @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-60 - A launch whose first chat request fails is not presented as ready
+    Given a managed vLLM launch that becomes ready but whose engine fails its first chat request
+    When the user opens the interactive serve summary against that engine
+    Then the deployment summary says the smoke test failed and does not call the service ready
+    And the deployment summary gives the engine's own reason
+    And the engine received exactly one chat request
+    And the deployment summary names the logs command for that service
+    And the launch's service record is left as ready
+    And no background automation daemon was left behind
