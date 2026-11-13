@@ -456,6 +456,32 @@ fn reuse_pregate_opens<T>(
         .flatten()
 }
 
+/// Whether the deployment summary may spend a device probe, given what the
+/// launch report says happened.
+///
+/// `!already_running` is the load-bearing half, not a cosmetic echo of the
+/// smoke test's gate. A service that was already running is `"ready"` by
+/// definition, so keying on the status alone opens this on *every* repeat
+/// `rocm serve` of a live model — and the probe is not free: on a miss it costs
+/// `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` plus one in-flight probe, about 14s
+/// with Lemonade's 8s inference probe, paid sequentially before the summary's
+/// remaining waits. That is a long stall bought for a row this command cannot
+/// learn anything new for — the engine answered the same thing when the service
+/// was launched, and a *running* service's device is what `rocm services list`
+/// reads, with its own budget for exactly that.
+///
+/// `probe` is a closure rather than a value for that reason: on the reuse path
+/// the cost must not be paid at all, which is what the unit test pins.
+fn serve_device_probe_opens<T>(
+    already_running: bool,
+    status: &str,
+    probe: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    (!already_running && status == "ready")
+        .then(probe)
+        .flatten()
+}
+
 /// The no-usable-GPU bail's host precondition, read from the visibility-resolved
 /// set of usable AMD GPU ordinals.
 ///
@@ -1251,8 +1277,11 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Read what the engine actually selected rather than guessing from
             // the pre-launch GPU plan: `gpu_indices` above can be empty for a
             // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
-            // the server is running fine on it. Only meaningful once the
-            // server is ready to answer, same gate as the smoke test.
+            // the server is running fine on it.
+            //
+            // Only for a launch this command performed — see
+            // [`serve_device_probe_opens`] for why skipping the reuse path is
+            // the point rather than tidiness.
             //
             // Asked more than once, briefly: `engines/lemonade` answers
             // `"unknown"` until its own inference probe has come back, which is
@@ -1260,9 +1289,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // bounded (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is a
             // supported outcome — the summary then has no `device:` row, and
             // `rocm services list` shows it once the engine can say.
-            let device = (report.status == "ready")
-                .then(|| fetch_service_device_briefly(&paths, &selected_engine, &report.service_id))
-                .flatten();
+            let device = serve_device_probe_opens(report.already_running, &report.status, || {
+                fetch_service_device_briefly(&paths, &selected_engine, &report.service_id)
+            });
 
             let mut notes = collect_serve_notes(
                 cpu_only,
@@ -1493,6 +1522,63 @@ mod tests {
         );
     }
 
+    /// Regression coverage for the device probe's gate (ROCMAI-550 review).
+    ///
+    /// The gate shipped as `report.status == "ready"` alone, under a comment
+    /// claiming it was "the same gate as the smoke test" — which it was not: the
+    /// smoke test and the Anthropic-endpoint wait beside it both also require
+    /// `!already_running`. A reused service is `"ready"` by definition, so the
+    /// omission made every repeat `rocm serve` of a live model pay the probe's
+    /// full retry budget (plus one in-flight probe, ~14s with Lemonade) before
+    /// printing a summary of a launch that did not happen.
+    ///
+    /// The probe is asserted *not consulted*, not merely that the row is absent:
+    /// the cost is the bug, and a gate that probed and then discarded the answer
+    /// would satisfy a value-only assertion.
+    #[test]
+    fn the_device_probe_is_not_spent_on_a_service_that_was_already_running() {
+        let mut probed = false;
+        assert!(
+            serve_device_probe_opens(true, "ready", || {
+                probed = true;
+                Some("gpu")
+            })
+            .is_none(),
+            "a reused service must not open the device probe: it is `ready` by \
+             definition, so the budget would be spent on every repeat `serve`"
+        );
+        assert!(
+            !probed,
+            "the probe must not even be called on the reuse path — the wall time \
+             is the regression, not the `device:` row"
+        );
+
+        // A launch that is not ready has nothing to ask the engine about yet.
+        let mut probed_starting = false;
+        assert!(
+            serve_device_probe_opens(false, "starting", || {
+                probed_starting = true;
+                Some("gpu")
+            })
+            .is_none()
+        );
+        assert!(!probed_starting);
+
+        // The row itself still works for the case it was added for: a fresh
+        // launch that reached ready, where the engine knows what it selected.
+        assert_eq!(
+            serve_device_probe_opens(false, "ready", || Some("gpu")),
+            Some("gpu"),
+            "a fresh ready launch must still read the engine's device, or the \
+             Vulkan-only `device:` row this PR adds is gone"
+        );
+        // `None` from the engine stays a supported answer: no row, no error.
+        assert_eq!(
+            serve_device_probe_opens(false, "ready", || Option::<&str>::None),
+            None
+        );
+    }
+
     #[test]
     fn serve_engine_selection_uses_shared_recipe_when_no_override_exists() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
@@ -1677,6 +1763,94 @@ mod tests {
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
             "Qwen3-4B-Instruct-2507-GGUF"
+        );
+    }
+
+    #[test]
+    fn serve_small_assistant_resolves_the_gguf_build_on_lemonade() {
+        // The small assistant recipe is published as safetensors under its
+        // canonical id and as GGUF under a companion repo. Lemonade can only
+        // serve the latter, and only with a quantization variant pinned, so
+        // every way of naming the recipe has to arrive at that ref.
+        for model in [
+            "qwen2.5",
+            "qwen2.5-1.5b",
+            "qwen2.5-1.5b-instruct",
+            "qwen-small",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        ] {
+            let recipe = resolve_builtin_model_recipe(model)
+                .unwrap_or_else(|| panic!("{model} resolves to a recipe"));
+            // With no engine named and no GPU family preferring one, automatic
+            // selection follows the recipe. A host whose family prefers vLLM
+            // takes the earlier branch in `select_serve_engine` and is not
+            // covered here; the ref each engine resolves to is, below.
+            assert_eq!(
+                select_serve_engine(None, None, Some(&recipe), None),
+                ServeEngineSelection {
+                    engine: "lemonade".to_owned(),
+                    source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+                },
+                "{model}"
+            );
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "lemonade"),
+                "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M",
+                "{model}"
+            );
+            // vLLM keeps the safetensors repo the canonical id names.
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "vllm"),
+                "Qwen/Qwen2.5-1.5B-Instruct",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_lemonade_catalog_recipe_resolves_to_a_servable_ref() {
+        // Lemonade passes a Hugging Face `owner/repo` through untouched, and the
+        // engine then refuses it without a `:variant` -- on Windows from inside
+        // the detached engine process, where the user never sees the reason. The
+        // catalog is what has to supply the variant, so no recipe that lists
+        // Lemonade may resolve to a bare `owner/repo`. A bare registry name (no
+        // `/`) is a Lemonade model id, not a Hugging Face repo, and is fine.
+        //
+        // Scope: recipes that list Lemonade, and only those. Lemonade can still
+        // be reached for a recipe that does not -- an explicit `--engine
+        // lemonade`, a configured `default_engine`, or the platform default when
+        // nothing else fits -- and that recipe is handed its canonical id, which
+        // is what a recipe with no Lemonade build should get. Refusing a bare
+        // ref before the engine starts is the other half of that, and is not
+        // this test's job.
+        let offenders = rocm_core::builtin_model_recipes()
+            .into_iter()
+            .filter(|recipe| model_recipe_supports_engine(recipe, "lemonade"))
+            .map(|recipe| {
+                let resolved = serve_model_ref_for_engine(
+                    &recipe.canonical_model_id,
+                    Some(&recipe),
+                    "lemonade",
+                );
+                (recipe.canonical_model_id, resolved)
+            })
+            .filter(|(_, resolved)| {
+                // A trailing `:` is as unservable as no colon at all, so the
+                // variant has to be there, not merely the separator.
+                resolved.contains('/')
+                    && resolved
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.split_once(':'))
+                        .is_none_or(|(_, variant)| variant.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "these recipes hand Lemonade a Hugging Face repo with no `:variant`, which the \
+             engine refuses after it has already been launched; give each one a lemonade \
+             engine_recipes entry whose model_id_override names the GGUF repo and variant: \
+             {offenders:?}"
         );
     }
 

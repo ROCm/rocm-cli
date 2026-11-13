@@ -60,7 +60,7 @@ async fn user_previews_sdk_install(world: &mut E2eWorld) {
     // this to a plan: no venv, no multi-GiB download.
     let stdout = crate::run_rocm_ok(
         world,
-        &["install", "sdk", "--family", "gfx110X-all", "--dry-run"],
+        &["install", "sdk", "--family", "gfx1100", "--dry-run"],
     );
     world.cli_output = Some(stdout);
 }
@@ -239,14 +239,22 @@ async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-/// TheRock package families this step may ask for, in preference order. Real
-/// published names, not placeholders: an unknown family is rejected during
+/// TheRock GPU targets this step may ask for, in preference order, each paired
+/// with the package family it resolves to. The install reads the newest layout,
+/// which picks its device payload by exact arch and refuses a grouped family
+/// name, so the request names the arch; the family is what the active runtime's
+/// `family=` column is compared against. Real published names, not placeholders:
+/// an unknown family is rejected during
 /// resolution, which would exit non-zero for a reason that has nothing to do
 /// with the consent gate and would still satisfy "the reinstall is refused".
 /// Each is published as a `therock-dist-linux-<family>-<version>.tar.gz` in the
-/// canonical release tarball catalog, for the same reason: an artifact the
+/// newest layout's release tarball catalog, for the same reason: an artifact the
 /// catalog does not carry fails resolution short of the gate.
-const OTHER_FAMILY_CANDIDATES: &[&str] = &["gfx110X-all", "gfx120X-all", "gfx94X-dcgpu"];
+const OTHER_FAMILY_CANDIDATES: &[(&str, &str)] = &[
+    ("gfx1100", "gfx110X-all"),
+    ("gfx1200", "gfx120X-all"),
+    ("gfx942", "gfx94X-dcgpu"),
+];
 
 #[when("the user installs a different GPU family without confirming")]
 async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
@@ -257,9 +265,9 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // case-preserving `family=` column — the runtime key alone would not do,
     // since it is lowercase-slugified and would never match `gfx110X-all`.
     let (runtimes, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
-    let family = OTHER_FAMILY_CANDIDATES
+    let (arch, _) = OTHER_FAMILY_CANDIDATES
         .iter()
-        .find(|candidate| !runtimes.contains(*candidate))
+        .find(|(_, family)| !runtimes.contains(*family))
         .copied()
         .unwrap_or_else(|| {
             panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
@@ -277,7 +285,7 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // `active_default_runtime_relation` shared by both formats — with a family
     // the host has genuinely never held. The refusal still costs only the
     // catalog listing: it bails before the multi-GiB archive is fetched.
-    let args = ["install", "sdk", "--format", "tarball", "--family", family];
+    let args = ["install", "sdk", "--format", "tarball", "--family", arch];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
@@ -709,6 +717,9 @@ fn assert_engine_ready(world: &mut E2eWorld) {
 }
 #[when("the user dry-runs a nightly SDK install for a known family")]
 async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
+    // An exact arch, not the `gfx120X-all` group: an unpinned install reads the
+    // newest layout, which picks its device payload by exact arch and refuses a
+    // group.
     let stdout = crate::run_rocm_ok(
         world,
         &[
@@ -717,7 +728,34 @@ async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
             "--channel",
             "nightly",
             "--family",
-            "gfx120X-all",
+            "gfx1200",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
+/// The last day the earlier (canonical) nightly stream published a build is
+/// 2026-08-22, so a pin before it can only be read from there.
+///
+/// The pin is 2026-08-19, not the 20th: the stream has no native Windows
+/// (`win_amd64`) torch, torchvision or torchaudio wheel for 2026-08-20, only
+/// Linux ones, so on a Windows host that pin finds no mutually compatible
+/// stack. The 19th has all four packages on both platforms for cp314, the
+/// Python this ROCm layout installs.
+#[when("the user dry-runs a nightly SDK install pinned to a build from the earlier stream")]
+async fn user_dry_runs_earlier_nightly_sdk(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--family",
+            "gfx1200",
+            "--build-date",
+            "2026-08-19",
             "--dry-run",
         ],
     );
@@ -756,7 +794,23 @@ fn requested_rocm_extras(rocm_spec: &str) -> &str {
 
 #[then("the SDK preview reports canonical nightly provenance")]
 async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
-    const AGGREGATE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
+    assert_nightly_provenance(
+        world,
+        "https://rocm.nightlies.amd.com/whl-multi-arch",
+        "multi-arch-v2",
+    );
+}
+
+#[then("the SDK preview reports next-layout nightly provenance")]
+async fn assert_next_nightly_provenance(world: &mut E2eWorld) {
+    assert_nightly_provenance(
+        world,
+        "https://nightly.repo.amd.com/rocm/whl-next",
+        "next-v1",
+    );
+}
+
+fn assert_nightly_provenance(world: &E2eWorld, aggregate: &str, generation: &str) {
     let output = world.cli_output.as_deref().expect("no SDK preview output");
 
     assert_eq!(
@@ -770,17 +824,17 @@ async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
     // disagrees with it is worse than either alone.
     assert_eq!(
         preview_field(output, "canonical_source"),
-        AGGREGATE,
-        "the preview declares a source other than the canonical nightly aggregate:\n{output}"
+        aggregate,
+        "the preview declares a source other than the expected nightly aggregate:\n{output}"
     );
     assert_eq!(
         preview_field(output, "index_url"),
-        AGGREGATE,
-        "the nightly install resolved something other than the canonical aggregate:\n{output}"
+        aggregate,
+        "the nightly install resolved something other than the expected aggregate:\n{output}"
     );
     assert_eq!(
         preview_field(output, "source_layout_generation"),
-        "multi-arch-v2",
+        generation,
         "the preview read the aggregate as some other layout:\n{output}"
     );
     // A `selected_rocm_version` line is provenance only if it names the version
@@ -808,9 +862,44 @@ async fn user_dry_runs_release_sdk(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user dry-runs a release SDK install pinned to an earlier ROCm 7 release")]
+async fn user_dry_runs_earlier_release_sdk(world: &mut E2eWorld) {
+    // Same as the unpinned preview above, with the pin the only difference, so
+    // the two scenarios differ in exactly the thing that picks the stream.
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--version",
+            "7.14.1",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
 #[then("the SDK preview reports canonical release provenance")]
 async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
-    const AGGREGATE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+    assert_release_provenance(
+        world,
+        "https://repo.amd.com/rocm/whl-multi-arch",
+        "multi-arch-v2",
+    );
+}
+
+#[then("the SDK preview reports next-layout release provenance")]
+async fn assert_next_release_provenance(world: &mut E2eWorld) {
+    assert_release_provenance(
+        world,
+        "https://stable.repo.amd.com/rocm/whl-next",
+        "next-v1",
+    );
+}
+
+fn assert_release_provenance(world: &E2eWorld, aggregate: &str, generation: &str) {
     let output = world.cli_output.as_deref().expect("no SDK preview output");
 
     assert_eq!(
@@ -824,17 +913,17 @@ async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
     // that says so — the URL the resolver chose, not the one it advertises.
     assert_eq!(
         preview_field(output, "canonical_source"),
-        AGGREGATE,
-        "the preview declares a source other than the canonical release aggregate:\n{output}"
+        aggregate,
+        "the preview declares a source other than the expected release aggregate:\n{output}"
     );
     assert_eq!(
         preview_field(output, "index_url"),
-        AGGREGATE,
-        "the release install resolved something other than the flat aggregate index:\n{output}"
+        aggregate,
+        "the release install resolved something other than the expected aggregate index:\n{output}"
     );
     assert_eq!(
         preview_field(output, "source_layout_generation"),
-        "multi-arch-v2",
+        generation,
         "the preview read the aggregate as some other layout:\n{output}"
     );
     // The release channel installs stable versions only, and a stable version

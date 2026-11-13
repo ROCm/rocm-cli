@@ -817,6 +817,50 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     .await;
 }
 
+/// The catalog's recommended small assistant, asked for by a short name with no
+/// `--engine`.
+///
+/// The engine is deliberately left to the CLI: the model is what decides which
+/// one runs, and the point of the scenario is that the catalog hands that engine
+/// a model ref it can serve. The expected ref therefore differs per host, and
+/// each side is an assertion in its own right: a lemonade host must be given the
+/// GGUF build with its quantization variant pinned (a bare `owner/repo` is a
+/// safetensors-only repo lemonade refuses, from inside the engine process), and
+/// a vLLM host must still be given the safetensors repo the canonical id names.
+///
+/// `Qwen2.5-1.5B` is the readiness substring for both, short enough to survive
+/// whichever shape the endpoint reports — lemonade's direct-serve path aliases
+/// the server to the full `owner/repo:variant` ref, but a router path would name
+/// the GGUF artifact instead, as `Qwen3-0.6B` allows for in the steps above.
+/// That looseness is why the exact ref is asserted here from the plan the CLI
+/// printed instead. Neither later check can tell the GGUF build from the
+/// safetensors repo: readiness is a bare substring match, and `model_ids_match`
+/// on the chat reply normalizes the variant and the `-GGUF` suffix away — so a
+/// wrong variant, or an override that reached the wrong engine, would run green.
+#[given("the recommended small assistant is being served by its short name")]
+async fn setup_small_assistant_by_short_name(world: &mut E2eWorld) {
+    let model = if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade"
+    {
+        "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"
+    } else {
+        "Qwen/Qwen2.5-1.5B-Instruct"
+    };
+    let stdout = serve_and_wait(
+        world,
+        &["serve", "qwen-small", "--managed"],
+        model,
+        "Qwen2.5-1.5B",
+    )
+    .await;
+    assert_eq!(
+        resolved_model(&stdout),
+        Some(model),
+        "`rocm serve qwen-small` on a host serving with {} must resolve to {model}:\n{stdout}",
+        e2e_cucumber::capability::host_capability().effective_serve_engine,
+    );
+    world.cli_output = Some(stdout);
+}
+
 #[given("a model is being served on aim")]
 async fn setup_aim_model(world: &mut E2eWorld) {
     serve_aim_canary(world).await;
@@ -981,10 +1025,16 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
+/// The catalog alias the short-name scenarios (serve-01, serve-02) ask for, held
+/// in one place so the Then step can say whether it was expanded without
+/// repeating the literal.
+const SHORT_NAME_UNDER_TEST: &str = "qwen2.5";
+
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
     let engine = "vllm";
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", SHORT_NAME_UNDER_TEST, "--engine", engine]);
     // stderr and the exit code ride along so a run that stopped on a refusal reads
     // as one in the Then step, instead of as "the name was not expanded".
     world.serve_runs = Some(vec![ServeRun {
@@ -1000,7 +1050,7 @@ async fn user_serves_multiple_engines(world: &mut E2eWorld) {
     let mut runs = Vec::new();
     for engine in ["lemonade", "vllm"] {
         let (stdout, stderr, rc) =
-            crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+            crate::run_rocm(world, &["serve", SHORT_NAME_UNDER_TEST, "--engine", engine]);
         runs.push(ServeRun {
             engine: engine.to_owned(),
             stdout,
@@ -1144,6 +1194,71 @@ async fn user_serves_with_automatic_port(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// ROCMAI-863: serve a real safetensors-only `owner/repo` rather than a made-up
+/// one, so the scenario covers the case users hit. There is no GGUF for Lemonade
+/// to serve under any variant — the refusal is the only correct outcome, and it
+/// must arrive on the terminal, not in a log nobody reads. `--managed` is what
+/// `rocm serve` does by default; naming it keeps the scenario on the path the
+/// report describes.
+///
+/// The id must be one the catalog has NO recipe for. The original report named
+/// `Qwen/Qwen2.5-1.5B-Instruct`, but #1044 gave that one a per-engine recipe
+/// resolving to `...-GGUF:Q4_K_M`, so the variant arrives from the catalog, the
+/// refusal correctly does not fire, and the scenario silently inverted — it
+/// served, exited 0, and only the GPU lane noticed. The assertion below keeps
+/// that from recurring quietly if this id ever gains a recipe too.
+const HF_REPO_WITHOUT_VARIANT: &str = "Qwen/Qwen2.5-3B-Instruct";
+
+#[when("the user serves a Hugging Face repo with no quantization variant on Lemonade")]
+async fn user_serves_hf_repo_without_variant(world: &mut E2eWorld) {
+    assert!(
+        !rocm_core::model_catalog::builtin_model_recipes()
+            .iter()
+            .any(|recipe| recipe.matches_ref(HF_REPO_WITHOUT_VARIANT)),
+        "{HF_REPO_WITHOUT_VARIANT} now has a catalog recipe, which supplies the \
+         quantization variant this scenario exists to see refused; pick an id \
+         the catalog has no recipe for"
+    );
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            HF_REPO_WITHOUT_VARIANT,
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The refusal has to say what would work, not just that this did not. The
+/// `owner/repo:<variant>` form is the way out, and it is what the user retypes.
+#[then("the user is told the model needs an explicit GGUF variant")]
+async fn assert_told_to_name_a_gguf_variant(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("`owner/repo:<variant>`"),
+        "expected the refusal to name the form that would work, got:\n{output}"
+    );
+}
+
+/// The discriminating assertion for the second half of ROCMAI-863. The old
+/// refusal offered `<model>:Q4_K_M`, a quantization nothing had looked for — on
+/// a safetensors-only repo that advice fails again, and the user is no better
+/// off than before. Asserted as an absence, because a wording pin would certify
+/// whatever text happened to be there rather than that it stopped guessing.
+#[then("no quantization is suggested for a repo the CLI has not inspected")]
+async fn assert_no_quantization_suggested(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("Q4_K_M") && !output.contains("Q4_0"),
+        "the refusal must not name a quantization this repo was never checked for, got:\n{output}"
+    );
 }
 
 #[when("the user sends a chat completion request")]
@@ -3031,26 +3146,42 @@ async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
     );
 }
 
-#[then("all engines expand to the same full model name")]
-async fn assert_consistent_expansion(world: &mut E2eWorld) {
+/// The build `SHORT_NAME_UNDER_TEST` must expand to on each engine.
+///
+/// The two differ on purpose: the catalog recipe behind this alias publishes a
+/// quantized GGUF for lemonade and the safetensors repo for vLLM, so equality
+/// across engines is the wrong check. Naming both refs is what keeps the step
+/// able to fail — on a wrong variant, on a missing expansion, and on an override
+/// that reached the wrong engine.
+const SHORT_NAME_EXPANSIONS: [(&str, &str); 2] = [
+    ("lemonade", "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"),
+    ("vllm", "Qwen/Qwen2.5-1.5B-Instruct"),
+];
+
+#[then("every engine expands it to the full name of the model it will serve")]
+async fn assert_short_name_expansion_per_engine(world: &mut E2eWorld) {
     let runs = world.serve_runs.as_ref().expect("no serve runs");
-    assert!(runs.len() >= 2, "need at least 2 serve outputs to compare");
-    let mut resolved: Vec<String> = Vec::new();
+    assert_eq!(
+        runs.len(),
+        SHORT_NAME_EXPANSIONS.len(),
+        "expected one serve output per engine in {SHORT_NAME_EXPANSIONS:?}"
+    );
     for (i, run) in runs.iter().enumerate() {
         // A missing `resolved model:` line means the engine never got far enough
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
-        // fail would produce equal ("") values and pass this check vacuously.
-        let Some(model) = run.resolved_model().map(str::to_string) else {
+        // fail would pass this check vacuously.
+        let Some(resolved) = run.resolved_model() else {
             panic!("engine #{i}: {}", run.missing_plan_message());
         };
-        resolved.push(model);
-    }
-    let first = &resolved[0];
-    for (i, r) in resolved.iter().enumerate().skip(1) {
+        let (_, expected) = SHORT_NAME_EXPANSIONS
+            .iter()
+            .find(|(engine, _)| *engine == run.engine)
+            .unwrap_or_else(|| panic!("no expected expansion recorded for engine {}", run.engine));
         assert_eq!(
-            r, first,
-            "inconsistent model name expansion across engines: {resolved:?} (index {i})"
+            &resolved, expected,
+            "engine '{}' expanded {SHORT_NAME_UNDER_TEST:?} to {resolved:?}:\n{}",
+            run.engine, run.stdout
         );
     }
 }
