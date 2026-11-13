@@ -362,6 +362,24 @@ mod tests {
             rendered.contains("the Vulkan backend can still be used"),
             "{rendered}"
         );
+        // AGENTS.md §3: advice naming a command is asserted together with the
+        // behaviour. Saying the Vulkan backend "can still be used" without
+        // naming how to use it leaves the user where they started, so the
+        // command is part of the claim, not decoration — without this
+        // assertion the recommendation could be deleted or garbled and this
+        // test would still pass.
+        //
+        // That the named command *parses* (the subcommand exists and accepts
+        // `--engine lemonade`) is proved mechanically rather than here:
+        // `advised_commands::every_advised_command_parses` in `apps/rocm`
+        // scans production string literals under `crates/`, including this
+        // one, and routes each through the real clap tree. rocm-core cannot
+        // see the CLI's argument parser, so this half pins that the sentence
+        // is printed at all for a Vulkan-only host.
+        assert!(
+            rendered.contains("serve on it with `rocm serve <model> --engine lemonade`"),
+            "a Vulkan-only host must be told the command that serves on it:\n{rendered}"
+        );
     }
 
     /// An unmapped target must not be *claimed* unsupported, even though every

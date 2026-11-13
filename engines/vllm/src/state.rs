@@ -85,22 +85,17 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
 /// now formatted by [`rocm_engine_protocol::format_reported_device`], shared
 /// with Lemonade, which is also what keeps an unpinned launch from rendering a
 /// dangling `rocm gpu`.
+///
+/// The ordinal comes from
+/// [`rocm_engine_protocol::first_gpu_index_from_state`] for the same reason:
+/// this engine and Lemonade read the same `gpu_indices` key out of state files
+/// of the same shape, and had byte-identical private copies of that read.
 fn reported_device(state: &Value) -> String {
     rocm_engine_protocol::format_reported_device(
         "rocm",
-        first_gpu_index_from_state(state),
+        rocm_engine_protocol::first_gpu_index_from_state(state),
         value_string(state, "gpu_name").as_deref(),
     )
-}
-
-/// The first pinned GPU ordinal recorded in service state, if any.
-fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
-    state
-        .get("gpu_indices")
-        .and_then(Value::as_array)
-        .and_then(|indices| indices.first())
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
 }
 
 pub(crate) fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
