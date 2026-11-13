@@ -272,10 +272,6 @@ mod tests {
 
     #[test]
     fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
-        // W7900's self-hosted nightly job was removed because it never got a
-        // runner; its nightly runs on the queue, which does not report into this
-        // grid. Its per-PR-workflow lane may still exist.
-        const NO_SELF_HOSTED_NIGHTLY: [&str; 1] = ["e2e-gpu-w7900-report"];
         // The nightly workflow exists to run *more* scenarios on *at least*
         // the per-PR platforms, plus lanes the per-PR smoke gate deliberately
         // skips (e.g. rad3, mi350p -- ROCMAI-125). If a per-PR platform ever
@@ -327,17 +323,8 @@ mod tests {
             "per-PR lane scan found nothing to check"
         );
         assert!(
-            per_pr
-                .iter()
-                .filter(|p| !NO_SELF_HOSTED_NIGHTLY.contains(&p.as_str()))
-                .all(|p| nightly.contains(p)),
+            per_pr.iter().all(|p| nightly.contains(p)),
             "every per-PR platform must also run nightly: per_pr={per_pr:?} nightly={nightly:?}"
-        );
-        assert!(
-            NO_SELF_HOSTED_NIGHTLY
-                .iter()
-                .all(|p| !nightly.iter().any(|q| q == p)),
-            "NO_SELF_HOSTED_NIGHTLY names a lane that runs nightly again: drop it from the list"
         );
     }
 
