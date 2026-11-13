@@ -13,8 +13,9 @@ name: E2E self-hosted
 # MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
 # pool (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
 # Ubuntu lane keeps its push / dispatch triggers; it does not start on
-# pull_request or merge_group. There is no W7900 lane: that hardware is covered
-# by the queue (docs/nightly-on-the-queue.md).
+# pull_request or merge_group. There is no W7900 lane here: W7900 is covered only
+# by the scheduled queue nightly's `w7900-dual` lane (docs/nightly-on-the-queue.md),
+# not on push, release/** or dispatch.
 #
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not

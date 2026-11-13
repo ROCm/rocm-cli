@@ -49,7 +49,10 @@ pool: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
 the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu lane (`e2e-gpu-strix-ubuntu`) no longer starts on `pull_request` or in
 the merge queue; it keeps its `push`/dispatch triggers. There is no W7900 lane
-in `e2e-selfhosted.yml` any more: that hardware is covered by the queue (below).
+in `e2e-selfhosted.yml` any more: W7900 is covered only by the scheduled queue
+nightly's `w7900-dual` lane (below; advisory), not on `push`, `release/**` or
+dispatch. Its first run, the 11-13 queue nightly
+([run 43351651832](https://github.com/ROCm/rocm-cli/actions/runs/43351651832)), got capacity at once and finished `Done`, exit 0.
 
 [`queue-run.yml`](../.github/workflows/queue-run.yml) runs GPU lanes on a
 shared GPU queue, one per GPU model, so no runner holds a GPU for the length
