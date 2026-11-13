@@ -967,6 +967,12 @@ rocm engines install vllm --reinstall")]
 #[derive(Subcommand, Debug)]
 pub(crate) enum RuntimesCommand {
     /// Show ROCm runtimes known to ROCm CLI.
+    ///
+    /// Each runtime is listed with its version (and build date), GPU family,
+    /// mode and toolchain, then its channel, package source, source layout
+    /// generation and exact GPU target as its manifest recorded them. A fact
+    /// recorded nowhere, or recorded blank, is shown as `unrecorded`; nothing
+    /// is guessed from other facts.
     List,
     /// Use the selected ROCm runtime by default.
     Activate {

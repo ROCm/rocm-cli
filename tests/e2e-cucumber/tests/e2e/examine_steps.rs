@@ -546,6 +546,54 @@ fn planted_setup_runtime_root(world: &E2eWorld) -> std::path::PathBuf {
         .join("setup-runtime")
 }
 
+#[given("the active runtime is a nightly runtime installed for one exact GPU")]
+async fn active_runtime_is_nightly_exact_target(world: &mut E2eWorld) {
+    use super::runtime_lifecycle_steps::{
+        NIGHTLY_EXACT_TARGET_KEY, plant_nightly_exact_target_runtime,
+    };
+    plant_nightly_exact_target_runtime(world);
+    // Black-box: plain JSON matching the CLI's on-disk config schema; every
+    // other field defaults. `examine` reads the active runtime from here.
+    let config_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("config");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config = serde_json::json!({ "active_runtime_key": NIGHTLY_EXACT_TARGET_KEY });
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[then(
+    "the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from"
+)]
+async fn runtime_state_names_active_provenance(world: &mut E2eWorld) {
+    use super::runtime_lifecycle_steps::{
+        NIGHTLY_DEVICE_TARGET, NIGHTLY_SOURCE, NIGHTLY_SOURCE_LAYOUT,
+    };
+    let out = world.cli_output.clone().unwrap_or_default();
+    for (field, expected) in [
+        ("active_runtime_channel", "nightly"),
+        ("active_runtime_source", NIGHTLY_SOURCE),
+        (
+            "active_runtime_source_layout_generation",
+            NIGHTLY_SOURCE_LAYOUT,
+        ),
+        ("active_runtime_device_target", NIGHTLY_DEVICE_TARGET),
+    ] {
+        assert_eq!(
+            field_value(&out, field),
+            Some(expected),
+            "examine must report {field} for the active runtime:\n{out}"
+        );
+    }
+}
+
 #[given("setup names a runtime folder the registry has forgotten")]
 async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
     let root = world.isolated_root.as_ref().expect("no isolated root");

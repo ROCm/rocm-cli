@@ -108,6 +108,18 @@ const fn devel_default_for_legacy_manifest() -> bool {
     true
 }
 
+/// The `selected_artifact_url` an adopted runtime records (`rocm runtimes
+/// adopt`). Adoption installs nothing, so there is no artifact to name; this
+/// marks that instead, and is never a package source.
+pub(crate) const ADOPTED_RUNTIME_ARTIFACT_URL: &str = "adopted-read-only";
+
+/// The value a provenance chain chose, trimmed, or `None` when there is none or
+/// it is blank. Applied once, after the chain has picked its field: a blank
+/// value is shown as `unrecorded`, it does not make the chain try the next one.
+fn recorded(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 impl InstalledRuntimeManifest {
     /// Whether this runtime has the compiler toolchain.
     ///
@@ -128,6 +140,49 @@ impl InstalledRuntimeManifest {
     /// the folder, so those cannot disagree about which runtimes are whose.
     pub(crate) const fn owns_install_root(&self) -> bool {
         !self.read_only && self.imported_from.is_none()
+    }
+
+    /// The source layout generation this runtime recorded: the manifest's own
+    /// field, else the one its wheel composition was written with. `None` when
+    /// neither is recorded.
+    ///
+    /// Shared by update planning (which treats `None` as the canonical stream)
+    /// and by [`Self::provenance`], so both choose the same recorded field.
+    /// They differ in what they do with its value: update planning uses it
+    /// as recorded, while the listing trims it and prints a blank one (or
+    /// `None`) as `unrecorded`.
+    pub(crate) fn recorded_source_layout_generation(&self) -> Option<&str> {
+        self.source_layout_generation.as_deref().or_else(|| {
+            self.wheel_composition
+                .as_ref()
+                .map(|composition| composition.source_layout_generation.as_str())
+        })
+    }
+
+    /// Where this runtime came from, as far as its manifest recorded it.
+    ///
+    /// The layout and target come from the same recorded field update planning
+    /// uses, through [`Self::recorded_source_layout_generation`] and
+    /// [`wheel_composition_device_target`]; the source is the package index,
+    /// else the artifact URL unless it is the adoption marker. Each chain moves
+    /// to its next field only when a field is absent. The chosen value then
+    /// goes through [`recorded`], which trims it and turns a blank one into
+    /// `None` (shown as `unrecorded`) rather than skipping it.
+    pub(crate) fn provenance(&self) -> RuntimeProvenance<'_> {
+        RuntimeProvenance {
+            channel: recorded(Some(self.channel.as_str())),
+            // A wheel install records the package index it resolved from; a
+            // tarball install records only the archive it downloaded. An
+            // adopted runtime records neither, only the adoption marker.
+            source: recorded(self.index_url.as_deref().or_else(|| {
+                Some(self.selected_artifact_url.as_str())
+                    .filter(|url| *url != ADOPTED_RUNTIME_ARTIFACT_URL)
+            })),
+            source_layout_generation: recorded(self.recorded_source_layout_generation()),
+            device_target: recorded(wheel_composition_device_target(
+                self.wheel_composition.as_ref(),
+            )),
+        }
     }
 
     pub(crate) fn normalize_host_paths(mut self) -> Self {
@@ -166,6 +221,49 @@ impl InstalledRuntimeManifest {
             probe.normalize_storage_paths();
         }
         self
+    }
+}
+
+/// Printed in place of a provenance fact the runtime's manifest does not record.
+///
+/// Older manifests predate some of these fields, and a tarball install never
+/// had an exact GPU target. [`InstalledRuntimeManifest::provenance`] prints this
+/// when a fact's chain of recorded fields finds nothing, or finds a blank
+/// value. It never guesses one fact from another — a target from the family,
+/// or a layout from the channel, would read as something the install recorded.
+pub(crate) const UNRECORDED_PROVENANCE: &str = "unrecorded";
+
+/// Where an installed runtime came from: the channel, the package source it was
+/// resolved from, the source layout generation, and the exact GPU target its
+/// packages were installed for. Every field is what the manifest recorded,
+/// trimmed, and `None` when it recorded nothing or a blank value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeProvenance<'a> {
+    pub channel: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub source_layout_generation: Option<&'a str>,
+    pub device_target: Option<&'a str>,
+}
+
+impl RuntimeProvenance<'_> {
+    /// Each fact as `(name, shown value)`, in display order, with
+    /// [`UNRECORDED_PROVENANCE`] for a fact that was not recorded.
+    ///
+    /// `rocm runtimes list` and `rocm examine` both print from this, so the
+    /// names and values the two show for one runtime cannot drift apart.
+    pub(crate) fn fields(&self) -> [(&'static str, &str); 4] {
+        fn shown(value: Option<&str>) -> &str {
+            value.unwrap_or(UNRECORDED_PROVENANCE)
+        }
+        [
+            ("channel", shown(self.channel)),
+            ("source", shown(self.source)),
+            (
+                "source_layout_generation",
+                shown(self.source_layout_generation),
+            ),
+            ("device_target", shown(self.device_target)),
+        ]
     }
 }
 
