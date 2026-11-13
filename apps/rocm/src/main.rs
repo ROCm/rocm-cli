@@ -45,6 +45,7 @@ mod freeform_planner;
 mod gpu_policy;
 mod install_cmd;
 mod logging;
+mod man_page;
 mod managed_service_status;
 mod model_catalog_text;
 mod model_fit;
@@ -640,19 +641,28 @@ pub(crate) struct ChatInferenceParams {
     pub max_tokens: Option<u32>,
 }
 
-fn dispatch(cli: Cli) -> Result<()> {
-    // `storage` is excluded alongside the other self-referential commands: it
-    // reports and reclaims disk, and the startup update check can provision a
-    // managed Python, which downloads instead of freeing.
-    if !matches!(
-        cli.command,
+/// Whether `command` runs without the startup update check first.
+///
+/// `storage` is excluded alongside the other self-referential commands: it
+/// reports and reclaims disk, and the startup update check can provision a
+/// managed Python, which downloads instead of freeing. `completions` and
+/// `__man-page` only print what this binary is, and the installer runs them
+/// before the user has run anything.
+const fn skips_startup_update_check(command: Option<&Command>) -> bool {
+    matches!(
+        command,
         Some(
             Command::Update { .. }
                 | Command::Bootstrap { .. }
                 | Command::Completions { .. }
+                | Command::ManPage
                 | Command::Storage { .. }
         )
-    ) {
+    )
+}
+
+fn dispatch(cli: Cli) -> Result<()> {
+    if !skips_startup_update_check(cli.command.as_ref()) {
         refresh_startup_update_check_quietly();
     }
 
@@ -954,6 +964,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             clap_complete::generate(shell, &mut cmd, "rocm", &mut std::io::stdout());
             Ok(())
         }
+        Some(Command::ManPage) => {
+            man_page::write(&mut io::stdout().lock()).context("failed to write the manual page")
+        }
         None => launch_default(),
     }
 }
@@ -1160,6 +1173,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "mcp-call",
         "__engine-serve-http",
         "__engine-stdio",
+        "__man-page",
         "bootstrap",
         "setup",
         "chat",
@@ -1518,6 +1532,41 @@ pub(crate) mod tests {
             full_names.iter().any(|n| n == "__engine-stdio"),
             "runtime command tree must retain hidden verbs for dispatch; got {full_names:?}"
         );
+    }
+
+    /// The commands that only print what this binary is, or that manage
+    /// updates and disk themselves, start without the update check; the
+    /// others run it.
+    #[test]
+    fn printing_the_manual_page_skips_the_startup_update_check() {
+        let skips = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            skips_startup_update_check(cli.command.as_ref())
+        };
+        assert!(skips(&["rocm", "__man-page"]));
+        assert!(skips(&["rocm", "completions", "fish"]));
+        assert!(skips(&["rocm", "update"]));
+        assert!(skips(&["rocm", "bootstrap"]));
+        // Reclaiming disk must not start a download.
+        assert!(skips(&["rocm", "storage", "report"]));
+        assert!(!skips(&["rocm", "examine"]));
+        assert!(!skips(&["rocm", "version"]));
+    }
+
+    /// Every top-level command, hidden or not, dispatches as a structured
+    /// command: a name missing from the list is read as a natural-language
+    /// request instead, so the installer's `rocm __man-page` would print a
+    /// request plan in place of the page.
+    #[test]
+    fn every_command_name_is_structured_not_freeform() {
+        for sc in Cli::command().get_subcommands() {
+            let name = sc.get_name().to_owned();
+            let invocation = parse_freeform_invocation(std::slice::from_ref(&name));
+            assert!(
+                !should_treat_as_freeform(&invocation),
+                "`rocm {name}` would be treated as a natural-language request"
+            );
+        }
     }
 
     #[test]

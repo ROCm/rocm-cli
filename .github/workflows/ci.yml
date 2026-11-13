@@ -371,7 +371,12 @@ jobs:
 
       - name: Install native build deps
         if: needs.changes.outputs.heavy == 'true'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+        # man-db: lifecycle-36 (the acceptance install lifecycle below) runs
+        # `man rocm` against the installed page and fails without man, and the
+        # installer checks run `man -w rocm` when it is there. The hosted
+        # ubuntu-24.04 image ships it today; installing it keeps that a
+        # guarantee on both images.
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev man-db
 
       # Installs the sccache binary. Both this and the probe below run BEFORE
       # setup-rust-toolchain, because its rust-cache step runs `cargo metadata`,
@@ -514,8 +519,8 @@ jobs:
         run: cargo xtask verify-pinned-keys
 
       # Hermetic: a signed local bundle and a stub `rocm`, no network and no
-      # GPU, so a fish-profile regression fails in this fast step instead of
-      # only inside a full release install.
+      # GPU, so a fish-profile or manual-page regression fails in this fast step
+      # instead of only inside a full release install.
       - name: Installer fish profile checks
         if: needs.changes.outputs.heavy == 'true'
         run: sh tests/install-sh/run.sh

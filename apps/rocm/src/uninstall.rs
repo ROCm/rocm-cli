@@ -9,8 +9,8 @@
 //! owns what only uninstall does on top of removing files:
 //!
 //! - undoing the PATH change the installer recorded making;
-//! - removing the fish completion script the Linux installer recorded writing,
-//!   when it is still the installer's own file;
+//! - removing the fish completion script and the manual page the Linux
+//!   installer recorded writing, when each is still the installer's own file;
 //! - deleting the running `rocm.exe` on Windows, which cannot unlink itself.
 
 use std::ffi::OsString;
@@ -30,8 +30,8 @@ use crate::uninstall_plan::{
 /// The file, next to the installed binaries, in which `install.sh` and
 /// `install.ps1` record the PATH change they made, one per line:
 /// `profile <shell profile>`, `path-expr <how the block spells the folder>`,
-/// and `completions <fish completion script>` from `install.sh`,
-/// `user-path <dir>` from `install.ps1`.
+/// `completions <fish completion script>` and `man <manual page>` from
+/// `install.sh`, `user-path <dir>` from `install.ps1`.
 pub(crate) const PATH_EDIT_RECORD: &str = ".rocm-cli-path-edit";
 
 const PROFILE_BLOCK_START: &str = "# >>> rocm-cli path >>>";
@@ -115,8 +115,8 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
 /// the record of the change are all still there to retry with. Then the
 /// config, data, and cache go, while `rocm` is still there to retry a failure
 /// with; then the binaries, and the record only once every change is undone.
-/// A fish completion script that cannot be removed is reported as a warning
-/// and the rest goes on.
+/// A fish completion script or manual page that cannot be removed is reported
+/// as a warning and the rest goes on.
 fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<()> {
     for edit in &plan.path_edits {
         match apply_path_edit(edit) {
@@ -133,9 +133,11 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
     let non_binaries = plan.actions.iter().filter(|entry| !is_binary(entry.kind));
     let binaries = plan.actions.iter().filter(|entry| is_binary(entry.kind));
     for entry in non_binaries.chain(binaries) {
-        // The review may have sat at a prompt, so a completion script is
-        // looked at again: only the regular file that was planned is removed.
-        if entry.kind == SHELL_COMPLETIONS_KIND && is_not_a_regular_file(&entry.path) {
+        let installer_file = installer_file(entry.kind);
+        // The review may have sat at a prompt, so a completion script or
+        // manual page is looked at again: only the regular file that was
+        // planned is removed.
+        if installer_file.is_some() && is_not_a_regular_file(&entry.path) {
             report(format!(
                 "warning: left {} {} in place: it is no longer the regular file that was \
                  reviewed",
@@ -144,18 +146,18 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
             ));
             continue;
         }
-        match remove_path(&entry.path) {
-            Ok(()) => report(format!("removed {} {}", entry.kind, entry.path.display())),
-            // Completions are best effort when installed, so a script that
-            // cannot be removed does not stop the uninstall either.
-            Err(error) if entry.kind == SHELL_COMPLETIONS_KIND => report(format!(
+        match (remove_path(&entry.path), installer_file) {
+            (Ok(()), _) => report(format!("removed {} {}", entry.kind, entry.path.display())),
+            // Completions and the manual page are best effort when installed,
+            // so one that cannot be removed does not stop the uninstall either.
+            (Err(error), Some(file)) => report(format!(
                 "warning: could not remove {} {}: {error:#}\n  \
-                 The uninstall went on without it; delete that file yourself so fish \
-                 stops completing rocm.",
+                 The uninstall went on without it; delete that file yourself {}.",
                 entry.kind,
-                entry.path.display()
+                entry.path.display(),
+                file.left_behind
             )),
-            Err(error) => {
+            (Err(error), None) => {
                 return Err(error)
                     .with_context(|| format!("failed to remove {}", entry.path.display()));
             }
@@ -217,7 +219,7 @@ pub(crate) fn render_extra_plan(output: &mut String, plan: &UninstallPlan) {
 
 /// Plan undoing the PATH change the installer made for `bin_dir`, the folder
 /// whose ROCm CLI entries `removed` lists, and (on Linux) removing the fish
-/// completion script it recorded writing for them.
+/// completion script and manual page it recorded writing for them.
 ///
 /// Only a change the installer recorded (or the shell-profile block it marks as
 /// its own) is undone, never a PATH line the user wrote. And it is left in place
@@ -270,7 +272,7 @@ pub(crate) fn plan_path_edits(
             ));
         }
     } else {
-        if plan_completion_removals(plan, &entries, bin_dir) {
+        if plan_installer_file_removals(plan, &entries, bin_dir) {
             unreadable = true;
         }
         let mut path_exprs = profile_path_exprs(bin_dir, home);
@@ -373,50 +375,113 @@ pub(crate) fn plan_path_edits(
 /// completions as best effort, so uninstall does too.
 pub(crate) const SHELL_COMPLETIONS_KIND: &str = "shell completions";
 
+/// The plan entry kind for the manual page `install.sh` wrote. Best effort, as
+/// for completions.
+pub(crate) const MANUAL_PAGE_KIND: &str = "manual page";
+
 /// The first line of the fish completion script `install.sh` writes, followed
 /// by the folder it installed into. Kept in step with `FISH_COMPLETIONS_MARKER`
 /// in `install.sh`, which a test below checks.
 const FISH_COMPLETIONS_MARKER: &[u8] = b"# rocm-cli fish completions for ";
 
-/// Plan removing the fish completion scripts `install.sh` recorded writing.
+/// The first line of the manual page `install.sh` writes, a roff comment
+/// followed by the folder it installed into. Kept in step with
+/// `MAN_PAGE_MARKER` in `install.sh`, which a test below checks.
+const MAN_PAGE_MARKER: &[u8] = b".\\\" rocm-cli manual page for ";
+
+/// A file `install.sh` writes outside the install folder for the binaries in
+/// it, and records in [`PATH_EDIT_RECORD`] so uninstall can remove it.
+struct InstallerFile {
+    /// The kind of its line in the record.
+    record_kind: &'static str,
+    /// The kind of its entry in the plan.
+    plan_kind: &'static str,
+    /// What the review calls it.
+    noun: &'static str,
+    /// The folder name and file name its recorded path must end in.
+    parent: &'static str,
+    file_name: &'static str,
+    /// Its first line, before the install folder.
+    marker: &'static [u8],
+    /// Why to delete it by hand when it cannot be removed.
+    left_behind: &'static str,
+}
+
+const INSTALLER_FILES: [InstallerFile; 2] = [
+    InstallerFile {
+        record_kind: "completions",
+        plan_kind: SHELL_COMPLETIONS_KIND,
+        noun: "fish completions",
+        parent: "completions",
+        file_name: "rocm.fish",
+        marker: FISH_COMPLETIONS_MARKER,
+        left_behind: "so fish stops completing rocm",
+    },
+    InstallerFile {
+        record_kind: "man",
+        plan_kind: MANUAL_PAGE_KIND,
+        noun: "manual page",
+        parent: "man1",
+        file_name: "rocm.1",
+        marker: MAN_PAGE_MARKER,
+        left_behind: "so `man rocm` stops showing a page for a rocm that is gone",
+    },
+];
+
+/// The installer file whose plan entries are of `plan_kind`, if any.
+fn installer_file(plan_kind: &str) -> Option<&'static InstallerFile> {
+    INSTALLER_FILES
+        .iter()
+        .find(|file| file.plan_kind == plan_kind)
+}
+
+/// Plan removing the files outside the install folder that `install.sh`
+/// recorded writing for its binaries: the fish completion script and the
+/// manual page.
 ///
 /// They only describe the binaries being removed, so they go with them even
-/// when the PATH change stays for other programs in the folder. `rocm.fish` is
-/// one fixed path that the user, or another install folder, may have written
-/// since, so a script is removed only when it is still a regular file whose
-/// first line is the installer's marker naming `bin_dir`. Any other script the
+/// when the PATH change stays for other programs in the folder. Each is one
+/// fixed path that the user, or another install folder, may have written
+/// since, so a file is removed only when it is still a regular file whose
+/// first line is the installer's marker naming `bin_dir`. Any other file the
 /// record names is left in place, and the review says why.
 ///
-/// Returns whether a script could not be checked, in which case the record has
+/// Returns whether a file could not be checked, in which case the record has
 /// to outlive this uninstall so a later one can look again.
-fn plan_completion_removals(
+fn plan_installer_file_removals(
     plan: &mut UninstallPlan,
     entries: &[(&str, OsString)],
     bin_dir: &Path,
 ) -> bool {
-    plan_completion_removals_with(plan, entries, bin_dir, fish_completions_owner)
+    plan_installer_file_removals_with(plan, entries, bin_dir, installer_marker_owner)
 }
 
-/// [`plan_completion_removals`] with the reading of a script's marker line
-/// supplied, so a script that cannot be read is testable without relying on
+/// [`plan_installer_file_removals`] with the reading of a file's marker line
+/// supplied, so a file that cannot be read is testable without relying on
 /// file permissions, which root ignores.
-fn plan_completion_removals_with(
+fn plan_installer_file_removals_with(
     plan: &mut UninstallPlan,
     entries: &[(&str, OsString)],
     bin_dir: &Path,
-    read_owner: impl Fn(&Path) -> std::io::Result<Option<PathBuf>>,
+    read_owner: impl Fn(&Path, &[u8]) -> std::io::Result<Option<PathBuf>>,
 ) -> bool {
     let mut unchecked = false;
     for (kind, target) in entries {
-        if *kind != "completions" {
+        let Some(file) = INSTALLER_FILES
+            .iter()
+            .find(|file| file.record_kind == *kind)
+        else {
             continue;
-        }
+        };
+        let noun = file.noun;
         let path = PathBuf::from(target);
-        if !is_recorded_fish_script(&path) {
+        if !is_recorded_installer_path(&path, file) {
             plan.skipped.push(format!(
-                "the install record names {} as fish completions, which is not an absolute \
-                 path ending in completions/rocm.fish without `..`, so it is left in place",
-                path.display()
+                "the install record names {} as {noun}, which is not an absolute path ending \
+                 in {}/{} without `..`, so it is left in place",
+                path.display(),
+                file.parent,
+                file.file_name
             ));
             continue;
         }
@@ -436,36 +501,36 @@ fn plan_completion_removals_with(
         };
         if meta.file_type().is_symlink() {
             plan.skipped.push(format!(
-                "fish completions {} left in place: it is a link, and the installer writes a file",
+                "{noun} {} left in place: it is a link, and the installer writes a file",
                 path.display()
             ));
             continue;
         }
         if !meta.is_file() {
             plan.skipped.push(format!(
-                "fish completions {} left in place: it is not a regular file, and the installer \
-                 writes a file",
+                "{noun} {} left in place: it is not a regular file, and the installer writes \
+                 a file",
                 path.display()
             ));
             continue;
         }
-        match read_owner(&path) {
+        match read_owner(&path, file.marker) {
             Ok(Some(owner)) if same_folder(&owner, bin_dir) => {
                 plan.actions.push(UninstallPlanEntry {
-                    kind: SHELL_COMPLETIONS_KIND,
+                    kind: file.plan_kind,
                     path,
                 });
             }
             Ok(Some(owner)) => plan.skipped.push(format!(
-                "fish completions {} left in place: the rocm-cli install in {} wrote it, not \
-                 this one in {}",
+                "{noun} {} left in place: the rocm-cli install in {} wrote it, not this one \
+                 in {}",
                 path.display(),
                 owner.display(),
                 bin_dir.display()
             )),
             Ok(None) => plan.skipped.push(format!(
-                "fish completions {} left in place: it does not start with the rocm-cli \
-                 installer's marker, so the installer did not write it",
+                "{noun} {} left in place: it does not start with the rocm-cli installer's \
+                 marker, so the installer did not write it",
                 path.display()
             )),
             Err(error) => {
@@ -488,32 +553,33 @@ fn is_not_a_regular_file(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Ok(meta) if !meta.is_file())
 }
 
-/// Whether a `completions` line in the record names a path `install.sh`
-/// writes: absolute, with no `..`, and ending in `completions/rocm.fish`. The
-/// record sits in a user-writable folder, so a line naming anything else is not
-/// one the installer wrote.
-fn is_recorded_fish_script(path: &Path) -> bool {
+/// Whether a record line names a path `install.sh` writes for `file`:
+/// absolute, with no `..`, and ending in its folder and file name
+/// (`completions/rocm.fish`, `man1/rocm.1`). The record sits in a
+/// user-writable folder, so a line naming anything else is not one the
+/// installer wrote.
+fn is_recorded_installer_path(path: &Path, file: &InstallerFile) -> bool {
     path.is_absolute()
         && !path
             .components()
             .any(|part| part == std::path::Component::ParentDir)
-        && path.file_name().is_some_and(|name| name == "rocm.fish")
+        && path.file_name().is_some_and(|name| name == file.file_name)
         && path
             .parent()
             .and_then(Path::file_name)
-            .is_some_and(|name| name == "completions")
+            .is_some_and(|name| name == file.parent)
 }
 
-/// The install folder named by the marker on the first line of `path`, or
+/// The install folder named by `marker` on the first line of `path`, or
 /// `None` when that line is not the installer's marker.
-fn fish_completions_owner(path: &Path) -> std::io::Result<Option<PathBuf>> {
+fn installer_marker_owner(path: &Path, marker: &[u8]) -> std::io::Result<Option<PathBuf>> {
     use std::io::{BufRead as _, BufReader};
     let mut first = Vec::new();
     BufReader::new(fs::File::open(path)?).read_until(b'\n', &mut first)?;
     let line = first.strip_suffix(b"\n").unwrap_or(&first);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     Ok(line
-        .strip_prefix(FISH_COMPLETIONS_MARKER)
+        .strip_prefix(marker)
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(os_string_from_bytes(dir))))
 }
@@ -1456,21 +1522,23 @@ mod tests {
         }
 
         /// `--keep-binaries` keeps the installer's PATH change, its fish
-        /// completions, and its record with the binaries, and says so. Run
-        /// against an installed folder that holds all of them, so the same plan
-        /// without the flag would remove them.
+        /// completions, its manual page, and its record with the binaries, and
+        /// says so. Run against an installed folder that holds all of them, so
+        /// the same plan without the flag would remove them.
         #[test]
         fn keeping_the_binaries_keeps_the_path_change_and_says_so() -> Result<()> {
             let layout = layout()?;
             let profile = layout.home.join(".bashrc");
             fs::write(&profile, POSIX_BLOCK)?;
             let completions = fish_completions(&layout)?;
+            let page = man_page(&layout)?;
             let record = record(
                 &layout,
                 &format!(
-                    "profile {}\ncompletions {}\n",
+                    "profile {}\ncompletions {}\nman {}\n",
                     profile.display(),
-                    completions.display()
+                    completions.display(),
+                    page.display()
                 ),
             )?;
             let plan_with = |keep_binaries| -> Result<UninstallPlan> {
@@ -1496,6 +1564,7 @@ mod tests {
                 vec![completions.clone()],
                 "{plan:?}"
             );
+            assert_eq!(man_actions(&plan), vec![page.clone()], "{plan:?}");
 
             let plan = plan_with(true)?;
             assert!(
@@ -1508,12 +1577,13 @@ mod tests {
                     .iter()
                     .any(|note| note.contains("--keep-binaries")
                         && note.contains(
-                            "PATH change and fish completions the installer made stay too"
+                            "any PATH change, fish completions and manual page the installer \
+                             made stay too"
                         )),
                 "{plan:?}"
             );
-            // Carrying the plan out leaves the change, the completions, their
-            // record, and the binaries where they are.
+            // Carrying the plan out leaves the change, the completions, the
+            // manual page, their record, and the binaries where they are.
             run(&plan).1?;
             assert_eq!(fs::read_to_string(&profile)?, POSIX_BLOCK);
             assert!(record.exists() && layout.removed.iter().all(|path| path.exists()));
@@ -1521,6 +1591,7 @@ mod tests {
                 completions.exists(),
                 "the completions stay with the binaries"
             );
+            assert!(page.exists(), "the manual page stays with the binaries");
             Ok(())
         }
 
@@ -1753,9 +1824,11 @@ mod tests {
         /// directly.
         #[test]
         fn only_an_absolute_completions_rocm_fish_path_is_the_installers() {
-            assert!(is_recorded_fish_script(Path::new(
-                "/home/me/.config/fish/completions/rocm.fish"
-            )));
+            let fish = &INSTALLER_FILES[0];
+            assert!(is_recorded_installer_path(
+                Path::new("/home/me/.config/fish/completions/rocm.fish"),
+                fish
+            ));
             for path in [
                 ".config/fish/completions/rocm.fish",
                 "completions/rocm.fish",
@@ -1763,7 +1836,21 @@ mod tests {
                 "/home/me/.config/fish/completions/other.fish",
                 "/home/me/.config/fish/rocm.fish",
             ] {
-                assert!(!is_recorded_fish_script(Path::new(path)), "{path}");
+                assert!(!is_recorded_installer_path(Path::new(path), fish), "{path}");
+            }
+            let man = &INSTALLER_FILES[1];
+            assert!(is_recorded_installer_path(
+                Path::new("/home/me/.local/share/man/man1/rocm.1"),
+                man
+            ));
+            for path in [
+                ".local/share/man/man1/rocm.1",
+                "/home/me/.local/share/man/man1/../man1/rocm.1",
+                "/home/me/.local/share/man/man1/rocm.fish",
+                "/home/me/.local/share/man/man8/rocm.1",
+                "/home/me/.config/fish/completions/rocm.fish",
+            ] {
+                assert!(!is_recorded_installer_path(Path::new(path), man), "{path}");
             }
         }
 
@@ -1865,9 +1952,10 @@ mod tests {
             let script = fish_completions(&layout)?;
             let entries = vec![("completions", script.clone().into_os_string())];
             let mut plan = UninstallPlan::default();
-            let unchecked = plan_completion_removals_with(&mut plan, &entries, &layout.bin, |_| {
-                Err(std::io::Error::other("no access"))
-            });
+            let unchecked =
+                plan_installer_file_removals_with(&mut plan, &entries, &layout.bin, |_, _| {
+                    Err(std::io::Error::other("no access"))
+                });
             assert!(unchecked, "{plan:?}");
             assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
             assert_eq!(
@@ -1988,6 +2076,327 @@ mod tests {
             Ok(())
         }
 
+        /// The manual page `install.sh` writes for the install in `bin`: its
+        /// marker line naming that folder, then the page.
+        fn marked_page(bin: &Path) -> String {
+            format!(
+                "{}{}\n.TH ROCM 1\n",
+                String::from_utf8_lossy(MAN_PAGE_MARKER),
+                bin.display()
+            )
+        }
+
+        /// Where `install.sh` writes the manual page under `layout`'s home,
+        /// written there as it writes it.
+        fn man_page(layout: &Layout) -> Result<PathBuf> {
+            let path = layout
+                .home
+                .join(".local")
+                .join("share")
+                .join("man")
+                .join("man1")
+                .join("rocm.1");
+            write_script(&path, &marked_page(&layout.bin))?;
+            Ok(path)
+        }
+
+        fn man_actions(plan: &UninstallPlan) -> Vec<PathBuf> {
+            plan.actions
+                .iter()
+                .filter(|entry| entry.kind == MANUAL_PAGE_KIND)
+                .map(|entry| entry.path.clone())
+                .collect()
+        }
+
+        fn man_record(layout: &Layout, page: &Path) -> Result<PathBuf> {
+            record(layout, &format!("man {}\n", page.display()))
+        }
+
+        /// The plan for `layout` with its binaries, after checking that planning
+        /// itself chose no manual page to remove.
+        fn binaries_with_man_planned_for_none(layout: &Layout) -> UninstallPlan {
+            let planned = plan_for(layout);
+            assert_eq!(man_actions(&planned), Vec::<PathBuf>::new(), "{planned:?}");
+            with_binaries(layout, planned)
+        }
+
+        #[test]
+        fn a_recorded_manual_page_is_removed_with_the_binaries() -> Result<()> {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            let record = man_record(&layout, &page)?;
+            let mut plan = with_binaries(&layout, UninstallPlan::default());
+            plan_path_edits(&mut plan, &layout.bin, &layout.removed, Some(&layout.home));
+            assert_eq!(man_actions(&plan), vec![page.clone()], "{plan:?}");
+
+            let (lines, result) = run(&plan);
+            result?;
+            assert!(!page.exists(), "the manual page is gone");
+            assert!(
+                page.parent().is_some_and(Path::exists),
+                "only the page goes, not the user's man1 folder"
+            );
+            assert!(!record.exists() && !layout.removed[0].exists());
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line == &format!("removed manual page {}", page.display())),
+                "{lines:?}"
+            );
+            Ok(())
+        }
+
+        /// A page the installer did not write stays, and the review says why.
+        #[test]
+        fn a_manual_page_without_the_marker_is_left_in_place_and_the_review_says_so() -> Result<()>
+        {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            fs::write(&page, ".TH ROCM 1\n")?;
+            man_record(&layout, &page)?;
+            let plan = binaries_with_man_planned_for_none(&layout);
+            assert!(
+                plan.skipped.iter().any(|note| note
+                    == &format!(
+                        "manual page {} left in place: it does not start with the rocm-cli \
+                         installer's marker, so the installer did not write it",
+                        page.display()
+                    )),
+                "{plan:?}"
+            );
+            run(&plan).1?;
+            assert_eq!(fs::read_to_string(&page)?, ".TH ROCM 1\n");
+            Ok(())
+        }
+
+        /// A fish completion script's marker does not pass for the manual
+        /// page's.
+        #[test]
+        fn a_manual_page_carrying_the_completions_marker_is_not_the_installers() -> Result<()> {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            fs::write(&page, marked_script(&layout.bin))?;
+            man_record(&layout, &page)?;
+            let plan = binaries_with_man_planned_for_none(&layout);
+            run(&plan).1?;
+            assert!(page.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn a_manual_page_another_install_folder_wrote_is_left_in_place() -> Result<()> {
+            let layout = layout()?;
+            let other_bin = layout.home.join("other-bin");
+            fs::create_dir_all(&other_bin)?;
+            let page = man_page(&layout)?;
+            fs::write(&page, marked_page(&other_bin))?;
+            man_record(&layout, &page)?;
+            let plan = binaries_with_man_planned_for_none(&layout);
+            assert!(
+                plan.skipped.iter().any(|note| note
+                    == &format!(
+                        "manual page {} left in place: the rocm-cli install in {} wrote it, \
+                         not this one in {}",
+                        page.display(),
+                        other_bin.display(),
+                        layout.bin.display()
+                    )),
+                "{plan:?}"
+            );
+            run(&plan).1?;
+            assert_eq!(fs::read_to_string(&page)?, marked_page(&other_bin));
+            Ok(())
+        }
+
+        #[test]
+        fn a_linked_manual_page_is_left_in_place() -> Result<()> {
+            let layout = layout()?;
+            let target = layout.home.join("dotfiles").join("rocm.1");
+            write_script(&target, &marked_page(&layout.bin))?;
+            let page = man_page(&layout)?;
+            fs::remove_file(&page)?;
+            std::os::unix::fs::symlink(&target, &page)?;
+            man_record(&layout, &page)?;
+            let plan = binaries_with_man_planned_for_none(&layout);
+            assert!(
+                plan.skipped.iter().any(|note| note
+                    == &format!(
+                        "manual page {} left in place: it is a link, and the installer writes \
+                         a file",
+                        page.display()
+                    )),
+                "{plan:?}"
+            );
+            run(&plan).1?;
+            assert!(fs::symlink_metadata(&page)?.is_symlink(), "the link stays");
+            assert!(target.exists(), "what the link points at stays");
+            Ok(())
+        }
+
+        /// Every page below carries this install's marker, so what stops each
+        /// one is the check on the recorded path.
+        #[test]
+        fn a_man_line_naming_another_file_is_not_trusted() -> Result<()> {
+            let layout = layout()?;
+            let marked = marked_page(&layout.bin);
+            let other_name = layout.home.join("man1").join("other.1");
+            write_script(&other_name, &marked)?;
+            let other_section = layout.home.join("man8").join("rocm.1");
+            write_script(&other_section, &marked)?;
+            let dotted = layout
+                .home
+                .join("man1")
+                .join("..")
+                .join("man1")
+                .join("rocm.1");
+            write_script(&layout.home.join("man1").join("rocm.1"), &marked)?;
+            record(
+                &layout,
+                &format!(
+                    "man {}\nman {}\nman {}\n",
+                    other_name.display(),
+                    other_section.display(),
+                    dotted.display()
+                ),
+            )?;
+            let plan = binaries_with_man_planned_for_none(&layout);
+            for refused in [&other_name, &other_section, &dotted] {
+                assert!(
+                    plan.skipped.iter().any(|note| note
+                        == &format!(
+                            "the install record names {} as manual page, which is not an \
+                             absolute path ending in man1/rocm.1 without `..`, so it is left \
+                             in place",
+                            refused.display()
+                        )),
+                    "{refused:?}: {plan:?}"
+                );
+            }
+            run(&plan).1?;
+            assert!(other_name.exists() && other_section.exists());
+            assert!(layout.home.join("man1").join("rocm.1").exists());
+            Ok(())
+        }
+
+        /// A page that cannot be checked is left in place with a warning, and
+        /// the install record stays so a later uninstall can look again.
+        #[test]
+        fn a_manual_page_that_cannot_be_checked_is_left_and_keeps_the_record() -> Result<()> {
+            let layout = layout()?;
+            let blocker = layout.home.join("afile");
+            fs::write(&blocker, "")?;
+            let page = blocker.join("man1").join("rocm.1");
+            let record = man_record(&layout, &page)?;
+            let plan = binaries_with_man_planned_for_none(&layout);
+            assert!(
+                plan.warnings.iter().any(|note| note.starts_with(&format!(
+                    "could not look at {} to check that the installer wrote it, so it is left \
+                     in place: ",
+                    page.display()
+                ))),
+                "{plan:?}"
+            );
+            assert_eq!(
+                plan.path_record, None,
+                "the record must outlive this uninstall"
+            );
+            run(&plan).1?;
+            assert!(record.exists(), "the record stays for a later uninstall");
+            Ok(())
+        }
+
+        /// The same for a page whose first line cannot be read, which no file
+        /// permission can stage for root, so the reader is supplied. It is
+        /// asked for the manual page's marker, not the completions'.
+        #[test]
+        fn a_manual_page_whose_marker_cannot_be_read_stays_and_keeps_the_record() -> Result<()> {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            let entries = vec![("man", page.clone().into_os_string())];
+            let mut plan = UninstallPlan::default();
+            let unchecked =
+                plan_installer_file_removals_with(&mut plan, &entries, &layout.bin, |_, marker| {
+                    assert_eq!(marker, MAN_PAGE_MARKER);
+                    Err(std::io::Error::other("no access"))
+                });
+            assert!(unchecked, "{plan:?}");
+            assert_eq!(man_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+            assert_eq!(
+                plan.warnings,
+                vec![format!(
+                    "could not read {} to check that the installer wrote it, so it is left in \
+                     place; delete it yourself if you no longer want it: no access",
+                    page.display()
+                )]
+            );
+            assert!(page.exists());
+            Ok(())
+        }
+
+        /// The installer treats the manual page as best effort, so one that
+        /// cannot be removed is a warning saying what to do: the binaries and
+        /// the record still go, and the uninstall reports success.
+        #[test]
+        fn a_manual_page_that_cannot_be_removed_is_a_warning_and_the_rest_goes_on() -> Result<()> {
+            let layout = layout()?;
+            let record = record(&layout, "")?;
+            let mut plan = with_binaries(&layout, plan_for(&layout));
+            plan.path_record = Some(record.clone());
+            // A name too long for any filesystem fails to remove, even for root.
+            let stuck = layout.home.join("x".repeat(300));
+            plan.actions.insert(
+                0,
+                crate::uninstall_plan::UninstallPlanEntry {
+                    kind: MANUAL_PAGE_KIND,
+                    path: stuck.clone(),
+                },
+            );
+
+            let (lines, result) = run(&plan);
+            result?;
+            let warning = format!(
+                "warning: could not remove manual page {}: ",
+                stuck.display()
+            );
+            assert!(
+                lines.iter().any(|line| line.starts_with(&warning)
+                    && line.contains(
+                        "The uninstall went on without it; delete that file yourself so \
+                         `man rocm` stops showing a page for a rocm that is gone."
+                    )),
+                "{lines:?}"
+            );
+            assert!(layout.removed.iter().all(|path| !path.exists()));
+            assert!(!record.exists(), "the record still goes last");
+            Ok(())
+        }
+
+        /// A page swapped for a folder after the review is left alone.
+        #[test]
+        fn a_manual_page_swapped_for_a_folder_after_the_review_is_left_alone() -> Result<()> {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            man_record(&layout, &page)?;
+            let plan = plan_for(&layout);
+            assert_eq!(man_actions(&plan), vec![page.clone()], "{plan:?}");
+            fs::remove_file(&page)?;
+            fs::create_dir_all(page.join("precious"))?;
+
+            let (lines, result) = run(&plan);
+            result?;
+            assert!(page.join("precious").exists(), "the folder was removed");
+            assert!(
+                lines.iter().any(|line| line
+                    == &format!(
+                        "warning: left manual page {} in place: it is no longer the regular \
+                         file that was reviewed",
+                        page.display()
+                    )),
+                "{lines:?}"
+            );
+            Ok(())
+        }
+
         #[test]
         fn a_record_from_before_completions_were_recorded_still_undoes_the_path_change()
         -> Result<()> {
@@ -2023,6 +2432,17 @@ mod tests {
         assert!(
             installer.contains(&format!("FISH_COMPLETIONS_MARKER='{marker}'")),
             "install.sh no longer writes {marker:?} as its fish completions marker"
+        );
+    }
+
+    /// `install.sh` writes the manual page marker this module looks for.
+    #[test]
+    fn the_installer_writes_the_manual_page_marker_uninstall_reads() {
+        let installer = include_str!("../../../install.sh");
+        let marker = std::str::from_utf8(MAN_PAGE_MARKER).expect("ASCII");
+        assert!(
+            installer.contains(&format!("MAN_PAGE_MARKER='{marker}'")),
+            "install.sh no longer writes {marker:?} as its manual page marker"
         );
     }
 }

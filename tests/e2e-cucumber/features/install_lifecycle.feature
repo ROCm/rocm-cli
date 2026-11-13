@@ -134,6 +134,7 @@ Feature: Release install lifecycle
     And the install manifest is gone
     And the isolated XDG config, data, and cache state is gone
     And the shell profile is back to the user's own settings
+    And the rocm manual page is gone
     And the record of the installer's PATH change is gone
 
   # ── Windows user-PATH restoration, loopback HTTP install, isolated smoke ─
@@ -309,7 +310,7 @@ Feature: Release install lifecycle
     And the record of the installer's PATH change is gone
 
   @id:lifecycle-linux-uninstall-keep-binaries-keeps-path @lifecycle @requires-os:linux
-  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change and the fish completions
+  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change, the fish completions and the manual page
     Given a freshly built release tree
     And a generated signing keypair
     And the login shell is bash
@@ -322,6 +323,7 @@ Feature: Release install lifecycle
     And the installed rocm and rocmd binaries are present
     And the shell profile still adds the install directory to PATH
     And the fish completions are still in place
+    And the rocm manual page is still in place
     And the record of the installer's PATH change is still in the install directory
 
   @id:lifecycle-linux-uninstall-path-failure-keeps-binaries @lifecycle @requires-os:linux
@@ -468,3 +470,40 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the installed rocm and rocmd binaries are gone
     And the user's own fish completions are untouched
+
+  # The manual page lands in share/man/man1 under the folder above the install
+  # directory, where man-db looks for the pages of any folder on PATH. The
+  # lookup runs with MANPATH unset and PATH holding only the install directory
+  # and the system folders, as in a new terminal after the install.
+  @id:lifecycle-linux-man-page-installed-and-removed @lifecycle @requires-os:linux
+  Scenario: lifecycle-36 - Linux - man rocm shows the installed rocm's manual, and uninstall removes it
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the shell profile updated
+    Then the installer reports the manual page and suggests man rocm
+    And man rocm in a new terminal shows the installed rocm's manual
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the rocm manual page is gone
+    And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-man-page-not-ours-left-alone @lifecycle @requires-os:linux
+  Scenario: lifecycle-37 - Linux - the installer leaves a rocm manual page it did not write, says so, and uninstall leaves it too
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the user already has their own rocm manual page
+    And a signed bundle installed with the shell profile updated
+    Then the installer leaves the user's own manual page and says why
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the user's own manual page is untouched
+
+  @id:lifecycle-linux-man-page-replaced-kept @lifecycle @requires-os:linux
+  Scenario: lifecycle-38 - Linux - uninstall leaves a manual page the user wrote over the installer's, and says so
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the shell profile updated
+    And the user has replaced the rocm manual page with their own
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And uninstall leaves the user's own manual page in place and says why

@@ -3364,9 +3364,9 @@ The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
 
-Fish profile setup in `install.sh` is covered on its own by
-[`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script signs a
-local bundle, points the installer at a temporary home, and checks:
+Fish profile setup and the manual page in `install.sh` are covered on their
+own by [`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script
+signs a local bundle, points the installer at a temporary home, and checks:
 
 - a bash, zsh, or ksh login shell still updates its own profile and, with
   `fish` on `PATH`, also writes the fish `PATH` block and records both
@@ -3391,11 +3391,37 @@ local bundle, points the installer at a temporary home, and checks:
 - a `rocm` that cannot print completions, or prints nothing, leaves the install
   and the `PATH` block in place with a note. The stub fails only once, as a
   failure that clears by itself would, and the printed lines, run as printed
-  from a bare environment in a home whose name holds a space, then create the
-  file; `rocm` is never handed the installer's stdin;
+  from a bare environment in a home whose name holds a space and a quote, then
+  create the file; `rocm` is never handed the installer's stdin;
 - a profile that cannot be created is reported rather than claimed as updated,
   and not recorded; as a non-root user only, so is one that cannot be written,
-  under both `sh` and `bash`.
+  under both `sh` and `bash`;
+- the manual page, written to `share/man/man1/rocm.1` in the folder above the
+  install folder with the marker line naming the install folder (mode 0644),
+  its `man` record line, the `manual page installed:` report and the
+  `man rocm` hint; when the host has `man`, `man -w rocm` with `MANPATH` unset
+  and only the install folder and the system folders on `PATH` finds it there
+  (man-db derives `<dir>/../share/man` from each `PATH` folder), and the
+  script prints `not checked` otherwise;
+- a reinstall replaces its own page and adds no second `man` record line, and
+  one an earlier install folder wrote is replaced and recorded;
+- a `rocm.1` that is already there and was not written by the installer (a
+  file, a link, a link whose target carries the marker, a dangling link) is
+  left exactly as it is, not recorded, with a note;
+- `ROCM_CLI_UPDATE_SHELL_PATH=0` still installs and records the page, without
+  the `man rocm` hint, and a relative install folder skips it with a note;
+- a `rocm` that cannot print the page, or prints nothing, leaves the install
+  in place with a note and no page or record line, and the printed lines, run
+  as printed from a bare environment in a home whose name holds a space and a
+  quote, write the page the installer would have, marker included, so the
+  next install takes it as its own and records it;
+- a `rocm` that prints something other than a page and exits 0, as one built
+  before `__man-page` existed prints a request plan, gets a note that this
+  version of rocm does not provide a page, with no page, record line, retry
+  lines or `man rocm` hint;
+- a profile that cannot be created still gets the page, but not the
+  `man rocm` hint, since a new terminal would not have the install folder on
+  `PATH` for `man` to find it.
 
 It needs no network or GPU. Set `INSTALL_SH` to run it against another copy of
 the installer. The Linux `build-and-test` job runs it when the change touches
@@ -3417,8 +3443,27 @@ of the uninstall still happens, and
 the installer leaves a `rocm.fish` it did not write, says so, and uninstall
 leaves it too. lifecycle-34 makes the `completions` folder read-only, so it
 needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path`
-(lifecycle-25) also seeds fish and checks the completions stay with
-`--keep-binaries`.
+(lifecycle-25) also seeds fish and checks the completions and the manual page
+stay with `--keep-binaries`, and `@id:lifecycle-linux-uninstall-full-purge`
+(lifecycle-09) that a full uninstall removes the manual page.
+
+The installed manual page has three scenarios of its own.
+`@id:lifecycle-linux-man-page-installed-and-removed` (lifecycle-36) checks that
+the installer reports the page and suggests `man rocm`, that `man rocm` and
+`man -w rocm`, run with `MANPATH` unset and `PATH` holding only the install
+folder and `/usr/bin:/bin`, show the installed rocm's page from
+`<install folder>/../share/man/man1`, and that uninstall removes it with its
+record. `@id:lifecycle-linux-man-page-not-ours-left-alone` (lifecycle-37)
+checks that a `rocm.1` the user already had is left alone, with the
+installer's note, and that uninstall leaves it too.
+`@id:lifecycle-linux-man-page-replaced-kept` (lifecycle-38) checks that
+uninstall leaves a recorded `rocm.1` the user wrote over the installer's, and
+says why. lifecycle-36 needs `man`
+(man-db) on the runner, and relies on man-db finding pages through `PATH`; it
+fails, rather than skips, without it, which is why the `build-and-test` job that
+runs the Linux lifecycle scenarios installs `man-db`. lifecycle-37 and
+lifecycle-38 read only files and run no `man`. The page's content against the binary is
+`manual-page-01` and `manual-page-02` below.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
@@ -3454,7 +3499,7 @@ Linux writes the shell profile); reinstall stale-manifest purge and config
 preservation; a Windows loopback-HTTP install; isolated installed-binary
 directory smoke checks (`rocm examine` must read only the isolated
 config/data/cache, never the real user `.rocm` state); and uninstall: a full
-purge that also restores the shell profile, the Windows user `PATH` taken back
+purge that also restores the shell profile and removes the manual page, the Windows user `PATH` taken back
 off with its other entries and its registry type kept, the `PATH` change kept while another program shares the install folder or
 with `--keep-binaries`, a `PATH` change that cannot be undone removing nothing
 so it can be retried, a profile and install-folder spelling found only through
@@ -3651,6 +3696,36 @@ toolchain, so install the runtime with `rocm install sdk --devel` (see
 [vllm.md](vllm.md)).
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
+
+## Manual page
+
+`rocm __man-page`, the hidden verb the Linux installer runs, prints the rocm(1)
+page as roff. The unit tests in [man_page.rs](../apps/rocm/src/man_page.rs)
+check the roff: the COMMANDS list is the visible top-level commands, every
+example parses, the exit codes are the ones clap and `rocm fix` use, and no
+other `rocm-*` page is referred to. The `manual-page-NN` E2E scenarios
+([manual_page.feature](../tests/e2e-cucumber/features/manual_page.feature), Linux only, default mock lane) read the page
+the binary under test prints, from its roff source: each entry's term is the
+line after its `.TP`, with roff's font and character escapes decoded, and an
+escape the step does not know fails it rather than passing through. They need
+nothing on the runner but the binary, so they run on every Linux lane,
+self-hosted ones included, whether or not it has `man`:
+
+- `@id:manual-page-lists-the-commands` (manual-page-01) compares the commands
+  the page lists with the ones `rocm --help` lists, without clap's
+  `help`, so a command added to the CLI cannot be missing from the page and a
+  hidden one cannot appear on it;
+- `@id:manual-page-examples-are-accepted` (manual-page-02) runs every example
+  the page gives with `--help` appended and expects exit 0, so an
+  example naming a command or flag that does not exist fails.
+
+Where the installer puts the page, and that `man rocm` finds and shows it, is
+lifecycle-36 above; that a `rocm.1` the installer did not write is left alone
+is lifecycle-37 and lifecycle-38.
+
+```bash
+cargo xtask e2e -- -n "manual-page-"
+```
 
 ## The Serve Reuse Exemption From The No-GPU Refusal
 

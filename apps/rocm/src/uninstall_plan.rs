@@ -198,8 +198,9 @@ pub(crate) fn build_uninstall_plan(
 
 /// Plan removing the installed binaries beside the running one, which
 /// `current_exe` names, undoing the installer's PATH change for their folder,
-/// and removing the fish completion script it recorded writing for them.
-/// `--keep-binaries` keeps all three, and so does a cargo build's folder.
+/// and removing the fish completion script and manual page it recorded writing
+/// for them. `--keep-binaries` keeps all of them, and so does a cargo build's
+/// folder.
 pub(crate) fn plan_installed_binaries(
     plan: &mut UninstallPlan,
     options: &UninstallOptions,
@@ -207,11 +208,11 @@ pub(crate) fn plan_installed_binaries(
     home: Option<&Path>,
 ) -> Result<()> {
     if options.keep_binaries {
-        // The PATH change and the completions only serve the binaries, so
-        // they stay with them.
+        // The PATH change, the completions and the manual page only serve the
+        // binaries, so they stay with them.
         plan.skipped.push(
-            "binary removal disabled by --keep-binaries, so any PATH change and fish completions \
-             the installer made stay too"
+            "binary removal disabled by --keep-binaries, so any PATH change, fish completions \
+             and manual page the installer made stay too"
                 .to_owned(),
         );
         return Ok(());

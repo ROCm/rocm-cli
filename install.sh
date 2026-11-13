@@ -419,14 +419,31 @@ configure_fish_path() {
 # FISH_COMPLETIONS_MARKER in apps/rocm/src/uninstall.rs.
 FISH_COMPLETIONS_MARKER='# rocm-cli fish completions for '
 
+# The same for the rocm(1) manual page: a roff comment line (`.\"`), which man
+# does not show, followed by the install folder. Keep it in step with
+# MAN_PAGE_MARKER in apps/rocm/src/uninstall.rs.
+MAN_PAGE_MARKER='.\" rocm-cli manual page for '
+
+# How the first line of the page `rocm __man-page` prints starts. A rocm built
+# before that verb existed reads it as a natural-language request: it prints a
+# request plan and exits 0, so success and output alone do not mean a page.
+# Keep it in step with TITLE_PREFIX in apps/rocm/src/man_page.rs.
+MAN_PAGE_TITLE='.TH ROCM 1 '
+
+# $1 quoted for a POSIX shell, so a printed command line can be run as printed
+# whatever the path holds: each ' becomes '\'' inside single quotes.
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # Whether file $1 is a regular file this installer (any install folder) wrote:
-# not a link, and starting with the marker line.
-is_installer_completions() {
+# not a link, and starting with marker line $2.
+is_installer_file() {
   [ -f "$1" ] && [ ! -L "$1" ] || return 1
   first_line=""
   IFS= read -r first_line < "$1" || [ -n "${first_line}" ] || return 1
   case "${first_line}" in
-    "${FISH_COMPLETIONS_MARKER}"?*) return 0 ;;
+    "$2"?*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -445,7 +462,7 @@ install_fish_completions() {
   completions_tmp="${tmp_dir}/rocm.fish"
   completions_marked="${tmp_dir}/rocm.fish.marked"
   if { [ -e "${completions_path}" ] || [ -L "${completions_path}" ]; } \
-    && ! is_installer_completions "${completions_path}"; then
+    && ! is_installer_file "${completions_path}" "${FISH_COMPLETIONS_MARKER}"; then
     info "note: fish completions not installed: ${completions_path} already exists and was not written by this installer"
     info "it is left as it is; remove it and run the installer again to replace it"
     return 0
@@ -462,9 +479,74 @@ install_fish_completions() {
   else
     info "note: could not install fish completions"
     info "to try again, run the installer again, or run:"
-    info "mkdir -p '${completions_dir}'"
-    info "'${INSTALL_DIR}/rocm' completions fish > '${completions_path}'"
+    info "mkdir -p $(sh_quote "${completions_dir}")"
+    info "$(sh_quote "${INSTALL_DIR}/rocm") completions fish > $(sh_quote "${completions_path}")"
     info "(a file written that way has no installer marker, so rocm uninstall leaves it)"
+  fi
+}
+
+# Install the rocm(1) manual page from the binary that was just placed, so it
+# matches it, and record it so `rocm uninstall` removes it with the binary. It
+# goes in share/man/man1 under the folder above the install folder
+# (~/.local/share/man/man1 for the default ~/.local/bin), where man looks for
+# the pages of any folder on PATH, so it needs no shell profile change and is
+# installed whatever ROCM_CLI_UPDATE_SHELL_PATH says. Best effort, and a rocm.1
+# that did not come from this installer is left alone, as for the fish
+# completions above. Output that is not a page (see MAN_PAGE_TITLE) means a
+# rocm too old to have one, which no retry fixes, so it gets a note only.
+man_page_installed=0
+install_man_page() {
+  case "${INSTALL_DIR}" in
+    /*) ;;
+    *)
+      info "note: manual page not installed: the install folder ${INSTALL_DIR} is not an absolute path"
+      return 0
+      ;;
+  esac
+  man_dir="$(dirname -- "${INSTALL_DIR}")/share/man/man1"
+  man_path="${man_dir}/rocm.1"
+  man_tmp="${tmp_dir}/rocm.1"
+  man_marked="${tmp_dir}/rocm.1.marked"
+  if { [ -e "${man_path}" ] || [ -L "${man_path}" ]; } \
+    && ! is_installer_file "${man_path}" "${MAN_PAGE_MARKER}"; then
+    info "note: manual page not installed: ${man_path} already exists and was not written by this installer"
+    info "it is left as it is; remove it and run the installer again to replace it"
+    return 0
+  fi
+  if ! "${INSTALL_DIR}/rocm" __man-page < /dev/null > "${man_tmp}" \
+    || [ ! -s "${man_tmp}" ]; then
+    man_page_status=failed
+  else
+    man_first_line=""
+    IFS= read -r man_first_line < "${man_tmp}" || true
+    case "${man_first_line}" in
+      "${MAN_PAGE_TITLE}"*) man_page_status=page ;;
+      *) man_page_status=not-a-page ;;
+    esac
+  fi
+  if [ "${man_page_status}" = not-a-page ]; then
+    # Nothing to try again: this rocm has no manual page to print.
+    info "note: manual page not installed: this version of rocm does not provide one"
+    return 0
+  fi
+  if [ "${man_page_status}" = page ] \
+    && { printf '%s%s\n' "${MAN_PAGE_MARKER}" "${INSTALL_DIR}" \
+      && cat "${man_tmp}"; } > "${man_marked}" \
+    && mkdir -p "${man_dir}" \
+    && install -m 0644 "${man_marked}" "${man_path}"; then
+    record_path_edit "man ${man_path}"
+    man_page_installed=1
+    ok "manual page installed:"
+    info "${man_path}"
+  else
+    # Run as printed, these lines write the page as the installer would,
+    # marker included, so the next install or uninstall treats it as its own.
+    info "note: could not install the manual page"
+    info "to try again, run the installer again, or run:"
+    info "mkdir -p $(sh_quote "${man_dir}")"
+    info "printf '%s%s\\n' $(sh_quote "${MAN_PAGE_MARKER}") $(sh_quote "${INSTALL_DIR}") > $(sh_quote "${man_path}")"
+    info "$(sh_quote "${INSTALL_DIR}/rocm") __man-page >> $(sh_quote "${man_path}")"
+    info "(rocm uninstall removes a page written that way only after the installer runs again and records it)"
   fi
 }
 
@@ -508,6 +590,12 @@ ROCM_CLI_BANNER
   printf '  %-20s # %s\n' "${cmd} install sdk" "set up a managed ROCm runtime"
   printf '  %-20s # %s\n' "${cmd} serve qwen" "serve a small built-in assistant model"
   printf '  %-20s # %s\n' "${cmd}" "open the launcher"
+  # man finds the page through the install folder on PATH, which only the
+  # shell profile change puts there in a new terminal, so the hint needs that
+  # change to have been saved, not only attempted.
+  if [ "${man_page_installed}" -eq 1 ] && [ "${profile_saved}" -eq 1 ]; then
+    printf '  %-20s # %s\n' "man rocm" "read the manual, offline"
+  fi
   echo
   echo "${next_hint}"
 }
@@ -711,6 +799,9 @@ done < "${manifest_path}"
 
 ensure_installer_process_path
 
+# Whether the shell profile now puts the install folder on PATH in a new
+# terminal, which is how man finds the manual page.
+profile_saved=0
 case ":${PATH}:" in
   *:"${INSTALL_DIR}":*)
     if [ "${UPDATE_SHELL_PATH}" = "1" ]; then
@@ -727,6 +818,10 @@ case ":${PATH}:" in
         record_path_edit "profile ${profile_path}"
         record_path_edit "path-expr ${path_expr}"
       fi
+      case "${profile_result}" in
+        updated:* | unchanged:*) profile_saved=1 ;;
+        *) ;;
+      esac
       case "${profile_result}" in
         updated:*)
           ok "shell profile updated:"
@@ -761,6 +856,8 @@ case ":${PATH}:" in
     info "run: ${INSTALL_DIR}/rocm examine"
     ;;
 esac
+
+install_man_page
 
 if [ "${UPDATE_SHELL_PATH}" = "1" ]; then
   cmd="rocm"
