@@ -1642,3 +1642,31 @@ anything.
 Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
 8192` prints the report with no model section, and stderr says that `--model,
 --context-size were ignored` and nothing about the model was fetched.
+
+## 13. Which Causes a Pasted Error Contributed To
+
+`rocm diagnose --symptom` scores the catalog from the examined host's state and
+the pasted text together, so a finding about the host can outrank the entry the
+paste added to. Each match says whether the paste contributed to its score or
+evidence; any keyword hit counts, however weak, so this is not a verdict that
+the match explains the error. On any host (PowerShell:
+`$env:HSA_OVERRIDE_GFX_VERSION = "11.0.0"` instead of the prefix):
+
+```bash
+HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --symptom 'HSA_STATUS_ERROR_INVALID_ISA' --json
+HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --symptom 'HSA_STATUS_ERROR_INVALID_ISA'
+HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --json
+```
+
+- In the first, every entry in `matched` carries `symptom_matched`:
+  `fix-2-unset-override` (raised by the override alone) is `false`, and
+  `fix-1-arch` (raised by the pasted ISA error) is `true`.
+- In the second, `fix-2-unset-override` has a line `source: the examined
+  host's state alone; the symptom text did not contribute to it`, and
+  `fix-1-arch` does not.
+- In the third, with no `--symptom`, the field is still present and `false` on
+  every entry, and the text form (the same command without `--json`) prints no
+  `source:` line.
+
+The e2e scenarios `diagnose-59`, `diagnose-60` and `diagnose-61` run these three
+checks on every lane.

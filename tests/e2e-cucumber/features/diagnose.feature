@@ -867,3 +867,47 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine whose only GPU is a released one
     When the user asks the CLI what that machine's report would carry in machine-readable form
     Then the report names the CLI version that `rocm version` leads with
+
+  # A diagnosis scores the catalog from two sources at once: what the examined
+  # host shows, and the error the user pasted. A finding about the host can
+  # outrank the entry the paste added to, so the ranking alone does not say
+  # which entries the paste contributed to, and a tool reading the result needs
+  # that said per entry. "Contributed" is all it says: any keyword hit counts,
+  # however weak, so it is not a verdict that the entry explains the error. The
+  # misconfiguration is an unneeded GPU override in the environment the CLI
+  # examines, which every lane reads the same way, so this holds on Linux,
+  # Windows and WSL alike. The paste is an ISA error, which no host state scores
+  # on its own and which names nothing the override entry reads, so the two
+  # answers cannot depend on the runner.
+  @id:diagnose-json-says-which-causes-the-paste-contributed-to
+  Scenario: diagnose-59 - A tool can tell which causes the pasted error contributed to
+    Given a machine with a known misconfiguration in its environment
+    And a pasted error that describes a different failure
+    When the user asks for a diagnosis with that paste, in machine-readable form
+    Then the paste is reported as not contributing to the misconfiguration on the machine
+    And the paste is reported as contributing to the cause it describes
+
+  # The same answer, for a person. Only the cause the paste did not contribute
+  # to is marked, and the mark appears only because the paste contributed to
+  # something else in the same report.
+  @id:diagnose-text-marks-causes-the-paste-did-not-contribute-to
+  Scenario: diagnose-60 - The human-readable diagnosis marks a cause the pasted error did not contribute to
+    Given a machine with a known misconfiguration in its environment
+    And a pasted error that describes a different failure
+    When the user asks for a diagnosis with that paste
+    Then the misconfiguration on the machine is marked as found from the host alone
+    And the cause the pasted error describes carries no such mark
+
+  # With nothing pasted, nothing in a paste contributed to anything. A tool is
+  # still told so on every entry rather than the answer being left out, because
+  # a missing answer is what a CLI too old to give one prints. A person is told
+  # nothing: the mark would sit on every cause and say nothing. The host is the
+  # one diagnose-59 uses, so at least one cause is listed on every lane, and
+  # both forms are asserted against it.
+  @id:diagnose-without-a-paste-credits-no-cause-to-one
+  Scenario: diagnose-61 - Without a pasted error no cause is credited to one, and none is marked
+    Given a machine with a known misconfiguration in its environment
+    When the user asks for a diagnosis without pasting an error, in machine-readable form
+    Then every listed cause is reported as not contributed to by a paste
+    When the user asks for a diagnosis without pasting an error
+    Then no listed cause is marked as found from the host alone

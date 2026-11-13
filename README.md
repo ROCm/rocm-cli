@@ -376,7 +376,16 @@ position.
 
 `rocm diagnose` takes these flags:
 
-- `--symptom` takes raw error text to sharpen keyword scoring.
+- `--symptom` takes raw error text to sharpen keyword scoring. A finding about
+  the examined host can still outrank the entry the text added to, so each
+  match says whether the text contributed to its score or evidence:
+  `symptom_matched` in `--json` (always present, `false` when no `--symptom`
+  was given). Any keyword hit counts, however weak, so `true` means the text
+  contributed, not that the match explains the error. In the human-readable
+  output, a `source: the examined host's state alone` line marks each shown
+  match the text did not contribute to, once the text contributed to any match
+  in the report. That includes one past `--top`, so all the rows shown can
+  carry the line when the only match the text contributed to was cut off.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
