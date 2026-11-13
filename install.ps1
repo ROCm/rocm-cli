@@ -168,14 +168,18 @@ function Convert-FileUriToPath {
     return $null
 }
 
-# Pinned production release signing public keys (trust roots). These stay empty
-# until the repository owner publishes production keys (see docs/release-trust.md,
-# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior:
-# a signature is verified only when a key is supplied via the parameters/env vars
-# or ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
-# signatures by default with these keys as trust roots. Two slots support
-# zero-downtime key rotation: a release signed with either the current or the
-# pre-staged next key verifies, so the next key is trusted before its first use.
+# Pinned production release signing public keys (trust roots). The Current slot
+# holds the published release key, whose canonical copy is
+# docs/keys/rocm-cli-release-current-public.pem; the Next slot stays "" until a
+# rotation key is published. Resolve-SigningPublicKey falls back to these keys
+# whenever no key is passed with -SigningPublicKeyPath/-SigningPublicKeyPem (or
+# ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/ROCM_CLI_SIGNING_PUBLIC_KEY_PEM), so while a
+# release key is pinned every install on any channel verifies the detached
+# signature and a missing .sig sidecar fails it, whether
+# ROCM_CLI_REQUIRE_SIGNATURE is unset or 0. A key supplied that way replaces
+# these keys rather than adding to them. Two slots support zero-downtime key
+# rotation: a release signed with either the current or the pre-staged next key
+# verifies, so the next key is trusted before its first use.
 $PinnedReleasePublicKeyCurrent = @"
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxuyScR/BzV+kuXqWAHtE
@@ -724,10 +728,16 @@ $sigPath = "$archivePath.sig"
 $extractDir = Join-Path $tempRoot "extract"
 $manifestPath = Join-Path $InstallDir ".rocm-cli-manifest"
 $signatureRequired = $RequireSignature -or (Test-Truthy $env:ROCM_CLI_REQUIRE_SIGNATURE)
-# Production default: once release trust roots are pinned, release-channel installs
-# always verify. An unset or 0 ROCM_CLI_REQUIRE_SIGNATURE does not lower this
-# floor; pass -SigningPublicKeyPath/-Pem (or the env vars) to point at an
-# alternate key (e.g. a private mirror) instead.
+# This floor changes no outcome while a release key is pinned:
+# Resolve-SigningPublicKey then always returns a key, and that alone makes the
+# check below verify. If both pinned slots were emptied,
+# Test-HasPinnedReleaseKey is false and the floor does not fire either, so a
+# release install with no key supplied would skip verification, unless
+# -RequireSignature or ROCM_CLI_REQUIRE_SIGNATURE=1 is given, which makes it
+# fail for want of a key. The floor is left as it is on purpose: making a release
+# install fail when no key resolves is a separate, planned change. Pass
+# -SigningPublicKeyPath/-Pem (or the env vars) to point at an alternate key
+# (e.g. a private mirror).
 if ($Channel -eq "release" -and (Test-HasPinnedReleaseKey)) {
     $signatureRequired = $true
 }

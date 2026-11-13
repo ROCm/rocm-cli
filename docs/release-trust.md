@@ -11,7 +11,8 @@ rocm-cli release packages are protected in two layers:
 1. Every bundle has a `.sha256` checksum, and installers verify it before
    activation.
 2. Release packaging can emit detached RSA/SHA-256 `.sig` files, and release
-   and nightly CI now require those signatures for published assets.
+   and nightly CI now require those signatures for every bundle archive they
+   publish, the archives the installers download.
 
 ## Signing Inputs
 
@@ -28,9 +29,14 @@ ROCM_CLI_SIGNING_PRIVATE_KEY_PATH
 ```
 
 Stable release and nightly CI set `ROCM_CLI_REQUIRE_SIGNATURE=1`, so packaging
-fails if no signing key is configured or if the `.sig` file is not produced.
-Upload steps also fail if signature assets are missing instead of publishing an
-unsigned release or nightly.
+fails if no signing key is configured or if the `.sig` file is not produced. The
+packaging steps also stop if the `.sig` is missing and run the dist verifier with
+`--require-signatures` before anything is uploaded, and the nightly publish job
+verifies the combined asset set the same way before replacing the public
+`nightly` release, so neither workflow publishes an unsigned bundle archive. The
+nightly release's convenience assets, attached after those checks, carry no
+sidecars (see
+[Remaining Owner Step](#remaining-owner-step)).
 
 Release CI also runs the cross-platform dist verifier before upload. Release
 jobs name both the versioned archive and the generic installer-facing archive,
@@ -113,8 +119,20 @@ they are not trust roots.
 
 ## Installer Verification
 
-Installers always verify checksums. Signature verification runs when a public
-key is supplied or `ROCM_CLI_REQUIRE_SIGNATURE=1` is set.
+Installers always verify checksums, and while a release key is pinned they
+verify the detached signature on every install whatever the channel. The
+release public key is pinned in both [install.sh](../install.sh) and
+[install.ps1](../install.ps1) (canonical copy
+[rocm-cli-release-current-public.pem](keys/rocm-cli-release-current-public.pem)),
+so a key always resolves and a missing `.sig` sidecar fails the install. An
+unset or `0` `ROCM_CLI_REQUIRE_SIGNATURE` does not turn verification off. A key
+supplied through `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` or
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` (or `install.ps1`'s `-SigningPublicKeyPath` or
+`-SigningPublicKeyPem`) replaces the pinned keys rather than adding to them, for
+example for a private mirror signed with its own key. Were both pinned slots
+emptied, an install with no key supplied would skip verification, unless
+`ROCM_CLI_REQUIRE_SIGNATURE=1` (or `install.ps1`'s `-RequireSignature`) is set,
+which makes it fail for want of a key.
 
 The detached `.sig` sidecar is the raw RSASSA-PKCS#1 v1.5 signature over the
 archive's SHA-256 digest, verified against the SubjectPublicKeyInfo
@@ -128,10 +146,11 @@ on both Windows PowerShell 5.1 (.NET Framework 4.6+, which the
 CMS/Authenticode blobs, not a raw detached signature checked against a bare
 public key.
 
+To verify against a different key:
+
 Linux:
 
 ```bash
-ROCM_CLI_REQUIRE_SIGNATURE=1 \
 ROCM_CLI_SIGNING_PUBLIC_KEY_PATH=/path/to/rocm-cli-signing-public-key.pem \
 sh ./install.sh release
 ```
@@ -139,16 +158,19 @@ sh ./install.sh release
 Windows:
 
 ```powershell
-$env:ROCM_CLI_REQUIRE_SIGNATURE = "1"
 .\install.ps1 release -SigningPublicKeyPath C:\path\to\rocm-cli-signing-public-key.pem
 ```
 
 The `@lifecycle` install-lifecycle E2E scenarios cover public-key path and PEM
 installer inputs, bad checksums, bad detached signatures, missing required
-`.sig` sidecars, and required-signature mode without a public key. The Windows
-scenarios additionally run a full signed install over a loopback HTTP download,
-proving `install.ps1` verifies with native .NET crypto. All of those checks
-happen before activation. Run the current host's set with
+`.sig` sidecars, and an install with no public key supplied, which falls back to
+the pinned release key and rejects the locally signed archive. On Linux two more
+run without asking for a signature: with `ROCM_CLI_REQUIRE_SIGNATURE=0`, the
+pinned key still rejects the locally signed archive when a specific version is
+installed, and with the variable unset a missing `.sig` still fails a release
+install. The Windows scenarios additionally run a full signed install over a
+loopback HTTP download, proving `install.ps1` verifies with native .NET crypto.
+All of those checks happen before activation. Run the current host's set with
 `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e` (see
 `docs/testing.md`).
 
@@ -377,31 +399,52 @@ node, as it always has, so the veto does not apply there.
 
 ## Remaining Owner Step
 
-The repo still needs a real project-owned public signing key and matching
-private release secret, plus the public metadata and model recipe index keys,
-signed sidecar publication, and hosted production recipe/source-policy
-documents. Do not generate those production keys inside CI. Once published, the
-installers, metadata cache, and model recipe index can make release-channel
-signature verification mandatory by default with those keys as trust roots.
+The release signing key is published as
+[rocm-cli-release-current-public.pem](keys/rocm-cli-release-current-public.pem)
+and pinned in both installers. The release and nightly workflows sign every
+archive the installers download with the matching private key and verify the
+signature before upload, and the installers already enforce it (see
+[Installer Verification](#installer-verification)). The nightly release also
+carries convenience assets uploaded with neither a `.sig` nor a `.sha256` of
+their own: `linux-binaries.tar.gz` and `windows-binaries.zip`, byte-identical
+copies of the signed Linux and Windows nightly archives, and the standalone
+`rocm` and `rocm.exe` binaries, extracted from those archives. No installer
+downloads them; to check what you download, prefer the signed archives.
 
-Those trust roots are pinned copies of the published keys: the
-`PINNED_RELEASE_PUBLIC_KEY_CURRENT`/`_NEXT` slots in
-[install.sh](../install.sh), `$PinnedReleasePublicKeyCurrent`/`Next` in
-[install.ps1](../install.ps1), and
-`PINNED_METADATA_PUBLIC_KEY_PEM` in
-[fetch.rs](../apps/rocm/src/therock/fetch.rs). `cargo xtask verify-pinned-keys`
-fails when a pinned copy differs from its canonical file under `docs/keys/`. The
-release and nightly workflows always run it; pull-request CI runs it when a
+Two owner-controlled inputs are still not published:
+
+- The runtime metadata signing key and the `.sig` sidecars for the metadata.
+  Until they are, `PINNED_METADATA_PUBLIC_KEY_PEM` stays `""` and metadata
+  signature verification stays opt-in through the
+  `ROCM_CLI_METADATA_PUBLIC_KEY_PATH`/`_PEM` env vars.
+- The model recipe index signing key, plus a hosted signed production recipe
+  index and source-policy documents. The CLI pins no key for the index and reads
+  one only from `ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH`.
+
+Do not generate those production keys inside CI.
+
+The trust-root slots are the `PINNED_RELEASE_PUBLIC_KEY_CURRENT`/`_NEXT` slots
+in [install.sh](../install.sh), `$PinnedReleasePublicKeyCurrent`/`Next` in
+[install.ps1](../install.ps1), and `PINNED_METADATA_PUBLIC_KEY_PEM` in
+[fetch.rs](../apps/rocm/src/therock/fetch.rs). A slot holds a pinned copy of a
+published key, and a slot whose key is not published yet (the `_NEXT`/`Next`
+release slots and the metadata slot) must stay `""`, which
+`cargo xtask verify-pinned-keys` enforces. It also fails when a pinned copy
+differs from its canonical file under `docs/keys/` and, where CI configures a
+signing public key (`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, else
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`), when that key differs from the canonical
+current release key, so CI verifies against the key users pin. The release and
+nightly workflows always run it; pull-request CI runs it when a
 change matches the `heavy` path filter in
 [ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
 installers, every Rust source and `xtask/`. It reads the one assignment
 the installer actually uses, so each slot must be assigned exactly once as a
-plain declaration, a slot whose key is not published yet must stay `""`, and
-`install.sh` must mark both of its slots `readonly`. The full rules, and what a
+plain declaration, and `install.sh` must mark both of its slots `readonly`. The full rules, and what a
 textual check cannot catch, are in
 [verify_pinned_keys.rs](../xtask/src/verify_pinned_keys.rs).
 
-When those owner-controlled inputs exist, release operators can add
+Once the runtime metadata public key and the signed model recipe index (with
+its public key) are published, release operators can add
 `--require-production-trust` or set `ROCM_CLI_REQUIRE_PRODUCTION_TRUST=1` so the
-dist verifier fails unless the release signing public key, runtime metadata
-public key, and signed model recipe index inputs are explicitly configured.
+dist verifier fails unless both are explicitly configured. The flag also checks
+the release signing public key, which release and nightly CI already configure.
