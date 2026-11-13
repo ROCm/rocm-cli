@@ -2075,10 +2075,17 @@ assertion is a deferred follow-up and is **not yet** exercised by the GPU
 acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
 key policy, generation, the owner-only key file (including one whose
 permissions were loosened before a re-store, and on the Windows build job the
-DACL read back from disk), and key-file resolution; `serve-57`
-(`@id:serve-endpoint-key-readable-by-owner-only` in
-[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature))
-checks the mode of a real serve's key file on the Linux GPU lanes.
+DACL read back from disk), and key-file resolution. The tests that fail
+without the repair of a loosened key file are `restoring_a_key_over_a_loosened_file_makes_it_0600_again`
+in [`endpoint_keys.rs`](../apps/rocm/src/endpoint_keys.rs), `write_owner_only_file_atomically_tightens_a_loosened_file`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), and on Windows
+`write_owner_only_file_atomically_replaces_a_loose_dacl_with_an_owner_only_one`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), which starts from a destination whose DACL grants Everyone. `serve-57` (`@id:serve-endpoint-key-readable-by-owner-only`
+in [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature))
+guards fresh-create behaviour only: it checks that a real serve's newly
+written key file is mode 0600 on the Linux GPU lanes, which held before this
+repair too, so it is a guard against a regression in that path, not evidence
+for the repair.
 
 ```bash
 cargo test -p rocm-core --lib owner_only

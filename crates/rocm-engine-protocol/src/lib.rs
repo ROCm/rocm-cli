@@ -155,14 +155,15 @@ pub fn endpoint_key_file_if_present(
 /// Remove `service_id`'s endpoint key file and any leftover staged copy of it.
 ///
 /// A store killed between staging and publishing leaves a staged copy beside
-/// the key (see `rocm_core::atomic_write::staged_siblings`); removing it too
-/// means no copy of the key outlives the service. Best-effort and idempotent:
-/// a missing file is not an error, and nothing is reported because no caller
-/// can act on a failed cleanup.
+/// the key (see `rocm_core::atomic_write::staged_siblings`), and this removes
+/// the copies it finds along with the key. Best-effort and idempotent: a
+/// missing file is not an error, a file it cannot remove is left where it is,
+/// and if the folder cannot be listed the staged copies are left, all without
+/// being reported, because no caller can act on a failed cleanup.
 ///
-/// A store still in flight for the same service loses its staged file too and
-/// then fails to publish. That is deliberate, fail-closed: the service's key
-/// is being removed, and a store finishing afterwards would bring it back.
+/// It removes the key and the staged copies present when the folder is
+/// listed. It does not exclude a store for the same service running at the
+/// same time, which may still publish a key or may fail.
 pub fn remove_endpoint_key_files(paths: &rocm_core::AppPaths, service_id: &str) {
     let key = endpoint_key_file_path(paths, service_id);
     for path in std::iter::once(key.clone()).chain(rocm_core::atomic_write::staged_siblings(&key)) {

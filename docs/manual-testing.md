@@ -1003,11 +1003,12 @@ Expected result: `600` and your user name.
 
 On native Windows a key-protected `rocm serve` has no engine that can run
 behind it: Lemonade refuses a key-protected bind there, vLLM does not run
-natively, and `--engine aim` stores the key but then cannot start, because
-rocm-cli supports AIM GPU passthrough only on Linux and WSL and AIM serves
-only on a GPU. `rocm remote serve <machine> <model>`
-stores its session key with the same owner-only file, so check that one. From
-PowerShell, after it reports the endpoint:
+natively, and `--engine aim` stores the key but its server then cannot
+start, because rocm-cli supports AIM GPU passthrough only on Linux and WSL and
+AIM serves only on a GPU. (What happens to that service's key file when the
+launch fails has not been verified on a Windows host.) Check instead
+`rocm remote serve <machine> <model>`, which stores its session key with the
+same owner-only file. From PowerShell, after it reports the endpoint:
 
 ```powershell
 icacls <data>\remote-sessions\<session-id>.endpoint-key

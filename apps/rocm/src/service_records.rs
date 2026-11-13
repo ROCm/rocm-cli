@@ -138,7 +138,8 @@ fn staged_endpoint_key_owner(file_name: &str) -> Option<&str> {
 }
 
 /// Every leftover staged endpoint-key copy in the services folder, keyed by the
-/// service it belongs to, from one listing of the folder.
+/// service it belongs to, from one listing of the folder. Empty when the folder
+/// cannot be listed, in which case those copies are left in place.
 fn staged_endpoint_keys_by_service(paths: &AppPaths) -> HashMap<String, Vec<PathBuf>> {
     let mut staged: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let Ok(entries) = fs::read_dir(paths.services_dir()) else {
