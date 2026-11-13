@@ -179,7 +179,10 @@ fn spawn_vllm_server(
 
     // Before the host-library checks below: a torch that cannot import because a
     // library is missing reports nothing here, so those checks still give their
-    // own guidance, and a wheel that does not match its torch is named first.
+    // own guidance, and a wheel that does not match its torch is named first. The
+    // gate probes in the launch environment, so it runs the same shim step
+    // `apply_therock_env` runs below (idempotent) even when a check after it
+    // then refuses the launch.
     require_importable_extensions(runtime)?;
 
     // Fail fast when the OpenMPI runtime is missing. vLLM's ROCm torch wheel
@@ -520,10 +523,11 @@ pub(crate) fn vllm_extension_import_problem(runtime: &VllmRuntime) -> Option<Str
 #[derive(Clone, Copy)]
 enum ProbeEnv {
     /// `detect`, which `rocm engines list` and the assistant's read-only
-    /// engines tool reach: nothing in the runtime is written. A compat stub that
-    /// was not written can make `import torch` fail, which the probe reports as
-    /// nothing, so a listing can read `ready` for a broken wheel until the first
-    /// launch has written the shims.
+    /// engines tool reach: nothing in the runtime is written. The loader path
+    /// comes from a listing of the compat directory, so `import torch` can fail
+    /// when a needed stub was not written yet, or when a stale `libnuma.so.1`
+    /// link is there. The probe reports a torch failure as nothing, so a listing
+    /// can read `ready` for a broken wheel until a launch has fixed the shims.
     ReadOnly,
     /// The serve gate, which is about to run the same shim step in
     /// `apply_therock_env` anyway: the probe sees the environment the server will
@@ -1391,7 +1395,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_extension_probe_changes_nothing_in_the_runtime() -> Result<()> {
+    fn the_read_only_extension_probe_leaves_the_compat_dir_alone() -> Result<()> {
         // `rocm engines list` and the assistant's read-only engines tool reach the
         // probe, so it must not run the compat-shim step, which removes a stale
         // numa symlink and may write a `libmpi_cxx` stub in the runtime.
@@ -1410,15 +1414,45 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_serve_gate_runs_in_the_launch_environment() -> Result<()> {
-        // The gate is about to run the shim step anyway, and must probe in the
-        // environment the server gets: the step ran when the stale shim is gone.
-        let (_guard, runtime, _compat_dir, stale_shim) = probe_runtime_with_stale_shim()?;
-        let _ = require_importable_extensions(&runtime);
-        assert!(
-            stale_shim.symlink_metadata().is_err(),
-            "the serve gate did not run in the launch environment"
-        );
+    fn the_serve_gate_probes_after_the_launch_environment_ran_the_shim_step() -> Result<()> {
+        // The stand-in reports a failure only once the stale numa link is gone, so
+        // the gate refuses only when the shim step ran before the probe started.
+        let env = tempfile::tempdir()?;
+        let bin = env.path().join("bin");
+        fs::create_dir_all(&bin)?;
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        let stale_shim = compat_dir.join("libnuma.so.1");
+        std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
+        let python = stand_in_python(
+            &bin,
+            &format!(
+                r#"if [ -L '{}' ]; then echo '{{"failures": []}}'; else echo '{{"failures": [{{"module": "vllm._C", "error": "launch-env"}}]}}'; fi"#,
+                stale_shim.display()
+            ),
+        )?;
+        let runtime = VllmRuntime {
+            python_executable: Some(python),
+            sdk_root: Some(env.path().join("sdk")),
+            ..VllmRuntime::for_test()
+        };
+        let error = require_importable_extensions(&runtime).expect_err("the gate refuses");
+        assert!(error.to_string().contains("launch-env"), "{error}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_does_not_let_python_write_bytecode_into_the_runtime() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo "{\"failures\": [{\"module\": \"vllm._C\", \"error\": \"pydwb=$PYTHONDONTWRITEBYTECODE\"}]}""#,
+        )?;
+        let runtime = test_vllm_runtime(Some(python), None);
+        let listed = vllm_extension_import_problem(&runtime).expect("the stand-in fails");
+        assert!(listed.contains("pydwb=1"), "{listed}");
+        let gate = require_importable_extensions(&runtime).expect_err("the gate refuses");
+        assert!(gate.to_string().contains("pydwb=1"), "{gate}");
         Ok(())
     }
     #[cfg(target_os = "linux")]

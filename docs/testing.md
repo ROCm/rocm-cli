@@ -3084,7 +3084,7 @@ before launching vLLM (the guidance is in the service log). `serve-57` (`@id:ser
 `@requires-os:linux`) covers the listing hermetically, against a stand-in
 interpreter, with no GPU, network or real vLLM. The `serve` refusal and the probe
 are unit-tested in [process.rs](../engines/vllm/src/process.rs)
-(`cargo test -p rocm-engine-vllm -- extension probe`); the real `import vllm._C` failure
+(`cargo test -p rocm-engine-vllm -- extension probe serve_gate`); the real `import vllm._C` failure
 needs a GPU host with a mismatched wheel.
 
 Natural-language plan handoff tests:
