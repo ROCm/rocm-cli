@@ -701,3 +701,30 @@ Feature: Runtime configuration
     Given a machine with an AMD GPU
     When the user dry-runs a release SDK install pinned to an earlier ROCm 7 release
     Then the SDK preview reports canonical release provenance
+
+  # ROCMAI-437. When Lemonade's ROCm backend cannot be aligned to the active ROCm
+  # version, the install reverts to the pinned backend and force-reinstalls it.
+  # The revert leaves the pin different from the active version, so before the
+  # failure was remembered every later install (and every `rocm serve` that
+  # installs Lemonade) ran both tiers' downloads and the forced reinstall again.
+  # The first install here is the failure; the second is the one under test.
+  # The failure is remembered for 24 hours; the unit tests in
+  # engines/lemonade/src/backend_alignment.rs cover expiry, another ROCm
+  # version, an unreadable record and the opt-out.
+  #
+  # Technical details: the version the alignment targets is overridden to
+  # 7.99.0 through the `rocm/e2e-test-hooks` variable
+  # ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION, so every tier fails on every lane
+  # without planting a runtime in the shared runtime tree. The Given's reinstall
+  # is also what the notice tells the user to run, so its alignment attempt shows
+  # the advice works. Same lane as runtime-16 and runtime-17: a real managed SDK
+  # and real backend downloads. `@requires-bare-metal` because under WSL2
+  # Lemonade selects its Vulkan backend and never attempts the alignment.
+  @id:runtime-lemonade-backend-alignment-failure-remembered @requires-gpu @requires-bare-metal @requires-engine:lemonade @nightly
+  Scenario: runtime-33 - A Lemonade backend that could not be aligned is not retried by the next install
+    Given a managed runtime is active
+    And the active ROCm version is one Lemonade publishes no backend build for
+    And reinstalling Lemonade has already failed to align its backend to that version
+    When the user installs the Lemonade engine
+    Then the install reuses Lemonade's pinned backend without trying the alignment again
+    And the user is told the alignment failed and how to try it again

@@ -2202,6 +2202,33 @@ lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
 
+Lemonade failed-alignment record focused tests (ROCMAI-437; a failed
+alignment is not repeated by the next install for 24 hours; see
+[Lemonade backend alignment on engine install](engine-plugins.md#lemonade-backend-alignment-on-engine-install)):
+
+```bash
+cargo test -p rocm-engine-lemonade record
+cargo test -p rocm-engine-lemonade a_failed_alignment_is_not_repeated
+cargo test -p rocm-engine-lemonade a_skipped_alignment_whose_install_fails
+```
+
+The tests are in [alignment_record.rs](../engines/lemonade/src/alignment_record.rs)
+and [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs), one per
+state of the record: none, one that skips the alignment
+(the regression test: the second install calls no alignment tier and installs
+without forcing, and its notice is asserted with the pin file), one for another
+ROCm version, one 24 hours old, an unreadable one, one that cannot be written,
+one removed by a later successful alignment, one removed by `--reinstall`
+(`reinstall_removes_the_record_of_a_failed_alignment` in
+[install.rs](../engines/lemonade/src/install.rs)), one the
+opt-out leaves alone, and a skipped alignment whose install fails (the error is
+reported and no notice is printed). The scenario
+`runtime-lemonade-backend-alignment-failure-remembered` (runtime-33 in
+[runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature)) runs the two installs for real on the
+`@nightly @requires-gpu` Lemonade lanes (not under WSL2); it targets ROCm 7.99.0
+through `ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION`, compiled only into the
+`rocm/e2e-test-hooks` build.
+
 Engine recipe adapter contract focused tests:
 
 ```bash

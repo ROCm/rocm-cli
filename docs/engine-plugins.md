@@ -66,6 +66,27 @@ was pinned before the attempt — the packaged pin on a fresh install or after
 `--reinstall`, but whatever alignment last wrote otherwise — rather than
 being kept.
 
+A failed alignment is remembered so that it is not repeated on every install.
+The revert puts back a pin that still differs from the active ROCm version, so
+without that every later `rocm engines install lemonade`, and every `rocm
+serve` that installs Lemonade, would download both builds and force-reinstall
+the pinned backend again. When the revert's install succeeds, the attempt (the
+active ROCm version, the pins it started from, the llama.cpp builds tried and
+the Lemonade version) is recorded in `.rocm-cli-alignment-failed.json` in the
+Lemonade runtime tree. For the next 24 hours an install for the same active
+ROCm version, pin and Lemonade version does not attempt the alignment: it
+installs the backend already pinned without forcing a reinstall, so a backend
+already installed is reused, and prints a line saying the alignment could not
+be done, when it failed, and when it is tried again. `rocm engines install
+lemonade --reinstall` tries it again at once, because it deletes and
+re-extracts the runtime tree, record included. A different active ROCm version,
+a new Lemonade version (which also re-extracts the tree), or a record older than
+24 hours runs the alignment as before, and an alignment that succeeds removes
+the record. A record that cannot be read is ignored with a warning, and one
+that cannot be written leaves the next install to try again, also with a
+warning. Setting `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` neither reads nor
+changes the record.
+
 A pin an earlier alignment kept can go stale: the llama.cpp or TheRock build it
 names may later be withdrawn upstream. When the pin already equals the active
 ROCm version the install does not attempt another alignment, so if installing

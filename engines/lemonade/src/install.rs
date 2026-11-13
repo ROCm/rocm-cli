@@ -967,6 +967,76 @@ mod tests {
         );
     }
 
+    /// The recovery the CLI names when a recorded alignment failure skips the
+    /// alignment is `--reinstall`. That only holds if a reinstall removes the
+    /// record, which it does because the record lives inside the runtime tree a
+    /// reinstall deletes and re-extracts. A plain install of the same version
+    /// keeps the tree, record included, which is what lets the record skip the
+    /// alignment at all.
+    #[test]
+    fn reinstall_removes_the_record_of_a_failed_alignment() {
+        use crate::alignment_record::{
+            AlignmentFailure, StoredAlignmentFailure, read_alignment_failure,
+            write_alignment_failure,
+        };
+        let env_root = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: env_root.path().join("config"),
+            data_dir: env_root.path().join("data"),
+            cache_dir: env_root.path().join("cache"),
+        };
+        let version = "11.5.1";
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("embeddable");
+        write_embeddable_with_pins(
+            &archive,
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+        );
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+        let install = |reinstall: bool| {
+            prepare_embeddable_with(
+                &paths,
+                Some(env_root.path()),
+                reinstall,
+                version,
+                &sha256,
+                |_, destination| {
+                    fs::copy(&archive, destination)?;
+                    Ok(())
+                },
+            )
+            .unwrap()
+        };
+        let runtime_dir = install(false).runtime_dir;
+        let failure = AlignmentFailure {
+            target_rocm_version: "7.99.0".to_owned(),
+            pinned_rocm_version: "7.13.0".to_owned(),
+            pinned_llamacpp_tag: Some("b9752".to_owned()),
+            latest_llamacpp_tag: None,
+            lemonade_version: version.to_owned(),
+            failed_at_unix_secs: 1_800_000_000,
+        };
+        write_alignment_failure(&runtime_dir, &failure).unwrap();
+
+        install(false);
+        assert_eq!(
+            read_alignment_failure(&runtime_dir),
+            StoredAlignmentFailure::Recorded(failure),
+            "a plain install keeps the tree and the record in it"
+        );
+
+        install(true);
+        assert_eq!(
+            read_alignment_failure(&runtime_dir),
+            StoredAlignmentFailure::Absent,
+            "--reinstall must remove the record, or the retry it advertises does not happen"
+        );
+        assert!(
+            lemond_path_in(&runtime_dir).is_file(),
+            "the tree was re-extracted"
+        );
+    }
+
     /// Writes an embeddable archive in the host's format holding the two
     /// binaries and a packaged `resources/backend_versions.json`.
     fn write_embeddable_with_pins(archive: &Path, pins: &str) {
