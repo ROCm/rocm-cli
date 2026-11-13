@@ -191,9 +191,25 @@ pub(super) fn resolve_family(
 /// family covered it. On the host branch the caller has already established
 /// that `normalize_therock_family` answers `None`, so the extra call there is
 /// a no-op that costs a string compare.
+///
+/// The Vulkan argument is [`rocm_core::VulkanStatus::Unknown`] — "nobody
+/// looked" — and deliberately not this host's probe result. `value` may be a
+/// target the user *named*, which can be a GPU that is not in this machine, so
+/// a Vulkan driver found here would say nothing about it; and on the host
+/// branch, probing would make `install sdk` refuse or allow based on a Vulkan
+/// fact that has no bearing on whether a ROCm SDK exists. `Unknown` keeps the
+/// `VulkanOnly` tier for every target the catalog confirms has no ROCm build,
+/// which is exactly the set this gate refused before the probe existed — the
+/// refusals are unchanged. It is also why these two messages may still
+/// interpolate the unconditional `VULKAN_ONLY_SUPPORT_CLAIM` while `rocm
+/// examine`, which does probe, grades its wording instead.
 fn target_is_vulkan_only(value: &str) -> bool {
     matches!(
-        gpu_support_level(Some(value), normalize_therock_family(value).as_deref()),
+        gpu_support_level(
+            Some(value),
+            normalize_therock_family(value).as_deref(),
+            rocm_core::VulkanStatus::Unknown,
+        ),
         GpuSupportLevel::VulkanOnly
     )
 }
@@ -400,13 +416,19 @@ mod tests {
         }
     }
 
-    /// Both refusals and `rocm examine`'s `rocm_support` line make the same
-    /// claim about a Vulkan-only GPU, so they render it from the same string.
+    /// Both refusals make the same claim about a Vulkan-only GPU, so they
+    /// render it from the same string.
     ///
     /// Asserting the constant is *in* each message is what makes it one
     /// claim; the wording itself is pinned word-for-word in `rocm-core`
     /// (`the_vulkan_only_claim_is_pinned_word_for_word`), so neither test
     /// alone can be satisfied by quietly rewriting the other's expectation.
+    ///
+    /// `rocm examine`'s `rocm_support` line is deliberately not in this list.
+    /// It is the one surface that pays for the Vulkan probe, so it grades the
+    /// claim by what the probe found rather than making it unconditionally -
+    /// see `rocm_support_line` in `rocm-core`'s `host_gpu/render.rs`. These
+    /// two share the constant precisely because they do *not* probe.
     #[test]
     fn both_install_refusals_render_the_shared_vulkan_only_claim() {
         for message in [

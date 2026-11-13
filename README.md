@@ -541,13 +541,50 @@ a target yourself with `--family gfx90c`: the request is refused, and no other
 family is substituted for it. `rocm examine` reports the same conclusion on a
 `rocm_support` line (see [Examine](#examine)).
 
-These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
+These GPUs can still work with the Vulkan backend, which needs no ROCm SDK —
+but whether they *do* depends on a Vulkan driver being installed, so `rocm
+examine` looks for one rather than assuming it. It reads the Vulkan ICD
+manifests (the Khronos `Drivers` registry key on Windows) and, where available,
+enumerates devices with `vulkaninfo`. A software rasteriser such as lavapipe or
+swiftshader does not count as a GPU driver.
 
 `rocm examine` prints that `rocm_support` line on **every** host, not only this
-case, at one of three levels: ROCm/HIP-supported, Vulkan-only (the case above),
-or unknown. Unknown covers both no GPU detected and a target this build's
-catalog does not recognise — detection gaps rather than a verdict about the
-hardware, so neither is reported as "no ROCm build".
+case, at one of five levels:
+
+| Level | Meaning |
+| --- | --- |
+| ROCm/HIP-supported | A TheRock package family covers this GPU. |
+| Vulkan-only | No ROCm build, **and** either a Vulkan GPU driver was found here, or the platform cannot be probed for one at all (anything other than Linux and Windows, or a summary from an older `rocm remote doctor` that predates the probe). The `rocm_support` line says which of the two it is, and only names a driver when one was actually found. |
+| Vulkan-unconfirmed | No ROCm build, and the probe could not reach an answer — no ICD, no enumerated device, and no `vulkaninfo` to ask. |
+| no GPU backend | No ROCm build, **and** the probe looked and found no Vulkan GPU driver. |
+| unknown | No GPU detected, or a target this build's catalog does not recognize. |
+
+The last row is a detection gap rather than a verdict about the hardware, which
+is why it is not reported as "no ROCm build". Vulkan-unconfirmed is kept
+separate from "no GPU backend" for the same reason in the other direction: on
+Windows the Khronos `Drivers` key is legacy and `vulkaninfo` is rarely on PATH,
+so a working machine can land there, and it has not earned a confirmed "no".
+
+`rocm examine --json` reports the evidence behind this in a `vulkan` object
+(status, ICD manifests found, devices enumerated). The field is optional, so an
+older `rocm remote doctor` summary that predates it reads as unknown rather
+than as a false "no Vulkan".
+
+The probe runs wherever the full host summary is gathered, not on `rocm examine`
+alone: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the
+free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'s
+host snapshot, MCP and sandbox paths. Each of those pays one `vulkaninfo` (or, on
+Windows, one registry read) per gather.
+
+It does not run on the lean scope, `ExamineSummary::gather_without_driver_facts`,
+which the runtime-install finalizer uses to read the GPU target: that leaves
+`vulkan` as `None`, meaning "not probed", which reads as unknown rather than as a
+false "no Vulkan".
+
+`rocm engines` and the `rocm diagnose` finding `info-20-gpu-no-rocm-support` still
+speak from the gfx table alone, so they can name Vulkan on a host where `rocm
+examine` would say otherwise; spawning `vulkaninfo` (and PowerShell on Windows)
+was judged too expensive for a plain listing command.
 
 #### Compiler toolchain (--devel)
 

@@ -3959,23 +3959,39 @@ row is the backend and ordinal with no name — correct and unspecific, rather
 than specific and wrong. No CI lane has two AMD GPUs, so that branch is covered
 by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
 
-**`rocm examine` prints a `rocm_support` line on every host**, at one of three
-levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, or unknown.
-Unknown covers both "nothing detected" and "a target this build's catalog does
-not recognise" — conflating the latter with "confirmed to have no ROCm build"
-would turn a detection gap into a claim about the hardware. `examine-49` holds
-the line against the `detected_gfx_target` and `compatible_therock_family` the
-same report prints, so every lane checks the level its own hardware implies:
+**`rocm examine` prints a `rocm_support` line on every host**, at one of five
+levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only,
+Vulkan-unconfirmed, no-GPU-backend, or unknown. Unknown covers both "nothing
+detected" and "a target this build's catalog does not recognize" — conflating
+the latter with "confirmed to have no ROCm build" would turn a detection gap
+into a claim about the hardware. `examine-49` holds the line against the
+`detected_gfx_target` and `compatible_therock_family` the same report prints,
+so every lane checks the level its own hardware implies:
 
 ```bash
 cargo xtask e2e -- -n '(examine-49)'
 ```
 
-Vulkan-only here is inferred from the gfx table, not probed: this change has
-three levels and this section describes three. Probing the host for a Vulkan
-driver, and the further levels that evidence makes knowable, is separate work.
-Written this way deliberately — a forward reference to an unmerged change reads
-as false the moment this merges on its own.
+The three levels below ROCm/HIP are decided by the Vulkan probe, not by the
+gfx table, and each has its own scenario because each is a different
+evidentiary state rather than a different wording of one:
+
+| Scenario | Host it plants | Level asserted |
+| --- | --- | --- |
+| `examine-50` | An ICD and an enumerated AMD GPU. | Vulkan-only |
+| `examine-51` | A `vulkaninfo` that runs and reports nothing. | no GPU backend |
+| `examine-52` | Only a software rasteriser (lavapipe). | no GPU backend |
+| `examine-53` | No ICD, no device, and no `vulkaninfo` to ask. | Vulkan-unconfirmed |
+
+```bash
+cargo xtask e2e -- -n '(examine-50|examine-51|examine-52|examine-53)'
+```
+
+`examine-51` and `examine-53` are the pair worth keeping straight: both end
+with nothing found, and they differ only in whether a tool was there to look.
+That difference is the whole reason `VulkanUnconfirmed` exists, so a change
+that collapses them will pass one of these and fail the other rather than
+silently reporting a confirmed absence to a host nobody probed.
 
 ## Windows Tool Notes
 

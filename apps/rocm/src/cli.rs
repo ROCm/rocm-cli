@@ -63,14 +63,18 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     ///
-    /// A `rocm_support` line is printed on every host, at one of three
-    /// levels: ROCm/HIP-supported, Vulkan-only, or unknown. Vulkan-only covers
-    /// a GPU that is recognized but has no ROCm build at all (`gfx90c`, the
-    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs), which still
-    /// works through Lemonade's Vulkan backend. Unknown covers both no GPU
-    /// detected and a target this build's catalog does not recognize: those
-    /// are detection gaps, not a verdict on the hardware, which is why an
-    /// empty `compatible_therock_family` does not read as a failed probe.
+    /// A `rocm_support` line is printed on every host, at one of five
+    /// levels: ROCm/HIP-supported, Vulkan-only, Vulkan-unconfirmed, no GPU
+    /// backend, or unknown. The three middle levels are decided by probing for
+    /// a Vulkan driver rather than by the gfx table: a GPU that is recognized
+    /// but has no ROCm build at all (`gfx90c`, the Vega iGPU in Renoir,
+    /// Lucienne, Cezanne and Barcelo APUs) runs through Lemonade's Vulkan
+    /// backend only if a driver is actually installed. Vulkan-unconfirmed means
+    /// the probe could not reach an answer, which is not the same as finding
+    /// none. Unknown covers both no GPU detected and a target this build's
+    /// catalog does not recognize: those are detection gaps, not a verdict on
+    /// the hardware, which is why an empty `compatible_therock_family` does not
+    /// read as a failed probe.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]

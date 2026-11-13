@@ -1252,6 +1252,7 @@ pub(crate) mod tests {
             detected_gfx_target: Some("gfx1201".to_owned()),
             compatible_therock_family: Some("gfx120X-all".to_owned()),
             detected_therock_family: None,
+            vulkan: None,
             driver: rocm_core::DriverSummary {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_missing".to_owned(),

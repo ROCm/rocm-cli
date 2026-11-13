@@ -1704,6 +1704,25 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
     }
 }
 
+/// The human-readable twin of the machine-readable planted-machine step, for
+/// scenarios whose subject is a sentence the report prints rather than a field
+/// it serialises.
+///
+/// It has to be its own step rather than reusing "the user inspects the
+/// system", because that one runs through `run_rocm`, which does not consume
+/// `World::command_env` -- so a planted host root never reaches the child and
+/// the CLI silently describes the *runner* instead. Not hypothetical: it is
+/// what made the first draft of examine-50/51/52 report the lane's own MI300X
+/// as `gfx942` while claiming to be about a Renoir APU.
+#[when("the user inspects that machine")]
+async fn user_inspects_planted_machine_text(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user inspects that machine in machine-readable form")]
 async fn user_inspects_planted_machine(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -3331,6 +3350,28 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
             "rocm serve <model>",
             &["rocm install sdk", "--engine lemonade"],
         ),
+        // The two probed Vulkan tiers land here too, and neither owes `--engine
+        // lemonade`: on both, nothing has established a backend that can serve
+        // this GPU, so naming an engine would promise a run the evidence does
+        // not support. A driver is what clears either condition.
+        //
+        // Split out because the catch-all below demands `--engine lemonade`,
+        // which neither tier's text contains. No lane reaches that assertion
+        // today only because none carries a detected, ROCm-unsupported GPU in
+        // these tiers; dropping these arms again makes the first such runner
+        // red rather than failing here. This arm has been lost to a merge once
+        // already.
+        //
+        // Told apart by each tier's own wording, as the catalog arm above is:
+        // `VulkanUnconfirmed` says the probe could not settle it, `NoGpuBackend`
+        // says it looked and found nothing.
+        (Some(_), None, _) if line.contains("could not confirm") => (
+            "install a Vulkan driver",
+            &["rocm install sdk", "--engine lemonade"],
+        ),
+        (Some(_), None, _) if line.contains("no Vulkan GPU driver was found") => {
+            ("install one", &["rocm install sdk", "--engine lemonade"])
+        }
         (Some(_), None, _) => (
             "rocm serve <model> --engine lemonade",
             &["rocm install sdk"],
@@ -3353,4 +3394,269 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
             "`{command}` cannot clear anything on this host: {line}\n{output}"
         );
     }
+}
+
+/// A KFD `gfx_target_version` naming gfx90c, the Vega iGPU in Renoir /
+/// Lucienne / Cezanne / Barcelo APUs.
+///
+/// The kernel packs the target as `major * 10000 + minor * 100 + step`, so
+/// `9.0.12` is `90012` and decodes to `gfx90c` (step 12 is the hex `c`). This
+/// is the one target the CLI recognizes *and* refuses to map to a ROCm package
+/// family, so it is what reaches the support level these scenarios are about.
+const KFD_GFX90C_TARGET_VERSION: &str = "90012";
+
+/// `vulkaninfo --summary` on a host whose Vega iGPU is driven by Mesa RADV.
+const RADV_VULKANINFO_SUMMARY: &str = "\
+Devices:
+========
+GPU0:
+\tapiVersion     = 1.3.274
+\tvendorID       = 0x1002
+\tdeviceID       = 0x1636
+\tdeviceType     = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+\tdeviceName     = AMD Radeon Graphics (RADV RENOIR)
+\tdriverID       = DRIVER_ID_MESA_RADV
+\tdriverName     = radv
+";
+
+/// `vulkaninfo --summary` on a host with only Mesa's CPU rasteriser: a complete
+/// Vulkan implementation, and not a GPU.
+const LAVAPIPE_VULKANINFO_SUMMARY: &str = "\
+Devices:
+========
+GPU0:
+\tapiVersion     = 1.3.255
+\tvendorID       = 0x10005
+\tdeviceType     = PHYSICAL_DEVICE_TYPE_CPU
+\tdeviceName     = llvmpipe (LLVM 15.0.7, 256 bits)
+\tdriverName     = llvmpipe
+";
+
+/// Plant a host whose GPU is identified but has no ROCm package family,
+/// carrying the Vulkan state the caller describes.
+///
+/// `icd_manifest` is the ICD file name the loader would find and
+/// `vulkaninfo_summary` what `vulkaninfo --summary` prints; `None` for either
+/// means that half of the evidence is absent.
+///
+/// The `vulkaninfo` stub is planted in **both** directions, because `PATH`
+/// still reaches the rest of the machine: a runner with a real `vulkaninfo`
+/// installed would otherwise answer for the fixture, and a scenario about a
+/// host with no Vulkan driver has to be hermetic about the host and not only
+/// about the planted root.
+///
+/// `None` plants a stub that **succeeds and reports no devices**, not one that
+/// fails. That distinction is the whole point of the `enumerated` input to
+/// `classify_vulkan_support`: a tool that exits non-zero answered nothing, and
+/// must leave the host `Inconclusive`, while one that runs and lists nothing is
+/// the genuine "looked and found none" that earns a confirmed `Absent`. The
+/// earlier `exit 1` stub pinned exactly the conflation this probe exists to
+/// avoid, so examine-51 passed for the wrong reason.
+fn plant_unsupported_gpu(
+    world: &mut E2eWorld,
+    icd_manifest: Option<&str>,
+    vulkaninfo_summary: Option<&str>,
+) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host_root = root.join("host-root");
+
+    let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        format!(
+            "cpu_cores_count 0\nsimd_count 56\ngfx_target_version {KFD_GFX90C_TARGET_VERSION}\n"
+        ),
+    )
+    .expect("failed to write planted KFD node properties");
+
+    if let Some(manifest) = icd_manifest {
+        let icd_dir = host_root.join("usr/share/vulkan/icd.d");
+        std::fs::create_dir_all(&icd_dir).expect("failed to create planted ICD dir");
+        std::fs::write(
+            icd_dir.join(manifest),
+            "{\"file_format_version\":\"1.0.0\",\"ICD\":{\"library_path\":\"libvulkan_fake.so\"}}\n",
+        )
+        .expect("failed to write planted ICD manifest");
+    }
+
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    // The same empty-bus `lspci` the other GPU fixtures plant: the probe must
+    // succeed without describing the runner's real cards.
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let vulkaninfo = match vulkaninfo_summary {
+        Some(summary) => format!("#!/bin/sh\ncat <<'ROCM_E2E_EOF'\n{summary}ROCM_E2E_EOF\n"),
+        // Exit 0 with an empty `Devices:` section: the tool answered, and the
+        // answer is "none". See this function's doc comment.
+        None => "#!/bin/sh\nprintf 'Devices:\\n=======\\n'\nexit 0\n".to_owned(),
+    };
+    rocm_core::fake_executable::write_fake_executable(&bin.join("vulkaninfo"), &vulkaninfo)
+        .expect("failed to write the fake vulkaninfo");
+
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+#[given("a machine whose GPU has no official support but has a working Vulkan driver")]
+async fn unsupported_gpu_with_vulkan(world: &mut E2eWorld) {
+    plant_unsupported_gpu(
+        world,
+        Some("radeon_icd.x86_64.json"),
+        Some(RADV_VULKANINFO_SUMMARY),
+    );
+}
+
+#[given("a machine whose GPU has no official support and no Vulkan driver")]
+async fn unsupported_gpu_without_vulkan(world: &mut E2eWorld) {
+    plant_unsupported_gpu(world, None, None);
+}
+
+/// The *common* no-driver shape, and the one examine-51 does not cover: a host
+/// with no ICD and no `vulkaninfo` to ask. The probe must then report that it
+/// could not confirm, rather than either promising Vulkan or declaring it absent.
+///
+/// Deleting the planted stub is not enough on its own, and doing only that would
+/// contradict `plant_unsupported_gpu`'s own "planted in both directions" reason:
+/// that function leaves the runner's `PATH` on the end, so a CI host with a real
+/// `vulkaninfo` installed would answer for the fixture and this scenario would
+/// describe the runner rather than the planted machine. So `PATH` is narrowed to
+/// the fake directory as well. `lspci` stays in it, and the fake executables are
+/// `#!/bin/sh` scripts reached by absolute path, so nothing else the probe needs
+/// is lost — only the ability to find a `vulkaninfo` anywhere.
+#[given("a machine whose GPU has no official support and no way to check Vulkan")]
+async fn unsupported_gpu_without_vulkaninfo(world: &mut E2eWorld) {
+    plant_unsupported_gpu(world, None, None);
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::remove_file(bin.join("vulkaninfo")).expect("failed to remove the planted vulkaninfo");
+    // Pushed after `plant_unsupported_gpu`'s own entry: `command_env` is applied
+    // in order, so this is the `PATH` the child sees.
+    let path =
+        std::env::join_paths(std::iter::once(bin)).expect("fake-bin cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[then("the inspection says it could not confirm whether a Vulkan driver is there")]
+async fn assert_vulkan_unconfirmed(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let line = rocm_support_line(output).expect("no rocm_support line");
+    assert!(
+        line.contains("`vulkaninfo` could not confirm"),
+        "the support line must name the gap that stopped it confirming, not assert \
+         a driver is absent: {line}\n{output}"
+    );
+    assert!(
+        !line.contains("Vulkan backend") && !line.contains("runs on"),
+        "and it must not promise a Vulkan path it never established: {line}\n{output}"
+    );
+}
+
+#[given("a machine whose GPU has no official support and only a software renderer")]
+async fn unsupported_gpu_with_software_renderer(world: &mut E2eWorld) {
+    plant_unsupported_gpu(
+        world,
+        Some("lvp_icd.x86_64.json"),
+        Some(LAVAPIPE_VULKANINFO_SUMMARY),
+    );
+}
+
+#[then("the inspection reports the GPU as unsupported by the official stack")]
+async fn assert_gpu_unsupported_by_rocm(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("rocm_support:") && output.contains("not supported by ROCm"),
+        "the inspection must say the GPU was identified and has no ROCm build:\n{output}"
+    );
+}
+
+#[then("the inspection reports that models can still run through Vulkan")]
+async fn assert_vulkan_offered(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("the Vulkan backend can be used"),
+        "a host with a working Vulkan device must be told so:\n{output}"
+    );
+    assert!(
+        output.contains("vulkan: available"),
+        "the machine-readable line must agree with the sentence:\n{output}"
+    );
+}
+
+#[then("the inspection names the Vulkan driver it found")]
+async fn assert_vulkan_driver_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    // The driver the planted device reported, not a guess from the ICD file
+    // name: naming it is what lets a reader check the claim.
+    //
+    // Asserted on the `rocm_support` line specifically, not the whole output.
+    // The `vulkan:` evidence line also carries the driver name, so a plain
+    // `output.contains("radv")` passed even when the support sentence — the
+    // half that actually makes the claim — named nothing at all.
+    let line = rocm_support_line(output).expect("no rocm_support line");
+    assert!(
+        line.contains("radv"),
+        "the support sentence itself must name the driver, not just the \
+         evidence line: {line}\n{output}"
+    );
+}
+
+#[then("the inspection does not claim models can run through Vulkan")]
+async fn assert_vulkan_not_promised(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        !output.contains("the Vulkan backend can be used"),
+        "a host with no usable Vulkan GPU must not be promised one:\n{output}"
+    );
+    assert!(
+        !output.contains("Vulkan backend is expected to work"),
+        "a host with no usable Vulkan GPU must not be promised one:\n{output}"
+    );
+}
+
+#[then("the inspection says no Vulkan driver was found")]
+async fn assert_no_vulkan_driver_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("no Vulkan GPU driver was found"),
+        "the inspection must say why no GPU path is open:\n{output}"
+    );
+    assert!(
+        output.contains("install one"),
+        "the advice must be able to clear the condition it is printed for:\n{output}"
+    );
+}
+
+#[then("the inspection says the only renderer it found runs on the CPU")]
+async fn assert_software_renderer_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("not a GPU path"),
+        "a CPU rasteriser must be named as such, not counted as a GPU:\n{output}"
+    );
+    // The support level must agree, not just the evidence line. Without this the
+    // scenario still passed when `gpu_support_level` ignored the probe entirely:
+    // the absence of a Vulkan promise was coming from the status wording alone,
+    // so nothing here held the classification itself.
+    assert!(
+        output.contains("no Vulkan GPU driver was found"),
+        "a host whose only renderer is the CPU has no GPU backend, and the support \
+         line must say so:\n{output}"
+    );
 }

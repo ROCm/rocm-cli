@@ -752,3 +752,60 @@ Feature: GPU detection and system inspection
     Then the inspection states this host's ROCm support level
     And the support level agrees with the GPU the inspection detected
     And the support level leaves a command that fits this host
+
+  # The three below close the gap this PR's own notes call unclosable: the
+  # `VulkanOnly` door needs a Renoir/Cezanne Vega APU, and no runner has one.
+  # It does not need the hardware, only the two signals the CLI reads for it --
+  # a KFD node naming the target, and the host's Vulkan driver state -- both of
+  # which the harness can plant. So these run on the ungated mock lane, which is
+  # the lane that has neither.
+  #
+  # They exist because the support level used to be inferred: "no ROCm build"
+  # was taken to mean "Vulkan then", on a machine nobody had looked at. Each
+  # scenario pins one of the three answers that inference could not tell apart.
+  @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
+  Scenario: examine-50 - A GPU the official stack rejects is told which way it can still run models
+    Given a machine whose GPU has no official support but has a working Vulkan driver
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection reports that models can still run through Vulkan
+    And the inspection names the Vulkan driver it found
+
+  @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
+  Scenario: examine-51 - A machine with no way to run models is not told it has one
+    Given a machine whose GPU has no official support and no Vulkan driver
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not claim models can run through Vulkan
+    And the inspection says no Vulkan driver was found
+
+  # A software renderer is a complete Vulkan implementation that runs on the
+  # CPU. Counting it would put a GPU-required run on the processor while
+  # reporting a GPU path - the one outcome the no-fallback rule exists to
+  # prevent, reached through a backend rather than a policy change.
+  @id:examine-does-not-count-a-software-renderer-as-a-gpu-path @requires-os:linux
+  Scenario: examine-52 - A software renderer does not count as a way to run on the GPU
+    Given a machine whose GPU has no official support and only a software renderer
+    When the user inspects that machine
+    Then the inspection does not claim models can run through Vulkan
+    And the inspection says the only renderer it found runs on the CPU
+
+  # The shape examine-51 does not reach. examine-51 plants a `vulkaninfo` that
+  # runs and reports no devices, which is the only shape that earns a confirmed
+  # absence; this host has no `vulkaninfo` to ask at all, and must be told the
+  # check could not be made rather than either promised Vulkan or declared to
+  # have nothing.
+  #
+  # Known gap, measured rather than assumed: a real `vulkaninfo` on a Linux host
+  # with no reachable driver does NOT produce examine-51's shape. It prints
+  # "Found no drivers!" and exits 1, which this probe classifies as
+  # inconclusive — so such a host lands at *this* scenario's level rather than
+  # examine-51's. Telling "no drivers" apart from "the tool is broken" needs the
+  # loader's own message, which the shared capture discards.
+  @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
+  Scenario: examine-53 - A machine that cannot be checked for Vulkan is not told either way
+    Given a machine whose GPU has no official support and no way to check Vulkan
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not claim models can run through Vulkan
+    And the inspection says it could not confirm whether a Vulkan driver is there

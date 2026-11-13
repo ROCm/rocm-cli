@@ -188,6 +188,26 @@ Proposal: the summary stack's inventory survives and `probe_gpus_windows` builds
 
 Hosts: this pair is native Windows only; on WSL `gpus[]` is already empty (see the host table), so rebuilding it from the inventory changes nothing there. The characterisation test covers an inventory that answers with one AMD adapter, with an AMD and an NVIDIA adapter, with an NVIDIA adapter only, with no adapter, that fails, and that times out, because `None` in the summary and an empty `gpus[]` with a `probe_failures` entry in the examination are different answers to "no adapter" and "could not ask", and the convergence must keep that distinction.
 
+## Vulkan support
+
+Verdict: not a duplicate — only the summary stack reads it — but it is a spawned process on a path that several commands reach, so it belongs in this note.
+
+`detect_vulkan_support` in [vulkan.rs](../crates/rocm-core/src/host_gpu/vulkan.rs) answers two questions: which ICD manifests the loader would find, and which devices actually enumerate.
+
+| | Linux | Windows |
+|---|---|---|
+| ICDs | the manifest directories, read from the filesystem | `powershell` over the Khronos `Drivers` registry keys |
+| Devices | `vulkaninfo --summary` | the same registry read; `vulkaninfo` is rarely on PATH |
+| Timeout | 1.5 s (`OPTIONAL_COMMAND_TIMEOUT`), per candidate spelling | the same 1.5 s, which a cold PowerShell start can exceed |
+| Failure | `None` from `capture_optional_command`, which does not distinguish "not installed" from "timed out" | the same |
+| Lookup ran? | always true: reading directories that may not exist is still a lookup | `false` whenever `powershell` is missing, exits non-zero or times out |
+
+The last row is `icds_listed`, the ICD-side counterpart of the `enumerated` flag that `vulkan_devices_from_capture` returns for `vulkaninfo`. Both say whether that source *answered*, and `classify_vulkan_support` requires both before it will report an empty result as a confirmed absence. On a platform that is neither Linux nor Windows the flag is `false` — there is nothing to read there — though the classifier never consults it, since `vulkan_is_probeable()` returns `Unknown` first.
+
+Who pays it. The probe runs once per full gather, so every caller of `ExamineSummary::gather` pays one: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'s host snapshot, MCP and sandbox paths. It is deliberately *not* run by the lean scope, `gather_without_driver_facts`, which the runtime-install finalizer uses to read the GPU target and nothing else; that scope leaves `vulkan` as `None` and `vulkan_status` reports `Unknown`. `the_summary_without_driver_facts_does_not_probe_vulkan` pins that, so restoring an unconditional probe fails a test rather than quietly adding a process to the install path.
+
+What a user can see: on a Windows host whose PowerShell start is slower than 1.5 s, the probe times out and the host reads Vulkan-unconfirmed rather than Vulkan-capable. It is no longer told the *same thing* as a host with a genuinely empty registry key, which is what `icds_listed` buys: the timed-out host is told the driver list could not be read, never that no driver was found, and it can no longer reach `Absent` at all. The collapse that remains is inside `capture_optional_command`, which still cannot say *which* failure it was ("not installed" and "timed out" are one `None`), so the sentence names the possibilities rather than the cause. `windows_icds_from_capture` is the pure seam where that `None` is turned into "did not answer", and it is unit-tested on every platform; the registry read itself still has no gate but CI's `windows-build-and-test`.
+
 ## Marketing name to gfx target
 
 Verdict: confirmed duplicate, but not equivalent. The two cover different names.

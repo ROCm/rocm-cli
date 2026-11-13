@@ -1086,6 +1086,40 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         rocm_core::GpuSupportLevel::RocmHip => {
             "default embedded Lemonade server with ROCm llama.cpp backend"
         }
+        // Looked at and inconclusive. Says the same "no ROCm/HIP" fact as the
+        // arm below, but stops short of its claim about Vulkan, because
+        // nothing here established it either way.
+        //
+        // Reached by every caller that passes a real `VulkanStatus`, which is
+        // `rocm examine` *and* `build_codex_bridge_snapshot` (the
+        // `InternalBridgeSnapshot` command and the MCP `bridge_snapshot` tool),
+        // which builds the level from `examine.vulkan_status()` rather than the
+        // cheap `host_gpu_support_level`. The MCP `engines` tool is deliberately
+        // NOT in that list: it goes through `host_gpu_support_level`, which
+        // always passes `VulkanStatus::Unknown`, so it can never land on these
+        // two arms.
+        //
+        // So the advice cannot be "run `rocm examine`": this very note is
+        // rendered *inside* that command's own output, through
+        // `examine_human_report` -> `append_examine_engine_inventory`, and told
+        // its reader to run the command they were already reading. It names the
+        // thing that would actually settle the question instead.
+        //
+        // That thing is NOT "install `vulkaninfo`", for the reason the matching
+        // arm in `host_gpu::render` spells out: on a real driverless Linux host
+        // the tool is already installed, prints "Found no drivers!" and exits 1,
+        // which is exactly what lands here. Both strings appear in the same
+        // `rocm examine` report, so advising that install would contradict the
+        // `rocm_support:` line a few lines above it.
+        rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
+             Vulkan driver is present could not be determined - install a Vulkan driver (Mesa \
+             RADV on Linux, the AMD display driver on Windows) to run models on this GPU, and \
+             run `vulkaninfo` yourself to see what it says"
+        }
+        rocm_core::GpuSupportLevel::NoGpuBackend => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
+        }
         rocm_core::GpuSupportLevel::Unknown => {
             "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
         }
@@ -1098,8 +1132,21 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
 /// The same two inputs `rocm examine` derives it from, read through
 /// `detect_host_gpu_summary` rather than the full examine gather — exactly what
 /// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
+///
+/// **The Vulkan probe is deliberately not run here**, so this stays the cheap
+/// probe its callers chose it for: the probe spawns `vulkaninfo` on Linux and
+/// PowerShell on Windows, and `rocm engines` is a listing command that would
+/// pay that on every invocation. Passing [`VulkanStatus::Unknown`] keeps these
+/// surfaces answering exactly as they did before this probe existed — a
+/// Vulkan-capable-by-the-table host still reads `VulkanOnly` — while `rocm
+/// examine`, which already gathers the probe, is the surface that can tell a
+/// host with a Vulkan driver from one without. That split is why
+/// `lemonade_engine_note` sends the user to `rocm examine` for a real answer.
 pub(crate) fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
-    rocm_core::gpu_support_level_for_host_gpu(&rocm_core::detect_host_gpu_summary(paths))
+    rocm_core::gpu_support_level_for_host_gpu(
+        &rocm_core::detect_host_gpu_summary(paths),
+        rocm_core::VulkanStatus::Unknown,
+    )
 }
 
 fn refresh_startup_update_check_quietly() {
