@@ -137,6 +137,7 @@ See [Commit signatures](https://github.com/ROCm/rocm-cli/blob/main/docs/commit-s
 - No secrets, credentials, or internal hostnames in committed files
 - Third-party dependencies recorded in `Cargo.lock`
 - License headers on new source files (see `licenserc.toml`)
+- Comments and documentation that state how the code behaves are checked against that code, and one that is the reason for a decision names the file and the function, constant or test that makes it true, as AGENTS.md section 3 states
 
 ## Reporting security issues
 
