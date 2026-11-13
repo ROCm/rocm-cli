@@ -137,7 +137,8 @@ pub struct HostCapability {
     /// What `serve` picks with no `--engine` on this host (re-implemented rule).
     pub effective_serve_engine: String,
     /// Stable platform identity derived from hardware, not from an artifact name:
-    /// "mock" (no AMD GPU), else the family/target (e.g. "mi300x", "strix-halo").
+    /// "mock" / "mock-windows" (no AMD GPU), else the family/target (e.g.
+    /// "mi300x", "strix-halo").
     pub platform_slug: String,
     /// Whether the `rocm` binary under test carries the test-only
     /// `e2e-oom-fault-injection` hook, so `@requires-oom-fault-injection`
@@ -725,7 +726,8 @@ fn parse_engines_list(text: &str) -> Vec<String> {
 
 /// Stable platform identity from hardware and host environment. WSL is a
 /// distinct platform even without a GPU, so its report never collides with the
-/// ordinary hosted mock column. Otherwise no AMD GPU → "mock"; GPU hosts use a
+/// ordinary hosted mock column. Otherwise no AMD GPU → "mock" ("mock-windows"
+/// on Windows, the hosted Windows lane's own column); GPU hosts use a
 /// coarse slug from the gfx family (data-center → "mi300x"; Strix gfx115x →
 /// "strix-halo"), falling back to the normalized family. The OS is appended for
 /// families that ship on more than one OS (Strix Halo runs both Ubuntu and
@@ -744,7 +746,12 @@ fn derive_platform_slug(
         };
     }
     if !has_amd_gpu {
-        return "mock".to_owned();
+        // The hosted Windows lane has no GPU either; give it its own column.
+        return if os_normalized(os_family) == "windows" {
+            "mock-windows".to_owned()
+        } else {
+            "mock".to_owned()
+        };
     }
     match gfx_target {
         Some(t) => {
@@ -1037,6 +1044,11 @@ Local model engines
     #[test]
     fn platform_slug_derivation() {
         assert_eq!(derive_platform_slug(false, None, "other", false), "mock");
+        // The hosted Windows lane must not collide with the hosted Linux one.
+        assert_eq!(
+            derive_platform_slug(false, None, "windows", false),
+            "mock-windows"
+        );
         // gfx950 normalizes to a `-dcgpu` family like gfx94x does, but it is a
         // different part with its own lane and report column — it must not be
         // slugged as mi300x.
