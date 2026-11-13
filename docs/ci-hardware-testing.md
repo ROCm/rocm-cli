@@ -348,6 +348,45 @@ guessed platform on Linux, which would report a Windows lane as Linux;
 `xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
 against it.
 
+## GPU visibility on the hardware pool
+
+A hardware job does not necessarily get every GPU its host has. On the
+self-hosted pool, and on the shared GPU queue's Linux pods
+([nightly-on-the-queue.md](nightly-on-the-queue.md)), the PCI bus listing
+(`lspci`, `/sys/bus/pci`, and possibly `/sys/class/drm`) describes the whole
+host, while the kernel's compute topology
+(`/sys/class/kfd/kfd/topology/nodes`) and the render nodes
+(`/dev/dri/renderD*`) describe only the GPUs this job may use. Lanes have
+been observed with eight AMD GPUs on the bus and one GPU node and one render
+node reachable. How many a job gets is a property of the runner, not of the
+change under test, and can differ between lanes and over time.
+
+Write a GPU-count assertion against what the job can reach, never against
+the bus:
+
+- compare against the KFD GPU nodes (nodes whose `properties` file reports a
+  nonzero `gfx_target_version`), or against the AMD entries in
+  `rocm examine --json`'s `gpus[]`, which is that set whenever KFD reports at
+  least one GPU node: `examine` matches the kernel's GPU nodes to the PCI scan
+  by address;
+- do not assert that the bus count equals the reachable count, in either
+  direction: AMD devices on the bus that the kernel does not expose appear
+  only in a `notes` entry, not in `gpus[]`, and a partitioned Instinct shows
+  several GPU nodes for one PCI address;
+- derive the expected number from the host at run time rather than
+  hard-coding it, and gate a premise of more than one GPU with
+  `@requires-multi-gpu`, which counts the same KFD GPU nodes (falling back
+  to the amdgpu DRM cards only where KFD reports none, as on Strix Halo).
+
+examine-17 (`@id:examine-lists-every-gpu-with-its-address-and-target` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature), step
+`assert_gpus_match_kfd_nodes` in
+[examine_steps.rs](../tests/e2e-cucumber/tests/e2e/examine_steps.rs)) is the
+worked example; the product side is `apply_kernel_gpu_membership` in
+[linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs). A red lane
+where the bus and the kernel disagree is the environment, not a regression:
+re-express the assertion, do not tag it out or weaken it.
+
 ## Engine is not an independently selectable axis
 
 None of the tables above vary the serve engine as a matrix dimension, because

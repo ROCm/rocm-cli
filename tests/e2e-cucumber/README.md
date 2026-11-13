@@ -257,6 +257,9 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
    dev-dependency the library target can't reach). See
    [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
    and [`fake-tailscale`](src/bin/fake-tailscale.rs) for the pattern.
+7. If a step asserts a GPU count, compare it against the GPUs the job can
+   reach, not the cards on the PCI bus: see
+   [GPU visibility on the hardware pool](../../docs/ci-hardware-testing.md#gpu-visibility-on-the-hardware-pool).
 
 ## Design principles
 
