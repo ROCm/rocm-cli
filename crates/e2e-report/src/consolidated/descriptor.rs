@@ -128,6 +128,13 @@ const KNOWN_PLATFORMS: &[KnownPlatform] = &[
         os: "Linux",
         slugs: &["mock"],
     },
+    // The GitHub-hosted Windows lane: no GPU, native Windows.
+    KnownPlatform {
+        artifact: "e2e-windows-report",
+        platform: "Mock",
+        os: "Windows",
+        slugs: &["mock-windows"],
+    },
     KnownPlatform {
         artifact: "e2e-gpu-report",
         platform: "MI300X",
@@ -275,6 +282,7 @@ mod tests {
     fn parse_descriptor_maps_known_artifacts() {
         for (name, platform, os) in [
             ("e2e-report", "Mock", "Linux"),
+            ("e2e-windows-report", "Mock", "Windows"),
             ("e2e-gpu-report", "MI300X", "Linux"),
             ("e2e-gpu-rad3-report", "R9700", "Linux"),
             ("e2e-gpu-mi350p-report", "MI350P", "Linux"),
@@ -404,6 +412,7 @@ mod tests {
         // values the harness writes and the artifact names the workflows upload.
         for (slug, artifact) in [
             ("mock", "e2e-report"),
+            ("mock-windows", "e2e-windows-report"),
             ("mi300x", "e2e-gpu-report"),
             ("gfx1201", "e2e-gpu-rad3-report"),
             ("mi350p", "e2e-gpu-mi350p-report"),

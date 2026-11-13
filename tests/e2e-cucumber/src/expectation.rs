@@ -38,6 +38,7 @@ const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
 const MERGE_QUEUE_TAG: &str = "merge-queue";
+const GPU_SMOKE_TAG: &str = "gpu-smoke";
 
 // `@serial` deliberately has no entry here, and `from_tags` below silently
 // ignores it like any other unrecognized tag: it isn't an expectation-
@@ -240,6 +241,10 @@ pub struct ScenarioDecl {
     /// lanes run in the merge queue; the native Linux GPU lanes (MI300X, W7900,
     /// Strix Ubuntu) do not.
     pub merge_queue: bool,
+    /// `@gpu-smoke`: one of the cheap per-engine real-GPU canaries that still
+    /// run on a pull request and in the merge queue, where a GPU lane runs no
+    /// other real-GPU scenario (`E2E_GPU_SMOKE_ONLY`, see [`restrict_to_lane`]).
+    pub gpu_smoke: bool,
 }
 
 impl ScenarioDecl {
@@ -273,6 +278,7 @@ impl ScenarioDecl {
         let mut nightly = false;
         let mut lifecycle = false;
         let mut merge_queue = false;
+        let mut gpu_smoke = false;
         for tag in tags {
             let tag = tag
                 .as_ref()
@@ -315,6 +321,8 @@ impl ScenarioDecl {
                 lifecycle = true;
             } else if tag == MERGE_QUEUE_TAG {
                 merge_queue = true;
+            } else if tag == GPU_SMOKE_TAG {
+                gpu_smoke = true;
             }
         }
         Self {
@@ -335,6 +343,7 @@ impl ScenarioDecl {
             nightly,
             lifecycle,
             merge_queue,
+            gpu_smoke,
         }
     }
 
@@ -794,6 +803,131 @@ pub fn unmatched_also_run_ids<'a>(extra_ids: &'a [String], known_ids: &[String])
         .filter(|id| !known_ids.contains(*id))
         .map(String::as_str)
         .collect()
+}
+
+/// Which part of the suite a lane runs, beyond what the host can run at all.
+///
+/// Both default to `false`: a lane runs everything its host can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaneSelection {
+    /// `E2E_GPU_ONLY`: a self-hosted GPU lane runs only the scenarios that need
+    /// the real hardware it has. Everything else runs on the GitHub-hosted
+    /// Linux and Windows lanes, where a GPU runner's time is not spent on it.
+    pub gpu_only: bool,
+    /// `E2E_GPU_SMOKE_ONLY`: on a pull request and in the merge queue, a GPU
+    /// lane's real-GPU scenarios narrow further to the `@gpu-smoke` canaries
+    /// (and, in the queue, the `@merge-queue` serves).
+    pub smoke_only: bool,
+}
+
+impl LaneSelection {
+    /// The variable a self-hosted GPU lane sets to run only its GPU scenarios.
+    pub const GPU_ONLY_ENV: &'static str = "E2E_GPU_ONLY";
+    /// The variable a lane sets on a pull request and in the merge queue to
+    /// narrow its real-GPU scenarios to the smoke test.
+    pub const SMOKE_ONLY_ENV: &'static str = "E2E_GPU_SMOKE_ONLY";
+
+    /// Parse the two switches; each is off when unset, empty or `0` (the
+    /// workflows' expression yields `''` off its events) and on when `1`.
+    ///
+    /// Anything else is an error rather than a fallback, as for
+    /// [`HardwareMode::parse`]: a lane that wrote `true` would otherwise run
+    /// the full suite on a GPU runner and still go green.
+    pub fn parse(gpu_only: Option<&str>, smoke_only: Option<&str>) -> Result<Self, String> {
+        let flag = |name: &str, value: Option<&str>| match value.map(str::trim) {
+            None | Some("" | "0") => Ok(false),
+            Some("1") => Ok(true),
+            Some(other) => Err(format!(
+                "{name}={other:?} is not a switch; use `1` or leave it unset"
+            )),
+        };
+        Ok(Self {
+            gpu_only: flag(Self::GPU_ONLY_ENV, gpu_only)?,
+            smoke_only: flag(Self::SMOKE_ONLY_ENV, smoke_only)?,
+        })
+    }
+
+    /// The selection this process runs with, read from [`Self::GPU_ONLY_ENV`]
+    /// and [`Self::SMOKE_ONLY_ENV`].
+    ///
+    /// # Panics
+    ///
+    /// On a value [`LaneSelection::parse`] rejects, including one that is not
+    /// valid Unicode: a lane must never run a share of the suite it did not
+    /// ask for.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_vars(|name| std::env::var_os(name))
+    }
+
+    /// [`LaneSelection::from_env`] over any source of variables, so the name
+    /// each switch is read from can be tested without touching the process
+    /// environment.
+    fn from_vars(read: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        let read = |name: &str| {
+            read(name).map(|value| {
+                value.into_string().unwrap_or_else(|raw| {
+                    panic!(
+                        "{name}={} is not valid Unicode, so it is not a switch; use `1` or \
+                         leave it unset",
+                        raw.display()
+                    )
+                })
+            })
+        };
+        Self::parse(
+            read(Self::GPU_ONLY_ENV).as_deref(),
+            read(Self::SMOKE_ONLY_ENV).as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"))
+    }
+}
+
+/// Whether a scenario needs the real GPU of the machine it runs on — a usable
+/// device (`@requires-gpu` or `@requires-real-gpu`, see
+/// [`ScenarioDecl::needs_gpu`]), or a detected chip name — as opposed to
+/// running anywhere, simulated machines included.
+///
+/// Built on `needs_gpu` rather than `requires_gpu`, so a declaration carrying
+/// only `requires_real_gpu` still counts: left out, it would be skipped by
+/// every GPU lane and run on none.
+const fn needs_real_gpu(decl: &ScenarioDecl) -> bool {
+    decl.needs_gpu() || decl.requires_gfx_target
+}
+
+/// Narrow a scenario's resolution to what this lane runs (see [`LaneSelection`]).
+///
+/// A scenario outside the lane's share resolves to `Skip` with the reason
+/// recorded, so the report shows it as not applicable on that lane rather than
+/// as a result that never arrived. An expectation that already resolved to
+/// `Skip` keeps its own, more precise reason.
+#[must_use]
+pub fn restrict_to_lane(
+    decl: &ScenarioDecl,
+    expectation: Expectation,
+    lane: LaneSelection,
+) -> Expectation {
+    if matches!(expectation, Expectation::Skip { .. }) {
+        return expectation;
+    }
+    let real_gpu = needs_real_gpu(decl);
+    if lane.gpu_only && !real_gpu {
+        return Expectation::Skip {
+            reason: "this GPU lane runs only scenarios that need its GPU (E2E_GPU_ONLY); \
+                     the rest run on the GitHub-hosted Linux and Windows lanes"
+                .to_owned(),
+        };
+    }
+    if lane.smoke_only && real_gpu && !decl.gpu_smoke && !decl.merge_queue {
+        return Expectation::Skip {
+            reason: "on a pull request and in the merge queue this lane runs only the \
+                     @gpu-smoke canaries (and, in the queue, the @merge-queue serves) of \
+                     the scenarios that need a GPU (E2E_GPU_SMOKE_ONLY); other events run \
+                     the rest"
+                .to_owned(),
+        };
+    }
+    expectation
 }
 
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
@@ -2784,5 +2918,181 @@ flaky = true
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_gpu_lane_runs_only_its_gpu_scenarios_narrowed_to_the_smoke_test_on_prs() {
+        let xfail = || Expectation::ExpectXfail {
+            bug: "B-1".to_owned(),
+            reason: "known".to_owned(),
+            flaky: false,
+        };
+        let canary = decl(&["id:serve-vllm", "requires-real-gpu", "gpu-smoke"]);
+        let queue_serve = decl(&["id:serve-default", "requires-real-gpu", "merge-queue"]);
+        let heavy = decl(&["id:runtime-install", "requires-real-gpu"]);
+        let gfx = decl(&["id:runtime-resolve", "requires-gfx-target"]);
+        let no_gpu = decl(&["id:examine-version"]);
+        let simulated = decl(&["id:examine-detects-wsl", "requires-os:linux"]);
+        let skip_reason = |e: Expectation| match e {
+            Expectation::Skip { reason } => reason,
+            other => panic!("expected skip, got {other:?}"),
+        };
+
+        let gpu_lane = LaneSelection {
+            gpu_only: true,
+            smoke_only: false,
+        };
+        // A GPU lane leaves everything that needs no GPU, simulated machines
+        // included, to the hosted lanes — and says so.
+        for d in [&no_gpu, &simulated] {
+            assert!(
+                skip_reason(restrict_to_lane(d, Expectation::ExpectPass, gpu_lane))
+                    .contains("E2E_GPU_ONLY")
+            );
+        }
+        // It keeps every scenario that needs its hardware, resolution intact.
+        for d in [&canary, &queue_serve, &heavy, &gfx] {
+            assert_eq!(restrict_to_lane(d, xfail(), gpu_lane), xfail());
+        }
+
+        let pr_gpu_lane = LaneSelection {
+            gpu_only: true,
+            smoke_only: true,
+        };
+        // On a pull request only the canaries and the queue serves remain.
+        assert_eq!(restrict_to_lane(&canary, xfail(), pr_gpu_lane), xfail());
+        assert_eq!(
+            restrict_to_lane(&queue_serve, Expectation::ExpectPass, pr_gpu_lane),
+            Expectation::ExpectPass
+        );
+        for d in [&heavy, &gfx] {
+            assert!(
+                skip_reason(restrict_to_lane(d, xfail(), pr_gpu_lane))
+                    .contains("E2E_GPU_SMOKE_ONLY")
+            );
+        }
+
+        // A lane that sets only the smoke switch (the WSL lane, whose GPU
+        // passthrough is advisory) keeps its non-GPU scenarios.
+        let smoke_only = LaneSelection {
+            gpu_only: false,
+            smoke_only: true,
+        };
+        assert_eq!(
+            restrict_to_lane(&no_gpu, Expectation::ExpectPass, smoke_only),
+            Expectation::ExpectPass
+        );
+        // A skip that already happened keeps its own, more precise reason.
+        let skip = Expectation::Skip {
+            reason: "requires os 'linux'".to_owned(),
+        };
+        assert_eq!(restrict_to_lane(&no_gpu, skip.clone(), pr_gpu_lane), skip);
+        // A lane with no selection changes nothing.
+        assert_eq!(
+            restrict_to_lane(&heavy, Expectation::ExpectPass, LaneSelection::default()),
+            Expectation::ExpectPass
+        );
+    }
+
+    /// The switches accept exactly what the workflows write — `1` on, `''` off
+    /// their events — and refuse anything else instead of ignoring it.
+    #[test]
+    fn lane_selection_reads_its_switches_strictly() {
+        assert_eq!(
+            LaneSelection::parse(None, None),
+            Ok(LaneSelection::default())
+        );
+        assert_eq!(
+            LaneSelection::parse(Some("1"), Some("")),
+            Ok(LaneSelection {
+                gpu_only: true,
+                smoke_only: false,
+            })
+        );
+        assert_eq!(
+            LaneSelection::parse(Some("0"), Some("1")),
+            Ok(LaneSelection {
+                gpu_only: false,
+                smoke_only: true,
+            })
+        );
+        let err = LaneSelection::parse(Some("true"), None).expect_err("`true` is not a switch");
+        assert!(err.contains("E2E_GPU_ONLY"), "{err}");
+        let err = LaneSelection::parse(None, Some("yes")).expect_err("`yes` is not a switch");
+        assert!(err.contains("E2E_GPU_SMOKE_ONLY"), "{err}");
+        // A valid first switch does not hide a bad second one.
+        let err = LaneSelection::parse(Some("1"), Some("on")).expect_err("`on` is not a switch");
+        assert!(err.contains("E2E_GPU_SMOKE_ONLY"), "{err}");
+        // Surrounding whitespace from a YAML value is not an error.
+        assert_eq!(
+            LaneSelection::parse(Some(" 1 "), Some(" ")),
+            Ok(LaneSelection {
+                gpu_only: true,
+                smoke_only: false,
+            })
+        );
+    }
+
+    /// Each switch is read from its own variable: a swapped or misspelt name
+    /// would leave a lane running a share of the suite it did not set.
+    #[test]
+    fn lane_selection_reads_each_switch_from_its_own_variable() {
+        let vars = |gpu_only: Option<&'static str>, smoke_only: Option<&'static str>| {
+            move |name: &str| match name {
+                "E2E_GPU_ONLY" => gpu_only.map(std::ffi::OsString::from),
+                "E2E_GPU_SMOKE_ONLY" => smoke_only.map(std::ffi::OsString::from),
+                other => panic!("read an unexpected variable {other}"),
+            }
+        };
+        assert_eq!(
+            LaneSelection::from_vars(vars(Some("1"), None)),
+            LaneSelection {
+                gpu_only: true,
+                smoke_only: false,
+            }
+        );
+        assert_eq!(
+            LaneSelection::from_vars(vars(None, Some("1"))),
+            LaneSelection {
+                gpu_only: false,
+                smoke_only: true,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "E2E_GPU_ONLY=\"true\" is not a switch")]
+    fn lane_selection_aborts_on_a_switch_it_does_not_recognise() {
+        let _ = LaneSelection::from_vars(|name| {
+            (name == "E2E_GPU_ONLY").then(|| std::ffi::OsString::from("true"))
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "is not valid Unicode")]
+    fn lane_selection_aborts_on_a_switch_that_is_not_unicode() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let _ = LaneSelection::from_vars(|name| {
+            (name == "E2E_GPU_SMOKE_ONLY").then(|| std::ffi::OsString::from_vec(vec![0x31, 0xff]))
+        });
+    }
+
+    /// Like the GPU gate, the lane split reads the implication itself rather
+    /// than trusting `from_tags` to have set `requires_gpu` too: a declaration
+    /// carrying only `requires_real_gpu` would otherwise be skipped by every
+    /// GPU lane as needing no GPU, and run on no lane at all.
+    #[test]
+    fn requires_real_gpu_alone_stays_on_a_gpu_lane() {
+        let mut d = decl(&["id:x", "requires-real-gpu"]);
+        d.requires_gpu = false;
+        let gpu_lane = LaneSelection {
+            gpu_only: true,
+            smoke_only: false,
+        };
+        assert_eq!(
+            restrict_to_lane(&d, Expectation::ExpectPass, gpu_lane),
+            Expectation::ExpectPass
+        );
     }
 }

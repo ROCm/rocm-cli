@@ -201,6 +201,7 @@ mod tests {
     /// entries.
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
+        "e2e-windows-report",
         "e2e-gpu-report",
         "e2e-gpu-n-1-report",
         "e2e-gpu-n-2-report",
@@ -372,6 +373,7 @@ mod tests {
             ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
             ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),
             ("mock", "e2e-report"),
+            ("mock-windows", "e2e-windows-report"),
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let root = tmp.path();
