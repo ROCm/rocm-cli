@@ -1052,7 +1052,8 @@ pub(crate) fn engine_inventory_note(
 ///
 /// All three of those have a live `GpuSupportLevel` in scope. The two places
 /// that still print the note statically — the dashboard TUI's engine-manager
-/// pane and `rocmd`'s own catalog in `apps/rocmd/src/common.rs` — keep the
+/// pane and `rocmd`'s own `rocmd_engine_inventory` in
+/// `apps/rocmd/src/host_snapshot.rs` — keep the
 /// unconditional ROCm wording, and that is deliberate rather than an oversight:
 /// the TUI pane renders a hard-coded descriptive list with no probe behind it,
 /// and `rocmd` is the daemon answering for whichever host a client asks about,
