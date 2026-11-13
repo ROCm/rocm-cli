@@ -64,13 +64,18 @@ pub fn json_state_lock_path(path: &Path) -> PathBuf {
 
 /// Merge `patch`'s top-level keys into the JSON object stored at `path`.
 ///
-/// Every writer of the state file — the engine wrapper that owns the service,
-/// a healthcheck latching that inference was verified, `rocmd` publishing the
-/// Anthropic endpoint — patches the same document, so the read, the merge and
-/// the write run under one cross-process lock ([`json_state_lock_path`]) and
-/// no writer can drop a key another just recorded. The result is published
-/// atomically ([`crate::atomic_write::write_file_atomically`]), so a reader
-/// that takes no lock still sees a whole document, never a truncated one.
+/// Several writers patch the same document — the engine wrapper that owns the
+/// service, a healthcheck latching that inference was verified, `rocmd`
+/// publishing the Anthropic endpoint — so the read, the merge and the write
+/// run under one cross-process lock ([`json_state_lock_path`]) and no merge
+/// can drop a key another merge recorded. The lock orders writers rather than
+/// combining them: a full rewrite through [`write_json_state_file`] still
+/// replaces every key merged before it, and a writer that bypasses both
+/// functions (the vLLM and AIM engines' own state writes) takes no lock at all.
+///
+/// The result is published atomically
+/// ([`crate::atomic_write::write_file_atomically`]), so a reader that takes no
+/// lock still sees a whole document, never a truncated one.
 ///
 /// Creates the file (and its parent) when absent. An existing file that is
 /// empty, is not valid JSON or does not hold a JSON object is an error, and the
@@ -1316,9 +1321,12 @@ mod tests {
         Ok(())
     }
 
-    /// A merge publishes through `atomic_write`, which reserves its own temp
-    /// file: another writer's file sitting on the name the merge would try
-    /// first is neither written through nor moved.
+    /// Another writer's file sitting on the temp name a clock-and-pid writer
+    /// would pick is neither written through nor moved by a merge. This pins
+    /// only that; a merge that wrote the state file in place would pass it
+    /// too, and the torn-read check in
+    /// `concurrent_merges_across_threads_and_processes_keep_every_key` is what
+    /// catches that.
     #[test]
     fn a_merge_spares_another_writers_staged_file() -> Result<()> {
         let dir = json_state_dir("foreign-temp");
@@ -1332,6 +1340,78 @@ mod tests {
         )?;
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
         let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            written,
+            serde_json::json!({ "server_pid": 42, "status": "ready" })
+        );
+        Ok(())
+    }
+
+    /// Runs `write` on another thread while this one holds the state
+    /// directory's lock; returns whether `write` finished before the lock was
+    /// released (a writer that takes the lock cannot) and its result.
+    fn finished_while_the_state_lock_was_held(
+        path: &Path,
+        write: impl FnOnce() -> Result<()> + Send,
+    ) -> (bool, Result<()>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let lock = FileLock::acquire(json_state_lock_path(path)).expect("hold the lock");
+        let started = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                started.store(true, Ordering::SeqCst);
+                let result = write();
+                finished.store(true, Ordering::SeqCst);
+                result
+            });
+            // The window starts once the writer runs, so a starved host cannot
+            // pass the check by not scheduling the writer at all.
+            while !started.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let finished_early = finished.load(Ordering::SeqCst);
+            drop(lock);
+            (finished_early, writer.join().expect("writer thread"))
+        })
+    }
+
+    /// A full rewrite takes the lock every merge holds across its
+    /// read-modify-write, so it can never land between a merge's read and its
+    /// write and then be overwritten by the merge's stale copy.
+    #[test]
+    fn a_state_file_rewrite_waits_for_the_directory_lock() -> Result<()> {
+        let dir = json_state_dir("rewrite-lock");
+        let path = dir.join("svc.json");
+
+        let (early, result) = finished_while_the_state_lock_was_held(&path, || {
+            write_json_state_file(&path, &serde_json::json!({ "status": "starting" }))
+        });
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+        result?;
+        assert!(!early, "the rewrite must wait for the lock");
+        assert_eq!(written, serde_json::json!({ "status": "starting" }));
+        Ok(())
+    }
+
+    #[test]
+    fn a_state_file_merge_waits_for_the_directory_lock() -> Result<()> {
+        let dir = json_state_dir("merge-lock");
+        let path = dir.join("svc.json");
+        fs::write(&path, br#"{"server_pid": 42}"#)?;
+
+        let (early, result) = finished_while_the_state_lock_was_held(&path, || {
+            merge_json_state_file(&path, &serde_json::json!({ "status": "ready" }))
+        });
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+        result?;
+        assert!(!early, "the merge must wait for the lock");
         assert_eq!(
             written,
             serde_json::json!({ "server_pid": 42, "status": "ready" })

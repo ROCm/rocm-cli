@@ -18,8 +18,8 @@ use crate::process::{
     spawn_lemond, wait_for_lemonade_cli_status,
 };
 use crate::state::{
-    free_local_port, mark_json_status, merge_json_state, record_server_or_stop_it,
-    resolve_lemonade_model_ref, terminate_pid, write_running_state,
+    free_local_port, mark_json_status, merge_json_state, ready_state_patch,
+    record_server_or_stop_it, resolve_lemonade_model_ref, terminate_pid, write_running_state,
 };
 use crate::{
     DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_MODEL_GGUF, DEFAULT_MODEL_REPO_DIR, ROCM_BACKEND_NAME,
@@ -291,12 +291,15 @@ pub(crate) fn serve_direct_llama_server(
         .spawn()
         .with_context(|| format!("failed to start {}", server.display()))?;
     let server_pid = child.id();
-    record_server_or_stop_it(&mut child, || {
+    // Captured once, while the server is certainly ours: every record of the
+    // server's identity and the stop that follows a failed record use it.
+    let server_identity = rocm_core::ProcessIdentity::capture(server_pid);
+    record_server_or_stop_it(&mut child, server_identity, &request.state_path, || {
         write_running_state(
             request,
             runtime,
             std::process::id(),
-            Some(server_pid),
+            Some(server_identity),
             "running",
         )
     })?;
@@ -320,24 +323,26 @@ pub(crate) fn serve_direct_llama_server(
         let _ = mark_json_status(&request.state_path, "failed");
         return Err(error);
     }
-    record_server_or_stop_it(&mut child, || {
+    record_server_or_stop_it(&mut child, server_identity, &request.state_path, || {
         merge_json_state(
             &request.state_path,
-            &json!({
-                "status": "ready",
-                "server_pid": server_pid,
-                // Identity token for the server PID, captured while the child is alive.
-                "server_start_ticks": rocm_core::process_start_ticks(server_pid),
-                "backend_state": "ready",
-                "backend_requested": backend,
-                "backend_mode": "lemonade-packaged-llama-server",
-                "load_response": {
-                    "status": "loaded",
-                    "method": "lemonade-packaged-llama-server",
-                    "model_name": request.model_ref,
-                    "model_path": model_path,
-                    "llamacpp_backend": backend
-                },
+            &serde_json::Value::Object({
+                let mut patch = ready_state_patch(server_identity, &backend);
+                patch.insert(
+                    "backend_mode".to_owned(),
+                    json!("lemonade-packaged-llama-server"),
+                );
+                patch.insert(
+                    "load_response".to_owned(),
+                    json!({
+                        "status": "loaded",
+                        "method": "lemonade-packaged-llama-server",
+                        "model_name": request.model_ref,
+                        "model_path": model_path,
+                        "llamacpp_backend": backend
+                    }),
+                );
+                patch
             }),
         )
     })?;

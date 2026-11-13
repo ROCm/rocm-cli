@@ -61,6 +61,7 @@ const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTAL
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
+/// Also the grace of the forced stop of a server whose state record failed.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Lemonade state identifies the actual llama-server process directly.
 const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Single;
@@ -626,15 +627,23 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         &process_env,
     )?;
     let server_pid = child.id();
-    crate::state::record_server_or_stop_it(&mut child, || {
-        crate::state::write_running_state(
-            &request,
-            &runtime,
-            std::process::id(),
-            Some(server_pid),
-            "running",
-        )
-    })?;
+    // Captured once, while the server is certainly ours: every record of the
+    // server's identity and the stop that follows a failed record use it.
+    let server_identity = rocm_core::ProcessIdentity::capture(server_pid);
+    crate::state::record_server_or_stop_it(
+        &mut child,
+        server_identity,
+        &request.state_path,
+        || {
+            crate::state::write_running_state(
+                &request,
+                &runtime,
+                std::process::id(),
+                Some(server_identity),
+                "running",
+            )
+        },
+    )?;
     crate::process::wait_for_lemonade_cli_status(
         &runtime.manifest,
         &request.host,
@@ -724,25 +733,29 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
             )
         });
     }
-    crate::state::record_server_or_stop_it(&mut child, || {
-        crate::state::merge_json_state(
-            &request.state_path,
-            &json!({
-                "status": "ready",
-                "server_pid": server_pid,
-                // Identity token for the server PID, captured while the child is alive.
-                "server_start_ticks": rocm_core::process_start_ticks(server_pid),
-                "backend_state": "ready",
-                "backend_requested": backend,
-                "load_response": {
-                    "status": "loaded",
-                    "method": "lemonade-cli",
-                    "model_name": request.model_ref,
-                    "llamacpp_backend": backend
-                },
-            }),
-        )
-    })?;
+    crate::state::record_server_or_stop_it(
+        &mut child,
+        server_identity,
+        &request.state_path,
+        || {
+            crate::state::merge_json_state(
+                &request.state_path,
+                &serde_json::Value::Object({
+                    let mut patch = crate::state::ready_state_patch(server_identity, &backend);
+                    patch.insert(
+                        "load_response".to_owned(),
+                        json!({
+                            "status": "loaded",
+                            "method": "lemonade-cli",
+                            "model_name": request.model_ref,
+                            "llamacpp_backend": backend
+                        }),
+                    );
+                    patch
+                }),
+            )
+        },
+    )?;
     let status = child.wait().context("failed waiting for Lemonade server")?;
     crate::state::mark_json_status(
         &request.state_path,
