@@ -71,7 +71,10 @@ syn = { version = "3", default-features = false, features = ["full", "parsing", 
 # acceptable cost for a preflight check. Unlisted mounts are detected by the
 # device-ID cross-check in `rocm-core::disk_space` and reported as unknown,
 # which never blocks an install.
-sysinfo = { version = "0.39", features = ["linux-tmpfs"] }
+# Default features are off because 0.40's `gpu` feature calls `statx` directly,
+# which glibc 2.17 (the manylinux2014 release build) does not provide, so the
+# link fails. Only CPU, memory and disk figures are used.
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk", "linux-tmpfs"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [workspace.lints.rust]
