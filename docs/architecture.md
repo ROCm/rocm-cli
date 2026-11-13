@@ -742,6 +742,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 | [`engine_stdio_client_contract.rs`](../xtask/src/engine_stdio_client_contract.rs) | Source-scan test that only the shared stdio client in [`stdio_client.rs`](../crates/rocm-engine-protocol/src/stdio_client.rs) puts a request on an engine child's stdin: a file that both pipes a child's stdin and names an engine envelope is reported unless it is a reviewed `ALLOWED` entry, and a stale entry fails too. | flat |
 | [`env_mutation_contract.rs`](../xtask/src/env_mutation_contract.rs) | Source-scan test that every test which mutates the process environment serializes itself. | flat |
 | [`eval_fixtures.rs`](../xtask/src/eval_fixtures.rs) | `cargo xtask eval-fixtures`: regenerates or checks the recorded `rocm` output the rocm-doctor skill evals replay, rendered from the compiled catalog. | flat |
+| [`host_baseline_contract.rs`](../xtask/src/host_baseline_contract.rs) | Tests for [`host-baseline.sh`](../.github/scripts/host-baseline.sh), the CI runner glibc/libstdc++ floor: drives the script under stubbed `getconf`/`ldconfig`, and ties its floor to the product floor stated in [`README.md`](../README.md) and [`wsl.md`](wsl.md). | flat |
 | [`lychee.rs`](../xtask/src/lychee.rs) | `cargo xtask lychee`: runs lychee with [`lychee.toml`](../lychee.toml) over the working tree, the local counterpart of the `docs-links` CI job. | flat |
 | [`manifest.rs`](../xtask/src/manifest.rs) | `cargo xtask manifest`: regenerates or checks the Cargo dependency table in [`MANIFEST.md`](../MANIFEST.md) from `cargo metadata`. | flat |
 | [`module_size.rs`](../xtask/src/module_size.rs) | `cargo xtask check-module-size`: fails when a source file exceeds `MAX_PRODUCTION_LINES` production lines, or when a `.rs` file under a crate's `src/` is declared by no `mod`. | flat |
@@ -765,7 +766,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 
 Boundaries:
 
-- The eight `*_contract.rs` files define no command: each is one `#[cfg(test)]` module run by `cargo test -p xtask`, and [`rust_source.rs`](../xtask/src/rust_source.rs) is declared test-only in [`main.rs`](../xtask/src/main.rs). The pull-request test selection narrows to the crates a change touches, so a change confined to another crate may not select them there; pushes to `main` and the merge queue run the whole workspace.
+- The nine `*_contract.rs` files define no command: each is one `#[cfg(test)]` module run by `cargo test -p xtask`, and [`rust_source.rs`](../xtask/src/rust_source.rs) is declared test-only in [`main.rs`](../xtask/src/main.rs). The pull-request test selection narrows to the crates a change touches, so a change confined to another crate may not select them there; pushes to `main` and the merge queue run the whole workspace.
 - [`affected.rs`](../xtask/src/affected.rs) is the one crate selection used by both CI's affected-crates job and [`prepush.rs`](../xtask/src/prepush.rs), which only widens it with `CROSS_CRATE_READS`; a change to how files are attributed to crates changes both.
 - [`paths.rs`](../xtask/src/paths.rs) defines the workspace root, the active target directory and binary file names, honouring `CARGO_TARGET_DIR` and a cross-compilation target; a new task uses it rather than recomputing them.
 

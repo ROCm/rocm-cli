@@ -3281,7 +3281,25 @@ with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 The eight native Linux GPU preflights are one script,
 [`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
 with its own `GPU_PREFLIGHT_MIN_FREE_GIB` (16 on the discrete lanes, 8 on
-Strix). It applies two gates, because neither sees what the other does: a
+Strix). It first runs
+[`host-baseline.sh`](../.github/scripts/host-baseline.sh), which fails the lane
+at once, without retrying, when the runner's glibc or libstdc++ is older than
+the product's supported floor in [README.md](../README.md) (see
+[ci-hardware-testing.md](ci-hardware-testing.md#self-hosted-runner-baseline)).
+[`host_baseline_contract.rs`](../xtask/src/host_baseline_contract.rs) drives
+that script under stubbed `getconf` and `ldconfig` — at, above and below the
+floor, versions that a string comparison gets wrong, multilib hosts that list
+an old 32-bit libstdc++ first, a cache with two x86-64 copies, a cache of
+thousands of entries, an `ldconfig` found only in sbin, and hosts where a value
+cannot be read — and fails when its floor and the one in `README.md` disagree.
+In [`workflow_contract.rs`](../xtask/src/workflow_contract.rs),
+`preflight_fails_a_host_below_the_baseline_without_querying_the_gpu` holds that
+a failing baseline stops the preflight before `rocm-smi` is asked anything,
+`preflight_runs_the_host_baseline_once_however_many_polls_it_takes` that it is
+not retried with the GPU wait, and
+`preflight_bounds_a_host_baseline_that_never_returns` that its 15s bound fails
+the preflight. Then
+it applies two GPU gates, because neither sees what the other does: a
 bounded wait on free memory, and then `reclaim-gpu.sh --assert-clear`. The
 memory floor is a fixed number of GiB against whatever pool `rocm-smi` reports,
 so its sensitivity is set by the pool's size rather than by what a serve holds —

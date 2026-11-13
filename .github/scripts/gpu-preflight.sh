@@ -7,7 +7,14 @@
 # reason instead of hanging to the job cap when the GPU is missing, the driver
 # is wedged, or the card is still held by a serve leaked by a prior run.
 #
-# TWO GATES, both of which must pass, because neither sees what the other does.
+# Before either GPU gate it runs `host-baseline.sh` once: the runner's glibc and
+# libstdc++ must meet the product's own supported floor (README.md), or the
+# Lemonade engine cannot load and the suite fails later for a reason it does not
+# name. Not retried: the floor describes the host, not the moment, so waiting
+# cannot change the answer. See that script for what it reads and why.
+#
+# TWO GPU GATES, both of which must pass, because neither sees what the other
+# does.
 #
 #   1. A BOUNDED WAIT on free memory. Not a one-shot check: transient
 #      contention — the reclaim step's kills still draining the card — self-
@@ -34,10 +41,12 @@
 # exhaust the pool while running nothing the reclaim rules match. They are
 # complementary, and each is the only one that catches its own case.
 #
-# ONE SCRIPT, SIX LANES. This body was six near-identical copies across
-# e2e-selfhosted.yml and nightly.yml (#294), differing only in the floor — so a
-# fix landed six times, and the one time it landed five, nothing noticed for
-# months. The only per-lane input is GPU_PREFLIGHT_MIN_FREE_GIB. The two
+# ONE SCRIPT, EVERY NATIVE LINUX LANE. This body was six near-identical copies
+# across e2e-selfhosted.yml and nightly.yml (#294), differing only in the
+# floor — so a fix landed six times, and the one time it landed five, nothing
+# noticed for months. It now serves eight jobs across those two workflows plus
+# the shared-queue lane (scripts/run-e2e-lane.sh), and the only per-lane input
+# is GPU_PREFLIGHT_MIN_FREE_GIB. The two
 # PowerShell blocks on the Windows-native lanes and the two advisory bodies on
 # the WSL lanes stay where they are: native Windows has no bash to run this
 # with, and the advisory lanes warn where this one fails.
@@ -65,6 +74,21 @@ CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
 # state of its own — and would break the contract tests that drive this script
 # from a scratch tree.
 RECLAIM_SCRIPT="scripts/reclaim-gpu.sh"
+# Named the same way, for the same reason.
+BASELINE_SCRIPT=".github/scripts/host-baseline.sh"
+
+# The host baseline, first and once. Bounded like every other call this script
+# makes; a check that never finished, or never ran, has shown nothing about the
+# host and fails rather than passes. Exit 1 is the baseline's own verdict, which
+# it has already explained on an `::error::` line.
+baseline_rc=0
+timeout 15 bash "${BASELINE_SCRIPT}" || baseline_rc=$?
+if [[ "${baseline_rc}" -ne 0 ]]; then
+  if [[ "${baseline_rc}" -ne 1 ]]; then
+    echo "::error::GPU preflight failed: the host baseline check (${BASELINE_SCRIPT}) could not be run — it exited ${baseline_rc} (124 is the 15s bound, 127 a missing script). Nothing was shown about this host's glibc or libstdc++, so this fails rather than passes."
+  fi
+  exit 1
+fi
 
 min_free=$((MIN_FREE_GIB * 1024 * 1024 * 1024))
 deadline=$((SECONDS + CEILING_SECS))

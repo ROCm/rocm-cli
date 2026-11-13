@@ -82,7 +82,11 @@ can be overridden for a single run (`queue-run.yml` sets the branch):
   GPU. The report's first line names the commit. Only a branch of this
   repository can be named, never a commit id. A lane that cannot check the
   commit out fails, with the reason in its `lane.log`.
-- the lane image — the container every lane runs
+- the lane image — the container every lane runs. It must meet the product's
+  minimum supported Linux release as [README.md](../README.md) states it: the
+  GPU preflight checks the image's glibc and libstdc++ inside the container, where the
+  engine runs, and fails the lane on an older image (see
+  [ci-hardware-testing.md](ci-hardware-testing.md#self-hosted-runner-baseline))
 - the lane command — a single line run by `bash` under `set -euo pipefail` in
   that image, from the root of the checkout, with the commit in
   `ROCM_CLI_COMMIT`. The default is
