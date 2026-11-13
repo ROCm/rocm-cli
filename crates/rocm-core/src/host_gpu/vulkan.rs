@@ -51,9 +51,14 @@ const LINUX_ICD_DIRS: [&str; 4] = [
 pub enum VulkanStatus {
     /// A Vulkan device answered and it is a real GPU.
     Available,
-    /// A driver is installed, but no device was enumerated -- `vulkaninfo` is
-    /// not on PATH, so nothing confirmed a device answers. Likely to work;
-    /// not established.
+    /// A driver is installed, but no AMD device was confirmed behind it.
+    /// Likely to work; not established.
+    ///
+    /// Three hosts land here and they are not owed the same sentence, which is
+    /// why `classify_vulkan_support` builds the detail from `devices` and
+    /// `enumerated` rather than from the status alone: `vulkaninfo` was not on
+    /// PATH to ask; it ran and listed nothing; or it ran and listed only
+    /// non-AMD hardware.
     DriverPresentDevicesUnverified,
     /// The probe looked and found no GPU Vulkan driver. A software rasteriser
     /// alone lands here, not in [`Self::Available`].
@@ -490,15 +495,30 @@ pub fn classify_vulkan_support(
             || "a Vulkan driver is installed".to_owned(),
             |label| format!("{label} is installed"),
         );
-    // Two different hosts reach this status and they are not owed the same
-    // sentence. An empty `devices` really is "nothing answered". A non-empty one
-    // means `vulkaninfo` answered and the hardware it listed simply was not AMD
-    // — saying no device was enumerated there is false, and it is the shape an
-    // NVIDIA box with an AMD iGPU disabled lands in.
-    let detail = if devices.is_empty() {
-        format!("{named}, but no device was enumerated (install `vulkaninfo` to confirm)")
-    } else {
+    // Three different hosts reach this status and they are not owed the same
+    // sentence. A non-empty `devices` means `vulkaninfo` answered and the
+    // hardware it listed simply was not AMD — saying no device was enumerated
+    // there is false, and it is the shape an NVIDIA box with an AMD iGPU
+    // disabled lands in.
+    //
+    // An empty `devices` splits on `enumerated`, the same evidence the
+    // `gpu_icds.is_empty()` arm above already branches on. `enumerated == true`
+    // means `vulkaninfo` ran, exited 0 and listed nothing — the answer is in
+    // hand, so telling that user to "install `vulkaninfo` to confirm" sends
+    // them after a tool that is already installed and has already answered
+    // (the common cause is a permission problem, e.g. not being in the
+    // `render` group, not a missing tool). Only `enumerated == false` is the
+    // case where the tool is genuinely missing or failed to run, and only
+    // there is that advice true.
+    let detail = if !devices.is_empty() {
         format!("{named}, but none of the devices it enumerated is an AMD GPU")
+    } else if enumerated {
+        format!(
+            "{named}, but `vulkaninfo` ran and listed no device, so nothing confirms it can \
+             reach a GPU here (on Linux, check that your user is in the `render` group)"
+        )
+    } else {
+        format!("{named}, but no device was enumerated (install `vulkaninfo` to confirm)")
     };
     VulkanSupport {
         status: VulkanStatus::DriverPresentDevicesUnverified,
@@ -632,27 +652,58 @@ GPU0:
         assert!(icd_is_gpu_driver("radeon_icd.x86_64.json"));
     }
 
+    /// Both halves of this test reach the same *status*; what they must not
+    /// share is the *sentence*. `enumerated` is the module's central piece of
+    /// evidence everywhere else, and this arm used to ignore it: a host whose
+    /// `vulkaninfo` had already run and already listed nothing was still told
+    /// to "install `vulkaninfo` to confirm". Asserting the two texts differ,
+    /// rather than asserting each in isolation, is what keeps the advice tied
+    /// to the evidence.
     #[test]
     fn an_installed_driver_with_no_enumerated_device_stays_unverified() {
-        let support = classify_vulkan_support(
+        let asked = classify_vulkan_support(
             vec!["radeon_icd.x86_64.json".to_owned()],
             Vec::new(),
             true,
             true,
         );
 
-        assert_eq!(support.status, VulkanStatus::DriverPresentDevicesUnverified);
+        assert_eq!(asked.status, VulkanStatus::DriverPresentDevicesUnverified);
         assert!(
-            support.status.is_usable(),
+            asked.status.is_usable(),
             "an installed GPU driver is still worth routing to"
         );
-        assert_eq!(support.driver_label().as_deref(), Some("Mesa RADV"));
+        assert_eq!(asked.driver_label().as_deref(), Some("Mesa RADV"));
+        let asked_detail = asked.detail.clone().expect("a detail is always set here");
         assert!(
-            support
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("no device was enumerated")),
-            "the gap must be stated, not papered over: {support:?}"
+            asked_detail.contains("listed no device"),
+            "the gap must be stated, not papered over: {asked:?}"
+        );
+        assert!(
+            !asked_detail.contains("install `vulkaninfo`"),
+            "`vulkaninfo` already ran and already answered; telling this user to install it \
+             sends them after a tool they have: {asked:?}"
+        );
+
+        // Same ICD, same (empty) device list, but nothing asked: here the tool
+        // really may be missing, so the install advice is the true one.
+        let unasked = classify_vulkan_support(
+            vec!["radeon_icd.x86_64.json".to_owned()],
+            Vec::new(),
+            true,
+            false,
+        );
+
+        assert_eq!(unasked.status, VulkanStatus::DriverPresentDevicesUnverified);
+        let unasked_detail = unasked.detail.clone().expect("a detail is always set here");
+        assert!(
+            unasked_detail.contains("install `vulkaninfo` to confirm"),
+            "with nothing having looked, the tool is what would settle it: {unasked:?}"
+        );
+        assert_ne!(
+            asked_detail, unasked_detail,
+            "`enumerated` is the difference between 'nothing looked' and 'something looked \
+             and found nothing'; the two must not be told the same thing"
         );
     }
 

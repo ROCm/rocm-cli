@@ -1364,6 +1364,105 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The two support levels this change added carry new user-facing wording
+    /// on both renderers, and nothing exercised either of them. They are each
+    /// other's nearest neighbour -- both say "no ROCm/HIP" -- so each case
+    /// asserts what the *other* one would have said is absent; otherwise a
+    /// single arm doing duty for both would still pass.
+    #[test]
+    fn examine_engine_inventory_separates_an_unconfirmed_vulkan_from_no_backend_at_all() {
+        let (root, paths) = test_paths("examine-engine-inventory-vulkan-tiers");
+        let config = RocmCliConfig::default();
+
+        let mut unconfirmed = String::new();
+        append_examine_engine_inventory(
+            &mut unconfirmed,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+        );
+        assert!(
+            unconfirmed.contains("could not be determined"),
+            "an unprobed Vulkan path must read as unknown, not as a verdict:\n{unconfirmed}"
+        );
+        assert!(
+            !unconfirmed.contains("no Vulkan driver was found"),
+            "`VulkanUnconfirmed` must not borrow `NoGpuBackend`'s confirmed absence:\n{unconfirmed}"
+        );
+        assert!(
+            !unconfirmed.contains("so it runs on the Vulkan llama.cpp backend"),
+            "nor may it promise the backend `VulkanOnly` promises:\n{unconfirmed}"
+        );
+
+        let mut none = String::new();
+        append_examine_engine_inventory(
+            &mut none,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+        );
+        assert!(
+            none.contains("no Vulkan driver was found")
+                && none.contains("no GPU backend can run here"),
+            "a confirmed absence must say so plainly:\n{none}"
+        );
+        assert!(
+            !none.contains("could not be determined"),
+            "`NoGpuBackend` is the probed answer, not the missing one:\n{none}"
+        );
+
+        assert_ne!(
+            unconfirmed, none,
+            "'we could not tell' and 'we looked and there is none' are different facts"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `rocm engines` renders the same two notes through a different renderer,
+    /// so it needs the same pair -- this is the counterpart to
+    /// `examine_engine_inventory_separates_an_unconfirmed_vulkan_from_no_backend_at_all`.
+    #[test]
+    fn engines_inventory_separates_an_unconfirmed_vulkan_from_no_backend_at_all() {
+        let (root, paths) = test_paths("engines-inventory-vulkan-tiers");
+
+        let unconfirmed = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+        );
+        assert!(
+            unconfirmed.contains("could not be determined")
+                && unconfirmed.contains("no ROCm/HIP support"),
+            "`rocm engines` must report the same unprobed Vulkan state examine does:\n{unconfirmed}"
+        );
+        assert!(
+            !unconfirmed.contains("Lemonade server with ROCm llama.cpp backend"),
+            "a host with no ROCm build must not be told it has one:\n{unconfirmed}"
+        );
+
+        let none = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+        );
+        assert!(
+            none.contains("no GPU backend can run here"),
+            "`rocm engines` must not keep promising a backend that was ruled out:\n{none}"
+        );
+        assert!(
+            !none.contains("could not be determined"),
+            "the probed answer must not be softened into the unprobed one:\n{none}"
+        );
+
+        assert_ne!(
+            unconfirmed, none,
+            "the two levels exist precisely because they are not the same claim"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// `rocm engines` makes the same claim `rocm examine` does, through a
     /// different renderer, so it needs the same pair of tests:
     /// `examine_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support`

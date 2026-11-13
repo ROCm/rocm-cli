@@ -1087,14 +1087,18 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         //
         // Reached by every caller that passes a real `VulkanStatus`, which is
         // `rocm examine` *and* `build_codex_bridge_snapshot` (the
-        // `InternalBridgeSnapshot` command and the MCP `bridge_snapshot`/
-        // `engines` tools), which builds the level from `examine.vulkan_status()`
-        // rather than the cheap `host_gpu_support_level`. So the advice cannot
-        // be "run `rocm examine`": this very note is rendered *inside* that
-        // command's own output, through `examine_human_report` ->
-        // `append_examine_engine_inventory`, and told its reader to run the
-        // command they were already reading. It names the thing that would
-        // actually settle the question instead.
+        // `InternalBridgeSnapshot` command and the MCP `bridge_snapshot` tool),
+        // which builds the level from `examine.vulkan_status()` rather than the
+        // cheap `host_gpu_support_level`. The MCP `engines` tool is deliberately
+        // NOT in that list: it goes through `host_gpu_support_level`, which
+        // always passes `VulkanStatus::Unknown`, so it can never land on these
+        // two arms.
+        //
+        // So the advice cannot be "run `rocm examine`": this very note is
+        // rendered *inside* that command's own output, through
+        // `examine_human_report` -> `append_examine_engine_inventory`, and told
+        // its reader to run the command they were already reading. It names the
+        // thing that would actually settle the question instead.
         //
         // That thing is NOT "install `vulkaninfo`", for the reason the matching
         // arm in `host_gpu::render` spells out: on a real driverless Linux host
