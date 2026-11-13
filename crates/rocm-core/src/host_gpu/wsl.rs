@@ -116,11 +116,23 @@ pub(crate) fn detect_wsl_host_displays() -> (WslHostDriverProbe, Vec<WslHostDisp
     ) else {
         return (WslHostDriverProbe::Unreachable, Vec::new());
     };
-    let inventory = parse_windows_examine_inventory(&output);
+    host_displays_from_inventory(&parse_windows_examine_inventory(&output))
+}
+
+/// Split out from [`detect_wsl_host_displays`] so the mapping can be driven with
+/// synthetic inventory output, the way [`parse_windows_examine_inventory`]'s own
+/// callers are: there is no Windows host to run the real query against in this
+/// suite, and the parts worth pinning are here rather than in the spawn.
+fn host_displays_from_inventory(
+    inventory: &WindowsExamineInventory,
+) -> (WslHostDriverProbe, Vec<WslHostDisplayAdapter>) {
     let adapters = inventory
         .amd_displays()
         .map(|display| WslHostDisplayAdapter {
             name: display.name.trim().to_owned(),
+            // An adapter with no id is still an adapter. The empty string says
+            // "this row carried none", which the gfx-target lookup answers
+            // `None` for, rather than dropping a GPU the host does list.
             pnp_device_id: display
                 .pnp_device_id
                 .as_deref()
@@ -489,6 +501,101 @@ mod tests {
     use super::*;
     use crate::host_gpu::tests::{CountingSources, pnputil_host};
     use crate::host_gpu::windows_inventory::{InventoryScope, assemble_windows_inventory};
+
+    /// Both answers come off one inventory, in the host's own order.
+    ///
+    /// Driven from the text the query really emits (`GPU`, name, driver, PNP id,
+    /// date, tab separated) rather than from hand-built adapters, because the
+    /// fields this mapping is responsible for are the ones the text decides:
+    /// trimming, and what an absent id becomes. Both rows are a pairing measured
+    /// on a real WSL2 host, including the generic name Windows gives the second
+    /// adapter.
+    #[test]
+    fn one_inventory_yields_both_the_driver_and_every_amd_adapter() {
+        let inventory = parse_windows_examine_inventory(
+            "GPU\t  AMD Radeon PRO W7900  \t32.0.32839.3472\tPCI\\VEN_1002&DEV_7448&SUBSYS_0E0D1002&REV_00\\6&3666587B&0&00000008\t2025-11-04\n\
+             GPU\tAMD Radeon(TM) Graphics\t32.0.32839.3472\tPCI\\VEN_1002&DEV_73DF&SUBSYS_0E371002&REV_88\\6&3008A2D0&0&00000009\t2025-11-04\n",
+        );
+
+        let (driver, adapters) = host_displays_from_inventory(&inventory);
+
+        assert_eq!(
+            driver,
+            WslHostDriverProbe::Version("32.0.32839.3472".to_owned()),
+            "the driver answer comes from the same query as the adapters"
+        );
+        assert_eq!(
+            adapters.len(),
+            2,
+            "every AMD adapter survives, not just the preferred one"
+        );
+        assert_eq!(
+            adapters[0].name, "AMD Radeon PRO W7900",
+            "the name is trimmed of the padding the query leaves on it"
+        );
+        assert_eq!(
+            adapters[0].pnp_device_id,
+            "PCI\\VEN_1002&DEV_7448&SUBSYS_0E0D1002&REV_00\\6&3666587B&0&00000008",
+            "the id is carried whole, instance path included"
+        );
+        assert_eq!(
+            adapters[1].name, "AMD Radeon(TM) Graphics",
+            "and the host's order is preserved"
+        );
+    }
+
+    /// A row with no PNP id is still a reported adapter.
+    ///
+    /// The id becomes an empty string rather than the row being dropped: the
+    /// host said an AMD adapter is there, and only its identity is unknown.
+    #[test]
+    fn an_adapter_with_no_device_id_is_kept_with_an_empty_one() {
+        let inventory =
+            parse_windows_examine_inventory("GPU\tAMD Radeon RX 9070 XT\t32.0.32015.7029\n");
+
+        let (driver, adapters) = host_displays_from_inventory(&inventory);
+
+        assert_eq!(
+            adapters.len(),
+            1,
+            "the adapter is not dropped for want of an id"
+        );
+        assert_eq!(adapters[0].name, "AMD Radeon RX 9070 XT");
+        assert!(
+            adapters[0].pnp_device_id.is_empty(),
+            "an absent id reads as empty, not as a missing adapter"
+        );
+        assert_eq!(
+            driver,
+            WslHostDriverProbe::Version("32.0.32015.7029".to_owned()),
+            "the driver is still readable from a row with no id"
+        );
+    }
+
+    /// A host that answered, but listed no AMD adapter, is not a host that was
+    /// never asked. `NoAmdDisplay` is evidence; `Unreachable` is the absence of
+    /// it, and only a failed spawn produces that.
+    ///
+    /// The query filters to AMD rows before it prints, so "no AMD adapter" is a
+    /// reply carrying the machine facts and no `GPU` line, which is what this
+    /// feeds. A reply holding some *other* vendor's adapter is not a shape this
+    /// path can receive, and `preferred_amd_display` would answer it with that
+    /// vendor's driver version.
+    #[test]
+    fn an_inventory_without_an_amd_adapter_reads_as_answered_not_unreachable() {
+        let inventory = parse_windows_examine_inventory(
+            "CPU\tIntel(R) Core(TM) i7-8700 CPU @ 3.20GHz\nRAM\t17179869184\n",
+        );
+
+        let (driver, adapters) = host_displays_from_inventory(&inventory);
+
+        assert!(adapters.is_empty(), "no GPU row means no AMD adapter");
+        assert_eq!(
+            driver,
+            WslHostDriverProbe::NoAmdDisplay,
+            "the host answered; it just has no AMD display"
+        );
+    }
 
     /// A host that answers but has no AMD adapter reads as `NoAmdDisplay`; a host
     /// where no source answers reads as `Unreachable`. The CPU and RAM answer is
