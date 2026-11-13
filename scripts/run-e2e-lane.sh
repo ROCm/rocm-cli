@@ -30,6 +30,14 @@ out="${LANE_OUT:-/out}"
 work="${E2E_LANE_WORK:-/var/tmp/e2e-lane}"
 channels="${E2E_CHANNELS:-release nightly}"
 
+# The lane fetches only the host's crates, so a build target set from outside
+# would need crates it skips and meet the network without a retry. Refused
+# before anything is installed. This covers the environment variable only.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+  echo "CARGO_BUILD_TARGET is set; unset it: the lane fetches only the host's crates" >&2
+  exit 1
+fi
+
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
@@ -158,10 +166,23 @@ bash .github/scripts/gpu-preflight.sh
 preflight_done=0
 
 # The two fetches in front of the build, each retried on its own. The first cargo
-# call in this checkout downloads the toolchain rust-toolchain.toml names; then
-# every crate is fetched, so the build below does not meet the network.
+# call in this checkout downloads the toolchain rust-toolchain.toml names: that
+# relies on rustup's proxy installing it on first call, and is a no-op where
+# cargo is not rustup-managed. Then the crates are fetched, so the build below
+# does not meet the network. Only the host's are: the build, the pre-warm and
+# the suite all run on the host (see the CARGO_BUILD_TARGET check at the top).
 retry 4 30 cargo --version
-retry 4 30 cargo fetch --locked
+# Captured first, so a cargo that fails here aborts the lane with its own error.
+cargo_info="$(cargo -vV)"
+host=""
+while read -r key value; do
+  if [[ "${key}" == "host:" ]]; then host="${value}"; fi
+done <<<"${cargo_info}"
+if [[ -z "${host}" ]]; then
+  echo "cargo did not report its host triple" >&2
+  exit 1
+fi
+retry 4 30 cargo fetch --locked --target "${host}"
 
 # The e2e-test-hooks feature must match what `cargo xtask e2e` builds for
 # itself; see the e2e-gpu job in e2e-selfhosted.yml.

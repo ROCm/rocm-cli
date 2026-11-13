@@ -181,7 +181,7 @@ Expected result:
   `rocm` build does not yet). Pinning an earlier release or nightly reads the
   earlier stream instead: `--version 7.14.1` reads
   `https://repo.amd.com/rocm/whl-multi-arch` (`multi-arch-v2`), and `--channel
-  nightly --build-date 2026-08-20` reads
+  nightly --build-date 2026-08-19` reads
   `https://rocm.nightlies.amd.com/whl-multi-arch`, while `--build-date
   2026-09-01` reads the newest layout's nightly index. `--format tarball` with no
   pin reads `https://stable.repo.amd.com/rocm/core/tarball/` (or
@@ -378,6 +378,36 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
+
+With that foreground server stopped, check that a catalogued recipe reaches
+Lemonade with a build it can load, from a short name alone — no `--engine`, no
+quantization variant typed by hand:
+
+```powershell
+rocm serve qwen-small --managed
+```
+
+Expected result:
+
+- The resolved name is `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M`, not the
+  requested `qwen-small` and not the safetensors id
+  `Qwen/Qwen2.5-1.5B-Instruct`. In a terminal that is the deployment summary's
+  `resolved model` row, shown beside `requested model` because the two differ;
+  pipe the command (`| Out-String` in PowerShell, `| cat` in a POSIX shell) to
+  get the `serve plan` form carrying the same line.
+- The service reaches `ready` and answers a chat request. On Windows in
+  particular it must not exit immediately leaving an empty engine log: a
+  safetensors-only id handed to Lemonade fails that way, inside the engine
+  process, where the reason never reaches the terminal.
+- The same name under `--engine vllm` resolves to `Qwen/Qwen2.5-1.5B-Instruct`
+  instead (Linux or WSL, Instinct hardware).
+
+Stop it again before moving on, so it does not hold the GPU and the port for
+the checks below:
+
+```powershell
+rocm services stop <service-id> --yes
+```
 
 To check the recovery from a stale Lemonade backend pin (Windows or Linux with
 a managed Lemonade runtime already installed and an active managed ROCm SDK):
@@ -701,7 +731,7 @@ possibly running, which is the safe direction: the record never reconciles to
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
-up: section 3 serves Lemonade and then stops it on both of its branches, the
+up: section 3 serves Lemonade and then stops it on each of its branches, the
 block just above stops whatever was left, and section 2 leaves one runtime.
 
 **Get two distinct runtime keys.** A wheel runtime key is built from the
@@ -1612,3 +1642,38 @@ anything.
 Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
 8192` prints the report with no model section, and stderr says that `--model,
 --context-size were ignored` and nothing about the model was fetched.
+
+## 13. Pasting An Error Into `rocm diagnose`
+
+`rocm diagnose --symptom-file` takes a pasted error without shell quoting.
+Copy a line that would break an argument, for example:
+
+```text
+-v "HSA_STATUS_ERROR_INVALID_ISA" isn't it? $(echo ran > ran.txt) & echo ran > ran.txt
+```
+
+Then, in an empty directory, hand it over in each shell you have:
+
+- bash (Linux or WSL): run `rocm diagnose --symptom-file - <<'EOF'`, paste,
+  then type `EOF` on its own line.
+- PowerShell (5.1 and 7): `Get-Clipboard -Raw > error.txt`, then
+  `rocm diagnose --symptom-file error.txt`. Not `Get-Clipboard | rocm ...`:
+  Windows PowerShell 5.1 pipes text to a program as ASCII and turns every
+  other character into `?`.
+- cmd.exe: save the paste to `error.txt` with an editor, then
+  `rocm diagnose --symptom-file error.txt`.
+- Any shell, nothing piped in: `rocm diagnose --symptom-file -`, paste at the
+  prompt, and end the input as the hint printed on the first line says.
+
+Expected result:
+
+- Each run reports the same causes as `rocm diagnose --symptom-file error.txt`
+  with the paste saved in `error.txt`, and exits 0.
+- No `ran.txt` appears in the directory.
+- `rocm diagnose --symptom-file no-such-file.txt`, the same flag on a binary
+  file (an image, say) and on a file larger than 16 MiB each print one error
+  naming the file and why, then the `Usage: rocm diagnose` line, and exit 2.
+- In Windows PowerShell 5.1, `Get-Clipboard -Raw > error.txt` writes UTF-16;
+  the same command reading that file still reports the same causes, and a
+  paste with a non-ASCII character in it (`é`, `→`, a typographic quote)
+  reports the same causes as in PowerShell 7.

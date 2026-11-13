@@ -10,10 +10,19 @@ Feature: Model serving
     When the user serves a model using its short name
     Then the output shows the full model name
 
+  # A short name is a catalog entry, and an entry can publish a different build
+  # of the same model per engine, so the names need not be identical -- what must
+  # hold is that each engine names the build it will serve.
+  #
+  # This discriminates nothing yet: the scenario is an expected failure on every
+  # host while its xfail row stands, and the vLLM run stops before printing a
+  # plan, so the step panics there whatever the lemonade half did. It becomes
+  # regression coverage when that row is narrowed. serve-55 and the unit tests in
+  # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
-  Scenario: serve-02 - Short name expansion is consistent across engines
+  Scenario: serve-02 - Every engine expands a short name rather than serving it
     When the user serves the same short name with different engines
-    Then all engines expand to the same full model name
+    Then every engine expands it to the full name of the model it will serve
 
   @id:serve-discoverable-by-name
   Scenario: serve-03 - A running model server is discoverable by name
@@ -860,3 +869,40 @@ Feature: Model serving
     When the user sends a streaming request to the Anthropic messages endpoint
     Then the response is delivered as Anthropic-style server-sent events
     And the streamed content reassembles into a complete reply
+
+  # The catalog's recommended small assistant for a low-VRAM machine, asked for
+  # by its short name with no engine named. Whatever engine is chosen for the
+  # user has to be handed a build of that model it can actually load, so the
+  # short name alone must be enough. (The dash serve wizard fills the field with
+  # the recipe's canonical id rather than a short name; the unit tests cover that
+  # spelling, and it resolves through the same recipe.)
+  #
+  # Deliberately NOT tagged @requires-engine: the engine is the CLI's to pick
+  # here, and pinning one would make the harness attribute the run to an engine
+  # the scenario never asked for. The host's own default engine is what gates it.
+  @id:serve-small-assistant-short-name @requires-gpu
+  Scenario: serve-55 - The recommended small assistant serves from its short name alone
+    Given a managed runtime is active
+    And the recommended small assistant is being served by its short name
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # ROCMAI-863: a Hugging Face repo named without a quantization variant has no
+  # GGUF file to serve, but serving started an engine for it anyway and left the
+  # objection to the background process — where, on Windows, nothing the user can
+  # see ever reports it: an empty log, a success exit, and a server recorded as
+  # stopped. The refusal now comes before anything starts. It also names no
+  # quantization of its own: nothing on this path reads the repository's files, so
+  # a suggested label is a guess, and following a guess fails a second time on a
+  # repo that ships no GGUF at all. @requires-gpu because a host with no usable
+  # GPU is turned away earlier, for that reason instead, and never reaches this
+  # one. No @requires-os deliberately — Windows is the lane the failure was silent
+  # on, so it is the one most worth watching.
+  @id:serve-missing-gguf-variant-refused @requires-gpu @requires-engine:lemonade
+  Scenario: serve-56 - Serving a Hugging Face repo with no quantization variant is refused
+    When the user serves a Hugging Face repo with no quantization variant on Lemonade
+    Then serving is refused before any engine starts
+    And the user is told the model needs an explicit GGUF variant
+    And no quantization is suggested for a repo the CLI has not inspected
+    And no local server was recorded

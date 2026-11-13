@@ -207,8 +207,6 @@ mod tests {
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
         "e2e-gpu-w7900-report",
-        "e2e-gpu-w7900-n-1-report",
-        "e2e-gpu-w7900-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-ubuntu-n-1-report",
         "e2e-gpu-strix-ubuntu-n-2-report",

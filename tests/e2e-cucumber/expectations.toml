@@ -34,20 +34,35 @@
 
 # --- EAI-7219: short-name expansion (vLLM does not show an expanded name) ---
 # What the lane logs show, so the scope below is not read as more than it is:
-# lemonade DOES print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
-# on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
-# stopped before it printed a serve plan, so the plan's name line was never
-# reached. EAI-7219 as reported describes the other shape: a vLLM plan that prints
-# `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
-# shown it. The steps used to discard stderr, so the cause of the empty stdout was
-# not known. The first lane run that reported it (run 41811714290: Strix Halo
-# Ubuntu release and nightly, and MI300X) shows vLLM stopping at "no active ROCm
-# runtime is configured", before any alias handling, so on those lanes the rows are
-# red for a missing runtime and not for this bug. On native Windows the stop is the
-# up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug either.
+# lemonade prints the full name on the Strix Halo Ubuntu and Windows lanes, and
+# vLLM's stdout is empty -- the run stopped before it printed a serve plan, so the
+# plan's name line was never reached. vLLM is therefore the whole of what keeps
+# these rows red.
+#
+# ROCMAI-863's pre-launch refusal does NOT reach these rows, though an earlier
+# revision of this comment said it did. That was written when `qwen2.5` expanded
+# to the bare `Qwen/Qwen2.5-1.5B-Instruct`, which ships no GGUF; #1044 then gave
+# that recipe a per-engine ref, so lemonade is handed
+# `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M` with the variant already pinned and
+# the refusal has nothing to fire on. The lemonade half still prints its name.
+# EAI-7219 as reported describes
+# the other shape: a vLLM plan that prints `resolved model: qwen2.5`, the alias
+# left unexpanded; the lane logs have not shown it. The steps used to discard
+# stderr, so the cause of the empty stdout was not known. The first lane run
+# that reported it (run 41811714290: Strix Halo Ubuntu release and nightly, and
+# MI300X) shows vLLM stopping at "no active ROCm runtime is configured", before
+# any alias handling, so on those lanes the rows are red for a missing runtime
+# and not for this bug. On native Windows the stop is the up-front vLLM refusal
+# (ROCMAI-823), a designed refusal and not this bug either.
 # The rows keep their all-hosts scope until the scenarios get a managed runtime or
 # are gated on the engine and the rows are narrowed to the real bug; their reasons
 # name both shapes so neither becomes a false claim.
+#
+# Looking forward rather than back, and not yet observed on any lane: the catalog
+# now gives `qwen2.5` a per-engine model id, so the name lemonade prints is
+# expected to become `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M` while vLLM keeps
+# `Qwen/Qwen2.5-1.5B-Instruct`. The two differing is by design, which is why
+# serve-02 asks each engine to expand the alias rather than to agree on a name.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
@@ -56,7 +71,7 @@ reason = "A vLLM serve of a short name shows no expanded full model name: it eit
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
+reason = "A serve of a short name does not show the full model name the engine will serve: vLLM either stops before printing a serve plan or prints the alias unexpanded, and the lemonade half is only reached once that stops happening."
 
 # ROCMAI-898 tracks multiple Strix Halo Ubuntu Lemonade serve signatures (first
 # tracked as GitHub issue ROCm/rocm-cli#897, since closed; ROCMAI-898 is the open
@@ -261,5 +276,5 @@ reason = "The Windows large-model serve crashes in the SDK's Tensile library on 
 # this row applies.
 [["serve-aim-lifecycle-parity"]]
 when = { os = "linux", is_wsl = false, therock_family = "gfx1151*", has_amd_gpu = true }
-bug = "#1058"
+bug = "rocm-cli#1058"
 reason = "Stopping a running AIM service on Strix Halo Ubuntu reports `Local server stop not confirmed` (exit 1); the serve itself works."

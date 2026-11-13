@@ -130,13 +130,11 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` |
 
-On `pull_request` and `merge_group`, `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`
-are skipped; both still run on `push`, dispatch and nightly. In the merge queue
-W7900 is one runner on borrowed quota that would sit behind the queue, and over
-7 days 35% of Strix Ubuntu's merge-queue jobs (98 of 281) were cancelled at the
-45 min cap; neither check is required and the queue does not wait for it. On a
+On `pull_request` and `merge_group`, `e2e-gpu-strix-ubuntu` is skipped; it still
+runs on `push` and dispatch. Over 7 days 35% of its merge-queue jobs (98 of 281)
+were cancelled at the 45 min cap; the check is not required and the queue does
+not wait for it. On a
 PR the other lanes above run (one Linux node, MI300X, and the Windows Strix Halo
 pool).
 
@@ -194,7 +192,7 @@ resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
-`e2e-wsl`, and `e2e-gpu-w7900`) run on AMD GPU systems, so they
+and `e2e-wsl`) run on AMD GPU systems, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
@@ -333,7 +331,6 @@ The lane artifacts are named canonically (`e2e-gpu-n-1-report`, `e2e-gpu-n-2-rep
 `e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
 `e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
 `e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`,
-`e2e-gpu-w7900-n-1-report`, `e2e-gpu-w7900-n-2-report`,
 `e2e-gpu-w7900-report`, `e2e-report`) in `ci.yml` and
 `e2e-selfhosted.yml`, because the report derives each platform's name and OS
 from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
@@ -398,9 +395,9 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 ## Triggers
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
-`pull_request` (all lanes but `e2e-gpu-strix-ubuntu` and `e2e-gpu-w7900`), and
-`merge_group` (the Windows Strix Halo and WSL2 lanes only: MI300X, Strix Ubuntu and
-W7900 are not required for merging and so are skipped in the merge queue rather
+`pull_request` (all lanes but `e2e-gpu-strix-ubuntu`), and
+`merge_group` (the Windows Strix Halo and WSL2 lanes only: MI300X and Strix Ubuntu
+are not required for merging and so are skipped in the merge queue rather
 than left queued on limited runner capacity or hung at their cap after its PR
 has merged) when the workflow's own `changes` job's
 `serve` path filter is `true`. A new push to a pull request
@@ -410,10 +407,10 @@ group of their own, so none is cancelled or replaced by another. The heavy
 lane: they run only on the Windows Strix Halo and WSL2 lanes (both set
 `E2E_MERGE_QUEUE` for `merge_group`), and the only vLLM serve
 before a change lands is the per-PR canary (`serve-05`), which runs when the
-`serve` filter matches. **The merge queue has no native Linux GPU lane**: MI300X,
-Strix Ubuntu and W7900 all skip `merge_group`, so it runs only Windows Strix and
+`serve` filter matches. **The merge queue has no native Linux GPU lane**: MI300X
+and Strix Ubuntu both skip `merge_group`, so it runs only Windows Strix and
 WSL2. `push` fires on `main` and on any `release/**` branch, so pushing to a
-release branch runs the full self-hosted matrix (all five lanes) ahead of
+release branch runs the full self-hosted matrix (all four lanes) ahead of
 cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
 branch. Merging or closing a pull request also starts a run (`closed` is a
@@ -451,8 +448,8 @@ plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust chang
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix (minus MI300X, Strix Ubuntu and
-W7900 in the merge queue) always runs there. Unlike the
+filter is forced `true`, so the full matrix (minus MI300X and Strix Ubuntu
+in the merge queue) always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
@@ -469,10 +466,9 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `w7900`) — which self-hosted job(s) to run. `app-dev-gpu`
+  `strix-wsl`) — which self-hosted job(s) to run. `app-dev-gpu`
   maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `w7900` to
-  `e2e-gpu-w7900`. (The mock lane has its own `platform` input on `ci.yml`; it
+  `e2e-gpu-strix-windows`, and `strix-wsl` to `e2e-wsl`. (The mock lane has its own `platform` input on `ci.yml`; it
   is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
@@ -577,13 +573,11 @@ side-by-side runtime only when no match is found. See
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-w7900` — all run with
+`e2e-gpu-strix-windows`, and `e2e-wsl` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
-it reports. Four of them run with `continue-on-error: false`, so a real
-regression shows red instead of always green; `e2e-gpu-w7900` runs with
-`continue-on-error: true` while that hardware is being proven out, and should
-be flipped to `false` once it has a track record. Their results also surface in
+it reports. They run with `continue-on-error: false`, so a real
+regression shows red instead of always green. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
 job, naming the lane, rather than silently dropping out of the grid; on a
