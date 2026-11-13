@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm engines shell`.
+//! Steps for `rocm engines shell`, and for the `rocm engines list` entry of a
+//! vLLM install whose compiled extensions do not import (plain piped runs).
 //!
-//! These run under a pseudo-terminal on purpose. The defect they guard — a shell
+//! The shell steps run under a pseudo-terminal on purpose. The defect they guard — a shell
 //! that is correctly activated but visually identical to the one it was launched
 //! from — exists only in what the terminal renders, so a piped run cannot see it.
 
@@ -154,5 +155,96 @@ async fn assert_engine_shell_exited(world: &mut E2eWorld) {
     assert!(
         world.tui.is_some(),
         "no engine shell session was opened for this scenario"
+    );
+}
+
+/// A vLLM install whose compiled extensions cannot be imported.
+///
+/// The stand-in interpreter answers every probe the way a wheel built against a
+/// different torch does: `vllm._C` fails with an undefined `c10` symbol. A
+/// `vllm` launcher beside it is what makes the runtime resolve as installed.
+/// Black-box: the CLI finds it through `ROCM_CLI_VLLM_PYTHON`, exactly as a user
+/// pointing the CLI at their own vLLM environment would.
+#[given("a vLLM install whose compiled extensions do not import")]
+async fn plant_vllm_with_broken_extensions(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("broken-vllm-env").join("bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in vLLM env");
+
+    let python = bin.join("python");
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\n\
+         echo '{\"failures\": [{\"module\": \"vllm._C\", \"error\": \"undefined symbol: c10_hip_boom\"}]}'\n",
+    )
+    .expect("failed to write the stand-in interpreter");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("vllm"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the stand-in vllm launcher");
+
+    world
+        .command_env
+        .push(("ROCM_CLI_VLLM_PYTHON", python.into_os_string()));
+}
+
+#[when("the user lists the engines of that install")]
+async fn list_engines_of_that_install(world: &mut E2eWorld) {
+    let args = ["engines", "list"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    world.cli_output = Some(stdout);
+}
+
+/// The `rocm engines list` block for one engine: its heading line and the
+/// indented lines under it, up to the next engine. Other engines print their own
+/// `runtime:` line (AIM reads `ready` wherever a Docker daemon is reachable), so
+/// the assertions below must not read the whole output.
+fn engine_block(output: &str, engine: &str) -> String {
+    let mut block = Vec::new();
+    let mut inside = false;
+    for line in output.lines() {
+        // An engine's heading sits at two columns (`* ` marks the default one);
+        // its `adapter:`/`runtime:`/`note:` lines are indented under it.
+        let heading = line.replacen("* ", "  ", 1);
+        let indent = heading.len() - heading.trim_start().len();
+        if !heading.trim().is_empty() && indent <= 2 {
+            inside = heading.trim_start().starts_with(engine);
+        }
+        if inside {
+            block.push(line);
+        }
+    }
+    block.join("\n")
+}
+
+#[then("vLLM is reported as installed but not usable")]
+async fn vllm_reported_not_usable(world: &mut E2eWorld) {
+    let out = world
+        .cli_output
+        .as_deref()
+        .expect("no engines output recorded");
+    let vllm = engine_block(out, "vllm");
+    assert!(
+        vllm.contains("runtime: installed, not usable"),
+        "the broken vLLM was not reported as unusable:\n{out}"
+    );
+    assert!(
+        !vllm.contains("runtime: ready"),
+        "a runtime whose extensions do not import must not read as ready:\n{out}"
+    );
+}
+
+#[then("the report names the extension that failed to import")]
+async fn report_names_failing_extension(world: &mut E2eWorld) {
+    let out = world
+        .cli_output
+        .as_deref()
+        .expect("no engines output recorded");
+    assert!(
+        engine_block(out, "vllm").contains("vllm._C"),
+        "the vLLM entry does not name the failing extension:\n{out}"
     );
 }

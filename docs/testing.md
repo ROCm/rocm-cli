@@ -3077,6 +3077,16 @@ unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
 their known serve failure there has not been observed, and a row claiming a
 known bug before one is seen would say something untrue.
 
+An installed vLLM whose compiled extensions (`vllm._C`, `vllm._rocm_C`,
+`vllm._C_stable_libtorch`) do not import against the runtime's torch is listed as
+`runtime: installed, not usable` by `rocm engines list`, and `rocm serve` refuses it
+before launching vLLM (the guidance is in the service log). `serve-57` (`@id:serve-vllm-broken-extensions-reported-not-usable`,
+`@requires-os:linux`) covers the listing hermetically, against a stand-in
+interpreter, with no GPU, network or real vLLM. The `serve` refusal and the probe
+are unit-tested in [process.rs](../engines/vllm/src/process.rs)
+(`cargo test -p rocm-engine-vllm -- extension probe serve_gate`); the real `import vllm._C` failure
+needs a GPU host with a mismatched wheel.
+
 Natural-language plan handoff tests:
 
 ```bash

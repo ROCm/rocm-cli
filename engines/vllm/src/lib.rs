@@ -305,7 +305,10 @@ where
 }
 
 fn detect_response() -> DetectResponse {
-    let runtime = crate::runtime::resolve_vllm_runtime(None);
+    detect_response_for(crate::runtime::resolve_vllm_runtime(None))
+}
+
+fn detect_response_for(runtime: anyhow::Result<crate::runtime::VllmRuntime>) -> DetectResponse {
     let installed = runtime.is_ok();
     let mut notes = Vec::new();
     if cfg!(windows) {
@@ -319,6 +322,15 @@ fn detect_response() -> DetectResponse {
             "vLLM command resolved from {}; no CPU fallback is used",
             runtime.source
         ));
+    }
+    // Installed is not usable: a vLLM built against another torch resolves and
+    // reports a version, yet cannot start. Say so here rather than at serve time.
+    let extension_problem = runtime
+        .as_ref()
+        .filter(|_| !cfg!(windows))
+        .and_then(crate::process::vllm_extension_import_problem);
+    if let Some(problem) = extension_problem.as_ref() {
+        notes.push(problem.clone());
     }
 
     DetectResponse {
@@ -339,19 +351,35 @@ fn detect_response() -> DetectResponse {
             .map(|version| format!("vllm {version}")),
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![EngineDeviceAvailability {
-            kind: "rocm_gpu".to_owned(),
-            available: installed && !cfg!(windows),
-            reason: if cfg!(windows) {
-                Some(windows_unsupported_message().to_owned())
-            } else if installed {
-                None
-            } else {
-                Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
-            },
-        }],
+        available_devices: vec![rocm_gpu_availability(
+            installed,
+            cfg!(windows),
+            extension_problem,
+        )],
         capabilities: capabilities(),
         notes,
+    }
+}
+
+/// The `rocm_gpu` device entry. An installed vLLM whose compiled extensions
+/// cannot import is not available, and says why.
+fn rocm_gpu_availability(
+    installed: bool,
+    windows: bool,
+    extension_problem: Option<String>,
+) -> EngineDeviceAvailability {
+    EngineDeviceAvailability {
+        kind: "rocm_gpu".to_owned(),
+        available: installed && !windows && extension_problem.is_none(),
+        reason: if windows {
+            Some(windows_unsupported_message().to_owned())
+        } else if let Some(problem) = extension_problem {
+            Some(problem)
+        } else if installed {
+            None
+        } else {
+            Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
+        },
     }
 }
 
@@ -392,6 +420,44 @@ mod tests {
     use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
     use serde_json::json;
 
+    #[cfg(unix)]
+    #[test]
+    fn detect_reports_a_runtime_whose_extensions_do_not_import_as_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let python = dir.path().join("python");
+        // Not `fs::write` then run: a concurrent test's fork can keep the write fd
+        // open, and the run fails with `Text file busy`.
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            "#!/bin/sh\necho '{\"failures\": [{\"module\": \"vllm._rocm_C\", \"error\": \"undefined symbol: x\"}]}'\n",
+        )
+        .expect("write stand-in interpreter");
+        let runtime = crate::runtime::VllmRuntime {
+            python_executable: Some(python),
+            ..crate::runtime::VllmRuntime::for_test()
+        };
+        let detect = detect_response_for(Ok(runtime));
+        assert!(detect.installed);
+        let device = &detect.available_devices[0];
+        assert!(!device.available);
+        assert!(
+            device
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("vllm._rocm_C")),
+            "{:?}",
+            device.reason
+        );
+        assert!(
+            detect
+                .notes
+                .iter()
+                .any(|note| note.contains("undefined symbol: x")),
+            "{:?}",
+            detect.notes
+        );
+    }
+
     #[test]
     fn engine_recipe_launch_args_forward_required_flags() {
         let hint = EngineRecipeHint {
@@ -405,6 +471,28 @@ mod tests {
         assert_eq!(
             engine_recipe_launch_args(Some(&hint)),
             vec!["--enable-auto-tool-choice".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_installed_vllm_with_an_extension_problem_is_not_available() {
+        let ready = rocm_gpu_availability(true, false, None);
+        assert!(ready.available);
+        assert_eq!(ready.reason, None);
+
+        let broken = rocm_gpu_availability(true, false, Some("extensions do not import".into()));
+        assert!(!broken.available);
+        assert_eq!(broken.reason.as_deref(), Some("extensions do not import"));
+
+        let missing = rocm_gpu_availability(false, false, None);
+        assert!(!missing.available);
+        assert!(missing.reason.is_some());
+
+        let windows = rocm_gpu_availability(true, true, Some("ignored".into()));
+        assert!(!windows.available);
+        assert_eq!(
+            windows.reason.as_deref(),
+            Some(windows_unsupported_message())
         );
     }
 

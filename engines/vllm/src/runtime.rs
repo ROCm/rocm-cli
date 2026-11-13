@@ -655,7 +655,8 @@ pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
 /// belongs on the loader path.
 enum CompatDirSignal {
     /// `ensure_therock_compat_shims`'s answer is not passed in to this
-    /// derivation (the running-state payload path, which never calls it).
+    /// derivation (the running-state payload path and the read-only extension
+    /// probe, which never call it).
     /// Falls back to a read-only directory listing of whatever is already on
     /// disk: not authoritative, but the best available signal without
     /// performing a write.
@@ -717,8 +718,9 @@ fn therock_library_path_entries_inner(
         // `ensure_therock_compat_shims` says a shim is needed this launch —
         // this is what keeps a leftover stub from an earlier run (the host
         // has since gained a real `libmpi_cxx.so*`) from shadowing the loader
-        // path. On the running-state payload path (`Unchecked`), which never
-        // calls that function, fall back to a read-only directory listing of
+        // path. On the running-state payload path and the read-only extension
+        // probe (`Unchecked`), which never call that function, fall back to a
+        // read-only directory listing of
         // whatever is already there: not authoritative, but the best
         // available signal without performing a write.
         match compat_dir_signal {
@@ -738,7 +740,8 @@ fn therock_library_path_entries_inner(
 /// Whether `compat_dir` currently has any entry at all — a plain directory
 /// listing, not a check for a specific shim [`ensure_therock_compat_shims`]
 /// would recognize. This is the fallback [`therock_library_path_entries`]
-/// uses on the running-state payload path, which never calls that function
+/// uses on the running-state payload path and in the read-only extension probe,
+/// which never call that function
 /// and so has no authoritative answer to consult; see
 /// [`therock_library_path_entries_for_launch`] for the path that does.
 fn compat_dir_has_shims(compat_dir: &Path) -> bool {
@@ -747,9 +750,9 @@ fn compat_dir_has_shims(compat_dir: &Path) -> bool {
         .is_ok_and(|mut entries| entries.next().is_some())
 }
 /// Materializes the runtime-owned OpenMPI compatibility shims that
-/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call it
 /// from the launch path, before building the environment a server is spawned
-/// with — never from running-state payload assembly, which only needs the
+/// with (the serve gate's probe does too, ahead of it) — never from running-state payload assembly, which only needs the
 /// path list `therock_library_path_entries` derives, not the shims
 /// themselves. Returns the `libmpi_cxx` compat dir when a shim is needed for
 /// *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to
