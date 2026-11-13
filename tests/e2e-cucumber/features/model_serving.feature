@@ -865,9 +865,10 @@ Feature: Model serving
   # terminal for it to report to: the child's own service log is the only account
   # of why. The launch fails naming that log, and leaves its record `stopped`
   # (not `failed`, which `rocmd`'s recovery would respawn) without naming the
-  # dead child: its pid is free, and no start-time token was captured for it
-  # that would stop a later cleanup from signalling whatever process reuses it. Serving the same
-  # model again then reaches the engine launch again. The engine is scripted to
+  # dead child: its pid is free, and a later stop or cleanup must not signal
+  # whatever process reuses it (on Windows no start-time token was captured for
+  # the dead engine that could tell the two apart). Serving the same model
+  # again then reaches the engine launch again. The engine is scripted to
   # die at startup in test builds (`rocm/e2e-test-hooks`), which also waives the
   # no-GPU pre-flight and engine preparation so this reaches a real spawn without
   # GPU hardware or a runtime download — the death itself is real, only its

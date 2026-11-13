@@ -3547,6 +3547,25 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
     // detached spawn does not redirect, and the scripted child never receives
     // `--log`, so the log stays empty and only the no-tail branch runs. Naming
     // the path is the claim both branches share, and it is the one pinned here.
+    let records = lemonade_service_records(world);
+    let log_paths: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["log_path"].as_str())
+        .collect();
+    assert!(
+        !log_paths.is_empty(),
+        "the failed launch left no lemonade service record"
+    );
+    assert!(
+        log_paths.iter().any(|path| output.contains(path)),
+        "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
+    );
+    assert_failed_launches_left_their_claims(&records, 1);
+}
+
+/// Every lemonade service record in the scenario's isolated data folder, read
+/// raw from disk.
+fn lemonade_service_records(world: &E2eWorld) -> Vec<serde_json::Value> {
     let services = world
         .isolated_root
         .as_ref()
@@ -3554,25 +3573,17 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         .path()
         .join("data")
         .join("services");
-    let records: Vec<serde_json::Value> = std::fs::read_dir(&services)
+    std::fs::read_dir(&services)
         .unwrap_or_else(|e| panic!("no services dir at {}: {e}", services.display()))
         .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
         .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
         .filter(|record| record["engine"] == "lemonade")
-        .collect();
-    let log_paths: Vec<&str> = records
-        .iter()
-        .filter_map(|record| record["log_path"].as_str())
-        .collect();
-    assert!(
-        !log_paths.is_empty(),
-        "the failed launch left no lemonade service record in {}",
-        services.display()
-    );
-    assert!(
-        log_paths.iter().any(|path| output.contains(path)),
-        "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
-    );
+        .collect()
+}
+
+/// `launches` failed launches of an engine that died at startup each left one
+/// record: `stopped`, and still the claim as it was written.
+fn assert_failed_launches_left_their_claims(records: &[serde_json::Value], launches: usize) {
     // Read raw from disk, not through `rocm services`, whose liveness refresh
     // would rewrite the very fields pinned here. `stopped`, not `failed`:
     // `rocmd`'s recovery restarts a managed `failed` record that carries no stop
@@ -3583,15 +3594,15 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         .collect();
     assert_eq!(
         statuses,
-        ["stopped"],
-        "the failed launch must leave its record `stopped`, not claiming the engine \
+        vec!["stopped"; launches],
+        "each failed launch must leave its record `stopped`, not claiming the engine \
          and model"
     );
     // The startup check saw the child die, so the record never names it: the
     // pid is free, and a later stop or cleanup must not signal whatever process
-    // reuses it. No start-time token was captured for the dead engine, so
-    // nothing else would tell that process from it. Both platforms leave the
-    // claim as it was written, before any child was put on record.
+    // reuses it. On Windows no start-time token was captured for the dead
+    // engine, so nothing else would tell that process from it. Both platforms
+    // leave the claim as it was written, before any child was put on record.
     let pids: Vec<(serde_json::Value, serde_json::Value)> = records
         .iter()
         .map(|record| {
@@ -3603,7 +3614,7 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         .collect();
     assert_eq!(
         pids,
-        [(serde_json::json!(0), serde_json::Value::Null)],
+        vec![(serde_json::json!(0), serde_json::Value::Null); launches],
         "a child the startup check saw die must not be named by the record"
     );
 }
@@ -3636,4 +3647,6 @@ async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
         "the retry must reach the engine launch again rather than being turned \
          away by the previous failed launch:\n{output}"
     );
+    // The retry's own cleanup left its record the same way, beside the first.
+    assert_failed_launches_left_their_claims(&lemonade_service_records(world), 2);
 }
