@@ -1677,3 +1677,45 @@ Expected result:
   the same command reading that file still reports the same causes, and a
   paste with a non-ASCII character in it (`é`, `→`, a typographic quote)
   reports the same causes as in PowerShell 7.
+
+## 14. Dashboard Chat With A Small-Context Local Model
+
+Needs a local OpenAI-compatible endpoint serving a model with a small context
+— llama.cpp's default `n_ctx` is 32768, which is the case this checks. The
+point is that an answer survives a tool call that returns a lot of text.
+
+```bash
+rocm dash
+```
+
+In the Chat tab, ask `which LLMs can this machine support`, which is the
+question that makes the model call `rocm_command` with `["model"]`.
+
+Expected result:
+
+- A written answer listing recommended models. Not
+  `chat request failed: ... 400 Bad Request`, and not a raw JSON error body.
+- The same question asked of `rocm mcp-call` returns the curated list, and the
+  per-recipe diagnostics only when asked for:
+
+  ```bash
+  echo '{"args":["model"]}' > args.json
+  rocm mcp-call rocm_command --arguments-file args.json | wc -c
+  echo '{"args":["model","--verbose"]}' > args.json
+  rocm mcp-call rocm_command --arguments-file args.json | wc -c
+  ```
+
+  The first is a few kilobytes and matches what `rocm model` prints in a
+  terminal; the second is far larger.
+
+- To see the truncation path, ask something that makes the model read a long
+  service log (`rocm_command` with `["logs"]` on a host with a lot of history).
+  The model's answer should say the output was partial and point at running the
+  command in a terminal — it must not present a cut list as a complete one.
+
+- To see the overflow message, point the Chat tab at a model with a very small
+  context (serve one with `--ctx-size 2048`) and ask the same question. The
+  transcript should read `A ROCm check returned more text than this model can
+  read (N of M tokens). Try a more specific question, or a model with a larger
+  context.` — and `rocm-cli.log` should still carry the provider's own body
+  with `exceed_context_size_error` in it.

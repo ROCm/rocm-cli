@@ -16,6 +16,87 @@ async fn user_asks_for_verbose_catalog(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Ask the `rocm_command` tool for the catalog, the way the dashboard's Chat
+/// tab and any MCP client do. `mcp-call` is the CLI's own entry to that tool,
+/// so the same dispatch the dash drives is exercised without a model or a TUI.
+fn ask_the_tool_for_the_catalog(world: &mut E2eWorld, args: &[&str]) {
+    let arguments = serde_json::json!({ "args": args }).to_string();
+    let (stdout, _, rc) = crate::run_rocm(
+        world,
+        &["mcp-call", "rocm_command", "--arguments-json", &arguments],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+/// The catalog text inside the tool's reply, with the call's success asserted
+/// first so a failure reads as the CLI's own rather than as a missing field.
+fn catalog_text_from_the_tool(world: &E2eWorld) -> String {
+    let output = world.cli_output.as_ref().expect("no tool reply");
+    assert_eq!(world.cli_rc, Some(0), "the tool call failed:\n{output}");
+    let reply: serde_json::Value = serde_json::from_str(output.trim())
+        .unwrap_or_else(|error| panic!("the tool reply is not JSON ({error}):\n{output}"));
+    assert_eq!(reply["isError"], serde_json::json!(false), "{reply}");
+    reply["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the tool reply carries no text:\n{output}"))
+        .to_owned()
+}
+
+#[when("a tool-using client asks for the model catalog")]
+async fn tool_client_asks_for_catalog(world: &mut E2eWorld) {
+    ask_the_tool_for_the_catalog(world, &["model"]);
+}
+
+#[when("a tool-using client asks for the model catalog in verbose detail")]
+async fn tool_client_asks_for_verbose_catalog(world: &mut E2eWorld) {
+    ask_the_tool_for_the_catalog(world, &["model", "--verbose"]);
+}
+
+#[then("the client is given the recommended models without the per-recipe diagnostics")]
+async fn tool_client_gets_the_recommendations(world: &mut E2eWorld) {
+    let text = catalog_text_from_the_tool(world);
+    // The same two lines the recommendation listing ends with for the built-in
+    // catalog, so this pins the curated renderer rather than merely "some
+    // text with a model id in it".
+    assert!(
+        text.contains(
+            "These are recommendations - you can serve any compatible Hugging Face model"
+        ) && text.contains("rocm serve <owner/repo>"),
+        "expected the recommendation listing:\n{text}"
+    );
+    // `aliases=[` opens every row of the verbose listing and appears nowhere
+    // in the curated one.
+    assert!(
+        !text.contains("aliases=["),
+        "the per-recipe diagnostics must not be the default:\n{text}"
+    );
+}
+
+#[then("what the client is given is small enough for a locally served model to read")]
+async fn tool_catalog_is_small_enough_to_read(world: &mut E2eWorld) {
+    let text = catalog_text_from_the_tool(world);
+    // 16 KiB is the dash's per-result budget (`TOOL_RESULT_CHAR_BUDGET` in
+    // `crates/rocm-dash-tui/src/agent/tools.rs`), chosen to leave room in a
+    // 32k-token context for the system prompt and several turns. Asserted as
+    // a literal rather than imported so the e2e suite does not take a
+    // dependency on a dash internal; the listing measured under 2 KB.
+    assert!(
+        text.len() < 16 * 1024,
+        "the catalog handed to a tool client is {} characters, past the dash's budget:\n{text}",
+        text.len()
+    );
+}
+
+#[then("the client is given the per-recipe diagnostics")]
+async fn tool_client_gets_the_diagnostics(world: &mut E2eWorld) {
+    let text = catalog_text_from_the_tool(world);
+    assert!(
+        text.contains("model recipes") && text.contains("aliases=["),
+        "expected the verbose per-recipe listing:\n{text}"
+    );
+}
+
 #[then("the catalog lists an AIM engine recipe")]
 async fn catalog_lists_aim_recipe(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no model catalog output");

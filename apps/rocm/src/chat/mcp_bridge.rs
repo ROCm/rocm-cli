@@ -41,8 +41,9 @@ use crate::{
     build_codex_bridge_gpu_snapshot, build_codex_bridge_snapshot,
     builtin_codex_bridge_engine_inventory, cli_version_string, record_cli_audit_event,
     render_config_text, render_engine_inventory_text_with_paths, render_examine_text,
-    render_examine_text_with_paths, render_model_registry_verbose_text_with_context_and_host,
-    render_setup_status_text, therock_install_version_selector,
+    render_examine_text_with_paths, render_model_registry_text_with_context_and_host,
+    render_model_registry_verbose_text_with_context_and_host, render_setup_status_text,
+    therock_install_version_selector,
 };
 use crate::{comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
@@ -497,8 +498,28 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         {
             Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
+        // `model` / `models` render what `rocm model` prints in a terminal —
+        // the curated recommendation list. They used to render the
+        // `--verbose` diagnostics instead: every recipe with its aliases,
+        // engine recipes, flags and policy notes, measured at 204,470
+        // characters (~58k tokens) on a developer host against 864 characters
+        // for plain `rocm model`. That is more than a locally served model's
+        // whole context, so the one tool call a small model reaches for when
+        // asked what it can run ended the turn with a provider error. The
+        // verbose dump is still reachable, but only when it was asked for.
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
+        {
+            Ok(render_model_registry_text_with_context_and_host(
+                Some(paths),
+                None,
+                None,
+            ))
+        }
+        [command, flag]
+            if (command.eq_ignore_ascii_case("model")
+                || command.eq_ignore_ascii_case("models"))
+                && flag.eq_ignore_ascii_case("--verbose") =>
         {
             Ok(render_model_registry_verbose_text_with_context_and_host(
                 Some(paths),
@@ -1175,6 +1196,81 @@ mod tests {
             env!("ROCM_CLI_GIT_HASH")
         );
         assert!(text.lines().any(|line| line == version_line), "{text}");
+    }
+
+    /// What the chat `model` tool hands back has to be what `rocm model`
+    /// prints, not the `--verbose` diagnostics. The verbose dump is every
+    /// recipe with its aliases, engine recipes, flags and policy notes; on a
+    /// developer host it measured 204,470 characters against 864 for plain
+    /// `rocm model`, which is more than a locally served model's whole
+    /// context. Asking a small model "which LLMs can this machine support"
+    /// makes it call exactly this, so the one question the tool exists for
+    /// used to end in a provider context-overflow error.
+    #[test]
+    fn chat_model_tool_returns_the_curated_list_rocm_model_prints() {
+        let (_root, paths) = test_paths("mcp-model-curated");
+
+        let result = run_internal_mcp_call(
+            &paths,
+            "rocm_command",
+            serde_json::json!({ "args": ["model"] }),
+            false,
+        )
+        .expect("read-only rocm_command model should run");
+        let text = mcp_tool_result_text(&result);
+
+        // The same recipes, from the same renderer `rocm model` calls.
+        let curated = render_model_registry_text_with_context_and_host(Some(&paths), None, None);
+        assert!(
+            text.contains(curated.trim()),
+            "the tool must return what `rocm model` prints:\n{text}"
+        );
+        // And not the per-recipe diagnostics, which are what made it huge.
+        assert!(
+            !text.contains("aliases=["),
+            "the verbose dump must not be the default:\n{text}"
+        );
+        // Comfortably inside the dash's 16 KiB per-result budget
+        // (`TOOL_RESULT_CHAR_BUDGET` in `crates/rocm-dash-tui/src/agent/tools.rs`),
+        // so a chat turn carrying it is never truncated on the built-in
+        // catalog. Asserted here rather than imported so the bin does not
+        // depend on a dash constant.
+        assert!(
+            text.len() < 16 * 1024,
+            "the curated list is {} characters, past the dash budget",
+            text.len()
+        );
+    }
+
+    /// The diagnostics are still reachable — the model has to ask for them,
+    /// the same way a person types `rocm model --verbose`.
+    #[test]
+    fn chat_model_tool_still_renders_the_verbose_dump_on_request() {
+        let (_root, paths) = test_paths("mcp-model-verbose");
+
+        let result = run_internal_mcp_call(
+            &paths,
+            "rocm_command",
+            serde_json::json!({ "args": ["model", "--verbose"] }),
+            false,
+        )
+        .expect("read-only rocm_command model --verbose should run");
+        let text = mcp_tool_result_text(&result);
+
+        assert!(text.contains("model recipes"), "{text}");
+        assert!(
+            text.contains("aliases=["),
+            "--verbose must still render the per-recipe diagnostics:\n{text}"
+        );
+        // The two really are different sizes; without this the test above
+        // could pass against a renderer that lost its diagnostics entirely.
+        let curated = render_model_registry_text_with_context_and_host(Some(&paths), None, None);
+        assert!(
+            text.len() > curated.len(),
+            "the verbose dump ({}) should be longer than the curated list ({})",
+            text.len(),
+            curated.len()
+        );
     }
 
     #[test]
