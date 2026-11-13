@@ -2,9 +2,14 @@
 //
 // SPDX-License-Identifier: MIT
 
+//! Tests of the host checks in `e2e/host_guard.rs`, which this file includes.
+//!
 //! The Windows install scenarios must refuse a Linux/WSL host before any CLI
-//! call, even when an explicit cucumber filter bypasses the platform tags.
-//! Check the actual step wiring without ever invoking a driver installer.
+//! call, even when an explicit cucumber filter bypasses the platform tags: this
+//! file checks the actual step wiring without ever invoking a driver installer,
+//! and that the check refuses Linux and WSL. Including `host_guard.rs` also
+//! runs its own test of the KFD topology step's check, which refuses any host
+//! but bare-metal Linux.
 
 #[path = "e2e/host_guard.rs"]
 mod host_guard;

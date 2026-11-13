@@ -266,6 +266,54 @@ a file it reads, so a pull request that touches nothing but
 `crates/rocm-dash-tui` does not run this test on Linux. The module-import
 contract above has the same property.
 
+### Capability-tagged scenarios name their OS
+
+A capability tag (`@requires-gpu`, `@requires-engine:<e>`, `@requires-docker`
+and the rest) asks what the host has, not which OS it runs, so the Windows GPU
+lane runs every `@requires-gpu` scenario. A scenario whose premise exists on
+one OS only also carries `@requires-os:<os>`. `@requires-os:linux` still
+admits WSL2, which reports itself as Linux, so add `@requires-bare-metal` too
+when WSL2 lacks the interface. examine-17 is the case that prompted this: its
+step reads the KFD topology, found none on the Windows lane, and passed
+without asserting anything.
+
+[platform_tags.rs](../tests/e2e-cucumber/tests/platform_tags.rs) reads the
+`.feature` files the e2e harness reads by default (every `*.feature` under
+`tests/e2e-cucumber/features/`, recursively, extension in any case), expands
+Scenario Outlines the way cucumber does, and parses each scenario's tags with
+the harness's own `ScenarioDecl::from_tags`. A capability tag there is any
+`@requires-*` tag `ScenarioDecl` reads except `@requires-os:<os>` and
+`@requires-wsl`, the two that decide the OS. It fails on:
+
+- a capability-tagged scenario with neither OS-deciding tag whose `@id` is not
+  in its `ALLOWED_ANY_OS` list, including one with no `@id` at all
+- two scenarios with the same `@id`
+- any tag on a `Feature:` or `Rule:` line, which does nothing: the harness
+  reads only each scenario's own tags
+- finding no `.feature` file, or no scenario, which would leave every other
+  check passing over nothing
+- an `ALLOWED_ANY_OS` entry that is listed twice, has an empty reason, names no
+  scenario, names one with no capability tag, or names one whose tags already
+  decide its OS
+
+Each entry's reason says why the scenario's steps hold on every OS a lane runs
+it on. The guard checks only that the OS is decided: whether a Linux scenario
+also needs `@requires-bare-metal` is left to review, and it pins that tag only
+on examine-17. Run it on its own with:
+
+```bash
+cargo test -p e2e-cucumber --test platform_tags
+```
+
+It reads tags, not steps, so whether an entry's reason is still true is a
+review question: a step that starts reading something only one OS has turns
+its entry wrong without failing anything here. Where it runs: the
+`windows-debug` job runs `cargo test --workspace` on every pull request that
+changes Rust or a `.feature` file, so a tag-only edit is checked there. The
+Linux pull-request lane runs it only when the change selects `e2e-cucumber` and
+passes that lane's Rust path filter, which a `.feature` file alone does not, and
+the pre-push hook does not run `e2e-cucumber`'s tests.
+
 ### Tests that run a fake executable
 
 Plant a stand-in `python`, `uv`, `amd-smi`, ... with
@@ -2817,8 +2865,10 @@ this harness's platform filter, so selecting a Windows scenario by name or tag
 on Linux runs it against Linux behavior instead of skipping it. The Windows
 install steps also require a native Windows build before any CLI invocation.
 [driver_host_guard.rs](../tests/e2e-cucumber/tests/driver_host_guard.rs) checks
-that ordering without running an installer. Do not run these scenarios on a
-non-Windows host.
+that ordering without running an installer. The same test target also tests the
+native-Windows check itself, and the check that the KFD topology step
+(examine-17) runs to refuse any host but bare-metal Linux.
+Do not run these scenarios on a non-Windows host.
 
 `serve-16` (`@id:serve-absent-gpu-index-rejected`,
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)) runs

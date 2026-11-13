@@ -415,9 +415,9 @@ Feature: Diagnosing failures and listing fixes
   # a fix the CLI applies, so the report of a change that never happened looked
   # like success.
   # @requires-bare-metal because the entry under test is scoped to bare-metal
-  # Linux and Windows. On WSL it is refused at the platform gate instead, which
-  # is a different contract with its own scenario — and the right one, since the
-  # catalog does not claim this remedy applies there.
+  # Linux and Windows. On WSL it is declined as not applicable instead, which is
+  # the contract diagnose-11 covers (with another entry) — and the right one,
+  # since the catalog does not claim this remedy applies there.
   @id:diagnose-fix-needing-an-argument-says-so @requires-bare-metal
   Scenario: diagnose-28 - A fix that needs more information says what it needs and changes nothing
     Given a user who has chosen a fix that cannot run until it is told what to act on

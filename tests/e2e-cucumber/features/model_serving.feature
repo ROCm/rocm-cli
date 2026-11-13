@@ -45,7 +45,12 @@ Feature: Model serving
   # caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
   # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
-  @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
+  # Every `@requires-engine:vllm` scenario also carries `@requires-os:linux`,
+  # which records that its premise is Linux-only: the CLI refuses vLLM on native
+  # Windows (serve-33). The tag changes no lane today, since the harness already
+  # counts vLLM unavailable on native Windows and skips these there. WSL2 is not
+  # excluded: the CLI there is a Linux build and serves vLLM.
+  @id:serve-vllm-inference @requires-gpu @requires-engine:vllm @requires-os:linux
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
@@ -118,7 +123,7 @@ Feature: Model serving
   # only applies where vLLM is the effective engine — `@requires-engine:vllm`
   # skips it on lemonade-default hosts (Strix Halo), where asserting a vLLM
   # default would be a guaranteed false failure.
-  @id:serve-vllm-default-on-instinct @requires-gpu @requires-engine:vllm
+  @id:serve-vllm-default-on-instinct @requires-gpu @requires-engine:vllm @requires-os:linux
   Scenario: serve-11 - vLLM is the default serving engine on Instinct
     Given a managed runtime is active
     When the user serves a vLLM-capable model without specifying an engine
@@ -383,7 +388,12 @@ Feature: Model serving
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  # `@requires-os:linux` on both: the CLI refuses AIM on native Windows, while
+  # the harness counts AIM as available wherever Docker runs and the GPU family
+  # fits, whatever the OS. Without the tag a native Windows host with Docker and
+  # such a GPU would run both and meet that refusal; with it they skip there.
+  # WSL2 is not excluded, since the CLI there is a Linux build.
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @requires-os:linux @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -398,7 +408,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @requires-os:linux @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim

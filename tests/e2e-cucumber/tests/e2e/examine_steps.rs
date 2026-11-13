@@ -1055,11 +1055,13 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
 /// The `gfx_target_version` of every GPU the KFD topology describes, read
 /// straight from sysfs.
 ///
-/// `None` when the topology is unreadable, which is the normal case off Linux.
-/// CPU nodes report a `gfx_target_version` of `0` and are skipped, so the length
-/// is the kernel's own GPU count and the values say whether those GPUs are all
-/// the same part.
-fn kfd_gpu_node_versions() -> Option<Vec<u32>> {
+/// `None` when the topology is unreadable. It takes a
+/// `host_guard::BareMetalLinux`, which only the host check makes, so it cannot
+/// be called off bare-metal Linux, where it would always be `None`. CPU nodes
+/// report a `gfx_target_version` of `0` and are skipped, so the length is the
+/// kernel's own GPU count and the values say whether those GPUs are all the
+/// same part.
+fn kfd_gpu_node_versions(_host: &super::host_guard::BareMetalLinux) -> Option<Vec<u32>> {
     let mut versions = Vec::new();
     for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
         .ok()?
@@ -1092,7 +1094,12 @@ fn host_has_lspci() -> bool {
 
 #[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
 async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
-    let Some(versions) = kfd_gpu_node_versions().filter(|versions| !versions.is_empty()) else {
+    // Off bare-metal Linux there is no KFD topology, so the early returns below
+    // would pass this step without asserting anything. They are for a Linux
+    // host missing a premise; any other host is a tagging mistake.
+    let host = super::host_guard::this_host_is_bare_metal_linux();
+    let Some(versions) = kfd_gpu_node_versions(&host).filter(|versions| !versions.is_empty())
+    else {
         return;
     };
     if !host_has_lspci() {
