@@ -938,8 +938,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             force_dev_binaries,
             force,
         }) => {
-            uninstall::reject_force(force.is_some())?;
-            uninstall(UninstallOptions {
+            let options = UninstallOptions {
                 yes,
                 dry_run,
                 keep_binaries,
@@ -947,7 +946,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 keep_data,
                 keep_cache,
                 force_dev_binaries,
-            })
+            };
+            uninstall::reject_force(force.is_some(), &options)?;
+            uninstall(options)
         }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();

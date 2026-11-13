@@ -20,7 +20,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, interactive_terminal, require_yes_or_interactive};
+use rocm_core::confirm::require_yes_or_interactive_with;
+use rocm_core::recovery_hint::{advise, with_try};
+use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::uninstall_plan::{
     PlanAudience, UninstallOptions, UninstallPlan, UninstallPlanEntry, build_uninstall_plan,
@@ -71,13 +73,71 @@ impl PathEdit {
 /// `--force-dev-binaries`, which removes development binaries, and a near miss
 /// such as `--forc` gets that same suggestion. Declared, those guesses land here
 /// instead, before anything is planned or removed.
-pub(crate) fn reject_force(force: bool) -> Result<()> {
+///
+/// The refusal ends with the command the user meant: the same `options`, with
+/// `--yes` in place of `--force`.
+pub(crate) fn reject_force(force: bool, options: &UninstallOptions) -> Result<()> {
     if force {
-        bail!(
-            "`--force` is not an option of `rocm uninstall`; use `--yes` to skip the confirmation"
-        );
+        bail!(with_try(
+            "`--force` is not an option of `rocm uninstall`; use `--yes` to skip the confirmation",
+            &uninstall_command_line(&confirmed(options))
+        ));
     }
     Ok(())
+}
+
+/// The `rocm uninstall` command line that runs with `options`, flags in a fixed
+/// order. It names only real flags, so never `--force`, and repeats every flag
+/// that changes what is removed, so following it removes what the refused run
+/// listed and nothing more. Settings made through the environment
+/// (`ROCM_CLI_CONFIG_DIR` and the like) are not repeated: the advice is for the
+/// same shell the refused command ran in.
+pub(crate) fn uninstall_command_line(options: &UninstallOptions) -> String {
+    let UninstallOptions {
+        yes,
+        dry_run,
+        keep_binaries,
+        keep_config,
+        keep_data,
+        keep_cache,
+        force_dev_binaries,
+    } = options;
+    let flags = [
+        (dry_run, "--dry-run"),
+        (keep_binaries, "--keep-binaries"),
+        (keep_config, "--keep-config"),
+        (keep_data, "--keep-data"),
+        (keep_cache, "--keep-cache"),
+        (force_dev_binaries, "--force-dev-binaries"),
+        (yes, "--yes"),
+    ];
+    let mut line = String::from("rocm uninstall");
+    for (_, flag) in flags.iter().filter(|(set, _)| **set) {
+        line.push(' ');
+        line.push_str(flag);
+    }
+    line
+}
+
+/// `options` with the confirmation given, as the advice in a refusal runs it.
+fn confirmed(options: &UninstallOptions) -> UninstallOptions {
+    UninstallOptions {
+        yes: true,
+        ..options.clone()
+    }
+}
+
+/// Whether `options` may remove what its plan lists without asking: `Ok(true)`
+/// with `--yes`, `Ok(false)` when there is a terminal to ask at, and otherwise
+/// the shared `--yes` refusal, ending with the same command confirmed.
+/// `interactive` is the terminal probe, injected so a test can take either
+/// side of it.
+pub(crate) fn approval(
+    options: &UninstallOptions,
+    interactive: impl FnOnce() -> bool,
+) -> Result<bool> {
+    require_yes_or_interactive_with(options.yes, "uninstall", interactive)
+        .map_err(|refusal| advise(refusal, &uninstall_command_line(&confirmed(options))))
 }
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
@@ -96,7 +156,7 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
         return Ok(());
     }
 
-    let already_approved = require_yes_or_interactive(options.yes, "uninstall")?;
+    let already_approved = approval(&options, interactive_terminal)?;
     if !already_approved && !confirm_uninstall()? {
         println!("uninstall cancelled");
         return Ok(());

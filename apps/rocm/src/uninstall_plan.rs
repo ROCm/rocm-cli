@@ -54,7 +54,7 @@ use rocm_core::{AppPaths, daemon_binary_path};
 use crate::managed_service_status::load_managed_services;
 use crate::{remote, uninstall};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UninstallOptions {
     pub(crate) yes: bool,
     pub(crate) dry_run: bool,

@@ -22,6 +22,7 @@
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
+use rocm_core::recovery_hint::with_try;
 use rocm_core::{AppPaths, ManagedServiceRecord};
 
 use crate::engine_install_env::{engine_manages_own_runtime, runtime_manifest_for_selector};
@@ -337,9 +338,10 @@ pub(crate) fn ensure_service_restart_approved(
     command: &str,
 ) -> Result<()> {
     if restart_services && !yes {
-        bail!(
-            "restarting running local servers requires --yes.\n\nTry: rocm runtimes {command} --restart-services --yes"
-        );
+        bail!(with_try(
+            "restarting running local servers requires --yes.",
+            &format!("rocm runtimes {command} --restart-services --yes")
+        ));
     }
     Ok(())
 }

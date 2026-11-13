@@ -517,6 +517,16 @@ not checked as written:
   `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
   in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
   checked through the functions that build it instead
+- advice assembled at run time has no literal to scan: the `Try:` line the two
+  `rocm uninstall` refusals end with is built from the flags the user gave
+  (`uninstall_command_line` in [uninstall.rs](../apps/rocm/src/uninstall.rs)), so
+  `uninstall_refusal_advice_parses_and_clears_the_refusal` and
+  `uninstall_force_advice_parses_and_clears_the_refusal` run each refusal for
+  every combination of uninstall's flags and check that the line parses, repeats
+  the command with `--yes`, and passes the gate. Every single-command `Try:`
+  footer is written by `with_try` in
+  [recovery_hint.rs](../crates/rocm-core/src/recovery_hint.rs), and these tests
+  read it back with its `try_command`
 - separate optional groups are tried one at a time, never together (they can
   be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
   command that fails only when flags from two of them are combined is not
@@ -1806,7 +1816,11 @@ and checks the listed folder goes; a run whose stdin or stdout is not a terminal
 empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
 mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
 is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
-its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+its examples with a dry run (`uninstall-11`). Both refusals end with a `Try:`
+line naming the same uninstall with `--yes` (and without `--force`), and
+`uninstall-16` (Linux, the `--yes` refusal) and `uninstall-17` (the `--force`
+refusal) run that line as printed and check it removes the config folder that
+was listed and keeps the data folder that was kept. The assistant's uninstall preview
 ends differently, since it has no flag to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
 `uninstall-13` to `uninstall-15` drive the confirmation prompt under a
@@ -1830,7 +1844,7 @@ step with this table. The help is a wording pin; the behavior is proven here:
 
 | Command | Without `--yes`, no terminal | Proven by |
 |---|---|---|
-| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing | `uninstall-04` (Linux) |
+| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing; ends with `Try:` and the same command with `--yes` | `uninstall-04`, `uninstall-16` (Linux) |
 | `rocm runtimes uninstall` | same | `runtime-lifecycle-04` |
 | `rocm storage remove-downloads`, `remove-old-installs` | same; only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
 | `rocm fix` | prints the plan, refuses, exit 5 (stdin only decides) | `diagnose-08` (Linux, bare metal) |
@@ -1843,7 +1857,7 @@ regression would delete real settings, so the command points `HOME` at a
 scratch folder itself:
 
 ```bash
-HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal, ending with its Try: line; exit 1
 ```
 
 ## Provider-Assisted Planning
