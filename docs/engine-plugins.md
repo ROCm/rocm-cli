@@ -154,6 +154,16 @@ Installer policy:
   start with that marker as it is, prints a note, and records nothing for it.
   A custom `ROCM_CLI_SHELL_PROFILE` replaces only the login shell's profile;
   fish's is still updated.
+  On Linux, `install.sh` also writes the `rocm(1)` manual page to
+  `share/man/man1/rocm.1` under the folder above the install folder
+  (`~/.local/share/man/man1/rocm.1` for the default `~/.local/bin`), starting
+  with a roff comment line naming the install folder, and records it as a
+  `man` line in `.rocm-cli-path-edit`, so `rocm uninstall` removes it with the
+  binaries. It does so even with `ROCM_CLI_UPDATE_SHELL_PATH=0`, since it is
+  no `PATH` change. As for `rocm.fish`, the installer leaves an existing
+  `rocm.1` (or link) that does not start with that line as it is, and
+  uninstall leaves a recorded `rocm.1` that does not start with that line for
+  its own folder.
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use

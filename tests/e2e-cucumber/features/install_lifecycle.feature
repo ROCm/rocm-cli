@@ -497,3 +497,13 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the installed rocm and rocmd binaries are gone
     And the user's own manual page is untouched
+
+  @id:lifecycle-linux-man-page-replaced-kept @lifecycle @requires-os:linux
+  Scenario: lifecycle-38 - Linux - uninstall leaves a manual page the user wrote over the installer's, and says so
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the shell profile updated
+    And the user has replaced the rocm manual page with their own
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And uninstall leaves the user's own manual page in place and says why

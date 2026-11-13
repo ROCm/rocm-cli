@@ -96,7 +96,8 @@ folder (`~/.local/share/man/man1/rocm.1` by default). `man` finds a page there
 for any folder on `PATH`, so `man rocm` works in a new terminal once
 `~/.local/bin` is on `PATH`; a `MANPATH` you set yourself hides it unless it
 ends in `:`. A `rocm.1` already there that the installer did not write is left
-as it is, with a note, like the fish completions.
+as it is, with a note, like the fish completions. A `rocm` release from before
+the manual page existed has none to install, and the installer says so.
 Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
 its completions included; the manual page is still installed. Rerun the
 installer any time to upgrade.
@@ -1911,10 +1912,9 @@ rocm completions powershell | Out-String | Invoke-Expression
 
 ### Manual page
 
-On Linux the installer also installs a `rocm` manual page (see
-[Installation](#installation)), so the overview of every command, the
-examples, the files ROCm CLI keeps and the environment variables it reads are
-available offline:
+On Linux the installer also installs a `rocm` manual page, so the overview of
+every command, the examples, the files ROCm CLI keeps and the environment
+variables it reads are available offline:
 
 ```
 man rocm

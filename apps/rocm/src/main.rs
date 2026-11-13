@@ -1546,6 +1546,9 @@ pub(crate) mod tests {
         assert!(skips(&["rocm", "__man-page"]));
         assert!(skips(&["rocm", "completions", "fish"]));
         assert!(skips(&["rocm", "update"]));
+        assert!(skips(&["rocm", "bootstrap"]));
+        // Reclaiming disk must not start a download.
+        assert!(skips(&["rocm", "storage", "report"]));
         assert!(!skips(&["rocm", "examine"]));
         assert!(!skips(&["rocm", "version"]));
     }

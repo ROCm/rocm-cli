@@ -2086,6 +2086,46 @@ async fn then_installer_leaves_users_man_page(world: &mut E2eWorld) {
     );
 }
 
+#[given("the user has replaced the rocm manual page with their own")]
+async fn given_users_replaced_man_page(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    let record = std::fs::read_to_string(st.install_dir.join(".rocm-cli-path-edit"))
+        .expect("the installer wrote no PATH-edit record");
+    assert!(
+        record
+            .lines()
+            .any(|line| line == format!("man {}", path.display())),
+        "the installer did not record the manual page, so uninstall would not look at it:\n{record}"
+    );
+    std::fs::write(&path, USERS_OWN_MAN_PAGE).expect("failed to replace the manual page");
+}
+
+#[then("uninstall leaves the user's own manual page in place and says why")]
+async fn then_users_replaced_man_page_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_MAN_PAGE,
+        "uninstall removed or changed {}, which the user wrote over the installer's",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "manual page {} left in place: it does not start with the rocm-cli installer's \
+             marker, so the installer did not write it",
+            path.display()
+        )),
+        "uninstall did not say why it left the manual page:\n{out}"
+    );
+    assert!(
+        !out.contains("removed manual page"),
+        "uninstall reported removing a manual page it kept:\n{out}"
+    );
+}
+
 #[then("the user's own manual page is untouched")]
 async fn then_users_man_page_untouched(world: &mut E2eWorld) {
     let st = state(world);

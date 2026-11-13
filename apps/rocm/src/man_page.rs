@@ -81,6 +81,13 @@ const EXAMPLES: &[(&[&str], &str)] = &[
 /// folder: `~/.local/share/man/man1/rocm.1` for the default `~/.local/bin`.
 const MAN_PAGE_PATH: &str = "<prefix>/share/man/man1/rocm.1";
 
+/// How the page's first line starts. The Linux installer installs what
+/// `rocm __man-page` printed only when it starts with this, since a rocm
+/// built before the verb existed reads `__man-page` as a natural-language
+/// request, prints a request plan and exits 0. `MAN_PAGE_TITLE` in
+/// `install.sh` is this string, which a test below checks.
+const TITLE_PREFIX: &str = ".TH ROCM 1 ";
+
 /// The variable the Linux installer reads for the folder it installs into.
 const INSTALL_DIR_ENV: &str = "ROCM_CLI_INSTALL_DIR";
 
@@ -100,7 +107,7 @@ fn render(root: clap::Command, w: &mut impl Write) -> io::Result<()> {
     let version = cmd.get_version().unwrap_or_default().replace('"', "'");
     // Written here rather than by `Man::render_title`, which leaves an empty
     // date unquoted, so the source and manual shift into the wrong fields.
-    writeln!(w, ".TH ROCM 1 \"\" \"rocm {version}\" \"ROCm CLI\"")?;
+    writeln!(w, "{TITLE_PREFIX}\"\" \"rocm {version}\" \"ROCm CLI\"")?;
     let man = Man::new(cmd);
     man.render_name_section(w)?;
     man.render_synopsis_section(w)?;
@@ -416,6 +423,34 @@ mod tests {
         }
     }
 
+    /// Every other variable the page names is read, under that exact name, by
+    /// the code the page says reads it, so a renamed variable cannot leave
+    /// the page naming one nothing reads.
+    #[test]
+    fn every_other_variable_the_page_names_is_read_under_that_name() {
+        let python = include_str!("therock/python.rs");
+        let update = include_str!("therock/update.rs");
+        let installer = include_str!("../../../install.sh");
+        for name in terms(&section(&page(), "ENVIRONMENT")) {
+            let (source, read) = match name.as_str() {
+                CONFIG_DIR_ENV | DATA_DIR_ENV | CACHE_DIR_ENV => continue,
+                "ROCM_CLI_PYTHON" | "ROCM_CLI_MANAGED_PYTHON_VERSION" => (
+                    "therock/python.rs",
+                    python.contains(&format!("std::env::var(\"{name}\")")),
+                ),
+                "ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK" => (
+                    "therock/update.rs",
+                    update.contains(&format!("std::env::var_os(\"{name}\")")),
+                ),
+                INSTALL_DIR_ENV | "ROCM_CLI_UPDATE_SHELL_PATH" => {
+                    ("install.sh", installer.contains(&format!("${{{name}:-")))
+                }
+                other => panic!("{other} is on the page but this test does not know its reader"),
+            };
+            assert!(read, "{source} does not read {name}");
+        }
+    }
+
     /// The usage-error code is the one clap exits with, and `rocm fix`'s own
     /// codes are the ones it publishes.
     #[test]
@@ -457,6 +492,40 @@ mod tests {
         assert!(
             commands.contains("Commands marked [preview] work but are outside"),
             "{commands}"
+        );
+    }
+
+    /// NAME and SYNOPSIS call the program `rocm`, whatever `--version`
+    /// calls it, and the synopsis names the command argument `command`.
+    #[test]
+    fn the_name_and_synopsis_call_the_program_rocm() {
+        let page = page();
+        let about = crate::Cli::command()
+            .get_about()
+            .expect("rocm has a summary")
+            .to_string();
+        let name = section(&page, "NAME");
+        assert_eq!(
+            name.first().map(String::as_str),
+            Some(format!("rocm \\- {about}").as_str()),
+            "{name:?}"
+        );
+        let synopsis = section(&page, "SYNOPSIS");
+        let usage = synopsis.first().expect("a synopsis line");
+        assert!(usage.starts_with("\\fBrocm\\fR "), "{usage}");
+        assert!(usage.ends_with(" [\\fIcommand\\fR]"), "{usage}");
+    }
+
+    /// The page starts with the title line the installer checks for before
+    /// installing it.
+    #[test]
+    fn the_installer_checks_for_the_title_the_page_starts_with() {
+        let page = page();
+        assert!(page.starts_with(TITLE_PREFIX), "{page}");
+        let installer = include_str!("../../../install.sh");
+        assert!(
+            installer.contains(&format!("MAN_PAGE_TITLE='{TITLE_PREFIX}'")),
+            "install.sh no longer checks for {TITLE_PREFIX:?}"
         );
     }
 

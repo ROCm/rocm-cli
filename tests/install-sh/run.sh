@@ -81,7 +81,9 @@ mkdir -p "${BUNDLE}"
 # print nothing once when it says `empty-once`: the stub consumes the file, so
 # the next run works, as a failure that clears by itself would. They also fail
 # when the installer hands `rocm` its own stdin, which under `curl | sh` is the
-# rest of the script. The manual page does the same with $HOME/.stub-man-page.
+# rest of the script. The manual page does the same with $HOME/.stub-man-page,
+# which can also say `plan-once`: print a request plan and exit 0, as a rocm
+# built before `__man-page` existed does.
 cat > "${BUNDLE}/rocm" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "__man-page" ] && [ "$#" -eq 1 ]; then
@@ -94,6 +96,11 @@ if [ "${1:-}" = "__man-page" ] && [ "$#" -eq 1 ]; then
   case "${_mode}" in
     fail-once) printf '%s\n' "stub manual page failure" >&2; exit 1 ;;
     empty-once) exit 0 ;;
+    # A rocm built before the verb existed reads it as a request.
+    plan-once)
+      printf '%s\n' 'request plan' '  request: __man-page' '  note: No ROCm action matched this request.'
+      exit 0
+      ;;
   esac
   printf '%s\n' '.TH ROCM 1 "" "rocm stub" "ROCm CLI"' '.SH NAME' 'rocm \- stub manual page'
   exit 0
@@ -487,9 +494,9 @@ fi
 # cleanly with the PATH block on record and writes no completion file. The
 # failure here clears by itself (the stub works on its second run), and the
 # printed advice, run as printed from a bare environment in a home whose name
-# holds a space, then creates the file.
+# holds a space and a quote, then creates the file.
 for mode in fail-once empty-once; do
-  comp_home="${WORK}/homes/spaced home ${mode}"
+  comp_home="${WORK}/homes/spaced it's home ${mode}"
   comp_log="${WORK}/completions-${mode}.log"
   comp_path="${comp_home}/.config/fish/completions/rocm.fish"
   comp_record="${comp_home}/.local/bin/.rocm-cli-path-edit"
@@ -584,12 +591,12 @@ fi
 
 # A rocm that cannot print its manual page, or prints nothing, still installs
 # cleanly and writes and records no page. The printed advice, run as printed
-# from a bare environment in a home whose name holds a space, writes the page
-# the installer would have, marker included, so the next install takes it as
-# its own and records it.
+# from a bare environment in a home whose name holds a space and a quote,
+# writes the page the installer would have, marker included, so the next
+# install takes it as its own and records it.
 failures_before="${FAILURES}"
 for mode in fail-once empty-once; do
-  mp_home="${WORK}/homes/spaced man ${mode}"
+  mp_home="${WORK}/homes/spaced it's man ${mode}"
   mp_log="${WORK}/man-page-${mode}.log"
   mp_path="$(man_page_path "${mp_home}")"
   mkdir -p "${mp_home}"
@@ -619,6 +626,30 @@ for mode in fail-once empty-once; do
 done
 if [ "${FAILURES}" -eq "${failures_before}" ]; then
   pass "a manual page that cannot be generated leaves the install and a working hint"
+fi
+
+# A rocm too old to have `__man-page` prints a request plan and exits 0. That
+# is not a page: nothing is written or recorded, `man rocm` is not suggested,
+# and no retry is offered, since running it again prints the same plan.
+failures_before="${FAILURES}"
+op_home="${WORK}/homes/old-rocm-man"
+op_log="${WORK}/old-rocm-man.log"
+op_path="$(man_page_path "${op_home}")"
+mkdir -p "${op_home}"
+printf '%s\n' plan-once > "${op_home}/.stub-man-page"
+install_case "${op_log}" "${op_home}" /bin/bash "${BASE_PATH}" 1
+assert_absent_file "${op_home}/.stub-man-page" "old rocm manual page was never attempted"
+assert_absent_file "${op_path}" "a request plan was installed as the manual page"
+[ -x "${op_home}/.local/bin/rocm" ] || fail "an old rocm's request plan stopped the install"
+assert_contains "${op_home}/.bashrc" "${POSIX_SNIPPET}" "an old rocm's request plan lost the PATH block"
+assert_log_contains "${op_log}" "note: manual page not installed: this version of rocm does not provide one" "an old rocm's request plan was not reported"
+assert_log_lacks "${op_log}" "manual page installed:" "an old rocm's request plan was reported installed"
+assert_log_lacks "${op_log}" "could not install the manual page" "an old rocm's request plan got the retry note"
+assert_log_lacks "${op_log}" "__man-page >>" "an old rocm's request plan got a retry recipe"
+assert_log_lacks "${op_log}" "man rocm" "an old rocm's request plan suggested man rocm"
+assert_eq "old rocm manual page record lines" "$(man_record_count "${op_home}")" 0
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "a rocm too old to print a manual page installs none and offers no retry"
 fi
 
 # A rocm.1 that is already there and did not come from this installer is the
@@ -719,6 +750,10 @@ install_case "${WORK}/profile-blocked.log" "${bl_home}" /bin/bash "${BASE_PATH}"
 assert_log_lacks "${WORK}/profile-blocked.log" "shell profile updated:" "an uncreatable profile was reported updated"
 assert_log_contains "${WORK}/profile-blocked.log" "is not saved in your shell profile" "an uncreatable profile was not reported"
 assert_absent_file "${bl_home}/blocker/profile" "a profile was written through a file"
+# The page is installed, but a new terminal will not have the install folder on
+# PATH, so man would not find it and `man rocm` is not suggested.
+assert_file_eq "manual page with an unsaved profile" "$(man_page_path "${bl_home}")" "$(installed_man_page "${bl_home}")"
+assert_log_lacks "${WORK}/profile-blocked.log" "man rocm" "an unsaved profile still suggested man rocm"
 if grep -F -q -- "profile " "${bl_home}/.local/bin/.rocm-cli-path-edit" 2>/dev/null; then
   fail "an uncreatable profile was recorded"
 fi
