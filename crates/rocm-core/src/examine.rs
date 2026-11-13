@@ -1070,3 +1070,10 @@ mod tests {
 #[cfg(test)]
 #[path = "examine_driver_proptests.rs"]
 mod driver_proptests;
+
+/// Property tests for how the GPU probes in `linux_gpus` and `windows`
+/// enumerate and classify AMD GPUs; a child module so it can reach the folds
+/// and classifiers while they stay private to `examine`.
+#[cfg(test)]
+#[path = "examine_gpu_proptests.rs"]
+mod gpu_proptests;

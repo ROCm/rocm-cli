@@ -144,8 +144,17 @@ pub(crate) fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
             }
             return Some(target.to_owned());
         }
-        if name_fallback.is_none() {
-            name_fallback = gfx_target_from_amd_marketing_name(name).map(str::to_owned);
+        if name_fallback.is_none()
+            && let Some(target) = gfx_target_from_amd_marketing_name(name)
+        {
+            // The same rule for a name: the marketing table names gfx90c by its
+            // codenames, and an iGPU recognised that way must not hide a
+            // discrete card further down the list either.
+            if gfx_target_has_no_rocm_build(target) {
+                unsupported_match = unsupported_match.or(Some(target));
+            } else {
+                name_fallback = Some(target.to_owned());
+            }
         }
     }
     name_fallback.or_else(|| unsupported_match.map(str::to_owned))
@@ -172,8 +181,9 @@ pub(crate) fn parse_windows_display_name(text: &str) -> Option<String> {
 /// can answer from the same table rather than from marketing-name matching
 /// alone: `Win32_VideoController` hands that probe the PNP id in the same
 /// query that gives it the name, and without this it dropped the id on the
-/// floor and left `gfx_target` empty for every part the name table does not
-/// cover -- which is every Vega iGPU, so a Renoir/Cezanne laptop reported no
+/// floor and left `gfx_target` empty for every part whose Windows name the
+/// name table cannot resolve -- among them every gfx90c Vega iGPU, named only
+/// "AMD Radeon(TM) Graphics" there, so a Renoir/Cezanne laptop reported no
 /// architecture at all unless a HIP SDK was installed to ask `hipInfo`.
 ///
 /// Returns the first match only. Which GPU of several a caller is asking about
@@ -240,6 +250,12 @@ pub(crate) fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'sta
     }
 }
 
+/// The gfx target an AMD marketing name or `lspci` codename names, or `None`
+/// when no entry in [`AMD_MARKETING_GFX_TARGETS`] matches.
+///
+/// This is the crate's one name-to-target table: the install-side display
+/// probes and `examine`'s GPU probes both answer from it, so a name resolves to
+/// the same target whichever command reads it.
 pub(crate) fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
     let normalized = normalize_marketing_name_for_match(&lower);
@@ -252,12 +268,12 @@ pub(crate) fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static 
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AmdMarketingGfxTarget {
-    pattern: &'static str,
-    gfx_target: &'static str,
+pub(crate) struct AmdMarketingGfxTarget {
+    pub(crate) pattern: &'static str,
+    pub(crate) gfx_target: &'static str,
 }
 
-const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
+pub(crate) const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
     // RDNA4 discrete.
     AmdMarketingGfxTarget {
         pattern: "ai pro r9700",
@@ -406,6 +422,17 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "8040s",
         gfx_target: "gfx1151",
     },
+    // The codename and the product line, as `lspci` and `rocminfo` print them.
+    // There is no "8045S": the three Strix Halo SKU names are 8060S, 8050S and
+    // 8040S (the Ryzen AI Max PRO 380's), so this table never carried one.
+    AmdMarketingGfxTarget {
+        pattern: "strix halo",
+        gfx_target: "gfx1151",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "ryzen ai max",
+        gfx_target: "gfx1151",
+    },
     // RDNA3.5 APUs.
     AmdMarketingGfxTarget {
         pattern: "890m",
@@ -416,11 +443,22 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         gfx_target: "gfx1150",
     },
     AmdMarketingGfxTarget {
+        pattern: "strix point",
+        gfx_target: "gfx1150",
+    },
+    AmdMarketingGfxTarget {
         pattern: "860m",
         gfx_target: "gfx1152",
     },
     AmdMarketingGfxTarget {
         pattern: "840m",
+        gfx_target: "gfx1152",
+    },
+    // Krackan Point is gfx1152, as its device id (`1114`) and the 860M/840M it
+    // sells as both say. gfx1150 and gfx1152 are separate TheRock families, so
+    // calling it gfx1150 selects the wrong runtime build.
+    AmdMarketingGfxTarget {
+        pattern: "krackan",
         gfx_target: "gfx1152",
     },
     AmdMarketingGfxTarget {
@@ -440,6 +478,32 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "740m",
         gfx_target: "gfx1103",
     },
+    // `lspci` prints the Phoenix codename with a die number (`Phoenix1`,
+    // `Phoenix3`), which is a different token from `phoenix`.
+    AmdMarketingGfxTarget {
+        pattern: "phoenix",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix1",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix2",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix3",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix4",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "hawk point",
+        gfx_target: "gfx1103",
+    },
     // RDNA2 APUs.
     AmdMarketingGfxTarget {
         pattern: "680m",
@@ -450,7 +514,23 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         gfx_target: "gfx1035",
     },
     AmdMarketingGfxTarget {
+        pattern: "rembrandt",
+        gfx_target: "gfx1035",
+    },
+    // Mendocino (Ryzen 7020 series) sells as a Radeon 610M too, which the row
+    // below answers as gfx1036; only the codename tells the two apart, so it is
+    // listed ahead of that row for `lspci`'s sake. A Windows Mendocino, named
+    // only "Radeon(TM) 610M", still reads as gfx1036 by name.
+    AmdMarketingGfxTarget {
+        pattern: "mendocino",
+        gfx_target: "gfx1037",
+    },
+    AmdMarketingGfxTarget {
         pattern: "610m",
+        gfx_target: "gfx1036",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "raphael",
         gfx_target: "gfx1036",
     },
     AmdMarketingGfxTarget {
@@ -460,6 +540,37 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
     AmdMarketingGfxTarget {
         pattern: "van gogh",
         gfx_target: "gfx1033",
+    },
+    // `lspci` spells it as one word, and the Steam Deck's own display name is
+    // the part number rather than any Radeon model.
+    AmdMarketingGfxTarget {
+        pattern: "vangogh",
+        gfx_target: "gfx1033",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "custom gpu 0405",
+        gfx_target: "gfx1033",
+    },
+    // Vega iGPUs in Ryzen 4000/5000/7030 parts. They sell as a bare "AMD
+    // Radeon Graphics", so the codename `lspci` prints is the only name that
+    // identifies them. gfx90c has no ROCm build (`gfx_target_has_no_rocm_build`),
+    // which is why the install-side probes rank a name answering it below every
+    // other recognised adapter.
+    AmdMarketingGfxTarget {
+        pattern: "renoir",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "cezanne",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "lucienne",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "barcelo",
+        gfx_target: "gfx90c",
     },
 ];
 
@@ -816,7 +927,8 @@ mod tests {
     /// Vega iGPU device ids that matter to `info-20-gpu-no-rocm-support`.
     ///
     /// This is the only source of a gfx target for those parts on a Windows
-    /// host with no HIP SDK: `classify_amd_marketing_name` has no Vega arm, and
+    /// host with no HIP SDK: Windows names these iGPUs only "AMD Radeon(TM)
+    /// Graphics", which no row of the name table resolves, and
     /// `hipInfo` is in the SDK that is not installed. Without it the ticket's
     /// 4700U laptop reported an empty target, and the check that exists for it
     /// could not fire on the machine it was written for.

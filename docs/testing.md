@@ -4338,6 +4338,72 @@ anything: an absent node (EAI-8457 states the scenario does not apply with no
 there ranks from the sysfs VRAM rows alone. `kfd_readable`'s doc comment carries
 the same statement next to the code.
 
+## Integrated Or Discrete GPU
+
+`rocm examine` reports each AMD GPU's `gfx_target` and `is_apu`. `rocm
+diagnose` raises `fix-9-igpu-dgpu` from `is_apu`, only when a host has both an
+integrated and a discrete AMD GPU. `rocm serve` withholds its low-VRAM warning
+on a single-GPU host whose detected `gfx_target` is an APU family, whose "VRAM"
+is a BIOS carve-out of system RAM: `vram_capacity_is_meaningful` in
+[gpu_policy.rs](../apps/rocm/src/gpu_policy.rs) asks `gfx_is_apu_family`, the
+predicate `is_apu` is derived from, rather than reading `is_apu` itself, and
+`rocm diagnose --model` asks the same check before judging a fit against that
+carve-out.
+
+`examine-49` in [examine.feature](../tests/e2e-cucumber/features/examine.feature)
+covers the PCI scan end to end on every Linux lane, GPU or not. It puts a
+stand-in `lspci` and an empty `rocminfo` on `PATH` and points the simulated host
+root at an empty tree, so the five planted rows are the only GPUs. The RX 7900
+XTX is classified by its marketing name, the Raphael iGPU by its device id alone
+(the `Device` row `lspci` prints when `pci.ids` has no name), Krackan Point and
+Renoir by their device ids (the scan asks the id first, so their codenames are
+not consulted), and Mendocino by its codename alone. The codename rows for the
+other Vega and RDNA iGPUs are covered at unit level
+(`examine_names_a_gpu_by_its_codename_from_the_shared_table`).
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-49 '
+```
+
+`examine-50` covers the kernel-topology route the same way, for an integrated
+GPU no lookup table names. Its simulated host root carries a KFD topology node
+per card, and its two `lspci` rows resolve no target (a Raven Ridge iGPU and an
+unnamed `Device` row), so the gfx902 and gfx1102 the topology reports are the
+only evidence. The Raven Ridge iGPU must come out integrated and the other card
+discrete:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-50 '
+```
+
+`examine-51` drops the PCI scan altogether, as an ordinary ROCm container with
+no `pciutils` does: the stand-in `lspci` lists nothing and neither topology node
+states a PCI address, so both GPUs are listed from the topology alone and must
+still come out integrated (gfx1151) and discrete (gfx1201). The sysfs fallback
+that runs when even the topology is unreadable lists a single GPU, so it cannot
+open the iGPU+dGPU gate and is covered at unit level only
+(`a_sysfs_fallback_gpu_carries_its_targets_verdict_where_one_is_known`); so is
+the `rocminfo` marketing-name fallback, which #393 keeps out of reach end to
+end. That fallback decides a verdict only when one AMD GPU and one agent are
+listed: `rocminfo` agents are paired with GPUs by position (#508), and on a
+multi-GPU host a position is no evidence of which card a name belongs to, so
+the verdict stays unknown there
+(`a_kernel_topology_gpu_is_classified_from_the_evidence_there_is`).
+
+What `rocminfo` and `hipInfo` add is covered one level down, in
+[examine_gpu_proptests.rs](../crates/rocm-core/src/examine_gpu_proptests.rs):
+a target nothing classifies must leave an earlier verdict standing
+(`gfx_apu_verdict` answers `None` for it). That rule cannot be reached end to
+end today, because a real `rocminfo` prints ISA `Name:` lines that make the
+parser drop every agent (#393). The Windows display property draws adapters
+that print only the generic `AMD Radeon(TM) Graphics`, so a display probe that
+stopped reading the PNP device id fails it. The property harness asserts floors
+on how much of each corpus its generators reach, and prints the measured rates:
+
+```bash
+cargo test -p rocm-core --lib -- examine::gpu_proptests --nocapture
+```
+
 ## Windows Runtime Preflight
 
 On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
