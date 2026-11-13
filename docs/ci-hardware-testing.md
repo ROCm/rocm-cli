@@ -331,9 +331,10 @@ The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
 `e2e-selfhosted.yml`, because the report derives each platform's name and OS
 from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
 of the per-PR `sdk_version` matrix (below, under "Triggers"); a `current`-leg
-artifact keeps its pre-matrix name unchanged. `rad3`/`mi350p` are nightly-only
-lanes (ROCMAI-125) and don't run that matrix, so they have no `-n-1`/`-n-2`
-entries. `nightly.yml`'s self-hosted lanes run a `channel:
+artifact keeps its pre-matrix name unchanged. `rad3`, `mi350p` and `w7900`
+are uploaded only by `nightly.yml` (`e2e-selfhosted.yml` has no W7900 lane any
+more, and `rad3`/`mi350p` were nightly-only from the start, ROCMAI-125); they
+don't run that matrix, so they have no `-n-1`/`-n-2` entries. `nightly.yml`'s self-hosted lanes run a `channel:
 [release, nightly]` matrix and append the channel as the final segment before
 the `-report` affix (e.g. `e2e-gpu-strix-windows-nightly-report`); the report
 strips that segment before matching, so the platform/OS derivation is
