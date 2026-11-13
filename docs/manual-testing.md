@@ -396,7 +396,7 @@ server (no download needed): the pinned build needs glibc 2.38 and OpenSSL 3
 (`libssl.so.3`). On a real older host, such as Ubuntu 22.04 (glibc 2.35) or
 Ubuntu 20.04 (glibc 2.31, OpenSSL 1.1 only), run
 `rocm engines install lemonade --yes` in a fresh data folder. On a newer host,
-use a debug build and set `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and
+use a build with the `rocm/e2e-test-hooks` feature and set `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and
 `ROCM_E2E_LEMONADE_HOST_OPENSSL=missing` first. Expected result:
 
 - It fails with `this host's libraries are too old for the Lemonade <version>

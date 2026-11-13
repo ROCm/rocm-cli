@@ -565,6 +565,17 @@ async fn assert_lemonade_backend_paired_with_active_sdk(world: &mut E2eWorld) {
         pinned_version, active_version,
         "the installed backend_versions.json does not pin the active ROCm SDK:\nstdout:\n{output}\nstderr:\n{stderr}"
     );
+    if pinned_version == packaged_therock_pin(output) {
+        // The active SDK is the packaged pin (ROCm 10.1 against Lemonade
+        // 2026.44.1), so the comparison above holds whatever the CLI did. The
+        // llama.cpp tag paired with that pin is a second signal: an alignment
+        // that rewrote the pin would also have moved it.
+        assert_eq!(
+            installed_backend_pin(output, "llamacpp", "rocm-stable"),
+            packaged_backend_pin(output, "llamacpp", "rocm-stable"),
+            "the active SDK is the packaged pin, yet the llama.cpp ROCm tag was rewritten:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+    }
     let reported_aligned = output
         .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK");
     if !reported_aligned {
@@ -592,6 +603,13 @@ fn is_plain_release_version(version: &str) -> bool {
 /// `therock.version` in the `resources/backend_versions.json` of the runtime
 /// tree the install reports (`env_path:`).
 fn installed_therock_pin(output: &str) -> String {
+    installed_backend_pin(output, "therock", "version")
+        .unwrap_or_else(|| panic!("no therock.version in the installed backend_versions.json"))
+}
+
+/// `<section>.<key>` in the installed `resources/backend_versions.json`, e.g.
+/// `llamacpp.rocm-stable`, the llama.cpp tag that goes with the ROCm pin.
+fn installed_backend_pin(output: &str, section: &str, key: &str) -> Option<String> {
     let env_path = output
         .lines()
         .find_map(|line| line.trim().strip_prefix("env_path: "))
@@ -610,10 +628,7 @@ fn installed_therock_pin(output: &str) -> String {
             backend_versions_path.display()
         )
     });
-    parsed["therock"]["version"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()))
-        .to_owned()
+    parsed[section][key].as_str().map(str::to_owned)
 }
 
 /// The CLI names the variable whenever it is set, so a user can tell it was
@@ -695,12 +710,17 @@ async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
     let pinned_version = installed_therock_pin(output);
     let packaged_version = packaged_therock_pin(output);
     // Where the active SDK already is the packaged pin (a ROCm 10.1 SDK against
-    // Lemonade 2026.44.1) this cannot tell an untouched pin from one rewritten to
-    // the same value; the absent alignment and revert lines above are then the
-    // whole check.
+    // Lemonade 2026.44.1) the ROCm version alone cannot tell an untouched pin
+    // from one rewritten to the same value, so the llama.cpp tag paired with it
+    // is checked too.
     assert_eq!(
         pinned_version, packaged_version,
         "the pin differs from the one the Lemonade archive ships even though the user opted out"
+    );
+    assert_eq!(
+        installed_backend_pin(output, "llamacpp", "rocm-stable"),
+        packaged_backend_pin(output, "llamacpp", "rocm-stable"),
+        "the llama.cpp ROCm tag differs from the one the Lemonade archive ships even though the user opted out"
     );
 }
 
@@ -712,6 +732,13 @@ async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
 /// (`lemonade-embeddable-<version>`): the downloads directory is never pruned,
 /// so a runner that installed an earlier pin still holds that archive too.
 fn packaged_therock_pin(output: &str) -> String {
+    packaged_backend_pin(output, "therock", "version")
+        .unwrap_or_else(|| panic!("no therock.version in the packaged backend_versions.json"))
+}
+
+/// `<section>.<key>` as the cached Lemonade archive ships it; see
+/// [`packaged_therock_pin`].
+fn packaged_backend_pin(output: &str, section: &str, key: &str) -> Option<String> {
     let env_path = output
         .lines()
         .find_map(|line| line.trim().strip_prefix("env_path: "))
@@ -759,10 +786,7 @@ fn packaged_therock_pin(output: &str) -> String {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&extracted.stdout)
         .unwrap_or_else(|error| panic!("failed to parse {member}: {error}"));
-    parsed["therock"]["version"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no therock.version in {member}"))
-        .to_owned()
+    parsed[section][key].as_str().map(str::to_owned)
 }
 
 /// The engine inventory reports a usable engine runtime.
