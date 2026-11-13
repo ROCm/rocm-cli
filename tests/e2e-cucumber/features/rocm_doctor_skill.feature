@@ -8,20 +8,20 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   #
   # The centre of this feature is the catalog diff (scenarios 1-3): the table in
   # `reference.md` is parsed and compared to what `rocm fix` really reports, so a
-  # renamed fix-id, a re-scoped OS, a flipped auto-flag, or a 16th failure mode
+  # renamed fix-id, a re-scoped OS, a flipped auto-flag, or a new failure mode
   # cannot merge here and silently break the published skill. Nothing else tests
   # that seam — `diagnose.feature` deliberately asserts only the SHAPE of a
   # diagnosis so it stays host-independent.
   #
   # That guarantee covers the table's cells and the auto-applicable prose line —
   # what `skill_steps.rs` actually parses. Free-standing prose that only
-  # restates those same facts in words — the Linux-only/Windows-only recap line
-  # beneath the table, for one — is not parsed here and can go stale even while
-  # the table itself stays correct. Two such counts are checked by the unit-level
-  # `tests/skill_reference.rs` instead: the "(N failure modes)" count in the
-  # catalog heading and SKILL.md's "The other M ... print-only" count. Two
-  # SKILL.md sentences are therefore fixtures: that print-only count, and the
-  # contract sentence that skill-07 reads.
+  # restates those same facts in words — the paragraph on the unused `fix-20`
+  # number under the table, for one — is not parsed here and can go stale even while
+  # the table itself stays correct. The "(N failure modes)" count in the catalog
+  # heading, SKILL.md's "The other M ... print-only" count and the names SKILL.md
+  # lists are checked by the unit-level `tests/skill_reference.rs` instead, whose
+  # module doc lists the SKILL.md sentences that are fixtures (skill-07 reads one
+  # of them).
   #
   # The catalog is authoritative in `crates/rocm-core`. When one of these fails,
   # the CLI is right and the document is what changes: `reference.md`, or
@@ -31,9 +31,9 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # the published document, and nothing else belongs. Claims proven elsewhere
   # are not restated. `diagnose.feature` already owns the CLI's own behaviour —
   # that a fix meant for another OS is declined without changing anything
-  # (`@id:fix-inapplicable-here-is-declined-not-attempted`), that the catalog
-  # listing is complete against an in-test list
-  # (`@id:fix-catalog-is-complete`), and that a report says plainly whether a
+  # (`@id:diagnose-fix-inapplicable-here-is-declined-not-attempted`), that the
+  # catalog listing is complete against an in-test list
+  # (`@id:diagnose-fix-catalog-is-complete`), and that a report says plainly whether a
   # cause was established (`@id:diagnose-json-states-when-nothing-matched`).
   # The exit-code and confirm-before-mutating contract is unit tested in
   # `crates/rocm-core/src/fix/runners.rs`, where a declined consent or a failed write
@@ -81,10 +81,10 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
     Then the inspection succeeds whatever it finds
     And its verdict is one the skill documents
 
-  # The skill's standing rule is "never invent a fix — if nothing matched, route
-  # the user upstream". That rule is only followable if the address the CLI hands
-  # over is one the skill's own routing table gives, so this is the last claim in
-  # `reference.md` that the binary can be held to.
+  # When nothing matched, the skill sends the user upstream. That is only
+  # followable if the address the CLI hands over is one `reference.md`'s
+  # Framework routing section lists, so this is the last claim in `reference.md`
+  # that the binary can be held to.
   #
   # The scenario is about the ADDRESS, not about nothing having matched. Whether
   # a report goes unexplained is not a property this suite can hold still: the
@@ -109,10 +109,10 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # though a raised contract means the catalog removed or changed something. The
   # scenario turns red at that bump, so the skill is read again first.
   #
-  # Whether an agent obeys the stop is behaviour, not text, and no committed
-  # test checks it today. The skill's evals cannot reach it, because their
-  # runners carry no `rocm`. A stub CLI that the evals can use would let them
-  # grade it.
+  # Whether an agent obeys the stop is behaviour, not text. The skill's evals
+  # grade it where they replay a recorded older CLI
+  # (`rocm-older-cli-stops-before-diagnosing`), which needs a model run, so this
+  # scenario holds only the declared number.
   @id:skill-required-contract-is-the-one-the-cli-publishes
   Scenario: skill-07 - The skill requires the same catalog contract that the CLI publishes
     Given the ROCm Doctor skill as it is published

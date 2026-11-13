@@ -41,13 +41,14 @@ use std::io::Write;
 
 pub(crate) use catalog::{COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, is_catalog_id};
 pub use catalog::{class_on, needs_on};
+pub use consent::{DRY_RUN_NOTICE, NON_INTERACTIVE_REFUSAL};
 pub use manifest::{
     CATALOG_CONTRACT_VERSION, CatalogManifest, ManifestEntry, ManifestPlatform, catalog_manifest,
     catalog_manifest_json,
 };
 pub use options::{FixClass, FixOptions, exit};
 pub(crate) use render::format_flags;
-pub use render::list_recipes;
+pub use render::{fix_plan_text, list_recipes};
 // The catalog's test-only oracles, which the `diagnose` module holds its own copies of
 // a recipe to.
 #[cfg(test)]

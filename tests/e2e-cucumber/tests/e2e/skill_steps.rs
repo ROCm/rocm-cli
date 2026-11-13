@@ -13,9 +13,9 @@
 //! `reference.md` is read as the EXPECTED-value fixture. That is a deliberate,
 //! narrow exception to the suite's black-box rule: nothing is imported from the
 //! rocm-cli codebase — a documentation artifact is read as test data, and that
-//! artifact is the thing under test. `SKILL.md` is read too, for two
+//! artifact is the thing under test. `SKILL.md` is read too, for a few fixture
 //! sentences: `skill-07` reads the catalog contract version Phase 0 requires,
-//! and `tests/skill_reference.rs` reads the "The other N ... print-only" count.
+//! and `tests/skill_reference.rs` lists all of them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -170,8 +170,8 @@ fn declared_contract_minimum(skill_md: &str) -> Option<u64> {
 ///
 /// Rows look like:
 /// `| `fix-1-arch` | linux/windows/wsl | <mode> | <signal> | print-only |`
-/// Only rows whose first cell is a backticked `fix-*` id are taken, which skips
-/// the header, the separator, and the exit-code table further up the file.
+/// Only rows whose first cell is a backticked catalog id are taken, which skips
+/// the header and the separator.
 fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
     let mut out = BTreeMap::new();
     for line in md.lines() {
@@ -461,12 +461,12 @@ fn documented_verdicts(md: &str) -> BTreeSet<String> {
 
 /// The subset of Framework routing the reference attributes to the **CLI**.
 ///
-/// The section names two different things: trackers the *skill* hands over from
-/// its own table (Lemonade, Ollama, LM Studio — the host probe cannot detect
-/// them), and the targets `route_when_no_match` actually returns. Checking the
-/// CLI's route against the union of both lets a documented-but-dead CLI target
-/// pass silently, which is how the removed lemonade / ollama / lm-studio arms
-/// stayed in the document. So the CLI is held to its own list.
+/// The section lists the targets `route_when_no_match` actually returns; the
+/// trackers the *skill* hands over itself (Lemonade, Ollama, LM Studio — the
+/// host probe cannot detect them) live in `SKILL.md`. Checking the CLI's route
+/// against a union of both would let a documented-but-dead CLI target pass
+/// silently, which is how the removed lemonade / ollama / lm-studio arms stayed
+/// in the document. So the CLI is held to its own list.
 fn documented_cli_routes(md: &str) -> BTreeMap<String, Option<String>> {
     let mut out = BTreeMap::new();
     let mut inside = false;
@@ -639,10 +639,10 @@ async fn assert_same_auto_set(world: &mut E2eWorld) {
             offered.marker
         );
     }
-    // The reference says it twice — marker cells above, per-host prose below —
-    // and the loop only checked the cells. A rename applied to the table and
-    // the CLI together would leave the prose stale, and the prose is what an
-    // agent reads before it decides whether to offer to run a fix.
+    // The reference says it twice — per-host bullets above the table and marker
+    // cells in it — and the loop only checked the cells. A rename applied to the
+    // table and the CLI together would leave the bullets stale, so they are
+    // checked too, which keeps them from drifting away from the table.
     let prose = documented_auto_prose_for(reference(world), &platform);
     let offered: BTreeSet<String> = cli
         .iter()
@@ -717,9 +717,10 @@ async fn assert_documented_fields_present(world: &mut E2eWorld) {
     // routing scenario covers that branch. What must hold is that anything
     // offered is fully readable by an agent following the skill.
     //
-    // The individual fields of a `fix` plan are NOT checked here. The reference
-    // does not spell them out, so there is no documented claim to compare
-    // against — that is a serialization shape, and `crates/rocm-core` owns it.
+    // The individual fields of a `fix` plan are NOT checked here. The ones
+    // `SKILL.md` names are checked against the serialised `Fix` by
+    // `tests/skill_reference.rs`, with no `rocm` binary needed; the shape itself
+    // is a serialization detail that `crates/rocm-core` owns.
     for cause in matched {
         let absent: Vec<&String> = per_cause
             .iter()
@@ -744,8 +745,8 @@ async fn assert_thresholds(world: &mut E2eWorld) {
             .unwrap_or_else(|| panic!("diagnose JSON has no numeric '{field}'"));
         assert_eq!(
             actual, *expected,
-            "{field} is {actual}, but reference.md states {expected} — and the skill's \
-             workflow text reasons about that number when it grades a cause"
+            "{field} is {actual}, but reference.md states {expected} — and the skill \
+             names this field when it grades a cause"
         );
     }
 }
@@ -894,8 +895,9 @@ async fn assert_required_contract_is_published(world: &mut E2eWorld) {
         required == published,
         "The CLI now publishes catalog contract version {published}, but SKILL.md still \
          requires {required}. A raised contract version means the catalog removed or \
-         changed something. Check the entry ids, the auto-applicable set and the exit \
-         codes in SKILL.md and reference.md against the new catalog, then raise the \
+         changed something. Check the entry ids, the fix classes and the field names \
+         in SKILL.md and reference.md, and the `exit_codes` names in SKILL.md, \
+         against the new catalog, then raise the \
          number in SKILL.md. Raise it only after a release publishes that contract, \
          because the installer Phase 0 offers installs the release channel."
     );

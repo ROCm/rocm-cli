@@ -267,12 +267,15 @@ mod tests {
     /// Every diagnosis must agree with the fix catalog about whether the CLI
     /// can apply the fix itself.
     ///
-    /// An agent following the rocm-doctor skill branches on `auto_applicable`
-    /// from `diagnose --json` to decide whether to offer to run `rocm fix` or
-    /// merely print the plan, while `fix::apply` dispatches on `RECIPES`. The
-    /// two are written in different files and nothing but this test holds them
-    /// together, so a drift makes the CLI contradict itself: it would advertise
-    /// a fix as one it can run and then refuse, or the reverse.
+    /// An agent following the rocm-doctor skill reads `fix.class` from
+    /// `diagnose --json` (`auto_applicable` is derived from it) to decide whether
+    /// `rocm fix` carries the fix out or merely prints the plan, while
+    /// `fix::apply` dispatches on `RECIPES`. `take_applicability_from_the_catalog`
+    /// derives `fix.class` and `fix.auto_applicable` from the catalog's class,
+    /// which is what keeps them in step. This test asserts only the
+    /// `auto_applicable` half, against the catalog's `applies_itself()` (true for
+    /// `auto` alone), so a diagnosis that bypassed the derivation would advertise
+    /// a fix as one the CLI can run and then refuse, or the reverse, and fail here.
     ///
     /// Both OS families are exercised because the checkers build their `Fix`
     /// per-OS and only one branch is taken per run, so a Linux-only test would

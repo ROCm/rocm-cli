@@ -7,7 +7,7 @@
 //! shares, and the refusal printed when a diagnosis position (`#2`) is passed
 //! as a fix-id.
 
-use super::catalog::{FixRecipe, RECIPES};
+use super::catalog::{FixRecipe, RECIPES, find_recipe};
 use super::consent::current_os;
 use super::options::FixClass;
 
@@ -107,29 +107,53 @@ pub(crate) fn format_flags(
 }
 
 pub(super) fn print_recipe(r: &FixRecipe) {
-    println!("Fix:        {}  -- {}", r.fix_id, r.title);
-    println!("OS scope:   {}", r.os_scope().join(", "));
-    println!("Rationale:  {}", r.rationale);
-    if !r.commands.is_empty() {
-        println!("Commands:");
-        for c in r.commands {
-            println!("  $ {c}");
-        }
+    for line in recipe_plan_lines(r, current_os()) {
+        println!("{line}");
     }
+}
+
+/// Every line of the plan `rocm fix <id>` prints for `r` on the platform `os`, in
+/// print order. What `os` changes is the class and the argument a plan names, which
+/// are per platform; [`print_recipe`] passes the running one.
+fn recipe_plan_lines(r: &FixRecipe, os: &str) -> Vec<String> {
+    let mut lines = vec![
+        format!("Fix:        {}  -- {}", r.fix_id, r.title),
+        format!("OS scope:   {}", r.os_scope().join(", ")),
+        format!("Rationale:  {}", r.rationale),
+    ];
+    if !r.commands.is_empty() {
+        lines.push("Commands:".to_owned());
+        lines.extend(r.commands.iter().map(|c| format!("  $ {c}")));
+    }
+    let platform = r.platform(os);
     let flags = format_flags(
         r.needs_sudo,
         r.needs_reboot,
         r.needs_relogin,
-        r.class_here(),
-        r.platform(current_os()).and_then(|p| p.needs),
+        r.class_on_os(os),
+        platform.and_then(|p| p.needs),
     );
-    println!("Flags:      {}", flags.join(", "));
-    for n in r.notes {
-        println!("Note:       {n}");
-    }
-    for line in verify_lines(r) {
-        println!("{line}");
-    }
+    lines.push(format!("Flags:      {}", flags.join(", ")));
+    lines.extend(r.notes.iter().map(|n| format!("Note:       {n}")));
+    lines.extend(verify_lines(r));
+    lines
+}
+
+/// The plan `rocm fix <fix_id>` prints on `os` (`linux`, `windows` or `wsl`), or
+/// `None` when there is no such fix.
+///
+/// It is the lines the command prints before it acts, and not the ones a runner adds
+/// after (such as the command it is about to run), which name the user and the
+/// machine.
+///
+/// `pub` only so the eval-fixture generator in `xtask` replays the plan without a
+/// second copy of its wording; hidden from the docs because it is not an API to
+/// build on.
+#[doc(hidden)]
+#[must_use]
+pub fn fix_plan_text(fix_id: &str, os: &str) -> Option<String> {
+    let recipe = find_recipe(fix_id)?;
+    Some(recipe_plan_lines(recipe, os).join("\n") + "\n")
 }
 
 /// The `Verify` lines of the plan `print_recipe` prints, in print order: the
@@ -421,6 +445,30 @@ mod tests {
             named.iter().any(|f| f.contains("--device-index")),
             "the catalog knows which argument fix-9-igpu-dgpu waits for, so the flags line \
              has to say it: {named:?}"
+        );
+    }
+
+    /// The plan a replaying tool prints is the one `rocm fix <id>` prints: the
+    /// class on the asked platform picks the flag, and an unknown id has no plan.
+    #[test]
+    fn fix_plan_text_is_the_plan_the_command_prints_for_the_platform() {
+        let linux = fix_plan_text("fix-4-render-group", "linux").expect("a plan");
+        assert!(linux.contains("\nOS scope:   linux\n"), "{linux}");
+        assert!(
+            linux.contains("\nFlags:      requires sudo, requires re-login, rocm fix can run it\n"),
+            "{linux}"
+        );
+        assert!(linux.ends_with('\n'));
+        // fix-4 does not apply on Windows, where the class falls back to print-only.
+        let windows = fix_plan_text("fix-4-render-group", "windows").expect("a plan");
+        assert!(windows.contains("manual only"), "{windows}");
+        assert_eq!(fix_plan_text("fix-0-nope", "linux"), None);
+        // The argument a plan waits for is per platform, and the flags line says it.
+        let needs_argument = fix_plan_text("fix-9-igpu-dgpu", "linux").expect("a plan");
+        assert!(
+            needs_argument
+                .contains("\nFlags:      needs --device-index before `rocm fix` will run it\n"),
+            "{needs_argument}"
         );
     }
 

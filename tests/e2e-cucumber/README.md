@@ -297,23 +297,24 @@ exception is `skill-07`, which reads
 that Phase 0 requires.
 
 Reading that document as test data is a deliberate, narrow exception to
-**Black-box only** above: nothing is imported from the rocm-cli codebase — a
-*documentation artifact* is read as test data, and that artifact is the thing
-under test. `skill_steps.rs` parses the specific claims each scenario names —
+**Black-box only** above: the scenario steps import nothing from the rocm-cli
+codebase — a *documentation artifact* is read as test data, and that artifact is
+the thing under test. (The ordinary-`cargo test` guard
+[skill_reference.rs](tests/skill_reference.rs) does import `rocm_core`, to compare
+the names SKILL.md lists with what the CLI publishes.) `skill_steps.rs` parses the specific claims each scenario names —
 the catalog table's cells, the auto-applicable prose line, the framework-routing
 bullets, the diagnose fields and thresholds — rather than restating them as
 constants, so editing one of those in `reference.md` starts being checked with
 no code change, and every one of those parsers asserts it found something — a
 heading it depends on being reworded upstream must fail loudly rather than
 quietly reduce an assertion to a no-op. Free-standing prose outside those
-spots — such as the Linux-only/Windows-only recap line under the table — is
-not parsed, so it can drift without failing anything here. Two counts are
-checked outside this feature by
-[skill_reference.rs](tests/skill_reference.rs): the failure-mode count in the
-catalog heading, and SKILL.md's "The other N ... print-only" count. Two
-sentences in SKILL.md are therefore fixtures. `skill-07` reads the sentence
-that declares the required catalog contract version, so rewording that
-sentence fails the scenario. `skill_reference.rs` reads the print-only count.
+spots — such as the paragraph on the unused `fix-20` number under the table —
+is not parsed, so it can drift without failing anything here.
+[skill_reference.rs](tests/skill_reference.rs) checks outside this feature the
+catalog table's vocabulary, the failure-mode count in the catalog heading,
+SKILL.md's "The other N ... print-only" count, and the exit-code and `fix` field
+names SKILL.md lists. Some sentences in SKILL.md are therefore fixtures:
+skill_reference.rs's module doc lists every one and says which test reads it.
 
 Two rules follow:
 

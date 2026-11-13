@@ -143,8 +143,13 @@ impl FixRecipe {
     /// it does not apply here at all — callers reach the OS gate in [`apply`]
     /// before the class is ever acted on, and understating is the safe default.
     pub(super) fn class_here(&self) -> FixClass {
-        self.platform(current_os())
-            .map_or(FixClass::PrintOnly, |p| p.class)
+        self.class_on_os(current_os())
+    }
+
+    /// What this recipe does on the platform `os`, [`FixClass::PrintOnly`] when it
+    /// does not apply there (the same understatement as [`Self::class_here`]).
+    pub(super) fn class_on_os(&self, os: &str) -> FixClass {
+        self.platform(os).map_or(FixClass::PrintOnly, |p| p.class)
     }
 
     /// The operating systems this applies on, in catalog order.
@@ -2378,7 +2383,8 @@ mod tests {
         // apply() returns 1 only when a platform's class is Auto and the recipe
         // has no runner (`Plan::MissingRunner`). `a_recipe_that_acts_has_a_runner`
         // keeps that impossible; assert the reachability argument here so
-        // reference.md's row 1 is accounted for rather than silently untested.
+        // the manifest's `internal` exit code is accounted for rather than
+        // silently untested.
         assert!(
             RECIPES.iter().all(|r| {
                 !r.applies_on.iter().any(|p| p.class.applies_itself()) || r.runner.is_some()

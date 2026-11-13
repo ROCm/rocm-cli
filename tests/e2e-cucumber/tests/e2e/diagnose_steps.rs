@@ -2805,7 +2805,7 @@ async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     assert_eq!(
         world.cli_rc,
         Some(1),
-        "a request with no answer must exit 1, as README.md and reference.md document"
+        "a request with no answer must exit 1, as README.md documents"
     );
     assert!(
         stderr.contains("--json"),

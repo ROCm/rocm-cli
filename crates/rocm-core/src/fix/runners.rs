@@ -11,7 +11,7 @@
 //! the catalog in `fix/catalog.rs` names the entry point of each recipe's
 //! runner and the running OS decides which variant runs.
 
-use super::consent::{QUERY_TIMEOUT, RUN_TIMEOUT, confirm, fail, relay_output};
+use super::consent::{DRY_RUN_NOTICE, QUERY_TIMEOUT, RUN_TIMEOUT, confirm, fail, relay_output};
 use super::options::{FixOptions, exit};
 use crate::probe_exec::{run, which};
 use crate::quoting::ps_single_quote_escape;
@@ -106,7 +106,7 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
     };
     println!("Will run: {program} {}", args.join(" "));
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Add user to render,video groups?", opts.yes) {
@@ -162,9 +162,10 @@ fn run_unset_override_linux() -> i32 {
 ///
 /// Takes the paths rather than deriving them from `$HOME`, for the same reason
 /// [`pin_device_in_rc_file`] takes its rc path: it makes the promise testable
-/// without mutating a process-global. And the promise needs testing — fix-2 is
-/// flagged `auto_applicable`, so `skills/rocm-doctor/` has to say plainly that
-/// this arm still only reports, and something has to hold that true.
+/// without mutating a process-global. And the promise needs testing — fix-2 has
+/// a runner on every platform and is class `auto` on Windows, so
+/// `skills/rocm-doctor/` has to say plainly that this arm still only reports, and
+/// something has to hold that true.
 fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
     let hits: Vec<&PathBuf> = candidates
         .iter()
@@ -219,8 +220,8 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
 /// the decline path testable without a real Windows host -- same reason
 /// [`pin_device_in_rc_file`] takes its consent as a closure.
 ///
-/// A decline must still exit `5`: `skills/rocm-doctor/reference.md` documents
-/// `5` as "user declined", and a caller (human or agent) relies on that to
+/// A decline must still exit `5`: the manifest's `exit_codes` publishes `5` as
+/// `declined` (`exit::DECLINED`), and a caller (human or agent) relies on that to
 /// tell "nothing happened because you said no" apart from "nothing happened
 /// because there was nothing to do". Declining just the User scope can't
 /// short-circuit straight to `return exit::DECLINED`, though -- if the Machine scope is
@@ -260,7 +261,7 @@ fn report_and_clear_override_windows(
             shown.join(" ")
         );
         if opts.dry_run {
-            println!("  (dry-run; not executed)");
+            println!("  {DRY_RUN_NOTICE}");
         } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
             let (rc, out, err) = run("setx", &setx_args, RUN_TIMEOUT);
             relay_output(&out, &err);
@@ -332,7 +333,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
@@ -431,7 +432,7 @@ fn path_export_windows(
     println!("Plan: prepend {bin_dir} to your User PATH:");
     println!("  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Update User PATH?", opts.yes) {
@@ -493,12 +494,12 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
 /// the rc file already pins a device, honour `--dry-run`, ask for consent, and
 /// append.
 ///
-/// Taking the rc path and the consent decision as parameters keeps this — the
-/// one auto-fix path on Linux that really mutates a file — testable end to end
+/// Taking the rc path and the consent decision as parameters keeps this —
+/// unlike the fix-6 PATH runner, which derives both itself — testable end to end
 /// against a temp file, with no `$HOME` mutation and no dependency on whether
-/// stdin happens to be a terminal. Exit codes are the contract documented in
-/// `skills/rocm-doctor/reference.md`: 0 applied/dry-run/already-set, 4 write
-/// failed, 5 declined.
+/// stdin happens to be a terminal. Exit codes are the `exit` constants in
+/// `options.rs`, published as the manifest's `exit_codes`: 0 applied/dry-run/
+/// already-set, 4 write failed, 5 declined.
 fn pin_device_in_rc_file(
     rc_file: &Path,
     idx: i64,
@@ -518,7 +519,7 @@ fn pin_device_in_rc_file(
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !consent() {
@@ -566,7 +567,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     println!("Plan: persist HIP_VISIBLE_DEVICES in the User env scope:");
     println!("  setx HIP_VISIBLE_DEVICES {idx}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Set HIP_VISIBLE_DEVICES in the User scope?", opts.yes) {
@@ -816,18 +817,20 @@ mod tests {
 
     // ── Consent and mutation contract ──────────────────────────────
     //
-    // `skills/rocm-doctor/reference.md` documents six exit codes, and the skill
-    // tells an agent it may run an auto-fix because the CLI "refuses on a
-    // non-interactive shell without --yes" and "confirms before mutating".
+    // The manifest's `exit_codes` (the `exit` constants in `options.rs`) names six
+    // codes, and `skills/rocm-doctor/SKILL.md` tells an agent to go through
+    // `--dry-run`, the user's OK and `--yes` because the CLI refuses on a
+    // non-interactive shell without `--yes` and confirms before mutating.
     // Before these tests, codes 1, 4 and 5 were asserted nowhere in the repo and
     // no test ever reached a runner that writes to disk: the two that look like
     // they cover it don't — `dry_run_never_mutates_...` picks fix-2, whose Linux
     // runner takes no FixOptions and never prompts, and diagnose.feature's
     // preview scenario picks print-only fix-1, which returns before any runner.
     //
-    // fix-9 is the auto-fix used here because its Linux runner is the one that
-    // genuinely appends to a file, and `pin_device_in_rc_file` lets that run
-    // against a temp path with an injected consent verdict.
+    // fix-9 (class `needs-argument`, applied once `--device-index` is given) is
+    // used here because its rc path and consent decision are injectable
+    // (`pin_device_in_rc_file`), so its append can run against a temp path with an
+    // injected consent verdict.
 
     /// A unique scratch path under the workspace's test-artifact dir, following
     /// the convention in `lib.rs`'s tests (no `tempfile` dev-dependency here).
@@ -854,10 +857,11 @@ mod tests {
         }
     }
 
-    /// `auto_applicable` means "the CLI has a runner", not "the runner mutates".
+    /// Having a runner is not the same as the `auto` class, and neither means
+    /// "the runner mutates".
     ///
     /// fix-2's Linux arm only reports where the override is persisted; it never
-    /// edits dotfiles. `auto_applicable_recipes_have_a_runner` cannot catch a
+    /// edits dotfiles. `a_recipe_that_acts_has_a_runner` cannot catch a
     /// regression here, because fix-2 does have a runner — so without this, a
     /// doc promising a `--dry-run` preview the Linux user never gets stays
     /// green. That is the drift `skills/rocm-doctor/` exists to prevent.
@@ -892,9 +896,8 @@ mod tests {
 
     /// The Windows arm of fix-2 does mutate (it runs `setx` to clear the User
     /// scope), so unlike the Linux arm above, a decline has to come back as
-    /// `5`, not `0` -- `skills/rocm-doctor/reference.md` documents `5` as
-    /// "user declined" and an agent tells that apart from "nothing to do"
-    /// this way.
+    /// `5`, not `0` -- the manifest's `exit_codes` publishes `5` as `declined`
+    /// and an agent tells that apart from "nothing to do" this way.
     #[test]
     fn windows_decline_on_user_scope_returns_5() {
         let code =

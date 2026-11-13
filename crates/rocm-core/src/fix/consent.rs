@@ -17,6 +17,22 @@ use std::time::Duration;
 pub(super) const RUN_TIMEOUT: Duration = Duration::from_mins(1);
 pub(super) const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// What `rocm fix` says on stderr when it is not given `--yes` in a shell with no
+/// terminal, where nobody can be asked.
+///
+/// `pub` only so the eval-fixture generator in `xtask` replays the same text the
+/// command prints, from this one constant; hidden from the docs because it is not an
+/// API to build on.
+#[doc(hidden)]
+pub const NON_INTERACTIVE_REFUSAL: &str =
+    "Non-interactive shell and --yes not passed; refusing to apply.";
+
+/// The line a runner prints after a plan when `--dry-run` stopped it before acting.
+///
+/// `pub` only for the same reason as [`NON_INTERACTIVE_REFUSAL`].
+#[doc(hidden)]
+pub const DRY_RUN_NOTICE: &str = "(dry-run; not executed)";
+
 /// Print a failure explanation to stderr, ignoring write failures (closed
 /// stderr, full disk) so an I/O error while explaining a failure can't itself
 /// panic the process.
@@ -70,7 +86,7 @@ const fn consent_without_prompt(assume_yes: bool, stdin_is_terminal: bool) -> Op
 pub(super) fn confirm(prompt: &str, assume_yes: bool) -> bool {
     if let Some(verdict) = consent_without_prompt(assume_yes, std::io::stdin().is_terminal()) {
         if !verdict {
-            fail!("Non-interactive shell and --yes not passed; refusing to apply.");
+            fail!("{NON_INTERACTIVE_REFUSAL}");
         }
         return verdict;
     }
