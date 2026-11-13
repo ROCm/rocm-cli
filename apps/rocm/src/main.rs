@@ -102,13 +102,11 @@ mod update_cmd;
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
 // this re-export. `env_root_for_service`, `attach_background_stdio`,
-// `detach_background_command`, `managed_engine_startup_failure_detail`,
-// `managed_service_process_command`, and
-// `ensure_public_service_has_endpoint_key` are no longer needed here either:
-// their only caller outside `dispatch()`, `restart_internal_managed_service`
-// (and the endpoint-key check inside it), moved out to `services_text.rs` and
-// has since moved on to `service_control.rs`, which reaches them via its own
-// imports instead.
+// `detach_background_command`, `managed_engine_startup_failure_detail`, and
+// `managed_service_process_command` are no longer needed here either: their
+// only caller outside `dispatch()`, `restart_internal_managed_service`, moved
+// out to `services_text.rs` and has since moved on to `service_control.rs`,
+// which reaches them via its own imports instead.
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`.

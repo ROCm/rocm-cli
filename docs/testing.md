@@ -2032,13 +2032,16 @@ cargo test -p rocm --bin rocm resolve_endpoint_auth
 cargo test -p rocm --bin rocm endpoint_client_config
 cargo test -p rocm --bin rocm api_key_client_config
 cargo test -p rocm --bin rocm public_bind_fails_closed
-cargo test -p rocm --bin rocm respawn_fails_closed
-cargo test -p rocm --bin rocm respawn_allows_loopback
 cargo test -p rocm --bin rocm restart_refuses_a_public_service
 cargo test -p rocm-core generate_endpoint_api_key
 cargo test -p rocm-engine-protocol endpoint_api_key
-cargo test -p rocm-engine-protocol is_public_bind_host
-cargo test -p rocmd recovery_respawn_fails_closed
+cargo test -p rocm-core is_public_bind_host
+cargo test -p rocm-core endpoint_key
+cargo test -p rocm --bin rocm the_command_a_respawn_refusal_names_clears_the_refusal
+cargo test -p rocm --bin rocm the_stop_a_refusal_names_is_harmless
+cargo test -p rocmd server_recover_passes_
+cargo test -p rocmd supervising_a_
+cargo test -p rocmd server_recover_refuses_a_keyless_public_service
 cargo test -p rocmd apply_endpoint_key_env
 ```
 
@@ -2076,16 +2079,53 @@ The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
 to respawn once its key is gone, rather than coming back unauthenticated. That
 covers `rocm services restart` and `rocmd`'s recovery supervisor, and the refusal
-happens before anything is stopped, so it cannot take down a running service. A
-stop therefore drops the key only once it has confirmed the engine is gone —
+happens before anything is stopped, so it cannot take down a running service.
+Both binaries apply the same guard, `rocm-core`'s
+`ensure_public_service_has_endpoint_key`, so the refusal reads the same for a
+launch, a restart and a daemon respawn bar the action it names and, for a fresh
+launch, why the key is missing (nothing stopped, so it is not told a stop
+dropped it); the `rocm serve <model> …` command it names keeps the recorded
+port (always, since a launch that leaves `--port` out is given one from
+`11435..=11535`, which a tailnet or proxy mapping that publishes the service
+does not follow), the recorded host unless it is exactly the default one (a
+padded or re-cased `127.0.0.1` is a public bind to the guard and to `rocm serve`,
+so it is printed, quoted, with `--allow-public-bind`, where leaving it out would
+bring the service back on the default host with no key), the public-bind opt-in and `--require-api-key`, so following it does not bring
+the service back somewhere else; the guard takes the port the record holds, and
+the model stays a placeholder because it does not decide where the endpoint is.
+The host is printed shell-quoted (`rocm-core`'s `posix_shell_quote`, as every
+other printed command quotes a value), because a host such as `[::1]` is a glob
+pattern to bash and zsh and would otherwise relaunch the service on another host
+or not at all; a test reads the printed command back through a real `sh` in a
+directory with files a glob could match and parses the words with the real
+`rocm serve` parser. A restart or respawn is of a recorded
+service that may still be running, and `rocm serve` reuses a running service
+for the same engine and model and discards the key it generated for that
+attempt, so the refusal names `rocm services stop <id> --yes` before the launch
+(a fresh launch records nothing and names no stop). The unit tests check each
+caller's text
+against the guard's and pin the guard's arguments at every call site (`rocm`'s
+restart and launch, `rocmd`'s supervisor before its manifest write and at the
+spawn, and its recovery watcher), and follow the named command for every start
+and host through the real parser, `serve`'s own port and key policy and the key
+file it stores, checking that it binds the host the service recorded; for a
+recorded service that is still running they follow the stop and then the launch
+through the real stop and the real reuse in the spawn, and show that the launch
+alone leaves the service keyless (`a_running_service_is_stopped_before_its_relaunch_so_the_advice_clears_the_refusal`).
+A stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
 that later observes the process dead. `service-stop-01`
 (`features/service_stop.feature`) covers `services stop` succeeding against a
 running record on the mock lane and the record being persisted as stopped, and
 `service-stop-02` covers the key being dropped once the daemon's `stop_server`
-confirms a stop. There is still no e2e coverage of `services restart`, which
-remains unit-tested only. Reusing a running service for a
+confirms a stop. `service-stop-09` covers a `services restart` of a public server whose key is
+gone being refused, naming a `rocm serve` command that `rocm` accepts, with the
+running server left running, and `service-stop-10` covers the same restart of a
+loopback server that was launched with `--require-api-key`, and `service-stop-11`
+covers the stop that refusal names, run as printed on a server that has
+already stopped, which is the usual way to the refusal; a restart that goes
+ahead remains unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
 upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
 Linux-only since the Windows managed Lemonade spawn can't enforce the key)
@@ -2654,9 +2694,40 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
+"service-stop-(0[1-689]|1[01])"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
+
+`service-stop-09` (Linux, mock lane) does not use that seam, because the
+refusal it covers comes before any stop. It plants a publicly bound server with
+a running recorded process and no key file and runs `rocm services restart
+--yes`: it checks the refusal's text and exit status, that the `rocm serve`
+command it names parses (its `<model>` filled in, `--help` last, with a bogus
+flag as the negative control) and carries the port the server was recorded on, that the `rocm services stop` it
+names before it is this server's exact stop command and parses the same way,
+and that the recorded process is still running and the record is not marked
+stopped.
+
+`service-stop-10` (Linux, mock lane) is the same restart of the other kind of
+server that needs a key: one bound to loopback whose record says it was launched
+with `--require-api-key`, which a stop left without its key file. It checks the
+refusal's own wording (it names the key flag and says nothing about a public
+host), that the `rocm serve` command it names carries `--require-api-key` and
+no `--host` or `--allow-public-bind` and parses, that the stop named before it
+is this server's exact stop command and parses, and, in the same scenario, that
+the recorded process is still running, the record is not marked stopped, still
+says it required a key and names no stop request, and no key file was created.
+
+`service-stop-11` (mock lane, no process recorded) plants the server a stop
+leaves behind, publicly bound, `stopped`, naming no process and with no key file,
+and restarts it: the refusal names a stop, and the scenario runs that stop as
+printed. It checks that the stop exits 0 and says the server stopped, that the
+record still reads stopped, names no process and no pending stop, that there is
+still no key file, and that the server is not listed as running. That the launch
+after it goes through is the unit test
+`the_stop_a_refusal_names_is_harmless_on_a_service_that_has_already_stopped`,
+which follows the advice through the real stop and the real spawn for a stopped
+record (a real `rocm serve` needs a GPU).
 
 `features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same
@@ -3206,6 +3277,7 @@ Artifact integrity and engine protocol property tests:
 ```bash
 cargo test -p rocm-core --test digest_gate_properties --test integrity_properties --test model_selector_properties
 cargo test -p rocm-engine-protocol --test protocol_properties
+cargo test -p rocm-core --lib endpoint_key
 cargo test -p rocm-engine-lemonade --lib archive_digest
 cargo test -p xtask verify_pinned_keys
 ```
@@ -3215,7 +3287,11 @@ pinned release key is authentic, and the code that decodes engine output. The
 generators aim at near misses — a digest one nibble off or sharing a correct
 prefix, a signature with one byte changed or leading zeros, a loopback spelling
 padded or re-cased, a model id with a variant suffix — because a uniformly
-random input is rejected by any implementation, correct or not. The pinned-key
+random input is rejected by any implementation, correct or not. The loopback
+property, `only_exact_loopback_spellings_skip_the_api_key`, runs next to the
+function it checks, `is_public_bind_host` in
+[`endpoint_key.rs`](../crates/rocm-core/src/endpoint_key.rs), so it is in the
+`rocm-core` lib tests rather than in `protocol_properties`. The pinned-key
 tests run the real check over a scratch repository root and walk every
 position of the committed key. `model_selector_properties` also pins, rather
 than asserts away, two shapes where readiness accepts an engine's reported name

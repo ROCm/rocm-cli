@@ -194,3 +194,79 @@ Feature: Stopping a managed service
     And the process now holding the recorded process id is still running
     And the server's record reads stopped and names no process
     And the server's endpoint key file is gone
+
+  # The restart refusal, which shares this file's planted record. A stop drops a
+  # server's endpoint key, and `rocm services restart` accepts a stopped id, so a
+  # restart of a publicly bound server whose key is gone would bring it back up
+  # without authentication; it is refused instead. The refusal names a `rocm
+  # serve` command to launch the server again, and the command is checked
+  # against the real parser with a model filled in for its `<model>`
+  # placeholder (`--help` ends the parse after every other word has been
+  # accepted, so nothing is started). The server is still running, and `rocm
+  # serve` reuses a running server and discards the key it generated, so the
+  # refusal names the stop that has to come first, and that is checked the same
+  # way. That running both clears the condition is covered by the unit tests,
+  # which follow them through the real stop, the spawn's reuse of a running
+  # service and `serve`'s own policy and key file; here they are only shown to
+  # be commands `rocm` accepts.
+  #
+  # The refusal comes before the stop, so the promise it makes is the one checked
+  # last: the running server is left running, not marked stopped and with no
+  # stop request recorded.
+  #
+  # Linux-only like the scenarios above: the recorded process carries the
+  # start-time token `/proc` gives it.
+  @id:service-stop-restart-refuses-a-public-server-without-its-key
+  @requires-os:linux
+  Scenario: service-stop-09 - Restarting a public server whose endpoint key is gone is refused and leaves it running
+    Given a public managed server whose endpoint key is gone and whose recorded process is running
+    When the user restarts it with --yes
+    Then the CLI refuses the restart because it would reopen the public server without authentication
+    And the refusal names a serve command that rocm accepts
+    And the refusal names the stop that has to come first
+    And the server is left running, with no stop recorded and no key file
+
+  # The other way a server needs a key: it was launched with `--require-api-key`
+  # on a loopback bind, because something outside this machine republishes its
+  # port, and a stop dropped the key. `rocm services restart` refuses it for the
+  # same reason as the public server above, but with its own wording, which says
+  # nothing about a public host, and its own command: it carries the flag the
+  # server asked for and no `--host`, because loopback is where it was. As above
+  # the server is still running, so the refusal names the stop first; both
+  # commands are checked against the real parser, and the promise that nothing
+  # was stopped is checked on the process, the record and the missing key file.
+  #
+  # Linux-only like the scenario above, for the same reason.
+  @id:service-stop-restart-refuses-a-loopback-server-that-required-a-key
+  @requires-os:linux
+  Scenario: service-stop-10 - Restarting a loopback server that required an API key, whose key is gone, is refused and leaves it running
+    Given a loopback managed server that required an API key, whose key is gone and whose recorded process is running
+    When the user restarts it with --yes
+    Then the CLI refuses the restart because it would reopen the server that required an API key without authentication
+    And the refusal names a serve command that asks for the key again and that rocm accepts
+    And the refusal names the stop that has to come first
+    And the server is left running, with no stop recorded and no key file
+    And the server's record still says it required an API key
+
+  # The common way to reach the restart refusal is a server that has already
+  # been stopped: a stop drops the key, and `rocm services restart` accepts the
+  # id of a stopped server. The refusal then names a stop before the launch, and
+  # that stop has nothing to stop. It must still do no harm, so it is run here as
+  # printed, on the stopped server: it exits 0, reports the server stopped, and
+  # leaves a record that names no process and no pending stop, which is the state
+  # the launch that follows it needs (nothing running for `rocm serve` to reuse,
+  # and nothing for the daemon's recovery to bring back under the old id). That
+  # the launch then goes through is covered by the unit test that follows the
+  # advice through the real stop and the real spawn for a stopped record, since
+  # a real `rocm serve` needs a GPU.
+  @id:service-stop-the-stop-a-refusal-names-is-harmless-on-a-stopped-server
+  Scenario: service-stop-11 - The stop a restart refusal names succeeds on a server that is already stopped and leaves it stopped
+    Given a public managed server that is already stopped and whose endpoint key is gone
+    When the user restarts it with --yes
+    Then the CLI refuses the restart because it would reopen the public server without authentication
+    And the refusal names the stop that has to come first
+    When the user runs the stop the refusal named
+    Then the CLI reports the service as stopped
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+    And the server is not listed as running

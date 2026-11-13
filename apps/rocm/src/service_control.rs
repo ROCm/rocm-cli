@@ -32,9 +32,9 @@
 //! (`load_managed_service`, `read_managed_service_manifest`) and shapes the
 //! `stop_server` answer with its `internal_stop_server_value`, which stays there
 //! next to `service_stop_unconfirmed` and the renderer that reads the same
-//! `stop_unconfirmed` status. This module takes
-//! `ensure_public_service_has_endpoint_key` and the spawn helpers from
-//! `service_launch.rs`, which does not import this module back.
+//! `stop_unconfirmed` status. This module takes the
+//! spawn helpers from `service_launch.rs`, which does not import this module
+//! back; its keyless-respawn check is `rocm_core`'s shared guard.
 //!
 //! The regression tests for the stop and restart paths live in this module's own
 //! `mod tests`. They reach shared fixtures (`test_paths`, `ScopedTestEnv`,
@@ -66,7 +66,6 @@ use crate::engines_cmd::env_root_for_service;
 use crate::gpu_policy::parse_device_policy;
 use crate::managed_service_status::load_managed_services;
 use crate::service_hints;
-use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
 use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
@@ -484,10 +483,13 @@ fn restart_internal_managed_service_inner(
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     // Checked before the stop, so a refused restart leaves a running service
     // running instead of stopping it and then failing to bring it back.
-    ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         &record.host,
         preserved_endpoint_key.is_some(),
         record.requires_api_key,
+        rocm_core::ServiceStart::Restart,
+        service_id,
+        record.port,
     )?;
     let (stop_report, stopped) =
         stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
@@ -954,6 +956,26 @@ mod tests {
             !rendered.contains("--require-api-key"),
             "a service that never passed the flag must not be told it did: {rendered}"
         );
+        // The restart's refusal is the shared guard's, worded for a restart —
+        // the same text a fresh launch and the daemon print, bar the action. A
+        // private copy here, or the wrong action passed, would differ.
+        assert_eq!(
+            rendered,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "0.0.0.0",
+                false,
+                false,
+                rocm_core::ServiceStart::Restart,
+                "vllm-public-2000",
+                12000,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            rendered.contains("restarting it would reopen it without authentication"),
+            "{rendered}"
+        );
 
         // The refusal happens before the stop, so the service is left alone.
         assert!(
@@ -1004,6 +1026,164 @@ mod tests {
             "a refused restart must not stop the service"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// What `rocm services restart` does about the endpoint key, at the real
+    /// call site, one argument of the guard at a time. The guard is `rocm_core`'s
+    /// and is tested there; what only this call site can get wrong is what it
+    /// passes: the host, the recorded `requires_api_key`, whether a usable key
+    /// file is on disk, and that it is a restart.
+    fn restart_outcome_for(
+        test: &str,
+        host: &str,
+        requires_api_key: bool,
+        key: Option<&str>,
+    ) -> String {
+        restart_outcome(test, host, requires_api_key, key, None).0
+    }
+
+    /// The restart's error, and the port the record had.
+    ///
+    /// The record is a Lemonade service, so a restart the guard lets through
+    /// begins with a real unload request to the recorded host and port before the
+    /// termination stand-in runs. `port` of `None` keeps the fixture's own port,
+    /// which nothing listens on, so such a restart cannot reach a server the test
+    /// does not own. A fixed `port` is only for a case the guard refuses, which
+    /// returns before anything is stopped; that is asserted before the restart
+    /// runs, so a case that would be let through cannot use one.
+    fn restart_outcome(
+        test: &str,
+        host: &str,
+        requires_api_key: bool,
+        key: Option<&str>,
+        port: Option<u16>,
+    ) -> (String, u16) {
+        let (root, paths) = test_paths(test);
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-key-site";
+        let mut record = stop_test_record(&paths, service_id);
+        record.host = host.to_owned();
+        if let Some(port) = port {
+            assert!(
+                rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    key.is_some(),
+                    requires_api_key,
+                    rocm_core::ServiceStart::Restart,
+                    service_id,
+                    port,
+                )
+                .is_err(),
+                "a fixed port is for a restart the guard refuses; this one would stop a \
+                 service on a port the test does not own"
+            );
+            record.port = port;
+        }
+        let recorded_port = record.port;
+        record.requires_api_key = requires_api_key;
+        record.write().unwrap();
+        if let Some(key) = key {
+            endpoint_keys::store_endpoint_api_key(&paths, service_id, key).unwrap();
+        }
+        // A restart the guard lets through stops the service and then waits for
+        // the launch lock, which is held, so it ends there and starts nothing: the
+        // error is what tells a refusal from a restart that went ahead.
+        let holder = rocm_core::FileLock::acquire(paths.managed_launch_lock_path()).unwrap();
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(Some(Duration::from_millis(50))));
+        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            bare_termination(Vec::new(), true)
+        });
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
+        drop(holder);
+        let _ = fs::remove_dir_all(root);
+        (
+            format!(
+                "{:#}",
+                result.expect_err("the restart never starts a child here")
+            ),
+            recorded_port,
+        )
+    }
+
+    #[test]
+    fn restart_passes_the_recorded_key_requirement_to_the_guard() {
+        // A loopback service that asked for `--require-api-key` and has lost its
+        // key is refused. Only `requires_api_key` makes it so, and every other
+        // test plants it false, so this is what pins the argument.
+        let (error, port) = restart_outcome("restart-site-requires", "127.0.0.1", true, None, None);
+        assert_eq!(
+            error,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "127.0.0.1",
+                false,
+                true,
+                rocm_core::ServiceStart::Restart,
+                "svc-restart-key-site",
+                port,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        // The same service without the requirement is not refused: it is let
+        // through to the stop and the lock wait.
+        let error = restart_outcome_for("restart-site-not-required", "127.0.0.1", false, None);
+        assert!(error.contains("stopped but NOT restarted"), "{error}");
+    }
+
+    #[test]
+    fn restart_passes_the_recorded_port_to_the_guard() {
+        // The command the refusal names has to land on the port the service had,
+        // so the port the restart reads off the record is what the guard prints.
+        for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
+            for port in [8123_u16, 9001] {
+                let (error, _) = restart_outcome(
+                    "restart-site-port",
+                    host,
+                    requires_api_key,
+                    None,
+                    Some(port),
+                );
+                assert_eq!(
+                    error,
+                    rocm_core::ensure_public_service_has_endpoint_key(
+                        host,
+                        false,
+                        requires_api_key,
+                        rocm_core::ServiceStart::Restart,
+                        "svc-restart-key-site",
+                        port,
+                    )
+                    .unwrap_err()
+                    .to_string()
+                );
+                assert!(error.contains(&format!("--port {port}")), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn restart_passes_whether_a_key_is_on_disk_to_the_guard() {
+        // A public service with its key still stored is not refused; without it
+        // the same service is. Together they pin the key-present argument.
+        let error =
+            restart_outcome_for("restart-site-key-present", "0.0.0.0", false, Some("a-key"));
+        assert!(error.contains("stopped but NOT restarted"), "{error}");
+        assert!(!error.contains("without authentication"), "{error}");
+        let error = restart_outcome_for("restart-site-key-absent", "0.0.0.0", false, None);
+        assert!(error.contains("without authentication"), "{error}");
+    }
+
+    #[test]
+    fn restart_passes_the_recorded_host_to_the_guard() {
+        // Whether a keyless service is refused for its bind depends on the
+        // recorded host: a public one is, loopback is not.
+        let error = restart_outcome_for("restart-site-host-public", "0.0.0.0", false, None);
+        assert!(
+            error.contains("bound to the public host `0.0.0.0`"),
+            "{error}"
+        );
+        let error = restart_outcome_for("restart-site-host-loopback", "127.0.0.1", false, None);
+        assert!(error.contains("stopped but NOT restarted"), "{error}");
     }
 
     #[test]
