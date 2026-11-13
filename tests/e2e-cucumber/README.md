@@ -138,7 +138,7 @@ Scenarios carry stable-id and capability tags:
 |---|---|
 | `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
-| `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
+| `@requires-multi-gpu` | Premise is a job that can reach **more than one** AMD GPU. The gate counts the GPUs the kernel exposes to this job (its KFD GPU nodes, else the amdgpu DRM cards on a zero-KFD host such as Strix Halo), not the cards on the PCI bus, which on a shared runner can list more than the job may use. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
 | `@requires-dir-permissions` | Premise is a directory that refuses new files once its write bits are cleared. Resolves to **skip** for a user those bits do not bind: root, which is what the self-hosted WSL2 guest runs the suite as. The capability probe's `dir_permissions_bind` clears the write bits on a directory under the temp root and tries to create a file in it. `@requires-os:linux` cannot express this: root on Linux is still `linux`, and the scenario would pass without testing anything. Always **skip** on Windows, which has no such bits. |
@@ -256,6 +256,9 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
    dev-dependency the library target can't reach). See
    [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
    and [`fake-tailscale`](src/bin/fake-tailscale.rs) for the pattern.
+7. If a step asserts a GPU count, compare it against the GPUs the job can
+   reach, not the cards on the PCI bus: see
+   [GPU visibility on the hardware pool](../../docs/ci-hardware-testing.md#gpu-visibility-on-the-hardware-pool).
 
 ## Design principles
 
