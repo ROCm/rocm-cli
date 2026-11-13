@@ -493,12 +493,18 @@ pub(crate) fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<Stri
         Some(value) => lines.push(format!("  ComfyUI: installed status is {value}.")),
         None => {}
     }
-    if let Some(status) = chat_tool_value(tool_text, "status") {
+    let status = chat_tool_value(tool_text, "status");
+    // One test of "unknown" for both the `Running:` line and the notes below,
+    // so the label and the reason behind it cannot disagree.
+    let status_unknown = status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("unknown"));
+    if let Some(status) = status {
         let running_text = if status.eq_ignore_ascii_case("running") {
             "running".to_owned()
         } else if status.eq_ignore_ascii_case("starting") {
             "starting".to_owned()
-        } else if status.eq_ignore_ascii_case("unknown") {
+        } else if status_unknown {
             "unknown".to_owned()
         } else {
             format!("not running ({status})")
@@ -525,7 +531,7 @@ pub(crate) fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<Stri
     // An unknown running state is not summed up by the `Running:` line: its
     // notes say why it is unknown and what answers, and its next step how to
     // clear it, so they are passed on.
-    if chat_tool_value(tool_text, "status").is_some_and(|status| status == "unknown") {
+    if status_unknown {
         for line in tool_text
             .lines()
             .skip_while(|line| line.trim() != "Running")
@@ -652,6 +658,26 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Running:` label and the notes behind an unknown state come from
+    /// one case-insensitive test, so a differently cased status keeps both.
+    #[test]
+    fn an_unknown_comfyui_state_keeps_its_notes_whatever_its_case() {
+        let status = "ComfyUI\n\n  installed: yes\n\nRunning\n  status: UNKNOWN\n  note: the \
+                      record cannot be parsed\n  next step: run `rocm comfyui stop`\n";
+
+        let summary = deterministic_comfyui_tool_summary(status).expect("a summary");
+
+        assert!(summary.contains("  Running: unknown."), "{summary}");
+        assert!(
+            summary.contains("  Note: the record cannot be parsed."),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("  Next step: run `rocm comfyui stop`."),
+            "{summary}"
+        );
+    }
 
     #[test]
     fn parse_deterministic_model_recipes_reads_header_fields_and_notes() {
