@@ -864,8 +864,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
-    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
-    // not have.
+    // E2E-only launch fault injection (either mode) likewise stands in for the
+    // GPU it does not have.
     //
     // The scripted free-space override opens the same waiver: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only

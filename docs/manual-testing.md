@@ -1651,7 +1651,8 @@ behaviour under test is described in
 [the README](../README.md#model-serving); the automated coverage is listed in
 [testing.md](testing.md#serve-smoke-test-failure).
 
-The repeatable route is the E2E scenario, which needs no GPU:
+The repeatable route is the E2E scenario, which needs no GPU but runs on Linux
+and WSL only (`@requires-os:linux`):
 
 ```bash
 cargo xtask e2e -- -n "serve-56"
@@ -1676,6 +1677,10 @@ becomes ready:
 - `rocm serve <model> --no-smoke-test` prints the plain `Deployment summary` with
   no smoke-test note, and re-running against an already-running service prints
   the `(already running)` summary with no smoke-test note.
+- Some failures are deliberately not detected and still read as `ready` (an error
+  sent as a `data:` payload inside a `200` stream, a `200` answer with no `data:`
+  line, a close-delimited stream cut after a token); the full list is in
+  [testing.md](testing.md#serve-smoke-test-failure).
 - A reasoning model that spends its small token budget before emitting any
   content is not a failure: the summary stays `ready` with the two metric rows
   `n/a` and no smoke-test note.

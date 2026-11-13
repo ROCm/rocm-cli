@@ -3944,18 +3944,24 @@ What is detected, and what is not:
 - Detected (the summary says the smoke test failed): a transport error or timeout,
   an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
   stream cut short.
-- Not detected (the summary reads as before, metrics `n/a`): an engine error sent
-  as a `data:` payload inside a `200` stream; a `200` answer with no `data:` line
-  at all (HTML, plain JSON, an empty body); a close-delimited stream cut after a
-  token; and a complete stream with no `content` token, which is deliberately not
-  a failure (a reasoning model can spend its whole small budget first, as the
-  readiness probe also allows for).
+- Not detected (no failure is reported and the status reads `ready`): an engine
+  error sent as a `data:` payload inside a `200` stream; a `200` answer with no
+  `data:` line at all (HTML, plain JSON, an empty body); a close-delimited stream
+  cut after a token; and a complete stream with no `content` token, which is
+  deliberately not a failure (a reasoning model can spend its whole small budget
+  first, as the readiness probe also allows for). The metric rows read `n/a` for
+  all of these except the close-delimited cut, which shows the metrics measured
+  up to the cut.
 - Known limitation: the reason shown is whatever the provider call reported, and
   two of its errors are not the engine's. It re-lists `/v1/models` before the
   request and can fail with "no ready managed service", and it writes an audit
   event after the stream is consumed. Either turns into a failed smoke test, which
   is why the note says the smoke test could not complete and only that the server
   may not be able to serve requests.
+- Known limitation: the request goes to the first ready local service serving the
+  model, not to the service id the summary reports. With two ready services
+  serving the same model, the verdict can describe the other one while the note
+  names `rocm logs --service <id>` of the one just launched.
 
 Focused unit coverage:
 
