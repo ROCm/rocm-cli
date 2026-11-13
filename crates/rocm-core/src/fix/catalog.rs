@@ -81,9 +81,10 @@ const PRINT_ON_LINUX_AND_WSL_AUTO_ON_WINDOWS: &[Platform] = &[
     on("wsl", FixClass::PrintOnly),
 ];
 
-/// `fix-9-igpu-dgpu`. Both arms short-circuit when no device index is given:
-/// they print the query that identifies the discrete GPU and return, so there
-/// is nothing for `--dry-run` to preview and no prompt to refuse.
+/// `fix-9-igpu-dgpu`. Every arm short-circuits without `--device-index`, printing
+/// the query that identifies the discrete GPU. WSL needs its own entry despite
+/// running the Linux arm: applicability is keyed on platform family, so without
+/// one the fix degrades to print-only.
 const NEEDS_DEVICE_INDEX: &[Platform] = &[
     Platform {
         os: "linux",
@@ -95,11 +96,16 @@ const NEEDS_DEVICE_INDEX: &[Platform] = &[
         class: FixClass::NeedsArgument,
         needs: Some("--device-index"),
     },
+    Platform {
+        os: "wsl",
+        class: FixClass::NeedsArgument,
+        needs: Some("--device-index"),
+    },
 ];
 
-/// `info-20-gpu-no-rocm-support`. Not "wsl": WSL2 reports no GPU topology, so
-/// the checker that produces this id never fires there and `rocm fix` would be
-/// claiming an answer for a host it was never asked about.
+/// `info-20-gpu-no-rocm-support`. Not "wsl": the checker that produces this id
+/// does not run there, so `rocm fix` would be claiming an answer for a host it
+/// was never asked about.
 const DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS: &[Platform] = &[
     on("linux", FixClass::DiagnoseOnly),
     on("windows", FixClass::DiagnoseOnly),
@@ -2278,9 +2284,9 @@ mod tests {
                 ("fix-6-path", "linux", FixClass::Auto),
                 ("fix-6-path", "windows", FixClass::Auto),
                 ("fix-6-path", "wsl", FixClass::Auto),
-                // Both arms short-circuit until `--device-index` names a target.
                 ("fix-9-igpu-dgpu", "linux", FixClass::NeedsArgument),
                 ("fix-9-igpu-dgpu", "windows", FixClass::NeedsArgument),
+                ("fix-9-igpu-dgpu", "wsl", FixClass::NeedsArgument),
             ]
         );
         // fix-16-vllm-oom carries a workaround the user must weigh (lowering the

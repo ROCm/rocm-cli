@@ -56,9 +56,10 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 
 /// The usable ordinals on a WSL host, from the plumbing `examine` reports on.
 ///
-/// One device: WSL2 exposes no per-device topology to enumerate, and the
-/// visibility mask still applies on top so an explicit `HIP_VISIBLE_DEVICES=""`
-/// is honoured. Takes the summary rather than reading the machine so the
+/// One device: this reads the guest's ROCDXG readiness, not the host adapter list
+/// `examine` records in `gpus`, so on a multi-adapter host the two can disagree.
+/// The visibility mask still applies on top so an explicit
+/// `HIP_VISIBLE_DEVICES=""` is honoured. Takes the summary rather than reading the machine so the
 /// decision -- ready means a device, anything else means none -- is testable
 /// without a WSL host.
 #[cfg(any(target_os = "linux", test))]
