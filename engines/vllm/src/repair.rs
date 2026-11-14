@@ -61,6 +61,17 @@ fn torch_alignment_disabled() -> bool {
     rocm_core::torch_alignment_disabled()
 }
 
+/// Whether this violation is the tensorizer upgrade the install makes on purpose.
+///
+/// vLLM pins `tensorizer==2.10.1`, which cannot be imported under Python 3.14; the
+/// install upgrades it (see `ensure_runtime_tensorizer` in `install.rs`), so
+/// `uv pip check` reports the exact pin as unmet forever. Treating that as a defect
+/// would reinstall vLLM, and with it the broken tensorizer, on every
+/// `rocm engines install vllm`.
+fn is_intended_tensorizer_override(detail: &str) -> bool {
+    rocm_core::vllm_tensorizer_override_installed(detail).is_some()
+}
+
 /// Whether this violation is the torch divergence rocm-cli deliberately leaves behind.
 ///
 /// After an engine install, rocm-cli puts back the SDK's *build* of the torch release
@@ -153,11 +164,12 @@ fn repair_from_violations(
     }
     let (intended, defects): (Vec<&DependencyViolation>, Vec<&DependencyViolation>) =
         owned.into_iter().partition(|violation| {
-            is_intended_torch_divergence(
-                &violation.detail,
-                sdk_torch_build,
-                torch_alignment_disabled,
-            )
+            is_intended_tensorizer_override(&violation.detail)
+                || is_intended_torch_divergence(
+                    &violation.detail,
+                    sdk_torch_build,
+                    torch_alignment_disabled,
+                )
         });
 
     if defects.is_empty() {
@@ -168,12 +180,24 @@ fn repair_from_violations(
         // is the SDK's and rocm-cli put it there; under the opt-out it is the user's and
         // rocm-cli never touched it. Reusing the first line for the second case would
         // tell a user who hand-installed torch that the CLI had installed it for them.
-        let headline = if torch_alignment_disabled {
+        let has_tensorizer = intended
+            .iter()
+            .any(|violation| is_intended_tensorizer_override(&violation.detail));
+        let has_torch = intended
+            .iter()
+            .any(|violation| !is_intended_tensorizer_override(&violation.detail));
+        let torch_headline = if torch_alignment_disabled {
             "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT; the torch stack this runtime holds is the user's and a reinstall would replace it"
         } else {
             "the runtime holds the SDK's build of the torch vLLM pins; that divergence is intended and a reinstall would undo it"
         };
-        let mut notes = vec![headline.to_owned()];
+        let tensorizer_headline = "the runtime holds a tensorizer at or above the release that fixes vLLM's pinned one instead of that pin; that divergence is intended and the install keeps it, so no reinstall is needed";
+        let headline = match (has_torch, has_tensorizer) {
+            (true, true) => format!("{torch_headline}; also, {tensorizer_headline}"),
+            (false, true) => tensorizer_headline.to_owned(),
+            _ => torch_headline.to_owned(),
+        };
+        let mut notes = vec![headline];
         notes.extend(
             intended
                 .iter()
@@ -249,6 +273,86 @@ mod tests {
     /// `false`/`true` does not have to be decoded against the signature.
     const ALIGNED: bool = false;
     const OPTED_OUT: bool = true;
+
+    const TENSORIZER_UNMET: &str =
+        "The package `vllm` requires `tensorizer==2.10.1`, but `2.12.1` is installed";
+
+    #[test]
+    fn the_tensorizer_override_is_not_a_reason_to_reinstall() {
+        // The install upgrades vLLM's tensorizer pin on purpose because the pinned
+        // release cannot be imported on some Pythons. The install keeps the upgrade, so
+        // no reinstall is needed.
+        let assessment = repair_from_violations(
+            &[violation("vllm", TENSORIZER_UNMET)],
+            Some(SDK_BUILD),
+            ALIGNED,
+        );
+        assert!(!assessment.needed, "{assessment:?}");
+        // The headline, not the `expected divergence:` line below it, is what says
+        // why nothing is reinstalled, and it is about tensorizer alone.
+        let headline = &assessment.notes[0];
+        assert!(
+            headline.contains("tensorizer") && headline.contains("no reinstall is needed"),
+            "{headline}"
+        );
+        assert!(!headline.contains("torch"), "{headline}");
+    }
+
+    #[test]
+    fn a_torch_and_a_tensorizer_divergence_together_are_both_named_in_the_headline() {
+        let torch = "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed";
+        let assessment = repair_from_violations(
+            &[
+                violation("vllm", torch),
+                violation("vllm", TENSORIZER_UNMET),
+            ],
+            Some(SDK_BUILD),
+            ALIGNED,
+        );
+        assert!(!assessment.needed, "{assessment:?}");
+        let headline = &assessment.notes[0];
+        assert!(
+            headline.contains("SDK's build of the torch") && headline.contains("tensorizer"),
+            "{headline}"
+        );
+    }
+
+    #[test]
+    fn a_tensorizer_older_than_the_fix_or_missing_still_forces_a_reinstall() {
+        for detail in [
+            "The package `vllm` requires `tensorizer==2.13.0`, but `2.12.1` is installed",
+            "The package `vllm` requires `tensorizer==2.10.1`, but `2.9.0` is installed",
+            "The package `vllm` requires `tensorizer==2.10.1`, but it's not installed",
+        ] {
+            let assessment =
+                repair_from_violations(&[violation("vllm", detail)], Some(SDK_BUILD), ALIGNED);
+            assert!(assessment.needed, "{detail}: {assessment:?}");
+        }
+    }
+
+    #[test]
+    fn the_tensorizer_override_does_not_hide_a_genuine_violation() {
+        let assessment = repair_from_violations(
+            &[
+                violation("vllm", TENSORIZER_UNMET),
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `numpy==2.0.0`, but `1.26.0` is installed",
+                ),
+            ],
+            Some(SDK_BUILD),
+            ALIGNED,
+        );
+        assert!(assessment.needed);
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .any(|note| note.starts_with("expected divergence:") && note.contains("tensorizer")),
+            "{:?}",
+            assessment.notes
+        );
+    }
 
     #[test]
     fn a_consistent_environment_is_not_reinstalled() {
