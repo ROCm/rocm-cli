@@ -35,6 +35,11 @@
 #                            matrix lane is `<display name> (<leg>)`.
 #   QUEUE_DEADLINE_MINUTES   how long a leg may stay queued.
 #   HARD_DEADLINE_MINUTES    how long after creation a leg may stay unfinished.
+#   LANE_RUN_MINUTES         the longest a lane may run once it starts (its
+#                            timeout-minutes). QUEUE_DEADLINE_MINUTES plus this must
+#                            fit in HARD_DEADLINE_MINUTES, or a lane that starts just
+#                            inside the queue deadline would be abandoned while it is
+#                            still legitimately running.
 #   POLL_SECS                seconds between polls (default 60).
 #   SETTLE_NOW_EPOCH         pin "now" (seconds since the epoch); tests only.
 #   GH_TOKEN, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY
@@ -46,15 +51,26 @@ set -euo pipefail
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 queue_minutes="${QUEUE_DEADLINE_MINUTES:?QUEUE_DEADLINE_MINUTES is required}"
 hard_minutes="${HARD_DEADLINE_MINUTES:?HARD_DEADLINE_MINUTES is required}"
+lane_run_minutes="${LANE_RUN_MINUTES:?LANE_RUN_MINUTES is required}"
 poll_secs="${POLL_SECS:-60}"
 # Bash arithmetic reads a non-number as 0, which would give up on every lane at
 # once; refuse it instead (the queue deadline is a dispatch input).
-for value in "${queue_minutes}" "${hard_minutes}" "${poll_secs}"; do
+for value in "${queue_minutes}" "${hard_minutes}" "${lane_run_minutes}" "${poll_secs}"; do
   if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
     echo "::error::deadline and poll values must be whole numbers, got '${value}'"
     exit 1
   fi
 done
+# Force base 10 from here on: arithmetic reads a leading zero as octal, so `060`
+# would be 48 and `008` an error.
+queue_minutes=$((10#${queue_minutes}))
+hard_minutes=$((10#${hard_minutes}))
+lane_run_minutes=$((10#${lane_run_minutes}))
+poll_secs=$((10#${poll_secs}))
+if ((queue_minutes + lane_run_minutes > hard_minutes)); then
+  echo "::error::a lane queued for ${queue_minutes} minutes and then run for ${lane_run_minutes} would pass the ${hard_minutes}-minute hard deadline; lower the queue deadline or raise the hard one"
+  exit 1
+fi
 output_file="${GITHUB_OUTPUT:-/dev/null}"
 summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
@@ -68,7 +84,9 @@ lanes_json=$(
 
 # One verdict per poll: every lane's result, whether anything is still pending,
 # and the names of the abandoned legs. `pending` wins over `abandoned` within a
-# lane, so a lane with one leg still able to finish is not settled early.
+# lane, so a lane with one leg still able to finish is not settled early. A job
+# belongs to the lane with the longest name it matches, so a lane named
+# `Build` and another named `Build (extra)` each keep their own legs.
 # shellcheck disable=SC2016  # jq program, not shell
 evaluate='
   def age: ($now - (.created_at | fromdateiso8601));
@@ -78,10 +96,13 @@ evaluate='
     elif .status == "in_progress" then "running"
     elif age >= $queue then "abandoned"
     else "waiting" end;
+  def owner($job):
+    [ $lanes[] | . as $l | select($job.name == $l.name or ($job.name | startswith($l.name + " ("))) ]
+    | max_by(.name | length);
   . as $jobs
+  | ($jobs | map(. as $job | . + {lane_id: (owner($job).id // null)})) as $owned
   | [ $lanes[] | . as $lane
-      | ($jobs | map(select(.name == $lane.name or (.name | startswith($lane.name + " (")))))
-        as $legs
+      | ($owned | map(select(.lane_id == $lane.id))) as $legs
       | ($legs | map(leg_state)) as $states
       | { id: $lane.id,
           abandoned: [ range(0; $legs | length) | select($states[.] == "abandoned") | $legs[.].name ],
@@ -90,8 +111,8 @@ evaluate='
               elif any($states[]; . == "running" or . == "waiting") then "pending"
               elif any($states[]; . == "abandoned") then "abandoned"
               elif all($legs[]; .conclusion == "skipped") then "skipped"
-              elif any($legs[]; .conclusion == "cancelled") then "cancelled"
               elif any($legs[]; .conclusion == "failure" or .conclusion == "timed_out") then "failure"
+              elif any($legs[]; .conclusion == "cancelled") then "cancelled"
               else "success" end ) } ]
   | { pending: any(.[]; .result == "pending"),
       results: (map({key: .id, value: {result: .result}}) | from_entries),

@@ -503,16 +503,21 @@ jobs, which wait on every lane, never ran.
   input) is abandoned, and a leg that started is waited for but abandoned at
   `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold the wait either.
   A lane that starts just inside the queue deadline still has its full
-  `timeout-minutes`, so keep the input at or below 120.
+  `timeout-minutes`, so the script refuses a queue deadline that, plus
+  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
+  minutes, at most 120.
 - `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
   whatever finished. An abandoned lane has no report artifact, so the report
   job's missing-report check flags it by name, the consolidated grid shows the
   gap and readiness reads it as a failed report rather than as success.
 - `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
   which is what stops the abandoned legs from holding the run open until the
-  24-hour limit. It runs only when something was abandoned, and only after the
-  report and readiness jobs are done, because cancelling the run also skips any
-  job that is still gated on `!cancelled()`.
+  24-hour limit. It runs only when something was abandoned or the settle job
+  itself failed (nothing else bounds the wait then), and only after the report
+  and readiness jobs are done, because cancelling the run also skips any job
+  that is still gated on `!cancelled()`. If the run is cancelled from outside
+  before the settle job finishes, nothing is left to wait on and the run ends
+  with it.
 
 To try a change to these jobs from a branch without publishing a nightly
 release, dispatch the workflow with `skip_build` set:

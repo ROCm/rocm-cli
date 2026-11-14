@@ -16,7 +16,8 @@ on:
         description: >-
           How long an E2E lane may wait for a runner before the run gives up on
           it (default 60). Lower it to try the give-up path from a branch
-          quickly; keep it at or below 120 (see HARD_DEADLINE_MINUTES).
+          quickly. Whole minutes, at most 120: a larger value is refused, because
+          a lane that started just inside it could outlast the hard deadline.
         type: string
         default: "60"
 
@@ -1642,6 +1643,10 @@ jobs:
           # A leg that started is waited for, but not past this: the queue
           # deadline plus the longest lane's timeout-minutes (120) plus slack.
           HARD_DEADLINE_MINUTES: "240"
+          # The longest lane's timeout-minutes. The script refuses a queue
+          # deadline that, plus this, would pass the hard deadline, so a
+          # dispatch input cannot abandon a lane that is still running.
+          LANE_RUN_MINUTES: "120"
           LANES: |
             e2e-gpu-nightly=E2E tests (MI300X, incl. nightly-only)
             e2e-gpu-nightly-rad3=E2E tests (rad3 R9700, incl. nightly-only)
@@ -2122,6 +2127,9 @@ jobs:
   # limit even though its reports are out. Cancelling is safe here only because
   # it runs after every other job: `needs` below lists them all, so what is
   # cancelled is the stragglers, never a job that is still producing a report.
+  # It also runs when the settle job itself failed (its own cap, or an
+  # infrastructure error): nothing else bounds the wait then, and the report
+  # and readiness jobs have already run on whatever finished.
   cancel-abandoned-e2e-lanes:
     name: Cancel E2E lanes that never got a runner
     runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
@@ -2139,7 +2147,7 @@ jobs:
       - release-readiness-nightly
       - release-readiness-narrative
       - publish-release-readiness-wiki
-    if: ${{ always() && needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0' }}
+    if: ${{ always() && (needs.e2e-lanes-settled.result == 'failure' || (needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0')) }}
     steps:
       - name: Cancel the run's unfinished lanes
         env:
