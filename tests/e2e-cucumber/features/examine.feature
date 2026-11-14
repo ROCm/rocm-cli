@@ -540,7 +540,7 @@ Feature: GPU detection and system inspection
     And the inspection's driver detail says the library is missing from the linker cache
 
   # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
-  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # name and searches its own `$ORIGIN` directory, so the loader finds it from the runtime's own
   # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
   # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
   # control is `examine-33`, the same machine with the library alone.
@@ -732,3 +732,40 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
+
+  # A ROCm wheel ships `librocdxg.so.1` beside `libhsa-runtime64`, but the HSA
+  # runtime opens `librocdxg.so`, a name the wheel does not ship, so on WSL2 it
+  # loads the host's librocdxg and never the copy it was built with. A 10.2 or
+  # newer nightly runtime then fails at first GPU use against a host
+  # `rocdxg-roct` 1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`), while
+  # `driver_status` still reads `wsl_rocdxg_ready`. The inspection lists such a
+  # copy; the control is the same runtime with `librocdxg.so` beside it. The
+  # install side of the same change (`rocm install sdk` linking the name) needs a
+  # real wheel download and is covered by unit tests only.
+  @id:examine-lists-a-runtime-librocdxg-its-runtime-does-not-load @requires-os:linux
+  Scenario: examine-49 - The inspection lists a managed runtime's librocdxg that its own runtime does not load
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection lists that runtime's librocdxg as one its own runtime does not load
+
+  @id:examine-lists-no-runtime-librocdxg-when-the-runtime-loads-its-own @requires-os:linux
+  Scenario: examine-50 - The inspection lists nothing when the runtime has librocdxg.so beside its own copy
+    Given a WSL machine with a managed runtime that has librocdxg.so beside its own copy
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The advice names a command: it has to exist and has to clear the finding.
+  @id:examine-runtime-librocdxg-advice-clears-the-finding @requires-os:linux
+  Scenario: examine-51 - Running the command the inspection advises clears the runtime librocdxg finding
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The finding is advice about the WSL2 loader path; a native host with the same
+  # runtime gets none.
+  @id:examine-lists-no-runtime-librocdxg-off-wsl @requires-os:linux
+  Scenario: examine-52 - The inspection lists no runtime librocdxg on a machine that is not WSL
+    Given a machine that is not WSL with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load

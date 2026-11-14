@@ -693,6 +693,7 @@ fn install_wheel_runtime(
         probe_rocm_sdk_runtime_for_target(&env_python, Some(device_target.as_str()))
             .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
+    report_runtime_librocdxg_link(&mut output, &rocm_sdk_probe);
     let installed_version = rocm_sdk_probe
         .rocm_sdk_version
         .clone()
@@ -750,6 +751,47 @@ fn install_wheel_runtime(
     }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
     Ok(SdkInstallResult::installed(output))
+}
+
+/// On WSL2 the runtime's HSA runtime opens `librocdxg.so`, which the wheel does
+/// not ship, so it would load the host's copy instead of the one beside it. Link
+/// the runtime's own copy into the library directories the probe recorded and
+/// write one report line per copy. The WSL gate is read inside
+/// `link_installed_runtime_copies`, so the install cannot pass a wrong answer.
+fn report_runtime_librocdxg_link(output: &mut String, probe: &RocmSdkPythonProbe) {
+    write_librocdxg_report(
+        output,
+        rocm_core::runtime_rocdxg::link_installed_runtime_copies(&librocdxg_dirs(probe)),
+    );
+}
+
+/// [`report_runtime_librocdxg_link`] with the WSL gate supplied, so the unit tests
+/// run the WSL branch on every Unix host. Shares the directory choice and the report
+/// writing with the install's own path.
+#[cfg(all(test, unix))]
+fn report_runtime_librocdxg_link_when(
+    output: &mut String,
+    is_wsl: bool,
+    probe: &RocmSdkPythonProbe,
+) {
+    write_librocdxg_report(
+        output,
+        rocm_core::runtime_rocdxg::link_installed_runtime_copies_when(
+            is_wsl,
+            &librocdxg_dirs(probe),
+        ),
+    );
+}
+
+/// The directories whose `librocdxg.so.1` is linked: the ones the probe recorded.
+fn librocdxg_dirs(probe: &RocmSdkPythonProbe) -> Vec<PathBuf> {
+    probe.library_paths.clone()
+}
+
+fn write_librocdxg_report(output: &mut String, lines: Vec<String>) {
+    for line in lines {
+        let _ = writeln!(output, "  {line}");
+    }
 }
 
 /// The host's legacy/system ROCm version when it is strictly newer than the
@@ -1138,6 +1180,49 @@ mod tests {
     use super::test_support::workspace_test_artifact_dir;
     use super::test_support::{test_paths, test_runtime_manifest};
     use super::*;
+
+    /// The install report links the probe's library directories when the host is
+    /// WSL, and touches nothing otherwise. Driven with the gate supplied, so both
+    /// branches run on every Unix host; the real gate is tested in
+    /// `runtime_rocdxg::tests` through a simulated host root (hooks lane).
+    #[cfg(unix)]
+    #[test]
+    fn the_install_report_links_only_the_probes_library_directories_when_wsl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lib = dir.path().join("lib");
+        let elsewhere = dir.path().join("elsewhere");
+        for d in [&lib, &elsewhere] {
+            fs::create_dir_all(d).expect("dir");
+            fs::write(d.join("libhsa-runtime64.so.1"), "").expect("runtime");
+            fs::write(d.join("librocdxg.so.1"), "own").expect("copy");
+        }
+        let probe = RocmSdkPythonProbe {
+            library_paths: vec![lib.clone()],
+            root_path: Some(elsewhere.clone()),
+            ..RocmSdkPythonProbe::default()
+        };
+
+        let mut off = String::new();
+        report_runtime_librocdxg_link_when(&mut off, false, &probe);
+        assert!(off.is_empty(), "{off}");
+        assert!(lib.join("librocdxg.so").symlink_metadata().is_err());
+
+        let mut on = String::new();
+        report_runtime_librocdxg_link_when(&mut on, true, &probe);
+        // The whole line, indent included: a copy path or a lost indent changes it.
+        assert!(
+            on.starts_with(&format!(
+                "  librocdxg: linked {} to the runtime's own copy",
+                lib.join("librocdxg.so").display()
+            )) && on.ends_with('\n'),
+            "{on}"
+        );
+        assert_eq!(fs::read(lib.join("librocdxg.so")).expect("link"), b"own");
+        assert!(
+            elsewhere.join("librocdxg.so").symlink_metadata().is_err(),
+            "only the probe's library paths are linked"
+        );
+    }
 
     /// `--format tarball` installs no Python, so a Python choice cannot be honoured
     /// and is refused before anything is resolved or downloaded. The refusal comes

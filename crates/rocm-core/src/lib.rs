@@ -53,6 +53,7 @@ pub mod report_rollup;
 pub mod report_trend;
 pub mod rocm_install;
 pub mod runtime;
+pub mod runtime_rocdxg;
 pub mod service_identity;
 pub mod service_record;
 mod sigpipe;

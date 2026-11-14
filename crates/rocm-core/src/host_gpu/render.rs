@@ -28,6 +28,37 @@ impl ExamineSummary {
         }
     }
 
+    /// The `wsl_runtime_librocdxg` line of the examine text, or an empty string.
+    ///
+    /// Present only when a managed runtime ships its own `librocdxg.so.1` that its
+    /// HSA runtime does not load. `driver_status` describes the host's plumbing
+    /// and stays as it is; this line is about the runtime. Each runtime's fix is
+    /// the `ln -s` command [`crate::runtime_rocdxg::link_command`] builds. It makes
+    /// the same relative link `rocm install sdk` creates for a runtime it installs
+    /// (through `link_runtime_copy`, not through the command).
+    fn runtime_librocdxg_line(&self) -> String {
+        if self.unlinked_runtime_librocdxg.is_empty() {
+            return String::new();
+        }
+        let commands = self
+            .unlinked_runtime_librocdxg
+            .iter()
+            .map(|copy| crate::runtime_rocdxg::link_command(copy))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let count = self.unlinked_runtime_librocdxg.len();
+        let noun = if count == 1 { "file sits" } else { "files sit" };
+        format!(
+            "  wsl_runtime_librocdxg: {count} managed-runtime librocdxg.so.1 {noun} beside libhsa-runtime64 with \
+             no librocdxg.so, and the runtime opens librocdxg.so, so it loads the \
+             host's librocdxg if there is one; a host copy older than the runtime expects fails at first GPU \
+             use (for example `undefined symbol: hsaKmtSetPersistingCacheSize`). This lists what the files \
+             show, not whether this machine is affected. To make the runtime use its own copy (this adds a \
+             link inside the runtime's directory, including for a runtime the CLI did not install) run: \
+             {commands}\n"
+        )
+    }
+
     pub fn render_text(&self) -> String {
         let legacy_paths = if self.legacy_rocm.paths.is_empty() {
             "<none>".to_owned()
@@ -50,7 +81,7 @@ impl ExamineSummary {
             "false (this run's output is captured, so the CLI will not prompt)"
         };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n{}  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_librocdxg_on_ld_library_path: {}\n  wsl_librocdxg_beside_runtime: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n{}  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_librocdxg_on_ld_library_path: {}\n  wsl_librocdxg_beside_runtime: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n{}  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -89,6 +120,7 @@ impl ExamineSummary {
             wsl.is_some_and(|summary| summary.cargo),
             wsl.and_then(|summary| summary.detail.as_deref())
                 .unwrap_or("<not WSL>"),
+            self.runtime_librocdxg_line(),
             self.managed_runtime_count,
             self.managed_service_count,
             self.model_cache_entries,
@@ -163,6 +195,7 @@ mod tests {
             wsl: None,
             managed_runtime_count: 2,
             managed_service_count: 1,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 3,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),
@@ -219,6 +252,7 @@ mod tests {
             wsl: None,
             managed_runtime_count: 0,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),
@@ -293,6 +327,54 @@ mod tests {
         assert!(!undated.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
     }
 
+    // Pins POSIX path strings; the finding is WSL-only.
+    #[cfg(unix)]
+    #[test]
+    fn examine_names_a_runtime_librocdxg_its_runtime_does_not_load() {
+        let mut summary = examine_summary_with_gpu(None, None);
+        summary.unlinked_runtime_librocdxg = vec![PathBuf::from("/rt/lib/librocdxg.so.1")];
+        let rendered = summary.render_text();
+        // The wording of the line is pinned here; that the command it names clears
+        // the finding is proved by scenario `examine-51`, which runs it.
+        assert!(
+            rendered.contains("wsl_runtime_librocdxg: 1 managed-runtime librocdxg.so.1 file sits beside libhsa-runtime64 with no librocdxg.so"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("run: ln -s librocdxg.so.1 '/rt/lib/librocdxg.so'"),
+            "{rendered}"
+        );
+        // The host's own plumbing verdict is a separate line and is not rewritten.
+        assert!(rendered.contains("driver_status: amd_display_driver_detected"));
+    }
+
+    #[test]
+    fn examine_prints_no_runtime_librocdxg_line_when_every_runtime_loads_its_own() {
+        let clean = examine_summary_with_gpu(None, None).render_text();
+        assert!(!clean.contains("wsl_runtime_librocdxg"), "{clean}");
+        // The same summary with one copy listed does print it, so the absence
+        // above is the absence of the finding and not of the line.
+        let mut listed = examine_summary_with_gpu(None, None);
+        listed.unlinked_runtime_librocdxg = vec![PathBuf::from("/rt/lib/librocdxg.so.1")];
+        assert!(listed.render_text().contains("wsl_runtime_librocdxg"));
+    }
+
+    // Pins POSIX path strings; the finding is WSL-only.
+    #[cfg(unix)]
+    #[test]
+    fn examine_joins_the_commands_for_several_copies() {
+        let mut summary = examine_summary_with_gpu(None, None);
+        summary.unlinked_runtime_librocdxg = vec![
+            PathBuf::from("/a/lib/librocdxg.so.1"),
+            PathBuf::from("/b/lib/librocdxg.so.1"),
+        ];
+        let rendered = summary.render_text();
+        assert!(rendered.contains("wsl_runtime_librocdxg: 2 managed-runtime librocdxg.so.1 files sit beside libhsa-runtime64 with no librocdxg.so"));
+        assert!(rendered.contains(
+            "run: ln -s librocdxg.so.1 '/a/lib/librocdxg.so'; ln -s librocdxg.so.1 '/b/lib/librocdxg.so'"
+        ));
+    }
+
     #[test]
     fn examine_prints_no_driver_age_lines_when_no_version_was_read() {
         let rendered = windows_summary_with_driver(None).render_text();
@@ -334,6 +416,7 @@ mod tests {
             wsl: None,
             managed_runtime_count: 0,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),
@@ -388,6 +471,7 @@ mod tests {
             wsl: None,
             managed_runtime_count: 0,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),

@@ -2449,6 +2449,12 @@ fn push_planted_wsl_machine_env(world: &mut E2eWorld, loader_path: &str) {
         "ROCM_CLI_TEST_HOST_ROOT",
         root.join("host-root").into_os_string(),
     ));
+    // A planted managed runtime makes every `rocm` start run the startup update
+    // check, which needs a PATH Python and the network and prints progress ahead
+    // of a `--json` document. These scenarios are about the host, not updates.
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
 }
 
 #[given("a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache")]
@@ -3181,4 +3187,167 @@ async fn assert_inspection_agrees_with_the_refusal(world: &mut E2eWorld) {
         "wsl_rocdxg_missing",
         "{json:#}"
     );
+}
+
+/// What the planted runtime's own `librocdxg.so.1` holds, so a read through a link
+/// shows which file the link points at.
+const PLANTED_RUNTIME_ROCDXG: &str = "the runtime's own librocdxg";
+
+/// Plant a managed wheel runtime in the registry, with the library directory its
+/// HSA runtime lives in. `with_unversioned` also plants `librocdxg.so` beside the
+/// versioned copy, which is the layout where the runtime loads its own copy.
+///
+/// Black-box: plain JSON in the registry schema, as `rocm install sdk` would
+/// have written it, with files standing in for the libraries (an empty file is
+/// enough for a check of which names exist).
+fn plant_managed_runtime_with_rocdxg(world: &mut E2eWorld, with_unversioned: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let lib = root.join("wheel-runtime/lib");
+    std::fs::create_dir_all(&lib).expect("failed to create the planted runtime lib");
+    std::fs::write(lib.join("libhsa-runtime64.so.1"), "").expect("failed to plant the runtime");
+    std::fs::write(lib.join("librocdxg.so.1"), PLANTED_RUNTIME_ROCDXG)
+        .expect("failed to plant librocdxg.so.1");
+    if with_unversioned {
+        std::fs::write(lib.join("librocdxg.so"), "").expect("failed to plant librocdxg.so");
+    }
+    let registry = root.join("data/runtimes/registry");
+    std::fs::create_dir_all(&registry).expect("failed to create the runtime registry");
+    let manifest = serde_json::json!({
+        "runtime_key": "wsl-rocdxg-runtime",
+        "runtime_id": "therock-nightly:gfx1151",
+        "channel": "nightly",
+        "format": "wheel",
+        "family": "gfx1151",
+        "family_source": "e2e",
+        "version": "10.3.0a20261113",
+        "install_root": root.join("wheel-runtime").display().to_string(),
+        "selected_artifact_url": "https://example.invalid/e2e.whl",
+        "installed_at_unix_ms": 1,
+        "rocm_sdk": {
+            "import_ok": true,
+            "root_path": root.join("wheel-runtime").display().to_string(),
+            "bin_path": root.join("wheel-runtime/bin").display().to_string(),
+            "library_paths": [lib.display().to_string()],
+        },
+    });
+    std::fs::write(
+        registry.join("wsl-rocdxg-runtime.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
+    )
+    .expect("failed to write the planted runtime manifest");
+}
+
+#[given("a WSL machine with a managed runtime that ships only a versioned librocdxg")]
+async fn wsl_machine_with_runtime_shipping_only_versioned_rocdxg(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "/opt/rocm/lib");
+    plant_managed_runtime_with_rocdxg(world, false);
+}
+
+#[given("a machine that is not WSL with a managed runtime that ships only a versioned librocdxg")]
+async fn native_machine_with_runtime_shipping_only_versioned_rocdxg(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // A simulated host root with no `/dev/dxg` and no Microsoft kernel string.
+    std::fs::create_dir_all(root.join("host-root/proc")).expect("failed to create planted /proc");
+    plant_managed_runtime_with_rocdxg(world, false);
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
+}
+
+#[given("a WSL machine with a managed runtime that has librocdxg.so beside its own copy")]
+async fn wsl_machine_with_runtime_holding_unversioned_rocdxg(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "/opt/rocm/lib");
+    plant_managed_runtime_with_rocdxg(world, true);
+}
+
+fn planted_runtime_librocdxg_copy(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("wheel-runtime/lib/librocdxg.so.1")
+        .display()
+        .to_string()
+}
+
+fn unlinked_runtime_librocdxg(world: &E2eWorld) -> Vec<String> {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    json.pointer("/summary/unlinked_runtime_librocdxg")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("no unlinked_runtime_librocdxg list:\n{json:#}"))
+        .iter()
+        .filter_map(|path| path.as_str().map(str::to_owned))
+        .collect()
+}
+
+#[then("the inspection lists that runtime's librocdxg as one its own runtime does not load")]
+async fn assert_runtime_librocdxg_listed(world: &mut E2eWorld) {
+    assert_eq!(
+        unlinked_runtime_librocdxg(world),
+        vec![planted_runtime_librocdxg_copy(world)]
+    );
+}
+
+#[then("the inspection lists no runtime librocdxg that its own runtime does not load")]
+async fn assert_runtime_librocdxg_not_listed(world: &mut E2eWorld) {
+    assert_eq!(unlinked_runtime_librocdxg(world), Vec::<String>::new());
+}
+
+#[when(
+    "the user runs the command the inspection advises for that runtime's librocdxg and inspects again"
+)]
+async fn user_follows_the_runtime_librocdxg_advice(world: &mut E2eWorld) {
+    let (text, _, text_rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip"]);
+    assert_eq!(text_rc, 0, "`rocm examine` failed:\n{text}");
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("wsl_runtime_librocdxg:"))
+        .unwrap_or_else(|| panic!("the inspection has no wsl_runtime_librocdxg line:\n{text}"));
+    let command = line.rsplit_once("run: ").map_or_else(
+        || panic!("the line names no command: {line}"),
+        |(_, command)| command.trim(),
+    );
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .expect("failed to run the advised command");
+    assert!(status.success(), "the advised command failed: {command}");
+    // Clearing the finding is not enough: a link to the wrong file would clear it
+    // too. The unversioned name must read as the runtime's own copy.
+    let link = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("wheel-runtime/lib/librocdxg.so");
+    assert_eq!(
+        std::fs::read_to_string(&link).expect("librocdxg.so does not resolve"),
+        PLANTED_RUNTIME_ROCDXG
+    );
+    // The scenario env is consumed by each run (`mem::take` in
+    // `run_rocm_with_scenario_env`), so the second run needs it planted again.
+    push_planted_wsl_machine_env(world, "/opt/rocm/lib");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
 }
