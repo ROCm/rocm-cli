@@ -484,6 +484,60 @@ Dispatch the GPU lanes with, e.g.:
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
 
+## Nightly lanes that never get a runner
+
+GitHub cannot time a job out while it waits for a runner: `timeout-minutes`
+only counts once a runner has taken the job, and a job that is still queued
+after 24 hours is cancelled. A lane whose runner pool is offline or saturated
+therefore held `nightly.yml` pending for a day, and the report and readiness
+jobs, which wait on every lane, never ran.
+
+`nightly.yml` bounds that wait itself:
+
+- `e2e-lanes-settled` stands in for the lanes in the report job's `needs`. It
+  polls the run's own job list
+  ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
+  once every lane leg has finished or can be given up on: a leg still queued
+  after `QUEUE_DEADLINE_MINUTES` (60, or the `queue_deadline_minutes` dispatch
+  input) is abandoned, and a leg that started is waited for but abandoned at
+  `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold the wait either.
+  A lane that starts just inside the queue deadline still has its full
+  `timeout-minutes`, so the script refuses a queue deadline that, plus
+  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
+  minutes, at most 120.
+- `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
+  whatever finished. An abandoned lane has no report artifact, so the report
+  job's missing-report check flags it by name, the consolidated grid shows the
+  gap and readiness reads it as a failed report rather than as success.
+- `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
+  which is what stops the abandoned legs from holding the run open until the
+  24-hour limit. It runs only when something was abandoned or the settle job
+  itself failed (nothing else bounds the wait then), and only after the report
+  and readiness jobs are done, because cancelling the run also skips any job
+  that is still gated on `!cancelled()`. If the run is cancelled from outside
+  before the settle job finishes, nothing is left to wait on and the run ends
+  with it.
+
+To try a change to these jobs from a branch without publishing a nightly
+release, dispatch the workflow with `skip_build` set:
+
+```bash
+gh workflow run nightly.yml --ref <branch> -f skip_build=true
+```
+
+Add `-f queue_deadline_minutes=5` to give up on lanes that have no runner after
+five minutes, which exercises the give-up and cancel path without a long wait.
+
+That skips the Linux and Windows builds and the release publish, and runs the
+lanes, the report, readiness and the settle job. The wiki publishers run only
+from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
+
+A lane added to `nightly.yml` must be added to the `LANES` list of
+`e2e-lanes-settled`;
+`nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
+and also fails if a job waits on a lane directly. The per-PR workflow
+does not use this mechanism.
+
 ## The shared pre-warmed runtime
 
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
