@@ -874,6 +874,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`tests/e2e/tui_driver.rs`](../tests/e2e-cucumber/tests/e2e/tui_driver.rs) | Pseudo-terminal driver for the dash and chat TUI: spawns the real binary under `portable-pty`, sends keys and reads the emulated `vt100` screen. | flat |
 | [`tests/e2e/uninstall_steps.rs`](../tests/e2e-cucumber/tests/e2e/uninstall_steps.rs) | Steps for [`uninstall.feature`](../tests/e2e-cucumber/features/uninstall.feature): `rocm uninstall` confined to the scenario root with `--keep-binaries` and redirected caches. | flat |
 | [`tests/e2e/update_steps.rs`](../tests/e2e-cucumber/tests/e2e/update_steps.rs) | Steps for [`update.feature`](../tests/e2e-cucumber/features/update.feature): the report-only `rocm update`, its feed status, and a loopback catalog where runtimes are planted. | flat |
+| [`tests/e2e/vllm_tensorizer_steps.rs`](../tests/e2e-cucumber/tests/e2e/vllm_tensorizer_steps.rs) | Steps for [`vllm_tensorizer.feature`](../tests/e2e-cucumber/features/vllm_tensorizer.feature): a planted Python and `uv` model vLLM's unimportable tensorizer pin, and the install must upgrade it, report it as a deliberate divergence, or refuse. | flat |
 
 Boundaries:
 

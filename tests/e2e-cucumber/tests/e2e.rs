@@ -51,6 +51,7 @@ mod e2e {
     pub mod tui_driver;
     pub mod uninstall_steps;
     pub mod update_steps;
+    pub mod vllm_tensorizer_steps;
 }
 
 // ── World ──────────────────────────────────────────────────────────
