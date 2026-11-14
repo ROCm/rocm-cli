@@ -72,10 +72,9 @@ fn serve_timeout_secs() -> u64 {
 
 /// Serve-readiness timeout for a scenario: a per-scenario override set by the
 /// `before` hook takes precedence over the global `E2E_SERVE_TIMEOUT_SECS` /
-/// default. The override is a `@serve-timeout:<secs>` tag on an expected-pass
-/// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
-/// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
-/// it fails fast).
+/// default. The override is an `expectations.toml` xfail `serve_timeout_secs`
+/// (shorten a known-bug serve so it fails fast), else a `@serve-timeout:<secs>`
+/// tag (lengthen a genuinely slow serve, e.g. a large model).
 pub(crate) fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override

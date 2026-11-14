@@ -152,8 +152,9 @@ pub struct E2eWorld {
     pub legacy_rocm_path: Option<PathBuf>,
     /// Per-scenario serve-readiness timeout override (seconds), set by the
     /// `before` hook from `expectations.toml` when this scenario is a known bug
-    /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
-    /// fail fast instead of burning the full cold-start window. `None` → the
+    /// with a `serve_timeout_secs` (which wins over a `@serve-timeout` tag), else
+    /// from that tag. Lets an xfail serve that never becomes ready fail fast
+    /// instead of burning the full cold-start window. `None` → the
     /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
     pub serve_timeout_override: Option<u64>,
     /// Whether `expectations.toml` marks this scenario a known bug on this host,
@@ -1508,10 +1509,10 @@ async fn run_suite() {
             let decl = ScenarioDecl::from_tags(&scenario.tags);
             if let Some(id) = &decl.id {
                 let engine = decl.effective_engine(cap);
-                // A `@serve-timeout:<secs>` tag on an expected-pass scenario (a
-                // genuinely slow serve, e.g. a large model) takes precedence;
-                // otherwise fall back to any xfail matrix override (fail-fast for
-                // a known-bug serve). Absent both → the step default.
+                // A matching xfail matrix override (fail-fast for a known-bug
+                // serve) takes precedence; otherwise a `@serve-timeout:<secs>` tag
+                // (a genuinely slow serve, e.g. a large model) applies. Absent
+                // both → the step default.
                 world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }

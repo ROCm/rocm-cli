@@ -27,6 +27,7 @@
 #   bug = "EAI-NNNN"                  ticket reference (shown in the report)
 #   reason = "..."                    human explanation (shown in the report)
 #   serve_timeout_secs = 90          optional: shorter serve wait for a known bug
+#                                    (wins over the scenario's @serve-timeout tag)
 #   flaky = true                     optional: bug reproduces only intermittently,
 #                                    so an XPASS is tolerated (reported, not stale)
 #
@@ -249,16 +250,20 @@ flaky = true
 #
 # runtime-16 asserts the alignment succeeded, which it cannot while the 7.14.x
 # tarball is unreachable. serve-06 serves a 35B model through the Windows lane's
-# 7.13 backend against the SDK's 7.14.1 libraries and the server crashes in the
-# SDK's Tensile library on the first inference request (access violation in the
-# lane's service log). The mismatch between the backend and the SDK is the
-# suspected cause; it has NOT been reproduced off Windows, so the row names both
-# facts. Both rows are deterministic (both scenarios failed on each Windows lane
+# 7.13 backend against the SDK's 7.14.1 libraries and the engine fails on its own
+# after the launch reports success: `rocm serve` exits 0, `/v1/models` never lists
+# the model within the wait (the failing step is the serve step, not the chat
+# request), and the lane's service log shows an access violation in the SDK's
+# Tensile library. The mismatch between the backend and the SDK is the suspected
+# cause; it has NOT been reproduced off Windows, so the row names both facts. Both rows are deterministic (both scenarios failed on each Windows lane
 # run examined: 2026-10-28, 2026-11-05 and 2026-11-06), so neither is `flaky`: an
-# XPASS means the cause is gone and the row should be deleted. Neither row sets
-# `serve_timeout_secs`: serve-06's own `@serve-timeout:2400` tag takes precedence
-# over a row, so a shorter wait here would have no effect, and the failing
-# serve-06 still holds the Windows lane for the full 2400s wait.
+# XPASS means the cause is gone and the row should be deleted. Only serve-06's row
+# sets `serve_timeout_secs`: a row's wait wins over the scenario's own
+# `@serve-timeout:2400` tag, and the failing serve never became ready within that
+# window on the Windows lane (2026-10-27 and 2026-11-10 runs), holding the lane for
+# about 41 minutes per channel. 600s is the step default, so the scenario still gets
+# a normal load; if the cause is fixed, delete the row and the tag's 2400s applies
+# again.
 [["runtime-lemonade-backend-alignment-reported"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-899"
@@ -267,7 +272,8 @@ reason = "Lemonade 11.5.1 fetches TheRock only from repo.amd.com/rocm/tarball/, 
 [["serve-large-model-inference"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-900"
-reason = "The Windows large-model serve crashes in the SDK's Tensile library on the first inference request; the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
+reason = "The Windows large-model serve never exposes the model (the launch exits 0, then the engine fails on its own; the service log shows a crash in the SDK's Tensile library); the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
+serve_timeout_secs = 600
 
 # Scoped to native Linux Strix Halo, the only place it has been seen (evidence is
 # in the tracking issue); `is_wsl = false` keeps WSL2, which also reports
