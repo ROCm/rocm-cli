@@ -287,7 +287,8 @@ On WSL2, wheel runtime installs and updates (`rocm install sdk`,
 `rocm update --apply`) also link `librocdxg.so` to the runtime's own
 `librocdxg.so.1`, so the runtime searches its own copy rather than an older host
 `librocdxg`; for a runtime installed earlier, `rocm examine` prints a `wsl_runtime_librocdxg` line
-with the command that does the same (see [WSL](docs/wsl.md)).
+with the command that does the same (see
+[WSL](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md)).
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
