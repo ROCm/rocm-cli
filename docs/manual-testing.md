@@ -1428,6 +1428,12 @@ cleanly. Run the install a second time: no upgrade warning, the same
 get past engine start-up (it no longer fails with
 `KeyError: 'crypto_stream_salsa20_NONCEBYTES'`).
 
+On some GPU families `rocm install sdk` installs vLLM itself
+(`maybe_auto_install_sdk_preferred_engine`), so the same upgrade warning and the
+`expected_divergence` block appear at the end of that command, a step earlier;
+the `rocm engines install vllm` that follows then shows the block without the
+warning, and nothing more needs doing.
+
 ## 7. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

@@ -119,7 +119,15 @@ fn plant(world: &E2eWorld, upgrade: Upgrade, coloured: bool, extra: Extra) {
         &bin.join("python"),
         &format!(
             r#"#!/bin/sh
-case " $* " in *" -I "*) unset PYTHONPATH ;; esac
+# Like a real interpreter, ignore PYTHONPATH under -E and under -I (which implies
+# -E), alone or combined with other short flags (`-sE`), before the `-c` script.
+for arg in "$@"; do
+  case "$arg" in
+    -c) break ;;
+    --*) ;;
+    -*E*|-*I*) unset PYTHONPATH ;;
+  esac
+done
 case "$*" in
   *tensorizer.serialization*)
     : > "{state}/probe-ran"

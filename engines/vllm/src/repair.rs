@@ -191,13 +191,15 @@ fn repair_from_violations(
         } else {
             "the runtime holds the SDK's build of the torch vLLM pins; that divergence is intended and a reinstall would undo it"
         };
-        let tensorizer_headline = "the runtime holds a tensorizer at or above the release that fixes vLLM's pinned one instead of that pin; that divergence is intended and the install keeps it, so no reinstall is needed";
-        let headline = match (has_torch, has_tensorizer) {
-            (true, true) => format!("{torch_headline}; also, {tensorizer_headline}"),
-            (false, true) => tensorizer_headline.to_owned(),
-            _ => torch_headline.to_owned(),
-        };
-        let mut notes = vec![headline];
+        let tensorizer_headline = "the runtime holds a tensorizer at or above the fixed release instead of vLLM's older pin; that divergence is intended and the install keeps it, so no reinstall is needed";
+        // One note per kind of divergence, not one joined line.
+        let mut notes = Vec::new();
+        if has_torch || !has_tensorizer {
+            notes.push(torch_headline.to_owned());
+        }
+        if has_tensorizer {
+            notes.push(tensorizer_headline.to_owned());
+        }
         notes.extend(
             intended
                 .iter()
@@ -296,6 +298,7 @@ mod tests {
             "{headline}"
         );
         assert!(!headline.contains("torch"), "{headline}");
+        assert!(headline.len() < 200, "{headline}");
     }
 
     #[test]
@@ -310,10 +313,23 @@ mod tests {
             ALIGNED,
         );
         assert!(!assessment.needed, "{assessment:?}");
-        let headline = &assessment.notes[0];
         assert!(
-            headline.contains("SDK's build of the torch") && headline.contains("tensorizer"),
-            "{headline}"
+            assessment.notes[0].contains("SDK's build of the torch")
+                && !assessment.notes[0].contains("tensorizer"),
+            "{:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment.notes[1].contains("tensorizer")
+                && assessment.notes[1].contains("no reinstall is needed")
+                && !assessment.notes[1].contains("torch"),
+            "{:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment.notes.iter().all(|note| note.len() < 200),
+            "no note should be a wall of joined findings: {:?}",
+            assessment.notes
         );
     }
 

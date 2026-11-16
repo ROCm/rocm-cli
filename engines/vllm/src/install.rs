@@ -1140,14 +1140,49 @@ mod tests {
         assert_eq!(classify_tensorizer_failure(stderr), TensorizerProbe::Usable);
     }
 
+    /// Each case raises its exception with tensorizer as the LAST frame, so only
+    /// the library-load rule can acquit it, and each carries exactly one of the
+    /// rule's markers: the exception type or the message.
     #[test]
-    fn a_library_load_error_raised_in_tensorizer_itself_is_not_its_fault() {
-        let os_error = "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\nOSError: libamdhip64.so.7: cannot open shared object file\n";
-        let import_error = "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\nImportError: libsodium.so: cannot open shared object file\n";
-        let missing = "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\nModuleNotFoundError: No module named 'redis'\n";
-        for stderr in [os_error, import_error, missing] {
-            assert_eq!(classify_tensorizer_failure(stderr), TensorizerProbe::Usable);
+    fn each_library_load_marker_alone_acquits_a_tensorizer_frame() {
+        let cases = [
+            (
+                "OSError type alone",
+                "OSError: [Errno 2] No such file or directory: 'libsodium.so'",
+            ),
+            (
+                "ImportError type alone",
+                "ImportError: cannot import name 'x' from 'y'",
+            ),
+            (
+                "ModuleNotFoundError type alone",
+                "ModuleNotFoundError: No module named 'redis'",
+            ),
+            (
+                "'shared object file' alone, wrapped in another type",
+                "RuntimeError: libamdhip64.so.7: cannot open shared object file",
+            ),
+            (
+                "'DLL load failed' alone, wrapped in another type",
+                "RuntimeError: DLL load failed while importing _tensorizer: The specified module could not be found.",
+            ),
+        ];
+        for (what, exception) in cases {
+            let stderr = format!(
+                "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\n{exception}\n"
+            );
+            assert_eq!(
+                classify_tensorizer_failure(&stderr),
+                TensorizerProbe::Usable,
+                "{what}"
+            );
         }
+        // The same frame with a non-load exception is tensorizer's own failure.
+        let broken = "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\nKeyError: 'x'\n";
+        assert!(matches!(
+            classify_tensorizer_failure(broken),
+            TensorizerProbe::Broken(_)
+        ));
     }
 
     #[test]
@@ -1207,6 +1242,7 @@ mod tests {
         )?
         .expect("an override is reported");
         assert_eq!(upgrades, 1);
+        assert!(probes.is_empty(), "the upgrade must be probed again");
         assert!(
             note.contains("2.12.1") && note.contains("on purpose"),
             "{note}"

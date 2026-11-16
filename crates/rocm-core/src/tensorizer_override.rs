@@ -27,52 +27,69 @@ pub fn tensorizer_override_requirement() -> String {
     format!("{TENSORIZER_PACKAGE}=={TENSORIZER_PYTHON314_FIX}")
 }
 
+/// The numeric release of a plain version, or `None` for anything else.
+///
+/// `uv` prints PEP 440 versions: a local segment follows `+`, and no `-` or space
+/// appears in a normalised release. A pre-release (`2.12.1rc1`, `dev0`), a version
+/// with a marker or any other trailing text, and an empty string have no plain
+/// release. A post-release counts as the release it follows.
+fn release(version: &str) -> Option<Vec<u64>> {
+    let public = version.split('+').next()?;
+    let mut parts = Vec::new();
+    for part in public.split('.') {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        // A post-release of a release is that release or later.
+        if digits.is_empty() && part.starts_with("post") {
+            break;
+        }
+        // `dev0` and the like: not a plain release.
+        if digits.is_empty() {
+            return None;
+        }
+        // `1rc1`, `1a2`, `1b3`, `1; python_version >= ...`: not a plain release.
+        if digits.len() != part.len() {
+            return None;
+        }
+        parts.push(digits.parse().ok()?);
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
 /// Whether `version` is at least [`TENSORIZER_PYTHON314_FIX`].
 ///
-/// Compares the dotted numeric release. A version that does not start with digits, or that is
-/// a pre-release (`2.12.1rc1`), is not treated as fixed.
+/// Compares the dotted numeric release. A version that has no plain release is
+/// not treated as fixed.
 pub fn tensorizer_version_is_fixed(version: &str) -> bool {
-    fn release(version: &str) -> Option<Vec<u64>> {
-        // `uv` prints PEP 440 versions: a local segment follows `+`, and no `-` or
-        // space appears in a normalised release.
-        let public = version.split('+').next()?;
-        let mut parts = Vec::new();
-        for part in public.split('.') {
-            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-            // A post-release of a release is that release or later.
-            if digits.is_empty() && part.starts_with("post") {
-                break;
-            }
-            // `dev0` and the like: not a plain release.
-            if digits.is_empty() {
-                return None;
-            }
-            // `1rc1`, `1a2`, `1b3`: a pre-release is not the release it precedes.
-            if digits.len() != part.len() {
-                return None;
-            }
-            parts.push(digits.parse().ok()?);
-        }
-        (!parts.is_empty()).then_some(parts)
-    }
     match (release(version), release(TENSORIZER_PYTHON314_FIX)) {
         (Some(have), Some(need)) => have >= need,
         _ => false,
     }
 }
 
+/// Whether `version` is a plain release strictly below the fix. Unlike
+/// `!tensorizer_version_is_fixed`, a version that cannot be read is not below it.
+fn tensorizer_version_is_below_fix(version: &str) -> bool {
+    match (release(version), release(TENSORIZER_PYTHON314_FIX)) {
+        (Some(have), Some(need)) => have < need,
+        _ => false,
+    }
+}
+
 /// Whether this unmet requirement is the tensorizer override.
 ///
-/// The requirement must be an exact pin on tensorizer below the fix (the pin that
-/// cannot be imported) and the installed release at least the fix. A tensorizer
-/// that is missing or older is a real defect, and so is a pin on a release that
-/// is itself fixed: that one is unmet for some other reason.
+/// `violation_subject` fills `required` only for a lone `==` pin, as the text after
+/// the `==`. That text must read as a plain release strictly below the fix (the
+/// pin that cannot be imported); a pin that does not parse (garbage, empty, or
+/// qualified by an environment marker, which leaves trailing text) stays a
+/// violation, as does a pin on a release at or above the fix. The installed
+/// release must be at least the fix. A tensorizer that is missing or older is a
+/// real defect.
 pub fn is_tensorizer_override(subject: &ViolationSubject) -> bool {
     subject.package.eq_ignore_ascii_case(TENSORIZER_PACKAGE)
         && subject
             .required
             .as_deref()
-            .is_some_and(|required| !tensorizer_version_is_fixed(required))
+            .is_some_and(tensorizer_version_is_below_fix)
         && subject
             .installed
             .as_deref()
@@ -145,6 +162,28 @@ mod tests {
         let mut loose_pin = subject("tensorizer", Some("2.12.1"));
         loose_pin.required = None;
         assert!(!is_tensorizer_override(&loose_pin));
+        // A pin that cannot be read must not pass as the deliberate override.
+        for required in [
+            "garbage",
+            "",
+            "2.10.1; python_version >= \"3.14\"",
+            "2.10.1rc1",
+            "2.12.1",
+            "2.12.1+local",
+        ] {
+            let mut pin = subject("tensorizer", Some("2.12.1"));
+            pin.required = Some(required.to_owned());
+            assert!(
+                !is_tensorizer_override(&pin),
+                "{required:?} must stay a violation"
+            );
+        }
+        // The plain pin still counts, with a local segment too.
+        for required in ["2.10.1", "2.11.0", "2.10.1+local"] {
+            let mut pin = subject("tensorizer", Some("2.12.1"));
+            pin.required = Some(required.to_owned());
+            assert!(is_tensorizer_override(&pin), "{required:?}");
+        }
     }
 
     #[test]

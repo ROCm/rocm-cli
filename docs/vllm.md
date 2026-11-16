@@ -157,7 +157,9 @@ imported after the upgrade fails the install with the exception, instead of
 ending in a startup crash at `rocm serve`. On a runtime this run did not
 install vLLM into, the same three cases are warnings, so an install that used to
 be a no-op (for example offline) stays one. A tensorizer that imports keeps
-vLLM's pin.
+vLLM's pin. A later `rocm engines install vllm` on a runtime whose upgrade
+failed only warns, and `rocm serve` on it keeps failing until an install
+succeeds: retrying after a failed install is deliberately not fatal.
 
 The check runs inside the engine install, before the CLI realigns the runtime's
 torch. If torch cannot load against the SDK at that moment, the probe sees a
