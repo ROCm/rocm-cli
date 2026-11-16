@@ -252,6 +252,33 @@ serving-instance registry needs the Unix domain socket telemetry, so that view
 is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
 anywhere without a GPU or daemon.
 
+On Linux and WSL, the embedded daemon also discovers loaded models from a
+separately running local Lemonade server at `127.0.0.1:13305`. Configure
+`dashboard.daemon.lemonade_host` and `dashboard.daemon.lemonade_port` in
+`config.json` for another endpoint, or set `dashboard.daemon.enable_lemonade`
+to `false` to disable external discovery. The file is `~/.rocm/config.json`, or
+`config.json` in the directory named by `ROCM_CLI_CONFIG_DIR`. Editing it is the
+only way to set these fields. Native Windows has no live dashboard telemetry, so it
+has no external discovery. A healthy server with no loaded models
+does not count as a running model. Discovery does not register an external server
+as a managed service or give ROCm CLI ownership of its process. External models
+are visible in Observe, but are excluded from the Services stop/restart controls.
+The tok/s figure for a Lemonade model is the rate of the endpoint's most recent
+completed request, not live throughput: it stays the same while the server is
+idle. The dashboard explains it with a legend (`Lemonade: last req tok/s, not live`)
+under the Instances table and the Services overlay rows, and a `last req` prefix in
+the instance detail and the quick preview. Because it is not live, the node-wide
+totals (the tok/W and tok/s heroes on Home and Observe) and the per-instance tok/W
+leave it out, and the agent snapshot marks it with `gen_tps_last_request`. A managed Lemonade server that requires an API key stays listed with its
+registry status and throughput unavailable; the dashboard never reads the key.
+
+The engine pane distinguishes a ROCm CLI-managed Lemonade installation from an
+externally running server. When installation detection is unavailable, it shows
+an unchecked status ("unknown, run `rocm engines list`") rather than claiming
+Lemonade is not installed. Installation status does not depend on GPU telemetry.
+It is read once, when the dashboard starts. After you install Lemonade from the
+Engines overlay, restart the dashboard to refresh it.
+
 ## Configure ROCm and serve a model
 
 Before serving a model, check whether a managed ROCm runtime is already
@@ -380,14 +407,15 @@ position.
   reads that text first: quotes, `$(...)` and a leading `-` in a pasted error
   can be changed, run, or taken as a flag.
 - `--symptom-file PATH` reads the same text from a file instead, or from
-  standard input when PATH is `-`, so no quoting is needed. It cannot be
-  combined with `--symptom`. The text that arrives is matched as `--symptom`
-  would match it, minus one trailing line break. A UTF-8 byte-order mark is
-  dropped and a UTF-16 file with a byte-order mark (what Windows PowerShell's
-  `>` writes) is decoded; anything else must be UTF-8. A file that cannot be
-  read, input that is not text, or input larger than 16 MiB is a usage error
-  (exit code 2). With nothing piped in, paste the error at the terminal and
-  end it with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+  standard input when PATH is `-`, so no quoting is needed (a file named `-`
+  is passed as `./-`). It cannot be combined with `--symptom`. The text that
+  arrives is matched as `--symptom` would match it, minus one trailing line
+  break. A UTF-8 byte-order mark is dropped and a UTF-16 file with a
+  byte-order mark (what Windows PowerShell's `>` writes) is decoded; anything
+  else must be UTF-8. A file that cannot be read, input that is not text, or
+  input larger than 16 MiB is a usage error (exit code 2). With nothing piped
+  in, paste the error at the terminal and end it with Ctrl-D at the start of
+  a line (Ctrl-Z then Enter on Windows).
 
   ```bash
   # bash (Linux, WSL): the quoted 'EOF' keeps the shell out of the paste
@@ -408,6 +436,16 @@ position.
   :: cmd.exe: save the error to a file first
   rocm diagnose --symptom-file error.txt
   ```
+- With either flag, a finding about the examined host can still outrank the
+  entry the text added to, so each match says whether the text contributed to
+  its score or evidence: `symptom_matched` in `--json` (always present, `false`
+  when neither `--symptom` nor `--symptom-file` was given). Any keyword hit
+  counts, however weak, so `true` means the text contributed, not that the
+  match explains the error. In the human-readable output, a `source: the
+  examined host's state alone` line marks each shown match the text did not
+  contribute to, once the text contributed to any match in the report. That
+  includes one past `--top`, so all the rows shown can carry the line when the
+  only match the text contributed to was cut off.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
@@ -504,7 +542,20 @@ hardware, not something an install or a setting can put right.
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
 - `--json`, used without a fix id, prints the catalog manifest as JSON. It
   applies no fix and exits 0. Together with a fix id it is refused, with exit
-  code 1.
+  code 1. The manifest names every exit code `rocm fix` returns
+  (`exit_codes`, name to number) and says what each means
+  (`exit_code_descriptions`, name to text).
+
+Exit code 2 has two causes. It is `unknown_id`, a fix id the catalog does not
+have, refused with a stderr line starting `Unknown fix-id:`; and it is also what
+the argument parser returns for a malformed command line (an unknown option, a
+missing value, or a value it cannot read, such as a non-number for
+`--device-index`), refused with a stderr line starting `error:` instead. A
+one-time `rocm:` notice can come before either line. A script that needs to know
+which happened reads the message, not the code. A negative device index depends
+on how it is written: `--device-index=-1` is accepted by the parser and the fix
+refuses it with exit 3, while `--device-index -1` (with a space) is read as an
+unknown option `-1`, a usage error that exits 2.
 
 ### ROCm installation
 
@@ -682,7 +733,12 @@ always right: the index has published a CPU-only torchaudio under the same
 requested version publishes no torchaudio for this Python and platform.
 
 It then asks `uv` to resolve Torch and torchvision from their published
-dependency metadata alongside the pinned torchaudio. Before it creates or
+dependency metadata alongside the pinned torchaudio. For a ROCm line the vLLM
+ROCm 10.x install also supports (10.0 and 10.1), the request is bounded to the
+Torch and torchvision series that install pairs for that line (for 10.1, torch
+2.13 and torchvision 0.28), because the newest torch on the index can pair with
+a torchvision that fails to import. The `version_resolution_specs:` line in the
+plan shows the bound. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
@@ -1236,7 +1292,26 @@ server instead (an already-serving one is reported at once). Watch the download 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
 engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models. Pass a GGUF repo
 with an explicit quantization variant, for example,
-`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`.
+`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. Lemonade also accepts
+registered GGUF names such as `Qwen3-0.6B-GGUF`, or the `qwen-smoke` alias.
+On Linux, direct serving resolves simple single-GGUF entries from the installed
+Lemonade catalog. Entries needing additional files or model-specific options,
+well-formed entries of an unrecognized shape, and registered names on Windows use
+Lemonade's router instead. That includes a registered checkpoint that is not a
+plain `owner/repo:variant`, such as one whose variant is `*`. Explicit `owner/repo:variant` references require the selected GPU
+llama-server backend. Direct serving uses that backend, including Vulkan when
+supported; it does not select a stale ROCm binary merely because it is on disk.
+When Lemonade selects a GPU backend other than ROCm, such as Vulkan, serving names
+that backend instead of presenting it as ROCm. Neither route silently substitutes
+the default model.
+
+On Linux, if Lemonade's router fails to load or verify a registered model, `rocm
+serve` stops the router and serves that model directly through the llama-server of
+the backend Lemonade selected, when the catalog entry resolves to a simple
+checkpoint. The serve log names the failure and the backend. This never uses a CPU
+backend: with no GPU llama-server for the selected backend, or on Windows, the
+router's error is returned and the service is marked failed. A server that did not
+become ready, a failed backend selection and a later server exit are never retried.
 
 The vLLM engine (Instinct) serves
 **safetensors** repos, such as `rocm serve Qwen/Qwen2.5-0.5B-Instruct`.

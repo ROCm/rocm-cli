@@ -382,6 +382,7 @@ mod tests {
     fn real_report_with_a_fix() -> DiagnoseReport {
         use rocm_core::diagnose::{Diagnosis, Fix};
         report(vec![Diagnosis {
+            symptom_matched: false,
             id: "dkms-mismatch".to_owned(),
             title: "DKMS built against another kernel".to_owned(),
             score: 90,
@@ -590,6 +591,7 @@ mod tests {
         let rendered = render_report(
             "gpu-box",
             &report(vec![Diagnosis {
+                symptom_matched: false,
                 id: "annotated".to_owned(),
                 title: "a fix that explains itself".to_owned(),
                 score: 90,
@@ -630,6 +632,7 @@ mod tests {
         let rendered = render_report(
             "gpu-box",
             &report(vec![Diagnosis {
+                symptom_matched: false,
                 id: "container".to_owned(),
                 title: "container missing devices".to_owned(),
                 score: 90,
@@ -704,6 +707,7 @@ mod tests {
         let rendered = render_report(
             "gpu-box",
             &report(vec![Diagnosis {
+                symptom_matched: false,
                 id: "wheels".to_owned(),
                 title: "wrong wheels".to_owned(),
                 score: 90,
@@ -739,5 +743,47 @@ mod tests {
         // acting on it means fixing the wrong computer.
         let rendered = render_report("gpu-box", &report(vec![]), 5);
         assert!(rendered.starts_with("Health of gpu-box"), "{rendered}");
+    }
+
+    /// The note under a cause the symptom did not contribute to describes the
+    /// examined host, which here is the remote one, and it marks only that
+    /// cause.
+    #[test]
+    fn the_symptom_note_is_true_of_a_remote_host_and_marks_only_its_cause() {
+        use rocm_core::diagnose::{Diagnosis, SYMPTOM_DID_NOT_CONTRIBUTE_NOTE};
+        let row = |id: &str, score: i32, symptom_matched: bool| Diagnosis {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            score,
+            symptom_matched,
+            ..Diagnosis::default()
+        };
+        let rendered = render_report(
+            "gpu-box",
+            &report(vec![
+                row("fix-host-only", 60, false),
+                row("fix-from-the-paste", 55, true),
+            ]),
+            5,
+        );
+        let block = |id: &str| -> Vec<&str> {
+            let marker = format!("({id})");
+            rendered
+                .lines()
+                .skip_while(|l| !l.contains(&marker))
+                .take_while(|l| !l.trim().is_empty())
+                .collect()
+        };
+        let marked = |id: &str| {
+            block(id)
+                .iter()
+                .any(|l| l.trim() == SYMPTOM_DID_NOT_CONTRIBUTE_NOTE)
+        };
+        assert!(marked("fix-host-only"), "{rendered}");
+        assert!(!marked("fix-from-the-paste"), "{rendered}");
+        assert!(
+            !SYMPTOM_DID_NOT_CONTRIBUTE_NOTE.contains("this machine"),
+            "the note is printed about a remote host too, where `this machine` is the wrong one"
+        );
     }
 }

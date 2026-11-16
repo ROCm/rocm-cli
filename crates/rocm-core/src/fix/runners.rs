@@ -995,6 +995,13 @@ mod tests {
             code, 5,
             "a failed read was never offered a prompt to decline"
         );
+        // The published `failed` description names this case: a read of state
+        // the fix needed, failing even under `--dry-run`.
+        assert_eq!(
+            code,
+            exit::FAILED,
+            "a failed read must exit with the code published as `failed`"
+        );
     }
 
     /// A genuinely empty User PATH (the read succeeded and returned `""`,
@@ -1212,5 +1219,32 @@ mod tests {
 
         assert_eq!(code, 4, "a failed write must exit 4, not 0");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A negative `--device-index` written `--device-index=-1` parses (it is an
+    /// `i64`), so the argument parser does not reject it (written with a space,
+    /// `--device-index -1`, it does: that is a usage error, exit 2, pinned by
+    /// `a_negative_device_index_reaches_the_fix_only_when_written_with_equals` in
+    /// `apps/rocm/src/main.rs`), and the runner refuses it with the code
+    /// published as `not_applicable` before reading or changing anything. The
+    /// description says so; this is what holds it, on every host, since the
+    /// guard runs before the platform split.
+    ///
+    /// Driven under `--dry-run` without `--yes`, so that if the guard were ever
+    /// lost the runner would only preview, never write the user's environment
+    /// or rc file from a test. The guard sits before the dry-run check, so the
+    /// same code comes back with or without it.
+    #[test]
+    fn a_negative_device_index_is_not_applicable_and_nothing_runs() {
+        let opts = FixOptions {
+            yes: false,
+            dry_run: true,
+            device_index: Some(-1),
+        };
+        assert_eq!(
+            run_hip_visible_devices(&opts),
+            exit::NOT_APPLICABLE,
+            "a negative device index must exit with the code published as not_applicable"
+        );
     }
 }

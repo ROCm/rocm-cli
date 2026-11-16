@@ -531,6 +531,7 @@ mod tests {
         rocm_core::DiagnoseReport {
             has_match,
             matched: vec![rocm_core::Diagnosis {
+                symptom_matched: false,
                 id: id.to_owned(),
                 title: "under test".to_owned(),
                 score,
