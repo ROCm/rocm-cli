@@ -283,8 +283,27 @@ fn settle_pending_stop_key_cleanup(
     // so dropping the marker here ended the record `stopped` with both fields
     // unset, and the next read called the operator's own stop a crash
     // (ROCMAI-541's symptom, through the one path its fix did not touch).
-    let consumed_marker = record.stop_requested_unix_ms.take();
-    record.settled_stop_unix_ms = consumed_marker;
+    //
+    // Written as a guarded move rather than `= take()`, but — unlike the
+    // identical-looking line in
+    // `service_control::stop_internal_managed_service_confirmed_with`, where the
+    // guard is what closes a live race — this one cannot currently fire: the
+    // `stop_requested_unix_ms.is_none()` early return at the top of this
+    // function already means the marker is `Some` by the time control reaches
+    // here, so a second listing arriving after the first settled the stop
+    // returns above instead. The guard states that precondition locally and
+    // keeps the line correct if the early return is ever relaxed, which is the
+    // whole difference it makes; `= take()` would silently assign `None` over
+    // an already-settled timestamp the moment that happened, re-creating the
+    // both-fields-unset record this move exists to prevent.
+    //
+    // Pinned by `a_second_listing_does_not_clear_the_stop_a_first_one_settled`,
+    // which asserts the outcome (the settled stamp survives a second listing)
+    // rather than this line: it stays green if either protection is removed and
+    // goes red only when both are.
+    if let Some(consumed_marker) = record.stop_requested_unix_ms.take() {
+        record.settled_stop_unix_ms = Some(consumed_marker);
+    }
     // A record that named no process has no stop to complete: the key and the
     // stale marker go, as they always did, but it is not read as stopped. It may
     // be a launch that has not recorded its supervisor yet. The marker's value
@@ -1252,6 +1271,65 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+        Ok(())
+    }
+
+    /// ROCMAI-541 review: the *second* listing must not undo what the first
+    /// one settled.
+    ///
+    /// The test above starts from a marker that is still there, so it passes
+    /// whether the move is guarded or an unconditional
+    /// `settled_stop_unix_ms = stop_requested_unix_ms.take()`. This helper runs
+    /// on every `rocm services`/`rocm dash`/`rocmd` listing, so two of them
+    /// racing — or one racing the stop's own finalization — reach it with the
+    /// marker already consumed. `.take()` on a field that is already `None` is
+    /// `None`, and assigning that across wipes the timestamp the first listing
+    /// correctly wrote, leaving the record `stopped` with both fields unset:
+    /// indistinguishable from a crash a liveness refresh reconciled, which is
+    /// the state this move exists to prevent.
+    ///
+    /// Two separate things stop that today — `settle_pending_stop_key_cleanup`
+    /// returns early when the marker is already `None`, and its move is written
+    /// as a guarded `if let` — so this asserts the **outcome** rather than
+    /// either mechanism. It stays green if either one is removed on its own and
+    /// goes red when both are, which is the honest strength of it: the guard is
+    /// not independently falsifiable, because the early return makes it
+    /// unreachable. Said plainly here rather than implied, since the line it
+    /// backs reads exactly like the one in `service_control` that *does* close
+    /// a live race.
+    #[test]
+    fn a_second_listing_does_not_clear_the_stop_a_first_one_settled() -> Result<()> {
+        let (root, paths) = test_paths("liveness-pending-stop-resettle");
+        paths.ensure()?;
+        let mut record = pending_stop_record(&paths, "svc-status")?;
+
+        // The first listing: consumes the marker and settles the stamp.
+        assert!(refresh_managed_service_runtime_liveness_with(
+            &paths,
+            &mut record,
+            |_| ProcessProbe::Gone
+        ));
+        assert_eq!(record.stop_requested_unix_ms, None);
+        assert_eq!(record.settled_stop_unix_ms, Some(1));
+
+        // The second listing, over the record the first one left. It has no
+        // marker to move; it must leave the evidence standing rather than
+        // moving `None` over it. The status is put back to a live one so the
+        // helper is actually re-entered instead of short-circuiting.
+        "ready".clone_into(&mut record.status);
+        record.supervisor_pid = 999_999_999;
+        record.write()?;
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+
+        assert_eq!(
+            record.settled_stop_unix_ms,
+            Some(1),
+            "a stop already settled must survive the next listing, or the pair of \
+             them ends with the same both-fields-unset record a crash leaves"
+        );
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

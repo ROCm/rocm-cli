@@ -630,6 +630,15 @@ impl ManagedServiceRecord {
     /// launch as failed. A stop marker would not hold either, because the
     /// liveness refresh clears it as soon as the recorded PIDs are gone.
     /// `rocmd`'s `find_recoverable_service` ignores `stopped`.
+    ///
+    /// That reasoning covers an abandonment with **no recorded cause** — a
+    /// publication failure, a cleanup after a guard refused — which is all this
+    /// is for. It is not a licence to overwrite a verdict already on disk: the
+    /// CLI's caller (`service_launch::launch_transaction::abandon_launch_record`)
+    /// applies this only to a record that still reads [`Self::is_live`], so a
+    /// launch whose child crashed keeps the `failed` its crash path recorded in
+    /// the manifest *and* the engine state file instead of being talked back
+    /// into a clean stop that only one of the two files would believe.
     pub fn mark_launch_abandoned(&mut self) {
         self.status = "stopped".to_owned();
     }

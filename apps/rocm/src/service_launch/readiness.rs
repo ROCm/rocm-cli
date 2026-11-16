@@ -104,11 +104,23 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
 /// `--wait` message used to read "the server exited before it became ready"
 /// even for a `rocm services stop` issued from another shell, which is a true
 /// sentence told in a way that reads as a failure.
+///
+/// The verdict is read off the *same* snapshot that gets stamped below, through
+/// [`record_shows_stop_was_requested`] rather than a second
+/// [`managed_service_stop_was_requested`] call. It used to be its own
+/// independent file read, taken a line before this one: a stop landing in the
+/// gap pinned `deliberate` to `false` from the stale first read while the
+/// second could already show the record live, and the two together stamped
+/// `failed` on a death that had in fact just been asked for. One read cannot
+/// disagree with itself.
 fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
-    let deliberate = managed_service_stop_was_requested(paths, service_id);
     let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
-        return deliberate;
+        // No snapshot to judge from and nothing to stamp. The standalone read
+        // is sound *here* precisely because this branch writes nothing, so
+        // there is no second read for it to contradict.
+        return managed_service_stop_was_requested(paths, service_id);
     };
+    let deliberate = record_shows_stop_was_requested(&latest);
     let on_disk = latest.status.clone();
     let _ = latest.refresh_from_engine_state();
     if crate::managed_service_status::managed_service_is_live(&latest) {
@@ -497,11 +509,22 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// [`StopWatch`] still narrows the live window for a stop that is requested and
 /// confirmed entirely between two polls.
 pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &str) -> bool {
-    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
-        |(record, _)| {
-            record.stop_requested_unix_ms.is_some() || record.settled_stop_unix_ms.is_some()
-        },
-    )
+    crate::services_text::read_managed_service_manifest(paths, service_id)
+        .is_ok_and(|(record, _)| record_shows_stop_was_requested(&record))
+}
+
+/// The predicate [`managed_service_stop_was_requested`] is made of, over a
+/// record a caller already holds — see that function for why these two fields
+/// and not the status are the evidence.
+///
+/// Split out, rather than spelled a second time at the one call site that has
+/// its snapshot in hand ([`settle_exited_service`]), so the two cannot drift:
+/// the whole point of `settled_stop_unix_ms` is that it answers where the
+/// short-lived `stop_requested_unix_ms` has already been consumed, and a call
+/// site that re-tested only the marker would silently lose exactly that half
+/// while still reading as if it asked the shared question.
+pub(crate) const fn record_shows_stop_was_requested(record: &ManagedServiceRecord) -> bool {
+    record.stop_requested_unix_ms.is_some() || record.settled_stop_unix_ms.is_some()
 }
 
 /// The marker half of [`managed_service_stop_was_requested`], without its
@@ -527,26 +550,37 @@ pub(crate) fn managed_service_stop_marker_present(paths: &AppPaths, service_id: 
 /// Latches an operator-requested stop seen at any point while a managed child
 /// is being watched.
 ///
-/// `stop_requested_unix_ms` is the only sound evidence that an exit was
-/// intentional (see [`managed_service_stop_was_requested`] for why the record's
-/// status is not), but it is deliberately short-lived:
+/// `stop_requested_unix_ms` is a stop's *live* evidence (see
+/// [`managed_service_stop_was_requested`] for why the record's status is no
+/// evidence at all), but it is deliberately short-lived:
 /// `stop_internal_managed_service_confirmed_with` writes it before it signals
-/// anything and clears it again once the stop is confirmed. A watcher that only
-/// reads it *after* noticing the child is gone can therefore arrive after the
-/// marker has been cleared, and report a deliberate stop as a crash.
+/// anything and takes it away again once the stop is confirmed. A watcher that
+/// only reads it *after* noticing the child is gone can therefore arrive after
+/// the marker is gone, and report a deliberate stop as a crash.
 ///
 /// Sampling on every liveness poll catches any stop that was still in flight
 /// while the child was being watched — in particular an *unconfirmed* stop,
-/// which re-stamps the marker and leaves the status alone, so
-/// [`managed_service_stop_was_requested`]'s status term would not fire for it
-/// either.
+/// which re-stamps the marker and deliberately leaves the status at
+/// `ready`/`running`, since that stop did not happen and must not be claimed.
 ///
 /// It is a narrowing, not a closure: a stop that is requested, signals, and
-/// confirms entirely inside one poll interval clears its marker before the next
-/// sample, so the latch misses it. That case is caught by the status term in
-/// [`managed_service_stop_was_requested`] — see the residual race documented
-/// there. A crash never writes the marker, so the latch cannot produce a false
-/// "stopped" of its own.
+/// confirms entirely inside one poll interval takes its marker away before the
+/// next sample, so the latch misses it. What catches that case is not this
+/// latch and not the record's status, but the fact that a confirmed stop
+/// *moves* its marker into [`ManagedServiceRecord::settled_stop_unix_ms`]
+/// rather than dropping it — so the one-shot
+/// [`managed_service_stop_was_requested`] at the end of a wait still finds the
+/// evidence through its second term. (An earlier version of this comment
+/// credited a `status == "stopped"` term in that predicate. There is no such
+/// term; removing it as unsound is what this change is for, and making the
+/// stop's own evidence durable is what replaced it.)
+///
+/// The residual gap is now narrow and named: `reset_for_restart` clears both
+/// fields, on purpose, so a stop settled before a relaunch cannot mask a crash
+/// after it — which also means a stop whose record is reset for relaunch
+/// between the stop and the end of the wait leaves nothing for either check to
+/// find. A crash never writes either field, so neither this latch nor that
+/// predicate can produce a false "stopped" of its own.
 #[derive(Default)]
 pub(crate) struct StopWatch {
     seen: bool,
@@ -558,14 +592,25 @@ impl StopWatch {
     /// once latched.
     pub(crate) fn sample(&mut self, paths: &AppPaths, service_id: &str) {
         if !self.seen {
-            // The MARKER alone, never `managed_service_stop_was_requested`: its
-            // `status == "stopped"` term is what liveness reconciliation
-            // (`rocmd`, `dash`, `rocm services`) writes for a *crashed* server,
-            // so latching on it would turn a crash reconciled mid-wait into a
-            // clean stop and exit 0 — the original bug. The marker is only ever
-            // written by a stop, which is what makes this latch sound and the
-            // type's doc above true. The status term still backs the one-shot
-            // check at the end of a wait, where no latch is available.
+            // The MARKER alone, never `managed_service_stop_was_requested`.
+            // Historically that was because the predicate also accepted
+            // `status == "stopped"`, which liveness reconciliation (`rocmd`,
+            // `dash`, `rocm services`) writes for a *crashed* server, so
+            // latching on it turned a crash reconciled mid-wait into a clean
+            // stop and exit 0 — the original bug. That term is gone, and the
+            // narrower reason it leaves behind still holds: this samples
+            // repeatedly and latches forever, so it may only fire on evidence
+            // written *during* the watch. `stop_requested_unix_ms` is exactly
+            // that — short-lived, and taken away again the moment a stop
+            // confirms. `settled_stop_unix_ms` is durable on purpose and can
+            // outlive the stop that wrote it, so latching on it could report a
+            // death as asked-for on the strength of an earlier stop.
+            //
+            // The one-shot check at the end of a wait does take the durable
+            // field, because it has no second chance to see a marker already
+            // consumed; it accepts the mirror-image exposure in exchange, held
+            // down by `reset_for_restart` clearing both fields on every
+            // relaunch.
             self.seen = managed_service_stop_marker_present(paths, service_id);
         }
     }
@@ -1415,6 +1460,57 @@ mod tests {
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// ROCMAI-541 review: `settle_exited_service`'s verdict and the record it
+    /// stamps now come from one snapshot, asked through the same predicate
+    /// [`managed_service_stop_was_requested`] uses.
+    ///
+    /// The case that pins it is a stop whose *marker* has already been consumed
+    /// — a concurrent `rocm services`/`dash` listing saw the signalled PIDs gone
+    /// first and moved `stop_requested_unix_ms` into `settled_stop_unix_ms`,
+    /// which is the whole reason that durable field exists. A call site that
+    /// re-spelled the test inline as "the marker is set" would find nothing and
+    /// stamp `failed` on a death the operator asked for, while still reading as
+    /// though it asked the shared question. Deleting either term of
+    /// `record_shows_stop_was_requested` fails one of these two arms.
+    ///
+    /// What this does **not** cover is the interleaving itself. The defect was
+    /// two independent reads with a stop landing between them; the fix is that
+    /// there is now only one read, which is a structural property, not one a
+    /// single-threaded test can falsify. No read-injection seam exists here to
+    /// drive it, and none is added for this.
+    #[test]
+    fn a_wait_death_is_deliberate_on_either_half_of_the_stop_evidence() {
+        for consumed_by_a_listing in [false, true] {
+            let (root, paths) =
+                test_paths(&format!("wait-settle-evidence-{consumed_by_a_listing}"));
+            paths.ensure().expect("paths");
+            let mut record = record_tracking_pid(&paths, 0, "starting");
+            if consumed_by_a_listing {
+                record.stop_requested_unix_ms = None;
+                record.settled_stop_unix_ms = Some(7);
+            } else {
+                record.stop_requested_unix_ms = Some(7);
+                record.settled_stop_unix_ms = None;
+            }
+            record.write().expect("write");
+
+            let deliberate = settle_exited_service(&paths, &record.service_id);
+            let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+
+            assert!(
+                deliberate,
+                "a stop is a stop whether or not a listing has already settled \
+                 its marker (consumed={consumed_by_a_listing})"
+            );
+            assert_eq!(
+                after.status, "stopped",
+                "and the record it stamps must agree with that verdict, not \
+                 call the operator's own stop a crash (consumed={consumed_by_a_listing})"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

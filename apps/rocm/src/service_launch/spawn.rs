@@ -842,6 +842,106 @@ mod tests {
         Ok(())
     }
 
+    /// ROCMAI-541 review: the `failed` a startup-window crash records has to
+    /// still be there once the launch transaction's own cleanup has run.
+    ///
+    /// The test above calls [`settle_startup_death`] directly, so it stops one
+    /// frame short of where the damage was. `settle_startup_death` merges
+    /// `failed` into the manifest and the engine state file and returns
+    /// `Crash`, the branch bails, and
+    /// [`spawn_managed_engine_child`]'s `Err` arm then hands
+    /// `abandon_failed_managed_launch` the in-memory `record` captured *before*
+    /// the spawn — still `starting`. Marking that copy abandoned and writing
+    /// the whole file put `stopped` back over the `failed`, while the engine
+    /// state file kept it, and `refresh_from_engine_state` will not re-read an
+    /// engine state file behind a `stopped` manifest, so the two never agree
+    /// again. Every helper-level test passed throughout.
+    ///
+    /// So this drives a child that exits immediately through the whole call and
+    /// asserts the **final** on-disk state, which is the only place the clobber
+    /// was visible. Both files are asserted together: the bug was precisely
+    /// that they disagreed, so checking either alone would have missed it.
+    /// Deleting the `is_live()` guard in `abandon_launch_record` turns this
+    /// red (it reads `stopped`) and leaves the rest of the suite green.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_startup_window_crash_stays_failed_after_the_launch_cleanup() -> Result<()> {
+        let (root, paths) = test_paths("startup-crash-survives-cleanup");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let service_id = "lemonade-startup-crash-cleanup";
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        // A child that really is spawned and really is gone again before the
+        // post-spawn window elapses — the production shape of the defect, and
+        // the reason the record reaches the `Err` arm with `engine_pid` set.
+        TEST_SPAWN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(std::rc::Rc::new(|_command| {
+                ProcessCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg("exit 3")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            }));
+        });
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            service_id,
+            "qwen",
+            &resolve,
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Auto,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        TEST_SPAWN_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        let error = result.err().expect("a child that exited fails the launch");
+        let manifest = ManagedServiceRecord::read_manifest(&paths, service_id)
+            .expect("the crashed launch keeps its record for `rocm services`/`rocm logs`");
+        let engine_state = fs::read_to_string(&manifest.engine_state_path).unwrap_or_default();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            manifest.status, "failed",
+            "the cleanup must not overwrite the crash it is cleaning up after: {error:#}"
+        );
+        assert!(
+            engine_state.contains("\"failed\""),
+            "and the engine state file ROCMAI-541 names must still agree with it: {engine_state}"
+        );
+        assert!(
+            !manifest.is_live(),
+            "a failed launch must stop reserving its port, which is what the \
+             `stopped` overwrite was there to guarantee"
+        );
+        Ok(())
+    }
+
     #[test]
     fn spawn_managed_engine_child_refuses_an_explicit_port_a_live_equivalent_does_not_serve()
     -> Result<()> {
@@ -1323,13 +1423,35 @@ mod tests {
         );
         let persisted =
             persisted.expect("a post-spawn failure must leave the record on disk, not delete it");
-        // `stopped`, not `failed`: rocmd's recovery restarts a `failed` record
-        // without a stop marker, which would respawn a launch the CLI just
-        // reported as failed (pinned on the rocmd side by
-        // `abandoned_launch_record_is_not_a_recovery_candidate`).
+        // `failed`, and this assertion used to read `stopped`.
+        //
+        // The child here *crashed*, so `settle_startup_death` has already
+        // merged `failed` into the manifest and the engine state file by the
+        // time cleanup runs. Overwriting the manifest with `stopped` and
+        // leaving the engine state file alone made the record disagree with
+        // itself permanently — `refresh_from_engine_state` will not re-read an
+        // engine state file behind a `stopped` manifest — and reported a crash
+        // to the user as a clean stop, which is the defect this whole change
+        // exists to close. The two sibling entry points already settled a crash
+        // this way (`readiness::settle_exited_service`,
+        // `service_control::settle_restart_startup_death` both leave `failed`
+        // standing); the fresh-launch path was the only one downgrading it.
+        //
+        // The property the old `stopped` was really protecting — that an
+        // abandoned launch stops reserving its port — is unaffected and still
+        // asserted below: `is_live()` accepts neither status.
+        //
+        // The consequence deliberately taken on: `rocmd`'s recovery scan treats
+        // a `failed` managed record with no stop marker as a candidate
+        // (`manifest_service_recovery_reason`), so it may now respawn a launch
+        // the CLI reported as failed. That was already true of a crash on the
+        // restart and `--wait` paths, so this makes the entry points agree
+        // rather than adding a new exposure; whether recovery *should* retry a
+        // launch that never reached readiness is the open question this PR's
+        // own "Known limitations" already records, and it is not decided here.
         assert_eq!(
-            persisted.status, "stopped",
-            "a post-spawn failure must mark the record abandoned, not leave it stuck"
+            persisted.status, "failed",
+            "a crashed launch must keep the reason its own crash path recorded"
         );
         assert_eq!(
             key, None,

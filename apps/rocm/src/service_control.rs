@@ -267,7 +267,22 @@ fn stop_internal_managed_service_confirmed_with(
         // `settled_stop_unix_ms` already exists for the sibling case (a marker
         // consumed by the refresh) and is already cleared by `reset_for_restart`,
         // so a stop settled before a relaunch cannot mask a later crash.
-        record.settled_stop_unix_ms = record.stop_requested_unix_ms.take();
+        //
+        // Guarded, not an unconditional `= take()`: `record` was re-read from
+        // disk just above, and the refresh this comment names
+        // (`refresh_managed_service_runtime_liveness`, which any concurrent
+        // `rocm services`/`rocm dash`/`rocmd` read runs) performs this very same
+        // move as soon as it observes the signalled PIDs gone. Landing first, it
+        // leaves `stop_requested_unix_ms` already `None` here — and `.take()` on
+        // `None` is `None`, which assigned straight across would erase the
+        // timestamp that refresh had just correctly written. Both fields would
+        // end unset, leaving `status: "stopped"` as the only trace: the exact
+        // crash-indistinguishable-from-a-stop state this field exists to
+        // prevent, produced by the stop path's own confirmation step. A value
+        // already settled is therefore left alone — it says the same thing.
+        if let Some(requested) = record.stop_requested_unix_ms.take() {
+            record.settled_stop_unix_ms = Some(requested);
+        }
         // The processes this stop confirmed gone are not the service's any more,
         // and their PIDs are stale the instant they exited. Left in the record,
         // a later stop would signal them again: a PID recorded without a
@@ -1402,6 +1417,20 @@ mod tests {
                 on_disk.stop_requested_unix_ms, None,
                 "{status}: a confirmed stop does not put the marker back"
             );
+            // The listing above already *moved* this stop's marker into
+            // `settled_stop_unix_ms`. The finalization below re-reads the record
+            // and must not undo that: moving a marker that is no longer there
+            // assigns `None` over the timestamp the listing wrote, and the
+            // record ends with both fields unset — `status: "stopped"` and
+            // nothing else, which is exactly what a crash reconciled by a
+            // liveness refresh also looks like. That is the misreading this
+            // whole change exists to close, reached through the stop path's own
+            // confirmation step.
+            assert!(
+                on_disk.settled_stop_unix_ms.is_some(),
+                "{status}: finalizing a stop a listing already settled must keep \
+                 the evidence, not clear it"
+            );
             assert_eq!(on_disk.supervisor_pid, 0, "{status}");
             assert_eq!(key, None, "{status}: the key goes with the confirmed stop");
         }
@@ -1685,6 +1714,11 @@ mod tests {
         assert_eq!(report["status"], "stopped", "{report}");
         assert_eq!(on_disk.status, "stopped");
         assert_eq!(on_disk.stop_requested_unix_ms, None);
+        assert!(
+            on_disk.settled_stop_unix_ms.is_some(),
+            "the marker is moved, not dropped: the stop's own evidence has to \
+             survive its final write, or the next read calls this a crash"
+        );
         assert_eq!(on_disk.restart_count, 7, "a concurrent write survives");
         assert_eq!(key, None, "a confirmed stop drops the key");
     }
@@ -2007,6 +2041,11 @@ mod tests {
         assert!(rendered.contains("stopped processes: 1"), "{rendered}");
         assert_eq!(on_disk.status, "stopped");
         assert_eq!(on_disk.stop_requested_unix_ms, None);
+        assert!(
+            on_disk.settled_stop_unix_ms.is_some(),
+            "a confirmed stop moves its marker into the durable field; dropping it \
+             leaves `status: stopped` as the only trace, which a crash also writes"
+        );
         assert_eq!(key, None, "a confirmed stop drops the key");
     }
 
@@ -2061,6 +2100,10 @@ mod tests {
         // The persisted state after the confirmed stop names no process.
         assert_eq!(after_first.status, "stopped");
         assert_eq!(after_first.stop_requested_unix_ms, None);
+        assert!(
+            after_first.settled_stop_unix_ms.is_some(),
+            "the marker moves into the durable field rather than being dropped"
+        );
         assert_eq!(after_first.supervisor_pid, 0);
         assert_eq!(after_first.supervisor_start_ticks, None);
         assert_eq!(after_first.engine_pid, None);

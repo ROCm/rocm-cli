@@ -133,14 +133,20 @@ const fn launch_cleanup_refusal(
 ///
 /// Order matters: a spawned child is terminated *first*, so it is not still
 /// holding the port or writing to the log by the time cleanup runs. The
-/// termination outcome is audited but not acted on: the record is marked
-/// abandoned (`stopped`, releasing the port) even when death was not confirmed. If no child was ever spawned (`record.engine_pid` is still `None`),
-/// every artifact this attempt created is removed: there is nothing for
-/// `rocm services`/`rocm logs` to show. If a child did run, its record and log
-/// are kept instead (marked `status = "stopped"`, see
-/// [`ManagedServiceRecord::mark_launch_abandoned`]), since the error that led here
+/// termination outcome is audited but not acted on: the record stops reserving
+/// the port even when death was not confirmed. If no child was ever spawned
+/// (`record.engine_pid` is still `None`), every artifact this attempt created is
+/// removed: there is nothing for `rocm services`/`rocm logs` to show. If a child
+/// did run, its record and log are kept instead, since the error that led here
 /// already told the user to go inspect that log; only the endpoint key, which a
 /// failed attempt has no use for, is cleared.
+///
+/// The status that record ends on is [`abandon_launch_record`]'s decision, not
+/// an unconditional [`ManagedServiceRecord::mark_launch_abandoned`]: a launch
+/// whose child *crashed* has already had `failed` recorded by the path that
+/// observed it, and overwriting that with `stopped` is what made the record
+/// disagree with its own engine state file permanently. See that function.
+///
 /// Every step is best-effort and idempotent; cleanup must never mask the
 /// original failure with a second one.
 pub(super) fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
@@ -204,9 +210,7 @@ fn abandon_failed_managed_launch_with(
             ),
             Some(&record.service_id),
         );
-        let mut abandoned = record.clone();
-        abandoned.mark_launch_abandoned();
-        let _ = abandoned.write();
+        abandon_launch_record(paths, record);
         endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
         return;
     }
@@ -218,6 +222,57 @@ fn abandon_failed_managed_launch_with(
         let _ = fs::remove_file(path);
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+}
+
+/// End a launch on the manifest **as it reads on disk now**, instead of writing
+/// back the in-memory copy this transaction has carried since before the spawn.
+///
+/// `record` is the launch's own snapshot, taken before the child existed: its
+/// status is still `starting`, and it predates everything the failure itself
+/// wrote. The crash paths above (`spawn`'s `settle_startup_death`,
+/// `readiness`'s `finalize_managed_launch_readiness`) merge `failed` into *both*
+/// the manifest and the engine state file and then return `Err`, which lands
+/// here — so cloning that stale snapshot, calling
+/// [`ManagedServiceRecord::mark_launch_abandoned`] and writing the whole file
+/// put `stopped` back over the `failed` recorded moments earlier, while the
+/// engine state file this cleanup does not touch kept `failed`. Nothing
+/// reconciles that pair afterwards: `refresh_from_engine_state` only re-reads
+/// the engine state file while the manifest says `starting`/`running`/
+/// `recovering`/`ready`, and `stopped` is none of them. A crash in the startup
+/// window therefore reported itself as a clean stop for good — ROCMAI-541's own
+/// symptom, re-entering through the cleanup of the very path whose fix records
+/// it.
+///
+/// So the verdict is applied to a fresh read, and a record that already reads
+/// *not live* keeps the status it has: whoever wrote it saw the death this
+/// cleanup is only reacting to, and `failed` releases the port just as
+/// `stopped` does ([`ManagedServiceRecord::is_live`] accepts neither).
+/// `mark_launch_abandoned`'s `stopped` still applies to every other
+/// abandonment — a publication failure, a cleanup with no recorded cause —
+/// where its own reason holds: nothing has said why, so `rocmd`'s recovery scan
+/// must not respawn what the CLI has just told the user failed to launch.
+///
+/// This is the fresh-launch counterpart of the restart path's
+/// `service_control::update_restarting_record`, deliberately merged rather than
+/// CAS'd. A CAS declines to write at all when the record no longer reads as its
+/// caller left it, which is right for a restart that can give up its turn, and
+/// wrong here: this is the last write of a failed transaction, and declining
+/// would strand the record at `starting` — still `is_live()`, so still
+/// reserving its port against every later launch, with nothing left to clear it
+/// but `rocmd`'s stale-record timeout. Merging the verdict releases the port
+/// unconditionally while leaving a recorded cause — and any marker a concurrent
+/// `rocm services stop` wrote in this window — alone.
+fn abandon_launch_record(paths: &AppPaths, record: &ManagedServiceRecord) {
+    // The in-memory snapshot is the fallback, not the source: when the manifest
+    // cannot be read there is no truer view to defer to, and a launch that is
+    // over must still stop reserving its port. Best-effort throughout, like
+    // every other step of this cleanup.
+    let mut current = ManagedServiceRecord::read_manifest(paths, &record.service_id)
+        .unwrap_or_else(|_| record.clone());
+    if current.is_live() {
+        current.mark_launch_abandoned();
+    }
+    let _ = current.write();
 }
 
 /// The ways a live managed service that already matches on liveness, engine and
