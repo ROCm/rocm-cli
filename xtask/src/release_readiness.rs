@@ -400,6 +400,16 @@ fn excerpt(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// The reason the matrix gives for having no queue lanes, if it says so
+/// (`e2e_queue_import::render_absent`).
+fn queue_absent_reason(markdown: &str) -> Option<String> {
+    use crate::e2e_queue_import::{ABSENT_LEAD, ABSENT_TAIL};
+    markdown.lines().find_map(|line| {
+        let rest = line.strip_prefix(ABSENT_LEAD)?;
+        Some(rest.strip_suffix(ABSENT_TAIL).unwrap_or(rest).to_string())
+    })
+}
+
 /// Sum of the `Fail` column across the consolidated E2E markdown's `**Total**`
 /// row (`crates/e2e-report`'s `consolidated_summary_markdown` format: `|
 /// Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |`), plus one
@@ -422,16 +432,6 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 /// Parsing the already-rendered rows, rather than re-deriving per-platform
 /// pass/fail here, keeps this in lockstep with that crate's known-bugs/xfail
 /// handling instead of duplicating it.
-/// The reason the matrix gives for having no queue lanes, if it says so
-/// (`e2e_queue_import::render_absent`).
-fn queue_absent_reason(markdown: &str) -> Option<String> {
-    use crate::e2e_queue_import::{ABSENT_LEAD, ABSENT_TAIL};
-    markdown.lines().find_map(|line| {
-        let rest = line.strip_prefix(ABSENT_LEAD)?;
-        Some(rest.strip_suffix(ABSENT_TAIL).unwrap_or(rest).to_string())
-    })
-}
-
 fn total_e2e_failures(markdown: &str) -> Option<u64> {
     // Scope strictly to the summary table's own row range — the document
     // keeps going after it with an expectation grid and a command-coverage

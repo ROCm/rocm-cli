@@ -51,7 +51,7 @@ pool: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
 the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu lane (`e2e-gpu-strix-ubuntu`) no longer starts on `pull_request` or in
 the merge queue; it keeps its `push`/dispatch triggers and also runs nightly
-(`e2e-gpu-nightly-strix` on the same DevLab Dispatch pool labels). There is no
+(`e2e-gpu-nightly-strix` on the same shared Strix pool labels). There is no
 W7900 lane in `e2e-selfhosted.yml` any more: W7900 is covered only by the
 scheduled queue nightly's `w7900-dual` lane (see
 [nightly-on-the-queue.md](nightly-on-the-queue.md)), not on `push`, `release/**`
@@ -451,7 +451,6 @@ combinations on that lane: the `nightly` channel is excluded from `n-1`/`n-2`,
 because it only carries the latest (pre-)release builds and cannot resolve the
 pinned released versions (`rocm install sdk` fails with "no mutually compatible
 TheRock ... versions"); those versions are covered by the `release` channel.
-
 
 `serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the

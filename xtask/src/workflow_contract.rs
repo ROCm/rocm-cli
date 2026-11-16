@@ -4450,8 +4450,12 @@ fi
             "--name queue-run-results",
             // A run that started a day ago is not tonight's, whenever it ended.
             "[ \"$started_at\" -ge \"$(date -u -d '24 hours ago' +%s)\" ]",
-            // The log says which branch the run tested and which lanes block.
-            "/logs\" > queue-results/job.log",
+            // Only a finished run: a run still going has a partial log.
+            "[ \"${run_info%%$'\\t'*}\" = \"completed\" ]",
+            // The log says which branch the run tested and which lanes block;
+            // the run may have several jobs, so every one is scanned.
+            "actions/runs/${candidate}/jobs?per_page=100",
+            "/logs\" > queue-results/job.log.part",
         ] {
             assert!(
                 fetch.contains(needed),
