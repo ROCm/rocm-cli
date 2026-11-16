@@ -884,6 +884,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_id: "vllm-1".into(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },

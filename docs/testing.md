@@ -686,6 +686,193 @@ behaviour wanted, so un-ignoring it is the fix's acceptance test.
 A gap in user-observable CLI behaviour that an e2e scenario covers is tracked
 with an xfail row in `tests/e2e-cucumber/expectations.toml` instead.
 
+## Lemonade serving and dashboard regressions
+
+The real GPU scenarios `serve-lemonade-inference` and
+`serve-hf-checkpoint-inference` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
+start Lemonade, request inference, and verify the model identity. The named-model
+case uses `Qwen3-0.6B-GGUF`; the checkpoint case uses
+`unsloth/Qwen3-0.6B-GGUF:Q4_0`. Both require a usable AMD GPU. Unit tests cover
+registered-name catalog resolution, conservative routing of multi-file and
+model-specific catalog entries, routing of a registered checkpoint that is not
+a plain `owner/repo:variant` (for example, variant `*`) to the router,
+quantization matching, and selection of the
+runtime's GPU backend when competing backend directories exist. Engine tests also
+verify persisted router identity through the health inference request; direct
+servers retain the exact requested alias.
+
+`serve-lemonade-complex-registered-inference` covers the pinned catalog's
+`Qwen3.5-0.8B-GGUF` entry, which also needs a projector file. It verifies router
+state, real inference for that model, and stopping the scenario-owned managed
+service on its isolated port. The `@requires-gpu` and
+`@requires-engine:lemonade` tags require a usable AMD GPU on a Lemonade lane.
+Its `@nightly` tag also requires `E2E_INCLUDE_NIGHTLY=1`, or the self-hosted
+workflow's `include_nightly` dispatch input. A runtime channel named `nightly`
+does not enable these scenarios by itself.
+
+`serve-lemonade-simple-registered-direct-route` is the Linux counterpart for a
+simple registered entry (`Qwen3-0.6B-GGUF`: one checkpoint with a variant, no extra
+files). It reads the engine state and asserts that `load_response.method` is
+`lemonade-packaged-llama-server` and that the `llama-server` that served belongs to
+the backend Lemonade selected (a stale directory of the other backend serving in its
+place fails it), so a change of route is caught even when the endpoint still answers. It also runs
+inference and stops the scenario-owned service. It needs a usable AMD GPU on a
+Lemonade Linux lane (`@requires-gpu`, `@requires-os:linux`,
+`@requires-engine:lemonade`). It has no flaky expectations row, so a route
+regression fails the lane. Of the other direct-route serves, `serve-07` keeps its
+flaky Linux row; `serve-08` has none, so it fails the lane too.
+
+The daemon's Lemonade contracts in
+[telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
+hold observation time during singleton-to-multiple-model transitions. The first
+multi-model snapshot must clear both the rate and its observation metadata;
+natural expiry cannot satisfy that assertion. Independent endpoints must overlap
+while each endpoint checks health before fetching stats. Health failures include
+endpoint context, and an unavailable external endpoint removes its rows without
+a grace period. A never-seen endpoint remains quiet when nothing answers,
+which means a refused connection or a timeout (Windows hangs on a closed local
+port instead of refusing). A never-seen endpoint that answers with an error
+status or a broken body warns.
+
+The dashboard scenarios in
+[dash.feature](../tests/e2e-cucumber/features/dash.feature) include:
+
+- `dash-lemonade-external-protocol-discovery`: a Lemonade protocol fixture on an
+  isolated non-default port, with multiple loaded models and no managed records.
+  The real CLI, embedded daemon, and TUI must discover it, show unknown
+  throughput for each model, report installation truthfully, and exclude it from
+  Services lifecycle targets. Pressing stop and restart must leave no approval
+  prompt and start no job, and the models stay displayed. Twice, after those
+  keys and after dashboard quit, one step asserts that no managed record exists
+  and that the fixture saw no request other than a `GET` of its health or stats
+  route. The fixture is an in-process thread, so the dashboard cannot stop it;
+  the request log is what catches a load, unload, or stop sent to the external
+  server.
+- `dash-lemonade-external-protocol-transitions`: loaded-model changes and endpoint
+  unavailability must update the dashboard, rather than retain false serving
+  claims. One remaining model shows its throughput, an empty or unreachable
+  server shows no models, and a reload restores both.
+- `dash-lemonade-managed-inference-journey`: a GPU-gated real Lemonade serve and
+  inference followed by dashboard observation. On Linux Lemonade hosts it is
+  expected to be flaky and its serve is bounded by `serve_timeout_secs` (readiness polling; the CLI process is killed only 300 s after that) in
+  [expectations.toml](../tests/e2e-cucumber/expectations.toml). The model must
+  appear as a full row in Observe, and its instance detail must show it READY
+  on the port it was served on. This is real engine acceptance;
+  the protocol fixtures do not prove GPU inference or engine installation.
+  The flaky row matches every lane that can run this scenario, so the whole
+  journey is advisory: its dashboard, instance detail, and post-quit inference
+  checks cannot block a merge. Only the serve step is intermittent, but
+  expectations apply per scenario. It also does not gate the
+  "Lemonade — managed runtime installed" wording.
+  Unit tests gate that wording instead:
+  `managed_installed_verdict_follows_detect_result` in
+  [dash.rs](../apps/rocm/src/dash.rs), and the engine pane glyph and verdict
+  tests in [pane.rs](../crates/rocm-dash-tui/src/ui/tabs/pane.rs). No other
+  scenario shows the installed state through a real Detect without a serve.
+  `dash-lemonade-external-protocol-discovery` and
+  `dash-lemonade-external-protocol-transitions` show only the not-installed
+  state.
+
+`dash-07` also covers the positive half of the ownership rule. With a live
+managed service, the Services overlay lists it with its port, and the stop key
+stages an approval prompt that names it. The scenario declines the prompt, so
+nothing is stopped.
+
+The isolated dashboard scenarios turn Lemonade discovery off unless a scenario
+sets it, so a Lemonade server running on the default port of a self-hosted
+runner cannot add rows or warnings. The two external protocol scenarios turn it
+on with their own host and port. None of them exercises the unset-key default,
+which a unit test in `apps/rocm` covers.
+
+`runtime-lemonade-backend-alignment-reported` tests the advice the direct
+serving error gives for a missing `llama-server`, `rocm engines install lemonade
+--reinstall`. It installs Lemonade, deletes the selected backend's `llama-server`
+(asserting it was there and is gone), reinstalls, and requires the file to be
+back. It needs a GPU and a real backend download, and it is tagged
+`@requires-os:windows` and `@nightly`, so it runs only on the Windows nightly GPU
+lane. The Linux direct route, where the direct serving error mostly fires, is not
+exercised by it. Only the selected backend's binary is deleted; a general
+damaged-runtime repair is not tested.
+
+`dash-lemonade-external-protocol-transitions` also requires the `last req tok/s`
+legend next to the single remaining model's rate. The Instances table and detail
+labels are covered by `table_labels_a_last_request_rate_and_only_then` in
+[instances.rs](../crates/rocm-dash-tui/src/ui/tabs/instances.rs) and
+`detail_names_a_last_request_rate` in
+[instance_detail.rs](../crates/rocm-dash-tui/src/ui/instance_detail.rs). That such a rate
+is not counted as live throughput is covered by unit tests:
+`node_efficiency_leaves_out_a_last_request_rate` in
+[efficiency.rs](../crates/rocm-dash-core/src/efficiency.rs),
+`home_heroes_leave_out_a_last_request_rate` in
+[home.rs](../crates/rocm-dash-tui/src/ui/tabs/home.rs),
+`observe_heroes_leave_out_a_last_request_rate` in
+[observe.rs](../crates/rocm-dash-tui/src/ui/tabs/observe.rs) and
+`instance_tools_carry_the_last_request_flag` in
+[snapshot.rs](../crates/rocm-dash-tui/src/agent/snapshot.rs).
+The daemon's two IPv6 contract tests in
+[telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs) fail
+when the machine cannot bind an IPv6 loopback address, since they are the only cover
+for the `::` to `::1` mapping; set `ROCM_TEST_NO_IPV6=1` on a machine that has none,
+and they report that they did not run.
+
+A direct llama-server serve on a non-ROCm GPU backend logs that Lemonade is
+serving on it only after the server is ready. `a_direct_serve_that_never_becomes_ready_does_not_log_that_it_is_serving`
+and the `NotReady` case of `direct_server_step_failure_stops_the_child_and_marks_state_failed`
+in [direct_llama.rs](../engines/lemonade/src/direct_llama.rs) assert the log and the failed
+state together; both are Linux-only unit tests.
+
+A known external Lemonade endpoint that starts answering 401 or 403 on a
+scrape-only tick is reported on that tick, not at the next discovery tick
+(`lemonade_scrape_only_tick_warns_when_a_known_external_endpoint_requires_credentials`
+in [telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)).
+
+Resolving a split (sharded) GGUF to its first shard, and preferring a complete set
+over an older partial download, have no Gherkin scenario. They need a real
+multi-shard checkpoint (several GiB) or a staged Lemonade runtime that the harness
+cannot fabricate. The unit tests in
+[direct_llama.rs](../engines/lemonade/src/direct_llama.rs) cover them
+(`parse_gguf_shard`, `first_shard_of_complete_set`, `is_incomplete_shard_set`).
+
+The Linux fallback from a failed Lemonade router load to direct serving has no
+Gherkin scenario: forcing the router to reject a model needs a real `lemond`
+failure that no safe, deterministic e2e hook produces. Unit tests in
+[lib.rs](../engines/lemonade/src/lib.rs) and
+[router_serve.rs](../engines/lemonade/src/router_serve.rs) cover it, asserting the
+result and the state together: `router_load_failure_falls_back_to_the_selected_gpu_llama_server`
+(llama-server arguments, final state, and the logged line naming the backend and
+saying it is not ROCm), `only_a_router_load_failure_may_fall_back_and_only_on_linux`,
+`fallback_never_serves_through_a_missing_or_cpu_backend`, and
+`only_a_load_or_verification_failure_is_eligible_for_direct_fallback`. The
+`serve-lemonade-complex-registered-inference` scenario remains the real-hardware
+check of the router route.
+
+Unit tests in `rocm-dash-tui` cover the dashboard side of these scenarios. A
+Services selection that outlives its row is clamped. A staged approval whose
+target disappears is dropped, and the next key is handled as a normal key. The
+engine pane shows the check or dot glyph for installed and not-installed
+status. The `rocm dash --help` test asserts that Lemonade discovery is scoped to
+Linux and WSL.
+
+Run the ordinary applicability-aware suite with `cargo xtask e2e`. For focused
+protocol regression development on Linux or WSL:
+
+```bash
+cargo xtask e2e -- -n 'External Lemonade protocol'
+```
+
+Cucumber name filtering bypasses the harness's custom applicability/expectation
+filter. Use it only for scenarios applicable to the local host. Do not force
+GPU-gated scenarios through a name filter on a GPU-less machine. Run the real
+serving journeys through the normal GPU lane selection.
+
+A green local unit or protocol-fixture run does not clear the existing flaky
+Linux serving expectations in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml). Removing one requires
+verification of that same real serving scenario on suitable hardware. Report
+GPU checks that could not run, and do not treat an installed version or a startup
+message as proof that inference works.
+
 ## Coverage floors
 
 Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
@@ -2177,7 +2364,7 @@ so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
 reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
 closed** on that exact combination (public bind + `--engine lemonade` + Windows)
 and directs the user to `--engine vllm` or a loopback host. vLLM (all platforms,
-via `VLLM_API_KEY`), the packaged llama-server fallback (via `--api-key-file`),
+via `VLLM_API_KEY`), direct llama-server serving (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
@@ -3066,10 +3253,11 @@ The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 `rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
 It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
-is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
-the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
+is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
+the queue nightly only) and the vLLM half falls to the Instinct lane. Of those,
+MI300X and the Strix Halo Windows and WSL2 lanes run on pull requests
 ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
-path filter matches) but none of their check names is a required status check,
+path filter matches; W7900 has no lane there any more) but none of their check names is a required status check,
 so the two unit tests above are the blocking per-PR coverage. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
 unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
@@ -4432,6 +4620,100 @@ Windows:
 cargo xtask e2e -- -n '(diagnose-48)'
 ```
 
+## Symptom From A File Or Standard Input
+
+`rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
+standard input when PATH is `-`, so a pasted error never passes through a
+shell's argument parser. How the bytes become the `--symptom` string (one
+trailing line break removed, a UTF-8 byte-order mark dropped, UTF-16 with a
+byte-order mark decoded, anything else UTF-8, and more than 16 MiB a usage
+error) is in [symptom_input.rs](../apps/rocm/src/symptom_input.rs), and its
+unit tests there pin each rule, including that a paste full of quotes,
+`$(...)`, a backtick and a leading `-` comes back byte for byte. They are the
+only tests that would fail if the trailing line break were kept: no scenario
+below depends on it, since a line break changes no cause. The clap rules (the
+two flags exclude each other, `-` is accepted as a path, a leading `-` is
+refused as `--symptom`'s value) are pinned by
+`diagnose_takes_the_symptom_from_a_file_or_stdin_but_not_with_symptom` in
+[cli.rs](../apps/rocm/src/cli.rs).
+
+```bash
+cargo nextest run -p rocm -E 'test(symptom)'
+```
+
+Three scenarios in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature), with their
+steps in
+[symptom_file_steps.rs](../tests/e2e-cucumber/tests/e2e/symptom_file_steps.rs),
+hold the behaviour end to end, GPU or not:
+
+- `diagnose-59` pipes a hostile paste through the platform's own shells (bash
+  on Linux and WSL; cmd.exe and Windows PowerShell on Windows) and requires
+  each diagnosis to equal the one for the same text passed as a single
+  argument with no shell in between: every cause, score and piece of
+  evidence, and every run exiting 0. The paste carries quotes, `$(...)` and a
+  leading `-`, but no shell parses it (each reads it from a file into the
+  pipe), so nothing in it can run by construction; the scenario asserts the
+  diagnosis, not the absence of something no shell could do. The paste is
+  ASCII: Windows PowerShell 5.1 pipes text as ASCII, which is why the docs
+  send PowerShell users through a file instead.
+- `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
+  scenario here; the Windows key is checked by hand in
+  [manual-testing.md](manual-testing.md) section 13) runs
+  `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
+  the whole exchange on screen (it has no scrollback), requires the hint
+  telling the user how to end the paste, then types the paste and Ctrl-D, the
+  Linux end-of-input key the hint names, and requires the screen, which also
+  holds the hint and the echoed paste, to contain the whole report the
+  argument form prints. It first requires that report to differ from the one
+  with no symptom, so a paste that was read and then dropped fails rather than
+  passing on a host where the host's own causes fill the report.
+- `diagnose-61` points the flag at a missing file and at one that is not
+  UTF-8, and requires a usage error (exit code 2) that names the file and the
+  reason, with nothing on stdout.
+
+None of them asserts which catalog entry matched, for the reason given at the
+top of that feature file: they compare two routes on the same host.
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(59|60|61) '
+```
+
+### Which causes the pasted error contributed to
+
+Every entry in `rocm diagnose --json`'s `matched` carries `symptom_matched`:
+`true` when the symptom text (from `--symptom` or `--symptom-file`)
+contributed to its score or evidence, `false` when it came from the examined
+host's state alone, and `false` on every entry when no symptom was given. Any
+keyword hit counts, however weak, so the field records a contribution, not that
+the entry explains the error.
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs) decides it by running the
+catalog a second time with no symptom and comparing each entry with its
+counterpart (`contributed`: absent, a different score, or different evidence),
+so no checker sets it by hand. The text report prints a `source: the examined
+host's state alone` line under each shown entry the text did not contribute to,
+once the text contributed to any entry in the report, including one cut off by
+`--top`. The rules are pinned by unit tests in diagnose.rs,
+[report.rs](../crates/rocm-core/src/diagnose/report.rs) and, for the same line
+under `rocm remote doctor`, [doctor.rs](../apps/rocm/src/remote/doctor.rs):
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/credited|contribution_is_any|symptom|carries_the_note|says_so_in_the_text|past_top|before_the_field/)'
+cargo nextest run -p rocm -E 'test(the_symptom_note_is_true_of_a_remote_host)'
+```
+
+`diagnose-62` (JSON), `diagnose-63` (text) and `diagnose-64` (no symptom, both
+forms) in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+cover it on every lane. They set an unneeded `HSA_OVERRIDE_GFX_VERSION` on the
+CLI. The first two also paste an ISA error, so the override entry must read
+`false` and the ISA entry `true` whatever the runner's own state; the third
+pastes nothing, so every entry must read `false` and no line is printed. To run
+only those three without bypassing the harness's gates:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
+```
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a model will run on this host
@@ -4819,6 +5101,41 @@ it is the one to pass on. The text output names the files it could not read, and
 report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
+
+## Fix Catalog Exit Codes
+
+`rocm fix --json` publishes each exit code twice over: `exit_codes` maps a name
+to its number and `exit_code_descriptions` maps the same name to what it means.
+Both are built from one table, `exit::MEANINGS` in
+[options.rs](../crates/rocm-core/src/fix/options.rs), so a code cannot be named
+without being described. The descriptions are an added field, so
+`contract_version` did not move.
+
+Exit 2 has two causes, and the `unknown_id` description says so: a fix-id the
+catalog does not have, and a command line the argument parser rejects before
+any fix-id is looked up. They are told apart by the message (a stderr line
+starting `Unknown fix-id:` against one starting `error:`), never by the code.
+The claim is about a line, not the start of stderr, because `run()` can print a
+one-time `rocm:` notice before either refusal. Each half of that claim is
+checked where it lives:
+
+- `the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`,
+  `every_published_exit_code_is_described_once` and
+  `every_exit_constant_is_published_and_nothing_else_is` in
+  [manifest.rs](../crates/rocm-core/src/fix/manifest.rs) hold the text and the
+  table, and the table to the `exit::` constants.
+- `a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id` in
+  [main.rs](../apps/rocm/src/main.rs) parses malformed `rocm fix` command lines
+  with the real `clap` definition and checks they exit with the published
+  `unknown_id` code and have a line starting `error:`.
+- `diagnose-34` (`@id:diagnose-fix-catalog-is-machine-readable`) runs the binary:
+  it reads the catalog, then runs `rocm fix` with an unknown fix-id and with an
+  unknown option, and checks each exits with the code the catalog publishes and
+  prints the message the description names. It has no tags, so every lane runs it.
+
+The other five descriptions are claims about the runners. The comment above each
+entry in `exit::MEANINGS` names the unit tests that prove it, and the branches
+no test drives (a command that exits non-zero, a missing tool or install).
 
 ## Doctor Skill Eval Replays
 
