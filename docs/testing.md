@@ -1844,6 +1844,17 @@ and `config set-engine --runtime-id` store a selector without resolving it. For
 `runtimes activate`, `@id:runtime-lifecycle-case-twin-selector-refused` also
 checks that nothing became active and that naming one key exactly then works.
 
+Runtimes installed before and after the ROCm 10 layout stay usable side by
+side: `@id:runtime-lifecycle-side-by-side-across-packaging-change` lists and
+activates a ROCm 7 runtime, a ROCm 10 release runtime and a ROCm 10 nightly
+runtime without rewriting their install records,
+`@id:runtime-lifecycle-side-by-side-uninstall-keeps-the-others` uninstalls one
+and checks the others keep their folders and records, and
+`@id:runtime-lifecycle-side-by-side-shared-name-refused` checks that the runtime
+id the two release runtimes share is refused with both keys named.
+Uninstalling a runtime that is the rollback target clears it as the rollback
+target in both the config and the active-runtime marker.
+
 Developer-only previous-runtime regression check:
 
 ```bash
@@ -3672,25 +3683,27 @@ needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios and the native-Windows vLLM refusal scenarios
-`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
-comma-separated list of `@id`s:
+scenarios, the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35`, and the side-by-side runtime scenarios
+`runtime-lifecycle-19`/`runtime-lifecycle-20`/`runtime-lifecycle-21` (none of
+them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,runtime-lifecycle-side-by-side-across-packaging-change,runtime-lifecycle-side-by-side-uninstall-keeps-the-others,runtime-lifecycle-side-by-side-shared-name-refused"
 cargo xtask e2e
 ```
 
-These three were made hermetic and Windows-portable without being tagged
-`@lifecycle` — they're ComfyUI install scenarios, not release packaging/
-install/uninstall ones, and tagging them `@lifecycle` would drop them out of
-the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`, neither of
-which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them into this
-lane instead, so this is the one required lane that guarantees Windows
-coverage for them; the self-hosted Windows lane that otherwise runs them is
-optional.
+All nine are hermetic (planted fixture binaries or runtimes, no GPU, no
+network) and Windows-portable without being tagged `@lifecycle` — they are
+ComfyUI install, vLLM refusal and runtime-selection scenarios, not release
+packaging/install/uninstall ones, and tagging them `@lifecycle` would drop
+them out of the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`,
+neither of which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them
+into this lane instead, so this is the one required lane that guarantees
+Windows coverage for them; the self-hosted Windows lane that otherwise runs
+them is optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature

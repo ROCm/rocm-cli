@@ -1491,6 +1491,74 @@ mod tests {
         }
     }
 
+    /// Pins the production derivation to the literal keys of the side-by-side
+    /// e2e fixture, from the fixture's inputs. The fixture
+    /// (tests/e2e-cucumber/tests/e2e/runtime_side_by_side_steps.rs) re-derives
+    /// keys in `Role::key` to plant runtimes without installing them, and its
+    /// planting step checks those against the same literals in
+    /// `Role::expected_key`. So a change here fails this test, and a change to
+    /// the fixture fails the scenario's Given.
+    #[test]
+    fn wheel_runtime_key_matches_the_side_by_side_e2e_fixture() {
+        let composition = |generation: &str, specs: [&str; 4]| WheelRuntimeComposition {
+            source_layout_generation: generation.to_owned(),
+            package_specs: specs.iter().map(|spec| (*spec).to_owned()).collect(),
+            rocm_sdk_target: Some("gfx942".to_owned()),
+        };
+        let cases = [
+            (
+                TheRockChannel::Release,
+                "7.14.0",
+                composition(
+                    "multi-arch-v2",
+                    [
+                        "rocm[libraries,devel,device-gfx942]==7.14.0",
+                        "torch[device-gfx942]==2.11.0+rocm7.14.0",
+                        "torchvision[device-gfx942]==0.26.0+rocm7.14.0",
+                        "torchaudio==2.11.0+rocm7.14.0",
+                    ],
+                ),
+                "release-wheel-multi-arch-7-14-0-992a08553d8be8f0",
+            ),
+            (
+                TheRockChannel::Release,
+                "10.0.0",
+                composition(
+                    "next-v1",
+                    [
+                        "rocm[libraries,device-gfx942]==10.0.0",
+                        "torch[device-gfx942]==2.13.0+rocm10.0.0",
+                        "torchvision[device-gfx942]==0.28.0+rocm10.0.0",
+                        "torchaudio==2.11.0.2+rocm10.0.0",
+                    ],
+                ),
+                "release-wheel-multi-arch-10-0-0-3d0e256f664a960d",
+            ),
+            (
+                TheRockChannel::Nightly,
+                "10.1.0a20260822",
+                composition(
+                    "multi-arch-v2",
+                    [
+                        "rocm[libraries,device-gfx942]==10.1.0a20260822",
+                        "torch[device-gfx942]==2.12.0+rocm10.1.0a20260822",
+                        "torchvision[device-gfx942]==0.27.0+rocm10.1.0a20260822",
+                        "torchaudio==2.12.0+rocm10.1.0a20260822",
+                    ],
+                ),
+                "nightly-wheel-multi-arch-10-1-0a20260822-95e3a823499c530b",
+            ),
+        ];
+        for (channel, version, composition, expected) in cases {
+            assert_eq!(
+                wheel_runtime_key(channel, version, &composition),
+                expected,
+                "the production key derivation changed; update these literals, and `Role::key` \
+                 and `Role::expected_key` in runtime_side_by_side_steps.rs, together"
+            );
+        }
+    }
+
     #[test]
     fn aggregate_wheel_runtime_key_separates_device_payloads_at_one_version() {
         let base = WheelRuntimeComposition {
