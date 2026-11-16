@@ -977,12 +977,14 @@ file, the workspace root manifest, CI config, or a doc an xtask test reads —
 the proptest seed guard and which no other crate depends on: a changed file under
 a `proptest-regressions` directory, and a changed Rust file whose diff adds or
 removes a line containing `proptest!` (found with `git diff -G`). On `main`
-and in the merge queue the full workspace always runs. For a full local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
-narrows the local pre-push hooks (next section).
+and in the merge queue the full workspace always runs. For a full local verification, run
+`cargo test --workspace --all-targets` above, which builds with the `e2e-test-hooks` feature
+off, and the feature-on `cargo nextest run` commands just below — `affected` is a CI optimization, and it
+also narrows the local pre-push hooks (next section).
 
-That `cargo nextest run` builds with the `e2e-test-hooks` feature off, so the
-tests that exist only with it are not among them. More steps of the `test` job
+The `test` job's affected-crates `cargo nextest run` builds with the
+`e2e-test-hooks` feature off, so the tests that exist only with it are not
+among them. More steps of the `test` job
 run them, each when its crate is in the selection or the selection is the
 whole workspace. Each runs that crate's whole suite with the feature on (the
 rocm-core one its library tests), not only the tests behind the feature:
@@ -1008,7 +1010,21 @@ feature can turn on or a `cfg_attr(..)` naming it, test code behind such a gate,
 or a `mod x;` behind the feature, whose file it does not read. It fails while
 such a crate has no step like these, so a crate that gains such test code needs
 a step of its own. It does not read integration tests under a crate's `tests/`
-directory, so a test there behind the feature is not checked.
+directory, so a test there behind the feature is not checked. It also checks
+that each such step has its exact `run:` and `if:` and no `continue-on-error`,
+that the `clippy` job runs both workspace clippy commands, feature off and on,
+and that every other crate with code behind the feature is in `rocm`'s
+`e2e-test-hooks` feature list. Run it on its own with:
+
+```bash
+cargo test -p xtask ci_lints_and_tests_every_crate_with_e2e_test_hooks_gated_tests
+```
+
+On a pull request the Linux `test` job runs it only when `xtask` is in the
+affected selection, but the whole workspace's tests, this one included, run
+whenever a Rust file changes: in the `windows-debug` job, and in the Linux
+`coverage` job, whose `cargo xtask coverage` runs `cargo llvm-cov --workspace
+--exclude e2e-cucumber`.
 
 ### Pre-push hook scope
 
@@ -1026,7 +1042,8 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
   `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
 
 The hooks build with `e2e-test-hooks` off, so the feature-on clippy and the feature-on
-test steps run only in CI, or by hand with the commands above.
+test steps run only in CI, or by hand with the feature-on commands under
+[Local Verification](#local-verification) and [CI test selection](#ci-test-selection).
 
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
 so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
@@ -1053,7 +1070,8 @@ filter, as before, including a lockfile-only push.
 The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
 job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
 `cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
-every change, and in the merge queue and on `main`, where the Linux `test` job is forced to
+every change, in the Linux `coverage` job (`cargo xtask coverage`, every crate but `e2e-cucumber`)
+on every Rust change, and in the merge queue and on `main`, where the Linux `test` job is forced to
 `--workspace`.
 
 Known limits, unchanged by the narrowing: the steps check the working tree rather than the pushed

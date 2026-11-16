@@ -747,7 +747,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 | [`eval_fixtures.rs`](../xtask/src/eval_fixtures.rs) | `cargo xtask eval-fixtures`: regenerates or checks the recorded `rocm` output the rocm-doctor skill evals replay, rendered from the compiled catalog. | flat |
 | [`lychee.rs`](../xtask/src/lychee.rs) | `cargo xtask lychee`: runs lychee with [`lychee.toml`](../lychee.toml) over the working tree, the local counterpart of the `docs-links` CI job. | flat |
 | [`manifest.rs`](../xtask/src/manifest.rs) | `cargo xtask manifest`: regenerates or checks the Cargo dependency table in [`MANIFEST.md`](../MANIFEST.md) from `cargo metadata`. | flat |
-| [`module_size.rs`](../xtask/src/module_size.rs) | `cargo xtask check-module-size`: fails when a source file exceeds `MAX_PRODUCTION_LINES` production lines, or when a `.rs` file under a crate's `src/` is declared by no `mod`. | flat |
+| [`module_size.rs`](../xtask/src/module_size.rs) | `cargo xtask check-module-size`: fails when a source file exceeds `MAX_PRODUCTION_LINES` production lines, or when a `.rs` file under a crate's `src/` is declared by no `mod`. Also provides a test-only walk of every package's module tree that [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) reuses. | flat |
 | [`package.rs`](../xtask/src/package.rs) | `cargo xtask package`: builds the release bundle directory from built binaries, its archive, the SHA-256 sidecar and, when a key is configured, a detached signature. | flat |
 | [`paths.rs`](../xtask/src/paths.rs) | Workspace paths shared by the tasks: the workspace root, the active `target/` directory, release binary locations and platform executable names. | flat |
 | [`powershell.rs`](../xtask/src/powershell.rs) | `cargo xtask powershell-lint`: runs PSScriptAnalyzer over `.ps1` files through `pwsh` or Windows PowerShell, which also reports syntax errors. | flat |
@@ -764,7 +764,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 | [`tpn.rs`](../xtask/src/tpn.rs) | `cargo xtask tpn`: regenerates or checks [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt) through cargo-about with the committed config and template. | flat |
 | [`verify_commits.rs`](../xtask/src/verify_commits.rs) | `cargo xtask verify-commits`: checks that every commit in a range is signed and carries a DCO `Signed-off-by` trailer, or only that signing is configured. | flat |
 | [`verify_pinned_keys.rs`](../xtask/src/verify_pinned_keys.rs) | `cargo xtask verify-pinned-keys`: checks that the public keys pinned in the installers and the CLI match the canonical keys under `docs/keys/`. | flat |
-| [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) | Source-scan tests over the GitHub workflow files and CI scripts: lane placement and concurrency groups, runner labels, timeouts, permissions and other CI invariants, including that CI lints and runs every crate's `e2e-test-hooks`-only tests, found by walking the module tree `module_size.rs` walks. | flat |
+| [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) | Source-scan tests over the GitHub workflow files and CI scripts: lane placement and concurrency groups, runner labels, timeouts, permissions and other CI invariants, including that CI lints and runs every crate's `e2e-test-hooks`-only tests, found by walking the module tree [`module_size.rs`](../xtask/src/module_size.rs) walks. | flat |
 
 Boundaries:
 

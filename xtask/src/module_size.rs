@@ -1519,7 +1519,9 @@ trait T {
     /// `both_b.rs` differ in which declaration carries the gate: the plain
     /// `mod` for one, the `#[path]` alias for the other. So a fold that keeps
     /// either the first or the last set entry for a file gives `false` on one
-    /// of them.
+    /// of them. A second package, `user`, loads `demo/src/plain.rs` behind a
+    /// test gate through `#[path]`: each package gets its own list, under its
+    /// own name, so that file is gated for `user` and not for `demo`.
     #[test]
     fn reached_source_files_flag_files_reached_through_a_test_gated_mod() {
         let dir = tempfile::tempdir().unwrap();
@@ -1527,7 +1529,7 @@ trait T {
         write(
             root,
             "Cargo.toml",
-            "[workspace]\nmembers = [\"demo\"]\nresolver = \"2\"\n",
+            "[workspace]\nmembers = [\"demo\", \"user\"]\nresolver = \"2\"\n",
         );
         write(root, "demo/Cargo.toml", &manifest("demo"));
         write(
@@ -1544,31 +1546,53 @@ trait T {
         write(root, "demo/src/own/child.rs", "fn c() {}\n");
         write(root, "demo/src/gated.rs", "mod below;\n");
         write(root, "demo/src/gated/below.rs", "fn b() {}\n");
+        write(root, "user/Cargo.toml", &manifest("user"));
+        write(
+            root,
+            "user/src/lib.rs",
+            "#[cfg(test)]\n#[path = \"../../demo/src/plain.rs\"]\nmod borrowed;\n",
+        );
 
-        let reached = reached_source_files_in(&real_metadata(root)).unwrap();
-        let [(name, files)] = reached.as_slice() else {
-            panic!("one package: {reached:?}");
-        };
-        assert_eq!(name, "demo");
-        let src = normalize(&root.join("demo/src"));
-        let flags: Vec<(String, bool)> = files
+        let mut reached = reached_source_files_in(&real_metadata(root)).unwrap();
+        reached.sort_by(|a, b| a.0.cmp(&b.0));
+        let root = normalize(root);
+        let flags: Vec<(&str, Vec<(String, bool)>)> = reached
             .iter()
-            .map(|(file, gated)| {
-                let relative = file.strip_prefix(&src).unwrap_or(file);
-                (relative.to_string_lossy().replace('\\', "/"), *gated)
+            .map(|(name, files)| {
+                let files = files
+                    .iter()
+                    .map(|(file, gated)| {
+                        let relative = file.strip_prefix(&root).unwrap_or(file);
+                        (relative.to_string_lossy().replace('\\', "/"), *gated)
+                    })
+                    .collect();
+                (name.as_str(), files)
             })
             .collect();
+        let row = |file: &str, gated: bool| (file.to_string(), gated);
         assert_eq!(
             flags,
             [
-                ("both_a.rs".to_string(), true),
-                ("both_b.rs".to_string(), true),
-                ("gated/below.rs".to_string(), true),
-                ("gated.rs".to_string(), true),
-                ("lib.rs".to_string(), false),
-                ("own/child.rs".to_string(), true),
-                ("own.rs".to_string(), false),
-                ("plain.rs".to_string(), false),
+                (
+                    "demo",
+                    vec![
+                        row("demo/src/both_a.rs", true),
+                        row("demo/src/both_b.rs", true),
+                        row("demo/src/gated/below.rs", true),
+                        row("demo/src/gated.rs", true),
+                        row("demo/src/lib.rs", false),
+                        row("demo/src/own/child.rs", true),
+                        row("demo/src/own.rs", false),
+                        row("demo/src/plain.rs", false),
+                    ]
+                ),
+                (
+                    "user",
+                    vec![
+                        row("demo/src/plain.rs", true),
+                        row("user/src/lib.rs", false),
+                    ]
+                ),
             ]
         );
     }

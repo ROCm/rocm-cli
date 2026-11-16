@@ -10573,9 +10573,11 @@ permissions:
     /// Test code that only an `e2e-test-hooks` build compiles, and the CI
     /// steps that must therefore lint it and run it with the feature on.
     ///
-    /// The feature is off in every CI build except the steps pinned here, so a
-    /// test behind it that no feature-on step builds is not compiled anywhere
-    /// in CI: it cannot fail, and the hook it covers can break unnoticed.
+    /// No unit-test, nextest or clippy build in CI enables the feature except
+    /// the steps pinned here (the e2e lanes build the binaries with it, but no
+    /// unit tests), so a test behind it that no pinned step builds is not
+    /// compiled by any CI test or lint: it cannot fail, and the hook it covers
+    /// can break unnoticed.
     mod e2e_test_hooks_coverage {
         use std::collections::BTreeSet;
 
@@ -10882,8 +10884,9 @@ permissions:
             for expected in ["rocm", "rocm-core"] {
                 assert!(
                     crates.contains(expected),
-                    "`{expected}` has tests behind `{FEATURE}` today, so the scan finding \
-                     {crates:?} has stopped seeing them; fix the scan before trusting it"
+                    "`{expected}` is missing from the crates with tests behind `{FEATURE}`, \
+                     {crates:?}: either the scan has stopped seeing them (fix the scan) or the \
+                     crate's last such test was removed (drop it from this list)"
                 );
             }
 
@@ -10932,8 +10935,17 @@ permissions:
                 );
             }
 
+            let seams = crates_with_hooks_seams(&packages);
+            for expected in ["rocm", "rocm-core", "rocm-engine-lemonade"] {
+                assert!(
+                    seams.contains(expected),
+                    "`{expected}` is missing from the crates with code behind `{FEATURE}`, \
+                     {seams:?}: either the seam scan has stopped seeing it (fix the scan) or the \
+                     crate's last such code was removed (drop it from this list)"
+                );
+            }
             let enabled = rocm_hooks_feature_entries();
-            for krate in crates_with_hooks_seams(&packages) {
+            for krate in seams {
                 assert!(
                     krate == "rocm" || enabled.contains(&format!("{krate}/{FEATURE}")),
                     "`{krate}` has code behind `{FEATURE}`, but `rocm/{FEATURE}` does not turn \
@@ -10986,6 +10998,7 @@ permissions:
                 "#[cfg(feature = \"e2e-test-hooks\")]\nmod hooks {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn t() {}\n    }\n}\n",
                 "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        #[cfg(feature = \"e2e-test-hooks\")]\n        {\n            assert!(true);\n        }\n    }\n}\n",
                 "#[cfg(test)]\nmod tests {\n    #[cfg_attr(not(feature = \"e2e-test-hooks\"), ignore)]\n    #[test]\n    fn t() {}\n}\n",
+                "#[cfg(test)]\nmod tests {\n    #[cfg_attr(feature = \"e2e-test-hooks\", ignore)]\n    #[test]\n    fn t() {}\n}\n",
                 "#[test]\nfn t() {\n    if cfg!(feature = \"e2e-test-hooks\") {}\n}\n",
                 "#[cfg(test)]\nmod tests {\n    #[cfg(feature = \"e2e-test-hooks\")]\n    use std::env;\n}\n",
                 "#[cfg(feature = \"e2e-test-hooks\")]\nmod hooks;\n",
