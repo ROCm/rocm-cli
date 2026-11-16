@@ -36,8 +36,9 @@ pub enum EngineTorchRequirement {
 ///
 /// `not_applicable (vllm does not pin torch)` counts only when the engine really
 /// declares no torch requirement. That is the ROCm 10.x discover install: the
-/// CLI pins torch itself and installs the engine without dependencies, so there
-/// is no engine pin for the alignment to settle against. The same text over an
+/// vLLM wheel declares no torch, and the engine install pins and realigns the
+/// torch trio itself, so there is no engine pin for the alignment to settle
+/// against. The same text over an
 /// engine that does declare one would be the skip this check exists to catch, as
 /// would any other `not_applicable` reason, such as a manifest that identifies no
 /// SDK torch build.

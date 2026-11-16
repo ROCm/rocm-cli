@@ -364,9 +364,10 @@ fn engine_requirement_for(lines: &[&str], output: &str) -> EngineTorchRequiremen
 /// torch in its own package metadata.
 ///
 /// Asked of the runtime's interpreter rather than read from the CLI's output, so
-/// the answer does not depend on the thing being judged. The ROCm 10.x discover
-/// install pins torch itself and installs vLLM without its dependencies, which is
-/// the case where this is `Absent` and `not_applicable` is the right verdict.
+/// the answer does not depend on the thing being judged. The ROCm 10.x vLLM wheel
+/// declares no torch and the engine install pins and realigns the torch trio
+/// itself, which is the case where this is `Absent` and `not_applicable` is the
+/// right verdict.
 fn engine_torch_requirement(output: &str) -> EngineTorchRequirement {
     let python = super::examine_steps::field_value(output, "python_executable")
         .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
@@ -395,12 +396,15 @@ fn engine_torch_requirement(output: &str) -> EngineTorchRequirement {
 ///
 /// Asked only where a `not_applicable` verdict means the alignment compared no pin,
 /// so nothing else vouches that the pair torch and torchvision came to rest on can
-/// register its operators. The verdict itself is `engine_import_verdict`.
+/// register its operators. `vllm._C` is imported on its own because `import vllm`
+/// loads that compiled extension lazily: a vLLM built against a different torch
+/// imports fine and only fails here, on an undefined torch symbol. The verdict
+/// itself is `engine_import_verdict`.
 fn assert_engine_stack_imports(output: &str) {
     let python = super::examine_steps::field_value(output, "python_executable")
         .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
     let probe = std::process::Command::new(python)
-        .args(["-c", "import torch, torchvision, vllm"])
+        .args(["-c", "import torch, torchvision, vllm, vllm._C"])
         .output()
         .unwrap_or_else(|error| panic!("failed to run {python}: {error}"));
     if let Err(cause) = engine_import_verdict(
@@ -467,8 +471,9 @@ async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
 /// there is no alignment to skip, so `disabled` cannot be printed. Any other
 /// `not_applicable` is the generic bucket for "nothing to decide", and folding the
 /// opt-out into it leaves the user who set the variable unable to tell whether it
-/// took effect. In the accepted case the SDK install's own line has to name the
-/// variable instead, so the reader is still told it was honoured.
+/// took effect. In the accepted case the output has to name the variable, which
+/// the `torch_kept:` line the next step requires does, so the reader is still told
+/// it was honoured.
 #[then("the torch alignment reports the opt-out instead of rewriting torch")]
 async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
