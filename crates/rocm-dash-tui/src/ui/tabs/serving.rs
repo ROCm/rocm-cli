@@ -210,6 +210,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_name: "vllm-1".into(),
+                managed: true,
                 model_name: "Llama-3.1-8B".into(),
                 status: InstanceStatus::Running,
                 port: Some(8000),
@@ -219,7 +220,7 @@ mod tests {
         let out = render(&s, 120, 28);
         // The running instance is shown inline in the detail pane — no popup.
         assert!(
-            out.contains("Running now"),
+            out.contains("Managed running"),
             "live running header missing: {out:?}"
         );
         assert!(
@@ -242,6 +243,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_name: "vllm-1".into(),
+                managed: true,
                 model_name: "Llama-3.1-8B".into(),
                 status: InstanceStatus::Ready,
                 port: Some(8000),
@@ -250,7 +252,7 @@ mod tests {
         );
         let out = render(&s, 120, 28);
         assert!(
-            out.contains("Running now — 1"),
+            out.contains("Managed running — 1"),
             "ready instance not counted as running: {out:?}"
         );
         assert!(
@@ -267,6 +269,7 @@ mod tests {
         s.serving_sel = 2;
         let mk = |name: &str, status| Instance {
             container_name: name.into(),
+            managed: true,
             model_name: name.into(),
             status,
             ..Default::default()
@@ -283,7 +286,7 @@ mod tests {
         s.instances
             .insert("b".into(), mk("Dead-Model", InstanceStatus::Stopped));
         let out = render(&s, 120, 28);
-        assert!(out.contains("Running now — 1"), "{out:?}");
+        assert!(out.contains("Managed running — 1"), "{out:?}");
         assert!(out.contains("Starting-Model"), "{out:?}");
         assert!(out.contains("downloading"), "{out:?}");
         assert!(!out.contains("none running"), "{out:?}");
@@ -296,6 +299,7 @@ mod tests {
     ) -> rocm_dash_core::metrics::Instance {
         rocm_dash_core::metrics::Instance {
             container_name: name.into(),
+            managed: true,
             model_name: name.into(),
             status: rocm_dash_core::metrics::InstanceStatus::Starting { phase },
             ..Default::default()
@@ -315,7 +319,7 @@ mod tests {
         s.instances
             .insert("a".into(), starting_inst("Docker-Model", None));
         let out = render(&s, 120, 28);
-        assert!(out.contains("Running now — 1"), "{out:?}");
+        assert!(out.contains("Managed running — 1"), "{out:?}");
         assert!(
             out.contains("docker-model") || out.contains("Docker-Model"),
             "{out:?}"
@@ -346,6 +350,7 @@ mod tests {
             "b".into(),
             Instance {
                 container_name: "Z-Serving".into(),
+                managed: true,
                 model_name: "Z-Serving".into(),
                 status: InstanceStatus::Ready,
                 ..Default::default()
@@ -365,7 +370,7 @@ mod tests {
                 .insert(format!("s{n}"), starting_inst(&format!("Start-{n}"), None));
         }
         let out = render(&s, 120, 40);
-        assert!(out.contains("Running now — 7"), "{out:?}");
+        assert!(out.contains("Managed running — 7"), "{out:?}");
         assert!(out.contains("…and 2 more"), "{out:?}");
     }
 
@@ -399,6 +404,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_name: "vllm-1".into(),
+                managed: true,
                 model_name: "Llama-3.1-8B".into(),
                 status: InstanceStatus::Running,
                 port: Some(8000),
@@ -437,6 +443,7 @@ mod tests {
                 format!("vllm-{n}"),
                 Instance {
                     container_name: format!("vllm-{n}"),
+                    managed: true,
                     model_name: format!("Model-{n}"),
                     status: InstanceStatus::Running,
                     port: Some(8000 + n),
@@ -450,7 +457,7 @@ mod tests {
             );
         }
         // area.height=8 → bento inner.height=5 for the detail column, tall
-        // enough for summary + blank + "Running now" header + the first
+        // enough for summary + blank + "Managed running" header + the first
         // running row, but far short of the old inline legend's position
         // after 5 rows + the "…and N more" line.
         let out = render(&s, 160, 8);
@@ -472,6 +479,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_name: "vllm-1".into(),
+                managed: true,
                 model_name: "Llama-3.1-8B".into(),
                 status: InstanceStatus::Running,
                 port: Some(8000),
@@ -500,6 +508,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_name: "vllm-1".into(),
+                managed: true,
                 model_name: "Llama-3.1-8B".into(),
                 status: InstanceStatus::Running,
                 port: Some(8000),
@@ -530,6 +539,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_name: "vllm-1".into(),
+                managed: true,
                 model_name: "Llama-3.1-8B".into(),
                 status: InstanceStatus::Running,
                 port: Some(8000),
