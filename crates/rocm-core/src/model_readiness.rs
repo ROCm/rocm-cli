@@ -131,11 +131,17 @@ pub enum AcceleratorMemory {
     /// measurements of driver and BIOS policy on this machine -- not installed
     /// RAM, and not a fraction of it.
     ///
-    /// `vram_carveout_gib` is what `amd-smi` reported as `total_vram`, kept only
-    /// so a report can show the two side by side. It is the fixed BIOS carve-out
-    /// (512 MiB on a Ryzen 7 4700U, ~4 GiB on a Strix Halo) and is never the
-    /// figure a recipe minimum is compared against: doing so refuses nearly
-    /// every curated model on machines that serve them.
+    /// `vram_carveout_gib` is what `amd-smi` reported as `total_vram`: the fixed
+    /// BIOS carve-out (512 MiB on a Ryzen 7 4700U, ~4 GiB on a Strix Halo). It
+    /// is never the figure a recipe minimum is compared against — doing so
+    /// refuses nearly every curated model on machines that serve them — and
+    /// **nothing reads it today**. It is reserved for a report that shows the
+    /// two figures side by side, which would be the place to explain why the
+    /// number `amd-smi` prints differs from the one the verdict used; no
+    /// renderer does that yet, and this enum carries no `Serialize`, so the
+    /// field cannot reach `--json` either. Carried rather than dropped because
+    /// the classification that fills it in (`classify_accelerator_memory` in the
+    /// `rocm` binary) is the only place the carve-out is still in hand.
     ///
     /// A ceiling is not an allocation. The operating system, the compositor and
     /// every other process draw on the same memory, so this can never reach
@@ -655,7 +661,17 @@ fn assess(
     // already answered -- and so a host the system-RAM check above has already
     // softened still gets this said about it, keeping that check's own
     // remediation rather than replacing it with one about a different problem.
+    //
+    // Gated on `requires_gpu` for the same reason the "no GPU is visible" check
+    // above is: a `cpu_only` recipe never allocates from the accelerator pool,
+    // so what that pool is shared with says nothing about whether it will run.
+    // Without the gate a `cpu_only` recipe on an APU is softened to `Degraded`
+    // and handed "close what else is using memory before serving" -- a
+    // remediation for a device the model does not touch, on evidence no earlier
+    // branch put in the report (a recipe with no GPU minimum takes the
+    // `(None, _)` arm and reaches here `Ready` with no GPU figure at all).
     if host.accelerator_memory.is_shared_pool()
+        && requires_gpu(recipe)
         && matches!(
             readiness.verdict,
             ModelVerdict::Ready | ModelVerdict::Degraded
@@ -1720,6 +1736,98 @@ mod tests {
             "a refusal on an aperture has to say freeing memory will not help, or the user \
              closes applications and asks again: {:?}",
             starved.evidence
+        );
+    }
+
+    /// A `cpu_only` recipe is not softened for a pool it never allocates from.
+    ///
+    /// The shared-pool check is the last thing `assess` does, and it used to
+    /// fire on the host alone: any `Ready`/`Degraded` verdict on an APU was
+    /// downgraded, told "this host's integrated GPU has no dedicated VRAM" and
+    /// handed "close what else is using memory before serving". For a
+    /// `cpu_only` recipe that is a remediation for a device the model does not
+    /// touch -- and one attached to evidence no earlier branch put in the
+    /// report, since a recipe with no GPU minimum takes the `(None, _)` arm and
+    /// arrives here `Ready` with no GPU figure at all. The "no GPU is visible"
+    /// gate a few dozen lines above already consults `requires_gpu`; this one
+    /// did not.
+    ///
+    /// `cpu_only` is a schema-validated `device_policy`
+    /// (`validate_model_device_policy`), so this is reachable through the
+    /// public `assess_model_readiness`. No shipped recipe pairs it with an
+    /// absent minimum today, which is why the recipe is synthesised from a real
+    /// one rather than looked up -- and why this was untested.
+    #[test]
+    fn a_cpu_only_recipe_is_not_degraded_by_a_shared_pool_it_never_uses() {
+        const CPU_ONLY_REF: &str = "cpu-only-probe";
+        const GPU_REF: &str = "gpu-probe";
+
+        let mut registry = builtin_model_recipe_registry();
+        // Cloned from a catalog recipe so every field this assessment does not
+        // care about is still catalog-shaped; only the two that make the
+        // untested combination are overridden.
+        let template = registry
+            .recipes
+            .iter()
+            .find(|recipe| recipe.matches_ref(SMALL_MODEL_REF))
+            .expect("the smallest curated recipe")
+            .clone();
+        let mut cpu_only = template.clone();
+        cpu_only.canonical_model_id = CPU_ONLY_REF.to_owned();
+        cpu_only.aliases.clear();
+        cpu_only.device_policy = "cpu_only".to_owned();
+        cpu_only.min_gpu_mem_gb = None;
+        // Cleared so the system-RAM softening cannot be what moves the verdict.
+        cpu_only.recommended_system_ram_gb = None;
+        registry.recipes.push(cpu_only);
+        // The non-vacuity half: the same host, the same synthetic shape, but a
+        // policy that does need the GPU. Without it this test would pass just
+        // as happily against a shared-pool check someone had deleted outright.
+        let mut gpu_required = template;
+        gpu_required.canonical_model_id = GPU_REF.to_owned();
+        gpu_required.aliases.clear();
+        gpu_required.device_policy = "gpu_required".to_owned();
+        gpu_required.recommended_system_ram_gb = None;
+        registry.recipes.push(gpu_required);
+
+        let catalog = ModelCatalogSource::Available(&registry);
+        let apu = HostFacts {
+            accelerator_memory: AcceleratorMemory::Unified {
+                gtt_total_gib: 60.0,
+                vram_carveout_gib: Some(4.0),
+            },
+            system_ram_gib: Some(4096.0),
+        };
+
+        let cpu = assess_model_readiness(CPU_ONLY_REF, &catalog, &apu, &engine_choice);
+        assert_eq!(
+            cpu.verdict,
+            ModelVerdict::Ready,
+            "a recipe that never allocates from the accelerator cannot be made worse by what \
+             that accelerator's pool is shared with: {:?}",
+            cpu.evidence
+        );
+        assert!(
+            !cpu.evidence
+                .iter()
+                .any(|line| line.contains("no dedicated VRAM")),
+            "the report volunteered GPU evidence for a `cpu_only` recipe: {:?}",
+            cpu.evidence
+        );
+        assert!(
+            cpu.fix.is_none(),
+            "nothing is wrong here, so there is nothing to remediate -- least of all freeing \
+             memory for a device this model does not use: {:?}",
+            cpu.fix
+        );
+
+        let gpu = assess_model_readiness(GPU_REF, &catalog, &apu, &engine_choice);
+        assert_eq!(
+            gpu.verdict,
+            ModelVerdict::Degraded,
+            "premise failed: this host must still soften a recipe that DOES need the GPU, or \
+             the assertion above proves only that the check is gone: {:?}",
+            gpu.evidence
         );
     }
 

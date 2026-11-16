@@ -173,11 +173,20 @@ impl FromStr for KvCacheType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EstimateOutcome {
-    /// The estimated total is within the GPU's dedicated memory. The total
+    /// The estimated total is within the memory the host's engine would
+    /// allocate from: a discrete card's dedicated VRAM, or — since this PR —
+    /// the ceiling on the shared pool an APU draws on
+    /// ([`crate::model_readiness::AcceleratorMemory::Unified`]). Against a
+    /// shared pool this is weaker than it sounds: the ceiling is not an
+    /// allocation, nothing here measured how much of it is free, and the
+    /// verdict beside it is `Degraded` for exactly that reason. The total
     /// compared is the sum of the parts as the report shows them, each in whole
     /// MiB rounded up, so it can be a few MiB above `total_bytes`.
     Fits,
-    /// The estimated total exceeds the GPU's dedicated memory.
+    /// The estimated total exceeds that memory — a discrete card's dedicated
+    /// VRAM, or an APU's shared-pool ceiling, as above. Over a shared-pool
+    /// ceiling this is as firm as over a card: freeing memory does not raise an
+    /// aperture the driver will not hand out.
     DoesNotFit,
     /// No comparison could be made. See [`ContextEstimate::cannot_estimate_reason`].
     CannotEstimate,
