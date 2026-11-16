@@ -3066,10 +3066,11 @@ The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 `rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
 It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
-is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
-the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
+is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
+the queue nightly only) and the vLLM half falls to the Instinct lane. Of those,
+MI300X and the Strix Halo Windows and WSL2 lanes run on pull requests
 ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
-path filter matches) but none of their check names is a required status check,
+path filter matches; W7900 has no lane there any more) but none of their check names is a required status check,
 so the two unit tests above are the blocking per-PR coverage. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
 unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
@@ -4930,6 +4931,41 @@ it is the one to pass on. The text output names the files it could not read, and
 report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
+
+## Fix Catalog Exit Codes
+
+`rocm fix --json` publishes each exit code twice over: `exit_codes` maps a name
+to its number and `exit_code_descriptions` maps the same name to what it means.
+Both are built from one table, `exit::MEANINGS` in
+[options.rs](../crates/rocm-core/src/fix/options.rs), so a code cannot be named
+without being described. The descriptions are an added field, so
+`contract_version` did not move.
+
+Exit 2 has two causes, and the `unknown_id` description says so: a fix-id the
+catalog does not have, and a command line the argument parser rejects before
+any fix-id is looked up. They are told apart by the message (a stderr line
+starting `Unknown fix-id:` against one starting `error:`), never by the code.
+The claim is about a line, not the start of stderr, because `run()` can print a
+one-time `rocm:` notice before either refusal. Each half of that claim is
+checked where it lives:
+
+- `the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`,
+  `every_published_exit_code_is_described_once` and
+  `every_exit_constant_is_published_and_nothing_else_is` in
+  [manifest.rs](../crates/rocm-core/src/fix/manifest.rs) hold the text and the
+  table, and the table to the `exit::` constants.
+- `a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id` in
+  [main.rs](../apps/rocm/src/main.rs) parses malformed `rocm fix` command lines
+  with the real `clap` definition and checks they exit with the published
+  `unknown_id` code and have a line starting `error:`.
+- `diagnose-34` (`@id:diagnose-fix-catalog-is-machine-readable`) runs the binary:
+  it reads the catalog, then runs `rocm fix` with an unknown fix-id and with an
+  unknown option, and checks each exits with the code the catalog publishes and
+  prints the message the description names. It has no tags, so every lane runs it.
+
+The other five descriptions are claims about the runners. The comment above each
+entry in `exit::MEANINGS` names the unit tests that prove it, and the branches
+no test drives (a command that exits non-zero, a missing tool or install).
 
 ## Doctor Skill Eval Replays
 
