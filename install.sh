@@ -813,6 +813,10 @@ if [ "${require_sig}" -eq 1 ] || [ -n "${public_keys}" ]; then
     # A locally-supplied archive has no URL to fall back on: the signature had to
     # travel with it. Refusing here is the point -- an artifact delivered out of
     # band is precisely the one whose provenance cannot be assumed.
+    if [ -n "${PR_NUMBER}" ]; then
+      # The bundle sits in a temporary directory; name the artifact file, not that path.
+      [ -f "${sig_path}" ] || fail "required signature sidecar is missing from the pull request artifact: ${asset_base}.sig"
+    fi
     [ -f "${sig_path}" ] || fail "required signature sidecar is missing: ${LOCAL_ARCHIVE}.sig"
   else
     fetch "${sig_url}" "${sig_path}" "required signature sidecar is missing or unavailable: ${sig_url}"

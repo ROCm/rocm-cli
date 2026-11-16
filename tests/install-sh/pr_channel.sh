@@ -385,7 +385,7 @@ for variant in path pem; do
     run_install "key-${variant}" "${stub}" "${PATH_WITH_GH}" pr-1048 ROCM_CLI_SIGNING_PUBLIC_KEY_PEM="${KEY_PEM}"
   fi
   assert_failed "key-${variant}" "a pull request bundle installed although a public key (${variant}) was supplied"
-  assert_log_contains "${WORK}/key-${variant}.log" "required signature sidecar is missing" "a supplied public key (${variant}) did not ask for the signature the bundle lacks"
+  assert_log_contains "${WORK}/key-${variant}.log" "required signature sidecar is missing from the pull request artifact: rocm-cli-pr-" "a supplied public key (${variant}) did not ask for the signature the bundle lacks"
   assert_not_installed "key-${variant}" "a pull request bundle was installed although a public key (${variant}) was supplied"
 done
 if [ "${FAILURES}" -eq 0 ]; then
