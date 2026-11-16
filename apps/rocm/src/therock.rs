@@ -524,6 +524,7 @@ fn install_wheel_runtime(
         torchaudio_pin: resolution.torchaudio_pin.as_ref(),
         no_wheel_warning: no_wheel_warning.as_deref(),
         stack: PlanStack::Resolved(ResolvedStack {
+            paths,
             compatibility_key: &resolution.package_versions.compatibility_key,
             install_root: &install_root,
             runtime_key: &runtime_key,
@@ -538,7 +539,7 @@ fn install_wheel_runtime(
     let mut output = String::new();
     write_wheel_plan(&mut output, &plan);
     if dry_run {
-        write_dry_run_tail(&mut output, &plan, Some(paths));
+        write_dry_run_tail(&mut output, &plan);
         return Ok(SdkInstallResult::plan(output));
     }
 

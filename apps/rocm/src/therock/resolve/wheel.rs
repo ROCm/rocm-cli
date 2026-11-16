@@ -2649,6 +2649,7 @@ sdk install
         let install_root = PathBuf::from("/runtimes").join(&runtime_key);
         let manifest_path = PathBuf::from("/manifests").join(&runtime_key);
         let (python, compatibility) = clean_host_python();
+        let (paths_root, paths) = super::super::super::test_support::test_paths("plan-keys");
         let plan = WheelPlan {
             channel: TheRockChannel::Release,
             version_selector: None,
@@ -2665,6 +2666,7 @@ sdk install
             torchaudio_pin: resolution.torchaudio_pin.as_ref(),
             no_wheel_warning: None,
             stack: PlanStack::Resolved(ResolvedStack {
+                paths: &paths,
                 compatibility_key: &resolution.package_versions.compatibility_key,
                 install_root: &install_root,
                 runtime_key: &runtime_key,
@@ -2675,8 +2677,7 @@ sdk install
         };
         let mut resolved = String::new();
         write_wheel_plan(&mut resolved, &plan);
-        let (paths_root, paths) = super::super::super::test_support::test_paths("plan-keys");
-        write_dry_run_tail(&mut resolved, &plan, Some(&paths));
+        write_dry_run_tail(&mut resolved, &plan);
         std::fs::remove_dir_all(paths_root).ok();
 
         let mut expected = plan_keys(&resolved);
@@ -2734,6 +2735,7 @@ sdk install
                 torchaudio_pin: resolution.torchaudio_pin.as_ref(),
                 no_wheel_warning: None,
                 stack: PlanStack::Resolved(ResolvedStack {
+                    paths: &paths,
                     compatibility_key: &resolution.package_versions.compatibility_key,
                     install_root,
                     runtime_key: "kept",
@@ -2744,7 +2746,7 @@ sdk install
             };
             let mut text = String::new();
             write_wheel_plan(&mut text, &plan);
-            write_dry_run_tail(&mut text, &plan, Some(&paths));
+            write_dry_run_tail(&mut text, &plan);
             text
         };
         let line = |text: &str, key: &str| {

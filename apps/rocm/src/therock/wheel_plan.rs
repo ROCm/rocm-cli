@@ -69,6 +69,11 @@ pub(super) enum PlanStack<'a> {
 }
 
 pub(super) struct ResolvedStack<'a> {
+    /// What a preview's venv step reads the install folder against (the managed
+    /// runtimes folder, for ownership). Carried by the resolved stack, the one
+    /// case whose venv step is decided, so a resolved plan cannot be previewed
+    /// without it.
+    pub(super) paths: &'a AppPaths,
     pub(super) compatibility_key: &'a str,
     pub(super) install_root: &'a Path,
     pub(super) runtime_key: &'a str,
@@ -222,18 +227,14 @@ pub(super) const UNRESOLVED_PROGRESS: &str = "No uv is installed; a real install
 /// do, the commands a real install would run, and where it would record the
 /// runtime.
 ///
-/// `paths` is needed only for a resolved plan, whose venv step is decided by
-/// [`dry_run_venv_plan`] from the install folder's files, running nothing from
-/// it; that function also shell-quotes the commands, which a user is invited to
-/// paste and whose install root can come from a model-chosen `--prefix`.
-pub(super) fn write_dry_run_tail(
-    output: &mut String,
-    plan: &WheelPlan<'_>,
-    paths: Option<&AppPaths>,
-) {
+/// A resolved plan's venv step is decided by [`dry_run_venv_plan`] from the
+/// install folder's files, running nothing from it; that function also
+/// shell-quotes the commands, which a user is invited to paste and whose install
+/// root can come from a model-chosen `--prefix`.
+pub(super) fn write_dry_run_tail(output: &mut String, plan: &WheelPlan<'_>) {
     let _ = writeln!(output, "  mode: dry-run");
-    match (&plan.stack, paths) {
-        (PlanStack::Resolved(stack), Some(paths)) => {
+    match &plan.stack {
+        PlanStack::Resolved(stack) => {
             let env_python = venv_python_path(stack.install_root);
             let mut install_args = uv_pip_install_base(&env_python);
             install_args.extend(["--index-url".to_owned(), plan.index_url.to_owned()]);
@@ -242,7 +243,7 @@ pub(super) fn write_dry_run_tail(
             }
             install_args.extend(stack.package_specs.iter().cloned());
             let venv_plan = dry_run_venv_plan(
-                paths,
+                stack.paths,
                 &plan.python.venv_python_arg(),
                 stack.install_root,
                 &plan.wheel_compatibility.python_tag,
@@ -256,10 +257,7 @@ pub(super) fn write_dry_run_tail(
                 let _ = writeln!(output, "  {key}: {value}");
             }
         }
-        (PlanStack::Resolved(_), None) => {
-            unreachable!("a resolved plan's preview is written with the paths its venv step reads")
-        }
-        (PlanStack::NeedsUv { .. }, _) => {
+        PlanStack::NeedsUv { .. } => {
             let _ = writeln!(output, "  python_env: {NOT_RESOLVED}");
             let _ = writeln!(output, "  command: {NOT_RESOLVED}");
             let _ = writeln!(output, "  env: {NOT_RESOLVED}");
@@ -343,6 +341,6 @@ pub(super) fn unresolved_wheel_preview(preview: &UnresolvedPreview<'_>) -> Strin
     };
     let mut output = String::new();
     write_wheel_plan(&mut output, &plan);
-    write_dry_run_tail(&mut output, &plan, None);
+    write_dry_run_tail(&mut output, &plan);
     output
 }
