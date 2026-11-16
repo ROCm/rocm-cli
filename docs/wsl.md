@@ -324,7 +324,9 @@ below.
   (`wsl_runtime_librocdxg` in the text form, `summary.unlinked_runtime_librocdxg`
   in `--json`; printed only when there is one). The wheel ships
   `librocdxg.so.1` beside `libhsa-runtime64`, but the runtime opens
-  `librocdxg.so`, which the wheel does not ship, so it loads the host's copy.
+  `librocdxg.so`, which the wheel does not ship (or which is a link to a file
+  that is missing: the loader's `open` fails on a broken link as on an absent
+  file), so it loads the host's copy.
   A host `rocdxg-roct` older than the runtime expects then fails at first GPU
   use, for example ROCm 10.2 and 10.3 nightly runtimes against `rocdxg-roct`
   1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`, then a segmentation
@@ -332,7 +334,12 @@ below.
   the host's plumbing. Wheel runtime installs and updates (`rocm install sdk`, `rocm update --apply`)
   link `librocdxg.so` to the runtime's own copy on WSL (tarballs ship both
   names, and an adopted runtime is never linked); for a runtime installed earlier the line names the
-  `ln -s librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same.
+  `ln -sfn librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same
+  (`-fn` so that it also replaces a dangling `librocdxg.so`; the install replaces
+  one atomically, and never touches a `librocdxg.so` that resolves). The
+  versioned name is the fixed `librocdxg.so.1`: a wheel whose soname changes is
+  not detected or linked, and a dangling `librocdxg.so` beside a runtime with no
+  `librocdxg.so.1` is not detected.
   The mechanism (the unversioned open skipping the runtime's directory and
   landing on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2
   nightly; which component requests `hsaKmtSetPersistingCacheSize` is not

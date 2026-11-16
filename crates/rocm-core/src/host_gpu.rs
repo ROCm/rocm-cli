@@ -140,9 +140,9 @@ pub struct ExamineSummary {
     pub managed_runtime_count: usize,
     pub managed_service_count: usize,
     /// Managed runtimes' own `librocdxg.so.1` that the runtime's HSA runtime does
-    /// not load on this WSL2 host, because it opens `librocdxg.so` and the wheel
-    /// ships no such file, so it takes the host's copy instead. Empty off WSL2
-    /// and when every runtime's copy is reachable. See
+    /// not load on this WSL host, because it opens `librocdxg.so` and the wheel
+    /// ships no such file (or the file is a dangling link), so it takes the host's
+    /// copy instead. Empty off WSL and when every runtime's copy is reachable. See
     /// [`crate::runtime_rocdxg`]. Absent from output written before the field
     /// existed, hence the default.
     #[serde(default)]

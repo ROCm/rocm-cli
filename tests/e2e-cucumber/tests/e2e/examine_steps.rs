@@ -2449,12 +2449,6 @@ fn push_planted_wsl_machine_env(world: &mut E2eWorld, loader_path: &str) {
         "ROCM_CLI_TEST_HOST_ROOT",
         root.join("host-root").into_os_string(),
     ));
-    // A planted managed runtime makes every `rocm` start run the startup update
-    // check, which needs a PATH Python and the network and prints progress ahead
-    // of a `--json` document. These scenarios are about the host, not updates.
-    world
-        .command_env
-        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
 }
 
 #[given("a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache")]
@@ -3200,6 +3194,17 @@ const PLANTED_RUNTIME_ROCDXG: &str = "the runtime's own librocdxg";
 /// Black-box: plain JSON in the registry schema, as `rocm install sdk` would
 /// have written it, with files standing in for the libraries (an empty file is
 /// enough for a check of which names exist).
+/// A planted managed runtime makes every `rocm` start run the startup update
+/// check, which needs a PATH Python and the network and prints progress ahead of a
+/// `--json` document. The scenarios that plant one are about the host, not
+/// updates. Like every scenario env it is consumed by one run, so a step that runs
+/// `rocm` again re-plants it.
+fn disable_startup_update_check(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
+}
+
 fn plant_managed_runtime_with_rocdxg(world: &mut E2eWorld, with_unversioned: bool) {
     let root = world
         .isolated_root
@@ -3240,6 +3245,7 @@ fn plant_managed_runtime_with_rocdxg(world: &mut E2eWorld, with_unversioned: boo
         serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
     )
     .expect("failed to write the planted runtime manifest");
+    disable_startup_update_check(world);
 }
 
 #[given("a WSL machine with a managed runtime that ships only a versioned librocdxg")]
@@ -3263,9 +3269,33 @@ async fn native_machine_with_runtime_shipping_only_versioned_rocdxg(world: &mut 
         "ROCM_CLI_TEST_HOST_ROOT",
         root.join("host-root").into_os_string(),
     ));
-    world
-        .command_env
-        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
+}
+
+#[given("a WSL machine with a managed runtime whose librocdxg.so is a link to a missing file")]
+async fn wsl_machine_with_runtime_holding_a_dangling_rocdxg_link(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "/opt/rocm/lib");
+    plant_managed_runtime_with_rocdxg(world, false);
+    let lib = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("wheel-runtime/lib");
+    // The loader's open() fails on a broken link as on a missing file, so this is
+    // as good as no link: the runtime loads the host's librocdxg.
+    plant_dangling_link("gone.so.9", &lib.join("librocdxg.so"));
+}
+
+/// A link to a file that does not exist. The scenario is `@requires-os:linux`, so
+/// the non-Unix arm exists only to keep the harness compiling on Windows.
+#[cfg(unix)]
+fn plant_dangling_link(target: &str, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).expect("failed to plant a dangling link");
+}
+
+#[cfg(not(unix))]
+fn plant_dangling_link(_target: &str, _link: &std::path::Path) {
+    unreachable!("a Linux-only scenario step");
 }
 
 #[given("a WSL machine with a managed runtime that has librocdxg.so beside its own copy")]
@@ -3313,6 +3343,12 @@ async fn assert_runtime_librocdxg_not_listed(world: &mut E2eWorld) {
     "the user runs the command the inspection advises for that runtime's librocdxg and inspects again"
 )]
 async fn user_follows_the_runtime_librocdxg_advice(world: &mut E2eWorld) {
+    // The scenario env is consumed by each run; a scenario that inspected before
+    // this step needs the machine planted again.
+    if world.command_env.is_empty() {
+        push_planted_wsl_machine_env(world, "/opt/rocm/lib");
+        disable_startup_update_check(world);
+    }
     let (text, _, text_rc) =
         crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip"]);
     assert_eq!(text_rc, 0, "`rocm examine` failed:\n{text}");
@@ -3345,6 +3381,7 @@ async fn user_follows_the_runtime_librocdxg_advice(world: &mut E2eWorld) {
     // The scenario env is consumed by each run (`mem::take` in
     // `run_rocm_with_scenario_env`), so the second run needs it planted again.
     push_planted_wsl_machine_env(world, "/opt/rocm/lib");
+    disable_startup_update_check(world);
     let (stdout, stderr, rc) =
         crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
     world.cli_output = Some(stdout);

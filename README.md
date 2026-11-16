@@ -315,7 +315,7 @@ raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
 On WSL2, wheel runtime installs and updates (`rocm install sdk`,
 `rocm update --apply`) also link `librocdxg.so` to the runtime's own
 `librocdxg.so.1`, so the runtime searches its own copy rather than an older host
-`librocdxg`; for a runtime installed earlier, `rocm examine` prints a `wsl_runtime_librocdxg` line
+`librocdxg` (it also replaces a dangling `librocdxg.so`); for a runtime installed earlier, `rocm examine` prints a `wsl_runtime_librocdxg` line
 with the command that does the same (see
 [WSL](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md)).
 

@@ -279,7 +279,10 @@ pub(crate) fn managed_therock_environment_records(
         .collect()
 }
 
-/// The library directories of every managed runtime in the registry; a directory
+/// The library directories of every managed runtime in the registry, as
+/// `managed_therock_environment_from_record` builds them: the recorded library
+/// and runtime-root `lib`/`lib64` directories, plus, on Linux, the host's
+/// `/usr/lib/wsl/lib` when it exists (that one is not a runtime's own). A directory
 /// shared by two runtimes appears twice.
 ///
 /// For checks that look at what a runtime ships on disk, such as

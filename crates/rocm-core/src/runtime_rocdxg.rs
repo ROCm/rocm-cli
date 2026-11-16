@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Which `librocdxg` a managed wheel runtime's HSA runtime actually loads on WSL2.
+//! Which `librocdxg` a managed wheel runtime's HSA runtime actually loads on WSL.
 //!
 //! The ROCm wheels ship their own `librocdxg.so.1` in `_rocm_sdk_core/lib`, next
 //! to `libhsa-runtime64.so.1`. The HSA runtime does not ask for that name: it
@@ -25,6 +25,21 @@
 //! before `LD_LIBRARY_PATH`), so it works for a bare `<runtime>/bin/python` as
 //! well as for a process the CLI launches.
 //!
+//! The name is judged three ways ([`NameState`]): absent, present and resolving
+//! (a regular file or a link that resolves: left alone, never replaced), and
+//! dangling (a link whose target is missing). A dangling `librocdxg.so` is as bad
+//! as an absent one: the loader's `open` fails with `ENOENT` on a broken link,
+//! tries the next directory and loads the host's copy (`LD_DEBUG=libs` on the
+//! 10.2 nightly with a dangling link first on `LD_LIBRARY_PATH` showed the link
+//! tried and skipped, then exit 139 as with no link). So detection lists a
+//! dangling name like an absent one, and the install replaces it atomically.
+//!
+//! Limits. The versioned name is the hard-coded `librocdxg.so.1`: a wheel whose
+//! soname is no longer that is neither detected nor linked, and no globbing is
+//! done (which versioned file would win is a design decision). A dangling
+//! `librocdxg.so` beside a runtime that ships no `librocdxg.so.1` is not
+//! detected either, because there is nothing to link it to.
+//!
 //! Only wheel runtime installs and updates (`install_wheel_runtime`) link.
 //! Tarballs ship both names, and an adopted or imported runtime is never linked
 //! by the CLI. The link is not tracked by the installer, so an uninstall that
@@ -38,30 +53,58 @@ const SHIPPED_NAME: &str = "librocdxg.so.1";
 /// The name the HSA runtime opens.
 const OPENED_NAME: &str = "librocdxg.so";
 
+/// What is at a path, as the loader sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameState {
+    /// Nothing is there.
+    Absent,
+    /// A regular file, or a link whose target exists.
+    Resolves,
+    /// A link whose target does not exist: `open` fails with `ENOENT`, so the
+    /// loader skips it as it would an absent name.
+    Dangling,
+}
+
+/// The [`NameState`] of `path` on this machine.
+#[must_use]
+pub fn name_state(path: &Path) -> NameState {
+    if path.metadata().is_ok() {
+        NameState::Resolves
+    } else if path.symlink_metadata().is_ok() {
+        NameState::Dangling
+    } else {
+        NameState::Absent
+    }
+}
+
 /// The runtime's own `librocdxg.so.1` for each directory in `dirs` that holds
-/// one next to a `libhsa-runtime64` but has no `librocdxg.so` beside it.
+/// one next to a `libhsa-runtime64` but whose `librocdxg.so` is absent or
+/// dangling.
 ///
 /// In such a directory the runtime's lookup for `librocdxg.so` does not find the
 /// runtime's own copy, so it loads the host's. A directory with the library but
-/// no runtime beside it is left out: nothing there opens it by name. One that
-/// already has `librocdxg.so` (a file or a link, even a broken one that the
-/// loader will refuse) is left out as well; there is nothing for this module to
-/// add.
+/// no runtime beside it is left out: nothing there opens it by name. One whose
+/// `librocdxg.so` resolves (a file or a working link) is left out as well; there
+/// is nothing for this module to add. A directory with no `librocdxg.so.1` is
+/// left out: there is nothing to link to.
 ///
-/// Takes a presence check rather than reading the machine, so the layouts can
-/// be tested without one. The real check is [`path_present`], which does not
-/// follow links, so a dangling `librocdxg.so` counts as present.
+/// Takes the state check rather than reading the machine, so the layouts can be
+/// tested without one; the real check is [`name_state`].
 #[must_use]
-pub fn unlinked_runtime_copies(dirs: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+pub fn unlinked_runtime_copies(
+    dirs: &[PathBuf],
+    state: impl Fn(&Path) -> NameState,
+) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     for dir in dirs {
         let copy = dir.join(SHIPPED_NAME);
         let has_runtime = ["libhsa-runtime64.so.1", "libhsa-runtime64.so"]
             .iter()
-            .any(|name| exists(&dir.join(name)));
-        // A dangling `librocdxg.so` is the loader's to report, and `ln -s` over
-        // it would fail with "File exists", so the check must not follow links.
-        if exists(&copy) && !exists(&dir.join(OPENED_NAME)) && has_runtime && !found.contains(&copy)
+            .any(|name| state(&dir.join(name)) == NameState::Resolves);
+        if state(&copy) == NameState::Resolves
+            && state(&dir.join(OPENED_NAME)) != NameState::Resolves
+            && has_runtime
+            && !found.contains(&copy)
         {
             found.push(copy);
         }
@@ -69,15 +112,10 @@ pub fn unlinked_runtime_copies(dirs: &[PathBuf], exists: impl Fn(&Path) -> bool)
     found
 }
 
-/// Whether something, a dangling link included, is at `path`.
-fn path_present(path: &Path) -> bool {
-    path.symlink_metadata().is_ok()
-}
-
 /// The `librocdxg.so.1` copies of every managed runtime whose own HSA runtime
 /// would not load them, for `rocm examine`.
 ///
-/// Empty off WSL2 (`is_wsl` false): the advice is about the WSL2 loader path and
+/// Empty off WSL (`is_wsl` false): the advice is about the WSL loader path and
 /// would mislead on a native host.
 #[must_use]
 pub fn unlinked_managed_runtime_copies(is_wsl: bool, paths: &crate::AppPaths) -> Vec<PathBuf> {
@@ -86,11 +124,11 @@ pub fn unlinked_managed_runtime_copies(is_wsl: bool, paths: &crate::AppPaths) ->
     }
     unlinked_runtime_copies(
         &crate::managed_runtime::managed_runtime_library_dirs(paths),
-        path_present,
+        name_state,
     )
 }
 
-/// The whole post-install step: on WSL2, link every runtime copy in `dirs` that
+/// The whole post-install step: on WSL, link every runtime copy in `dirs` that
 /// its HSA runtime would not load, and return one line per copy saying what
 /// happened, for the install report.
 ///
@@ -107,26 +145,31 @@ pub fn link_installed_runtime_copies(dirs: &[PathBuf]) -> Vec<String> {
 /// Each line is built from the outcome of that copy's own link attempt, so a
 /// link that failed cannot be reported as made. A failure is not an error for
 /// the install: the line gives the error and the command to run once its cause
-/// is fixed (the same link call failed, so the command alone may fail the same way). Nothing is
-/// touched off WSL2, where the HSA runtime does not open `librocdxg`.
+/// is fixed (the same link call failed, so the command alone may fail the same
+/// way). Nothing is touched off WSL, where the HSA runtime does not open
+/// `librocdxg`.
 pub fn link_installed_runtime_copies_when(is_wsl: bool, dirs: &[PathBuf]) -> Vec<String> {
     if !is_wsl {
         return Vec::new();
     }
-    link_copies_with(dirs, path_present, link_runtime_copy)
+    link_copies_with(dirs, name_state, link_runtime_copy)
 }
 
 fn link_copies_with(
     dirs: &[PathBuf],
-    exists: impl Fn(&Path) -> bool,
-    link: impl Fn(&Path) -> io::Result<PathBuf>,
+    state: impl Fn(&Path) -> NameState,
+    link: impl Fn(&Path) -> io::Result<Linked>,
 ) -> Vec<String> {
-    unlinked_runtime_copies(dirs, exists)
+    unlinked_runtime_copies(dirs, state)
         .iter()
         .map(|copy| match link(copy) {
-            Ok(link) => format!(
+            Ok(linked) if linked.replaced_dangling => format!(
+                "librocdxg: replaced a dangling {} with a link to the runtime's own copy; the runtime searches its own directory first",
+                linked.path.display()
+            ),
+            Ok(linked) => format!(
                 "librocdxg: linked {} to the runtime's own copy; the runtime searches its own directory first",
-                link.display()
+                linked.path.display()
             ),
             Err(error) => format!(
                 "librocdxg: could not link {}: {error}; the runtime may load the host's librocdxg, which fails at first GPU use if it is older than the runtime expects; once the cause above is fixed, run: {}",
@@ -140,6 +183,10 @@ fn link_copies_with(
 /// The command that gives `copy`'s directory the unversioned name, for advice
 /// that has to name something the user can run.
 ///
+/// `-f` and `-n` make it clear a dangling `librocdxg.so` as well as an absent
+/// one (a plain `ln -s` fails with "File exists" on a dangling link). The advice
+/// is only printed for an absent or dangling name, never for one that resolves.
+///
 /// A path containing a newline or invalid UTF-8 is not handled: the advice is one
 /// line printed through `Path::display`.
 #[must_use]
@@ -151,20 +198,35 @@ pub fn link_command(copy: &Path) -> String {
         .display()
         .to_string()
         .replace('\'', "'\\''");
-    format!("ln -s {SHIPPED_NAME} '{target}'")
+    format!("ln -sfn {SHIPPED_NAME} '{target}'")
 }
 
-/// Give `copy`'s directory a `librocdxg.so` that points at `copy`, and return
-/// the link's path.
+/// What [`link_runtime_copy`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Linked {
+    /// The `librocdxg.so` link that now exists.
+    pub path: PathBuf,
+    /// A dangling `librocdxg.so` was there and was replaced.
+    pub replaced_dangling: bool,
+}
+
+/// Give `copy`'s directory a `librocdxg.so` that points at `copy`.
 ///
 /// The link is relative (`librocdxg.so -> librocdxg.so.1`), so it survives the
-/// runtime directory being moved or restored from a cache. An existing
-/// `librocdxg.so` is left alone and reported as an error rather than replaced.
+/// runtime directory being moved or restored from a cache.
+///
+/// What is already at `librocdxg.so` decides (see [`NameState`]): nothing, and
+/// the link is created; a dangling link, and it is replaced atomically (a
+/// temporary link in the same directory is renamed over it, so the name is never
+/// absent in between, and the temporary is removed if the rename fails); a file
+/// or a working link, and it is left alone and reported as an
+/// [`io::ErrorKind::AlreadyExists`] error. `copy` itself is not checked: the
+/// caller links only a copy that exists.
 ///
 /// # Errors
 /// Returns the underlying error when the link cannot be created, or
-/// [`io::ErrorKind::Unsupported`] off Unix (the WSL2 path is Linux only).
-pub fn link_runtime_copy(copy: &Path) -> io::Result<PathBuf> {
+/// [`io::ErrorKind::Unsupported`] off Unix (the WSL path is Linux only).
+pub fn link_runtime_copy(copy: &Path) -> io::Result<Linked> {
     let dir = copy.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -174,8 +236,23 @@ pub fn link_runtime_copy(copy: &Path) -> io::Result<PathBuf> {
     let link = dir.join(OPENED_NAME);
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(SHIPPED_NAME, &link)?;
-        Ok(link)
+        match name_state(&link) {
+            NameState::Absent => {
+                std::os::unix::fs::symlink(SHIPPED_NAME, &link)?;
+                Ok(Linked {
+                    path: link,
+                    replaced_dangling: false,
+                })
+            }
+            NameState::Dangling => {
+                replace_with_link(dir, &link)?;
+                Ok(Linked {
+                    path: link,
+                    replaced_dangling: true,
+                })
+            }
+            NameState::Resolves => Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists")),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -187,10 +264,29 @@ pub fn link_runtime_copy(copy: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Replace `link` with a link to [`SHIPPED_NAME`] without a window in which the
+/// name is absent: make a temporary link beside it, then rename over it.
+#[cfg(unix)]
+fn replace_with_link(dir: &Path, link: &Path) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let temporary = dir.join(format!(
+        ".{OPENED_NAME}.tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::os::unix::fs::symlink(SHIPPED_NAME, &temporary)?;
+    if let Err(error) = std::fs::rename(&temporary, link) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // The tests pin Unix paths and the shell command, and the code under test is
-    // WSL2-only, so they run on Unix only. The module is a plain `cfg(test)` one
+    // WSL-only, so they run on Unix only. The module is a plain `cfg(test)` one
     // so the registry-writer guard in `apps/rocm/src/runtime_registry.rs` cuts it
     // off as test code.
     #[cfg(unix)]
@@ -198,9 +294,15 @@ mod tests {
         use super::super::*;
         use std::collections::HashSet;
 
-        fn files(paths: &[&str]) -> impl Fn(&Path) -> bool {
+        fn files(paths: &[&str]) -> impl Fn(&Path) -> NameState {
             let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
-            move |path| set.contains(path)
+            move |path| {
+                if set.contains(path) {
+                    NameState::Resolves
+                } else {
+                    NameState::Absent
+                }
+            }
         }
 
         fn write(path: &Path, contents: &[u8]) {
@@ -271,7 +373,7 @@ mod tests {
             let copy = PathBuf::from("/rt/lib/librocdxg.so.1");
             assert_eq!(
                 link_command(&copy),
-                "ln -s librocdxg.so.1 '/rt/lib/librocdxg.so'"
+                "ln -sfn librocdxg.so.1 '/rt/lib/librocdxg.so'"
             );
         }
 
@@ -280,7 +382,7 @@ mod tests {
             let copy = PathBuf::from("/rt/it's/librocdxg.so.1");
             assert_eq!(
                 link_command(&copy),
-                "ln -s librocdxg.so.1 '/rt/it'\\''s/librocdxg.so'"
+                "ln -sfn librocdxg.so.1 '/rt/it'\\''s/librocdxg.so'"
             );
         }
 
@@ -293,7 +395,9 @@ mod tests {
             write(&by_install.path().join("librocdxg.so.1"), b"own");
             write(&quoted.join("librocdxg.so.1"), b"own");
 
-            let link = link_runtime_copy(&by_install.path().join("librocdxg.so.1")).expect("link");
+            let link = link_runtime_copy(&by_install.path().join("librocdxg.so.1"))
+                .expect("link")
+                .path;
             let status = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(link_command(&quoted.join("librocdxg.so.1")))
@@ -325,25 +429,125 @@ mod tests {
             assert!(lines[0].contains("could not link"), "{lines:?}");
             assert!(!lines[0].contains("linked /"), "{lines:?}");
             assert!(
-                lines[0].contains("ln -s librocdxg.so.1 '/rt/lib/librocdxg.so'"),
+                lines[0].contains("ln -sfn librocdxg.so.1 '/rt/lib/librocdxg.so'"),
                 "{lines:?}"
             );
         }
 
-        #[test]
-        fn a_dangling_unversioned_link_is_left_alone_by_detection_and_linking() {
+        /// A runtime directory whose `librocdxg.so` is a link to nowhere.
+        fn runtime_dir_with_a_dangling_link() -> tempfile::TempDir {
             let dir = tempfile::tempdir().expect("temp dir");
-            let copy = dir.path().join("librocdxg.so.1");
-            write(&copy, b"x");
+            write(&dir.path().join("librocdxg.so.1"), b"own");
             write(&dir.path().join("libhsa-runtime64.so.1"), b"");
-            std::os::unix::fs::symlink("gone.so", dir.path().join("librocdxg.so")).expect("link");
+            std::os::unix::fs::symlink("gone.so.9", dir.path().join("librocdxg.so"))
+                .expect("dangling link");
+            dir
+        }
+
+        #[test]
+        fn a_dangling_unversioned_link_is_listed_like_an_absent_one() {
+            let dir = runtime_dir_with_a_dangling_link();
             let dirs = vec![dir.path().to_path_buf()];
 
-            assert!(
-                unlinked_runtime_copies(&dirs, path_present).is_empty(),
-                "a dangling link is present, and `ln -s` over it would fail"
+            assert_eq!(
+                name_state(&dir.path().join("librocdxg.so")),
+                NameState::Dangling
             );
-            assert!(link_runtime_copy(&copy).is_err());
+            assert_eq!(
+                unlinked_runtime_copies(&dirs, name_state),
+                vec![dir.path().join("librocdxg.so.1")],
+                "the loader skips a broken link, so the runtime loads the host's copy"
+            );
+        }
+
+        #[test]
+        fn the_install_step_replaces_a_dangling_link_atomically() {
+            let dir = runtime_dir_with_a_dangling_link();
+            let lines = link_installed_runtime_copies_when(true, &[dir.path().to_path_buf()]);
+
+            let link = dir.path().join("librocdxg.so");
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].contains(&format!("replaced a dangling {}", link.display())),
+                "{lines:?}"
+            );
+            assert_eq!(std::fs::read(&link).expect("resolves now"), b"own");
+            assert_eq!(
+                std::fs::read_link(&link).expect("read_link"),
+                PathBuf::from("librocdxg.so.1")
+            );
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("read_dir")
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".tmp-"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "no temporary link is left: {leftovers:?}"
+            );
+        }
+
+        #[test]
+        fn a_resolving_link_or_a_file_is_never_replaced() {
+            for make in [
+                |dir: &Path| {
+                    write(&dir.join("other.so"), b"theirs");
+                    std::os::unix::fs::symlink("other.so", dir.join("librocdxg.so")).expect("link");
+                },
+                |dir: &Path| write(&dir.join("librocdxg.so"), b"theirs"),
+            ] {
+                let dir = runtime_dir_shipping_only_the_versioned_copy();
+                make(dir.path());
+                let lines = link_installed_runtime_copies_when(true, &[dir.path().to_path_buf()]);
+
+                assert!(lines.is_empty(), "nothing to do: {lines:?}");
+                assert_eq!(
+                    std::fs::read(dir.path().join("librocdxg.so")).expect("untouched"),
+                    b"theirs"
+                );
+                assert!(link_runtime_copy(&dir.path().join("librocdxg.so.1")).is_err());
+                assert_eq!(
+                    std::fs::read(dir.path().join("librocdxg.so")).expect("still untouched"),
+                    b"theirs"
+                );
+            }
+        }
+
+        #[test]
+        fn a_failed_replacement_removes_its_temporary_link() {
+            let dir = runtime_dir_with_a_dangling_link();
+            // The rename fails (its destination's directory does not exist), after
+            // the temporary link was made.
+            let outcome = replace_with_link(dir.path(), &dir.path().join("no/such/librocdxg.so"));
+
+            assert!(outcome.is_err());
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("read_dir")
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+
+        #[test]
+        fn the_advised_command_clears_a_dangling_link() {
+            let dir = runtime_dir_with_a_dangling_link();
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(link_command(&dir.path().join("librocdxg.so.1")))
+                .status()
+                .expect("run the advised command");
+
+            assert!(
+                status.success(),
+                "a plain `ln -s` would fail with File exists"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("librocdxg.so")).expect("resolves"),
+                b"own"
+            );
+            assert!(unlinked_runtime_copies(&[dir.path().to_path_buf()], name_state).is_empty());
         }
 
         fn runtime_dir_shipping_only_the_versioned_copy() -> tempfile::TempDir {
@@ -434,7 +638,11 @@ mod tests {
             let dir = runtime_dir_shipping_only_the_versioned_copy();
             write(&dir.path().join("librocdxg.so"), b"someone else's file");
             let absent_unversioned = |path: &Path| {
-                path.file_name().is_none_or(|name| name != "librocdxg.so") && path_present(path)
+                if path.file_name().is_some_and(|name| name == "librocdxg.so") {
+                    NameState::Absent
+                } else {
+                    name_state(path)
+                }
             };
             let lines = link_copies_with(
                 &[dir.path().to_path_buf()],
@@ -452,7 +660,7 @@ mod tests {
                 "{lines:?}"
             );
             assert!(
-                lines[0].contains("once the cause above is fixed, run: ln -s librocdxg.so.1"),
+                lines[0].contains("once the cause above is fixed, run: ln -sfn librocdxg.so.1"),
                 "{lines:?}"
             );
             assert_eq!(
@@ -509,12 +717,12 @@ mod tests {
         fn a_made_link_is_reported_as_made() {
             let dirs = vec![PathBuf::from("/rt/lib")];
             let exists = files(&["/rt/lib/librocdxg.so.1", "/rt/lib/libhsa-runtime64.so.1"]);
-            let lines =
-                link_copies_with(
-                    &dirs,
-                    exists,
-                    |copy| Ok(copy.with_file_name("librocdxg.so")),
-                );
+            let lines = link_copies_with(&dirs, exists, |copy| {
+                Ok(Linked {
+                    path: copy.with_file_name("librocdxg.so"),
+                    replaced_dangling: false,
+                })
+            });
             assert_eq!(lines.len(), 1);
             assert!(
                 lines[0].contains("linked /rt/lib/librocdxg.so to the runtime's own copy"),
@@ -529,9 +737,9 @@ mod tests {
             write(&copy, b"runtime copy");
             write(&dir.path().join("libhsa-runtime64.so.1"), b"");
             let dirs = vec![dir.path().to_path_buf()];
-            assert_eq!(unlinked_runtime_copies(&dirs, Path::exists).len(), 1);
+            assert_eq!(unlinked_runtime_copies(&dirs, name_state).len(), 1);
 
-            let link = link_runtime_copy(&copy).expect("link");
+            let link = link_runtime_copy(&copy).expect("link").path;
 
             assert_eq!(link, dir.path().join("librocdxg.so"));
             assert_eq!(
@@ -544,7 +752,7 @@ mod tests {
                 b"runtime copy"
             );
             assert!(
-                unlinked_runtime_copies(&dirs, Path::exists).is_empty(),
+                unlinked_runtime_copies(&dirs, name_state).is_empty(),
                 "once linked, the runtime is no longer reported"
             );
             assert!(

@@ -753,7 +753,7 @@ fn install_wheel_runtime(
     Ok(SdkInstallResult::installed(output))
 }
 
-/// On WSL2 the runtime's HSA runtime opens `librocdxg.so`, which the wheel does
+/// On WSL the runtime's HSA runtime opens `librocdxg.so`, which the wheel does
 /// not ship, so it would load the host's copy instead of the one beside it. Link
 /// the runtime's own copy into the library directories the probe recorded and
 /// write one report line per copy. The WSL gate is read inside

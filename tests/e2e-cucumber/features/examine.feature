@@ -769,3 +769,16 @@ Feature: GPU detection and system inspection
     Given a machine that is not WSL with a managed runtime that ships only a versioned librocdxg
     When the user inspects that machine in machine-readable form
     Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # A broken `librocdxg.so` link is as bad as none: the loader's open() fails on
+  # it as on a missing file and the runtime loads the host's copy (observed with
+  # LD_DEBUG=libs on the 10.2 nightly, which still exited 139). The inspection
+  # lists it, and the advised command (which must replace a dangling link, so a
+  # plain `ln -s` is not enough) leaves the name reading as the runtime's own copy.
+  @id:examine-lists-a-dangling-runtime-librocdxg-link-and-the-advice-clears-it @requires-os:linux
+  Scenario: examine-53 - A dangling librocdxg.so link is listed and the advised command replaces it
+    Given a WSL machine with a managed runtime whose librocdxg.so is a link to a missing file
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists that runtime's librocdxg as one its own runtime does not load
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load

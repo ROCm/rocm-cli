@@ -33,9 +33,10 @@ impl ExamineSummary {
     /// Present only when a managed runtime ships its own `librocdxg.so.1` that its
     /// HSA runtime does not load. `driver_status` describes the host's plumbing
     /// and stays as it is; this line is about the runtime. Each runtime's fix is
-    /// the `ln -s` command [`crate::runtime_rocdxg::link_command`] builds. It makes
-    /// the same relative link `rocm install sdk` creates for a runtime it installs
-    /// (through `link_runtime_copy`, not through the command).
+    /// the `ln -sfn` command [`crate::runtime_rocdxg::link_command`] builds (`-fn`
+    /// so it also clears a dangling `librocdxg.so`). It makes the same relative
+    /// link `rocm install sdk` creates for a runtime it installs (through
+    /// `link_runtime_copy`, not through the command).
     fn runtime_librocdxg_line(&self) -> String {
         if self.unlinked_runtime_librocdxg.is_empty() {
             return String::new();
@@ -50,7 +51,7 @@ impl ExamineSummary {
         let noun = if count == 1 { "file sits" } else { "files sit" };
         format!(
             "  wsl_runtime_librocdxg: {count} managed-runtime librocdxg.so.1 {noun} beside libhsa-runtime64 with \
-             no librocdxg.so, and the runtime opens librocdxg.so, so it loads the \
+             no librocdxg.so (or a dangling one), and the runtime opens librocdxg.so, so it loads the \
              host's librocdxg if there is one; a host copy older than the runtime expects fails at first GPU \
              use (for example `undefined symbol: hsaKmtSetPersistingCacheSize`). This lists what the files \
              show, not whether this machine is affected. To make the runtime use its own copy (this adds a \
@@ -337,11 +338,11 @@ mod tests {
         // The wording of the line is pinned here; that the command it names clears
         // the finding is proved by scenario `examine-51`, which runs it.
         assert!(
-            rendered.contains("wsl_runtime_librocdxg: 1 managed-runtime librocdxg.so.1 file sits beside libhsa-runtime64 with no librocdxg.so"),
+            rendered.contains("wsl_runtime_librocdxg: 1 managed-runtime librocdxg.so.1 file sits beside libhsa-runtime64 with no librocdxg.so (or a dangling one)"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("run: ln -s librocdxg.so.1 '/rt/lib/librocdxg.so'"),
+            rendered.contains("run: ln -sfn librocdxg.so.1 '/rt/lib/librocdxg.so'"),
             "{rendered}"
         );
         // The host's own plumbing verdict is a separate line and is not rewritten.
@@ -369,9 +370,9 @@ mod tests {
             PathBuf::from("/b/lib/librocdxg.so.1"),
         ];
         let rendered = summary.render_text();
-        assert!(rendered.contains("wsl_runtime_librocdxg: 2 managed-runtime librocdxg.so.1 files sit beside libhsa-runtime64 with no librocdxg.so"));
+        assert!(rendered.contains("wsl_runtime_librocdxg: 2 managed-runtime librocdxg.so.1 files sit beside libhsa-runtime64 with no librocdxg.so (or a dangling one)"));
         assert!(rendered.contains(
-            "run: ln -s librocdxg.so.1 '/a/lib/librocdxg.so'; ln -s librocdxg.so.1 '/b/lib/librocdxg.so'"
+            "run: ln -sfn librocdxg.so.1 '/a/lib/librocdxg.so'; ln -sfn librocdxg.so.1 '/b/lib/librocdxg.so'"
         ));
     }
 
