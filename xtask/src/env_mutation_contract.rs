@@ -509,6 +509,41 @@ mod tests {
         );
     }
 
+    /// Every entry in [`MUTATIONS`] still names a call made somewhere in the
+    /// tree.
+    ///
+    /// The entries are text, so renaming a wrapper or guard leaves its entry
+    /// matching nothing: the scan stays green while the renamed call is
+    /// outside it, which is the silent failure this module is written
+    /// against. Matched on code with literals and comments stripped, so a
+    /// mention in a doc comment does not keep a dead entry alive, and this
+    /// file is skipped because its fixtures exist to spell the calls.
+    #[test]
+    fn every_listed_mutation_is_still_called_in_the_tree() {
+        let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/env_mutation_contract.rs");
+        let code: Vec<String> = workspace_rust_sources()
+            .iter()
+            .filter(|path| **path != this_file)
+            .map(|path| {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+                strip_literals_and_comments(&text)
+            })
+            .collect();
+
+        let stale: Vec<&str> = MUTATIONS
+            .iter()
+            .copied()
+            .filter(|call| !code.iter().any(|text| text.contains(call)))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "MUTATIONS lists calls nothing in the tree makes any more, so the \
+             scan no longer covers whatever replaced them -- rename the entry \
+             with the symbol, or drop it: {stale:?}"
+        );
+    }
+
     /// A mutating call, assembled at runtime.
     ///
     /// Spelling `env::set_var` literally in a fixture would make this file's own
