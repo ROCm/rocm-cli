@@ -3568,6 +3568,15 @@ python scripts/nightly_canary.py --self-test
 What the scheduled canary checks, who is told and how to rerun it are in
 [ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
 
+The vLLM route check (advisory) has a self-test of the same kind:
+
+```bash
+python scripts/vllm_route_check.py --self-test
+```
+
+What it checks and why it is not a required check are in
+[ci-hardware-testing.md](ci-hardware-testing.md#vllm-route-check-advisory).
+
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
 as a whole string — so a change to its quoting, spacing or field order fails
 the test rather than slipping past a substring assertion — and then runs that

@@ -14,9 +14,13 @@ lane runs no scenarios on it (the nightly queue lanes did exactly that on the
 10.3.0a nightly SDKs).
 
 The tables are read from the engine's own source, so this cannot drift from
-them, and the matching mirrors the engine's: a discovery row matches on
+them, and the row matching is the engine's: a discovery row matches on
 ``major.minor``, a static pin on ``major.minor.patch``, both ignoring any
-``aYYYYMMDD`` suffix. Nothing is installed and no GPU is needed.
+``aYYYYMMDD`` suffix. It is stricter than the engine in one place on purpose:
+a version with no row whose major has no discovery row makes the engine fall
+back to the default static pin (a ROCm 7.2.3 vLLM wheel) rather than refuse,
+and this reports that too, because that wheel is not built for the SDK.
+Nothing is installed and no GPU is needed.
 
 It resolves the live indexes, so it can go red with no change in the PR: an
 index that moved on to an SDK vLLM has no wheels for. The workflow that runs it
@@ -70,18 +74,23 @@ def read_routes(discover_text: str, static_text: str) -> dict[str, set]:
 
 
 def route_problem(version: str, routes: dict[str, set]) -> str | None:
-    """Why vLLM cannot be installed on ``version``; ``None`` when it can."""
+    """Why vLLM has no build for ``version``; ``None`` when it has one."""
     found = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
     if not found:
         return f"selected version {version!r} is not a ROCm release version"
     triple = tuple(int(part) for part in found.groups())
     if triple[:2] in routes["discover"] or triple in routes["static"]:
         return None
+    outcome = (
+        "`rocm engines install vllm` refuses that runtime"
+        if triple[0] in {line[0] for line in routes["discover"]}
+        else "`rocm engines install vllm` would fall back to the default static pin, "
+        "a wheel built for another ROCm"
+    )
     return (
-        f"vLLM has no install route for ROCm SDK {version}: no discovery row for "
+        f"vLLM has no build for ROCm SDK {version}: no discovery row for "
         f"{triple[0]}.{triple[1]} and no static pin for "
-        f"{triple[0]}.{triple[1]}.{triple[2]}, so `rocm engines install vllm` "
-        "refuses that runtime"
+        f"{triple[0]}.{triple[1]}.{triple[2]}, so {outcome}"
     )
 
 
@@ -120,7 +129,7 @@ def probe(rocm: str, channel: str, family: str, routes: dict[str, set]) -> str |
     problem = route_problem(version, routes)
     if problem:
         return f"{label}: {problem}"
-    print(f"{label}: ROCm SDK {version} has a vLLM route")
+    print(f"{label}: ROCm SDK {version} has a vLLM build")
     return None
 
 
@@ -150,9 +159,13 @@ def self_test() -> None:
     assert route_problem("10.1.7", routes) is None, "a discovery row spans patches"
     assert route_problem("7.2.3a20260423", routes) is None
     assert route_problem("7.2.4", routes) is not None, "a static pin is exact"
+    refused = route_problem("10.3.0", routes)
+    assert refused and "refuses" in refused, refused
+    fallback = route_problem("11.0.0", routes)
+    assert fallback and "fall back" in fallback, fallback
     assert route_problem("10.9.0", routes) is not None, "test fixtures are no route"
     new_line = route_problem("10.3.0a20261115", routes)
-    assert new_line and "10.3" in new_line, new_line
+    assert new_line and "10.3" in new_line and "refuses" in new_line, new_line
     assert route_problem("nightly", routes) is not None
     for broken in (("", SAMPLE_STATIC), (SAMPLE_DISCOVER, "")):
         try:

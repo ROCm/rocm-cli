@@ -8,13 +8,16 @@ name: vLLM route check
 # Required, that would block unrelated merges, so it only reports.
 #
 # Runs on a PR only when it touches what decides the answer: the resolver that
-# picks the default SDK, the engine's two build tables, or this check. CPU only:
+# picks the default SDK (source.rs, resolve*, version.rs), the engine's two build tables, or this check. CPU only:
 # a dry run, no install.
 
 on:
   pull_request:
     paths:
       - apps/rocm/src/therock/source.rs
+      - apps/rocm/src/therock/resolve.rs
+      - apps/rocm/src/therock/resolve/**
+      - apps/rocm/src/therock/version.rs
       - engines/vllm/src/wheel_builds.rs
       - engines/vllm/src/discover_builds.rs
       - scripts/vllm_route_check.py
@@ -43,7 +46,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache-key: ubuntu-24.04
 
