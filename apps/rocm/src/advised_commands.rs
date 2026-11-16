@@ -1298,6 +1298,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "rocm services prune --any-age --older-than-hours 0",
         "the doc's expected result is that the parser rejects this combination",
     ),
+    (
+        "docs/manual-testing.md",
+        "rocm fix --no-such-option; echo $?",
+        "the doc's expected result is that the parser rejects the unknown option \
+         with exit 2, the code the catalog publishes for an unknown fix-id",
+    ),
     // The `device:` row's value (ROCMAI-550). Every engine reports the backend
     // it selected as `<backend> [gpu <n>] [(<name>)]` -- `vulkan (AMD Radeon
     // Graphics)`, `rocm gpu 1 (AMD Instinct MI300X)` -- so the ROCm half of
