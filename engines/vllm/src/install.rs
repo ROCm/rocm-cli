@@ -344,7 +344,7 @@ fn tensorizer_step(
              {requirement} failed: {error:#}"
         );
         return if fatal {
-            Err(error.context(format!("vLLM was installed, but {message}")))
+            Err(anyhow::anyhow!("vLLM was installed, but {message}"))
         } else {
             Ok(Some(format!("{message}; vLLM would fail at startup")))
         };
@@ -1238,7 +1238,13 @@ mod tests {
         let fail = || -> Result<()> { bail!("network unreachable") };
         let error = tensorizer_step(true, true, || Ok(broken()), fail)
             .expect_err("an install must not leave an unusable runtime");
-        assert!(format!("{error:#}").contains("network unreachable"));
+        // The message already carries the cause once; chaining the error as a
+        // source as well would print it twice under `{:#}`.
+        assert_eq!(
+            format!("{error:#}").matches("network unreachable").count(),
+            1,
+            "{error:#}"
+        );
         let note = tensorizer_step(true, false, || Ok(broken()), fail)?
             .expect("the failure is reported as a note");
         assert!(

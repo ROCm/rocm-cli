@@ -73,6 +73,10 @@ enum Extra {
     KeyErrorInTorch,
     /// A genuine unmet requirement beside the already upgraded tensorizer. A vLLM
     /// install clears it and, like the real one, puts back vLLM's tensorizer pin.
+    /// Any `vllm==` install clears it here: the automatic repair does not pass
+    /// `--reinstall` (only the user's `--reinstall` does), and
+    /// [`Extra::ViolationClearedOnlyByReinstall`] models the violation a plain
+    /// install leaves.
     ViolationBesideUpgrade,
     /// As [`Extra::ViolationBesideUpgrade`], but the stand-in `uv` only clears the
     /// violation when vLLM is installed with `--reinstall`, so the plain repair

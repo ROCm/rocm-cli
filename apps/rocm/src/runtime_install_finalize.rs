@@ -909,6 +909,8 @@ fn tensorizer_divergence_note(expected: &[String]) -> Option<String> {
     let installed = expected
         .iter()
         .find_map(|detail| rocm_core::vllm_tensorizer_override_installed(detail))?;
+    // Parsed from a `uv pip check` line, so flattened like the other values here.
+    let installed = sanitize_log_value(&installed);
     Some(format!(
         "  note: vLLM pins an older tensorizer release; this runtime has tensorizer {installed}, at or above the fixed release {}, which the vLLM install keeps, so `uv pip check` reports vLLM's pin as unmet",
         rocm_core::TENSORIZER_PYTHON314_FIX
@@ -1292,6 +1294,24 @@ pub(crate) mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn the_note_flattens_control_characters_in_the_version_it_prints() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `tensorizer==2.10.1`, but `2.12.1+x\ny` is installed"
+                    .to_owned(),
+            ],
+            &[],
+        );
+
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(
+            rendered.contains("this runtime has tensorizer 2.12.1+x y, at or above"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("\ny"), "{rendered}");
     }
 
     #[test]

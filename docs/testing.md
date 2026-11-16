@@ -1950,13 +1950,14 @@ left alone; that an upgrade which cannot be fetched warns when this run did not
 install vLLM but fails when it did (a first install or `--reinstall`; a repair takes
 the same path); and
 that repairing a genuine violation beside the upgraded tensorizer clears it and
-upgrades tensorizer again. Unit tests in `engines/vllm/src/install.rs` and
-`repair.rs` cover the classification (with Unix and Windows paths), the probe
+upgrades tensorizer again. Unit tests in [install.rs](../engines/vllm/src/install.rs) and
+[repair.rs](../engines/vllm/src/repair.rs) cover the classification (with Unix and Windows paths), the probe
 command, the probe and upgrade timeouts and the repair decision
 (`cargo test -p rocm-engine-vllm tensorizer`). The shared rule that decides what
 counts as vLLM's own unmet tensorizer pin is tested in `rocm-core`
 (`cargo test -p rocm-core tensorizer_override`), and its use in the dependency
-check report in `runtime_install_finalize.rs`
+check report in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs)
 (`cargo test -p rocm --bin rocm runtime_install_finalize`).
 To run just these locally: `cargo xtask e2e -- -n 'vllm-tensorizer'`. The `-n` form
 selects by scenario name and bypasses the harness's own gating, so it needs a Linux
