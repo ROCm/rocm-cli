@@ -439,7 +439,7 @@ fn render_services_text_with_devices(
         .iter()
         .find(|record| !managed_service_is_live(record))
         .map(|record| record.service_id.clone());
-    let records = all_records
+    let mut records = all_records
         .into_iter()
         .filter(|record| all || managed_service_is_live(record))
         .collect::<Vec<_>>();
@@ -486,6 +486,7 @@ fn render_services_text_with_devices(
             .map(|record| (record.service_id.as_str(), record.engine.as_str()))
             .collect(),
     );
+    refresh_published_anthropic_endpoints(&mut records);
 
     let _ = writeln!(output, "Servers");
     for record in &records {
@@ -536,6 +537,49 @@ fn render_services_text_with_devices(
         );
     }
     Ok(output)
+}
+
+/// Re-read each live record's published Anthropic endpoint from the engine
+/// state file, after the device probe and before anything is printed.
+///
+/// [`render_services_text_with_devices`] snapshots every record once, up front,
+/// via `load_managed_services`. That was a local read, so the snapshot was
+/// effectively taken at print time. Since ROCMAI-550 the device probe sits
+/// between the two and can spend seconds (up to
+/// `engine_ipc::SERVICE_DEVICE_PROBE_BUDGET`) on live `Healthcheck` RPCs, and
+/// the serving process publishes the Anthropic endpoint at roughly the moment
+/// the engine first lists its model — the same moment the device probe starts
+/// getting an answer. So the gap this PR opened is exactly the window in which
+/// a freshly ready service renders with no `anthropic endpoint:` row, from a
+/// snapshot that predates the publication.
+///
+/// `serve_cmd.rs`'s post-launch summary hit the same race and answers it with
+/// `rocm_core::wait_for_published_anthropic_endpoint`; this is the same read,
+/// with no wait. A wait is right there — that command has just launched the
+/// server and is standing by for it — and wrong here: `rocm services list`
+/// reports on whatever exists, and must not start blocking on a service that
+/// has not published yet and may never. Reading once restores the timing the
+/// listing had before the probe existed.
+///
+/// Gated on the same statuses as `ManagedServiceRecord::refresh_from_engine_state`,
+/// which is what put the field on the snapshot in the first place: for anything
+/// else the state file is a finished run's leftovers and the record's own value
+/// is the one to keep.
+fn refresh_published_anthropic_endpoints(records: &mut [ManagedServiceRecord]) {
+    for record in records {
+        if !matches!(
+            record.status.as_str(),
+            "starting" | "running" | "recovering" | "ready"
+        ) {
+            continue;
+        }
+        if let Some(url) = rocm_core::wait_for_published_anthropic_endpoint(
+            &record.engine_state_path,
+            Duration::ZERO,
+        ) {
+            record.anthropic_endpoint_url = Some(url);
+        }
+    }
 }
 
 /// The machine-readable counterpart to [`render_services_text`].
@@ -1899,6 +1943,101 @@ pub(crate) mod tests {
             rendered.matches("  device: ").count(),
             1,
             "only the service with a reported device gets a row:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// The `anthropic endpoint:` row must survive the device probe's gap.
+    ///
+    /// `render_services_text_with_devices` snapshots every record once, up
+    /// front. That used to be a local read taken effectively at print time;
+    /// since the device probe went in between, the snapshot can be seconds old
+    /// by the time a row is written. The serving process publishes the
+    /// Anthropic endpoint to the engine state file at about the moment the
+    /// engine first lists its model — the same moment the probe starts getting
+    /// an answer — so that gap is precisely the window in which a freshly
+    /// ready service renders with no `anthropic endpoint:` row at all.
+    ///
+    /// The probe closure here *is* that window: it publishes the endpoint
+    /// while it runs. Rendering from the pre-probe snapshot therefore shows no
+    /// row and this test fails; only a re-read after the probe passes it. The
+    /// fixture cannot be "the endpoint is simply on the record", which the
+    /// stopped-service test above already covers and which passes either way.
+    #[test]
+    fn services_listing_shows_an_anthropic_endpoint_published_while_the_probe_ran() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (root, paths) = test_paths("services-anthropic-after-probe");
+        paths.ensure()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let ready_port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0_u8; 512];
+                let read = stream.read(&mut request)?;
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let body = if request.starts_with("POST /v1/chat/completions ") {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                } else {
+                    r#"{"data":[{"id":"Qwen/Qwen3.5"}]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(())
+        });
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-anthropic-late",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            ready_port,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+        record.write()?;
+        // Nothing is published when the snapshot is taken: no state file exists,
+        // so `refresh_from_engine_state` has nothing to adopt.
+        assert!(!record.engine_state_path.exists());
+        let state_path = record.engine_state_path;
+
+        let rendered = render_services_text_with_devices(&paths, false, |_ready| {
+            // What the serving process does while the probe is in flight.
+            if let Some(parent) = state_path.parent() {
+                fs::create_dir_all(parent).expect("engine state dir");
+            }
+            fs::write(
+                &state_path,
+                r#"{"status": "ready", "anthropic_endpoint_url": "http://127.0.0.1:1", "anthropic_endpoint_mode": "proxy"}"#,
+            )
+            .expect("publish the anthropic endpoint mid-probe");
+            HashMap::new()
+        })?;
+        server
+            .join()
+            .expect("fake models server should not panic")?;
+        let _ = fs::remove_dir_all(root);
+
+        // Port 1 is closed, so the row says "(not responding)". What is pinned
+        // is that the row exists and names the published URL — the five Strix
+        // Halo scenarios that regressed look for exactly this prefix.
+        assert!(
+            rendered.contains("  anthropic endpoint: http://127.0.0.1:1"),
+            "an endpoint published during the device probe must still reach the \
+             row, not be lost to the pre-probe snapshot:\n{rendered}"
         );
         Ok(())
     }
