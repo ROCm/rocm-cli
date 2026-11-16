@@ -1185,11 +1185,12 @@ pub(crate) enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
     ///
-    /// Each running server is asked which backend and GPU it is actually on, so
-    /// this takes a few seconds rather than returning instantly. The asking is
-    /// capped in total (about 18 seconds worst case, however many servers are
-    /// listed), and a server that does not answer in time simply has no device
-    /// line.
+    /// In the default table, each running server is asked which backend and GPU
+    /// it is actually on, so this takes a few seconds rather than returning
+    /// instantly. The asking is capped in total (about 18 seconds worst case,
+    /// however many servers are listed), and a server that does not answer in
+    /// time simply has no device line. `--json` asks nothing and carries no
+    /// device field: it is the stored records, returned as fast as before.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
