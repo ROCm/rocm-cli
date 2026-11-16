@@ -125,7 +125,7 @@ pub fn is_tensorizer_override(subject: &ViolationSubject) -> bool {
 /// Returning the installed release lets a caller print the version the runtime
 /// holds instead of the constant it was upgraded to.
 pub fn vllm_tensorizer_override_installed(detail: &str) -> Option<String> {
-    let (requirer, _) = detail.split_once(" requires `")?;
+    let (requirer, _) = detail.split_once(crate::uv::UV_CHECK_REQUIREMENT_INFIX)?;
     if !requirer.contains("`vllm`") {
         return None;
     }
@@ -304,6 +304,20 @@ mod tests {
             assert!(!tensorizer_version_is_fixed(text), "{text:?} fixed");
             assert!(!tensorizer_version_is_below_fix(text), "{text:?} below");
         }
+    }
+
+    #[test]
+    fn the_requirement_frame_is_the_one_uv_check_parsing_uses() {
+        // Built from the shared constant, not a literal, so a change to the frame
+        // `violation_subject` splits on is a change here too.
+        let detail = format!(
+            "The package `vllm`{}tensorizer==2.10.1`, but `2.12.1` is installed",
+            crate::uv::UV_CHECK_REQUIREMENT_INFIX
+        );
+        assert_eq!(
+            vllm_tensorizer_override_installed(&detail).as_deref(),
+            Some("2.12.1")
+        );
     }
 
     #[test]

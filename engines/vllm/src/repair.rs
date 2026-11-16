@@ -173,8 +173,10 @@ fn repair_from_violations(
         });
 
     if defects.is_empty() {
-        // Nothing to repair. Reinstalling here would replace that torch with the
-        // engine's build and hand back a runtime nobody asked for.
+        // Nothing to repair: every violation is an intended divergence. For torch,
+        // reinstalling would replace the SDK's build with the engine's and hand back a
+        // runtime nobody asked for. For tensorizer the install keeps the upgrade, so
+        // a reinstall is not needed (it would only upgrade tensorizer again).
         //
         // Which sentence is true depends on whose torch this is. Under the alignment it
         // is the SDK's and rocm-cli put it there; under the opt-out it is the user's and

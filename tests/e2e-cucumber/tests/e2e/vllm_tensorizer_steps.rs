@@ -5,13 +5,26 @@
 //! Steps for `vllm_tensorizer.feature`: `rocm engines install vllm` against a
 //! managed runtime whose vLLM pins a tensorizer that cannot be imported.
 //!
-//! The runtime's Python and `uv` are shell stand-ins that share two state
-//! files in the runtime folder, so the scenario can read what the "installed"
-//! tensorizer is rather than trusting the CLI's account of it:
-//! `tensorizer-version` (written by the stand-in `uv` when it is asked to
-//! install tensorizer) and `uv.log` (every `uv` invocation). The stand-ins
-//! use only shell builtins, because the scenario runs the CLI with a PATH that
-//! holds nothing but its own shims.
+//! The runtime's Python and `uv` are shell stand-ins that share state files in
+//! the runtime folder, so the scenario can read what the "installed" tensorizer is
+//! rather than trusting the CLI's account of it:
+//!
+//! - `tensorizer-version`: written by the stand-in `uv` when it installs
+//!   tensorizer (and reset to vLLM's pin when it installs vLLM);
+//! - `uv.log`: every `uv` invocation;
+//! - `probe-ran`: written by the stand-in Python whenever the tensorizer import
+//!   probe runs;
+//! - `repaired`: written by the stand-in `uv` when a vLLM install clears the
+//!   planted violation;
+//! - marker files written when the scenario plants the runtime, which pick how
+//!   the stand-ins behave: `library-failure`, `library-failure-in-tensorizer`,
+//!   `key-error-in-torch`, `needs-pythonpath`, `needs-repair` and
+//!   `repair-needs-reinstall-flag`;
+//! - `bin/vllm`, which the stand-in `uv` creates when it installs vLLM into a
+//!   runtime that did not have it.
+//!
+//! The stand-ins use only shell builtins, because the scenario runs the CLI with
+//! a PATH that holds nothing but its own shims.
 
 use std::path::{Path, PathBuf};
 
@@ -149,9 +162,13 @@ case "$*" in
       echo "KeyError: 'gfx1151'" >&2
       exit 1
     fi
-    if [ -e "{state}/needs-pythonpath" ] && [ -z "$PYTHONPATH" ]; then
-      echo "ModuleNotFoundError: No module named 'amdsmi'" >&2
-      exit 1
+    if [ -e "{state}/needs-pythonpath" ]; then
+      case ":$PYTHONPATH:" in
+        *":{state}/lib/python3.14/site-packages/_rocm_sdk_core/share/amd_smi:"*) ;;
+        *)
+          echo "ModuleNotFoundError: No module named 'amdsmi'" >&2
+          exit 1 ;;
+      esac
     fi
     version=""
     [ -e "{state}/tensorizer-version" ] && read -r version < "{state}/tensorizer-version"
@@ -284,7 +301,15 @@ fn run_engines_install(world: &mut E2eWorld, subcommand: &[&str], extra: &[&str]
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &args,
-        &[("PATH", path.as_str()), ("ROCM_CLI_UV_BINARY", uv.as_str())],
+        &[
+            ("PATH", path.as_str()),
+            ("ROCM_CLI_UV_BINARY", uv.as_str()),
+            // A decoy that never satisfies the stand-in, and that replaces whatever
+            // PYTHONPATH the host exports: only the entry the server's launch
+            // environment prepends to it does, so the result does not depend on
+            // the host.
+            ("PYTHONPATH", "/nonexistent/decoy-pythonpath"),
+        ],
     );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
@@ -506,15 +531,15 @@ async fn refused_not_upgraded(world: &mut E2eWorld) {
             && output.contains("network unreachable"),
         "expected the refusal to name the failed upgrade:\n{output}"
     );
-    // The reinstall really ran before the check, so this is the fresh-install path
-    // and the refusal may say so.
+    // This run installed vLLM (a `--reinstall` or a first install) before the check,
+    // so the refusal may say so.
     assert!(
         output.contains("vLLM was installed, but"),
-        "a refusal after a reinstall should say the install ran:\n{output}"
+        "a refusal after this run installed vLLM should say the install ran:\n{output}"
     );
     assert!(
         uv_log(world).contains("vllm"),
-        "the reinstall must have run, uv log:\n{}",
+        "this run must have installed vLLM, uv log:\n{}",
         uv_log(world)
     );
 }

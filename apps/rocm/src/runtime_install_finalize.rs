@@ -261,9 +261,11 @@ enum EngineDependencyCheck {
     /// build of the release the engine pins, and the tensorizer upgrade leaves
     /// vLLM's runtime holding a newer tensorizer than the one it pins because the
     /// pinned one cannot be imported; the engine's exact-pin metadata cannot
-    /// express either. The distinction matters because the remedy for a real
-    /// violation — reinstalling the engine — is precisely what would undo them and
-    /// restore a runtime that cannot open a device or cannot import tensorizer.
+    /// express either. The distinction matters for torch: the remedy for a real
+    /// violation — reinstalling the engine — would undo a torch divergence and
+    /// restore a runtime that cannot open a device. A tensorizer divergence does not
+    /// rule the reinstall out: the install re-checks tensorizer and upgrades it
+    /// again.
     ExpectedDivergence(Vec<String>),
     /// The check itself could not run (no usable `uv`, unreadable environment).
     NotVerified(String),
