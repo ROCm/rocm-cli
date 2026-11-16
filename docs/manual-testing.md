@@ -27,7 +27,7 @@ output must report `os: linux` and `wsl: true`.
 On WSL2 with a managed wheel runtime, also check `rocm examine`: it prints no
 `wsl_runtime_librocdxg` line for a runtime installed by this build (the install
 linked `librocdxg.so` beside the runtime's `libhsa-runtime64`), and for an older
-runtime the line's `ln -s` command, once run, makes it disappear. Then run
+runtime the line's `ln -sfn` command, once run, makes it disappear. Then run
 `<runtime>/bin/python -I -c "import torch; print(torch.zeros(1, device='cuda'))"`.
 
 Do not set `ROCM_CLI_THEROCK_FAMILY` during normal setup tests. rocm-cli should

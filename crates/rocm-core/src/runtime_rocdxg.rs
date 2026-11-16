@@ -530,6 +530,47 @@ mod tests {
             assert!(leftovers.is_empty(), "{leftovers:?}");
         }
 
+        /// Two threads replacing dangling links in one directory at once (two
+        /// runtime copies in one directory is the shape the counter exists for):
+        /// every temporary name must differ, or one rename fails or a link is lost.
+        #[test]
+        fn concurrent_replacements_in_one_directory_use_distinct_temporary_names() {
+            const ROUNDS: usize = 200;
+            let dir = tempfile::tempdir().expect("temp dir");
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<Vec<io::Result<()>>> = std::thread::scope(|scope| {
+                let run = |name: &'static str| {
+                    let (dir, barrier) = (dir.path(), &barrier);
+                    scope.spawn(move || {
+                        (0..ROUNDS)
+                            .map(|round| {
+                                let link = dir.join(format!("{name}-{round}"));
+                                std::os::unix::fs::symlink("gone", &link).expect("dangling");
+                                barrier.wait();
+                                replace_with_link(dir, &link)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let (a, b) = (run("a"), run("b"));
+                vec![a.join().expect("thread a"), b.join().expect("thread b")]
+            });
+
+            for outcome in results.iter().flatten() {
+                assert!(outcome.is_ok(), "{outcome:?}");
+            }
+            for name in ["a", "b"] {
+                for round in 0..ROUNDS {
+                    let link = dir.path().join(format!("{name}-{round}"));
+                    assert_eq!(
+                        std::fs::read_link(&link).expect("still a link"),
+                        PathBuf::from("librocdxg.so.1"),
+                        "{link:?}"
+                    );
+                }
+            }
+        }
+
         #[test]
         fn the_advised_command_clears_a_dangling_link() {
             let dir = runtime_dir_with_a_dangling_link();
