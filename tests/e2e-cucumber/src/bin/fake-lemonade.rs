@@ -96,25 +96,96 @@ fn run_lemond() -> ExitCode {
 const LEMOND_MAX_LIFETIME: Duration = Duration::from_mins(10);
 
 fn run_lemonade_cli(args: &[String]) -> ExitCode {
-    if let Some(index) = args.iter().position(|arg| arg == "backends") {
-        if args.get(index + 1).map(String::as_str) == Some("install") {
+    match cli_call(args) {
+        CliCall::BackendsInstall => {
             // Fail loudly on stderr: the engine passes the child's stderr
             // through, and the scenario asserts this line to prove the install
             // it saw fail was this fake's rather than a real runtime's.
             eprintln!(
                 "{FAKE_LEMONADE_INSTALL_REFUSAL} for @id:serve-lemonade-preparation-recovery"
             );
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-        print!("{BACKENDS_TABLE}");
-        return ExitCode::SUCCESS;
+        CliCall::Backends => {
+            print!("{BACKENDS_TABLE}");
+            ExitCode::SUCCESS
+        }
+        // `status` succeeds, and so does any other subcommand: the scenario
+        // never reaches model load, and failing here would mask the failure it
+        // is actually asserting.
+        CliCall::Status | CliCall::Other => ExitCode::SUCCESS,
+    }
+}
+
+/// Which of the calls this fake answers `args` is.
+#[derive(Debug, PartialEq, Eq)]
+enum CliCall {
+    Status,
+    Backends,
+    BackendsInstall,
+    Other,
+}
+
+/// Classifies a `lemonade` call by its subcommand: the first word after the
+/// global `--host H` and `--port P` options the engine passes ahead of it.
+/// Matching the subcommand position, not a word anywhere in `args`, keeps an
+/// argument that merely equals `status` or `backends` from being taken as one.
+fn cli_call(args: &[String]) -> CliCall {
+    let mut rest = args;
+    while let [flag, _value, tail @ ..] = rest {
+        if flag != "--host" && flag != "--port" {
+            break;
+        }
+        rest = tail;
+    }
+    match rest {
+        [command] if command == "status" => CliCall::Status,
+        [command, action, ..] if command == "backends" && action == "install" => {
+            CliCall::BackendsInstall
+        }
+        // Any other `backends` call lists, so a flag the engine may add later
+        // still gets the table rather than an empty success.
+        [command, ..] if command == "backends" => CliCall::Backends,
+        _ => CliCall::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CliCall, cli_call};
+
+    fn call(args: &[&str]) -> CliCall {
+        cli_call(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
     }
 
-    if args.iter().any(|arg| arg == "status") {
-        return ExitCode::SUCCESS;
+    #[test]
+    fn the_engine_calls_are_recognised_after_the_global_options() {
+        assert_eq!(
+            call(&["--host", "127.0.0.1", "--port", "8000", "status"]),
+            CliCall::Status
+        );
+        assert_eq!(call(&["backends"]), CliCall::Backends);
+        assert_eq!(call(&["backends", "--verbose"]), CliCall::Backends);
+        assert_eq!(
+            call(&[
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000",
+                "backends",
+                "install",
+                "llamacpp:rocm",
+            ]),
+            CliCall::BackendsInstall
+        );
     }
 
-    // Any other subcommand: succeed quietly. The scenario never reaches model
-    // load, and failing here would mask the failure it is actually asserting.
-    ExitCode::SUCCESS
+    #[test]
+    fn a_word_outside_the_subcommand_position_is_not_a_subcommand() {
+        assert_eq!(call(&["pull", "status"]), CliCall::Other);
+        assert_eq!(call(&["pull", "backends", "install"]), CliCall::Other);
+        assert_eq!(call(&["--host", "status", "pull"]), CliCall::Other);
+        assert_eq!(call(&["status", "extra"]), CliCall::Other);
+        assert_eq!(call(&[]), CliCall::Other);
+    }
 }
