@@ -47,7 +47,16 @@ impl AppState {
             .or_else(|| {
                 self.serve_wizard
                     .as_ref()
-                    .and_then(|m| m.active_job.as_deref())
+                    .and_then(|m| {
+                        // While the serve wizard's detach-confirm modal is open,
+                        // that modal owns the overlay; do not let the shared
+                        // active-job console renderer mask it.
+                        if m.detach_confirm.is_some() {
+                            None
+                        } else {
+                            m.active_job.as_deref()
+                        }
+                    })
             })
             .or_else(|| {
                 self.engine_manager
@@ -223,6 +232,7 @@ impl AppState {
                 && w.browser.is_none()
                 && w.picker.is_none()
                 && w.approval.is_none()
+                && w.detach_confirm.is_none()
                 && w.active_job.is_none()
         }) && self
             .install_manager
@@ -556,11 +566,16 @@ mod tests {
             browser,
             picker,
             approval,
+            detach_confirm,
             active_job,
             message: _,
         } = ServeWizardState::default();
         assert!(
-            browser.is_none() && picker.is_none() && approval.is_none() && active_job.is_none()
+            browser.is_none()
+                && picker.is_none()
+                && approval.is_none()
+                && detach_confirm.is_none()
+                && active_job.is_none()
         );
 
         let InstallManagerState {

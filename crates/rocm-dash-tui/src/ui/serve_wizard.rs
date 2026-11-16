@@ -250,6 +250,9 @@ pub struct ServeWizardState {
     pub picker: Option<ModelPicker>,
     /// Approval modal; `Some` while a launch is gated.
     pub approval: Option<PendingServe>,
+    /// Confirmation modal shown when the user tries to leave a running serve
+    /// console, to avoid hiding startup failures by accident.
+    pub detach_confirm: Option<ApprovalChoice>,
     /// In-flight (or just-finished) launch job id.
     pub active_job: Option<String>,
     /// Transient validation message (e.g. empty model / bad port).
@@ -271,6 +274,7 @@ impl Default for ServeWizardState {
             browser: None,
             picker: None,
             approval: None,
+            detach_confirm: None,
             active_job: None,
             message: None,
         }
@@ -520,11 +524,32 @@ pub fn on_key(
         return Vec::new();
     }
 
+    // 3b) Running-console detach confirmation has focus.
+    if let Some(choice) = w.detach_confirm {
+        let (choice, verdict) = approval_key(key.code, choice);
+        w.detach_confirm = Some(choice);
+        match verdict {
+            Some(ApprovalVerdict::Approve) => *wizard = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => w.detach_confirm = None,
+            None => {}
+        }
+        return Vec::new();
+    }
+
     // 4) A launch job is showing in the console.
     if let Some(job_id) = w.active_job.clone() {
+        let running = jobs.job(&job_id).is_some_and(|j| !j.is_terminal());
         match on_console_key(&job_id, jobs, key) {
             ConsoleOutcome::Cancelled(fx) => return fx,
-            ConsoleOutcome::Closed => *wizard = None,
+            ConsoleOutcome::Closed => {
+                if running {
+                    // Leaving while startup is still in progress can hide a
+                    // near-immediate failure. Make this explicit.
+                    w.detach_confirm = Some(ApprovalChoice::Deny);
+                } else {
+                    *wizard = None;
+                }
+            }
             ConsoleOutcome::Dismissed => w.active_job = None,
             ConsoleOutcome::Unhandled => {}
         }
@@ -760,6 +785,18 @@ fn spawn_serve(
     fx
 }
 
+fn detach_running_request(model: &str) -> ApprovalRequest {
+    ApprovalRequest::new(
+        format!("leave running serve for {model} ?"),
+        vec![
+            "The serve job is still running or starting.".to_string(),
+            "Leaving now can hide a startup failure until you check services/logs later.".to_string(),
+            "Approve: leave this screen now.".to_string(),
+            "Deny: keep watching the live startup console.".to_string(),
+        ],
+    )
+}
+
 /// Render the overlay (form, or the folder browser, or the approval modal, or
 /// the job console — in priority order).
 pub fn draw_serve_wizard(
@@ -827,6 +864,15 @@ pub fn draw_serve_wizard(
     }
     if let Some(pending) = &w.approval {
         draw_approval(f, area, &pending.request, pending.choice, theme);
+    }
+    if let Some(choice) = w.detach_confirm {
+        draw_approval(
+            f,
+            area,
+            &detach_running_request(w.model.trim()),
+            choice,
+            theme,
+        );
     }
 }
 
@@ -1983,13 +2029,15 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.as_ref().unwrap().active_job.is_some());
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('q')));
-        assert!(wiz.is_none(), "q must close the overlay even mid-job");
+        assert!(wiz.is_some(), "q should require detach confirmation mid-job");
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(wiz.is_none(), "confirming detach closes the overlay");
     }
 
     #[test]
     fn esc_closes_overlay_while_running_then_dismisses_when_terminal() {
-        // Running: Esc leaves the whole overlay (the launch keeps running in the
-        // background) — the user is never trapped during the readiness wait.
+        // Running: Esc asks for detach confirmation first.
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "m".into();
@@ -1998,7 +2046,12 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.as_ref().unwrap().active_job.is_some());
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
-        assert!(wiz.is_none(), "Esc closes the overlay even mid-job");
+        assert!(wiz.is_some(), "Esc should open detach confirmation mid-job");
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        // Deny stays in the console.
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('n')));
+        assert!(wiz.is_some());
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_none());
 
         // Terminal: Esc dismisses the console back to the form (wizard stays open).
         let mut wiz = Some(ServeWizardState::default());
@@ -2018,6 +2071,22 @@ mod tests {
             wiz.is_some(),
             "dismissing a finished console keeps the wizard open"
         );
+    }
+
+    #[test]
+    fn detach_confirmation_cancel_keeps_running_console_open() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        wiz.as_mut().unwrap().model = "m".into();
+        wiz.as_mut().unwrap().focus(Field::Launch);
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        let w = wiz.as_ref().unwrap();
+        assert!(w.detach_confirm.is_none());
+        assert!(w.active_job.is_some(), "cancel keeps console active");
     }
 
     #[test]

@@ -30,6 +30,8 @@ const MENU_ITEMS_Y: u16 = 8;
 const MENU_ITEM_COUNT: u16 = MENU_ITEMS.len() as u16;
 /// Minimum inner width the logo needs before the menu will render.
 const MENU_MIN_WIDTH: u16 = 31;
+/// Minimum width for the compact (no-logo) fallback menu.
+const MENU_MIN_WIDTH_COMPACT: u16 = 1;
 
 /// Whether the Esc menu's inner box is tall and wide enough to show the logo
 /// AND every selectable item. The old guard only checked the logo
@@ -41,6 +43,11 @@ const fn menu_fits(inner_height: u16, inner_width: u16) -> bool {
     inner_width >= MENU_MIN_WIDTH && inner_height >= MENU_ITEMS_Y + MENU_ITEM_COUNT
 }
 
+/// Compact fallback fit check: no logo, just the selectable items.
+const fn menu_fits_compact(inner_height: u16, inner_width: u16) -> bool {
+    inner_width >= MENU_MIN_WIDTH_COMPACT && inner_height >= 1
+}
+
 /// Esc main menu: Home backdrop dimmed by `grey_overlay`, a double-border modal
 /// with the btop `draw_logo` and the Options/Help/Quit list.
 pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
@@ -48,16 +55,52 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     let modal = centered_rect(50, 70, 60, 17, area);
     f.render_widget(Clear, modal);
     let inner = panel::bento(f, modal, None, BoxRole::Primary, false, theme);
-    if !menu_fits(inner.height, inner.width) {
+    let full_layout = menu_fits(inner.height, inner.width);
+    if !full_layout && !menu_fits_compact(inner.height, inner.width) {
         return;
     }
-    let logo_w = 31u16;
-    let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
-    draw_logo(f, cx, inner.y + 1, theme);
 
-    let mx = inner.x + 4;
-    for (i, item) in MENU_ITEMS.iter().enumerate() {
-        let y = inner.y + MENU_ITEMS_Y + i as u16;
+    let (mx, start_y, row_w, first_idx, visible_rows) = if full_layout {
+        let logo_w = 31u16;
+        let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
+        draw_logo(f, cx, inner.y + 1, theme);
+        (
+            inner.x + 4,
+            inner.y + MENU_ITEMS_Y,
+            inner.width.saturating_sub(4),
+            0usize,
+            MENU_ITEMS.len(),
+        )
+    } else {
+        // Small viewport fallback: hide the large wordmark so the actionable
+        // rows stay visible instead of rendering an empty frame.
+        let visible_rows = usize::from(inner.height.min(MENU_ITEM_COUNT));
+        let first_idx = if visible_rows == 0 {
+            0
+        } else {
+            let sel = sel.min(MENU_ITEMS.len().saturating_sub(1));
+            let half = visible_rows / 2;
+            sel.saturating_sub(half)
+                .min(MENU_ITEMS.len().saturating_sub(visible_rows))
+        };
+        let row_pad = u16::from(inner.width > 2);
+        (
+            inner.x + row_pad,
+            inner.y + inner.height.saturating_sub(MENU_ITEM_COUNT) / 2,
+            inner.width.saturating_sub(row_pad),
+            first_idx,
+            visible_rows,
+        )
+    };
+
+    if row_w == 0 || visible_rows == 0 {
+        return;
+    }
+
+    for row in 0..visible_rows {
+        let i = first_idx + row;
+        let item = &MENU_ITEMS[i];
+        let y = start_y + row as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -77,7 +120,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
                 Span::styled(cur, Style::default().fg(theme.accent)),
                 Span::styled(item.label(), st),
             ])),
-            Rect::new(mx, y, inner.width.saturating_sub(4), 1),
+            Rect::new(mx, y, row_w, 1),
         );
     }
 }
@@ -400,29 +443,41 @@ mod tests {
     }
 
     #[test]
-    fn esc_menu_is_drawn_only_when_the_box_is_tall_enough_for_every_item() {
+    fn esc_menu_falls_back_to_compact_layout_when_logo_layout_is_too_tall() {
         // End-to-end counterpart of `esc_menu_requires_room_for_all_items`: on
-        // a 120-column screen the box has 13 rows at height 19 (the logo would
-        // show but not every item) and 14 at height 20, the smallest screen on
-        // which Options, Help and Quit all fit.
+        // a 120-column screen the box at height 19 is too short for the logo
+        // layout, so it should render a compact no-logo menu instead of an
+        // empty frame.
         let theme = Theme::from_name("default-dark");
         let render = |h: u16| {
             let area = Rect::new(0, 0, 120, h);
             crate::ui::tests::rows(120, h, |f| super::draw_menu(f, area, 0, &theme)).join("\n")
         };
-        let short = render(19);
+        let compact = render(19);
         assert!(
-            !short.contains('█')
-                && !short.contains("Options")
-                && !short.contains("Help")
-                && !short.contains("Quit"),
-            "height 19 must draw an empty frame:\n{short}"
+            !compact.contains('█'),
+            "compact fallback should hide the large logo:\n{compact}"
         );
+        for label in ["Options", "Help", "Quit"] {
+            assert!(compact.contains(label), "{label} must remain visible in compact mode");
+        }
         let just_fits = render(20);
         assert!(just_fits.contains('█'), "logo at height 20");
         for label in ["Options", "Help", "Quit"] {
             assert!(just_fits.contains(label), "{label} at height 20");
         }
+    }
+
+    #[test]
+    fn esc_menu_compact_mode_can_render_a_single_visible_row() {
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 120, 3);
+        let tiny = crate::ui::tests::rows(120, 3, |f| super::draw_menu(f, area, 2, &theme))
+            .join("\n");
+        assert!(!tiny.contains('█'), "tiny layout hides logo:\n{tiny}");
+        assert!(tiny.contains("▸ Quit"), "selected row must remain visible:\n{tiny}");
+        assert!(!tiny.contains("Options"), "only one row should be visible:\n{tiny}");
+        assert!(!tiny.contains("Help"), "only one row should be visible:\n{tiny}");
     }
 
     #[test]
