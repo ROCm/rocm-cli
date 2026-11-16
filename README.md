@@ -1530,7 +1530,9 @@ can take a few seconds rather than returning instantly. The query is capped in
 total — about 18 seconds worst case, however many servers are listed — and a
 server that does not answer in time simply has no `device` line rather than
 holding up the rest of the list. The same applies to asking about servers in
-`rocm chat`, which prints the same list.
+`rocm chat`, which prints the same list. `list --json` is unaffected: it emits
+the stored service records, which have no `device` field, asks no server
+anything, and returns as fast as it always did.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
