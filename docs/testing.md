@@ -720,8 +720,8 @@ place fails it), so a change of route is caught even when the endpoint still ans
 inference and stops the scenario-owned service. It needs a usable AMD GPU on a
 Lemonade Linux lane (`@requires-gpu`, `@requires-os:linux`,
 `@requires-engine:lemonade`). It has no flaky expectations row, so a route
-regression fails the lane. Of the other direct-route serves, `serve-07` keeps its
-flaky Linux row; `serve-08` has none, so it fails the lane too.
+regression fails the lane. The other direct-route serves, `serve-07` and
+`serve-08`, have no row either, so a regression there fails the lane too.
 
 The daemon's Lemonade contracts in
 [telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
@@ -754,18 +754,16 @@ The dashboard scenarios in
   claims. One remaining model shows its throughput, an empty or unreachable
   server shows no models, and a reload restores both.
 - `dash-lemonade-managed-inference-journey`: a GPU-gated real Lemonade serve and
-  inference followed by dashboard observation. On Linux Lemonade hosts it is
-  expected to be flaky and its serve is bounded by `serve_timeout_secs` (readiness polling; the CLI process is killed only 300 s after that) in
-  [expectations.toml](../tests/e2e-cucumber/expectations.toml). The model must
+  inference followed by dashboard observation. It carries no row in
+  [expectations.toml](../tests/e2e-cucumber/expectations.toml), so it is
+  expected to pass on every Linux Lemonade host that runs it; its flaky
+  ROCMAI-898 row was removed with the others (see
+  [Lemonade managed-serve failure evidence](#lemonade-managed-serve-failure-evidence)). The model must
   appear as a full row in Observe, and its instance detail must show it READY
   on the port it was served on. This is real engine acceptance;
   the protocol fixtures do not prove GPU inference or engine installation.
-  The flaky row matches every lane that can run this scenario, so the whole
-  journey is advisory: its dashboard, instance detail, and post-quit inference
-  checks cannot block a merge. Only the serve step is intermittent, but
-  expectations apply per scenario. It also does not gate the
-  "Lemonade — managed runtime installed" wording.
-  Unit tests gate that wording instead:
+  It runs only on GPU lanes, so the
+  "Lemonade — managed runtime installed" wording is also gated by unit tests:
   `managed_installed_verdict_follows_detect_result` in
   [dash.rs](../apps/rocm/src/dash.rs), and the engine pane glyph and verdict
   tests in [pane.rs](../crates/rocm-dash-tui/src/ui/tabs/pane.rs). No other
@@ -1768,9 +1766,20 @@ is the `kill/reap failed` branch, which needs an operating system that refuses t
 kill a child it just started.
 
 Use the evidence to distinguish backend startup, download, and router readiness
-failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
-as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
-backend's ready line does not establish that the router serves the requested
+failures. The diagnostics were added for the Strix Halo Ubuntu Lemonade serve
+failures of ROCMAI-898 (first tracked as
+[issue #897](https://github.com/ROCm/rocm-cli/issues/897)), which [#963](https://github.com/ROCm/rocm-cli/pull/963) fixed.
+Twelve of the scenarios that carried ROCMAI-898 expected-failure rows in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml) no longer carry a
+row on Linux lemonade hosts, and
+`lemonade_linux_serve_scenarios_have_no_xfail_after_rocmai_898` in
+[expectation.rs](../tests/e2e-cucumber/src/expectation.rs) guards them against a
+row that matches one of the hosts it models.
+The other two, `serve-50` and `serve-52`, keep flaky rows under ROCMAI-1023 for
+a different symptom: the serve is ready, but `rocm services list` shows no
+`anthropic endpoint:` row.
+
+A backend's ready line does not establish that the router serves the requested
 model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
 managed-launch contract or imply a backend fix.
 
@@ -3223,12 +3232,8 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper; on a Linux host
-that runs it with lemonade it is an expected failure in
-[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
-not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
-the row also matches other Linux lemonade hosts, where a pass is tolerated).
+(GPU lane: serving with no watcher enabled starts no helper; it is pinned to
+lemonade and expected to pass on every GPU lane that runs it, Linux and Windows).
 
 Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
 its HTTP front are tested in
@@ -3254,7 +3259,14 @@ checks the reply is an event stream that reassembles into text, with usage in
 `message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. The proxy's unit tests cover the stream event sequence, a stream
+serves with. On a Linux host serving with lemonade, `serve-50` and `serve-52`
+carry flaky rows in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml) under ROCMAI-1023
+(`services list` intermittently shows no `anthropic endpoint:` row after the
+service is ready), and `serve-53` has an expected-failure row under EAI-7223
+on vLLM, which is started without a tool-call parser.
+
+The proxy's unit tests cover the stream event sequence, a stream
 that ends early, an engine refusal before the first byte, and the refusal of a
 streaming request that offers `tools` (no scenario covers that refusal). The
 tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`

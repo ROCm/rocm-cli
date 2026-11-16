@@ -910,9 +910,8 @@ Feature: Model serving
   # Linux only: registered names take the router on Windows both with and
   # without the direct llama-server route, so a Windows run cannot tell the
   # two behaviours apart.
-  # No expectations row is added for this scenario. The flaky Linux rows cover
-  # the direct llama-server route, and this scenario takes the router route, so
-  # those rows' failure mode does not describe it. It is nightly-only.
+  # No expectations row: it is expected to pass on every Linux lemonade host
+  # that runs it. It is nightly-only.
   @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
   Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
     Given a managed runtime is active
