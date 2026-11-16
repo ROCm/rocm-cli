@@ -988,11 +988,14 @@ mod tests {
         assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
             "10.1.0a20260611"
         ))));
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.2.0"
+        ))));
     }
     #[test]
     fn runtime_has_discover_build_rejects_a_line_with_no_discover_row() {
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
-            Some("10.2.0")
+            Some("10.3.0")
         )));
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
             Some("7.2.3")

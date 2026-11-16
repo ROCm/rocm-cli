@@ -109,8 +109,8 @@ SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
 vLLM install then refuses that runtime; re-running the install with
 `--python-version 3.14` moves it back.
 
-This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
-through *different* rows: they pin different vLLM minors and read vLLM from
+This route is selected by `major.minor`, so `10.0.0`, `10.1.0` and `10.2.0`
+discover through *different* rows: they pin different vLLM minors and read vLLM from
 different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
 host from 10.0's production index. Both rows take their torch stack from the
 same `whl-next` index, which is also where `rocm install sdk` resolves either
@@ -118,6 +118,17 @@ SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
 resolves its own torch, torchvision, and torchaudio pins fresh from the row's
 own static version prefixes, instead of reusing what the SDK install resolved.
 The SDK install might have resolved a different torch version than the row pins.
+
+The `10.2.0` row is the exception to "the SDK's own `+rocmX.Y` torch": `whl-next`
+publishes no `+rocm10.2` torch, and the 10.2 vLLM wheel needs torch 2.14 or
+newer, so the row installs `torch 2.14.*+rocm10.1.0` with torchvision `0.29.*`
+(published as `+rocm10.0.0`) and the newest torchaudio `2.11` rebuild. That
+mixes ROCm lines on purpose, so the install skips the `+rocm<version>` local
+version check for those three packages on that row only; vLLM's own wheel
+(spelled `.rocm102`) is still checked against the SDK. The row has been run on
+one gfx1151 WSL2 host with the 10.1 SDK, not yet on a 10.2 SDK or an Instinct
+GPU, and the 10.2 vLLM wheel is published for `linux_x86_64` only. The nightly
+channel resolves to ROCm 10.3, which has no vLLM build and no row.
 
 One value flows the other way. A row's exact torchaudio pin, where it has one
 instead of a series, is also the hardware-verified build `rocm install sdk` pins

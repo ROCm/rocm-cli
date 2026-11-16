@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::discover_builds::{
-    DiscoverVersion, VllmRocmDiscoverBuild, rocm_sdk_series_matches, vllm_rocm_discover_build,
+    DiscoverVersion, VllmRocmDiscoverBuild, rocm_sdk_series_matches, rocm_series,
+    vllm_rocm_discover_build,
 };
 use crate::repair::{RepairAssessment, assess_runtime_repair};
 use crate::runtime::{
@@ -859,16 +860,46 @@ fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Resul
     let Some(local) = split_local_version(version).1 else {
         return Ok(());
     };
-    let Some(local_rocm) = local.strip_prefix("rocm") else {
+    let matches = if let Some(local_rocm) = local.strip_prefix("rocm") {
+        rocm_sdk_series_matches(local_rocm, rocm_sdk_version)
+    } else if let Some(compact) = compact_rocm_local_segment(local) {
+        // `.rocm102` names 10.2 with no dot between major and minor.
+        rocm_series(rocm_sdk_version)
+            .is_some_and(|(major, minor)| compact == format!("{major}{minor}"))
+    } else {
         return Ok(());
     };
-    if rocm_sdk_series_matches(local_rocm, rocm_sdk_version) {
+    if matches {
         return Ok(());
     }
     bail!(
         "discovered `{pin}` for ROCm SDK {rocm_sdk_version}, but its `+{local}` build targets a \
          different ROCm release; the index for this ROCm line is serving another SDK's wheels"
     )
+}
+/// Applies [`ensure_rocm_local_version_matches`] to every discovered pin, except
+/// the torch triplet on a row whose `torch_stack_matches_sdk` is false: that
+/// row borrows another ROCm line's torch on purpose.
+fn ensure_discovered_pins_match_sdk(pins: &[String], build: &VllmRocmDiscoverBuild) -> Result<()> {
+    for pin in pins {
+        let is_torch_stack = ["torch==", "torchvision==", "torchaudio=="]
+            .iter()
+            .any(|prefix| pin.starts_with(prefix));
+        if is_torch_stack && !build.torch_stack_matches_sdk {
+            continue;
+        }
+        ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
+    }
+    Ok(())
+}
+/// The digits of a `rocm<digits>` segment in a dotted local version, e.g.
+/// `102` for `g5df63a720.d20261110.rocm102`: the spelling the 10.2 vLLM wheels
+/// use, with no dot between the ROCm major and minor.
+fn compact_rocm_local_segment(local: &str) -> Option<&str> {
+    local
+        .split('.')
+        .filter_map(|segment| segment.strip_prefix("rocm"))
+        .find(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 /// The PEP 425 interpreter tag of `python`, e.g. `cp314`.
 fn python_interpreter_tag(python: &Path) -> Result<String> {
@@ -1031,9 +1062,7 @@ fn install_vllm_rocm10_discover(
     notes.extend(amd_aiter_note);
 
     let pins = vec![torch, torchvision, torchaudio, vllm, flash_attn, amd_aiter];
-    for pin in &pins {
-        ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
-    }
+    ensure_discovered_pins_match_sdk(&pins, build)?;
 
     // Two separate `uv pip install` calls, each scoped to exactly one index:
     // see `vllm_rocm10_discover_torch_install_args` for why combining both
@@ -2120,6 +2149,48 @@ fi
         let rendered = format!("{err:#}");
         assert!(rendered.contains("10.1.0"), "{rendered}");
         assert!(rendered.contains("rocm10.0.0"), "{rendered}");
+    }
+    /// The 10.2 vLLM wheels spell their ROCm line `.rocm102`, not
+    /// `+rocm10.2.0`; the guard must still compare it.
+    #[test]
+    fn rocm_local_version_guard_compares_the_compact_rocm_spelling() {
+        let ten_two = "vllm==0.32.1.dev0+g5df63a720.d20261110.rocm102";
+        assert!(ensure_rocm_local_version_matches(ten_two, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(ten_two, "10.2.0a20261022").is_ok());
+        let err = ensure_rocm_local_version_matches(ten_two, "10.1.0")
+            .expect_err("a 10.2 wheel must not install onto a 10.1 SDK");
+        assert!(format!("{err:#}").contains("rocm102"), "{err:#}");
+        // And a 10.1 wheel must not slip onto a 10.2 SDK through the dotted spelling.
+        assert!(
+            ensure_rocm_local_version_matches("vllm==0.29.1.dev0+rocm10.1.0.gabc", "10.2.0")
+                .is_err()
+        );
+    }
+    /// The 10.2 row installs the 10.1 torch stack on purpose, but only the
+    /// torch triplet may differ from the SDK's line.
+    #[test]
+    fn discovered_pins_guard_skips_only_the_borrowed_torch_stack() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let ten_one = vllm_rocm_discover_build("10.1.0").expect("10.1 row");
+        let torch_stack = |torch: &str| {
+            vec![
+                format!("torch=={torch}"),
+                "torchvision==0.29.0+rocm10.0.0".to_owned(),
+                "torchaudio==2.11.0.3+rocm10.1.0".to_owned(),
+                "vllm==0.32.1.dev0+g5df63a720.d20261110.rocm102".to_owned(),
+                "flash-attn==2.8.3".to_owned(),
+            ]
+        };
+        assert!(
+            ensure_discovered_pins_match_sdk(&torch_stack("2.14.0+rocm10.1.0"), ten_two).is_ok()
+        );
+        // The same borrowed stack is rejected on a row that expects its own.
+        assert!(
+            ensure_discovered_pins_match_sdk(&torch_stack("2.14.0+rocm10.1.0"), ten_one).is_err()
+        );
+        // vLLM itself is still checked on the 10.2 row.
+        let wrong_vllm = vec!["vllm==0.29.1.dev0+rocm10.1.0.gabc".to_owned()];
+        assert!(ensure_discovered_pins_match_sdk(&wrong_vllm, ten_two).is_err());
     }
     /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
     /// arg-builder helpers in isolation: the remaining-deps install must use

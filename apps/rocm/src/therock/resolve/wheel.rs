@@ -1927,7 +1927,11 @@ mod tests {
         );
         assert_eq!(nightly[1], "torch[device-gfx942]==2.13.*");
 
-        let no_row = published_pip_requirements("10.2.0", "2.12.0+rocm10.2.0", "gfx942", false);
+        let ten_two = published_pip_requirements("10.2.0", "2.11.0.3", "gfx942", false);
+        assert_eq!(ten_two[1], "torch[device-gfx942]==2.14.*");
+        assert_eq!(ten_two[2], "torchvision[device-gfx942]==0.29.*");
+
+        let no_row = published_pip_requirements("10.3.0", "2.12.0+rocm10.3.0", "gfx942", false);
         assert_eq!(no_row[1], "torch[device-gfx942]");
         assert_eq!(no_row[2], "torchvision[device-gfx942]");
     }
