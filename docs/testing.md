@@ -1942,6 +1942,43 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## vLLM Tensorizer Check
+
+vLLM's wheel pins a tensorizer release that cannot be imported under Python 3.14,
+and `rocm engines install vllm` checks that it imports and upgrades it when it
+does not (see [vllm.md](vllm.md)). The `vllm-tensorizer-NN` E2E scenarios
+([vllm_tensorizer.feature](../tests/e2e-cucumber/features/vllm_tensorizer.feature);
+gated only on `@requires-os:linux`, with no GPU, network or nightly tag, so the
+Linux e2e jobs run them) run that command against a planted managed runtime
+whose Python cannot import the pinned tensorizer. They check the upgrade
+warning, `dependency_check: expected_divergence`, the note's tensorizer release
+and the release the runtime ends up holding in the same scenario; that a second
+install neither upgrades again nor reinstalls vLLM; that an upgrade which does
+not help warns with the `KeyError` shown when this run did not install vLLM and
+refuses, saying the install ran, when it did (`--reinstall`); that a coloured traceback and a
+`PYTHONPATH` only the server's launch environment provides are judged correctly;
+that a missing library, or a non-library exception raised below tensorizer, is
+left alone; that an upgrade which cannot be fetched warns when this run did not
+install vLLM but fails when it did (a first install or `--reinstall`; a repair takes
+the same path); and
+that repairing a genuine violation beside the upgraded tensorizer clears it and
+upgrades tensorizer again. Unit tests in [install.rs](../engines/vllm/src/install.rs) and
+[repair.rs](../engines/vllm/src/repair.rs) cover the classification (with Unix and Windows paths), the probe
+command, the probe and upgrade timeouts and the repair decision
+(`cargo test -p rocm-engine-vllm -- install::tests repair::tests`, which also
+runs the other tests of those two modules; a `tensorizer` name filter would miss
+the probe-command, timeout and hung-child tests). The shared rule that decides what
+counts as vLLM's own unmet tensorizer pin is tested in `rocm-core`
+(`cargo test -p rocm-core tensorizer_override`), and its use in the dependency
+check report in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs)
+(`cargo test -p rocm --bin rocm runtime_install_finalize`).
+To run just these locally: `cargo xtask e2e -- -n 'vllm-tensorizer'`. The `-n` form
+selects by scenario name and bypasses the harness's own gating, so it needs a Linux
+host for these scenarios.
+The scenarios are Linux only; the real Python 3.14 import is only exercised by
+hand ([manual-testing.md](manual-testing.md#6c-the-tensorizer-upgrade-on-python-314)).
+
 ## Lemonade Installs On Disk
 
 `features/lemonade_installs.feature` covers what a user is told about the
