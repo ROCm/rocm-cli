@@ -621,6 +621,29 @@ impl StopWatch {
     }
 }
 
+/// Whether the service's files on disk still name the supervisor the caller
+/// spawned, read fresh rather than from a spawn-time snapshot.
+///
+/// `supervisor_pid`/`supervisor_start_ticks` are the right pair to compare on:
+/// `refresh_from_engine_state` never touches them, and a legitimate restart
+/// does rewrite them (`record_supervisor_identity` at the top of the spawn
+/// path), so they distinguish "these files still describe the child I am
+/// watching" from "a restart has already replaced it". The pid alone would not
+/// — pids are recycled, which is what the start-time token rules out.
+pub(super) fn still_watching_this_supervisor(
+    paths: &AppPaths,
+    service_id: &str,
+    supervisor_pid: u32,
+    supervisor_start_ticks: Option<u64>,
+) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
+        |(current, _)| {
+            current.supervisor_pid == supervisor_pid
+                && current.supervisor_start_ticks == supervisor_start_ticks
+        },
+    )
+}
+
 /// Decide a managed launch's final status from the HTTP readiness wait and the
 /// child's liveness, and retire a child that died before reaching `Serving` as
 /// a failure rather than quietly reporting whatever lower status the readiness
@@ -667,29 +690,6 @@ impl StopWatch {
 /// `stop_requested_unix_ms` a concurrent stop just wrote to disk — the same
 /// hazard the merge above (and the attach path's equivalent write) already
 /// guards against.
-/// Whether the service's files on disk still name the supervisor the caller
-/// spawned, read fresh rather than from a spawn-time snapshot.
-///
-/// `supervisor_pid`/`supervisor_start_ticks` are the right pair to compare on:
-/// `refresh_from_engine_state` never touches them, and a legitimate restart
-/// does rewrite them (`record_supervisor_identity` at the top of the spawn
-/// path), so they distinguish "these files still describe the child I am
-/// watching" from "a restart has already replaced it". The pid alone would not
-/// — pids are recycled, which is what the start-time token rules out.
-pub(super) fn still_watching_this_supervisor(
-    paths: &AppPaths,
-    service_id: &str,
-    supervisor_pid: u32,
-    supervisor_start_ticks: Option<u64>,
-) -> bool {
-    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
-        |(current, _)| {
-            current.supervisor_pid == supervisor_pid
-                && current.supervisor_start_ticks == supervisor_start_ticks
-        },
-    )
-}
-
 pub(super) fn finalize_managed_launch_readiness(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
@@ -1451,14 +1451,48 @@ mod tests {
             "the engine state file is the one ROCMAI-541 names: {engine_state}"
         );
 
-        // A record that already failed keeps its reason: the guard, not the
-        // overwrite, is what spares it (a `failed` -> `failed` rewrite would
-        // be invisible).
+        // A record that already failed keeps its reason — but the status alone
+        // cannot show that, because a `failed` -> `failed` rewrite is
+        // invisible: delete the `latest.status == on_disk` early return and the
+        // status assertion still passes. What that guard actually controls is
+        // whether the stale snapshot is written back AT ALL, so that is what
+        // this arm pins.
+        //
+        // The stand-in for "something a concurrent writer put on disk after
+        // this snapshot was taken" is a key the record type does not know.
+        // `ManagedServiceRecord` does not deny unknown fields, so a read drops
+        // the key and `write()` re-serializes without it: the key survives
+        // exactly when the early return skips the write, and is gone the moment
+        // it does not. That makes this a deterministic proxy for the concurrent
+        // overwrite the guard exists to avoid, with no race to win.
         record.status = "failed".to_owned();
         record.write().expect("write");
+        let planted_manifest = fs::read_to_string(&record.manifest_path).expect("manifest");
+        let mut planted: serde_json::Value =
+            serde_json::from_str(&planted_manifest).expect("manifest json");
+        planted["written_by_someone_else"] = serde_json::json!("concurrent");
+        fs::write(
+            &record.manifest_path,
+            serde_json::to_vec_pretty(&planted).expect("serialize"),
+        )
+        .expect("plant a concurrent writer's field");
+
         settle_exited_service(&paths, &record.service_id);
+
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
+        let reread: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record.manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(
+            reread
+                .get("written_by_someone_else")
+                .and_then(serde_json::Value::as_str),
+            Some("concurrent"),
+            "the refresh learned nothing, so the stale snapshot must not be written back over \
+             whatever else reached disk meanwhile: that is what the `latest.status == on_disk` \
+             early return protects, and what the status assertion above cannot see"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
