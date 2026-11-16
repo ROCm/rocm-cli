@@ -46,6 +46,7 @@ mod e2e {
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
+    pub mod symptom_file_steps;
     pub mod therock_steps;
     pub mod tui_driver;
     pub mod uninstall_steps;
@@ -57,6 +58,7 @@ mod e2e {
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
     pub mock: Option<MockServer>,
+    pub lemonade_protocol: Option<e2e_cucumber::lemonade_protocol::LemonadeProtocolServer>,
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
@@ -201,6 +203,14 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The pasted error a diagnose-59 or diagnose-60 scenario hands to
+    /// `rocm diagnose --symptom-file`. Its own field for the reason
+    /// `skill_symptom` is.
+    pub symptom_paste: Option<String>,
+    /// The `rocm diagnose --symptom-file` runs a diagnose-59 to diagnose-61
+    /// scenario made: one per shell that piped a paste, or one per file the
+    /// CLI was pointed at.
+    pub symptom_file_runs: Vec<e2e::symptom_file_steps::SymptomFileRun>,
     /// The background helper (`rocm daemon`) a scenario saw running, captured
     /// while it was known live, so `Drop` can stop it by a verified identity if
     /// an earlier step failed before the scenario disabled the watcher.
@@ -354,6 +364,7 @@ impl Default for E2eWorld {
 
         Self {
             mock: None,
+            lemonade_protocol: None,
             artifact_server: None,
             paced_download_server: None,
             comfyui_port_listener: None,
@@ -391,6 +402,8 @@ impl Default for E2eWorld {
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            symptom_paste: None,
+            symptom_file_runs: Vec::new(),
             helper_identity: None,
             recorded_process: None,
             recorded_descendant: None,
@@ -770,6 +783,7 @@ impl Drop for E2eWorld {
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
+        self.lemonade_protocol.take();
         self.artifact_server.take();
         self.paced_download_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
@@ -945,6 +959,67 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
+}
+
+/// Like [`run_rocm`], but gives up after `timeout` instead of blocking forever.
+///
+/// [`run_rocm`] uses `Command::output`, which waits for the pipes to close. A
+/// `rocm serve --managed` that leaves a supervisor holding an inherited pipe, or
+/// that never returns, therefore stalls the whole lane with no report. Here the
+/// child writes to files, so an inherited handle cannot keep us waiting, and the
+/// child is killed once the deadline passes. A timeout is reported as rc `-1`
+/// with a note appended to stderr.
+pub fn run_rocm_bounded(
+    world: &E2eWorld,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
+    use std::process::Stdio;
+
+    let binary = rocm_binary();
+    let dir = tempfile::tempdir().expect("temp dir for bounded command output");
+    let out_path = dir.path().join("stdout");
+    let err_path = dir.path().join("stderr");
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(
+        std::fs::File::create(&out_path).expect("stdout file"),
+    ));
+    cmd.stderr(Stdio::from(
+        std::fs::File::create(&err_path).expect("stderr file"),
+    ));
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait on rocm") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let rc = status.and_then(|s| s.code()).unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&std::fs::read(&out_path).unwrap_or_default()).to_string();
+    let mut stderr =
+        String::from_utf8_lossy(&std::fs::read(&err_path).unwrap_or_default()).to_string();
+    if timed_out {
+        stderr = format!(
+            "{stderr}\n`rocm {}` did not return within {}s and was killed\n",
+            args.join(" "),
+            timeout.as_secs()
+        );
+    }
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (stdout, stderr, rc)
 }
 
 /// Run `rocm`, returning stdout, and panic with the full diagnostic bundle

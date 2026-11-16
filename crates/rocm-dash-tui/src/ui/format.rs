@@ -230,6 +230,30 @@ pub const HELD_MARKER: &str = "*";
 /// panels rather than inventing view-specific descriptions.
 pub const HELD_LEGEND: &str = "* = held (prior scrape window)";
 
+/// Explains the tok/s of a Lemonade row: the endpoint reports the rate of its most
+/// recent completed request, which stays unchanged while the server is idle.
+///
+/// Short enough to join the held legend inside an 80-column table.
+pub const LAST_REQ_LEGEND: &str = "Lemonade: last req tok/s, not live";
+
+/// The label for a throughput figure (compact rows and the instance detail).
+///
+/// `last req` for the rate of a Lemonade endpoint's most recent request
+/// ([`rocm_dash_core::metrics::Instance::gen_tps_last_request`]), `gen` for a
+/// live rate.
+#[must_use]
+pub const fn gen_rate_label(last_request: bool) -> &'static str {
+    if last_request { "last req" } else { "gen" }
+}
+
+/// [`gen_rate_label`] for a column with a fixed budget: as wide as `gen`, so a
+/// last-request rate is never clipped to a different number. A legend
+/// ([`LAST_REQ_LEGEND`]) explains it.
+#[must_use]
+pub const fn gen_rate_label_short(last_request: bool) -> &'static str {
+    if last_request { "req" } else { "gen" }
+}
+
 /// Compact gen_tps for narrow table cells (matches the existing bare-number format).
 ///
 /// - `None` → `"—"` (unavailable; em-dash matches the rest of the table)
