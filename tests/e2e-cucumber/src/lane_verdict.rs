@@ -20,6 +20,18 @@
 //! - [`post_run_verdict`], after the run: a run that executed no scenario is
 //!   fatal on every lane, and so is a GPU-declaring lane on which no
 //!   `@requires-gpu` scenario executed.
+//!
+//! The module also holds the decisions `tests/e2e.rs` takes around those two
+//! checks, so they are unit-tested too: [`preflight`] (the declaration plus
+//! the pre-run verdict), [`needs_gpu`] and [`gpu_scenario_counts`] (the input to
+//! the post-run check), [`run_failed`] (the final exit, combining the
+//! harness's own XPASS and failure classification with the post-run verdict),
+//! [`finish_run`] (the post-run verdict and the `platform.json` manifest that
+//! records it), and [`failure_lines`] and [`note_line`] (the exact lines
+//! printed, with the annotation escaped by [`workflow_command`]). The harness
+//! itself still sets up the run, probes the host, reads its other environment
+//! variables, classifies the scenario results, writes the files, and does the
+//! printing and exiting; that glue has no test of its own.
 
 use std::ffi::OsStr;
 
@@ -137,8 +149,7 @@ pub fn post_run_verdict(
     if executed == 0 {
         verdict.fatal = Some(
             "0 scenarios executed: a run that executes nothing tests nothing. Check the \
-             cucumber --name/--tags filter, E2E_ONLY_LIFECYCLE and E2E_ALSO_RUN_IDS, and the \
-             host capability line above"
+             cucumber --name/--tags filter, E2E_ONLY_LIFECYCLE and E2E_ALSO_RUN_IDS"
                 .to_owned(),
         );
         return verdict;
@@ -164,11 +175,175 @@ pub fn post_run_verdict(
     verdict
 }
 
+/// What the harness carries forward from the pre-run check when it passes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preflight {
+    /// The lane's parsed [`EXPECT_GPU_ENV`] declaration, for the post-run check.
+    pub declaration: GpuDeclaration,
+    /// Lines to print before the run.
+    pub notes: Vec<String>,
+}
+
+/// The pre-run lane check, from the raw [`EXPECT_GPU_ENV`] value and the
+/// probe's results: `Err` with the reason when the run must not start.
+///
+/// An invalid declaration is reported before anything the probe found, since
+/// the verdict depends on the declaration. The harness only prints the notes
+/// or the refusal and exits.
+pub fn preflight(
+    declaration_value: Option<&OsStr>,
+    probe_error: Option<&str>,
+    has_amd_gpu: bool,
+    probe_facts: &str,
+) -> Result<Preflight, String> {
+    let declaration = parse_gpu_declaration(declaration_value)?;
+    let verdict = preflight_verdict(probe_error, has_amd_gpu, probe_facts, declaration);
+    match verdict.fatal {
+        Some(fatal) => Err(fatal),
+        None => Ok(Preflight {
+            declaration,
+            notes: verdict.notes,
+        }),
+    }
+}
+
+/// Whether a scenario counts toward the post-run GPU check.
+///
+/// It does when tagged `@requires-gpu` or `@requires-multi-gpu`. `@requires-gfx-target` does not
+/// count, since such a scenario reads the chip name without using the GPU.
+#[must_use]
+pub const fn needs_gpu(decl: &crate::expectation::ScenarioDecl) -> bool {
+    decl.requires_gpu || decl.requires_multi_gpu
+}
+
+/// Count the GPU scenarios the harness resolved and how many of them executed.
+///
+/// `resolved` is each scenario the harness's filter saw, as `(id, needs_gpu)`;
+/// `executed` is the id of each scenario in `report.json`. `None` when nothing
+/// was resolved: a cucumber `--name`/`--tags` filter replaced the harness's
+/// filter, so which scenarios need a GPU is unknown (see [`post_run_verdict`]).
+/// An executed id the harness did not resolve as a GPU scenario is not counted.
+pub fn gpu_scenario_counts<'a>(
+    resolved: impl IntoIterator<Item = (&'a str, bool)>,
+    executed: impl IntoIterator<Item = &'a str>,
+) -> Option<GpuScenarioCounts> {
+    let mut any_resolved = false;
+    let gpu_ids: std::collections::BTreeSet<&str> = resolved
+        .into_iter()
+        .inspect(|_| any_resolved = true)
+        .filter_map(|(id, gpu)| gpu.then_some(id))
+        .collect();
+    if !any_resolved {
+        return None;
+    }
+    Some(GpuScenarioCounts {
+        resolved: gpu_ids.len(),
+        executed: executed
+            .into_iter()
+            .filter(|id| gpu_ids.contains(id))
+            .count(),
+    })
+}
+
+/// Whether the run exits non-zero after reconciliation.
+///
+/// Any one of a stale XPASS, an unexpected failure (both counted by the
+/// harness) or a fatal post-run verdict is enough. Parse and hook errors exit
+/// earlier, in the harness.
+#[must_use]
+pub const fn run_failed(stale_xpass: usize, unexpected_fail: usize, post_run: &Verdict) -> bool {
+    stale_xpass > 0 || unexpected_fail > 0 || post_run.fatal.is_some()
+}
+
+/// A GitHub Actions workflow command (`::error::…`, `::notice::…`) carrying
+/// `message` as its data.
+///
+/// The data is escaped as the runner expects — `%` first, then CR and LF — so a
+/// probe's stderr tail can neither cut the annotation short at a newline nor
+/// have a literal `%0A` in it read back as one.
+#[must_use]
+pub fn workflow_command(command: &str, message: &str) -> String {
+    let data = message
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    format!("::{command}::{data}")
+}
+
+/// One scenario the harness's filter resolved, as [`finish_run`] needs it.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedRun<'s> {
+    pub id: &'s str,
+    pub feature: &'s str,
+    pub scenario: &'s str,
+    pub engine: &'s str,
+    pub expectation: &'s crate::expectation::Expectation,
+    /// [`needs_gpu`] of the scenario's tags.
+    pub needs_gpu: bool,
+}
+
+/// The post-run lane check, and the `platform.json` manifest that records its
+/// failure as `lane_failure` so the consolidated report shows the lane red.
+///
+/// `resolved` is every scenario the harness's filter saw (empty when a CLI
+/// filter replaced it); `executed` is the id of each scenario in
+/// `report.json`.
+#[must_use]
+pub fn finish_run<'a>(
+    cap: &'a crate::capability::HostCapability,
+    versions: crate::capability::PlatformVersions,
+    resolved: &[ResolvedRun<'_>],
+    executed: &[&str],
+    declaration: GpuDeclaration,
+) -> (Verdict, crate::expectation::PlatformManifest<'a>) {
+    let gpu = gpu_scenario_counts(
+        resolved.iter().map(|r| (r.id, r.needs_gpu)),
+        executed.iter().copied(),
+    );
+    let verdict = post_run_verdict(executed.len(), gpu, declaration);
+    let manifest = crate::expectation::PlatformManifest {
+        platform_slug: &cap.platform_slug,
+        capability: cap,
+        versions,
+        lane_failure: verdict.fatal.clone(),
+        expectations: resolved
+            .iter()
+            .map(|r| {
+                crate::expectation::ResolvedScenario::new(
+                    r.id,
+                    r.feature,
+                    r.scenario,
+                    r.engine,
+                    r.expectation,
+                )
+            })
+            .collect(),
+    };
+    (verdict, manifest)
+}
+
+/// The lines the harness prints when a lane check fails: a GitHub `::error::`
+/// annotation, then the same message as a plain line for anyone reading the
+/// log outside Actions.
+#[must_use]
+pub fn failure_lines(message: &str) -> [String; 2] {
+    let line = format!("E2E lane check failed: {message}");
+    [workflow_command("error", &line), line]
+}
+
+/// The `::notice::` line the harness prints for a lane-check note.
+#[must_use]
+pub fn note_line(note: &str) -> String {
+    workflow_command("notice", &format!("E2E lane: {note}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPECT_GPU_ENV, GpuDeclaration, GpuScenarioCounts, Verdict, parse_gpu_declaration,
-        post_run_verdict, preflight_verdict,
+        EXPECT_GPU_ENV, GpuDeclaration, GpuScenarioCounts, Preflight, ResolvedRun, Verdict,
+        failure_lines, finish_run, gpu_scenario_counts, needs_gpu, note_line,
+        parse_gpu_declaration, post_run_verdict, preflight, preflight_verdict, run_failed,
+        workflow_command,
     };
     use std::ffi::OsStr;
 
@@ -270,6 +445,9 @@ mod tests {
     fn a_declared_absent_gpu_that_is_present_is_a_note_not_a_failure() {
         let verdict = preflight_verdict(None, true, FACTS, GpuDeclaration::NotExpected);
         assert_eq!(verdict.fatal, None);
+        // Pins the wording only. That @requires-gpu scenarios do run on a host
+        // whose probe found a GPU, whatever the declaration, is proved by
+        // `expectation::tests::requires_gpu_runs_where_the_probe_found_a_gpu_and_skips_where_it_did_not`.
         assert_eq!(
             verdict.notes,
             [format!(
@@ -286,6 +464,9 @@ mod tests {
     fn a_declared_absent_gpu_that_is_absent_runs_with_a_note() {
         let verdict = preflight_verdict(None, false, FACTS, GpuDeclaration::NotExpected);
         assert_eq!(verdict.fatal, None);
+        // Pins the wording only. That @requires-gpu scenarios resolve to skip
+        // (not applicable) where the probe found no GPU is proved by
+        // `expectation::tests::requires_gpu_runs_where_the_probe_found_a_gpu_and_skips_where_it_did_not`.
         assert_eq!(
             verdict.notes,
             [
@@ -331,7 +512,7 @@ mod tests {
                     Some(
                         "0 scenarios executed: a run that executes nothing tests nothing. Check \
                          the cucumber --name/--tags filter, E2E_ONLY_LIFECYCLE and \
-                         E2E_ALSO_RUN_IDS, and the host capability line above"
+                         E2E_ALSO_RUN_IDS"
                     ),
                     "{declaration:?}, {gpu:?}"
                 );
@@ -356,6 +537,32 @@ mod tests {
                 "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu scenario \
                  executed (7 resolved, none ran)"
             )
+        );
+    }
+
+    // Post-run row: declared 1, scenarios ran, and the harness's filter ran but
+    // resolved no GPU scenario at all (none selected): still fatal, since the
+    // lane promised GPU coverage it did not get.
+    #[test]
+    fn a_gpu_lane_that_resolved_no_gpu_scenario_is_fatal() {
+        let verdict = post_run_verdict(
+            5,
+            Some(GpuScenarioCounts {
+                resolved: 0,
+                executed: 0,
+            }),
+            GpuDeclaration::Expected,
+        );
+        assert_eq!(
+            verdict,
+            Verdict {
+                fatal: Some(
+                    "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu scenario \
+                     executed (0 resolved, none ran)"
+                        .to_owned()
+                ),
+                notes: vec![],
+            }
         );
     }
 
@@ -416,6 +623,323 @@ mod tests {
                 GpuDeclaration::Undeclared,
             ),
             Verdict::default()
+        );
+    }
+
+    // --- the harness glue, as pure functions ---
+
+    #[test]
+    fn preflight_refuses_an_invalid_declaration_before_reading_the_probe() {
+        let invalid = Err(
+            "invalid E2E_EXPECT_GPU value \"yes\": use 1 (this lane has a GPU), \
+                           0 (it deliberately has none), or leave it unset"
+                .to_owned(),
+        );
+        // A probe that also failed, or found no GPU, must not displace the
+        // declaration error: the declaration is checked first.
+        for (probe_error, has_amd_gpu) in [(None, true), (Some(PROBE_ERROR), false), (None, false)]
+        {
+            assert_eq!(
+                preflight(Some(OsStr::new("yes")), probe_error, has_amd_gpu, FACTS),
+                invalid,
+                "probe_error={probe_error:?}, gpu={has_amd_gpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_a_failed_probe_and_a_missing_declared_gpu() {
+        let refused = preflight(None, Some(PROBE_ERROR), true, FACTS).expect_err("probe failed");
+        assert!(refused.ends_with(PROBE_ERROR), "{refused}");
+        let refused =
+            preflight(Some(OsStr::new("1")), None, false, FACTS).expect_err("declared GPU missing");
+        assert!(
+            refused.starts_with("this lane declares a GPU (E2E_EXPECT_GPU=1)"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn preflight_carries_the_declaration_and_notes_into_the_run() {
+        assert_eq!(
+            preflight(Some(OsStr::new("0")), None, false, FACTS),
+            Ok(Preflight {
+                declaration: GpuDeclaration::NotExpected,
+                notes: vec![
+                    "this lane declares no usable GPU (E2E_EXPECT_GPU=0); @requires-gpu \
+                     scenarios are not applicable here"
+                        .to_owned()
+                ],
+            })
+        );
+        assert_eq!(
+            preflight(Some(OsStr::new("1")), None, true, FACTS),
+            Ok(Preflight {
+                declaration: GpuDeclaration::Expected,
+                notes: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn gpu_and_multi_gpu_scenarios_need_a_gpu_and_a_gfx_target_one_does_not() {
+        let decl = crate::expectation::ScenarioDecl::from_tags;
+        assert!(needs_gpu(&decl(&["id:a", "requires-gpu"])));
+        assert!(needs_gpu(&decl(&["id:b", "requires-multi-gpu"])));
+        assert!(!needs_gpu(&decl(&["id:c", "requires-gfx-target"])));
+        assert!(!needs_gpu(&decl(&["id:d"])));
+    }
+
+    #[test]
+    fn a_cli_filtered_run_resolved_nothing_so_has_no_gpu_counts() {
+        assert_eq!(gpu_scenario_counts([], ["serve-a", "serve-b"]), None);
+    }
+
+    #[test]
+    fn gpu_counts_take_resolved_from_the_filter_and_executed_from_the_report() {
+        let resolved = [
+            ("gpu-ran", true),
+            ("multi-gpu-only", true),
+            ("gpu-skipped", true),
+            ("cpu-ran", false),
+        ];
+        // `cpu-ran` executed but is not a GPU scenario, and `untagged` was
+        // never resolved: neither counts as an executed GPU scenario.
+        let executed = ["gpu-ran", "multi-gpu-only", "cpu-ran", "untagged"];
+        assert_eq!(
+            gpu_scenario_counts(resolved, executed),
+            Some(GpuScenarioCounts {
+                resolved: 3,
+                executed: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn gpu_counts_with_nothing_executed_are_zero_not_none() {
+        assert_eq!(
+            gpu_scenario_counts([("gpu", true), ("cpu", false)], []),
+            Some(GpuScenarioCounts {
+                resolved: 1,
+                executed: 0,
+            })
+        );
+        assert_eq!(
+            gpu_scenario_counts([("cpu", false)], ["cpu"]),
+            Some(GpuScenarioCounts {
+                resolved: 0,
+                executed: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn the_run_fails_on_any_one_of_its_three_reasons() {
+        let fatal = Verdict {
+            fatal: Some("0 scenarios executed".to_owned()),
+            notes: vec![],
+        };
+        let clean = Verdict::default();
+        assert!(!run_failed(0, 0, &clean));
+        assert!(run_failed(1, 0, &clean));
+        assert!(run_failed(0, 1, &clean));
+        assert!(run_failed(0, 0, &fatal));
+        // A note alone never fails the run.
+        let noted = Verdict {
+            fatal: None,
+            notes: vec!["stale".to_owned()],
+        };
+        assert!(!run_failed(0, 0, &noted));
+    }
+
+    #[test]
+    fn workflow_command_data_escapes_percent_cr_and_lf() {
+        assert_eq!(
+            workflow_command("error", "100% failed\r\nstderr: a%0Ab"),
+            "::error::100%25 failed%0D%0Astderr: a%250Ab"
+        );
+        assert_eq!(workflow_command("notice", "plain"), "::notice::plain");
+    }
+
+    #[test]
+    fn a_failure_prints_an_escaped_annotation_then_the_plain_message() {
+        assert_eq!(
+            failure_lines("probe failed\n--- stderr ---\n100% full"),
+            [
+                "::error::E2E lane check failed: probe failed%0A--- stderr ---%0A100%25 full"
+                    .to_owned(),
+                "E2E lane check failed: probe failed\n--- stderr ---\n100% full".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_note_prints_as_an_escaped_notice() {
+        assert_eq!(
+            note_line("7 of 7 @requires-gpu scenario(s) did not run (100%)"),
+            "::notice::E2E lane: 7 of 7 @requires-gpu scenario(s) did not run (100%25)"
+        );
+    }
+
+    /// `finish_run`'s manifest, written as the harness writes it and read back
+    /// with the consolidated report's own loader: the post-run lane failure
+    /// it records makes the lane red there, and a lane that passed the check
+    /// stays green. Ties the producer to the consumer through the function
+    /// `tests/e2e.rs` calls.
+    #[test]
+    fn finish_runs_manifest_reads_back_as_the_verdict_in_the_report() {
+        let cap = crate::capability::HostCapability {
+            os_family: "linux".into(),
+            is_wsl: false,
+            gfx_target: Some("gfx1151".into()),
+            has_amd_gpu: true,
+            amd_gpu_count: Some(1),
+            available_engines: vec!["lemonade".into()],
+            effective_serve_engine: "lemonade".into(),
+            platform_slug: "strix-halo-linux".into(),
+            oom_fault_injection: false,
+            case_sensitive_fs: true,
+            dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
+        };
+        let pass = crate::expectation::Expectation::ExpectPass;
+        let skip = crate::expectation::Expectation::Skip {
+            reason: "no usable AMD GPU".to_owned(),
+        };
+        let resolved_with = |gpu_expectation| {
+            [
+                ResolvedRun {
+                    id: "examine-version",
+                    feature: "Examine",
+                    scenario: "examine-01",
+                    engine: "lemonade",
+                    expectation: &pass,
+                    needs_gpu: false,
+                },
+                ResolvedRun {
+                    id: "serve-gpu",
+                    feature: "Serving",
+                    scenario: "serve-01",
+                    engine: "vllm",
+                    expectation: gpu_expectation,
+                    needs_gpu: true,
+                },
+            ]
+        };
+        // Writes what the harness writes and reads it back: the verdict, the
+        // report's status, and `platform.json`'s id -> expected mapping.
+        // `executed` is also what report.json holds; every listed id passed.
+        let status_of = |resolved: &[ResolvedRun<'_>], executed: &[&str]| {
+            let (verdict, manifest) = finish_run(
+                &cap,
+                crate::capability::PlatformVersions::default(),
+                resolved,
+                executed,
+                GpuDeclaration::Expected,
+            );
+            let dir = tempfile::TempDir::with_prefix("rocm-e2e-manifest-").expect("temp dir");
+            let elements: Vec<String> = executed
+                .iter()
+                .map(|id| {
+                    format!(
+                        r#"{{"name":"{id}","tags":[{{"name":"id:{id}"}}],"steps":[{{"keyword":"Given ","name":"x","result":{{"status":"passed"}}}}]}}"#
+                    )
+                })
+                .collect();
+            let report = dir.path().join("report.json");
+            std::fs::write(
+                &report,
+                format!(
+                    r#"[{{"name":"F","uri":"f.feature","elements":[{}]}}]"#,
+                    elements.join(",")
+                ),
+            )
+            .expect("report.json");
+            let platform = dir.path().join("platform.json");
+            std::fs::write(
+                &platform,
+                serde_json::to_string_pretty(&manifest).expect("serializes"),
+            )
+            .expect("platform.json");
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&platform).expect("read back"))
+                    .expect("valid json");
+            let mapping: Vec<Vec<String>> = written["expectations"]
+                .as_array()
+                .expect("an expectations array")
+                .iter()
+                .map(|e| {
+                    ["id", "feature", "scenario", "effective_engine", "expected"]
+                        .iter()
+                        .map(|key| e[*key].as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+                .collect();
+            (
+                verdict,
+                e2e_report::platform_status("e2e-report", &report),
+                mapping,
+            )
+        };
+        // id, feature, scenario, effective_engine, expected — per expectation.
+        let mapping_of = |rows: &[[&str; 5]]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|row| row.iter().map(|field| (*field).to_owned()).collect())
+                .collect()
+        };
+
+        // Every cell is pass or skip, so only the recorded lane failure can
+        // make this row FAIL.
+        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu \
+                      scenario executed (1 resolved, none ran)";
+        let (verdict, failed, mapping) = status_of(&resolved_with(&skip), &["examine-version"]);
+        assert_eq!(verdict.fatal.as_deref(), Some(reason));
+        assert_eq!(
+            mapping,
+            mapping_of(&[
+                [
+                    "examine-version",
+                    "Examine",
+                    "examine-01",
+                    "lemonade",
+                    "pass"
+                ],
+                ["serve-gpu", "Serving", "serve-01", "vllm", "skip"],
+            ])
+        );
+        assert_eq!(
+            failed,
+            e2e_report::PlatformStatus {
+                ok: false,
+                status: "FAIL",
+                lane_failure: Some(reason.to_owned()),
+            }
+        );
+
+        let (verdict, passed, mapping) =
+            status_of(&resolved_with(&pass), &["examine-version", "serve-gpu"]);
+        assert_eq!(verdict.fatal, None);
+        assert_eq!(
+            mapping,
+            mapping_of(&[
+                [
+                    "examine-version",
+                    "Examine",
+                    "examine-01",
+                    "lemonade",
+                    "pass"
+                ],
+                ["serve-gpu", "Serving", "serve-01", "vllm", "pass"],
+            ])
+        );
+        assert_eq!(
+            passed,
+            e2e_report::PlatformStatus {
+                ok: true,
+                status: "PASS",
+                lane_failure: None,
+            }
         );
     }
 }

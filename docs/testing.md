@@ -958,9 +958,16 @@ reporting it green:
 
 - before any scenario runs, when the capability probe could not read the binary
   under test: `rocm examine` or `rocm engines list` could not be started (check
-  `ROCM_CLI_BINARY`), exited non-zero, or printed nothing;
+  `ROCM_CLI_BINARY`), or could not be waited on, exited non-zero, printed
+  nothing, was still running after `E2E_PROBE_TIMEOUT_SECS` (whole seconds ≥ 1;
+  anything else uses 120), or exited but left its output open. The post-run
+  version probe (`collect_versions`) uses the same deadline but fails quietly,
+  only blanking the version columns, and does not refuse the run;
 - after the run, when no scenario executed, which includes a
-  `cargo xtask e2e -- -n <regex>` whose regex matches no scenario name.
+  `cargo xtask e2e -- -n <regex>` whose regex matches no scenario name. The
+  reason is written into `platform.json`, so `cargo xtask e2e-report` shows that
+  lane as FAIL with the reason under "Needs attention: platforms", in both its
+  markdown summary and its HTML report.
 
 `E2E_EXPECT_GPU` declares whether the host has a GPU. With `1`, the run also
 fails before any scenario if the probe found no usable AMD GPU, and after the
@@ -975,7 +982,7 @@ and, for each way a probe can fail, in
 
 ```bash
 cargo test -p e2e-cucumber --lib lane_verdict
-cargo test -p e2e-cucumber --lib capability::tests::a_probe
+cargo test -p e2e-cucumber --lib capability::tests
 cargo test -p xtask every_self_hosted_lane_declares_whether_it_has_a_gpu
 ```
 

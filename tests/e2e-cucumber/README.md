@@ -101,6 +101,7 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 | `ROCM_CLI_CONFIG_DIR` | (temp dir) | Isolated config directory per scenario |
 | `ROCM_CLI_DATA_DIR` | (temp dir) | Isolated data directory per scenario |
 | `ROCM_CLI_CACHE_DIR` | (temp dir) | Isolated cache directory per scenario |
+| `E2E_PROBE_TIMEOUT_SECS` | 120 | How long each capability-probe command (`rocm examine`, `rocm engines list`) may run before it is killed and the run is refused: whole seconds ≥ 1; anything else uses 120. The post-run version probe (`collect_versions`) uses the same deadline but fails quietly, only blanking the version columns, and does not refuse the run |
 | `E2E_EXPECT_GPU` | unset (undeclared) | Whether the lane has a GPU: `1` = GPU expected, `0` = deliberately none, unset or empty = no claim; any other value fails the run. Set on every self-hosted CI lane; see "Lane verdict" below |
 
 ### Lane verdict
@@ -111,14 +112,24 @@ scenario was skipped. The harness checks the run itself, before and after the
 scenarios:
 
 - **Before any scenario runs**, it fails when the capability probe could not
-  read the binary under test (`rocm examine` or `rocm engines list` could not be
-  started, exited non-zero, or printed nothing), naming the command, its exit
-  status and the tail of its stderr. On a lane that sets `E2E_EXPECT_GPU=1` it
-  also fails when the probe found no usable AMD GPU, naming the detected gfx
-  target, WSL flag, driver status and visibility mask it decided from.
+  read the binary under test, naming the command and saying why:
+  `rocm examine` or `rocm engines list` could not be started (with the error),
+  or could not be waited on, exited non-zero (with the exit
+  status and the tail of its stderr), printed nothing, was still running after
+  `E2E_PROBE_TIMEOUT_SECS` (default 120; it is killed, and the message gives
+  the deadline and the stderr tail so far), or exited but left its output
+  open, held by a process it started (with the stderr tail so far). On a lane
+  that sets `E2E_EXPECT_GPU=1` it also fails when the probe found no usable AMD
+  GPU, naming the detected gfx target, WSL flag, driver status and visibility
+  mask it decided from. A run refused here writes no `platform.json`, and the
+  consolidated report shows it as EMPTY.
 - **After the run**, it fails when no scenario executed (for example a `-n`
   filter that matches nothing), and on an `E2E_EXPECT_GPU=1` lane when no
-  `@requires-gpu` scenario executed.
+  `@requires-gpu` scenario executed. The reason is also recorded as
+  `lane_failure` in `platform.json`, so the consolidated report shows the lane
+  as FAIL, even when every scenario it resolved was a skip, and gives the reason
+  under "Needs attention: platforms" (in both the step summary and the HTML
+  report) and in the lane's section of the HTML report.
 
 `E2E_EXPECT_GPU=0` is for a lane that deliberately has no usable GPU, such as
 the WSL lanes: the harness prints a note that `@requires-gpu` scenarios are not

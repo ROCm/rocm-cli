@@ -642,6 +642,12 @@ job, naming the lane, rather than silently dropping out of the grid; on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
 
+A lane the harness failed after its run (no scenario executed, or no
+`@requires-gpu` scenario on an `E2E_EXPECT_GPU=1` lane) records the reason in
+its `platform.json`, and its row reads FAIL with the reason under "Needs
+attention: platforms" (step summary and HTML report alike), even when every
+scenario it resolved was a skip.
+
 ### Timeouts on the Strix lanes
 
 Every Strix Halo lane raises two budgets rather than letting a slow host read

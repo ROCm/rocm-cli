@@ -17,8 +17,8 @@ mod single_report;
 pub use consolidated::html::{RunMeta, generate_consolidated};
 pub use consolidated::markdown::consolidated_summary_markdown;
 pub use consolidated::{
-    ADVISORY_QUEUE_MARKER, PlatformReports, artifact_name_for_platform_slug, load_platform_reports,
-    queue_artifact_name, queue_lane_gpu,
+    ADVISORY_QUEUE_MARKER, PlatformReports, PlatformStatus, artifact_name_for_platform_slug,
+    load_platform_reports, platform_status, queue_artifact_name, queue_lane_gpu,
 };
 pub use parse::{XfailReport, evaluate_xfail, scenario_results_by_id};
 pub use single_report::generate;
