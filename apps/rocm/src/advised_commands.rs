@@ -1298,6 +1298,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "rocm services prune --any-age --older-than-hours 0",
         "the doc's expected result is that the parser rejects this combination",
     ),
+    (
+        "docs/manual-testing.md",
+        "rocm fix --no-such-option; echo $?",
+        "the doc's expected result is that the parser rejects the unknown option \
+         with exit 2, the code the catalog publishes for an unknown fix-id",
+    ),
 ];
 
 /// Natural-language examples must reach the planner with a multi-word request:
@@ -2126,6 +2132,9 @@ fn a_heredoc_ends_the_command() {
         "rocm diagnose --symptom-file - <<\"EOF\"",
         "rocm diagnose --symptom-file - << EOF",
         "rocm diagnose --symptom-file - <<EOF",
+        // A here-string (`<<<`) ends it the same way.
+        "rocm diagnose --symptom-file - <<< \"text\"",
+        "rocm diagnose --symptom-file - <<<text",
     ] {
         assert_eq!(
             command_parts(raw),
@@ -2143,6 +2152,8 @@ fn a_heredoc_ends_the_command() {
         "rocm diagnose --symptom-file - <<'EOF' && rocm frobnicate --x",
         "rocm diagnose --symptom-file - <<EOF; rocm frobnicate --x",
         "rocm diagnose --symptom-file - << EOF || rocm frobnicate --x",
+        // A here-string (`<<<`) is a redirection too.
+        "rocm diagnose --symptom-file - <<< \"text\" && rocm frobnicate --x",
     ] {
         assert_eq!(
             command_parts(raw),
