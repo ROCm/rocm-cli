@@ -56,7 +56,7 @@ Feature: Runtime configuration
   # the installed vLLM really requires no torch.
   # Nothing compared a pin there, and the device check only proves torch can run a
   # kernel, so the same step also imports torch, torchvision, vLLM and its compiled
-  # extension in the runtime: a reinstall that leaves a torch and torchvision pair
+  # extensions in the runtime: a reinstall that leaves a torch and torchvision pair
   # unable to register their operators, or a torch the vLLM build does not match,
   # fails here instead of passing and breaking every serve.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly

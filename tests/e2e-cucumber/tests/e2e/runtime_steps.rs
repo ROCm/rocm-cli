@@ -392,19 +392,24 @@ fn engine_torch_requirement(output: &str) -> EngineTorchRequirement {
     }
 }
 
-/// The runtime's interpreter can import torch, torchvision and vLLM together.
+/// The runtime's interpreter can import torch, torchvision, vLLM and its compiled
+/// extensions together.
 ///
 /// Asked only where a `not_applicable` verdict means the alignment compared no pin,
 /// so nothing else vouches that the pair torch and torchvision came to rest on can
-/// register its operators. `vllm._C` is imported on its own because `import vllm`
-/// loads that compiled extension lazily: a vLLM built against a different torch
-/// imports fine and only fails here, on an undefined torch symbol. The verdict
-/// itself is `engine_import_verdict`.
+/// register its operators. `vllm._C` and `vllm._rocm_C` are imported on their own
+/// because `import vllm` loads those compiled extensions lazily: a vLLM built
+/// against a different torch imports fine and only fails here, on an undefined
+/// torch symbol. The CLI installs only ROCm builds, so both are always present.
+/// The verdict itself is `engine_import_verdict`.
 fn assert_engine_stack_imports(output: &str) {
     let python = super::examine_steps::field_value(output, "python_executable")
         .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
     let probe = std::process::Command::new(python)
-        .args(["-c", "import torch, torchvision, vllm, vllm._C"])
+        .args([
+            "-c",
+            "import torch, torchvision, vllm, vllm._C, vllm._rocm_C",
+        ])
         .output()
         .unwrap_or_else(|error| panic!("failed to run {python}: {error}"));
     if let Err(cause) = engine_import_verdict(
@@ -473,7 +478,10 @@ async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
 /// opt-out into it leaves the user who set the variable unable to tell whether it
 /// took effect. In the accepted case the output has to name the variable, which
 /// the `torch_kept:` line the next step requires does, so the reader is still told
-/// it was honoured.
+/// it was honoured. On this route the alignment returns `not_applicable` before it
+/// reads the opt-out, so the verdict is the same with or without the variable set
+/// and this step does not exercise that gate: the `realigned` rejection above rules
+/// out the one failure that matters, and the next step proves the torch was kept.
 #[then("the torch alignment reports the opt-out instead of rewriting torch")]
 async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");

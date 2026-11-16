@@ -54,13 +54,14 @@ pub fn is_settled(verdict_line: &str, engine: EngineTorchRequirement) -> bool {
         && verdict_line.strip_prefix(verdict).map(str::trim) == Some(NO_PIN_REASON)
 }
 
-/// Judge the result of importing the stack the engine needs (torch, torchvision and
-/// the engine itself) in the runtime's own interpreter.
+/// Judge the result of importing the stack the engine needs (torch, torchvision,
+/// the engine and its compiled extensions) in the runtime's own interpreter.
 ///
 /// Needed where the alignment decided nothing. `not_applicable` says no engine pin
 /// was compared, and the device check that follows only proves torch can run a
-/// kernel, so a torch and torchvision that cannot register their operators together
-/// passes both while every `rocm serve` on the runtime fails on import. The last
+/// kernel, so a torch and torchvision that cannot register their operators
+/// together, or a torch the engine's compiled extensions were not built against,
+/// pass both while every `rocm serve` on the runtime fails on import. The last
 /// line of the failure is returned, because that is the line that names the cause.
 ///
 /// # Errors
