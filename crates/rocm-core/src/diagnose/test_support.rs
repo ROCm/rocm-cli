@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `Examination` builders shared by the tests of more than one `diagnose` module.
+//! `Examination` builders and shell stubs shared by the tests of more than one
+//! `diagnose` module.
 
 use crate::examine::{Examination, Gpu, WslFacts};
 
@@ -76,4 +77,41 @@ pub(super) fn windows_driver_exam(version: &str, date: &str) -> Examination {
         adrenalin_date: date.to_owned(),
         ..Examination::default()
     }
+}
+
+/// Writes each `(name, script)` as an executable in a new directory, to be
+/// the whole `PATH` of a shell that runs a Linux verify line.
+#[cfg(unix)]
+pub(super) fn stub_bin_dir(stubs: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("the stub directory is created");
+    for (name, script) in stubs {
+        let path = dir.path().join(name);
+        crate::fake_executable::write_fake_executable(&path, format!("#!/bin/sh\n{script}\n"))
+            .expect("a stub is planted");
+    }
+    dir
+}
+
+/// Runs one printed line in `/bin/sh` whose `PATH` is only `bin` and whose
+/// environment is only `PATH` and `env`. Returns whether it exited 0, and
+/// its stdout and stderr.
+#[cfg(unix)]
+pub(super) fn run_in_sh(
+    line: &str,
+    bin: &std::path::Path,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(line)
+        .env_clear()
+        .env("PATH", bin)
+        .envs(env.iter().copied())
+        .output()
+        .expect("/bin/sh runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
