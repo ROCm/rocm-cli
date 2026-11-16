@@ -806,8 +806,8 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`src/powershell_text_rule.rs`](../tests/e2e-cucumber/src/powershell_text_rule.rs) | The text rule for the Windows lines `rocm fix` and `rocm diagnose` print, a copy of the rule in `rocm-core` checked against a shared fixture table. | flat |
 | [`src/quit_and_wait.rs`](../tests/e2e-cucumber/src/quit_and_wait.rs) | Retry loop for quitting a TUI that may open a quit-confirm prompt first. | flat |
 | [`src/reader_failure.rs`](../tests/e2e-cucumber/src/reader_failure.rs) | Failure state shared between a background terminal reader and its waiters. | flat |
-| [`src/runtime_root.rs`](../tests/e2e-cucumber/src/runtime_root.rs) | `check_runtime_root_not_nested`: judges the active runtime folder `rocm examine` prints and rejects a doubly nested `runtimes/wheel` path. | flat |
 | [`src/runtime_pins.rs`](../tests/e2e-cucumber/src/runtime_pins.rs) | Reads a pinned runtime version out of the workspace-root [`runtime-deps.toml`](../runtime-deps.toml) as plain data, so a planted runtime keyed by that pin (the Lemonade `env_id`) follows a version bump without importing `rocm-deps`. | flat |
+| [`src/runtime_root.rs`](../tests/e2e-cucumber/src/runtime_root.rs) | `check_runtime_root_not_nested`: judges the active runtime folder `rocm examine` prints and rejects a doubly nested `runtimes/wheel` path. | flat |
 | [`src/send_until.rs`](../tests/e2e-cucumber/src/send_until.rs) | Retry loop for sending an idempotent terminal input until its effect appears. | flat |
 | [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail. | flat |
 | [`src/serve_plan.rs`](../tests/e2e-cucumber/src/serve_plan.rs) | Explains why a `rocm serve` run printed no `resolved model:` line by keeping stderr's refusal alongside stdout. | flat |
