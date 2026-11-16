@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -99,10 +100,10 @@ pub fn run(args: &Args) -> Result<()> {
                 // A log that yielded no lanes is as good as none for the lanes'
                 // state: every lane is then read as blocking.
                 let have_matrix = !log.lanes.is_empty();
-                let plan = plan(&log, scan(queue_dir)?, have_matrix);
-                write_reports(&plan, queue_dir, &args.artifacts_dir)?;
+                let lanes_plan = plan(&log, scan(queue_dir)?, have_matrix);
+                write_reports(&lanes_plan, queue_dir, &args.artifacts_dir)?;
                 render_section(
-                    &plan,
+                    &lanes_plan,
                     args.run_url.as_deref(),
                     args.run_started.as_deref(),
                     have_matrix,
@@ -188,9 +189,12 @@ fn is_lane_name(name: &str) -> bool {
 /// pattern are kept; a line that does not is ignored, so a log that is not what
 /// was expected yields no lanes rather than text to publish.
 fn parse_log(log: Option<&str>) -> QueueLog {
+    static TESTED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^rocm-cli (\S+) at ([0-9a-f]{40})$").expect("static pattern")
+    });
     let mut out = QueueLog::default();
     let Some(log) = log else { return out };
-    let tested = Regex::new(r"^rocm-cli (\S+) at ([0-9a-f]{40})$").expect("static pattern");
+    let tested = &*TESTED;
     let mut in_matrix = false;
     let mut unnamed = 0;
     for line in log.lines() {
@@ -231,7 +235,7 @@ fn parse_log(log: Option<&str>) -> QueueLog {
         if !is_lane_name(lane) {
             unnamed += 1;
             out.lanes.push(MatrixRow {
-                lane: format!("unnamed-{unnamed}"),
+                lane: format!("unnamed-row-{unnamed}"),
                 phase: None,
                 exit: None,
                 blocking: true,
@@ -261,7 +265,8 @@ fn parse_log(log: Option<&str>) -> QueueLog {
 /// The channels with a `results/report.json` under each lane directory of the
 /// downloaded artifact. A directory (or the final file) that is a symlink is not
 /// followed. A lane directory with a name that is not a lane name is kept as an
-/// `unnamed-N` lane with no reports, so that it shows as a lane without a result
+/// `unnamed-dir-N` lane with no reports (a matrix row is `unnamed-row-N`: the two
+/// cannot be told to be the same lane, so they are never merged), so that it shows as a lane without a result
 /// instead of dropping out unseen.
 fn scan(queue_dir: &Path) -> Result<BTreeMap<String, Vec<&'static str>>> {
     let mut lanes = BTreeMap::new();
@@ -279,7 +284,7 @@ fn scan(queue_dir: &Path) -> Result<BTreeMap<String, Vec<&'static str>>> {
         if !is_lane_name(&lane) {
             eprintln!("warning: a queue lane directory has an unexpected name; shown as unnamed");
             unnamed += 1;
-            lanes.insert(format!("unnamed-{unnamed}"), Vec::new());
+            lanes.insert(format!("unnamed-dir-{unnamed}"), Vec::new());
             continue;
         }
         let channels = CHANNELS
@@ -360,6 +365,10 @@ fn plan(log: &QueueLog, found: BTreeMap<String, Vec<&'static str>>, have_matrix:
 }
 
 /// Write each lane's report directories under `artifacts_dir`.
+fn make_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
 fn write_reports(plan: &Plan, queue_dir: &Path, artifacts_dir: &Path) -> Result<()> {
     for lane in &plan.lanes {
         for channel in &lane.reported {
@@ -368,8 +377,7 @@ fn write_reports(plan: &Plan, queue_dir: &Path, artifacts_dir: &Path) -> Result<
                 !lane.blocking,
                 Some(channel),
             ));
-            std::fs::create_dir_all(&dest)
-                .with_context(|| format!("creating {}", dest.display()))?;
+            make_dir(&dest)?;
             let src = queue_dir.join(&lane.lane).join(channel).join("results");
             for file in REPORT_FILES {
                 let from = src.join(file);
@@ -397,8 +405,7 @@ fn write_reports(plan: &Plan, queue_dir: &Path, artifacts_dir: &Path) -> Result<
                 !lane.blocking,
                 *channel,
             ));
-            std::fs::create_dir_all(&dest)
-                .with_context(|| format!("creating {}", dest.display()))?;
+            make_dir(&dest)?;
             // No scenarios at all: the report shows the lane as EMPTY.
             std::fs::write(dest.join("report.json"), "[]\n")
                 .with_context(|| format!("writing {}", dest.join("report.json").display()))?;
@@ -455,9 +462,11 @@ fn render_absent(reason: &str) -> String {
 }
 
 fn is_run_url(url: &str) -> bool {
-    Regex::new(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$")
-        .expect("static pattern")
-        .is_match(url)
+    static RUN_URL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$")
+            .expect("static pattern")
+    });
+    RUN_URL.is_match(url)
 }
 
 /// The status section: which run was imported, and one row per lane.
@@ -467,17 +476,16 @@ fn render_section(
     run_started: Option<&str>,
     have_matrix: bool,
 ) -> String {
+    static STARTED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$").expect("static pattern")
+    });
     let mut out = String::from(SECTION_HEADING);
     let mut source = String::from("Latest finished run of the shared GPU queue on `main`");
     if let Some(url) = run_url.filter(|u| is_run_url(u)) {
         let id = url.rsplit('/').next().unwrap_or_default();
         let _ = write!(source, ": [run {id}]({url})");
     }
-    if let Some(started) = run_started.filter(|s| {
-        Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")
-            .expect("static pattern")
-            .is_match(s)
-    }) {
+    if let Some(started) = run_started.filter(|s| STARTED.is_match(s)) {
         let _ = write!(source, ", started {started}");
     }
     if let Some(commit) = &plan.commit {
@@ -604,7 +612,7 @@ mod tests {
         let lanes = parse_log(Some(hostile)).lanes;
         assert_eq!(
             lanes.iter().map(|l| l.lane.as_str()).collect::<Vec<_>>(),
-            ["unnamed-1", "unnamed-2"]
+            ["unnamed-row-1", "unnamed-row-2"]
         );
         assert!(lanes.iter().all(|l| l.blocking));
     }
@@ -896,7 +904,7 @@ mod tests {
         assert_eq!(
             log.lanes,
             vec![MatrixRow {
-                lane: "unnamed-1".to_owned(),
+                lane: "unnamed-row-1".to_owned(),
                 phase: None,
                 exit: None,
                 blocking: true,
@@ -910,13 +918,13 @@ mod tests {
             "[]",
         );
         let found = scan(queue.path()).expect("scan");
-        assert_eq!(found.get("unnamed-1"), Some(&Vec::new()));
+        assert_eq!(found.get("unnamed-dir-1"), Some(&Vec::new()));
         assert_eq!(found.get("mi300x"), Some(&vec!["release"]));
         let plan = plan(&QueueLog::default(), found, false);
         let unnamed = plan
             .lanes
             .iter()
-            .find(|l| l.lane == "unnamed-1")
+            .find(|l| l.lane == "unnamed-dir-1")
             .expect("lane");
         assert!(unnamed.blocking);
         assert_eq!(unnamed.placeholders, vec![None]);
