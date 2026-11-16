@@ -24,11 +24,11 @@
 //! in the conversation, and `tool_use` blocks with the `tool_use` stop reason in
 //! the reply. A `stream: true` request is answered with Anthropic server-sent
 //! events (`message_start` through `message_stop`) built from the engine's
-//! streamed chat-completion chunks as they arrive; streaming a request that
-//! defines `tools` is not translated yet. Streaming with tools, extended
-//! thinking, server tools and other non-text content blocks (images) are
-//! refused with an Anthropic `invalid_request_error` that says so, rather than
-//! being dropped silently. The engine reports token usage only at the end of a
+//! streamed chat-completion chunks as they arrive, including streamed tool
+//! calls (one `tool_use` block per call, its arguments as `input_json_delta`
+//! fragments). Extended thinking, server tools and other non-text content
+//! blocks (images) are refused with an Anthropic `invalid_request_error` that
+//! says so, rather than being dropped silently. The engine reports token usage only at the end of a
 //! stream, so `message_start` carries `input_tokens: 0` and the real figures
 //! arrive in `message_delta`. Fields that only annotate a request (`metadata`)
 //! are ignored.
@@ -492,8 +492,9 @@ fn pump_stream(
             .all(|event| sender.blocking_send(Bytes::from(event)).is_ok())
     };
     for line in BufReader::new(upstream).lines() {
-        // Events are only sent when a chunk carries text, so a client that left
-        // during a long reasoning phase would otherwise go unnoticed.
+        // Events are only sent when a chunk carries text or a tool call, so a
+        // client that left during a long reasoning phase would otherwise go
+        // unnoticed.
         if sender.is_closed() {
             return;
         }
@@ -854,11 +855,6 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
     }
 
     let tools = translate_tools(object.get("tools"))?;
-    if stream && tools.is_some() {
-        // The stream translator only emits text blocks; tool-call deltas would
-        // be dropped silently.
-        return Err(ProxyError::unsupported("streaming a request with `tools`"));
-    }
     let mut out = json!({
         "model": served_model,
         "messages": messages,
@@ -974,15 +970,53 @@ fn openai_to_anthropic(reply: &Value, served_model: &str) -> Result<Value, Proxy
     }))
 }
 
+/// A fragment of a `tool_use` block's JSON input.
+fn input_json_delta(index: u32, fragment: &str) -> String {
+    sse_event(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "input_json_delta", "partial_json": fragment },
+        }),
+    )
+}
+
 /// One Anthropic server-sent event.
 fn sse_event(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
 /// Turns an engine's streamed chat-completion chunks into the Anthropic
-/// streaming event sequence: `message_start`, one text `content_block_start`,
-/// a `content_block_delta` per text fragment, then `content_block_stop`,
+/// streaming event sequence: `message_start`, then content blocks in order (a
+/// text block per run of text, a `tool_use` block per tool call, each with a
+/// `content_block_start`, deltas and a `content_block_stop`), then
 /// `message_delta` and `message_stop` once the engine is done.
+///
+/// Only one block is open at a time. An engine streams a tool call as a first
+/// delta carrying its `id` and function name followed by fragments of its JSON
+/// arguments, and starts the next call (or more text) only after the previous
+/// one is complete, so a block is closed when something else begins. An engine
+/// that returns to a call it already left (interleaving two calls) cannot be
+/// relayed that way, so the stream ends with an `error` event instead.
+///
+/// A call's `content_block_start` waits for its name. String argument
+/// fragments that arrive before it are held and sent right after it; later
+/// ones are relayed as they arrive, and the whole is checked when the block
+/// closes. A call that never gets a name, or whose fragments do not add up to
+/// a JSON object, then ends the stream with an `error` event in place of its
+/// `content_block_stop`. Arguments of any other JSON type than a string, an
+/// object or `null` end the stream with an `error` event at once. Either way
+/// the client never gets a finished `tool_use` it cannot run (the
+/// non-streaming reply answers 502 for the same calls).
+///
+/// A `length` finish is reported as `max_tokens` whatever came before it. The
+/// blocks already relayed stay: a complete call, a call cut off mid-arguments
+/// (closed with the partial JSON, which is not checked) and a call cut off
+/// before any argument (closed with `{}`). Only a call cut off before its name
+/// is dropped, since none of it reached the client. The non-streaming reply
+/// differs here: it keeps complete calls with the `tool_use` stop reason, and
+/// drops every call when one was cut off.
 ///
 /// The closing events wait for the engine's `[DONE]` (or end of stream) rather
 /// than its `finish_reason` chunk, because the usage totals arrive in a chunk
@@ -990,11 +1024,50 @@ fn sse_event(event: &str, data: &Value) -> String {
 struct StreamTranslator {
     served_model: String,
     started: bool,
-    block_open: bool,
+    /// The block currently open, if any.
+    open: Option<OpenBlock>,
+    /// Anthropic index the next block gets.
+    next_index: u32,
+    /// The reply's id, as `message_start` gave it.
+    message_id: String,
+    /// How many tool calls the reply has had. A call the engine gave no id is
+    /// numbered by it under the reply's id, so when the engine's chunks carry
+    /// an id, such calls in different replies do not share one. Known limit:
+    /// chunks without an id give every reply `msg_rocm`, so its id-less calls
+    /// are `toolu_rocm_0`, `toolu_rocm_1`... again, the ids the non-streaming
+    /// reply gives such calls in every reply.
+    tool_calls: usize,
+    /// `(engine index, engine id)` of every tool call already closed, so a
+    /// fragment for one of them is recognised.
+    closed_calls: Vec<(u64, Option<String>)>,
     finished: bool,
     stop_reason: Option<&'static str>,
     input_tokens: u64,
     output_tokens: u64,
+}
+
+/// A content block that has been started and not yet stopped.
+enum OpenBlock {
+    Text { index: u32 },
+    Tool(ToolCall),
+}
+
+/// A streamed tool call that has not been closed yet.
+struct ToolCall {
+    /// Its Anthropic index, once its `content_block_start` was sent. That waits
+    /// for the call's name, which a client needs to run it.
+    index: Option<u32>,
+    /// The engine's position for the call in the reply.
+    call_index: u64,
+    /// The engine's id for the call, if it sent one.
+    engine_id: Option<String>,
+    /// The id the client sees (synthesised when the engine sent none).
+    id: String,
+    name: String,
+    /// Every argument fragment received so far.
+    arguments: String,
+    /// How many bytes of `arguments` the client already has.
+    relayed: usize,
 }
 
 impl StreamTranslator {
@@ -1002,7 +1075,11 @@ impl StreamTranslator {
         Self {
             served_model: served_model.to_owned(),
             started: false,
-            block_open: false,
+            open: None,
+            next_index: 0,
+            message_id: String::new(),
+            tool_calls: 0,
+            closed_calls: Vec::new(),
             finished: false,
             stop_reason: None,
             input_tokens: 0,
@@ -1068,29 +1145,46 @@ impl StreamTranslator {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
+            && let Err(message) = self.choice_delta(choice, &mut events)
         {
-            if let Some(text) = choice
-                .pointer("/delta/content")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
-                events.extend(self.open_block());
-                events.push(sse_event(
-                    "content_block_delta",
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": { "type": "text_delta", "text": text },
-                    }),
-                ));
-            }
-            match choice.get("finish_reason").and_then(Value::as_str) {
-                Some("length") => self.stop_reason = Some("max_tokens"),
-                Some(_) => self.stop_reason = Some("end_turn"),
-                None => {}
-            }
+            events.extend(self.fail(&message));
         }
         events
+    }
+
+    /// Translate one chunk's choice into `events`: its text, its tool-call
+    /// fragments and its finish reason. An `Err` is the message of the `error`
+    /// event the stream must end with.
+    fn choice_delta(&mut self, choice: &Value, events: &mut Vec<String>) -> Result<(), String> {
+        if let Some(text) = choice
+            .pointer("/delta/content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            let index = self.open_text(events)?;
+            events.push(sse_event(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": { "type": "text_delta", "text": text },
+                }),
+            ));
+        }
+        if let Some(calls) = choice
+            .pointer("/delta/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for (position, call) in calls.iter().enumerate() {
+                self.tool_call_delta(position as u64, call, events)?;
+            }
+        }
+        match choice.get("finish_reason").and_then(Value::as_str) {
+            Some("length") => self.stop_reason = Some("max_tokens"),
+            Some(_) => self.stop_reason = Some(self.natural_stop_reason()),
+            None => {}
+        }
+        Ok(())
     }
 
     /// The events for an engine stream that is over: complete if a stop reason
@@ -1099,8 +1193,8 @@ impl StreamTranslator {
         if self.finished {
             return Vec::new();
         }
-        if self.stop_reason.is_some() {
-            return self.complete();
+        if let Some(stop_reason) = self.stop_reason {
+            return self.complete(stop_reason);
         }
         self.fail("the engine's stream ended before the reply was complete")
     }
@@ -1122,6 +1216,7 @@ impl StreamTranslator {
 
     fn start(&mut self, id: &str, model: &str) -> String {
         self.started = true;
+        id.clone_into(&mut self.message_id);
         sse_event(
             "message_start",
             &json!({
@@ -1140,40 +1235,225 @@ impl StreamTranslator {
         )
     }
 
-    fn open_block(&mut self) -> Option<String> {
-        if self.block_open {
-            return None;
+    /// `tool_use` when the reply contained a tool call, `end_turn` otherwise.
+    /// Some engines report `stop` rather than `tool_calls` after a call.
+    const fn natural_stop_reason(&self) -> &'static str {
+        if self.tool_calls > 0 {
+            "tool_use"
+        } else {
+            "end_turn"
         }
-        self.block_open = true;
-        Some(sse_event(
+    }
+
+    /// A new block's index.
+    const fn take_index(&mut self) -> u32 {
+        let index = self.next_index;
+        self.next_index += 1;
+        index
+    }
+
+    /// Stop the open block, if any, into `events`. A tool call is checked
+    /// first: one with no name or with arguments that are not a JSON object is
+    /// an `Err`, unless the token limit cut it off (then a nameless call is
+    /// dropped and partial arguments are closed as they are). A call that
+    /// streamed no arguments gets an empty object, so the client has JSON to
+    /// parse.
+    fn close_open(&mut self, events: &mut Vec<String>) -> Result<(), String> {
+        let index = match self.open.take() {
+            None => return Ok(()),
+            Some(OpenBlock::Text { index }) => index,
+            Some(OpenBlock::Tool(call)) => {
+                let truncated = self.stop_reason == Some("max_tokens");
+                self.closed_calls.push((call.call_index, call.engine_id));
+                let Some(index) = call.index else {
+                    // Nothing of the call reached the client, so a call the token
+                    // limit cut off before its name is dropped.
+                    return if truncated {
+                        Ok(())
+                    } else {
+                        Err("the engine's tool call had no name".to_owned())
+                    };
+                };
+                let raw = call.arguments.trim();
+                if raw.is_empty() {
+                    events.push(input_json_delta(index, "{}"));
+                } else if !truncated
+                    && !serde_json::from_str::<Value>(raw).is_ok_and(|input| input.is_object())
+                {
+                    return Err(format!(
+                        "the model's arguments for tool `{}` were not a JSON object: {raw}",
+                        call.name
+                    ));
+                }
+                index
+            }
+        };
+        events.push(sse_event(
+            "content_block_stop",
+            &json!({ "type": "content_block_stop", "index": index }),
+        ));
+        Ok(())
+    }
+
+    /// Make a text block the open one, adding the events that takes to
+    /// `events`, and return its index.
+    fn open_text(&mut self, events: &mut Vec<String>) -> Result<u32, String> {
+        if let Some(OpenBlock::Text { index }) = self.open {
+            return Ok(index);
+        }
+        self.close_open(events)?;
+        let index = self.take_index();
+        self.open = Some(OpenBlock::Text { index });
+        events.push(sse_event(
             "content_block_start",
             &json!({
                 "type": "content_block_start",
-                "index": 0,
+                "index": index,
                 "content_block": { "type": "text", "text": "" },
             }),
-        ))
+        ));
+        Ok(index)
     }
 
-    /// The closing events. An engine that produced no text still gets an empty
-    /// text block, matching the non-streaming reply.
-    fn complete(&mut self) -> Vec<String> {
-        let mut events = Vec::new();
-        if !self.started {
-            let model = self.served_model.clone();
-            events.push(self.start("msg_rocm", &model));
+    /// Translate one entry of a chunk's `delta.tool_calls` into `events`.
+    ///
+    /// An entry continues the open call when it has the same engine index and
+    /// either no `id`, the open call's `id`, or an `id` where the open call has
+    /// none yet (adopted as the call's id). Otherwise it starts a new call,
+    /// unless it names a call already closed, which is an `Err`. A call's block
+    /// starts once its name is known; string fragments are held until then
+    /// and relayed as they arrive after it.
+    fn tool_call_delta(
+        &mut self,
+        position: u64,
+        call: &Value,
+        events: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let call_index = call
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(position);
+        let engine_id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let continues = matches!(
+            &self.open,
+            Some(OpenBlock::Tool(open)) if open.call_index == call_index
+                && engine_id.is_none_or(|id| open.engine_id.as_deref().is_none_or(|open_id| open_id == id))
+        );
+        if !continues {
+            let returns_to_a_closed_call =
+                self.closed_calls
+                    .iter()
+                    .any(|(closed_index, closed_id)| match engine_id {
+                        Some(id) => closed_id.as_deref() == Some(id),
+                        None => *closed_index == call_index,
+                    });
+            if returns_to_a_closed_call {
+                return Err(
+                    "the engine interleaved its tool calls, which cannot be streamed".to_owned(),
+                );
+            }
+            self.close_open(events)?;
+            let id = engine_id.map_or_else(
+                || {
+                    let reply = self.message_id.trim_start_matches("msg_");
+                    format!("toolu_{reply}_{}", self.tool_calls)
+                },
+                str::to_owned,
+            );
+            self.tool_calls += 1;
+            self.open = Some(OpenBlock::Tool(ToolCall {
+                index: None,
+                call_index,
+                engine_id: engine_id.map(str::to_owned),
+                id,
+                name: String::new(),
+                arguments: String::new(),
+                relayed: 0,
+            }));
         }
-        events.extend(self.open_block());
-        events.push(sse_event(
-            "content_block_stop",
-            &json!({ "type": "content_block_stop", "index": 0 }),
-        ));
+        let mut next_index = self.next_index;
+        let Some(OpenBlock::Tool(open)) = &mut self.open else {
+            unreachable!("a tool call was just made the open block");
+        };
+        if open.engine_id.is_none()
+            && let Some(id) = engine_id
+        {
+            id.clone_into(&mut open.id);
+            open.engine_id = Some(id.to_owned());
+        }
+        if let Some(name) = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .filter(|name| open.name.is_empty() && !name.is_empty())
+        {
+            name.clone_into(&mut open.name);
+        }
+        match call.pointer("/function/arguments") {
+            // A delta with nothing new for the arguments.
+            None | Some(Value::Null) => {}
+            Some(Value::String(fragment)) => open.arguments.push_str(fragment),
+            // Not the OpenAI shape, but some engines send the object itself.
+            Some(object @ Value::Object(_)) => open.arguments.push_str(&object.to_string()),
+            Some(other) => {
+                return Err(format!(
+                    "the engine's arguments for tool `{}` were not a JSON object: {other}",
+                    open.name
+                ));
+            }
+        }
+        if open.index.is_none() && !open.name.is_empty() {
+            open.index = Some(next_index);
+            next_index += 1;
+            events.push(sse_event(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": next_index - 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": open.id,
+                        "name": open.name,
+                        "input": {},
+                    },
+                }),
+            ));
+        }
+        if let Some(index) = open.index
+            && open.relayed < open.arguments.len()
+        {
+            events.push(input_json_delta(index, &open.arguments[open.relayed..]));
+            open.relayed = open.arguments.len();
+        }
+        self.next_index = next_index;
+        Ok(())
+    }
+
+    /// The closing events, for a reply that finished with `stop_reason`. A
+    /// stop reason only comes from a chunk, after `message_start`. An engine
+    /// that produced no content still gets an empty text block, matching the
+    /// non-streaming reply.
+    fn complete(&mut self, stop_reason: &'static str) -> Vec<String> {
+        let mut events = Vec::new();
+        let closed = self.close_open(&mut events).and_then(|()| {
+            if self.next_index == 0 {
+                self.open_text(&mut events)?;
+                self.close_open(&mut events)?;
+            }
+            Ok(())
+        });
+        if let Err(message) = closed {
+            events.extend(self.fail(&message));
+            return events;
+        }
         events.push(sse_event(
             "message_delta",
             &json!({
                 "type": "message_delta",
                 "delta": {
-                    "stop_reason": self.stop_reason.unwrap_or("end_turn"),
+                    "stop_reason": stop_reason,
                     "stop_sequence": null,
                 },
                 "usage": {
@@ -1287,17 +1567,12 @@ mod tests {
     #[test]
     fn request_refuses_what_it_cannot_translate_instead_of_dropping_it() {
         let base = || json!({"max_tokens": 8, "messages": [{"role": "user", "content": "x"}]});
-        let mut streaming_tools = base();
-        streaming_tools["stream"] = json!(true);
-        streaming_tools["tools"] =
-            json!([{"name": "get_weather", "input_schema": {"type": "object"}}]);
         let mut server_tool = base();
         server_tool["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
         let image = json!({"max_tokens": 8, "messages": [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}}
         ]}]});
         for (request, needle) in [
-            (streaming_tools, "streaming"),
             (server_tool, "a tool of type `web_search_20250305`"),
             (image, "`image` content block"),
         ] {
@@ -1371,6 +1646,22 @@ mod tests {
                 .status,
             502
         );
+    }
+
+    #[test]
+    fn response_keeps_complete_calls_as_tool_use_under_a_length_stop() {
+        // Pins the non-streaming behaviour as it is: complete calls win over
+        // the token limit. A stream has relayed them before the stop arrives,
+        // so it reports `max_tokens` instead (see the stream tests).
+        let message = openai_to_anthropic(
+            &json!({"choices": [{"message": {"content": null, "tool_calls": [
+                {"id": "call_1", "function": {"name": "weather", "arguments": "{\"city\":\"Oslo\"}"}}
+            ]}, "finish_reason": "length"}]}),
+            MODEL,
+        )
+        .unwrap();
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(message["content"][0]["input"], json!({"city": "Oslo"}));
     }
 
     #[test]
@@ -1767,6 +2058,680 @@ mod tests {
     }
 
     #[test]
+    fn a_streaming_request_with_tools_is_forwarded_with_its_tools() {
+        let out = translate(&json!({
+            "max_tokens": 8,
+            "stream": true,
+            "tools": [{"name": "get_weather", "description": "d", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "x"}],
+        }))
+        .unwrap();
+        assert_eq!(out["stream"], true);
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    /// The `data:` body an engine streams for the given chunks, `[DONE]` last.
+    fn engine_stream(chunks: &[String]) -> String {
+        let mut body = String::new();
+        for chunk in chunks {
+            body.push_str("data: ");
+            body.push_str(chunk);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn call(index: u64, id: Option<&str>, name: Option<&str>, arguments: &str) -> Value {
+        let mut call =
+            json!({"index": index, "type": "function", "function": {"arguments": arguments}});
+        if let Some(id) = id {
+            call["id"] = json!(id);
+        }
+        if let Some(name) = name {
+            call["function"]["name"] = json!(name);
+        }
+        call
+    }
+
+    /// The `(event, index, detail)` of every content-block event, where detail
+    /// is the block type, the text, or the JSON fragment.
+    fn blocks(events: &[String]) -> Vec<(String, u64, String)> {
+        events
+            .iter()
+            .filter_map(|event| {
+                let (name, data) = event.strip_prefix("event: ")?.split_once("\ndata: ")?;
+                let data: Value = serde_json::from_str(data.trim()).ok()?;
+                let detail = match name {
+                    "content_block_start" => data["content_block"]["type"].as_str()?.to_owned(),
+                    "content_block_delta" => data["delta"]["text"]
+                        .as_str()
+                        .or_else(|| data["delta"]["partial_json"].as_str())?
+                        .to_owned(),
+                    "content_block_stop" => String::new(),
+                    _ => return None,
+                };
+                Some((name.to_owned(), data["index"].as_u64()?, detail))
+            })
+            .collect()
+    }
+
+    fn stop_reason(events: &[String]) -> String {
+        let delta = events
+            .iter()
+            .find(|event| event.starts_with("event: message_delta"))
+            .expect("a message_delta");
+        let data: Value =
+            serde_json::from_str(delta.split_once("data: ").unwrap().1.trim()).unwrap();
+        data["delta"]["stop_reason"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_streamed_tool_call_becomes_a_tool_use_block_with_json_fragments() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"role": "assistant", "tool_calls": [call(0, Some("call_1"), Some("get_weather"), "")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(0, None, None, "{\"city\":")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(0, None, None, "\"Oslo\"}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            names(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert!(events[1].contains(r#""id":"call_1""#), "{}", events[1]);
+        assert!(
+            events[1].contains(r#""name":"get_weather""#),
+            "{}",
+            events[1]
+        );
+        let fragments: String = blocks(&events)
+            .into_iter()
+            .filter(|(name, ..)| name == "content_block_delta")
+            .map(|(.., detail)| detail)
+            .collect();
+        assert_eq!(fragments, r#"{"city":"Oslo"}"#);
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn text_then_a_tool_call_are_two_blocks_in_order() {
+        let events = pump(&engine_stream(&[
+            chunk(&json!({"content": "Checking."}), None),
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "text".into()),
+                ("content_block_delta".into(), 0, "Checking.".into()),
+                ("content_block_stop".into(), 0, String::new()),
+                ("content_block_start".into(), 1, "tool_use".into()),
+                ("content_block_delta".into(), 1, "{}".into()),
+                ("content_block_stop".into(), 1, String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_tool_calls_get_their_own_blocks_whether_or_not_the_engine_numbers_them() {
+        let numbered = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("a"), Some("one"), "{\"x\":1}")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(1, Some("b"), Some("two"), "{\"y\":2}")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(2, Some("c"), Some("three"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        // An engine that gives every call index 0 is told apart by `id`, and
+        // a fresh id after two closed calls is a third call, not a return.
+        let all_zero = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("a"), Some("one"), "{\"x\":1}")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(0, Some("b"), Some("two"), "{\"y\":2}")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("three"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        for events in [numbered, all_zero] {
+            let starts: Vec<_> = blocks(&events)
+                .into_iter()
+                .filter(|(name, ..)| name == "content_block_start")
+                .map(|(_, index, kind)| (index, kind))
+                .collect();
+            assert_eq!(
+                starts,
+                [
+                    (0, "tool_use".to_owned()),
+                    (1, "tool_use".to_owned()),
+                    (2, "tool_use".to_owned()),
+                ]
+            );
+            assert!(events.iter().any(|e| e.contains(r#""name":"two""#)));
+            assert!(events.iter().any(|e| e.contains(r#""name":"three""#)));
+            assert_eq!(stop_reason(&events), "tool_use");
+        }
+    }
+
+    #[test]
+    fn a_tool_call_without_arguments_still_gets_an_empty_json_object() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("list_files"), "")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_call_id_is_synthesised_and_stop_after_a_call_means_tool_use() {
+        // Some engines name no id and finish a tool call with `stop`. Each call
+        // gets its own id, tied to the reply so a later turn's calls differ.
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, None, Some("run"), "{}")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(1, None, Some("run"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("stop")),
+        ]));
+        assert_eq!(tool_use_ids(&events), ["toolu_t1_0", "toolu_t1_1"]);
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn an_id_arriving_after_the_call_opened_replaces_the_synthesised_one() {
+        // The call opens with neither id nor name; its id comes with the name,
+        // before the block starts, so the client sees the engine's id.
+        let first = call(0, None, None, "");
+        let events = pump(&engine_stream(&[
+            chunk(&json!({"tool_calls": [first]}), None),
+            chunk(
+                &json!({"tool_calls": [call(0, Some("call_7"), Some("run"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert!(events[1].contains(r#""id":"call_7""#), "{}", events[1]);
+    }
+
+    #[test]
+    fn a_named_call_cut_off_before_any_argument_is_closed_with_an_empty_object() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("length")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+        assert_eq!(stop_reason(&events), "max_tokens");
+    }
+
+    #[test]
+    fn a_delta_without_an_arguments_key_is_no_fragment() {
+        let mut opening = call(0, Some("c"), Some("run"), "");
+        opening["function"]
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        let events = pump(&engine_stream(&[
+            chunk(&json!({"tool_calls": [opening]}), None),
+            chunk(
+                &json!({"tool_calls": [call(0, None, None, "{\"a\":1}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{\"a\":1}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    /// The `id` of every `tool_use` block a reply started.
+    fn tool_use_ids(events: &[String]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| event.starts_with("event: content_block_start"))
+            .map(|event| {
+                let data: Value =
+                    serde_json::from_str(event.split_once("data: ").unwrap().1.trim()).unwrap();
+                data["content_block"]["id"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    /// A reply of one id-less call to `run`, from chunks with id `chunk_id`.
+    fn reply_with_an_id_less_call(chunk_id: Option<&str>) -> Vec<String> {
+        let chunk = |delta: Value, finish: Option<&str>| {
+            let mut chunk =
+                json!({"model": MODEL, "choices": [{"delta": delta, "finish_reason": finish}]});
+            if let Some(id) = chunk_id {
+                chunk["id"] = json!(id);
+            }
+            chunk.to_string()
+        };
+        pump(&engine_stream(&[
+            chunk(
+                json!({"tool_calls": [call(0, None, Some("run"), "{}")]}),
+                None,
+            ),
+            chunk(json!({}), Some("tool_calls")),
+        ]))
+    }
+
+    #[test]
+    fn id_less_calls_in_different_replies_get_different_ids_when_chunks_carry_one() {
+        assert_eq!(
+            tool_use_ids(&reply_with_an_id_less_call(Some("chatcmpl-one"))),
+            ["toolu_one_0"]
+        );
+        assert_eq!(
+            tool_use_ids(&reply_with_an_id_less_call(Some("chatcmpl-two"))),
+            ["toolu_two_0"]
+        );
+        // Known limit: with no chunk id every reply falls back to the ids the
+        // non-streaming reply uses, so two such replies share them.
+        assert_eq!(
+            tool_use_ids(&reply_with_an_id_less_call(None)),
+            ["toolu_rocm_0"]
+        );
+    }
+
+    #[test]
+    fn running_out_of_tokens_mid_call_is_max_tokens_not_tool_use() {
+        // The block and its fragments already reached the client, so they stay
+        // and are closed; `max_tokens` tells the client not to run the call.
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "{\"a\":")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("length")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{\"a\":".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+        assert_eq!(stop_reason(&events), "max_tokens");
+    }
+
+    #[test]
+    fn a_complete_call_before_a_length_stop_is_relayed_and_stops_for_max_tokens() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "{\"a\":1}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("length")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{\"a\":1}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+        assert_eq!(stop_reason(&events), "max_tokens");
+    }
+
+    #[test]
+    fn arguments_that_are_neither_a_string_nor_an_object_are_an_error() {
+        for arguments in [json!([1]), json!(5), json!(true)] {
+            let mut entry = call(0, Some("c"), Some("run"), "");
+            entry["function"]["arguments"] = arguments.clone();
+            let events = pump(&engine_stream(&[
+                chunk(&json!({"tool_calls": [entry]}), None),
+                chunk(&json!({}), Some("tool_calls")),
+            ]));
+            let (name, message) = ending(&events);
+            assert_eq!(name, "error", "{arguments}: {events:?}");
+            // Refused on arrival, not relayed and refused at the block's close.
+            assert!(
+                message
+                    .starts_with("the engine's arguments for tool `run` were not a JSON object: "),
+                "{message}"
+            );
+            assert!(
+                !events.iter().any(|e| e.contains("input_json_delta")),
+                "{arguments}: {events:?}"
+            );
+        }
+        // `null` is what a delta with nothing new carries, and is no fragment.
+        let mut nothing_new = call(0, None, None, "");
+        nothing_new["function"]["arguments"] = Value::Null;
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "{\"a\":1}")]}),
+                None,
+            ),
+            chunk(&json!({"tool_calls": [nothing_new]}), None),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(stop_reason(&events), "tool_use");
+        assert_eq!(blocks(&events)[1].2, "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_plain_text_stream_keeps_its_end_turn_stop_and_single_block() {
+        let events = pump(&engine_stream(&[
+            chunk(&json!({"content": "hi"}), None),
+            chunk(&json!({}), Some("stop")),
+        ]));
+        assert_eq!(stop_reason(&events), "end_turn");
+        assert_eq!(blocks(&events).len(), 3);
+    }
+
+    /// The final event's name and, for an `error`, its message.
+    fn ending(events: &[String]) -> (String, String) {
+        let last = events.last().expect("an event");
+        let (name, data) = last
+            .strip_prefix("event: ")
+            .and_then(|rest| rest.split_once("\ndata: "))
+            .unwrap();
+        let data: Value = serde_json::from_str(data.trim()).unwrap();
+        (
+            name.to_owned(),
+            data["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+
+    #[test]
+    fn an_engine_that_resends_the_id_and_name_on_every_chunk_streams_one_block() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "{\"a\":")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "1}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{\"a\":".into()),
+                ("content_block_delta".into(), 0, "1}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn calls_with_index_gaps_and_text_after_a_call_keep_dense_block_indexes() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(2, Some("a"), Some("one"), "{}")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(5, Some("b"), Some("two"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({"content": "done"}), None),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+                ("content_block_start".into(), 1, "tool_use".into()),
+                ("content_block_delta".into(), 1, "{}".into()),
+                ("content_block_stop".into(), 1, String::new()),
+                ("content_block_start".into(), 2, "text".into()),
+                ("content_block_delta".into(), 2, "done".into()),
+                ("content_block_stop".into(), 2, String::new()),
+            ]
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn text_after_a_call_with_bad_arguments_ends_the_stream_with_an_error() {
+        // Text closes the open call, and closing it checks its arguments.
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("a"), Some("one"), "[1]")]}),
+                None,
+            ),
+            chunk(&json!({"content": "done"}), None),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        let (name, message) = ending(&events);
+        assert_eq!(name, "error", "{events:?}");
+        assert!(
+            message.contains("tool `one` were not a JSON object"),
+            "{message}"
+        );
+        assert!(
+            !events.iter().any(|e| e.contains("text_delta")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_named_after_its_first_delta_starts_once_the_name_arrives() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), None, "{\"a\"")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(0, None, Some("run"), ":1}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "tool_use".into()),
+                ("content_block_delta".into(), 0, "{\"a\":1}".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+        assert!(events[1].contains(r#""name":"run""#), "{}", events[1]);
+    }
+
+    #[test]
+    fn arguments_sent_as_an_object_are_relayed_as_its_json() {
+        let mut entry = call(0, Some("c"), Some("run"), "");
+        entry["function"]["arguments"] = json!({"a": 1});
+        let events = pump(&engine_stream(&[
+            chunk(&json!({"tool_calls": [entry]}), None),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(blocks(&events)[1].2, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn a_usage_only_chunk_after_a_call_reaches_message_delta() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+            json!({"id": "chatcmpl-t1", "choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}})
+                .to_string(),
+        ]));
+        let delta = events
+            .iter()
+            .find(|event| event.starts_with("event: message_delta"))
+            .unwrap();
+        assert!(delta.contains(r#""output_tokens":3"#), "{delta}");
+        assert!(delta.contains(r#""input_tokens":7"#), "{delta}");
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn an_engine_returning_to_a_closed_call_ends_the_stream_with_an_error() {
+        // The first call is valid JSON when the second begins, so only the
+        // return to it gives the interleaving away: by index when the fragment
+        // has no id, by id (whatever index it comes with) when it has one.
+        for returning in [call(0, None, None, " "), call(7, Some("a"), None, " ")] {
+            let events = pump(&engine_stream(&[
+                chunk(
+                    &json!({"tool_calls": [call(0, Some("a"), Some("one"), "{\"x\":1}")]}),
+                    None,
+                ),
+                chunk(
+                    &json!({"tool_calls": [call(1, Some("b"), Some("two"), "{}")]}),
+                    None,
+                ),
+                chunk(&json!({"tool_calls": [returning]}), None),
+                chunk(&json!({}), Some("tool_calls")),
+            ]));
+            let (name, message) = ending(&events);
+            assert_eq!(name, "error", "{events:?}");
+            assert!(message.contains("interleaved"), "{message}");
+            assert!(!events.iter().any(|e| e.contains("message_stop")));
+        }
+        // Left mid-object, the first call already fails its JSON check when
+        // the second begins.
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("a"), Some("one"), "{\"x\":")]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [call(1, Some("b"), Some("two"), "{}")]}),
+                None,
+            ),
+            chunk(&json!({"tool_calls": [call(0, None, None, "1}")]}), None),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        let (name, message) = ending(&events);
+        assert_eq!(name, "error", "{events:?}");
+        assert!(
+            message.contains("tool `one` were not a JSON object"),
+            "{message}"
+        );
+        assert!(!events.iter().any(|e| e.contains(r#""name":"two""#)));
+    }
+
+    #[test]
+    fn a_call_that_never_gets_a_name_is_an_error_not_a_nameless_tool_use() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), None, "{}")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        assert_eq!(
+            ending(&events),
+            ("error".into(), "the engine's tool call had no name".into())
+        );
+        assert!(!events.iter().any(|e| e.contains("tool_use")), "{events:?}");
+    }
+
+    #[test]
+    fn arguments_that_are_not_a_json_object_are_an_error() {
+        let events = pump(&engine_stream(&[
+            chunk(
+                &json!({"tool_calls": [call(0, Some("c"), Some("run"), "[1]")]}),
+                None,
+            ),
+            chunk(&json!({}), Some("tool_calls")),
+        ]));
+        let (name, message) = ending(&events);
+        assert_eq!(name, "error");
+        assert!(
+            message.contains("arguments for tool `run` were not a JSON object: [1]"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_call_cut_off_before_its_name_is_dropped_and_the_reply_still_has_a_block() {
+        let events = pump(&engine_stream(&[
+            chunk(&json!({"tool_calls": [call(0, Some("c"), None, "")]}), None),
+            chunk(&json!({}), Some("length")),
+        ]));
+        assert_eq!(
+            blocks(&events),
+            [
+                ("content_block_start".into(), 0, "text".into()),
+                ("content_block_stop".into(), 0, String::new()),
+            ]
+        );
+        assert_eq!(stop_reason(&events), "max_tokens");
+    }
+
+    #[test]
     fn usage_after_the_finish_chunk_still_reaches_message_delta() {
         let mut translator = StreamTranslator::new(MODEL);
         translator.feed(&chunk(&json!({"content": "x"}), None));
@@ -1942,13 +2907,42 @@ mod tests {
                         "choices": [],
                         "usage": {"prompt_tokens": 3, "completion_tokens": 2},
                     });
-                    let events = format!(
-                        "{}{}{}{}data: {usage}\n\ndata: [DONE]\n\n",
-                        chunk(json!({"role": "assistant", "content": ""}), Value::Null),
-                        chunk(json!({"content": "po"}), Value::Null),
-                        chunk(json!({"content": "ng"}), Value::Null),
-                        chunk(json!({}), json!("stop")),
-                    );
+                    // Offered tools and not yet answered by a tool result, the
+                    // engine streams a call the way vLLM does: id and name
+                    // first, then the arguments in fragments.
+                    let events = if body.contains("\"tools\"")
+                        && !body.contains("\"role\":\"tool\"")
+                    {
+                        let call = |head: Value, arguments: &str| {
+                            let mut call =
+                                json!({"index": 0, "function": {"arguments": arguments}});
+                            if let Value::Object(head) = head {
+                                call.as_object_mut().unwrap().extend(head);
+                            }
+                            json!({"tool_calls": [call]})
+                        };
+                        format!(
+                            "{}{}{}{}data: {usage}\n\ndata: [DONE]\n\n",
+                            chunk(
+                                call(
+                                    json!({"id": "call_9", "type": "function", "function": {"name": "get_weather", "arguments": ""}}),
+                                    "",
+                                ),
+                                Value::Null,
+                            ),
+                            chunk(call(Value::Null, "{\"city\":"), Value::Null),
+                            chunk(call(Value::Null, "\"Oslo\"}"), Value::Null),
+                            chunk(json!({}), json!("tool_calls")),
+                        )
+                    } else {
+                        format!(
+                            "{}{}{}{}data: {usage}\n\ndata: [DONE]\n\n",
+                            chunk(json!({"role": "assistant", "content": ""}), Value::Null),
+                            chunk(json!({"content": "po"}), Value::Null),
+                            chunk(json!({"content": "ng"}), Value::Null),
+                            chunk(json!({}), json!("stop")),
+                        )
+                    };
                     let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{events}"
@@ -2091,7 +3085,7 @@ mod tests {
                 &base,
                 "/v1/messages",
                 None,
-                &json!({"max_tokens": 4, "stream": true, "tools": [{"name": "t"}], "messages": [{"role": "user", "content": "x"}]}),
+                &json!({"max_tokens": 4, "tools": [{"type": "web_search_20250305", "name": "web_search"}], "messages": [{"role": "user", "content": "x"}]}),
             )
         })
         .await
@@ -2103,16 +3097,24 @@ mod tests {
 
     /// POST a streaming request and return `(status, content-type, raw body)`.
     fn post_streaming(base: &str, key: Option<&str>) -> (u16, String, String) {
+        post_streaming_body(
+            base,
+            key,
+            &json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "stream": true,
+                "messages": [{"role": "user", "content": "ping"}],
+            }),
+        )
+    }
+
+    /// POST `body` and return `(status, content-type, raw body)`.
+    fn post_streaming_body(base: &str, key: Option<&str>, body: &Value) -> (u16, String, String) {
         let mut request = ureq::post(&format!("{base}/v1/messages"));
         if let Some(key) = key {
             request = request.set("x-api-key", key);
         }
-        let body = json!({
-            "model": "claude-sonnet-4",
-            "max_tokens": 16,
-            "stream": true,
-            "messages": [{"role": "user", "content": "ping"}],
-        });
         let read = |response: ureq::Response| {
             (
                 response.status(),
@@ -2179,6 +3181,94 @@ mod tests {
         let forwarded: Value = serde_json::from_str(&seen[0].1).unwrap();
         assert_eq!(forwarded["stream"], true);
         assert_eq!(forwarded["model"], MODEL);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_streamed_tool_call_round_trips_through_the_engine() {
+        let engine = fake_engine();
+        let base = proxy_over(&engine).await;
+        let ask = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 64,
+            "stream": true,
+            "tools": [weather_tool()],
+            "messages": [{"role": "user", "content": "weather in Oslo?"}],
+        });
+        let first_base = base.clone();
+        let (status, content_type, body) =
+            tokio::task::spawn_blocking(move || post_streaming_body(&first_base, None, &ask))
+                .await
+                .unwrap();
+        assert_eq!(
+            (status, content_type.as_str()),
+            (200, "text/event-stream"),
+            "{body}"
+        );
+        let events = sse_events(&body);
+        let names: Vec<_> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "tool_use", "id": "call_9", "name": "get_weather", "input": {}})
+        );
+        let input: String = events
+            .iter()
+            .filter_map(|(_, data)| data["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(input, r#"{"city":"Oslo"}"#);
+        assert_eq!(events[5].1["delta"]["stop_reason"], "tool_use");
+
+        // The client sends the call back with its result, still streaming.
+        let answer = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 64,
+            "stream": true,
+            "tools": [weather_tool()],
+            "messages": [
+                {"role": "user", "content": "weather in Oslo?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_9", "name": "get_weather", "input": {"city": "Oslo"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_9", "content": "sunny"}
+                ]},
+            ],
+        });
+        let (status, _, body) =
+            tokio::task::spawn_blocking(move || post_streaming_body(&base, None, &answer))
+                .await
+                .unwrap();
+        assert_eq!(status, 200, "{body}");
+        let events = sse_events(&body);
+        let text: String = events
+            .iter()
+            .filter_map(|(_, data)| data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(text, "pong");
+        assert_eq!(events.last().unwrap().0, "message_stop");
+
+        let seen = engine.seen.lock().unwrap();
+        let first: Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(first["stream"], true);
+        assert_eq!(first["tools"][0]["function"]["name"], "get_weather");
+        let second: Value = serde_json::from_str(&seen[1].1).unwrap();
+        let messages = second["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_9");
+        assert_eq!(
+            messages[2],
+            json!({"role": "tool", "tool_call_id": "call_9", "content": "sunny"})
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

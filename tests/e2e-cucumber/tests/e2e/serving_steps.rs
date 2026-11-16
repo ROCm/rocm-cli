@@ -2609,31 +2609,25 @@ async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
     .await;
 }
 
-/// The tool the tool-use scenario offers, and the argument it requires.
+/// The tool both tool-use scenarios offer, and the argument it requires.
 const ANTHROPIC_TOOL_NAME: &str = "get_weather";
 const ANTHROPIC_TOOL_ARGUMENT: &str = "city";
 
 #[when("the user sends a tool-use request to the Anthropic messages endpoint")]
 async fn user_sends_anthropic_tool_use_request(world: &mut E2eWorld) {
-    // The tool is named in `tool_choice` so the reply does not depend on the
-    // model choosing to call it: what is under test is the translation of the
-    // definition out and of the call back, not the model's judgement.
+    // The tool is named in `tool_choice`, which an engine that honours it turns
+    // into a call to that tool: what is under test is the translation of the
+    // definition out and of the call back, not the model's judgement. An
+    // engine that does not honour a named `tool_choice` leaves the call to the
+    // model.
     post_anthropic_messages(
         world,
         serde_json::json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
-            "tools": [{
-                "name": ANTHROPIC_TOOL_NAME,
-                "description": "Get the current weather for a city.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {ANTHROPIC_TOOL_ARGUMENT: {"type": "string"}},
-                    "required": [ANTHROPIC_TOOL_ARGUMENT],
-                },
-            }],
+            "tools": [anthropic_weather_tool()],
             "tool_choice": {"type": "tool", "name": ANTHROPIC_TOOL_NAME},
-            "messages": [{"role": "user", "content": "What is the weather in Oslo?"}],
+            "messages": [{"role": "user", "content": ANTHROPIC_TOOL_QUESTION}],
         }),
     )
     .await;
@@ -2716,17 +2710,26 @@ async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
 
 #[when("the user sends a streaming request to the Anthropic messages endpoint")]
 async fn user_sends_streaming_anthropic_messages_request(world: &mut E2eWorld) {
+    // Same budget and model name as the non-streaming request above.
+    post_anthropic_stream(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }),
+    )
+    .await;
+}
+
+/// POST a `stream: true` `body` to the served model's Anthropic endpoint and
+/// keep its content type and raw event stream in `world.anthropic_stream`.
+async fn post_anthropic_stream(world: &mut E2eWorld, body: serde_json::Value) {
     let base = listed_anthropic_endpoint(world)
         .await
         .expect("no Anthropic endpoint is listed for the served model");
     let budget = Duration::from_secs(crate::inference_timeout_for(world));
-    // Same budget and model name as the non-streaming request above.
-    let body = serde_json::json!({
-        "model": "claude-sonnet-4-5",
-        "max_tokens": 1024,
-        "stream": true,
-        "messages": [{"role": "user", "content": "Hello"}],
-    });
     let (content_type, events) = tokio::spawn(async move {
         let response = reqwest::Client::builder()
             .timeout(budget)
@@ -2738,11 +2741,11 @@ async fn user_sends_streaming_anthropic_messages_request(world: &mut E2eWorld) {
             .send()
             .await
             .unwrap_or_else(|error| panic!("POST {base}/v1/messages failed: {error}"));
-        assert!(
-            response.status().is_success(),
-            "streaming request answered HTTP {}",
-            response.status()
-        );
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            panic!("streaming request answered HTTP {status}: {body}");
+        }
         let content_type = response
             .headers()
             .get("content-type")
@@ -2846,6 +2849,264 @@ async fn assert_anthropic_stream_reassembles(world: &mut E2eWorld) {
             .as_u64()
             .is_some_and(|n| n > 0),
         "message_delta reports no output tokens: {delta}"
+    );
+}
+
+/// The Anthropic tool definition both tool-use scenarios offer.
+fn anthropic_weather_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": ANTHROPIC_TOOL_NAME,
+        "description": "Get the current weather for a city.",
+        "input_schema": {
+            "type": "object",
+            "properties": {ANTHROPIC_TOOL_ARGUMENT: {"type": "string"}},
+            "required": [ANTHROPIC_TOOL_ARGUMENT],
+        },
+    })
+}
+
+/// The question both tool-use scenarios ask.
+const ANTHROPIC_TOOL_QUESTION: &str = "What is the weather in Oslo?";
+
+/// The token budget of each streamed tool-use turn. A reasoning model (the
+/// Qwen3 the lanes serve thinks by default, and the proxy cannot turn that
+/// off) spends tokens thinking before it answers, and both turns must finish
+/// for their own reason (`tool_use`, then `end_turn` or `tool_use`) rather
+/// than run out of budget, so this leaves room well past the 1024 the other
+/// Anthropic scenarios use.
+const STREAMED_TOOL_TURN_BUDGET: u32 = 4096;
+
+#[when(
+    "a coding agent sends a streamed request that requires a tool to the Anthropic messages endpoint"
+)]
+async fn agent_sends_streaming_tool_use_request(world: &mut E2eWorld) {
+    // A coding agent streams every request and offers its tools on each. The
+    // tool is required by name with parallel calls disabled (which the proxy
+    // forwards as `parallel_tool_calls: false`), so an engine that honours
+    // both answers with exactly one call to it. An engine that does not honour
+    // a named `tool_choice` leaves the call to the model. What is under test
+    // is that the call is relayed while the reply streams.
+    post_anthropic_stream(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": STREAMED_TOOL_TURN_BUDGET,
+            "stream": true,
+            "tools": [anthropic_weather_tool()],
+            "tool_choice": {
+                "type": "tool",
+                "name": ANTHROPIC_TOOL_NAME,
+                "disable_parallel_tool_use": true,
+            },
+            "messages": [{"role": "user", "content": ANTHROPIC_TOOL_QUESTION}],
+        }),
+    )
+    .await;
+}
+
+/// Rebuild the assistant's content blocks from a streamed reply, the way an
+/// Anthropic client does: each `content_block_start` opens a block at its
+/// index, text and `input_json_delta` fragments are appended to it, and a
+/// `tool_use` block's input is the JSON its fragments add up to.
+///
+/// It also holds the stream to the event contract: blocks start in index
+/// order, one at a time; deltas and the `content_block_stop` go to the open
+/// block; and every block is stopped before `message_delta`.
+fn streamed_content(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+    let mut blocks: Vec<(serde_json::Value, String)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (name, data) in events {
+        let index = data["index"].as_u64().map(|i| usize::try_from(i).unwrap());
+        match name.as_str() {
+            "content_block_start" => {
+                let index = index.expect("content_block_start without an index");
+                assert_eq!(
+                    open, None,
+                    "a block started before block {open:?} stopped: {events:?}"
+                );
+                assert_eq!(
+                    index,
+                    blocks.len(),
+                    "blocks must start in index order: {events:?}"
+                );
+                blocks.push((data["content_block"].clone(), String::new()));
+                open = Some(index);
+            }
+            "content_block_delta" => {
+                let index = index.expect("content_block_delta without an index");
+                assert_eq!(
+                    open,
+                    Some(index),
+                    "a delta for a block that is not open: {events:?}"
+                );
+                let (block, json) = &mut blocks[index];
+                match data["delta"]["type"].as_str() {
+                    Some("text_delta") => {
+                        let text = block["text"].as_str().unwrap_or_default().to_owned()
+                            + data["delta"]["text"].as_str().unwrap_or_default();
+                        block["text"] = serde_json::Value::String(text);
+                    }
+                    Some("input_json_delta") => {
+                        json.push_str(data["delta"]["partial_json"].as_str().unwrap_or_default());
+                    }
+                    other => panic!("unexpected delta type {other:?}: {data}"),
+                }
+            }
+            "content_block_stop" => {
+                let index = index.expect("content_block_stop without an index");
+                assert_eq!(
+                    open,
+                    Some(index),
+                    "a stop for a block that is not open: {events:?}"
+                );
+                open = None;
+            }
+            "message_delta" => {
+                assert_eq!(
+                    open, None,
+                    "message_delta while block {open:?} is open: {events:?}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        open, None,
+        "the stream left block {open:?} open: {events:?}"
+    );
+    blocks
+        .into_iter()
+        .map(|(mut block, json)| {
+            if block["type"] == "tool_use" {
+                block["input"] = serde_json::from_str(&json).unwrap_or_else(|error| {
+                    panic!("the streamed tool input is not JSON ({error}): {json}")
+                });
+            }
+            block
+        })
+        .collect()
+}
+
+/// The `stop_reason` the stream's `message_delta` carries, after checking the
+/// stream completed (`message_stop` last, right after `message_delta`, no
+/// `error`).
+fn completed_stream_stop_reason(events: &[(String, serde_json::Value)]) -> String {
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        !names.contains(&"error"),
+        "the stream carried an error: {events:?}"
+    );
+    assert_eq!(names.first(), Some(&"message_start"), "{names:?}");
+    assert!(
+        names.ends_with(&["message_delta", "message_stop"]),
+        "the stream does not end with message_delta then message_stop: {names:?}"
+    );
+    events[events.len() - 2].1["delta"]["stop_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("message_delta has no stop_reason: {events:?}"))
+        .to_owned()
+}
+
+#[then("the agent receives the tool request as a streamed tool_use block")]
+async fn assert_streamed_tool_use_block(world: &mut E2eWorld) {
+    let (header, events) = parse_anthropic_stream(world);
+    assert!(
+        header.contains("text/event-stream"),
+        "the reply was not streamed: {header}"
+    );
+    assert_eq!(
+        completed_stream_stop_reason(&events),
+        "tool_use",
+        "a streamed reply with a tool call stops for tool use: {events:?}"
+    );
+    // The call is relayed as stream events, not only as a finished message:
+    // its block starts, then its arguments arrive as `input_json_delta`.
+    assert!(
+        events
+            .iter()
+            .any(|(name, data)| name == "content_block_delta"
+                && data["delta"]["type"] == "input_json_delta"),
+        "the tool arguments did not stream as input_json_delta: {events:?}"
+    );
+    let content = streamed_content(&events);
+    let calls: Vec<_> = content
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .collect();
+    // Parallel calls are disabled in the request, so a reply that honours it
+    // carries one call.
+    let [call] = calls.as_slice() else {
+        panic!("expected exactly one tool_use block in the streamed reply: {content:?}");
+    };
+    assert!(
+        call["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the tool_use block has no id: {call}"
+    );
+    assert_eq!(call["name"], ANTHROPIC_TOOL_NAME, "{call}");
+    assert!(
+        call["input"][ANTHROPIC_TOOL_ARGUMENT]
+            .as_str()
+            .is_some_and(|city| !city.is_empty()),
+        "the streamed tool input has no `{ANTHROPIC_TOOL_ARGUMENT}` argument: {call}"
+    );
+}
+
+#[when("the agent sends the tool result back in a streamed request")]
+async fn agent_sends_streamed_tool_result(world: &mut E2eWorld) {
+    let (_, events) = parse_anthropic_stream(world);
+    let assistant = streamed_content(&events);
+    let call_id = assistant
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .and_then(|block| block["id"].as_str())
+        .expect("no tool_use block to answer")
+        .to_owned();
+    // The assistant turn goes back exactly as the client rebuilt it from the
+    // stream, which is what a coding agent does on its next request.
+    post_anthropic_stream(
+        world,
+        serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": STREAMED_TOOL_TURN_BUDGET,
+            "stream": true,
+            "tools": [anthropic_weather_tool()],
+            "messages": [
+                {"role": "user", "content": ANTHROPIC_TOOL_QUESTION},
+                {"role": "assistant", "content": assistant},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": "Sunny, 18 degrees Celsius.",
+                }]},
+            ],
+        }),
+    )
+    .await;
+}
+
+#[then("the streamed reply continues the conversation")]
+async fn assert_streamed_reply_continues(world: &mut E2eWorld) {
+    let (_, events) = parse_anthropic_stream(world);
+    let stop_reason = completed_stream_stop_reason(&events);
+    // Whether the model answers in text or calls the tool again is its own
+    // choice; either is a turn that continues the conversation. What must not
+    // happen is an empty reply, a refusal of the tool result, or a reply the
+    // token budget cut off: that would mean the turn never finished, which is
+    // what `STREAMED_TOOL_TURN_BUDGET` leaves room to avoid for a model that
+    // thinks first.
+    assert!(
+        ["end_turn", "tool_use"].contains(&stop_reason.as_str()),
+        "the reply after the tool result stopped for `{stop_reason}`: {events:?}"
+    );
+    let content = streamed_content(&events);
+    assert!(
+        content.iter().any(|block| {
+            block["type"] == "tool_use"
+                || block["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+        }),
+        "the reply after the tool result is empty (stop_reason {stop_reason}): {events:?}"
     );
 }
 

@@ -821,11 +821,11 @@ Feature: Model serving
 
   # ROCMAI-597: a served model is also reachable from Anthropic-format clients.
   # The serving process publishes an Anthropic-compatible `/v1/messages` endpoint
-  # beside the OpenAI one — the engine's own when it serves one, else a
-  # translation front on its own port — and `services list` shows it. Engine-
+  # beside the OpenAI one — a translation front on its own port, even for an
+  # engine with a route of its own — and `services list` shows it. Engine-
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
-  # Tool use is translated for non-streaming requests (serve-53); a streaming
-  # request that offers tools is refused, which only the unit tests cover.
+  # Tool use is translated for non-streaming requests (serve-53) and for
+  # streamed ones (serve-61).
   @id:serve-anthropic-endpoint-advertised @requires-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
@@ -980,3 +980,20 @@ Feature: Model serving
     And the deployment summary names the logs command for that service
     And the launch's service record is left as ready
     And no background automation daemon was left behind
+
+  # ROCMAI-1070: a coding agent (Claude Code and the like) streams every request
+  # and offers its tools on each, so a streamed reply must be able to carry a
+  # tool call. The call arrives as a `tool_use` block whose arguments stream as
+  # `input_json_delta` events; the agent rebuilds its turn from the stream, sends
+  # the tool result back, and the model carries on. As in serve-53 the tool is
+  # required by name, here with parallel calls disabled; on an engine that does
+  # not honour a named tool choice, the run also depends on the model choosing
+  # to call the tool.
+  @id:serve-anthropic-messages-streaming-tool-use @requires-gpu
+  Scenario: serve-61 - A streamed reply from a served model can call a tool
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When a coding agent sends a streamed request that requires a tool to the Anthropic messages endpoint
+    Then the agent receives the tool request as a streamed tool_use block
+    When the agent sends the tool result back in a streamed request
+    Then the streamed reply continues the conversation

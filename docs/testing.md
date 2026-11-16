@@ -3439,12 +3439,30 @@ The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-
 tool and requires it gets a `tool_use` block back) and `serve-54`
 (`@id:serve-anthropic-messages-streaming`, which sends `stream: true` and
 checks the reply is an event stream that reassembles into text, with usage in
-`message_delta`) in
+`message_delta`) and `serve-61` (`@id:serve-anthropic-messages-streaming-tool-use`,
+a streamed request that requires a tool gets the call as a streamed `tool_use`
+block, and sending the tool result back in a second streamed request gets a
+reply) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. The proxy's unit tests cover the stream event sequence, a stream
-that ends early, an engine refusal before the first byte, and the refusal of a
-streaming request that offers `tools` (no scenario covers that refusal). The
+serves with. `serve-53` and `serve-61` have two expected-failure rows each in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml): a non-flaky one
+on vLLM, which is served without a tool-call parser (EAI-7223), and a flaky one
+on Linux Lemonade (ROCMAI-898). A failure on either counts as expected, so the
+lanes where they must pass are the Strix Halo Windows ones,
+`e2e-gpu-strix-windows` in
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) and the scheduled
+`e2e-gpu-nightly-strix-windows` in
+[nightly.yml](../.github/workflows/nightly.yml). Neither is a required check. The proxy's unit
+tests cover the stream event sequence, a stream that ends early and an engine
+refusal before the first byte. For streamed tool calls they cover one block per
+call in order (numbered or not, with index gaps, before or after text), arguments relayed
+as `input_json_delta` fragments, `{}` for a call with none, ids for calls the
+engine gave none, the `tool_use` stop reason after an engine's `stop`,
+`max_tokens` for a `length` finish with the relayed blocks kept, and the
+`error` event that ends the stream for a call with no name, arguments that are
+not a JSON object, or an engine that interleaves two calls; a streamed call
+and its `tool_result` also round-trip through the proxy to a fake engine. The non-streaming
 tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
 blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
 same module; `serve-53` is the real-engine check.

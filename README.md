@@ -1268,7 +1268,7 @@ with the `tool_use` stop reason in the reply. Whether the model calls a tool
 depends on the engine: vLLM needs `--tool-call-parser <name>` (and auto tool choice) for any
 `tool_choice` (`any` and a named tool included), and answers a request that names a
 tool with a 400 without one. A streaming request is answered with Anthropic server-sent events built from the
-engine's streamed chunks, but streaming a request that defines `tools` is refused. Extended thinking, server tools (web search and
+engine's streamed chunks, including streamed tool calls (each becomes a `tool_use` block whose arguments arrive as `input_json_delta` fragments). Extended thinking, server tools (web search and
 the like) and image or other non-text content blocks are refused with
 an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
 marks the endpoint `(not responding)` when a ready service's endpoint does not
