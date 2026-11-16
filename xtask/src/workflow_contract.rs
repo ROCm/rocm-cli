@@ -4446,7 +4446,7 @@ fi
             // Today's run: not yesterday's, whatever its conclusion was.
             "date -u -d '24 hours ago'",
             ".created_at >= $since",
-            "gh run download \"$found\"",
+            "gh run download \"$candidate\"",
             "--name queue-run-results",
             // A run that started a day ago is not tonight's, whenever it ended.
             "[ \"$started_at\" -ge \"$(date -u -d '24 hours ago' +%s)\" ]",
@@ -4749,6 +4749,7 @@ fi
             failing_gates: vec!["E2E (report unreadable)".to_string()],
             e2e_fail_total: None,
             build_skipped: false,
+            queue_absent: None,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
@@ -4768,6 +4769,7 @@ fi
             failing_gates: vec![],
             e2e_fail_total: Some(0),
             build_skipped: false,
+            queue_absent: None,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });

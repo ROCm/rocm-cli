@@ -441,12 +441,15 @@ fn one_line(text: &str) -> String {
 }
 
 const SECTION_HEADING: &str = "## Queue lanes\n\n";
+/// How the "nothing imported" note starts; `release-readiness` looks for it in
+/// the matrix so the verdict page can say the queue lanes are missing too.
+pub(crate) const ABSENT_LEAD: &str = "_No queue lanes are in this report: ";
+pub(crate) const ABSENT_TAIL: &str = ". The GPUs the shared queue tests are not shown tonight._";
 
 /// The section for a nightly with no queue results to import.
 fn render_absent(reason: &str) -> String {
     format!(
-        "{SECTION_HEADING}_No queue lanes are in this report: {}. The GPUs the shared queue \
-         tests are not shown tonight._\n\n",
+        "{SECTION_HEADING}{ABSENT_LEAD}{}{ABSENT_TAIL}\n\n",
         one_line(reason)
     )
 }

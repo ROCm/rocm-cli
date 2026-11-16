@@ -1408,31 +1408,40 @@ jobs:
           repo_id=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id) ||
             absent "the repository could not be read"
           since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-          found=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=queue-run-results&per_page=50" |
+          # Newest first: a run asked to test another branch (a `queue-run.yml`
+          # dispatch runs main's workflow too) must not hide an older run of main.
+          candidates=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=queue-run-results&per_page=50" |
             jq -r --arg since "$since" --argjson repo "$repo_id" '
               [.artifacts[]
                | select(.expired == false)
                | select(.workflow_run.head_branch == "main" and .workflow_run.head_repository_id == $repo)
                | select(.created_at >= $since)]
-              | sort_by(.created_at) | last // empty | .workflow_run.id') ||
+              | sort_by(.created_at) | reverse | .[:5][] | .workflow_run.id') ||
             absent "the queue results could not be listed"
-          [ -n "$found" ] ||
+          [ -n "$candidates" ] ||
             absent "no queue run on main finished in the last 24 hours (a run still going is not imported)"
-          # The run of main's workflow can have been asked to test another branch,
-          # and a run that started a day ago is not tonight's.
-          started=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${found}" --jq .run_started_at) ||
-            absent "when the newest queue run started could not be read"
-          started_at=$(date -u -d "$started" +%s 2>/dev/null) &&
-            [ "$started_at" -ge "$(date -u -d '24 hours ago' +%s)" ] ||
-            absent "the newest queue run started more than 24 hours ago"
-          echo "$started" > queue-results/started.txt
-          gh run download "$found" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results ||
-            absent "the queue results of run $found could not be downloaded"
-          # The log names the branch the run tested and which lanes the queue
-          # blocks on. Without it nothing is imported.
-          job=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${found}/jobs" --jq '.jobs[0].id') &&
-            gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log ||
-            rm -f queue-results/job.log
+          found=""
+          for candidate in $candidates; do
+            rm -rf queue-results/results queue-results/job.log
+            # A run that started a day ago is not tonight's.
+            started=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}" --jq .run_started_at) || continue
+            started_at=$(date -u -d "$started" +%s 2>/dev/null) &&
+              [ "$started_at" -ge "$(date -u -d '24 hours ago' +%s)" ] || continue
+            gh run download "$candidate" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results || continue
+            # The log names the branch the run tested and which lanes the queue
+            # blocks on; a run that tested another branch is skipped, not the end
+            # of the search. `e2e-queue-import` checks the log again.
+            job=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/jobs" --jq '.jobs[0].id') &&
+              gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log &&
+              grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log || continue
+            found="$candidate"
+            echo "$started" > queue-results/started.txt
+            break
+          done
+          if [ -z "$found" ]; then
+            rm -rf queue-results/results queue-results/job.log
+            absent "none of the newest queue runs of the last 24 hours tested main with a readable log and results"
+          fi
           echo "$found" > queue-results/run-id.txt
 
       # Turn the run's lanes into reports of this job's own kind, and write the

@@ -219,7 +219,9 @@ queue has (MI325X, MI350X, MI355X) is on them.
   run that took under about three and a half hours is in the night's report. A
   run that is still going, that started on an earlier day or that tested
   another branch is not imported, and neither is a run published again by
-  `nightly-queue.yml`.
+  `nightly-queue.yml`. The job looks at the five newest runs of the window and
+  takes the first that tested `main`, so a run of another branch does not hide
+  an earlier run of `main`.
 - **Which lanes, and whether each blocks.** The artifact holds the lanes'
   files and nothing else about the run, so the job reads the run's job log, whose
   lane matrix is the only place the queue prints which lanes it ran and which of
@@ -255,8 +257,10 @@ queue has (MI325X, MI350X, MI355X) is on them.
   branch, an artifact or log that cannot be downloaded or an import that fails
   never fails the nightly report: the page opens with a `Queue lanes` note
   saying that no queue lanes are in it tonight and why, and the rest is built as
-  before. The verdict does not take that absence for a failure, so read the note
-  before reading a `GO`.
+  before. The verdict does not take that absence for a failure, so the
+  `Release-Readiness` table says it too: its `E2E` row is marked "queue lanes
+  missing" and a warning under the table names the reason. Read it before
+  reading a `GO`: that `GO` does not cover the queue's GPUs.
 
 What is public follows from the queue's own rules: the artifact is public and
 already scanned, only three of its files are used, and the log is the public job

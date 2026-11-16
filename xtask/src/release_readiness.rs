@@ -72,6 +72,11 @@ pub struct Facts {
     /// Whether the nightly or Windows build gate was skipped (a legitimate
     /// no-op-night outcome, not a failure) rather than actually run.
     pub build_skipped: bool,
+    /// Why the shared queue's GPU lanes are not in tonight's E2E report, when
+    /// the matrix says so. The verdict does not count that absence as a
+    /// failure, so the table has to say it: the E2E row covers only the lanes
+    /// that are in the report.
+    pub queue_absent: Option<String>,
     pub commits: CommitBuckets,
     pub known_issues: Vec<KnownIssue>,
 }
@@ -93,7 +98,7 @@ pub fn run(
         .with_context(|| format!("reading e2e report {}", e2e_report.display()))?;
     let e2e_fail_total = total_e2e_failures(&e2e_text);
 
-    let facts = assemble_facts(
+    let mut facts = assemble_facts(
         since_tag,
         commits,
         known_issues,
@@ -102,6 +107,7 @@ pub fn run(
         windows_result,
         e2e_report_job_result,
     );
+    facts.queue_absent = queue_absent_reason(&e2e_text);
 
     // Trailing newline so the file ends like a text file.
     write_parented(out, &format!("{}\n", serde_json::to_string_pretty(&facts)?))?;
@@ -164,6 +170,7 @@ fn assemble_facts(
         failing_gates,
         e2e_fail_total,
         build_skipped: nightly_result == "skipped" || windows_result == "skipped",
+        queue_absent: None,
         commits,
         known_issues,
     }
@@ -415,6 +422,16 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 /// Parsing the already-rendered rows, rather than re-deriving per-platform
 /// pass/fail here, keeps this in lockstep with that crate's known-bugs/xfail
 /// handling instead of duplicating it.
+/// The reason the matrix gives for having no queue lanes, if it says so
+/// (`e2e_queue_import::render_absent`).
+fn queue_absent_reason(markdown: &str) -> Option<String> {
+    use crate::e2e_queue_import::{ABSENT_LEAD, ABSENT_TAIL};
+    markdown.lines().find_map(|line| {
+        let rest = line.strip_prefix(ABSENT_LEAD)?;
+        Some(rest.strip_suffix(ABSENT_TAIL).unwrap_or(rest).to_string())
+    })
+}
+
 fn total_e2e_failures(markdown: &str) -> Option<u64> {
     // Scope strictly to the summary table's own row range — the document
     // keeps going after it with an expectation grid and a command-coverage
@@ -497,10 +514,13 @@ pub(crate) fn render_table(facts: &Facts) -> String {
     // the header below so `publish-release-readiness-wiki`'s guard (which
     // greps for it) only trips on a truly empty/degenerate table.
     let e2e_failing = facts.failing_gates.iter().any(|g| g.starts_with("E2E"));
-    let e2e_evidence = match facts.e2e_fail_total {
+    let mut e2e_evidence = match facts.e2e_fail_total {
         Some(n) => format!("{n} failure(s) across all platforms"),
         None => "evidence unreadable".to_string(),
     };
+    if facts.queue_absent.is_some() {
+        e2e_evidence.push_str(" in the report (queue lanes missing, see below)");
+    }
 
     out.push_str("| Area | Evidence | Status |\n|---|---|:--:|\n");
     let _ = writeln!(
@@ -520,6 +540,16 @@ pub(crate) fn render_table(facts: &Facts) -> String {
         if e2e_failing { "❌" } else { "✅" }
     );
     out.push('\n');
+
+    if let Some(reason) = &facts.queue_absent {
+        let _ = writeln!(
+            out,
+            "⚠️ **The shared queue's GPU lanes are not in tonight's report** ({}). The E2E row \
+             above does not cover them, so a GO here does not cover R9700, MI350P, W7900 or the \
+             queue's blocking lanes.\n",
+            escape_markdown(reason)
+        );
+    }
 
     // The status table above only has room for a glyph per row, which is
     // ambiguous on its own (e.g. a cancelled E2E lane renders as
@@ -849,6 +879,34 @@ mod tests {
             "real producer output with 0 actual failures must read as 0, not inflated by \
              downstream tables:\n{md}"
         );
+    }
+
+    #[test]
+    fn the_table_says_when_the_queue_lanes_are_missing() {
+        let md = format!(
+            "## Queue lanes\n\n{}{}{}\n\n",
+            crate::e2e_queue_import::ABSENT_LEAD,
+            "no queue run on main finished in the last 24 hours",
+            crate::e2e_queue_import::ABSENT_TAIL
+        );
+        let reason = queue_absent_reason(&md).expect("the note is recognised");
+        assert_eq!(reason, "no queue run on main finished in the last 24 hours");
+        assert_eq!(queue_absent_reason("| Total | 0 |\n"), None);
+        let mut facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            "success",
+        );
+        facts.queue_absent = Some(reason);
+        let table = render_table(&facts);
+        assert!(table.contains("queue lanes missing"), "{table}");
+        assert!(table.contains("not in tonight's report"), "{table}");
+        // Not a failure: the verdict stays as the other gates decide it.
+        assert_eq!(facts.verdict, Verdict::Go);
     }
 
     #[test]
