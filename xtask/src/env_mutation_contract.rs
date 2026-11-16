@@ -122,11 +122,17 @@ mod tests {
     /// directly from its type, rather than through that call, would leave
     /// nothing for this list's text to match; build such a guard only through
     /// the listed call.
-    const MUTATIONS: [&str; 4] = [
+    ///
+    /// `EnvVarGuard::set(` (`crates/rocm-core/src/examine/framework.rs`) is the
+    /// same shape: its constructor sets the variable and its `Drop` restores
+    /// it, both in impls the scan never enters, so the test that builds one
+    /// shows neither call.
+    const MUTATIONS: [&str; 5] = [
         "set_var(",
         "remove_var(",
         "RestoredEnvVar::set(",
         "UnsetKeyOnExit::arm(",
+        "EnvVarGuard::set(",
     ];
 
     /// Named helpers that serialize env mutation for their whole scope.
@@ -574,7 +580,7 @@ mod tests {
     fn every_mutating_call_is_flagged_inside_an_unguarded_test() {
         let kinds = ["set_var", "remove_var"];
         let delegated = ["RestoredEnvVar::set"];
-        let held = ["UnsetKeyOnExit::arm"];
+        let held = ["UnsetKeyOnExit::arm", "EnvVarGuard::set"];
         assert_eq!(
             MUTATIONS.len(),
             kinds.len() + delegated.len() + held.len(),

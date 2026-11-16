@@ -162,9 +162,9 @@ for any of these known blind spots:
   helper to that list, or it is outside the guard.
 - A guard held by the test whose `Drop` mutates the environment — the mutation
   runs in the `Drop` impl, which the scan never enters. List the call that
-  builds the guard in `MUTATIONS`, as `UnsetKeyOnExit::arm(` is, and build it
-  only through that call: constructing the type directly leaves no listed text
-  to match, and nothing enforces this.
+  builds the guard in `MUTATIONS`, as `UnsetKeyOnExit::arm(` and
+  `EnvVarGuard::set(` are, and build it only through that call: constructing
+  the type directly leaves no listed text to match, and nothing enforces this.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
