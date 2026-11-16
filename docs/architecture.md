@@ -495,7 +495,7 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 | [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs) | The chat-agent seam: the `AgentClient` trait, `AgentError`, `StateSnapshot`, `InferenceParams`, and the request budget — `DEFAULT_REQUEST_TIMEOUT`, the `ROCM_DASH_CHAT_TIMEOUT_SECS` override (`REQUEST_TIMEOUT_ENV`) and the `request_timeout()` that resolves between them. | relocation |
 | [`agent/clients.rs`](../crates/rocm-dash-tui/src/agent/clients.rs) | The `AgentClient` backends: Rig (OpenAI-compatible), ChatGPT (OAuth device code), Anthropic, and the in-memory `MockAgentClient`. | relocation |
 | [`agent/snapshot.rs`](../crates/rocm-dash-tui/src/agent/snapshot.rs) | Pure JSON summaries of the cached telemetry snapshot for the agent's tools, with no `rig` dependency. | relocation |
-| [`agent/tools.rs`](../crates/rocm-dash-tui/src/agent/tools.rs) | The Rig `Tool` wrappers: the telemetry tools over the cached snapshot, the read-only and mutating ROCm tools, and their registration on an agent builder. | relocation |
+| [`agent/tools.rs`](../crates/rocm-dash-tui/src/agent/tools.rs) | The Rig `Tool` wrappers: the telemetry tools over the cached snapshot, the read-only and mutating ROCm tools, their registration on an agent builder, and the per-result size cap and duplicate-output trim applied before a tool result reaches the model. | relocation |
 
 #### `app/`
 
@@ -504,7 +504,7 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 | [`app/mod.rs`](../crates/rocm-dash-tui/src/app/mod.rs) | The reducer's front: `AppState` and its constructor, the theme picker, row selection, and `apply_event`, which folds daemon events into state. | flat |
 | [`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs) | `KeyAction` dispatch: maps a key press or a resolved mouse hit to a `KeyAction` and applies it to reducer state (`apply_action`). | domain |
 | [`app/chat.rs`](../crates/rocm-dash-tui/src/app/chat.rs) | Chat-backend construction, local-engine detection, and saving an accepted endpoint to the dashboard config. | relocation |
-| [`app/chat_runtime.rs`](../crates/rocm-dash-tui/src/app/chat_runtime.rs) | `ChatRuntime`, the live chat backend the tick loop owns: which agent answers the next turn, and the drains for the provider-switch, endpoint-rebuild and dispatch edges. | flat |
+| [`app/chat_runtime.rs`](../crates/rocm-dash-tui/src/app/chat_runtime.rs) | `ChatRuntime`, the live chat backend the tick loop owns: which agent answers the next turn, the drains for the provider-switch, endpoint-rebuild and dispatch edges, and the mapping from a backend error to the line the Chat tab shows. | flat |
 | [`app/chat_state.rs`](../crates/rocm-dash-tui/src/app/chat_state.rs) | An `impl AppState` block for chat consent, the local-endpoint detection offer, submitting a turn, and applying the agent's reply or error. | flat |
 | [`app/event_loop.rs`](../crates/rocm-dash-tui/src/app/event_loop.rs) | The tick loop: `run` (set up, run, tear down) and `event_loop`, with the frame-draw gate and the registry-probe seeding. | domain |
 | [`app/focus.rs`](../crates/rocm-dash-tui/src/app/focus.rs) | Focused-host policy: what a dashboard launched for Setup, Serve or Examine does differently (no daemon client or chat, one overlay opened at start, console close keys swallowed). | flat |
@@ -816,6 +816,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`src/stray_process.rs`](../tests/e2e-cucumber/src/stray_process.rs) | What scenario teardown does about a process a scenario started and recorded: only a process that is still the one recorded is ended, never one that has since exited or whose PID another process has taken. Decided apart from the system reads, so a table test covers each case on every host. | flat |
 | [`src/tasklist.rs`](../tests/e2e-cucumber/src/tasklist.rs) | What `tasklist` says about one process, read so that a failed query cannot pass for an answer: the exit status is judged before the text, so a run that did not succeed gives no answer rather than "the process exited". Pure, so a table test covers every case on every host. | flat |
 | [`src/terminal_size.rs`](../tests/e2e-cucumber/src/terminal_size.rs) | Validates a requested terminal size and applies it to the emulated screen before the real PTY. | flat |
+| [`src/torch_alignment_outcome.rs`](../tests/e2e-cucumber/src/torch_alignment_outcome.rs) | Which `torch_alignment:` outcomes the runtime scenarios accept as settled, including `not_applicable` when the engine declares no torch pin, and the verdict on importing the engine's stack. | flat |
 
 #### `src/bin/`
 
