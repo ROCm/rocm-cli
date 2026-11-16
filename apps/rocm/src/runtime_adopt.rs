@@ -658,9 +658,13 @@ mod tests {
     enum TestAdoptRequest {
         /// A request with the runtime id and key spelled out.
         HandBuilt,
-        /// The request `rocm runtimes adopt` builds with no `--runtime-id`,
-        /// through [`infer_adopt_runtime_request`]; `channel` is `--channel`.
-        Inferred { channel: Option<&'static str> },
+        /// The request `rocm runtimes adopt` builds, through
+        /// [`infer_adopt_runtime_request`]; `runtime_id` is `--runtime-id` and
+        /// `channel` is `--channel`.
+        Inferred {
+            runtime_id: Option<&'static str>,
+            channel: Option<&'static str>,
+        },
     }
 
     /// Adopts a fake external environment, building the request as `request`
@@ -730,10 +734,13 @@ mod tests {
                 runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
                 replace: false,
             },
-            TestAdoptRequest::Inferred { channel } => infer_adopt_runtime_request(
+            TestAdoptRequest::Inferred {
+                runtime_id,
+                channel,
+            } => infer_adopt_runtime_request(
                 python_executable,
                 Some(external_root),
-                None,
+                runtime_id.map(str::to_owned),
                 None,
                 channel.map(str::to_owned),
                 false,
@@ -763,17 +770,26 @@ mod tests {
     /// Adoption installs nothing, so there is no package source to name: the
     /// manifest's artifact URL holds only the adoption marker. The listing must
     /// say the source was not recorded rather than present that marker as one.
-    /// The channel is the one adoption recorded, for the request `rocm runtimes
-    /// adopt` builds with no `--runtime-id`: adoption's default, `release`, when
-    /// no `--channel` is named, and `nightly` after `--channel nightly`.
+    /// The channel is the one adoption recorded, for each way the request
+    /// `rocm runtimes adopt` builds can name it: adoption's default, `release`,
+    /// when neither `--channel` nor `--runtime-id` names one; `nightly` after
+    /// `--channel nightly`; and `nightly` after `--runtime-id
+    /// therock-nightly:<family>` with no `--channel`, where the channel comes
+    /// from the runtime id alone. The family is the one the test probe reports.
     #[test]
     fn adopted_runtime_lists_its_channel_and_its_source_as_unrecorded() -> Result<()> {
-        for (channel_flag, expected_channel) in [(None, "release"), (Some("nightly"), "nightly")] {
+        for (runtime_id_flag, channel_flag, expected_channel) in [
+            (None, None, "release"),
+            (None, Some("nightly"), "nightly"),
+            (Some("therock-nightly:gfx120X-all"), None, "nightly"),
+        ] {
+            let flags = format!("--runtime-id {runtime_id_flag:?} --channel {channel_flag:?}");
             let (root, paths) = test_paths("runtime-adopt-provenance");
             let adopted = adopt_test_runtime_with(
                 &root,
                 &paths,
                 TestAdoptRequest::Inferred {
+                    runtime_id: runtime_id_flag,
                     channel: channel_flag,
                 },
             )?;
@@ -781,17 +797,14 @@ mod tests {
                 crate::runtimes_cmd::render_runtimes_text(&paths, &RocmCliConfig::default())?;
             let _ = fs::remove_dir_all(root);
 
-            assert_eq!(
-                adopted.channel, expected_channel,
-                "--channel {channel_flag:?}"
-            );
+            assert_eq!(adopted.channel, expected_channel, "{flags}");
             assert_eq!(
                 crate::runtimes_cmd::tests::provenance_line(&rendered, &adopted.runtime_key),
                 format!(
                     "      provenance: channel={expected_channel} source=unrecorded \
                      source_layout_generation=unrecorded device_target=unrecorded"
                 ),
-                "--channel {channel_flag:?}:\n{rendered}"
+                "{flags}:\n{rendered}"
             );
         }
         Ok(())

@@ -1813,8 +1813,10 @@ the blank and trimming rules are pinned by
 `runtime_list_reads_each_provenance_fact_from_where_it_was_recorded`; blank or
 padded values are not what `rocm install sdk` writes, but can come from a
 hand-edited manifest or one brought in with `rocm runtimes import`. An adopted
-runtime's channel is the one adoption recorded: `release` when none was named
-and `nightly` after `--channel nightly`, both pinned by
+runtime's channel is the one adoption recorded: the channel `--channel` or
+`--runtime-id` named, `release` when neither names one. All three paths
+(neither flag, `--channel nightly`, and `--runtime-id therock-nightly:<family>`
+with no `--channel`) are pinned by
 `adopted_runtime_lists_its_channel_and_its_source_as_unrecorded` in
 [runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs). The marker adoption
 writes in place of an artifact URL is persisted manifest format. Code in the

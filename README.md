@@ -825,7 +825,8 @@ package specs. For the layout and target that is the same recorded field
 facts (the target is never the family) — so a tarball or family-wide install
 shows `device_target=unrecorded`, and an adopted runtime, which installed
 nothing, shows `source=unrecorded`. An adopted runtime's channel is the one adoption
-recorded: `nightly` after `--channel nightly`, `release` when none was named.
+recorded: the channel `--channel` or `--runtime-id` named, `release` when neither
+names one.
 `rocm examine` reports the same four facts for the active runtime as
 `active_runtime_channel`, `active_runtime_source`,
 `active_runtime_source_layout_generation` and `active_runtime_device_target`.

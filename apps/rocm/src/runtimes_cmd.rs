@@ -1358,8 +1358,9 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Each provenance fact is read the way `rocm update` reads it, each chain
-    /// moving to its next field only when a field is absent: package index,
+    /// The layout and target are read from the same recorded fields
+    /// `rocm update` reads; it does not read the recorded source. Each chain
+    /// moves to its next field only when a field is absent: package index,
     /// else artifact URL (never the adoption marker); layout field, else the
     /// wheel composition's layout; `rocm_sdk_target`, else the
     /// `device-<target>` package extra. The value chosen is printed trimmed,
