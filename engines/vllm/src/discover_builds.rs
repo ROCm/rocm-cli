@@ -50,6 +50,21 @@ impl DiscoverVersion {
     }
 }
 
+/// Where a [`VllmRocmDiscoverBuild`] row gets its torch, torchvision and
+/// torchaudio from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TorchStack {
+    /// Resolved from the row's `torch_index_url` by series, newest first.
+    Discover,
+    /// The versions the SDK install already put in the runtime, checked
+    /// against the row's series and ROCm line. For an index that serves
+    /// several ROCm lines at once, where the newest build of a series belongs
+    /// to the newest line: the nightly index lists about two dozen
+    /// `+rocm10.3.0aDATE` torch builds after the last `+rocm10.2.0a20261022`
+    /// one, and PEP 440 has no local-version wildcard to ask for the line.
+    FromInstalledSdk,
+}
+
 /// A ROCm SDK version whose vLLM/flash-attn/amd-aiter wheels aren't published
 /// under a fixed filename (AMD rotates the dev-tag suffix constantly), so the
 /// exact wheel must be discovered from the index at install time instead of
@@ -90,6 +105,7 @@ pub(crate) struct VllmRocmDiscoverBuild {
     /// [`verified_torchaudio_release`](crate::wheel_builds::verified_torchaudio_release): set one only for a build confirmed to
     /// load against the row's torch on real hardware, never as a guess.
     pub(crate) torchaudio_version: DiscoverVersion,
+    pub(crate) torch_stack: TorchStack,
 }
 
 /// Every ROCm SDK `major.minor` line the engine installs by live wheel
@@ -123,6 +139,7 @@ pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // establish, and this row has no coverage on the self-hosted lanes.
         // `rocm install sdk` reads this field too: see `torchaudio_version`.
         torchaudio_version: DiscoverVersion::Series("2.11"),
+        torch_stack: TorchStack::Discover,
     },
     VllmRocmDiscoverBuild {
         rocm_sdk_version: "10.1.0",
@@ -158,6 +175,7 @@ pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // confirmed-working builds instead. `rocm install sdk` pins this same
         // build for the 10.1 line: see `torchaudio_version`.
         torchaudio_version: DiscoverVersion::Exact("2.11.0.2"),
+        torch_stack: TorchStack::Discover,
     },
     VllmRocmDiscoverBuild {
         rocm_sdk_version: "10.2.0",
@@ -165,11 +183,16 @@ pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // Same staging host as 10.1: it publishes the `.rocm102` vLLM builds
         // (`0.32.1.dev0+g<sha>.d<date>.rocm102`) next to the 10.1 ones.
         vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
-        // Torch stack from the same staging host as vLLM, not `whl-next`:
-        // `whl-next` publishes no `+rocm10.2` torch, while staging carries a
-        // full 10.2 stack (`torch 2.14.0`, `torchvision 0.29.2` and
-        // `torchaudio 2.11.1`, each `+rocm10.2.0rcN`).
-        torch_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/",
+        // The torch stack is the SDK's own, from the nightly index it was
+        // installed from (see `TorchStack::FromInstalledSdk`). Not the staging
+        // host's `+rocm10.2.0rcN` torch: that build requires
+        // `amd-torch-device-gfx*==2.14.0+rocm10.2.0rcN` and
+        // `rocm==10.2.0rc2`, which staging answers 403 for, so a GPU payload
+        // for it cannot be installed, and it is a different release than the
+        // `10.2.0aDATE` SDK that `rocm install sdk` installs. The 10.2 vLLM
+        // wheel imports (`import vllm._C`) against the SDK's own torch
+        // `2.14.0+rocm10.2.0a20261022`.
+        torch_index_url: "https://nightly.repo.amd.com/rocm/whl-next/",
         vllm_version_prefix: "0.32",
         flash_attn_version_prefix: "2.8",
         amd_aiter_version_prefix: "0.1",
@@ -178,10 +201,11 @@ pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // `_ZN3c104cuda19CUDAErrorLogCaptureC1Ev`; 2.14 imports cleanly.
         torch_version_prefix: "2.14",
         torchvision_version_prefix: "0.29",
-        // A series match, which resolves the newest `2.11` build, `2.11.1`.
-        // Not Exact, because an Exact pin would make `rocm install sdk` treat
-        // it as verified for a 10.2 SDK, which nobody has tested.
+        // A series match, not Exact: an Exact pin would make `rocm install
+        // sdk` treat it as verified for a 10.2 SDK, which nobody has run on a
+        // GPU.
         torchaudio_version: DiscoverVersion::Series("2.11"),
+        torch_stack: TorchStack::FromInstalledSdk,
     },
 ];
 
@@ -313,11 +337,10 @@ mod tests {
         // 2.14, not 2.13: vLLM 0.32's `_C` needs a torch 2.14 symbol.
         assert_eq!(ten_two.torch_version_prefix, "2.14");
         assert_eq!(ten_two.torchvision_version_prefix, "0.29");
-        // The 10.2 torch stack is published on the staging host, unlike 10.1's.
-        assert_eq!(
-            ten_two.torch_index_url,
-            "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/"
-        );
+        // The nightly index serves 10.2 and 10.3 torch side by side, so the
+        // 10.2 row reuses the SDK's own stack; the other rows discover theirs.
+        assert_eq!(ten_two.torch_stack, TorchStack::FromInstalledSdk);
+        assert_eq!(ten_one.torch_stack, TorchStack::Discover);
 
         // An unpublished line must not borrow another line's wheels.
         assert!(vllm_rocm_discover_build("10.3.0").is_none());

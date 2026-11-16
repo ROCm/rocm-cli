@@ -119,12 +119,18 @@ resolves its own torch, torchvision, and torchaudio pins fresh from the row's
 own static version prefixes, instead of reusing what the SDK install resolved.
 The SDK install might have resolved a different torch version than the row pins.
 
-The `10.2.0` row reads its torch stack from the staging host too, not
-`whl-next`, which publishes no `+rocm10.2` torch: `torch 2.14.*`, torchvision
-`0.29.*` and the newest torchaudio `2.11` build, each `+rocm10.2.0rcN`. The row
-has not yet been run on a 10.2 SDK, and the 10.2 vLLM wheel is published for
-`linux_x86_64` only. The nightly channel resolves to ROCm 10.3, which has no
-vLLM build and no row.
+The `10.2.0` row does not discover its torch stack: it keeps the torch,
+torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,
+torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`), checks them
+against the row's series and the SDK's ROCm line, and realigns to those exact
+builds from the nightly index. A series match would not work there: that index
+serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
+`+rocm10.3` build. The staging host's `+rocm10.2.0rcN` torch is not used: it
+requires `rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that
+staging does not serve. The row has been installed and imported (`import
+vllm._C`) against a 10.2 SDK, but not yet served on a GPU, and the 10.2 vLLM
+wheel is published for `linux_x86_64` only. The nightly channel resolves to
+ROCm 10.3, which has no vLLM build and no row.
 
 One value flows the other way. A row's exact torchaudio pin, where it has one
 instead of a series, is also the hardware-verified build `rocm install sdk` pins

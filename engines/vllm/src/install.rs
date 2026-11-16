@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::discover_builds::{
-    DiscoverVersion, VllmRocmDiscoverBuild, rocm_sdk_series_matches, rocm_series,
+    DiscoverVersion, TorchStack, VllmRocmDiscoverBuild, rocm_sdk_series_matches, rocm_series,
     vllm_rocm_discover_build,
 };
 use crate::repair::{RepairAssessment, assess_runtime_repair};
@@ -567,6 +567,93 @@ fn discover_pinned_requirement_for(
             )
         })
 }
+/// The row's torch, torchvision and torchaudio pins, in that order.
+///
+/// A [`TorchStack::Discover`] row resolves them from its index. A
+/// [`TorchStack::FromInstalledSdk`] row takes them from the runtime the SDK
+/// install already resolved, because the index it realigns from serves
+/// several ROCm lines at once and a series such as `torch==2.14.*` would pick
+/// the newest line's build (see [`TorchStack`]).
+fn torch_stack_pins(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    build: &VllmRocmDiscoverBuild,
+) -> Result<Vec<String>> {
+    match build.torch_stack {
+        TorchStack::Discover => ["torch", "torchvision", "torchaudio"]
+            .into_iter()
+            .map(|pkg| {
+                let version = match pkg {
+                    "torch" => DiscoverVersion::Series(build.torch_version_prefix),
+                    "torchvision" => DiscoverVersion::Series(build.torchvision_version_prefix),
+                    _ => build.torchaudio_version,
+                };
+                discover_pinned_requirement(uv, paths, python, build.torch_index_url, pkg, version)
+            })
+            .collect(),
+        TorchStack::FromInstalledSdk => {
+            let output = ProcessCommand::new(uv)
+                .args(uv_pip_freeze_args(python))
+                .envs(uv_command_env(paths))
+                .output()
+                .context("failed to launch `uv pip freeze` to read the SDK's torch stack")?;
+            if !output.status.success() {
+                bail!(
+                    "`uv pip freeze` failed for {}: {}",
+                    python.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            installed_torch_stack_pins(&String::from_utf8_lossy(&output.stdout), build)
+        }
+    }
+}
+
+/// [`torch_stack_pins`] for a [`TorchStack::FromInstalledSdk`] row, from the
+/// `uv pip freeze` output of the SDK runtime.
+///
+/// Each pin must belong to the row's torch, torchvision and torchaudio series
+/// and be built for the row's ROCm line, so a runtime whose torch is not the
+/// one the vLLM wheel was built against is refused instead of silently kept.
+fn installed_torch_stack_pins(freeze: &str, build: &VllmRocmDiscoverBuild) -> Result<Vec<String>> {
+    let wanted = [
+        ("torch", build.torch_version_prefix),
+        ("torchvision", build.torchvision_version_prefix),
+        (
+            "torchaudio",
+            match build.torchaudio_version {
+                DiscoverVersion::Series(series) | DiscoverVersion::Exact(series) => series,
+            },
+        ),
+    ];
+    wanted
+        .into_iter()
+        .map(|(pkg, series)| {
+            let prefix = format!("{pkg}==");
+            let pin = freeze
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(&prefix))
+                .with_context(|| {
+                    format!(
+                        "the ROCm SDK runtime has no `{pkg}` installed; vLLM for ROCm {} reuses \
+                         the SDK's own torch stack, so reinstall the SDK with `rocm install sdk`",
+                        build.rocm_sdk_version
+                    )
+                })?;
+            let release = &pin[prefix.len()..];
+            if !release.starts_with(&format!("{series}.")) {
+                bail!(
+                    "the ROCm SDK runtime has `{pin}`, but vLLM for ROCm {} needs `{pkg}` {series}.x",
+                    build.rocm_sdk_version
+                );
+            }
+            ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
+            Ok(pin.to_owned())
+        })
+        .collect()
+}
 /// Runs the dependency-resolving `uv pip install --dry-run` for the discovered
 /// vLLM pin and returns uv's report, without installing anything.
 ///
@@ -970,36 +1057,17 @@ fn install_vllm_rocm10_discover(
     build: &VllmRocmDiscoverBuild,
 ) -> Result<VllmInstallOutcome> {
     ensure_discover_python_tag(python, build)?;
-    let torch = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torch",
-        DiscoverVersion::Series(build.torch_version_prefix),
-    )?;
-    // Discovered fresh from the same index and row as torch, rather than
-    // snapshotted from whatever the SDK install resolved earlier: that
-    // snapshot can pair with a *different* torch version than the one this
-    // row pins (the SDK's own install is unpinned and may have picked the
-    // newest torch/torchvision/torchaudio available, independently of each
-    // other), producing an ABI-incompatible triplet at realign time.
-    let torchvision = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torchvision",
-        DiscoverVersion::Series(build.torchvision_version_prefix),
-    )?;
-    let torchaudio = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torchaudio",
-        build.torchaudio_version,
-    )?;
+    // Discovered (or read from the SDK runtime) together, as one coherent set,
+    // rather than snapshotted from whatever the SDK install resolved earlier
+    // for a row that discovers: that snapshot can pair with a *different*
+    // torch version than the one this row pins, producing an ABI-incompatible
+    // triplet at realign time.
+    let mut torch_stack = torch_stack_pins(uv, paths, python, build)?.into_iter();
+    let (torch, torchvision, torchaudio) = (
+        torch_stack.next().context("torch pin")?,
+        torch_stack.next().context("torchvision pin")?,
+        torch_stack.next().context("torchaudio pin")?,
+    );
     let vllm = discover_pinned_requirement(
         uv,
         paths,
@@ -2152,6 +2220,39 @@ fi
             ensure_rocm_local_version_matches("vllm==0.29.1.dev0+rocm10.1.0.gabc", "10.2.0")
                 .is_err()
         );
+    }
+    /// A 10.2 runtime keeps the torch stack its SDK install resolved; a stack
+    /// from another series or another ROCm line is refused, not kept.
+    #[test]
+    fn installed_torch_stack_pins_reads_and_checks_the_sdk_stack() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let freeze = "flash-attn==2.8.3\ntorch==2.14.0+rocm10.2.0a20261022\n\
+                      torchaudio==2.11.1+rocm10.2.0a20261022\n\
+                      torchvision==0.29.2+rocm10.2.0a20261022\n";
+        assert_eq!(
+            installed_torch_stack_pins(freeze, ten_two).expect("coherent 10.2 stack"),
+            [
+                "torch==2.14.0+rocm10.2.0a20261022",
+                "torchvision==0.29.2+rocm10.2.0a20261022",
+                "torchaudio==2.11.1+rocm10.2.0a20261022",
+            ]
+        );
+        // The 10.1 torch an unpinned SDK install can leave behind is not 2.14's pair.
+        let old = freeze.replace("2.14.0+rocm10.2.0a20261022", "2.13.0+rocm10.2.0a20261022");
+        let err = installed_torch_stack_pins(&old, ten_two).expect_err("torch 2.13");
+        assert!(
+            format!("{err:#}").contains("needs `torch` 2.14.x"),
+            "{err:#}"
+        );
+        // Another ROCm line is refused by the same guard as every other pin.
+        let other_line = freeze.replace(
+            "torch==2.14.0+rocm10.2.0a20261022",
+            "torch==2.14.0+rocm10.3.0a20261110",
+        );
+        assert!(installed_torch_stack_pins(&other_line, ten_two).is_err());
+        // A runtime with no torch says what to do.
+        let err = installed_torch_stack_pins("flash-attn==2.8.3\n", ten_two).expect_err("no torch");
+        assert!(format!("{err:#}").contains("rocm install sdk"), "{err:#}");
     }
     /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
     /// arg-builder helpers in isolation: the remaining-deps install must use
