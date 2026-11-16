@@ -24,7 +24,7 @@ This writes `target/release/rocm.exe` on Windows and `target/release/rocm` on
 Linux/WSL. Run the binary directly on each platform. On WSL/Linux the examine
 output must report `os: linux` and `wsl: true`.
 
-On WSL2 with a managed wheel runtime, also check `rocm examine`: it prints no
+On WSL with a managed wheel runtime, also check `rocm examine`: it prints no
 `wsl_runtime_librocdxg` line for a runtime installed by this build (the install
 linked `librocdxg.so` beside the runtime's `libhsa-runtime64`), and for an older
 runtime the line's `ln -sfn` command, once run, makes it disappear. Then run

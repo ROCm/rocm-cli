@@ -784,6 +784,9 @@ fn report_runtime_librocdxg_link_when(
 }
 
 /// The directories whose `librocdxg.so.1` is linked: the ones the probe recorded.
+/// `rocm examine` scans a list computed separately from the registry record
+/// (`managed_runtime_library_dirs`) that includes these; a test in `rocm-core`
+/// pins that.
 fn librocdxg_dirs(probe: &RocmSdkPythonProbe) -> Vec<PathBuf> {
     probe.library_paths.clone()
 }

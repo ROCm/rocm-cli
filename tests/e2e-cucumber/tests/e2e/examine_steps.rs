@@ -3187,13 +3187,6 @@ async fn assert_inspection_agrees_with_the_refusal(world: &mut E2eWorld) {
 /// shows which file the link points at.
 const PLANTED_RUNTIME_ROCDXG: &str = "the runtime's own librocdxg";
 
-/// Plant a managed wheel runtime in the registry, with the library directory its
-/// HSA runtime lives in. `with_unversioned` also plants `librocdxg.so` beside the
-/// versioned copy, which is the layout where the runtime loads its own copy.
-///
-/// Black-box: plain JSON in the registry schema, as `rocm install sdk` would
-/// have written it, with files standing in for the libraries (an empty file is
-/// enough for a check of which names exist).
 /// A planted managed runtime makes every `rocm` start run the startup update
 /// check, which needs a PATH Python and the network and prints progress ahead of a
 /// `--json` document. The scenarios that plant one are about the host, not
@@ -3205,6 +3198,13 @@ fn disable_startup_update_check(world: &mut E2eWorld) {
         .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
 }
 
+/// Plant a managed wheel runtime in the registry, with the library directory its
+/// HSA runtime lives in. `with_unversioned` also plants `librocdxg.so` beside the
+/// versioned copy, which is the layout where the runtime loads its own copy.
+///
+/// Black-box: plain JSON in the registry schema, as `rocm install sdk` would
+/// have written it, with files standing in for the libraries (an empty file is
+/// enough for a check of which names exist).
 fn plant_managed_runtime_with_rocdxg(world: &mut E2eWorld, with_unversioned: bool) {
     let root = world
         .isolated_root

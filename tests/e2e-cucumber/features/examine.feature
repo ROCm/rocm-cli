@@ -762,7 +762,7 @@ Feature: GPU detection and system inspection
     When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
     Then the inspection lists no runtime librocdxg that its own runtime does not load
 
-  # The finding is advice about the WSL2 loader path; a native host with the same
+  # The finding is advice about the WSL loader path; a native host with the same
   # runtime gets none.
   @id:examine-lists-no-runtime-librocdxg-off-wsl @requires-os:linux
   Scenario: examine-52 - The inspection lists no runtime librocdxg on a machine that is not WSL

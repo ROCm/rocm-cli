@@ -603,6 +603,21 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm remote doctor` and the daemon read an `ExamineSummary` another build
+    /// wrote; one from before `unlinked_runtime_librocdxg` existed must still load.
+    #[test]
+    fn a_summary_written_before_the_runtime_librocdxg_field_still_loads() {
+        let mut value = serde_json::to_value(windows_summary_with_driver(None)).expect("serialise");
+        let removed = value
+            .as_object_mut()
+            .expect("an object")
+            .remove("unlinked_runtime_librocdxg");
+        assert!(removed.is_some(), "the field is serialised today");
+
+        let loaded: ExamineSummary = serde_json::from_value(value).expect("old summary loads");
+        assert!(loaded.unlinked_runtime_librocdxg.is_empty());
+    }
+
     pub(super) fn windows_summary_with_driver(
         info: Option<crate::windows_driver::WindowsDriverInfo>,
     ) -> ExamineSummary {

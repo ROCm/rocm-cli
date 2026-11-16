@@ -312,7 +312,7 @@ the nightly channel moved on 2026-08-23. If ROCm CLI can't tell which exact GPU
 arch this computer has, or you want a different one, also add `--family` with the
 raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
 
-On WSL2, wheel runtime installs and updates (`rocm install sdk`,
+On WSL, wheel runtime installs and updates (`rocm install sdk`,
 `rocm update --apply`) also link `librocdxg.so` to the runtime's own
 `librocdxg.so.1`, so the runtime searches its own copy rather than an older host
 `librocdxg` (it also replaces a dangling `librocdxg.so`); for a runtime installed earlier, `rocm examine` prints a `wsl_runtime_librocdxg` line

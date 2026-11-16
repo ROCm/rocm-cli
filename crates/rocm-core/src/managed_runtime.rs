@@ -287,6 +287,12 @@ pub(crate) fn managed_therock_environment_records(
 /// (that one is not a runtime's own). A directory shared by two runtimes appears
 /// twice.
 ///
+/// `rocm install sdk` links the probe's `library_paths`, which the registry record
+/// keeps and this list includes (pinned by
+/// `runtime_rocdxg::tests::examine_scans_every_directory_the_install_would_link`),
+/// so examine scans at least every directory the install links; the two lists are
+/// computed separately.
+///
 /// For checks that look at what a runtime ships on disk, such as
 /// [`crate::runtime_rocdxg`], rather than at the one runtime that is active.
 pub(crate) fn managed_runtime_library_dirs(paths: &AppPaths) -> Vec<PathBuf> {

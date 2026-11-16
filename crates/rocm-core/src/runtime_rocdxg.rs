@@ -38,7 +38,17 @@
 //! soname is no longer that is neither detected nor linked, and no globbing is
 //! done (which versioned file would win is a design decision). A dangling
 //! `librocdxg.so` beside a runtime that ships no `librocdxg.so.1` is not
-//! detected either, because there is nothing to link it to.
+//! detected either, because there is nothing to link it to. A versioned copy that
+//! is itself dangling (or a link loop) is likewise left out of both `rocm examine`
+//! and the install, and deliberately not reported: there is nothing valid to link
+//! to, and a runtime whose own `librocdxg.so.1` is broken is a different, wider
+//! fault than the one this module covers.
+//!
+//! "Never replaced" holds for a name that resolves when it is checked. The
+//! replacement of a dangling link re-checks the name immediately before the
+//! rename, but a name that becomes a working link between that re-check and the
+//! rename is still replaced: `rename` has no "only if still dangling" form. The
+//! window is a few microseconds in a single-process, one-shot install.
 //!
 //! Only wheel runtime installs and updates (`install_wheel_runtime`) link.
 //! Tarballs ship both names, and an adopted or imported runtime is never linked
@@ -60,8 +70,8 @@ pub enum NameState {
     Absent,
     /// A regular file, or a link whose target exists.
     Resolves,
-    /// A link whose target does not exist: `open` fails with `ENOENT`, so the
-    /// loader skips it as it would an absent name.
+    /// A link whose target does not exist, or that loops (`ELOOP`): `open` fails
+    /// on it, so the loader skips it as it would an absent name.
     Dangling,
 }
 
@@ -85,8 +95,9 @@ pub fn name_state(path: &Path) -> NameState {
 /// runtime's own copy, so it loads the host's. A directory with the library but
 /// no runtime beside it is left out: nothing there opens it by name. One whose
 /// `librocdxg.so` resolves (a file or a working link) is left out as well; there
-/// is nothing for this module to add. A directory with no `librocdxg.so.1` is
-/// left out: there is nothing to link to.
+/// is nothing for this module to add. A directory whose `librocdxg.so.1` is not
+/// there or does not resolve (absent, dangling, or a link loop) is left out:
+/// there is nothing valid to link to, and that broken copy is not reported.
 ///
 /// Takes the state check rather than reading the machine, so the layouts can be
 /// tested without one; the real check is [`name_state`].
@@ -216,9 +227,9 @@ pub struct Linked {
 /// runtime directory being moved or restored from a cache.
 ///
 /// What is already at `librocdxg.so` decides (see [`NameState`]): nothing, and
-/// the link is created; a dangling link, and it is replaced atomically (a
-/// temporary link in the same directory is renamed over it, so the name is never
-/// absent in between, and the temporary is removed if the rename fails); a file
+/// the link is created; a dangling link, and it is replaced (a temporary link in
+/// the same directory is renamed over it, so the name is never absent in
+/// between; see `replace_with_link` for the one window that remains); a file
 /// or a working link, and it is left alone and reported as an
 /// [`io::ErrorKind::AlreadyExists`] error. `copy` itself is not checked: the
 /// caller links only a copy that exists.
@@ -264,10 +275,38 @@ pub fn link_runtime_copy(copy: &Path) -> io::Result<Linked> {
     }
 }
 
-/// Replace `link` with a link to [`SHIPPED_NAME`] without a window in which the
-/// name is absent: make a temporary link beside it, then rename over it.
+/// Replace the dangling `link` with a link to [`SHIPPED_NAME`] without a window in
+/// which the name is absent: make a temporary link beside it, then rename over it.
+///
+/// The name is re-checked just before the rename and left alone (an
+/// [`io::ErrorKind::AlreadyExists`] error) if it no longer dangles. That narrows
+/// the check-then-act window but cannot close it: a name that becomes a working
+/// link between the re-check and the rename is replaced. If the rename fails the
+/// temporary is removed, and a failure to remove it is part of the returned error.
+///
+/// The temporary's name carries the process id and a process-wide counter, so two
+/// replacements in one process never share one. A leftover from a crashed process
+/// could only collide after the pid is reused, and then `symlink` fails with
+/// `File exists`, which is reported, not acted on.
 #[cfg(unix)]
 fn replace_with_link(dir: &Path, link: &Path) -> io::Result<()> {
+    replace_with_link_using(
+        dir,
+        link,
+        name_state,
+        |from, to| std::fs::rename(from, to),
+        |path| std::fs::remove_file(path),
+    )
+}
+
+#[cfg(unix)]
+fn replace_with_link_using(
+    dir: &Path,
+    link: &Path,
+    state: impl Fn(&Path) -> NameState,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+    remove: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let temporary = dir.join(format!(
@@ -276,9 +315,25 @@ fn replace_with_link(dir: &Path, link: &Path) -> io::Result<()> {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::os::unix::fs::symlink(SHIPPED_NAME, &temporary)?;
-    if let Err(error) = std::fs::rename(&temporary, link) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
+    let outcome = if state(link) == NameState::Dangling {
+        rename(&temporary, link)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "File exists (it no longer dangles)",
+        ))
+    };
+    if let Err(error) = outcome {
+        return Err(match remove(&temporary) {
+            Ok(()) => error,
+            Err(cleanup) => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; and the temporary link {} could not be removed: {cleanup}",
+                    temporary.display()
+                ),
+            ),
+        });
     }
     Ok(())
 }
@@ -444,6 +499,112 @@ mod tests {
             dir
         }
 
+        /// The runtime directory with the versioned name in a given state; the
+        /// unversioned name is absent.
+        fn runtime_dir_with_versioned_name(make: impl Fn(&Path)) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().expect("temp dir");
+            write(&dir.path().join("libhsa-runtime64.so.1"), b"");
+            make(&dir.path().join("librocdxg.so.1"));
+            dir
+        }
+
+        fn temporaries_in(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .expect("read_dir")
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .count()
+        }
+
+        #[test]
+        fn the_versioned_copy_decides_whether_a_directory_is_listed() {
+            type Make = fn(&Path);
+            let cases: [(&str, Make, bool); 5] = [
+                ("a regular file", |p| write(p, b"own"), true),
+                (
+                    "a link that resolves",
+                    |p| {
+                        write(&p.with_file_name("real.so"), b"own");
+                        std::os::unix::fs::symlink("real.so", p).expect("link");
+                    },
+                    true,
+                ),
+                ("absent", |_| {}, false),
+                (
+                    "a dangling link",
+                    |p| std::os::unix::fs::symlink("gone.so", p).expect("link"),
+                    false,
+                ),
+                (
+                    "a link loop",
+                    |p| std::os::unix::fs::symlink("librocdxg.so.1", p).expect("link"),
+                    false,
+                ),
+            ];
+            for (what, make, listed) in cases {
+                let dir = runtime_dir_with_versioned_name(make);
+                let dirs = vec![dir.path().to_path_buf()];
+                let found = unlinked_runtime_copies(&dirs, name_state);
+                assert_eq!(found.is_empty(), !listed, "{what}: {found:?}");
+
+                let lines = link_installed_runtime_copies_when(true, &dirs);
+                assert_eq!(lines.is_empty(), !listed, "{what}: {lines:?}");
+                assert_eq!(
+                    dir.path().join("librocdxg.so").symlink_metadata().is_ok(),
+                    listed,
+                    "{what}: a link is made only for a copy that can be linked to"
+                );
+                assert_eq!(temporaries_in(dir.path()), 0, "{what}");
+            }
+        }
+
+        #[test]
+        fn examine_does_not_list_a_runtime_whose_versioned_copy_dangles() {
+            let (root, paths) = crate::test_support::temp_app_paths("runtime-rocdxg-dangling-copy");
+            let lib = root.join("wheel/lib");
+            write(&lib.join("libhsa-runtime64.so.1"), b"");
+            std::os::unix::fs::symlink("gone.so", lib.join("librocdxg.so.1")).expect("link");
+            register_runtime(
+                &paths.data_dir.join("runtimes").join("registry"),
+                "k",
+                &[&lib],
+            );
+
+            assert!(unlinked_managed_runtime_copies(true, &paths).is_empty());
+        }
+
+        #[test]
+        fn examine_scans_every_directory_the_install_would_link() {
+            // The install links the probe's `library_paths`; the registry record
+            // holds the same list, and examine scans what the environment builder
+            // makes of it. Both are computed separately, so pin that the second
+            // contains the first for a wheel-shaped runtime.
+            let (root, paths) = crate::test_support::temp_app_paths("runtime-rocdxg-dir-sets");
+            let wheel = root.join("rt/lib/python3.14/site-packages");
+            let probe_library_paths = [
+                wheel.join("_rocm_sdk_core/lib"),
+                wheel.join("_rocm_sdk_core/lib/rocm_sysdeps/lib"),
+                wheel.join("_rocm_sdk_libraries/lib"),
+            ];
+            for dir in &probe_library_paths {
+                std::fs::create_dir_all(dir).expect("dir");
+            }
+            let refs: Vec<&Path> = probe_library_paths.iter().map(PathBuf::as_path).collect();
+            register_runtime(
+                &paths.data_dir.join("runtimes").join("registry"),
+                "k",
+                &refs,
+            );
+
+            let scanned = crate::managed_runtime::managed_runtime_library_dirs(&paths);
+            for dir in &probe_library_paths {
+                assert!(
+                    scanned.contains(dir),
+                    "examine does not scan {dir:?}: {scanned:?}"
+                );
+            }
+        }
+
         #[test]
         fn a_dangling_unversioned_link_is_listed_like_an_absent_one() {
             let dir = runtime_dir_with_a_dangling_link();
@@ -461,7 +622,7 @@ mod tests {
         }
 
         #[test]
-        fn the_install_step_replaces_a_dangling_link_atomically() {
+        fn the_install_step_replaces_a_dangling_link_and_leaves_no_temporary() {
             let dir = runtime_dir_with_a_dangling_link();
             let lines = link_installed_runtime_copies_when(true, &[dir.path().to_path_buf()]);
 
@@ -512,6 +673,58 @@ mod tests {
                     b"theirs"
                 );
             }
+        }
+
+        #[test]
+        fn a_name_that_stopped_dangling_before_the_rename_is_left_alone() {
+            let dir = runtime_dir_shipping_only_the_versioned_copy();
+            write(&dir.path().join("librocdxg.so"), b"theirs");
+            let link = dir.path().join("librocdxg.so");
+            // The caller saw a dangling name; by the re-check it resolves.
+            let outcome = replace_with_link(dir.path(), &link);
+
+            assert_eq!(
+                outcome.expect_err("refused").kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(std::fs::read(&link).expect("untouched"), b"theirs");
+            let leftovers = std::fs::read_dir(dir.path())
+                .expect("read_dir")
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .count();
+            assert_eq!(leftovers, 0, "the temporary link is removed");
+        }
+
+        #[test]
+        fn a_failed_cleanup_is_part_of_the_error() {
+            let dir = runtime_dir_with_a_dangling_link();
+            let link = dir.path().join("librocdxg.so");
+            let outcome = replace_with_link_using(
+                dir.path(),
+                &link,
+                name_state,
+                |_, _| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "rename denied",
+                    ))
+                },
+                |_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "remove denied",
+                    ))
+                },
+            );
+
+            let message = outcome.expect_err("failed").to_string();
+            assert!(message.contains("rename denied"), "{message}");
+            assert!(
+                message.contains("and the temporary link")
+                    && message.contains("could not be removed: remove denied"),
+                "{message}"
+            );
         }
 
         #[test]
@@ -673,9 +886,11 @@ mod tests {
 
         #[test]
         fn the_install_step_reports_a_failed_link_with_the_manual_command() {
-            // The failure does not rely on permissions (root ignores them): the
-            // presence check is told `librocdxg.so` is absent while a file really is
-            // there, so the link attempt fails with "File exists" for any user.
+            // The failure does not rely on permissions (root ignores them): the state
+            // check handed to `link_copies_with` is told `librocdxg.so` is absent
+            // while a file really is there, so `link_runtime_copy`'s own check of
+            // the name refuses it with `AlreadyExists` ("File exists") for any
+            // user. It is that check, not the OS `symlink` call, that fails here.
             let dir = runtime_dir_shipping_only_the_versioned_copy();
             write(&dir.path().join("librocdxg.so"), b"someone else's file");
             let absent_unversioned = |path: &Path| {

@@ -339,7 +339,9 @@ below.
   one atomically, and never touches a `librocdxg.so` that resolves). The
   versioned name is the fixed `librocdxg.so.1`: a wheel whose soname changes is
   not detected or linked, and a dangling `librocdxg.so` beside a runtime with no
-  `librocdxg.so.1` is not detected.
+  `librocdxg.so.1` is not detected. A `librocdxg.so.1` that is itself dangling or
+  a link loop is not listed or linked either, and is deliberately not reported
+  (nothing valid to link to).
   The mechanism (the unversioned open skipping the runtime's directory and
   landing on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2
   nightly; which component requests `hsaKmtSetPersistingCacheSize` is not
