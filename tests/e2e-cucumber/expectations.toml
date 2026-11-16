@@ -284,7 +284,17 @@ reason = "The Windows large-model serve crashes in the SDK's Tensile library on 
 # `os = "linux"` on gfx1151, out of it, so a WSL host that gains Docker and passes
 # the scenario is not an XPASS. A host without Docker skips the scenario before
 # this row applies.
+# `flaky = true`: the stop is only sometimes unconfirmed. Strix Halo Ubuntu
+# nightly legs of the Nightly workflow: the scheduled run 43565012101
+# (2026-11-14, both channels) failed with `STOP FAILED (rc=1)`; the scheduled
+# runs 43376987418 (2026-11-13), 43684256545 (2026-11-15) and 43815703148
+# (2026-11-16), and the dispatched run 43431146000 (2026-11-13), passed it, on
+# both channels each. A deterministic row turned every passing run red as a
+# stale XPASS, so the job failed on those days with only xfails failing.
+# `flaky` also means a fixed rocm-cli#1058 is not flagged as a stale row, so
+# delete the row by hand when #1058 is closed.
 [["serve-aim-lifecycle-parity"]]
 when = { os = "linux", is_wsl = false, therock_family = "gfx1151*", has_amd_gpu = true }
 bug = "rocm-cli#1058"
-reason = "Stopping a running AIM service on Strix Halo Ubuntu reports `Local server stop not confirmed` (exit 1); the serve itself works."
+reason = "Stopping a running AIM service on Strix Halo Ubuntu intermittently reports `Local server stop not confirmed` (exit 1); the serve itself works."
+flaky = true

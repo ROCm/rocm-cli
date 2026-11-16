@@ -1670,9 +1670,9 @@ the tagging and that they stay reachable when the opt-in is set.
 
 Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
 logs whether Docker is reachable ("Report whether Docker is reachable").
-`serve-27`'s known failure on the Strix Halo pool is an xfail row in
-`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
-means the row is stale.
+`serve-27`'s intermittent failure on the Strix Halo pool is a `flaky` xfail row
+in `expectations.toml`, tracked in rocm-cli#1058; a pass there is a tolerated
+XPASS, not a sign the row is stale, so delete the row by hand when #1058 closes.
 
 ### Lemonade managed-serve failure evidence
 
