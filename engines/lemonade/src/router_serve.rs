@@ -612,7 +612,12 @@ mod tests {
 
     #[test]
     fn ready_state_merge_failure_stops_the_server() {
-        assert_post_spawn_failure_stops_server(Fail::ReadyMerge, "failed to write");
+        // The merge reads the file first, under the state directory's lock, and
+        // refuses one it cannot read rather than replace it.
+        assert_post_spawn_failure_stops_server(
+            Fail::ReadyMerge,
+            "left it untouched and recorded nothing",
+        );
     }
 
     /// The ready write fails after the model loaded and verified, and the server
