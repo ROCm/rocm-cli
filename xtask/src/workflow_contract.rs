@@ -2333,10 +2333,19 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         for (workflow, text, report_job, step) in &steps {
             let (workflow, report_job) = (*workflow, *report_job);
             let block = job_block(text, report_job);
-            let lanes = self_hosted_e2e_jobs(text);
-            let expected: Vec<String> = lanes
+            let mut lanes = self_hosted_e2e_jobs(text);
+            // A pull request's queue gate runs on a GitHub-hosted runner, but it
+            // is a lane all the same: it uploads a report, and can die without.
+            lanes.extend(
+                job_ids(text)
+                    .into_iter()
+                    .filter(|job| job_block(text, job).contains("gh workflow run queue-pr-run.yml"))
+                    .map(|job| (job, String::from("the queue"))),
+            );
+            let expected: Vec<String> = job_ids(text)
                 .iter()
-                .map(|(job, _)| format!("{job}={}", uploaded_report_artifact(workflow, text, job)))
+                .filter(|job| lanes.iter().any(|(lane, _)| lane == *job))
+                .map(|job| format!("{job}={}", uploaded_report_artifact(workflow, text, job)))
                 .collect();
             // Read from the step itself, so a LANE_REPORTS left elsewhere in the
             // job after the step is deleted cannot satisfy this.
@@ -2493,6 +2502,9 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             .expect("the per-PR workflow has a report check");
         let results = [
             ("e2e-gpu", "success"),
+            // The queue gate is a lane of this check too: skipped here, as for a
+            // pull request that gets no queue run.
+            ("e2e-gpu-queue", "skipped"),
             ("e2e-gpu-strix-ubuntu", "skipped"),
             ("e2e-gpu-strix-windows", "skipped"),
             ("e2e-wsl", "skipped"),
@@ -8267,6 +8279,19 @@ jobs:
                 "github.event_name != 'merge_group' && ",
                 "app-dev-gpu",
             ),
+            // A pull request's queue lane: only on a `pull_request` from this
+            // repository, and never on `closed`, which skips `changes` and so it.
+            PinnedIf {
+                job: "e2e-gpu-queue",
+                condition: "always() && needs.changes.result == 'success' \
+                            && needs.changes.outputs.serve == 'true' \
+                            && github.event_name == 'pull_request' \
+                            && github.event.action != 'closed' \
+                            && github.event.pull_request.head.repo.full_name \
+                            == github.repository"
+                    .to_owned(),
+                matrix_lane: false,
+            },
             off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
@@ -9904,7 +9929,12 @@ permissions:
     }
 
     /// The workflows that may run on the queue-report runner.
-    const QUEUE_WORKFLOWS: [&str; 2] = ["nightly-queue.yml", "queue-run.yml"];
+    const QUEUE_WORKFLOWS: [&str; 3] = ["nightly-queue.yml", "queue-pr-run.yml", "queue-run.yml"];
+
+    /// The workflows that may dispatch `queue-pr-run.yml`, on a GitHub-hosted
+    /// runner: a pull request's gate job. Naming it is all they may do of the
+    /// queue's; the runner's label and the other two workflows stay refused.
+    const QUEUE_PR_RUN_CALLERS: [&str; 1] = ["e2e-selfhosted.yml"];
 
     #[test]
     fn queue_nightly_publisher_holds_no_credential() {
@@ -9913,6 +9943,97 @@ permissions:
             &["${{inputs.request_id}}", "${{runner.temp}}"],
             &["workflow_dispatch:"],
         );
+    }
+
+    #[test]
+    fn queue_pr_run_holds_no_credential() {
+        // The branch and the caller's run reach it as inputs: the branch only
+        // through `env:` into the publisher, the caller only into the run's
+        // title.
+        assert_queue_workflow_holds_no_credential(
+            "queue-pr-run.yml",
+            &[
+                "${{inputs.branch}}",
+                "${{inputs.caller}}",
+                "${{runner.temp}}",
+            ],
+            &["workflow_dispatch:"],
+        );
+    }
+
+    /// What the pull request's gate job may and may not do: it holds no queue
+    /// credential, dispatches the workflow as it is on main, and publishes only
+    /// the queue run's release report as the MI300X one.
+    #[test]
+    fn the_pull_request_gate_dispatches_the_workflow_on_main_and_nothing_else() {
+        let text = read_workflow("e2e-selfhosted.yml");
+        let gate = job_block(&text, "e2e-gpu-queue");
+        // GitHub-hosted: it needs no runner of the queue's, and no label of it.
+        assert_eq!(runs_on_values(gate), ["ubuntu-24.04"]);
+        // The one permission it needs, to dispatch: no contents, no token to push.
+        assert_eq!(
+            gate.matches("permissions:").count(),
+            1,
+            "the gate declares its permissions once"
+        );
+        assert!(
+            gate.contains("      actions: write\n    if:"),
+            "the gate's only permission is `actions: write`"
+        );
+        // From main, never from the pull request's own copy of the workflow: the
+        // runner runs only the file as it is on main.
+        assert!(
+            gate.contains("gh workflow run queue-pr-run.yml --ref main -f \"branch=${HEAD_REF}\""),
+            "the gate must dispatch queue-pr-run.yml on main with the PR's branch"
+        );
+        // Only a pull request from this repository: a fork cannot dispatch.
+        for needed in [
+            "github.event_name == 'pull_request'",
+            "github.event.action != 'closed'",
+            "github.event.pull_request.head.repo.full_name == github.repository",
+        ] {
+            assert!(
+                gate.contains(needed),
+                "the gate must only run when {needed}"
+            );
+        }
+        // The PR author's branch name reaches the script through the environment,
+        // never as text of it, and is checked before it is used.
+        assert!(
+            gate.contains("HEAD_REF: ${{ github.event.pull_request.head.ref }}"),
+            "the branch name must come through env"
+        );
+        let script: Vec<&str> = gate
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("run: |"))
+            .collect();
+        assert!(
+            !script.iter().any(|line| line.contains("${{")),
+            "no expression may sit inside the gate's script"
+        );
+        assert!(
+            gate.contains("=~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$"),
+            "the branch name must be checked before it is passed on"
+        );
+        // Its one report, the MI300X cell the queue's run stands for.
+        assert_eq!(
+            uploaded_report_artifact("e2e-selfhosted.yml", &text, "e2e-gpu-queue"),
+            "e2e-gpu-report"
+        );
+        assert_eq!(
+            uploaded_report_artifact("e2e-selfhosted.yml", &text, "e2e-gpu"),
+            "e2e-gpu-selfhosted-report",
+            "the self-hosted lane must not take the queue's report name"
+        );
+        // And no other job dispatches or names the queue's workflow.
+        for job in job_ids(&text) {
+            if job != "e2e-gpu-queue" {
+                assert!(
+                    !without_comments(job_block(&text, &job)).contains("queue-pr-run"),
+                    "job `{job}` names queue-pr-run.yml: only the gate may"
+                );
+            }
+        }
     }
 
     #[test]
@@ -10121,7 +10242,10 @@ permissions:
             {
                 continue;
             }
-            let found = queue_runner_references(&read_workflow(&name), &workflow_name);
+            let mut found = queue_runner_references(&read_workflow(&name), &workflow_name);
+            if QUEUE_PR_RUN_CALLERS.contains(&name.as_ref()) {
+                found.retain(|word| word != "queue-pr-run");
+            }
             assert!(
                 found.is_empty(),
                 "{name} names {found:?}: only {QUEUE_WORKFLOWS:?} may use the queue-report \
@@ -10162,7 +10286,7 @@ permissions:
                         .is_some_and(word_char)
             })
         };
-        let mut found: Vec<String> = ["queue-report", "nightly-queue", "queue-run"]
+        let mut found: Vec<String> = ["queue-report", "nightly-queue", "queue-run", "queue-pr-run"]
             .into_iter()
             .filter(|word| names_word(word))
             .map(str::to_owned)
@@ -10201,6 +10325,10 @@ permissions:
             (
                 job("    uses: ./.github/workflows/queue-run.yml"),
                 vec!["queue-run"],
+            ),
+            (
+                job("    run: gh workflow run queue-pr-run.yml --ref main"),
+                vec!["queue-pr-run"],
             ),
             (job("    needs: [queue-run]"), vec!["queue-run"]),
             (
@@ -10253,6 +10381,9 @@ permissions:
         for (file, group) in [
             ("queue-run.yml", "queue-run"),
             ("nightly-queue.yml", "nightly-queue"),
+            // Per branch, so pull requests' runs go side by side (the queue
+            // side limits how many); GitHub keeps one waiting per group.
+            ("queue-pr-run.yml", "queue-pr-run-${{ inputs.branch }}"),
         ] {
             let text = read_workflow(file);
             // A publisher that may fail without failing the job reports a
@@ -10428,6 +10559,7 @@ permissions:
         for (file, artifact) in [
             ("queue-run.yml", "queue-run-results"),
             ("nightly-queue.yml", "nightly-queue-results"),
+            ("queue-pr-run.yml", "queue-pr-run-results"),
         ] {
             let upload = yaml_block(file, "      - name: Upload lane results");
             // Uploaded whatever the run's verdict: a failed run's files are

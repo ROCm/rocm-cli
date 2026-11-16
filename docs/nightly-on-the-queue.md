@@ -56,6 +56,32 @@ third dispatch, or the nightly schedule, replaces a dispatch still waiting
 and that one never runs. The branch must exist in this repository;
 otherwise the job fails at once.
 
+## Pull requests
+
+A pull request from this repository also runs its MI300X check on the queue.
+The gate job `e2e-gpu-queue` in
+[`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml) runs on a
+GitHub-hosted runner, holds no queue credential and needs only `actions: write`:
+it dispatches [`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) on
+`main` with the pull request's branch, waits for that run, and publishes the
+release-channel report of the MI300X lane as `e2e-gpu-report`, the MI300X cell
+of the consolidated report. `queue-pr-run.yml` uploads
+`queue-pr-run-results` from `queue-pr-run.yml`, as `queue-run.yml` does its own.
+The self-hosted MI300X lane of the same pull request uploads
+`e2e-gpu-selfhosted-report`, shown beside it as "MI300X (self-hosted)": the queue
+run is the primary MI300X check and the self-hosted one the second.
+
+A pull request's run is a preset of the queue side: one GPU model (MI300X), the
+`release` channel alone and no `@nightly` scenarios, a lane that waits at most 45
+minutes to be started and runs at most 75, and a few such runs at once. The
+queue side does not take one while the nightly goes, or when it has no healthy
+MI300X worker: the gate job then fails with the reason the queue gave, which is
+capacity, not a failing test. A pull request from a fork gets no queue run, since
+its token cannot dispatch and the queue only checks out branches of this
+repository. `e2e-selfhosted.yml` is the only workflow that may name
+`queue-pr-run.yml`; the runner is set up to run `queue-pr-run.yml` only as it is
+on `main`, never the pull request's own copy of any workflow.
+
 ## Publishing a finished run
 
 Dispatch `nightly-queue.yml` with a run's `request_id` — the id its

@@ -225,7 +225,12 @@ jobs:
     # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
     # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
     # on gfx1151 — red on the WSL host, and (worse) a silent pass published as
-    # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
+    # an MI300X report, which the consolidated grid renders as MI300X.
+    #
+    # On a pull request this lane is the second MI300X check: the first is the
+    # queue run of `e2e-gpu-queue` below, which does not wait for one of these
+    # runners. This lane is kept for the runners' own coverage (their runtime and
+    # cache), and its failure is as non-blocking as it always was.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
     # Read by `e2e-report`: a run that skipped itself as stale uploads nothing,
@@ -507,11 +512,15 @@ jobs:
       # literally, so a GH-expression-computed name would be invisible to it. The
       # `current` leg's name is UNCHANGED from before this matrix existed — it's
       # also what a single-element (non-release-branch) matrix always uploads.
+      # `e2e-gpu-selfhosted-report`, not `e2e-gpu-report`: that name is the pull
+      # request gate's (`e2e-gpu-queue`), whose queue run is the MI300X lane for
+      # pull requests; this one, on the self-hosted runners, shows beside it as
+      # "MI300X (self-hosted)".
       - name: Upload E2E report (current)
         if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-gpu-report
+          name: e2e-gpu-selfhosted-report
           path: tests/e2e-cucumber/results/
 
       - name: Upload E2E report (n-1)
@@ -561,6 +570,113 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh run cancel "$GITHUB_RUN_ID" || echo "::warning::could not cancel run ${GITHUB_RUN_ID}; its other lanes keep running"
+
+  # The MI300X lane of a pull request, run on the shared GPU queue instead of on
+  # a self-hosted runner that has to be free (docs/nightly-on-the-queue.md): it
+  # dispatches queue-pr-run.yml on main with the PR's branch, waits for that run,
+  # and publishes its release-channel report as `e2e-gpu-report`, the MI300X cell
+  # of the consolidated grid. The queue run is the primary MI300X check; `e2e-gpu`
+  # above is the second. This job runs on a GitHub-hosted runner and holds no queue
+  # credential: dispatching needs `actions: write`, nothing more.
+  #
+  # Only a pull request from this repository: a fork's token cannot dispatch, and
+  # the queue only checks out branches of this repository. A run the queue does
+  # not take (too many going, or the nightly's window) fails this job, with the
+  # queue's reason, rather than passing: a missing report is never green.
+  e2e-gpu-queue:
+    name: E2E tests (MI300X, queue)
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API and copies files
+    # The queue run's own limit is 170 min; the dispatch and the download add
+    # minutes.
+    timeout-minutes: 180
+    needs: [changes]
+    permissions:
+      actions: write
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && needs.changes.outputs.serve == 'true'
+      && github.event_name == 'pull_request'
+      && github.event.action != 'closed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - name: Run on the queue
+        id: queue
+        run: |
+          set -euo pipefail
+          # The branch name is the PR author's: checked before it goes anywhere.
+          if ! [[ "$HEAD_REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then
+            echo "::error::the branch name is not one the queue takes"
+            exit 1
+          fi
+          caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh workflow run queue-pr-run.yml --ref main -f "branch=${HEAD_REF}" -f "caller=${caller}"
+
+          # The dispatch does not say which run it started; the run's title names
+          # this job, so look for that.
+          run_id=""
+          for _ in $(seq 1 36); do
+            run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+              --limit 50 --json databaseId,displayTitle |
+              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty')
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::the dispatched queue run did not appear within 3 minutes"
+            exit 1
+          fi
+          url="https://github.com/${GH_REPO}/actions/runs/${run_id}"
+          echo "queue run: ${url}"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "### MI300X on the queue" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run: ${url}" >> "$GITHUB_STEP_SUMMARY"
+
+          # Polled once a minute, not `gh run watch`, which polls every few
+          # seconds against this job's token. The job's own timeout bounds this.
+          while true; do
+            status=$(gh run view "$run_id" --json status --jq .status)
+            [ "$status" = completed ] && break
+            sleep 60
+          done
+          conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion)
+          echo "queue run concluded: ${conclusion}"
+
+          # What the run published: the lanes' files, one directory per lane,
+          # each with a directory per channel. Only the MI300X lane's release
+          # channel is the report of this job.
+          mkdir -p queue-results report
+          gh run download "$run_id" --name queue-pr-run-results --dir queue-results ||
+            echo "::warning::the queue run published no results"
+          if [ -f queue-results/refused.txt ]; then
+            echo "::error::the queue did not take the run: $(head -n 1 queue-results/refused.txt)"
+            echo "The queue did not take the run: $(head -n 1 queue-results/refused.txt)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          results=queue-results/mi300x/release/results
+          if [ -f "${results}/report.json" ]; then
+            cp -R "${results}/." report/
+          else
+            echo "::error::the queue run left no MI300X release report (it ${conclusion}); it may be incomplete, which is capacity, not a failing test"
+            echo "No MI300X release report: the run ${conclusion}. Incomplete lanes are capacity, not a failing test; see the run above." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # A failing suite fails the queue run, and the report above shows
+          # which scenarios; the job follows the run's verdict.
+          [ "$conclusion" = success ]
+
+      # A report is uploaded whatever the verdict, as the self-hosted lane's is:
+      # a failing run's report is what the consolidated grid is for.
+      - name: Upload E2E report
+        if: always() && hashFiles('report/report.json') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-gpu-report
+          path: report/
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
   # Dispatch ephemeral pool, opt-in only via the `devlab-dispatch` label (see
@@ -1725,6 +1841,7 @@ jobs:
     needs:
       - changes
       - e2e-gpu
+      - e2e-gpu-queue
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
       - e2e-wsl
@@ -1796,7 +1913,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu=e2e-gpu-report
+            e2e-gpu=e2e-gpu-selfhosted-report
+            e2e-gpu-queue=e2e-gpu-report
             e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
             e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
             e2e-wsl=e2e-gpu-strix-wsl-report
