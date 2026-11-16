@@ -41,11 +41,12 @@ Feature: Model serving
   # vLLM serve + inference (safetensors model). Engine coverage: vLLM. This is the
   # deliberate vLLM half of a per-engine pair with `serve-lemonade-inference`
   # below, so it stays pinned to vLLM (the slug names the engine). It is also the
-  # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
-  # caught before merge, while the heavier `@merge-queue` serves
+  # vLLM per-PR canary (`@gpu-smoke`): one real vLLM serve runs on every PR so a
+  # broken serve is caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
-  # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
-  @id:serve-vllm-inference @requires-real-gpu @requires-engine:vllm
+  # `serve-readiness-contract` and the three port-reservation serves) run only
+  # in the merge queue (not on MI300X).
+  @id:serve-vllm-inference @requires-real-gpu @requires-engine:vllm @gpu-smoke
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
@@ -69,9 +70,9 @@ Feature: Model serving
     And the response identifies the correct model
 
   # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade. The
-  # lemonade per-PR canary: one real lemonade serve runs on every PR (the
-  # counterpart to the vLLM canary above).
-  @id:serve-lemonade-inference @requires-real-gpu @requires-engine:lemonade
+  # lemonade per-PR canary (`@gpu-smoke`): one real lemonade serve runs on every
+  # PR (the counterpart to the vLLM canary above).
+  @id:serve-lemonade-inference @requires-real-gpu @requires-engine:lemonade @gpu-smoke
   Scenario: serve-07 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
     And a GGUF model is being served on lemonade
@@ -84,7 +85,7 @@ Feature: Model serving
   # catalog entries can also serve directly on Linux when their metadata is
   # simple enough; other registered entries use Lemonade's router. Both canaries
   # use the same small checkpoint, sharing the cache without another download.
-  @id:serve-hf-checkpoint-inference @requires-real-gpu @requires-engine:lemonade
+  @id:serve-hf-checkpoint-inference @requires-real-gpu @requires-engine:lemonade @gpu-smoke
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
     And a canonical Hugging Face GGUF checkpoint is being served on lemonade
@@ -489,7 +490,14 @@ Feature: Model serving
   # the bail left all three refusal scenarios green. Planting a configured setup
   # venv that the registry has not yet recorded is what makes the write reachable,
   # and the last Then is what refuses it.
-  @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
+  #
+  # Linux only: the refusal needs a probe that can say "no usable GPU", and
+  # `rocm_core::usable_amd_gpu_indices` answers "unknown" off Linux, so a
+  # GPU-required launch is passed through on native Windows and this premise
+  # cannot hold there. On the GPU-less hosted Windows lane it launched a real
+  # Lemonade serve instead of refusing (ROCMAI-1059). Drop the tag when Windows
+  # has a probe.
+  @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
   Scenario: serve-29 - A live service for another model does not soften the no-GPU refusal
     Given a live managed Lemonade serve for an unrelated model
     And setup names an unregistered runtime folder
