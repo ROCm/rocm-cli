@@ -111,6 +111,31 @@ built `rocm`: `python scripts/nightly_canary.py --rocm target/release/rocm`
 against fixtures without the network).
 
 
+## vLLM route check (advisory)
+
+[`vllm-route-check.yml`](../.github/workflows/vllm-route-check.yml) runs on a
+pull request that touches [`source.rs`](../apps/rocm/src/therock/source.rs) (the
+resolver that picks the default SDK), the vLLM engine's
+[`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs) or
+[`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) (the build
+tables), or the check itself (and on `workflow_dispatch`). On GitHub-hosted
+`ubuntu-24.04`, with no GPU and no install, it runs
+`rocm install sdk --channel <release|nightly> --family <gfx942|gfx950> --dry-run`
+and fails when the selected ROCm SDK version has neither a discovery row nor a
+static pin in those tables, matched the way the engine matches them (see
+[`vllm_route_check.py`](../scripts/vllm_route_check.py)). Without a route
+`rocm engines install vllm` refuses the runtime, and every vLLM-default Instinct
+lane runs no scenarios on it: the nightly queue lanes lost their whole nightly
+channel to this on the 10.3.0a SDKs.
+
+It is **advisory and not a required check**. It resolves the live indexes, so it
+can fail a pull request that changed nothing, when an index moves to an SDK
+vLLM has no wheels for; required, that would block unrelated merges. Read a red
+run as "the default SDK has no vLLM build yet": add the discovery row once the
+wheels are published, or wait for them. Locally, with a built `rocm`:
+`python scripts/vllm_route_check.py --rocm target/release/rocm`.
+
+
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
 "release/**"]`. On that trigger, every self-hosted GPU job additionally pins

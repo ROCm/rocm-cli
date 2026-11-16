@@ -1,0 +1,55 @@
+name: vLLM route check
+
+# Advisory, and deliberately NOT a required check. Resolves the SDK an unpinned
+# `rocm install sdk` picks on the release and the nightly channel, and fails
+# when the vLLM engine has no install route for it (see
+# scripts/vllm_route_check.py). It reads the live indexes, so it can go red on a
+# PR that changed nothing: an index moved on to an SDK vLLM has no wheels for.
+# Required, that would block unrelated merges, so it only reports.
+#
+# Runs on a PR only when it touches what decides the answer: the resolver that
+# picks the default SDK, the engine's two build tables, or this check. CPU only:
+# a dry run, no install.
+
+on:
+  pull_request:
+    paths:
+      - apps/rocm/src/therock/source.rs
+      - engines/vllm/src/wheel_builds.rs
+      - engines/vllm/src/discover_builds.rs
+      - scripts/vllm_route_check.py
+      - .github/workflows/vllm-route-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  AWS_LC_SYS_USE_SYSTEM: "0"
+
+jobs:
+  vllm-route:
+    name: vLLM route for the default SDKs (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+
+      - name: Build rocm
+        run: cargo build --release -p rocm
+
+      - name: Self-test
+        run: python3 scripts/vllm_route_check.py --self-test
+
+      - name: Check the vLLM route of the default SDKs
+        run: python3 scripts/vllm_route_check.py --rocm target/release/rocm
