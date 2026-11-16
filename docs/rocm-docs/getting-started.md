@@ -6,14 +6,44 @@ SPDX-License-Identifier: MIT
 
 # Getting started with ROCm CLI
 
+## Quickstart
+
+<!-- Step 1 and the closing paragraph are deliberate copies of the README text,
+     with the cross-references retargeted to this site. The include between
+     them uses the end of README step 1 and the start of its closing paragraph
+     as anchors; edit both together. -->
+This quickstart takes you from installing ROCm CLI to getting a chat reply from
+a model served on your GPU. You need a computer with a supported AMD GPU running
+Linux, WSL2, or Windows. The first run involves large downloads:
+`rocm install sdk` fetches a ROCm runtime and a PyTorch stack, and `rocm serve`
+fetches a model of a few GB. Allow extra time and disk space.
+
+Follow these steps:
+
+1. Install ROCm CLI with the command for your platform in
+   [Installing ROCm CLI](install/installation.md). Then open a new terminal and
+   confirm that `rocm version` prints the CLI version.
+
+```{include} ../../README.md
+:start-after: "`rocm version` prints the CLI version."
+:end-before: "For other models and engine options, see"
+```
+
+For other models and engine options, see
+[Configure ROCm and serve a model](#configure-rocm-and-serve-a-model) and
+[Model serving](commands.md#model-serving).
+
+The following recording shows the CLI inspecting the environment and chatting
+with a locally served model:
+
+![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
+
 ## First run
 
 ```{include} ../../README.md
 :start-after: "## First run"
 :end-before: "## Interactive interfaces"
 ```
-
-![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
 
 ## Interactive interfaces
 

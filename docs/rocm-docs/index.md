@@ -50,7 +50,7 @@ Check platform support and install the prebuilt binaries.
 :link: getting-started
 :link-type: doc
 
-Inspect your environment, configure ROCm, and serve a model.
+Quickstart: install ROCm CLI, serve a model, and chat with it.
 ```
 
 ```{grid-item-card} Look up a command
