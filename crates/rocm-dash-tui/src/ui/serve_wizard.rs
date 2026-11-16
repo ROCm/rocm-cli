@@ -790,7 +790,8 @@ fn detach_running_request(model: &str) -> ApprovalRequest {
         format!("leave running serve for {model} ?"),
         vec![
             "The serve job is still running or starting.".to_string(),
-            "Leaving now can hide a startup failure until you check services/logs later.".to_string(),
+            "Leaving now can hide a startup failure until you check services/logs later."
+                .to_string(),
             "Approve: leave this screen now.".to_string(),
             "Deny: keep watching the live startup console.".to_string(),
         ],
@@ -2029,7 +2030,10 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.as_ref().unwrap().active_job.is_some());
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('q')));
-        assert!(wiz.is_some(), "q should require detach confirmation mid-job");
+        assert!(
+            wiz.is_some(),
+            "q should require detach confirmation mid-job"
+        );
         assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.is_none(), "confirming detach closes the overlay");

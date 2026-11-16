@@ -459,7 +459,10 @@ mod tests {
             "compact fallback should hide the large logo:\n{compact}"
         );
         for label in ["Options", "Help", "Quit"] {
-            assert!(compact.contains(label), "{label} must remain visible in compact mode");
+            assert!(
+                compact.contains(label),
+                "{label} must remain visible in compact mode"
+            );
         }
         let just_fits = render(20);
         assert!(just_fits.contains('█'), "logo at height 20");
@@ -472,12 +475,21 @@ mod tests {
     fn esc_menu_compact_mode_can_render_a_single_visible_row() {
         let theme = Theme::from_name("default-dark");
         let area = Rect::new(0, 0, 120, 3);
-        let tiny = crate::ui::tests::rows(120, 3, |f| super::draw_menu(f, area, 2, &theme))
-            .join("\n");
+        let tiny =
+            crate::ui::tests::rows(120, 3, |f| super::draw_menu(f, area, 2, &theme)).join("\n");
         assert!(!tiny.contains('█'), "tiny layout hides logo:\n{tiny}");
-        assert!(tiny.contains("▸ Quit"), "selected row must remain visible:\n{tiny}");
-        assert!(!tiny.contains("Options"), "only one row should be visible:\n{tiny}");
-        assert!(!tiny.contains("Help"), "only one row should be visible:\n{tiny}");
+        assert!(
+            tiny.contains("▸ Quit"),
+            "selected row must remain visible:\n{tiny}"
+        );
+        assert!(
+            !tiny.contains("Options"),
+            "only one row should be visible:\n{tiny}"
+        );
+        assert!(
+            !tiny.contains("Help"),
+            "only one row should be visible:\n{tiny}"
+        );
     }
 
     #[test]

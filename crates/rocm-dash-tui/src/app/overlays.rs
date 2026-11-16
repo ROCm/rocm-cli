@@ -45,18 +45,16 @@ impl AppState {
             .as_ref()
             .and_then(|m| m.active_job.as_deref())
             .or_else(|| {
-                self.serve_wizard
-                    .as_ref()
-                    .and_then(|m| {
-                        // While the serve wizard's detach-confirm modal is open,
-                        // that modal owns the overlay; do not let the shared
-                        // active-job console renderer mask it.
-                        if m.detach_confirm.is_some() {
-                            None
-                        } else {
-                            m.active_job.as_deref()
-                        }
-                    })
+                self.serve_wizard.as_ref().and_then(|m| {
+                    // While the serve wizard's detach-confirm modal is open,
+                    // that modal owns the overlay; do not let the shared
+                    // active-job console renderer mask it.
+                    if m.detach_confirm.is_some() {
+                        None
+                    } else {
+                        m.active_job.as_deref()
+                    }
+                })
             })
             .or_else(|| {
                 self.engine_manager
