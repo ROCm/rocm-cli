@@ -877,21 +877,6 @@ fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Resul
          different ROCm release; the index for this ROCm line is serving another SDK's wheels"
     )
 }
-/// Applies [`ensure_rocm_local_version_matches`] to every discovered pin, except
-/// the torch triplet on a row whose `torch_stack_matches_sdk` is false: that
-/// row borrows another ROCm line's torch on purpose.
-fn ensure_discovered_pins_match_sdk(pins: &[String], build: &VllmRocmDiscoverBuild) -> Result<()> {
-    for pin in pins {
-        let is_torch_stack = ["torch==", "torchvision==", "torchaudio=="]
-            .iter()
-            .any(|prefix| pin.starts_with(prefix));
-        if is_torch_stack && !build.torch_stack_matches_sdk {
-            continue;
-        }
-        ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
-    }
-    Ok(())
-}
 /// The digits of a `rocm<digits>` segment in a dotted local version, e.g.
 /// `102` for `g5df63a720.d20261110.rocm102`: the spelling the 10.2 vLLM wheels
 /// use, with no dot between the ROCm major and minor.
@@ -1062,7 +1047,9 @@ fn install_vllm_rocm10_discover(
     notes.extend(amd_aiter_note);
 
     let pins = vec![torch, torchvision, torchaudio, vllm, flash_attn, amd_aiter];
-    ensure_discovered_pins_match_sdk(&pins, build)?;
+    for pin in &pins {
+        ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
+    }
 
     // Two separate `uv pip install` calls, each scoped to exactly one index:
     // see `vllm_rocm10_discover_torch_install_args` for why combining both
@@ -2165,32 +2152,6 @@ fi
             ensure_rocm_local_version_matches("vllm==0.29.1.dev0+rocm10.1.0.gabc", "10.2.0")
                 .is_err()
         );
-    }
-    /// The 10.2 row installs the 10.1 torch stack on purpose, but only the
-    /// torch triplet may differ from the SDK's line.
-    #[test]
-    fn discovered_pins_guard_skips_only_the_borrowed_torch_stack() {
-        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
-        let ten_one = vllm_rocm_discover_build("10.1.0").expect("10.1 row");
-        let torch_stack = |torch: &str| {
-            vec![
-                format!("torch=={torch}"),
-                "torchvision==0.29.0+rocm10.0.0".to_owned(),
-                "torchaudio==2.11.0.3+rocm10.1.0".to_owned(),
-                "vllm==0.32.1.dev0+g5df63a720.d20261110.rocm102".to_owned(),
-                "flash-attn==2.8.3".to_owned(),
-            ]
-        };
-        assert!(
-            ensure_discovered_pins_match_sdk(&torch_stack("2.14.0+rocm10.1.0"), ten_two).is_ok()
-        );
-        // The same borrowed stack is rejected on a row that expects its own.
-        assert!(
-            ensure_discovered_pins_match_sdk(&torch_stack("2.14.0+rocm10.1.0"), ten_one).is_err()
-        );
-        // vLLM itself is still checked on the 10.2 row.
-        let wrong_vllm = vec!["vllm==0.29.1.dev0+rocm10.1.0.gabc".to_owned()];
-        assert!(ensure_discovered_pins_match_sdk(&wrong_vllm, ten_two).is_err());
     }
     /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
     /// arg-builder helpers in isolation: the remaining-deps install must use
