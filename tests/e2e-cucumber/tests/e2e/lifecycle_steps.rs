@@ -66,6 +66,20 @@ pub struct LifecycleState {
     /// The fish config seeded before install, which uninstall must restore
     /// exactly.
     fish_config_before_install: Option<String>,
+    /// What the installer is told about `ROCM_CLI_REQUIRE_SIGNATURE`.
+    signature_requirement: SignatureRequirement,
+}
+
+/// What a scenario's installer runs are told about `ROCM_CLI_REQUIRE_SIGNATURE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SignatureRequirement {
+    /// Set to `1`, as every scenario but the default-trust ones runs.
+    #[default]
+    Required,
+    /// Not set at all, as a user who never asked for a signature runs.
+    Unset,
+    /// Set to `0`, as a user who turned the requirement off runs.
+    Off,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -211,8 +225,28 @@ fn run_installer(
     public_key_env: &[(&str, String)],
     extra_env: &[(&str, String)],
 ) -> (String, bool) {
+    run_installer_on_channel(
+        world,
+        "release",
+        install_dir,
+        download_base,
+        public_key_env,
+        extra_env,
+    )
+}
+
+/// [`run_installer`] with the channel argument the installer is given: `release`
+/// or a release tag naming a specific version.
+fn run_installer_on_channel(
+    world: &E2eWorld,
+    channel: &str,
+    install_dir: &Path,
+    download_base: &str,
+    public_key_env: &[(&str, String)],
+    extra_env: &[(&str, String)],
+) -> (String, bool) {
     let root = workspace_root();
-    let cmd = installer_command(&root);
+    let cmd = installer_command(&root, channel);
     run_installer_command(
         world,
         cmd,
@@ -237,13 +271,30 @@ fn run_installer_command(
     cmd.current_dir(current_dir);
     cmd.env("ROCM_CLI_DOWNLOAD_BASE", download_base);
     cmd.env("ROCM_CLI_INSTALL_DIR", install_dir);
-    cmd.env("ROCM_CLI_REQUIRE_SIGNATURE", "1");
+    match st.signature_requirement {
+        SignatureRequirement::Required => {
+            cmd.env("ROCM_CLI_REQUIRE_SIGNATURE", "1");
+        }
+        // Also drops one inherited from the runner, so the install sees the
+        // variable genuinely unset.
+        SignatureRequirement::Unset => {
+            cmd.env_remove("ROCM_CLI_REQUIRE_SIGNATURE");
+        }
+        SignatureRequirement::Off => {
+            cmd.env("ROCM_CLI_REQUIRE_SIGNATURE", "0");
+        }
+    }
     // Isolate the installer's HOME so shell-profile writes and the seeded
     // ~/.rocm/config.json land in the scenario's tree, never the real home.
     cmd.env("HOME", &st.home_dir);
     // fish's config lives under $XDG_CONFIG_HOME when that is set, which would
     // point the installer's fish setup at the runner's real config.
     cmd.env_remove("XDG_CONFIG_HOME");
+    // The installer takes a key from these in preference to its pinned ones, so
+    // one inherited from the runner would stand in for the pinned key on every
+    // path that supplies none. The child sees only the key the step passes.
+    cmd.env_remove("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH");
+    cmd.env_remove("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM");
     for (key, value) in public_key_env {
         cmd.env(key, value);
     }
@@ -259,22 +310,28 @@ fn run_installer_command(
     (combined, output.status.success())
 }
 
-/// Build the platform-appropriate installer command (`sh install.sh release` on
-/// Unix; `pwsh -File install.ps1 release` on Windows).
+/// Build the platform-appropriate installer command for `channel`
+/// (`sh install.sh <channel>` on Unix; `pwsh -File install.ps1 <channel>` on
+/// Windows).
 #[cfg(not(windows))]
-fn installer_command(root: &Path) -> Command {
+fn installer_command(root: &Path, channel: &str) -> Command {
     let mut cmd = Command::new("sh");
-    cmd.arg(root.join("install.sh")).arg("release");
+    cmd.arg(root.join("install.sh")).arg(channel);
     cmd
 }
 
 #[cfg(windows)]
-fn installer_command(root: &Path) -> Command {
-    powershell_installer_command(&root.join("install.ps1"))
+fn installer_command(root: &Path, channel: &str) -> Command {
+    powershell_command(&root.join("install.ps1"), channel)
 }
 
 #[cfg(windows)]
 fn powershell_installer_command(installer: &Path) -> Command {
+    powershell_command(installer, "release")
+}
+
+#[cfg(windows)]
+fn powershell_command(installer: &Path, channel: &str) -> Command {
     // Prefer pwsh; fall back to Windows PowerShell.
     let shell = if which_ok("pwsh") {
         "pwsh"
@@ -284,7 +341,7 @@ fn powershell_installer_command(installer: &Path) -> Command {
     let mut cmd = Command::new(shell);
     cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(installer)
-        .arg("release");
+        .arg(channel);
     cmd
 }
 
@@ -545,6 +602,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         custom_profile: None,
         login_shell: None,
         fish_config_before_install: None,
+        signature_requirement: SignatureRequirement::Required,
     });
 }
 
@@ -630,6 +688,16 @@ async fn given_fish_configured(world: &mut E2eWorld) {
 #[given("the login shell is bash")]
 async fn given_login_shell_bash(world: &mut E2eWorld) {
     state_mut(world).login_shell = Some("/bin/bash".to_owned());
+}
+
+#[given("the user has not asked the installer to require a signature")]
+async fn given_signature_requirement_unset(world: &mut E2eWorld) {
+    state_mut(world).signature_requirement = SignatureRequirement::Unset;
+}
+
+#[given("the user has turned the installer's signature requirement off")]
+async fn given_signature_requirement_off(world: &mut E2eWorld) {
+    state_mut(world).signature_requirement = SignatureRequirement::Off;
 }
 
 #[given("a signed bundle installed updating the user PATH")]
@@ -991,6 +1059,26 @@ async fn when_install_no_key(world: &mut E2eWorld) {
     let download_base = st.download_base.clone();
     let no_path = [("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
     let (out, _ok) = run_installer(world, &install_dir, &download_base, &[], &no_path);
+    state_mut(world).last_output = out;
+}
+
+#[when("a specific version of the signed bundle is installed with no public key supplied")]
+async fn when_install_version_no_key(world: &mut E2eWorld) {
+    // Any channel other than `release` names a release tag, so the installer has
+    // no release-channel signature requirement to fall back on. The download
+    // base still points at the scenario's own packaged bundle.
+    let st = state(world);
+    let install_dir = st.install_dir.clone();
+    let download_base = st.download_base.clone();
+    let no_path = [("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
+    let (out, _ok) = run_installer_on_channel(
+        world,
+        "v0.0.0-e2e",
+        &install_dir,
+        &download_base,
+        &[],
+        &no_path,
+    );
     state_mut(world).last_output = out;
 }
 
