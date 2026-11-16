@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Automations manager overlay (Phase 3 Wave 3).
+//! Automations manager overlay.
 //!
 //! Lists the background checks ("watchers", plumbed in from the bin which owns
 //! `rocm-core`) and toggles them via the `rocm automations …` verbs:
@@ -340,11 +340,8 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     fn automations() -> Vec<AutomationSummary> {
         vec![

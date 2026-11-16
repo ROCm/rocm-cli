@@ -5,7 +5,13 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::lifecycle_steps;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
+// The note the text report prints under a cause the paste did not contribute
+// to (diagnose-63/-64) is read from the library's own constant rather than
+// typed again here, so the real binary's output is held to the one string the
+// renderer prints from.
+use rocm_core::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE;
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -51,6 +57,43 @@ const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 /// root or touching real group membership.
 const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
+/// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
+/// coverage lives here rather than being folded into [`MUTATING_FIX_ID`]'s
+/// scenario: unlike every other fix-recipe mock in this file, there is no
+/// precedent for faking the thing under test (`powershell.exe`/`setx.exe`
+/// itself), so these scenarios run the real write against the real
+/// User-scope PATH on a `@requires-os:windows` lane instead -- see
+/// `lifecycle_steps::stage_user_path_for_test` for how that stays restorable.
+const PATH_FIX_ID: &str = "fix-6-path";
+
+/// The directory stood in for a HIP SDK install root, inside the scenario's
+/// isolated root. `fix-6-path` resolves its bin dir from `$HIP_PATH` (or the
+/// newest real ROCm install if unset), so pointing `HIP_PATH` here with a real
+/// `bin` subdirectory on disk is enough to reach the PATH read/plan/write
+/// logic without a real ROCm install.
+fn path_fix_sdk_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-hip-sdk")
+}
+
+/// The bin dir `fix-6-path` would prepend to the User PATH, under
+/// [`path_fix_sdk_dir`].
+fn path_fix_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    path_fix_sdk_dir(world).join("bin")
+}
+
+/// A real pre-existing User PATH value containing an apostrophe, the way
+/// `C:\Users\O'Brien\bin` would appear on a host with that username. Not a
+/// contrived edge case -- see `ps_single_quote_escape`'s doc comment in
+/// `crates/rocm-core/src/quoting.rs` -- and chosen so [`assert_path_fix_prepended_with_apostrophe_intact`]
+/// can prove the escaped write script still parses correctly against a real
+/// `powershell.exe`, not just the unit test's simulated one.
+const PATH_FIX_EXISTING_USER_PATH: &str = r"C:\Users\O'Brien\bin;C:\Windows\System32";
+
 /// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
 ///
 /// A duplicate of the catalog, on purpose: a test that derived this list from
@@ -89,6 +132,14 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-7-wsl1",
     "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
+    "fix-21-msvc-redist-outdated",
+    "fix-22-display-driver-old",
+    // The catalog's one DIAGNOSE-ONLY entry, carrying an `info-` id because it
+    // has no fix to offer. It is in the catalog all the same: `rocm diagnose`
+    // prints `apply with: rocm fix info-20-gpu-no-rocm-support` for it, so
+    // `rocm fix` has to resolve that id -- by naming the problem and changing
+    // nothing. Leaving it out here would let the two published forms drift.
+    "info-20-gpu-no-rocm-support",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -270,6 +321,212 @@ async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_FIX_ID.to_string());
 }
 
+#[given("a user who has chosen the fix for the missing MSVC runtime")]
+async fn user_chose_msvc_runtime_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-15-msvc-redist".to_string());
+}
+
+#[given("a user who has chosen the fix for the GPU override")]
+async fn user_chose_override_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-2-unset-override".to_string());
+}
+
+#[given("a user who has chosen the fix for ROCm missing from PATH")]
+async fn user_chose_path_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-6-path".to_string());
+}
+
+#[given("a user who has chosen the fix for a missing render group")]
+async fn user_chose_render_group_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen the fix for a framework wheel built for another ROCm release")]
+async fn user_chose_wheel_mismatch_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-8-wheel-rocm".to_string());
+}
+
+#[then(
+    "the printed commands and verify line avoid the constructs known to break in Windows PowerShell"
+)]
+async fn assert_printed_lines_avoid_powershell_hostile_syntax(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let mut lines: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("  $ "))
+        .filter(|c| !c.trim_start().starts_with('#'))
+        .collect();
+    // Every verify line is shown on Windows, the Linux one included (labelled).
+    lines.extend(printed_verify_lines(output));
+    // The rule lives in this crate because it does not depend on rocm-core. The
+    // table in `fixtures/powershell_text_rule_cases.txt` holds it and the
+    // rocm-core rule to the same answers.
+    for line in lines {
+        if let Some(why) = e2e_cucumber::powershell_text_rule::refusal(line) {
+            panic!("`{line}` uses {why}");
+        }
+    }
+}
+
+#[then("the printed verify command is a PowerShell command that selects FileVersion")]
+async fn assert_verify_is_powershell_selecting_version(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // Text only. `the_msvc_verify_runs_in_cmd_and_powershell` (rocm-core,
+    // Windows only) runs the line.
+    assert!(
+        verify.starts_with("powershell -NoProfile -Command ") && verify.contains("FileVersion"),
+        "expected a PowerShell command that prints FileVersion: {verify}"
+    );
+}
+
+#[then("the printed Linux verify line shows the GPU without needing a compiler")]
+async fn assert_linux_verify_shows_the_gpu(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let linux = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify (Linux, WSL):"))
+        .unwrap_or_else(|| panic!("the preview printed no Linux verify line:\n{output}"))
+        .trim();
+    // `rocminfo` lists the GPU agents. `hipcc` is the compiler a runtime-only
+    // Linux install does not have, so a line that runs it fails there even
+    // with PATH fixed. Text only: the line is not run here, because a Linux
+    // lane without ROCm has no `rocminfo`.
+    assert!(
+        linux.starts_with("rocminfo") && !linux.contains("hipcc"),
+        "the Linux verify line must show the GPU and not need hipcc: {linux}"
+    );
+    // The line every OS can run stays free of anything only Linux has.
+    let shared = printed_verify_line(output);
+    assert!(
+        !shared.contains("rocminfo"),
+        "the Windows verify line must not need rocminfo: {shared}"
+    );
+}
+
+#[then("the printed Linux verify line reads the override without needing Python")]
+async fn assert_linux_verify_reads_the_override_without_python(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let linux = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify (Linux, WSL):"))
+        .unwrap_or_else(|| panic!("the preview printed no Linux verify line:\n{output}"))
+        .trim();
+    // A stock Ubuntu has `python3` and no `python`, so a line that runs either
+    // fails there after a correct fix. Text only: the line is run, with an
+    // empty PATH, by `the_override_linux_verify_runs_with_nothing_on_path` in
+    // rocm-core (Unix hosts).
+    assert!(
+        linux.contains("HSA_OVERRIDE_GFX_VERSION") && !linux.contains("python"),
+        "the Linux verify line must read the override without Python: {linux}"
+    );
+    // The line every OS can run is the one that needs `python`.
+    let shared = printed_verify_line(output);
+    assert!(
+        shared.starts_with("python -c "),
+        "the plain verify line is the python one: {shared}"
+    );
+}
+
+#[then("the printed notes say a stock Linux install has python3 and not python")]
+async fn assert_notes_name_the_python3_case(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The claim is about the two verify lines printed above: the plain one runs
+    // `python` and fails on a stock Ubuntu, the Linux one does not. The
+    // assertion in `assert_linux_verify_reads_the_override_without_python` is
+    // what makes the note's statement about the Linux line true.
+    assert!(
+        output
+            .lines()
+            .any(|line| line.strip_prefix("Note:").is_some_and(|note| {
+                note.contains("python3")
+                    && note.contains("`python`")
+                    && note.contains("Verify (Linux, WSL)")
+            })),
+        "no note names the python3 case:\n{output}"
+    );
+}
+
+#[then("the printed notes say a runtime-only Linux install has no hipcc")]
+async fn assert_notes_name_the_runtime_only_case(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The claim is about the two verify lines printed above: the one that runs
+    // `hipcc` fails on a runtime-only install, the Linux one does not. The
+    // assertion in `assert_linux_verify_shows_the_gpu` is what makes the note's
+    // statement about the Linux line true.
+    assert!(
+        output
+            .lines()
+            .any(|line| line.strip_prefix("Note:").is_some_and(|note| {
+                note.contains("runtime-only")
+                    && note.contains("hipcc")
+                    && note.contains("Verify (Linux, WSL)")
+            })),
+        "no note names the runtime-only case:\n{output}"
+    );
+}
+
+#[then(
+    "the printed verify line checks the user belongs to the group that owns the GPU compute device, and shows that group"
+)]
+async fn assert_render_group_verify_shows_the_kfd_owner(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // The cause tells the user to join the group that owns `/dev/kfd`, which
+    // need not be `render`, so the check has to accept that group and show
+    // it. Text only: the line needs a Linux host to run, and
+    // `the_render_group_verify_accepts_the_group_that_owns_kfd` in
+    // crates/rocm-core/src/diagnose/linux.rs runs it with stand-in tools. That
+    // `rocm diagnose` prints this same line is held by
+    // `the_render_group_fix_verify_matches_the_catalog_copy` there; both read
+    // one constant.
+    assert!(
+        verify.starts_with("groups ")
+            && verify.contains("stat -c %G /dev/kfd")
+            && verify.contains("ls -l /dev/kfd"),
+        "the verify line must check the group that owns /dev/kfd and list it: {verify}"
+    );
+}
+
+#[then("the printed title names the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_title_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let title = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Fix:"))
+        .unwrap_or_else(|| panic!("the preview printed no Fix: line:\n{output}"))
+        .trim();
+    // Text only. The comparison the title describes, `X.Y` and not the bare
+    // major, is held by `the_wheel_mismatch_compares_the_x_y_release_and_says_so`
+    // in crates/rocm-core/src/diagnose/host.rs.
+    assert!(
+        title.contains("X.Y") && !title.contains("major"),
+        "the title must name the X.Y release it compares: {title}"
+    );
+}
+
+/// Every `Verify` line the preview printed: the plain one and the Linux one.
+fn printed_verify_lines(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("Verify:")
+                .or_else(|| line.strip_prefix("Verify (Linux, WSL):"))
+        })
+        .map(str::trim)
+        .collect()
+}
+
+fn printed_verify_line(output: &str) -> &str {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify:"))
+        .map_or_else(
+            || panic!("the preview printed no Verify: line:\n{output}"),
+            str::trim,
+        )
+}
+
 #[given("a user who has chosen a known fix")]
 async fn user_chose_known_fix(world: &mut E2eWorld) {
     world.model_name = Some(PREVIEW_FIX_ID.to_string());
@@ -322,14 +579,8 @@ async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
     // through one of these two scripts either way, and both fail unconditionally.
     for name in ["usermod", "sudo"] {
         let script = bin_dir.join(name);
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n")
+        rocm_core::fake_executable::write_fake_executable(&script, "#!/bin/sh\nexit 1\n")
             .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .unwrap_or_else(|e| panic!("failed to chmod fake {name}: {e}"));
-        }
     }
     // Restricting `$PATH` to only the fakes above also makes the recipe's
     // root-detection deterministic: it shells out to `id -u`, which is not on
@@ -352,6 +603,41 @@ async fn user_named_diagnosis_position(world: &mut E2eWorld) {
     // CLI never sees it. The product behaviour under test is what happens when
     // the argument does arrive.
     world.model_name = Some("#1".to_string());
+}
+
+#[given("a Windows host with a HIP SDK install and an apostrophe already on the real User PATH")]
+async fn user_on_windows_with_hip_sdk_and_apostrophe_path(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir)
+        .expect("failed to create the scenario's fake HIP SDK bin dir");
+    world
+        .command_env
+        .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    // Captured and restored by `LifecycleState`'s `Drop` (see
+    // `stage_user_path_for_test`), the same guarantee the lifecycle Windows
+    // scenarios get for the same machine-global state.
+    lifecycle_steps::stage_user_path_for_test(world, PATH_FIX_EXISTING_USER_PATH);
+    world.model_name = Some(PATH_FIX_ID.to_string());
+}
+
+#[given("a Windows host with a HIP SDK install and no way to resolve PowerShell")]
+async fn user_on_windows_with_hip_sdk_and_no_powershell(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir)
+        .expect("failed to create the scenario's fake HIP SDK bin dir");
+    world
+        .command_env
+        .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    // An empty child PATH means the CLI's own `Command::new("powershell")`
+    // cannot resolve the binary at all -- `powershell.exe` lives under
+    // `System32\WindowsPowerShell\v1.0`, which Windows does NOT search
+    // unconditionally the way it does System32 itself, so this is a real
+    // instance of the "PowerShell missing" cause `ps_env_scope`'s doc comment
+    // names, not a faked one. Nothing here touches the real machine's
+    // User-scope PATH, so no capture/restore is needed: the read never gets
+    // far enough to risk it.
+    world.command_env.push(("PATH", std::ffi::OsString::new()));
+    world.model_name = Some(PATH_FIX_ID.to_string());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -537,9 +823,9 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // <id> --dry-run`. Assert the shape (present once per cause, ending in
     // the always-on auto/manual marker) rather than a specific fix-id's exact
     // flags: the top match is environment-dependent, and a shared vocabulary
-    // doesn't guarantee diagnose and the fix.rs catalog agree on the
-    // underlying values for a given fix-id -- unit tests in diagnose.rs call
-    // fix.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
+    // doesn't guarantee diagnose and the fix/catalog.rs catalog agree on the
+    // underlying values for a given fix-id -- unit tests in diagnose/linux.rs call
+    // fix/catalog.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
     // values against the catalog for that.
     let causes = output.lines().filter(|l| l.contains("score=")).count();
     assert!(causes > 0, "no scored causes to check:\n{output}");
@@ -645,15 +931,25 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
 /// panicking with the raw output if it is absent. Shared by the two `Then`
 /// steps that assert on the vLLM OOM entry.
 fn find_vllm_oom<'a>(report: &'a serde_json::Value, output: &str) -> &'a serde_json::Value {
+    find_matched(report, "fix-16-vllm-oom", output)
+}
+
+/// The entry of the diagnosis's `matched` list with the given id, panicking with
+/// the raw output if it is absent.
+fn find_matched<'a>(
+    report: &'a serde_json::Value,
+    id: &str,
+    output: &str,
+) -> &'a serde_json::Value {
     report
         .get("matched")
         .and_then(serde_json::Value::as_array)
         .and_then(|matches| {
             matches.iter().find(|diagnosis| {
-                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some(id)
             })
         })
-        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"))
+        .unwrap_or_else(|| panic!("expected {id} in diagnosis:\n{output}"))
 }
 
 #[then("no vLLM startup OOM is reported")]
@@ -717,12 +1013,30 @@ async fn assert_named_fix_is_runnable_here(world: &mut E2eWorld) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
         .to_owned();
-    let (fix_output, fix_stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+#[then("the CLI can act on the fix named for the engine-startup import failure")]
+async fn assert_import_failure_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_matched(&report, ENGINE_IMPORT_FIX_ID, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+/// Runs `rocm fix <fix_id>` and checks that it prints its advisory plan rather
+/// than refusing on this platform. Shared by the steps that follow a diagnosis
+/// to the fix it named.
+fn assert_fix_is_printable_here(world: &mut E2eWorld, fix_id: &str) {
+    let (fix_output, fix_stderr, rc) = crate::run_rocm(world, &["fix", fix_id]);
     assert_eq!(
         rc,
         0,
         "{}",
-        e2e_cucumber::cli_failure_report(&["fix", &fix_id], rc, &fix_output, &fix_stderr)
+        e2e_cucumber::cli_failure_report(&["fix", fix_id], rc, &fix_output, &fix_stderr)
     );
     assert!(
         fix_output.to_lowercase().contains("print-only"),
@@ -1424,6 +1738,79 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
     );
 }
 
+#[then("the CLI used PowerShell's SetEnvironmentVariable, not setx, to update the User PATH")]
+async fn assert_path_fix_used_set_environment_variable(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "expected the real PATH write to succeed:\n{output}"
+    );
+    // Scoped to the write, not to the whole command output. `rocm fix <id>`
+    // prints the catalog recipe first, and `fix-6-path`'s notes name
+    // `setx PATH "%PATH%;..."` in order to warn a Windows user off it -- so a
+    // whole-output `!contains("setx ")` reports on the documentation rather
+    // than on what the CLI did, and fails on a correct run. Taking the region
+    // between the plan line and the post-write confirmation asserts both
+    // halves where they mean something: the write went through PowerShell,
+    // and nothing in the write went through `setx`. Obtaining the region at
+    // all is what pins the plan line and the confirmation wording cb9f748d
+    // introduced.
+    let write_region = e2e_cucumber::user_path_write_region(output).unwrap_or_else(|| {
+        panic!(
+            "expected the plan/write region cb9f748d introduced -- a `Plan: prepend ...` line \
+             through a `This only takes effect in NEW shells` confirmation:\n{output}"
+        )
+    });
+    assert!(
+        write_region.contains("[Environment]::SetEnvironmentVariable("),
+        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{write_region}"
+    );
+    assert!(
+        !write_region.contains("setx "),
+        "setx must not appear in the plan or the write now that it goes through PowerShell:\n{write_region}"
+    );
+}
+
+#[then("the HIP SDK bin dir is prepended on the real User PATH, apostrophe intact")]
+async fn assert_path_fix_prepended_with_apostrophe_intact(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world).to_string_lossy().into_owned();
+    let new_user_path = lifecycle_steps::read_user_path_for_test();
+    assert!(
+        new_user_path.starts_with(&bin_dir),
+        "expected {bin_dir} prepended (not appended) to the real User PATH: {new_user_path:?}"
+    );
+    assert!(
+        new_user_path.contains("O'Brien"),
+        "the pre-existing apostrophe-containing path entry must survive the write \
+         unmangled -- a failure here means the write script's quoting broke \
+         mid-statement against a real powershell.exe, not just the unit test's \
+         simulated one:\n{new_user_path:?}"
+    );
+}
+
+#[then("the CLI aborts the PATH fix with exit code 4 and changes nothing")]
+async fn assert_path_fix_aborts_on_unreadable_path(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a failed PATH read must abort with exit code 4 -- the same code as a \
+         write failure -- rather than being silently treated as an empty PATH \
+         (ROCMAI-449):\n{output}\n{stderr}"
+    );
+    let combined = format!("{output}\n{stderr}");
+    assert!(
+        combined.contains("Could not read the current User PATH"),
+        "expected the abort message naming the failed read:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Plan: prepend"),
+        "a failed read must abort before any write plan is printed:\n{combined}"
+    );
+}
+
 // ── `rocm diagnose --model` ────────────────────────────────────────
 
 /// The largest curated recipe. Its 905 GiB minimum is above any single machine
@@ -1905,7 +2292,7 @@ async fn assert_reason_is_not_curated(world: &mut E2eWorld) {
     );
 }
 
-fn workspace_root() -> std::path::PathBuf {
+pub(crate) fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -1913,7 +2300,7 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-fn xtask_command() -> std::process::Command {
+pub(crate) fn xtask_command() -> std::process::Command {
     if let Some(binary) = std::env::var_os("ROCM_XTASK_BINARY") {
         std::process::Command::new(binary)
     } else {
@@ -2183,6 +2570,14 @@ async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
         );
         return;
     }
+    assert_names_no_user_host_or_path(&out);
+}
+
+/// The sweep behind the claim that a report names no user, host, or file path.
+///
+/// Shared by the step that checks the report and the step that checks the
+/// sentence the CLI prints about it, so the sentence is held to the same proof.
+fn assert_names_no_user_host_or_path(out: &str) {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
@@ -2286,6 +2681,43 @@ async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
                 || out.contains("\"refused\""),
             "the output is neither a genuine report nor a stated refusal, so this assertion \
              would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
+#[then(
+    "the CLI says the mail carries the user's own address, and the report names no user, host, or file path"
+)]
+async fn assert_sender_notice_is_given_and_true(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let notice = "it goes from your own mail account and carries your address";
+    // Same discriminator as above. A refusal offers no mail, so it has nothing
+    // to say about one.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(notice),
+            "a mail was offered without telling the user it carries their address:\n{out}"
+        );
+        assert!(
+            out.contains("The report itself names no user, host, or file path."),
+            "the notice no longer states what the report leaves out:\n{out}"
+        );
+        // The second sentence is a claim about this output. Prove it here,
+        // against the same run, rather than trusting the wording. The notice
+        // line itself is left out of the sweep: it names the words "user",
+        // "host" and "path", and a lane whose `$USER` or host name is one of
+        // them (`USER=user` is common in containers) would fail on the
+        // sentence instead of on the report.
+        let without_notice: String = out
+            .lines()
+            .filter(|line| !line.contains(notice))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_names_no_user_host_or_path(&without_notice);
+    } else {
+        assert!(
+            !out.contains(notice),
+            "a refusal offers no mail, yet the user was told about one:\n{out}"
         );
     }
 }
@@ -2419,15 +2851,99 @@ async fn assert_exit_codes_published(world: &mut E2eWorld) {
             "the published exit codes are missing `{name}`:\n{catalog:#}"
         );
     }
+    // A name without a meaning leaves the caller guessing just the same, so
+    // every published code needs a description that says something.
+    for name in codes.keys() {
+        let description = catalog["exit_code_descriptions"][name]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !description.trim().is_empty(),
+            "exit code `{name}` is published without a description:\n{catalog:#}"
+        );
+    }
+}
+
+/// The catalog `rocm fix --json` printed earlier in the scenario. The steps
+/// that run the CLI again after it keep their output local, so it stays here.
+fn published_catalog(world: &E2eWorld) -> serde_json::Value {
+    let output = world.cli_output.as_ref().expect("no catalog was read");
+    serde_json::from_str(output).expect("catalog parses")
+}
+
+/// The code the catalog publishes for `name`, and its description.
+fn published_exit_code(catalog: &serde_json::Value, name: &str) -> (i32, String) {
+    let code = catalog["exit_codes"][name]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no exit code published for `{name}`:\n{catalog:#}"));
+    let description = catalog["exit_code_descriptions"][name]
+        .as_str()
+        .unwrap_or_else(|| panic!("no description published for `{name}`:\n{catalog:#}"))
+        .to_owned();
+    (
+        i32::try_from(code).expect("an exit code fits i32"),
+        description,
+    )
+}
+
+/// Whether some line of `stderr` starts with `prefix`. The description promises
+/// a line, not the start of stderr: a one-time `rocm:` notice printed at startup
+/// can come before either refusal.
+fn has_line_starting_with(stderr: &str, prefix: &str) -> bool {
+    stderr.lines().any(|line| line.starts_with(prefix))
+}
+
+#[then("asking for a fix it does not offer exits with the code the catalog describes for that")]
+async fn assert_unknown_fix_exits_as_published(world: &mut E2eWorld) {
+    let catalog = published_catalog(world);
+    let (code, description) = published_exit_code(&catalog, "unknown_id");
+    let (_stdout, stderr, rc) = crate::run_rocm(world, &["fix", "fix-does-not-exist"]);
+    assert_eq!(
+        rc, code,
+        "an unknown fix-id must exit with the code the catalog publishes for it; stderr:\n{stderr}"
+    );
+    // The description names the message that sets this refusal apart; the
+    // refusal has to actually print it, or the advice sends a caller looking
+    // for a line that never comes.
+    let marker = "Unknown fix-id:";
+    assert!(
+        description.contains(marker) && has_line_starting_with(&stderr, marker),
+        "the description must name `{marker}`, and a stderr line must start with it.\n\
+         description: {description}\nstderr:\n{stderr}"
+    );
+}
+
+#[then(
+    "a malformed command line exits with that same code, as the catalog warns, and is told apart by its message"
+)]
+async fn assert_usage_error_shares_the_unknown_id_code(world: &mut E2eWorld) {
+    let catalog = published_catalog(world);
+    let (code, description) = published_exit_code(&catalog, "unknown_id");
+    assert!(
+        description.contains("malformed command line") && description.contains("`error:`"),
+        "the catalog must warn that a usage error exits {code} too, and say how to spot it:\n\
+         {description}"
+    );
+    let (_stdout, stderr, rc) = crate::run_rocm(world, &["fix", "--no-such-option"]);
+    assert_eq!(
+        rc, code,
+        "a malformed `rocm fix` command line must exit {code}, as the catalog warns; stderr:\n{stderr}"
+    );
+    // A line for the `error:`, the whole of stderr for the absence: the
+    // unknown-id message must appear nowhere in a usage error.
+    assert!(
+        has_line_starting_with(&stderr, "error:") && !stderr.contains("Unknown fix-id:"),
+        "a usage error must be distinguishable by its message, as the catalog says:\n{stderr}"
+    );
 }
 
 #[then("the CLI refuses and explains that the two cannot be combined")]
 async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     let stderr = world.cli_stderr.as_ref().expect("no stderr");
-    assert_ne!(
+    assert_eq!(
         world.cli_rc,
-        Some(0),
-        "a request with no answer must not look like it succeeded"
+        Some(1),
+        "a request with no answer must exit 1, as README.md and reference.md document"
     );
     assert!(
         stderr.contains("--json"),
@@ -2438,5 +2954,1521 @@ async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     assert!(
         serde_json::from_str::<serde_json::Value>(stdout).is_err(),
         "a refused request still produced machine-readable output:\n{stdout}"
+    );
+}
+
+// ── A GPU ROCm has no build for ────────────────────────────────────
+
+#[given("a machine whose only GPU is one ROCm has no build for")]
+async fn machine_with_an_unsupported_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // One GPU node in the kernel topology, reporting gfx_target_version 90012.
+    // That decodes to gfx90c -- the Vega iGPU in Renoir / Lucienne / Cezanne /
+    // Barcelo, and the one architecture the catalog says has no ROCm build.
+    // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
+    // GPU rather than a CPU node.
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 56\ngfx_target_version 90012\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.join("host-root").into()));
+    // An `lspci` that lists an empty bus, ahead of any real one, so the PCI
+    // probe succeeds on every runner without describing the runner's cards --
+    // a second, supported GPU would make the whole-machine claim false and the
+    // cause would correctly not fire.
+    let bin = root.join("unsupported-gpu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user asks the CLI to diagnose that machine's state")]
+async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
+    // No `--symptom`: the finding is about the hardware, and the user on this
+    // host has no error to paste -- Vulkan inference works. `--top 20` so the
+    // assertions below read the whole ranking rather than the default five.
+    // Where the cause ranks is a separate question from whether it is reported
+    // at all, and the runner's own state can add causes above it.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--top", "20"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+// ── Stale repo advice on a simulated Ubuntu host ───────────────────
+
+#[given("an Ubuntu 24.04 machine with two stale ROCm repo files")]
+async fn ubuntu_with_stale_repos(world: &mut E2eWorld) {
+    let host = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(host.join("etc/apt/sources.list.d"))
+        .expect("failed to create planted apt directory");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
+    )
+    .expect("failed to write planted os-release");
+    for name in ["amdgpu.list", "rocm.list"] {
+        std::fs::write(
+            host.join("etc/apt/sources.list.d").join(name),
+            "# planted\n",
+        )
+        .expect("failed to plant a repo file");
+    }
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user diagnoses that machine with a stale repo symptom")]
+async fn user_diagnoses_stale_repo_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "stale repo conflict",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the stale repo cause names both planted repo files and the driver reinstall command")]
+async fn assert_stale_repo_advice(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause: Vec<&str> = output
+        .lines()
+        .skip_while(|line| !line.contains("(fix-7-stale-repos)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    let text = cause.join("\n");
+    assert!(
+        !text.is_empty(),
+        "no stale repo cause was reported:\n{output}"
+    );
+    // The logical paths a user would move, not the scenario's temp host root.
+    for file in ["amdgpu.list", "rocm.list"] {
+        assert!(
+            text.contains(&format!("/etc/apt/sources.list.d/{file}")),
+            "{file} must be named by its real path:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("rocm install driver --dkms --yes"),
+        "Ubuntu 24.04 has a driver plan, so the advice must name it:\n{text}"
+    );
+}
+
+#[then("the advised driver reinstall command accepts the flags it is advised with")]
+async fn assert_advised_driver_command_exists(world: &mut E2eWorld) {
+    let (stdout, _stderr, rc) = crate::run_rocm(world, &["install", "driver", "--help"]);
+    assert_eq!(rc, 0, "`rocm install driver --help` must exist:\n{stdout}");
+    for flag in ["--dkms", "--yes"] {
+        assert!(
+            stdout.contains(flag),
+            "{flag} is advised but not accepted:\n{stdout}"
+        );
+    }
+}
+
+// ── The verify line `rocm diagnose` prints on Linux ────────────────
+
+/// The reported cause block for `fix_id`: the `#N (id)` header line and
+/// everything under it up to the blank line that ends it.
+fn cause_block<'a>(output: &'a str, fix_id: &str) -> Vec<&'a str> {
+    let marker = format!("({fix_id})");
+    output
+        .lines()
+        .skip_while(|line| !line.contains(&marker))
+        .take_while(|line| !line.trim().is_empty())
+        .collect()
+}
+
+/// The text after `verify after fix:` in the cause block for `fix_id`.
+fn diagnose_verify_line(output: &str, fix_id: &str) -> String {
+    let block = cause_block(output, fix_id);
+    assert!(
+        !block.is_empty(),
+        "no `{fix_id}` cause was reported:
+{output}"
+    );
+    block
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("verify after fix:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "`{fix_id}` printed no verify line:
+{}",
+                block.join(
+                    "
+"
+                )
+            )
+        })
+        .trim()
+        .to_owned()
+}
+
+#[when("the user diagnoses this machine with a ROCm runtime library load failure")]
+async fn user_diagnoses_runtime_library_load_failure(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "libamdhip64.so.6: cannot open shared object file",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the wheel mismatch cause and its plan name the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_cause_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // The symptom alone raises this cause on every OS it is scoped to, whatever
+    // the host's own ROCm, so every lane sees the block. Text only: the
+    // comparison it describes is held by
+    // `the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+    // crates/rocm-core/src/diagnose/host.rs.
+    let block = cause_block(output, "fix-8-wheel-rocm");
+    assert!(
+        !block.is_empty(),
+        "no `fix-8-wheel-rocm` cause was reported:\n{output}"
+    );
+    // Only the title and the plan: they are what describe the comparison, and
+    // another line of the block may say "major" about something else.
+    let header = block[0];
+    assert!(
+        header.contains("X.Y release") && !header.contains("major"),
+        "the cause's title must name the X.Y release: {header}"
+    );
+    let plan = block
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("plan:"))
+        .unwrap_or_else(|| panic!("the cause printed no plan:\n{}", block.join("\n")));
+    assert!(
+        plan.contains("X.Y release") && !plan.contains("major"),
+        "the plan must name the X.Y release: {plan}"
+    );
+}
+
+#[given("a Linux machine whose shell has a GPU override set")]
+async fn linux_machine_with_a_gpu_override(world: &mut E2eWorld) {
+    // `rocm diagnose` reads the override from the environment it examines,
+    // which is the CLI child's, so setting it there is the whole setup.
+    world
+        .command_env
+        .push(("HSA_OVERRIDE_GFX_VERSION", "11.0.0".into()));
+}
+
+#[when("the user diagnoses that machine with a page fault symptom")]
+async fn user_diagnoses_page_fault_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["diagnose", "--symptom", "page fault", "--top", "20"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then(
+    "the override cause prints a verify line that reads the override and checks torch with python3"
+)]
+async fn assert_diagnose_override_verify_uses_python3(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let verify = diagnose_verify_line(output, "fix-2-unset-override");
+    // A stock Ubuntu has `python3` and no `python`, so a printed line that runs
+    // `python` fails there after a correct fix. Text only: the line is run by
+    // `the_override_fix_verify_runs_where_only_python3_exists` in rocm-core
+    // (Unix hosts), and this machine may have no torch.
+    assert_eq!(
+        verify,
+        "echo \"${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}\"; python3 -c \"import torch; print(torch.cuda.is_available())\"",
+        "the printed verify line changed"
+    );
+    assert!(
+        !verify.split_whitespace().any(|word| word == "python"),
+        "the verify line must not run bare `python`: {verify}"
+    );
+}
+
+#[given("a simulated Linux machine with ROCm missing from PATH")]
+async fn simulated_linux_machine_without_rocm_on_path(world: &mut E2eWorld) {
+    // Planted host root, as in diagnose-40/42, so the runner's own ROCm state
+    // is not what is described. The symptom below is what makes the cause fire.
+    let host = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(host.join("etc")).expect("failed to create planted etc");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu
+VERSION_ID=\"24.04\"
+VERSION_CODENAME=noble
+PRETTY_NAME=\"Ubuntu 24.04 LTS\"
+",
+    )
+    .expect("failed to write planted os-release");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user diagnoses that machine with a rocminfo not found symptom")]
+async fn user_diagnoses_rocminfo_not_found(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "rocminfo: command not found",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the PATH cause prints a verify line that shows the GPU with rocminfo alone")]
+async fn assert_diagnose_path_verify_is_rocminfo_alone(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let verify = diagnose_verify_line(output, "fix-6-path");
+    // `hipcc` is the compiler a runtime-only install does not have, so a line
+    // that chains it fails there with PATH fixed. Text only: running `rocminfo`
+    // needs ROCm on the lane.
+    assert_eq!(
+        verify, "rocminfo | head -n 5",
+        "the printed verify line changed"
+    );
+    assert!(
+        !verify.contains("hipcc"),
+        "the verify line must not need hipcc: {verify}"
+    );
+}
+
+// ── Windows display driver advice ──────────────────────────────────
+
+#[when("the user diagnoses this machine in machine-readable form, with no symptom")]
+async fn user_diagnoses_without_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The reported cause block for `info-20-gpu-no-rocm-support`: the `#N (id)`
+/// header line and everything under it up to the blank line that ends it.
+fn unsupported_gpu_cause(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .skip_while(|line| !line.contains("(info-20-gpu-no-rocm-support)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect()
+}
+
+#[then("the diagnosis names the architecture and says Vulkan still works")]
+async fn assert_unsupported_gpu_named(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm diagnose` always exits 0");
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause = unsupported_gpu_cause(output);
+    assert!(
+        !cause.is_empty(),
+        "the planted gfx90c host must be told why ROCm will not work on it:\n{output}"
+    );
+    let text = cause.join("\n");
+    assert!(
+        text.contains("gfx90c"),
+        "naming the architecture is the acceptance criterion; a bare \"unsupported\" \
+         leaves the user unable to check it:\n{text}"
+    );
+    assert!(
+        text.contains("Vulkan"),
+        "and the usable path has to be named, or the report reads as \"this machine \
+         cannot do inference\":\n{text}"
+    );
+}
+
+#[then("that cause offers no fix to apply, and says so")]
+async fn assert_unsupported_gpu_has_no_fix(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let text = unsupported_gpu_cause(output).join("\n");
+    assert!(
+        text.contains("no reliable fix"),
+        "the flags line has to say there is nothing to apply, or `apply with:` below it \
+         reads as a repair:\n{text}"
+    );
+    // The `apply with:` line is still printed, and still works: the id is a
+    // DIAGNOSE-ONLY catalog entry, so `rocm fix` answers for it by naming the
+    // problem and changing nothing. Dropping the line for this one id would
+    // have made README and `--help` false for it.
+    assert!(
+        text.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+        "every cause carries the command that acts on it, this one included:\n{text}"
+    );
+    // Run against the SAME simulated host the diagnosis was made on, not the
+    // runner's own machine. `run_rocm_with_scenario_env` in the When step
+    // consumes `world.command_env` by design, so the host root is re-applied
+    // here explicitly rather than by reaching into a drained field.
+    //
+    // This is not cosmetic. `rocm fix` gates on `fix::current_os`, which
+    // resolves WSL by probing `/dev/dxg` and `/proc/version` *through* the host
+    // root. On a WSL2 runner -- which `@requires-os:linux` selects, because WSL2
+    // reports an `os_family` of `linux` -- the unrooted command is read as os
+    // `wsl`, which this entry deliberately does not apply on, and it exits 3 for
+    // a reason that has nothing to do with the behaviour under test.
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    let (fix_stdout, _, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", "info-20-gpu-no-rocm-support", "--yes"],
+        &[(
+            "ROCM_CLI_TEST_HOST_ROOT",
+            host_root.to_string_lossy().as_ref(),
+        )],
+    );
+    assert_eq!(
+        rc, 0,
+        "the id the report told the user to run must be one `rocm fix` accepts:\n{fix_stdout}"
+    );
+    // Exit 0 alone is also what a PRINT-ONLY routing produces, and that one
+    // hands the user commands to run. What the report promised is that there is
+    // nothing to apply, so the promise is what gets asserted -- AGENTS.md §3.
+    assert!(
+        fix_stdout.contains("no reliable fix, so this command changes nothing"),
+        "a DIAGNOSE-ONLY id has to say it changed nothing; exit 0 on its own would \
+         equally describe a print-only fix handing over steps to carry out:\n{fix_stdout}"
+    );
+    assert!(
+        !fix_stdout.contains("Copy the commands above"),
+        "and it must not route through the print-only path, which asks for steps to be \
+         run that this entry does not have:\n{fix_stdout}"
+    );
+}
+
+#[then("no cause tells this user to install the HIP SDK")]
+async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
+    // DELIBERATELY WEAKER THAN ITS NAME SUGGESTS, and a reader should know
+    // which half of the change it covers.
+    //
+    // `check_13_hip_sdk_missing` opens with `if e.os_family != "windows" {
+    // return zero(..) }`, which predates this change. On a Linux lane that
+    // early return alone makes this assertion hold, so it would still pass with
+    // `check_20` deleted. What it is worth is the general form: a guard that
+    // nothing *else* ever starts proposing an SDK install on a Vulkan-only
+    // host, and that the Windows gate above is not removed without a
+    // replacement. It is not proof of the Windows regression.
+    //
+    // That regression has no end-to-end coverage, and cannot have any today.
+    // The host-simulation seam (`rocm_core::hardware_root`, via
+    // `ROCM_CLI_TEST_HOST_ROOT`) re-roots Linux sysfs/procfs/device paths only;
+    // the Windows GPU probe shells out to `Win32_VideoController` and has no
+    // seam, so a Windows-shaped gfx90c host cannot be planted at all. The
+    // Windows lane that runs per PR is restricted to `@lifecycle` scenarios by
+    // `E2E_ONLY_LIFECYCLE=1`, and the self-hosted Windows lanes run on real
+    // Strix Halo (gfx1151, supported), where `check_20` correctly stays silent.
+    // The stated substitute is the unit test
+    // `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` in
+    // `rocm-core::diagnose`, which drives the whole `diagnose()` pipeline on
+    // the ticket's exact Windows/gfx90c host shape. The gate on a supported
+    // Windows GPU (the Strix Halo shape of ROCMAI-830) does run end to end, as
+    // `diagnose-48` on the Windows GPU lane.
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    assert!(
+        !output.contains("fix-13-hip-sdk-missing"),
+        "a host whose only engine is Vulkan has nothing to gain from a HIP SDK:\n{output}"
+    );
+}
+
+#[then(
+    "the diagnosis offers the old display driver advice only when the inspection reports an old driver"
+)]
+async fn assert_old_driver_advice_follows_the_inspection(world: &mut E2eWorld) {
+    const FIX_ID: &str = "fix-22-display-driver-old";
+    let diagnosis: serde_json::Value =
+        serde_json::from_str(world.cli_output.as_ref().expect("no diagnosis"))
+            .expect("`diagnose --json` did not emit valid JSON");
+    let (examine_json, _, _) = crate::run_rocm(world, &["examine", "--json"]);
+    let examine: serde_json::Value =
+        serde_json::from_str(&examine_json).expect("`examine --json` did not emit valid JSON");
+    // Required, as `examine-29` requires it: a CLI without the driver record
+    // must fail here, not read as "no old driver".
+    let record = super::examine_steps::windows_driver_record(&examine).unwrap_or_else(|| {
+        panic!("the machine-readable inspection carries no Windows driver record:\n{examine:#}")
+    });
+    let old =
+        record.get("age").and_then(serde_json::Value::as_str) == Some("predates_first_hip_sdk");
+    let row = diagnosis["matched"]
+        .as_array()
+        .expect("matched is a list")
+        .iter()
+        .find(|entry| entry["id"] == FIX_ID);
+    assert_eq!(
+        row.is_some(),
+        old,
+        "advice present: {}, driver old: {old}\n{diagnosis:#}",
+        row.is_some()
+    );
+    // Advice, never an established cause.
+    if let Some(row) = row {
+        let score = row["score"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the advice row has no numeric score:\n{row:#}"));
+        let threshold = diagnosis["min_score_for_match"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the diagnosis has no numeric threshold:\n{diagnosis:#}"));
+        assert!(score < threshold, "{row:#}");
+    }
+}
+
+#[then(
+    "the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it"
+)]
+async fn assert_hip_sdk_advice_follows_the_inspection(world: &mut E2eWorld) {
+    const FIX_ID: &str = "fix-13-hip-sdk-missing";
+    let diagnosis: serde_json::Value =
+        serde_json::from_str(world.cli_output.as_ref().expect("no diagnosis"))
+            .expect("`diagnose --json` did not emit valid JSON");
+    let (examine_json, _, _) = crate::run_rocm(world, &["examine", "--json"]);
+    let examine: serde_json::Value =
+        serde_json::from_str(&examine_json).expect("`examine --json` did not emit valid JSON");
+    let field = |name: &str| {
+        examine
+            .get(name)
+            .unwrap_or_else(|| panic!("the inspection carries no `{name}`:\n{examine:#}"))
+    };
+    let text = |name: &str| field(name).as_str().unwrap_or_default().to_owned();
+    // Something on this host that calls into the system HIP SDK, read from the
+    // inspection the same way `check_13_hip_sdk_missing` reads it with no
+    // symptom: a managed runtime's HIP build brings its own HIP runtime, and
+    // Lemonade's bundled llama.cpp is not on PATH as a HIP build.
+    let has_amd_gpu = field("has_amd_gpu").as_bool() == Some(true);
+    let framework = text("framework");
+    let ambient_hip_torch = framework == "pytorch"
+        && text("framework_rocm_version").starts_with("hip=")
+        && text("framework_source") != "managed-runtime";
+    let hip_llama_cpp = framework == "llama-cpp" && text("framework_rocm_version") == "GGML_HIP=ON";
+    let ambient_hip_torch = has_amd_gpu && ambient_hip_torch;
+    let hip_llama_cpp = has_amd_gpu && hip_llama_cpp;
+    let needs_hip = ambient_hip_torch || hip_llama_cpp;
+    let sdk_unusable =
+        text("hip_sdk_path").is_empty() || field("hipinfo_present").as_bool() != Some(true);
+    // ROCMAI-837 considers the ambient-torch +25 listing beside a healthy SDK
+    // wrong. This oracle copies that rule on purpose, so whoever changes the
+    // +25 bonus in `check_13_hip_sdk_missing` must update this copy too.
+    // Mirrors the scoring in `check_13_hip_sdk_missing`, not only its
+    // headline: inside the `needs_hip` gate an unusable SDK scores 35 or 30,
+    // and an ambient HIP-built torch adds a further 25 that does not look at
+    // the SDK at all. `run_all_checks` keeps any score above zero in
+    // `matched`, so a host with ambient HIP torch and a healthy SDK still
+    // lists the entry (weakly, 25).
+    let expected = needs_hip && (sdk_unusable || ambient_hip_torch);
+    let present = diagnosis["matched"]
+        .as_array()
+        .expect("matched is a list")
+        .iter()
+        .any(|entry| entry["id"] == FIX_ID);
+    assert_eq!(
+        present,
+        expected,
+        "{FIX_ID} present: {present}; inspection: framework {framework:?} (source {:?}, \
+         rocm {:?}), HIP SDK {:?}, hipInfo {}\n{diagnosis:#}",
+        text("framework_source"),
+        text("framework_rocm_version"),
+        text("hip_sdk_path"),
+        field("hipinfo_present"),
+    );
+}
+
+const TINY_GGUF_LAYERS: u64 = 2;
+const TINY_GGUF_KV_HEADS: u64 = 1;
+const TINY_GGUF_HEAD_WIDTH: u64 = 64;
+const TINY_GGUF_WEIGHT_BYTES: u64 = 1024 * 1024;
+const TINY_GGUF_REQUESTED_CONTEXT: u64 = 2048;
+
+/// A minimal, valid GGUF v3 file: the metadata an estimate reads, one tensor
+/// record, and a zeroed weight region of [`TINY_GGUF_WEIGHT_BYTES`].
+fn tiny_gguf_bytes() -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn entry_u32(out: &mut Vec<u8>, key: &str, value: u32) {
+        string(out, key);
+        out.extend_from_slice(&4_u32.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut metadata = Vec::new();
+    string(&mut metadata, "general.architecture");
+    metadata.extend_from_slice(&8_u32.to_le_bytes());
+    string(&mut metadata, "e2e");
+    entry_u32(&mut metadata, "e2e.block_count", TINY_GGUF_LAYERS as u32);
+    entry_u32(&mut metadata, "e2e.embedding_length", 128);
+    entry_u32(&mut metadata, "e2e.feed_forward_length", 256);
+    entry_u32(&mut metadata, "e2e.attention.head_count", 2);
+    entry_u32(
+        &mut metadata,
+        "e2e.attention.head_count_kv",
+        TINY_GGUF_KV_HEADS as u32,
+    );
+    entry_u32(&mut metadata, "e2e.context_length", 8192);
+
+    let mut tensor = Vec::new();
+    string(&mut tensor, "w");
+    tensor.extend_from_slice(&1_u32.to_le_bytes());
+    tensor.extend_from_slice(&1024_u64.to_le_bytes());
+    tensor.extend_from_slice(&0_u32.to_le_bytes());
+    tensor.extend_from_slice(&0_u64.to_le_bytes());
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"GGUF");
+    file.extend_from_slice(&3_u32.to_le_bytes());
+    file.extend_from_slice(&1_u64.to_le_bytes());
+    file.extend_from_slice(&7_u64.to_le_bytes());
+    file.extend_from_slice(&metadata);
+    file.extend_from_slice(&tensor);
+    // Tensor data starts at the next multiple of the default 32-byte alignment.
+    file.resize(file.len().div_ceil(32) * 32, 0);
+    file.resize(file.len() + TINY_GGUF_WEIGHT_BYTES as usize, 0);
+    file
+}
+
+#[given("a user asking about a small GGUF file on this machine")]
+async fn user_asks_about_a_small_gguf(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let path = root.join("tiny-e2e-model.gguf");
+    std::fs::write(&path, tiny_gguf_bytes()).expect("write the GGUF fixture");
+    world.model_name = Some(path.to_string_lossy().into_owned());
+}
+
+#[when(
+    "the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form"
+)]
+async fn user_asks_whether_a_gguf_would_run_json(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            &model,
+            "--context-size",
+            "2048",
+            "--kv-cache-type",
+            "q8_0",
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when(
+    "the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form"
+)]
+async fn user_asks_whether_a_gguf_would_run_text(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            &model,
+            "--context-size",
+            "2048",
+            "--kv-cache-type",
+            "q8_0",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn estimate_section(model: &serde_json::Value) -> &serde_json::Value {
+    model
+        .get("estimate")
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| panic!("the model section carries no estimate: {model:#}"))
+}
+
+#[then("the answer is an estimate under its own outcome, and the verdict stays undetermined")]
+async fn assert_gguf_answer_is_an_estimate(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "an estimate from a header is not a recipe's verdict: {model:#}"
+    );
+    assert_eq!(
+        model_field(&model, "undetermined_reason").as_str(),
+        Some("model_not_curated"),
+        "{model:#}"
+    );
+    let estimate = estimate_section(&model);
+    assert_eq!(estimate["context_size"], TINY_GGUF_REQUESTED_CONTEXT);
+    assert_eq!(estimate["context_size_defaulted"], false);
+    assert_eq!(estimate["kv_cache_type"], "q8_0");
+    assert_eq!(estimate["architecture"], "e2e");
+    assert_eq!(estimate["layers"], TINY_GGUF_LAYERS);
+}
+
+#[then("the estimate sizes the file's weights and its KV cache at that context")]
+async fn assert_gguf_estimate_sizes_weights_and_cache(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let estimate = estimate_section(&model);
+    let gib = f64::from(1024 * 1024 * 1024_u32);
+    let weights = estimate["weights_gib"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no weights figure: {estimate:#}"));
+    assert!(
+        (weights - TINY_GGUF_WEIGHT_BYTES as f64 / gib).abs() < 1e-9,
+        "the weights are the file's size after its header: {estimate:#}"
+    );
+    // layers x kv heads x (key + value width) x tokens x 34/32 bytes (q8_0).
+    let kv_bytes = (TINY_GGUF_LAYERS * TINY_GGUF_KV_HEADS * 2 * TINY_GGUF_HEAD_WIDTH) as f64
+        * TINY_GGUF_REQUESTED_CONTEXT as f64
+        * 34.0
+        / 32.0;
+    let kv = estimate["kv_cache_gib"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no KV cache figure: {estimate:#}"));
+    assert!(
+        (kv - kv_bytes / gib).abs() < 1e-9,
+        "expected {} GiB of KV cache: {estimate:#}",
+        kv_bytes / gib
+    );
+}
+
+#[then(
+    "a machine that measured its GPU is told whether the estimate fits, and one that could not is told why"
+)]
+async fn assert_gguf_estimate_compares_only_a_measured_gpu(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let estimate = estimate_section(&model);
+    let outcome = estimate["outcome"].as_str().unwrap_or_default();
+    if estimate["available_gib"].is_number() {
+        // The outcome the reported figures imply: the verdict is decided on the
+        // parts as shown (each rounded up to a whole MiB) against the card's
+        // memory, so the same arithmetic over the JSON says which answer is
+        // owed on this lane, and a predicate turned the wrong way fails here.
+        const MIB: f64 = 1024.0 * 1024.0;
+        let shown_mib: f64 = [
+            "weights_bytes",
+            "kv_cache_bytes",
+            "compute_buffer_bytes",
+            "runtime_reserve_bytes",
+        ]
+        .iter()
+        .map(|field| {
+            let bytes = estimate[field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no {field}: {estimate:#}"));
+            (bytes as f64 / MIB).ceil()
+        })
+        .sum();
+        let available_mib = estimate["available_gib"].as_f64().unwrap_or_default() * 1024.0;
+        let expected = if shown_mib <= available_mib {
+            "fits"
+        } else {
+            "does_not_fit"
+        };
+        assert_eq!(
+            outcome, expected,
+            "{shown_mib} MiB needed against {available_mib} MiB: {estimate:#}"
+        );
+        if outcome == "fits" {
+            assert!(
+                estimate["max_context"].as_u64().unwrap_or(0) >= TINY_GGUF_REQUESTED_CONTEXT,
+                "fits at 2048 tokens but reports a smaller ceiling: {estimate:#}"
+            );
+        }
+    } else {
+        assert_eq!(outcome, "cannot_estimate", "{estimate:#}");
+        let reason = estimate["cannot_estimate_reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            matches!(
+                reason,
+                "no_gpu" | "accelerator_memory_unknown" | "unified_memory_unreadable"
+            ),
+            "no memory was measured, so the reason must say so: {estimate:#}"
+        );
+        assert!(
+            estimate["total_gib"].is_number(),
+            "what the file needs is still worth reporting: {estimate:#}"
+        );
+    }
+}
+
+#[then(
+    "the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked"
+)]
+async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let output = world.cli_output.clone().expect("no diagnose output");
+    let model = world.model_name.clone().expect("no model named");
+    let header = output
+        .lines()
+        .find(|line| line.starts_with(&format!("rocm diagnose --model {model}: ")))
+        .unwrap_or_else(|| panic!("no model header in:\n{output}"));
+    for verdict in ["READY", "BLOCKED", "DEGRADED"] {
+        assert!(
+            !header.ends_with(verdict) && !header.contains(&format!(": {verdict}")),
+            "an estimate was reported with the verdict word {verdict}: {header}"
+        );
+    }
+    // Which label is owed depends on whether this host's memory was compared,
+    // and the report says which: a compared estimate names the card it was
+    // compared with. A compared estimate must be labelled ESTIMATED with the
+    // outcome its own figures imply, and one that was not, UNDETERMINED -- so
+    // the label is checked on whichever lane runs this, not only accepted.
+    // A GPU-less hosted runner takes the second branch; a lane that measures
+    // dedicated VRAM (the MI300X self-hosted lane) takes the first.
+    let compared = output.contains("the GPU with the most dedicated VRAM that ROCm can see has");
+    if compared {
+        // The label owed follows from the two figures the report prints: the
+        // total it needs ("= about N MiB") and the card's ("has M MiB").
+        let number_after = |marker: &str| -> u64 {
+            let at = output
+                .find(marker)
+                .unwrap_or_else(|| panic!("no `{marker}` in:\n{output}"))
+                + marker.len();
+            output[at..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or_else(|| panic!("no figure after `{marker}` in:\n{output}"))
+        };
+        let needed = number_after("= about ");
+        let offered = number_after("can see has ");
+        let label = if needed <= offered {
+            ": ESTIMATED: fits at 2048 tokens"
+        } else {
+            ": ESTIMATED: does not fit at 2048 tokens"
+        };
+        assert!(
+            header.contains(label),
+            "{needed} MiB needed against {offered} MiB, so `{label}` is owed: {header}"
+        );
+    } else {
+        assert!(
+            header.ends_with(": UNDETERMINED"),
+            "nothing was compared, so the answer is undetermined: {header}"
+        );
+    }
+    assert!(
+        output.contains("KV cache (q8_0)"),
+        "the figures the estimate rests on were not shown:\n{output}"
+    );
+}
+
+/// Start a stand-in Hugging Face endpoint on a loopback port and point the CLI at
+/// it. It counts every connection. A repository listing request
+/// (`/api/models/...`) is answered with `listing` when one is given; every other
+/// request, and a listing when none is given, gets an empty 404. It stops when
+/// the World lets go of its handle, so a scenario leaves no thread behind.
+fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in hub");
+    listener
+        .set_nonblocking(true)
+        .expect("make the stand-in hub non-blocking");
+    let port = listener.local_addr().expect("hub address").port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        while Arc::strong_count(&seen) > 1 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    // The request line is all that is needed, and it arrives first.
+                    let mut buf = [0_u8; 2048];
+                    let read = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let is_listing = request
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|path| path.starts_with("/api/models/"));
+                    let response = match listing {
+                        Some(body) if is_listing => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned(),
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    });
+    world.hub_requests = Some(requests);
+    world
+        .command_env
+        .push(("HF_ENDPOINT", format!("http://127.0.0.1:{port}").into()));
+}
+
+#[given("a Hugging Face endpoint that records every request made to it")]
+async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
+    start_stand_in_hub(world, None);
+}
+
+/// A repository holding one model and its multimodal projector, as llama.cpp
+/// vision models ship. Sizes are given so no `HEAD` request is needed.
+const MODEL_AND_PROJECTOR_LISTING: &str = r#"{"siblings":[{"rfilename":"e2e-model-Q4_K_M.gguf","size":1048576},{"rfilename":"mmproj-e2e-model-f16.gguf","size":1048576}]}"#;
+
+#[given("a Hugging Face repository that holds a model and its multimodal projector")]
+async fn a_hub_repository_with_a_model_and_a_projector(world: &mut E2eWorld) {
+    start_stand_in_hub(world, Some(MODEL_AND_PROJECTOR_LISTING));
+}
+
+#[when("the user asks the CLI whether the projector file would run, naming it exactly")]
+async fn user_asks_about_the_projector_file(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            "e2e-owner/e2e-repo:mmproj-e2e-model-f16.gguf",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI says the file is a multimodal projector and names the model file instead")]
+async fn assert_the_cli_named_the_projector_and_the_model(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        output.contains(
+            "`mmproj-e2e-model-f16.gguf` is a multimodal projector (mmproj), not a language model"
+        ),
+        "{output}"
+    );
+    assert!(output.contains("e2e-model-Q4_K_M.gguf"), "{output}");
+    assert!(!output.contains("no GGUF file matching"), "{output}");
+    // Nothing points the user back at the file it refused.
+    assert!(
+        !output.contains("rocm serve e2e-owner/e2e-repo:mmproj"),
+        "the refused projector was offered as a serve command:\n{output}"
+    );
+    // The one model in the repository is offered by its exact name.
+    assert!(
+        output.contains(
+            "verify after fix: rocm diagnose --model e2e-owner/e2e-repo:e2e-model-Q4_K_M.gguf"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("header could not be read"), "{output}");
+}
+
+#[then("the endpoint was asked only for the repository's file list")]
+async fn assert_only_the_listing_was_requested(world: &mut E2eWorld) {
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    // One listing request; the projector was refused before any header read.
+    assert_eq!(seen, 1, "the hub was asked {seen} time(s)");
+}
+
+const HUB_MODEL_REF: &str = "e2e-owner/e2e-repo:Q4_K_M";
+
+async fn run_hub_model_question(world: &mut E2eWorld, report: bool) {
+    // The environment the Given recorded is consumed by one run; keep it for the next.
+    let env = world.command_env.clone();
+    let mut args = vec!["diagnose", "--model", HUB_MODEL_REF, "--json"];
+    if report {
+        args.insert(1, "--report");
+    }
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    world.command_env = env;
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to prepare a problem report that names a model on that endpoint")]
+async fn user_prepares_a_report_naming_a_hub_model(world: &mut E2eWorld) {
+    run_hub_model_question(world, true).await;
+}
+
+#[when("the user asks the CLI the same model question without preparing a report")]
+async fn user_asks_the_hub_model_question_without_a_report(world: &mut E2eWorld) {
+    run_hub_model_question(world, false).await;
+}
+
+#[then("no request reached the endpoint")]
+async fn assert_no_request_reached_the_hub(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    // A moment for a request that was sent to be counted before the check.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(seen, 0, "a prepared report reached the hub {seen} time(s)");
+}
+
+#[then("the CLI says the model was ignored rather than assessed")]
+async fn assert_the_report_said_it_ignored_the_model(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("--model was ignored") && stderr.contains("nothing about the model"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[then("the CLI does not say the model was ignored")]
+async fn assert_the_cli_did_not_say_it_ignored_the_model(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(!stderr.contains("was ignored"), "stderr was: {stderr}");
+}
+
+#[then("the endpoint was asked about the model")]
+async fn assert_the_hub_was_asked_about_the_model(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        seen > 0,
+        "the same question without --report never reached the endpoint, so the check above \
+         proved nothing"
+    );
+}
+
+fn run_model_question(world: &mut E2eWorld, args: &[&str]) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, args);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn evidence_text(model: &serde_json::Value) -> String {
+    model_field(model, "evidence")
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+#[when("the user asks the CLI for a context size or a KV cache type without naming a model")]
+async fn user_asks_for_context_options_without_a_model(world: &mut E2eWorld) {
+    let mut outcomes = Vec::new();
+    for option in [["--context-size", "8192"], ["--kv-cache-type", "q8_0"]] {
+        let (_, stderr, rc) =
+            crate::run_rocm_with_scenario_env(world, &["diagnose", option[0], option[1]]);
+        outcomes.push(format!("{}\t{rc}\t{stderr}", option[0]));
+    }
+    world.cli_output = Some(outcomes.join("\n\u{0}\n"));
+}
+
+#[then("the CLI refuses each as a usage error that names --model")]
+async fn assert_context_options_refused_without_a_model(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let outcomes: Vec<&str> = output.split("\n\u{0}\n").collect();
+    assert_eq!(outcomes.len(), 2, "{output}");
+    for outcome in outcomes {
+        let mut parts = outcome.splitn(3, '\t');
+        let (option, rc, stderr) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        // clap's usage-error exit code.
+        assert_eq!(
+            rc, "2",
+            "{option} was not refused as a usage error: {stderr}"
+        );
+        assert!(
+            stderr.contains("--model"),
+            "{option}: the refusal does not name what is missing: {stderr}"
+        );
+    }
+}
+
+#[when(
+    "the user asks the CLI whether the smallest curated model would run at 8192 tokens, in machine-readable form"
+)]
+async fn user_asks_about_a_curated_model_with_a_context_size(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            SMALLEST_MODEL_REF,
+            "--context-size",
+            "8192",
+            "--json",
+        ],
+    );
+}
+
+#[then(
+    "the answer says the context options do not apply to a curated recipe, and carries no estimate"
+)]
+async fn assert_curated_model_says_context_options_do_not_apply(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains("do not apply to a curated recipe"),
+        "the option was accepted and nothing said it was not applied: {model:#}"
+    );
+    assert!(
+        model.get("estimate").is_none_or(serde_json::Value::is_null),
+        "a curated model was estimated from a header it has none of: {model:#}"
+    );
+}
+
+fn missing_gguf_path(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("no-such-model.gguf")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[when(
+    "the user asks the CLI whether a GGUF file that does not exist would run, in machine-readable form"
+)]
+async fn user_asks_about_a_missing_gguf(world: &mut E2eWorld) {
+    let path = missing_gguf_path(world);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "{path} must not exist"
+    );
+    run_model_question(world, &["diagnose", "--model", &path, "--json"]);
+}
+
+#[then("the answer says the file could not be opened and offers no upstream route")]
+async fn assert_missing_gguf_could_not_be_opened(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let path = missing_gguf_path(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains(&format!("could not open {path}")),
+        "the answer does not say which file could not be opened: {model:#}"
+    );
+    assert_eq!(
+        estimate_section(&model)["cannot_estimate_reason"],
+        "header_unreadable",
+        "{model:#}"
+    );
+    assert!(
+        model.get("route").is_none_or(serde_json::Value::is_null),
+        "a path that does not exist was routed to the upstream tracker: {model:#}"
+    );
+}
+
+#[then("the plan is to ask again about that path")]
+async fn assert_missing_gguf_plan_is_to_check_the_path(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let path = missing_gguf_path(world);
+    let fix = model_field(&model, "fix");
+    // The command names the path as given, quoted when the platform's shell
+    // would split or expand it (the scenario's temp directory decides which).
+    let verify = fix["verify"].as_str().unwrap_or("");
+    let bare = format!("rocm diagnose --model {path}");
+    let quoted = format!("rocm diagnose --model '{path}'");
+    // Either form asks again with `rocm diagnose`; serving a file that is not
+    // there would only repeat the error.
+    assert!(verify == bare || verify == quoted, "{model:#}");
+}
+
+#[when(
+    "the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form"
+)]
+async fn user_asks_about_a_bare_repository_with_a_context_size(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            UNCURATED_MODEL_REF,
+            "--context-size",
+            "8192",
+            "--json",
+        ],
+    );
+}
+
+#[then("the answer says the reference names a repository and asks for a quantization")]
+async fn assert_bare_repository_asks_for_a_quantization(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains(&format!(
+            "`{UNCURATED_MODEL_REF}` names a repository, not a model file: add `:QUANT`"
+        )),
+        "{model:#}"
+    );
+    assert!(
+        model.get("estimate").is_none_or(serde_json::Value::is_null),
+        "a repository was estimated as if it were one file: {model:#}"
+    );
+}
+
+#[when("the user asks the CLI about a quantization the repository does not hold")]
+async fn user_asks_about_a_missing_quantization(world: &mut E2eWorld) {
+    run_model_question(world, &["diagnose", "--model", "e2e-owner/e2e-repo:Q8_0"]);
+}
+
+#[then("the CLI says nothing matches and lists the model and the projector, marked as a projector")]
+async fn assert_missing_quantization_lists_every_gguf(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        output.contains(
+            "no GGUF file matching `Q8_0` in the repository (it has: e2e-model-Q4_K_M.gguf, \
+             mmproj-e2e-model-f16.gguf (multimodal projector))"
+        ),
+        "{output}"
+    );
+}
+
+// ── The CLI version a problem report names ─────────────────────────
+
+#[given("a simulated Linux machine whose only GPU is a released one")]
+async fn simulated_machine_with_a_released_gpu(world: &mut E2eWorld) {
+    // Planted as in diagnose-40, but with gfx_target_version 110000 (gfx1100),
+    // which is on the compatibility matrix, so `--report` prepares a report on
+    // every Linux lane instead of refusing on the runner's own hardware.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("etc")).expect("failed to create planted etc");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=\"24.04\"\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
+    )
+    .expect("failed to write planted os-release");
+    let node = host.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 96\ngfx_target_version 110000\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+    // An empty PCI bus, so a runner's real card cannot join the planted one.
+    let bin = root.join("released-gpu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user asks the CLI what that machine's report would carry in machine-readable form")]
+async fn user_asks_for_the_simulated_machines_report(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--report", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the report names the CLI version that `rocm version` leads with")]
+async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_eq!(world.cli_rc, Some(0), "{out}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|err| {
+        panic!("the planted released GPU did not produce a JSON report ({err}):\n{out}\n{stderr}")
+    });
+    let reported = report["cli_version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the report has no cli_version:\n{report:#}"));
+
+    let (version_out, version_err, version_rc) = crate::run_rocm(world, &["version"]);
+    assert_eq!(version_rc, 0, "{version_out}\n{version_err}");
+    let first_line = version_out.lines().next().unwrap_or_default().trim();
+    let (leading, reference) = first_line
+        .strip_prefix("rocm-cli ")
+        .and_then(|rest| rest.split_once(" ("))
+        .and_then(|(version, rest)| {
+            rest.split_once(", ")
+                .map(|(reference, _hash)| (version, reference))
+        })
+        .unwrap_or_else(|| panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {first_line}"));
+    assert_eq!(
+        reported, leading,
+        "the report's cli_version is not the version `rocm version` leads with \
+         ({first_line}):\n{report:#}"
+    );
+    // Agreement alone would also hold if both surfaces regressed to the same
+    // wrong value (the frozen workspace version, say), so the version is also
+    // checked against the one the ref calls for, worked out independently.
+    assert_ne!(
+        reference, "unknown",
+        "version ref did not resolve: {first_line}"
+    );
+    assert_eq!(
+        reported,
+        super::examine_steps::expected_leading_version(reference),
+        "the report's cli_version does not follow from the ref ({first_line})"
+    );
+}
+
+// ── Which causes the pasted error contributed to (diagnose-62/-63/-64) ─────
+
+/// The entry an unneeded GPU override in the environment raises. It reads the
+/// environment and a page-fault paste, never an ISA error.
+const ENV_MISCONFIG_FIX_ID: &str = "fix-2-unset-override";
+
+/// The entry [`KNOWN_SYMPTOM`] scores. No host state scores it on its own.
+const PASTE_FIX_ID: &str = "fix-1-arch";
+
+#[given("a machine with a known misconfiguration in its environment")]
+async fn machine_with_env_misconfiguration(world: &mut E2eWorld) {
+    // `rocm diagnose` examines its own environment, so setting the override on
+    // the CLI child is the whole setup, on every platform the entry covers.
+    world
+        .command_env
+        .push(("HSA_OVERRIDE_GFX_VERSION", "11.0.0".into()));
+}
+
+#[given("a pasted error that describes a different failure")]
+async fn pasted_error_for_a_different_failure(world: &mut E2eWorld) {
+    world.model_name = Some(KNOWN_SYMPTOM.to_owned());
+}
+
+/// Run `rocm diagnose` with `paste` as the symptom, or with no `--symptom` at
+/// all when it is `None`.
+fn run_diagnose(world: &mut E2eWorld, paste: Option<&str>, json: bool) {
+    let mut args = vec!["diagnose", "--top", "50"];
+    if let Some(paste) = paste {
+        args.extend(["--symptom", paste]);
+    }
+    if json {
+        args.push("--json");
+    }
+    // The planted host holds for the whole scenario, and diagnose-64 asks
+    // twice, but running a command consumes the scenario environment. Put it
+    // back so the second run examines the same host as the first.
+    let host_env = world.command_env.clone();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    world.command_env = host_env;
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn diagnose_with_paste(world: &mut E2eWorld, json: bool) {
+    let paste = world.model_name.clone().expect("no paste set");
+    run_diagnose(world, Some(&paste), json);
+}
+
+#[when("the user asks for a diagnosis with that paste, in machine-readable form")]
+async fn user_diagnoses_paste_json(world: &mut E2eWorld) {
+    diagnose_with_paste(world, true);
+}
+
+#[when("the user asks for a diagnosis with that paste")]
+async fn user_diagnoses_paste_text(world: &mut E2eWorld) {
+    diagnose_with_paste(world, false);
+}
+
+#[when("the user asks for a diagnosis without pasting an error, in machine-readable form")]
+async fn user_diagnoses_without_paste_json(world: &mut E2eWorld) {
+    run_diagnose(world, None, true);
+}
+
+#[when("the user asks for a diagnosis without pasting an error")]
+async fn user_diagnoses_without_paste_text(world: &mut E2eWorld) {
+    run_diagnose(world, None, false);
+}
+
+/// The listed causes of the JSON report, each as `(id, symptom_matched)`,
+/// failing the step when the run failed or any entry lacks a boolean field.
+fn symptom_matched_by_id(world: &E2eWorld) -> Vec<(String, bool)> {
+    let stdout = world.cli_output.as_deref().expect("no diagnose output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose failed:\n{stdout}\n{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("diagnose --json is not JSON ({e}):\n{stdout}"));
+    let matched = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `matched` list:\n{report:#}"));
+    matched
+        .iter()
+        .map(|d| {
+            let flag = d["symptom_matched"].as_bool().unwrap_or_else(|| {
+                panic!("every listed cause says whether the paste contributed to it:\n{d:#}")
+            });
+            (d["id"].as_str().unwrap_or_default().to_owned(), flag)
+        })
+        .collect()
+}
+
+/// `symptom_matched` of the entry `id`, failing the step when it is not listed.
+fn symptom_matched_of(world: &E2eWorld, id: &str) -> bool {
+    let listed = symptom_matched_by_id(world);
+    listed
+        .iter()
+        .find(|(listed_id, _)| listed_id == id)
+        .map_or_else(
+            || panic!("{id} was not listed: {listed:?}"),
+            |(_, flag)| *flag,
+        )
+}
+
+#[then("the paste is reported as not contributing to the misconfiguration on the machine")]
+async fn assert_paste_did_not_contribute_to_env_misconfig(world: &mut E2eWorld) {
+    assert!(
+        !symptom_matched_of(world, ENV_MISCONFIG_FIX_ID),
+        "{ENV_MISCONFIG_FIX_ID} comes from the environment alone, so the paste must not \
+         be credited with it"
+    );
+}
+
+#[then("the paste is reported as contributing to the cause it describes")]
+async fn assert_paste_contributed_to_its_cause(world: &mut E2eWorld) {
+    assert!(
+        symptom_matched_of(world, PASTE_FIX_ID),
+        "{PASTE_FIX_ID} is scored from the paste, so the paste must be credited with it"
+    );
+}
+
+#[then("every listed cause is reported as not contributed to by a paste")]
+async fn assert_no_cause_credited_without_a_paste(world: &mut E2eWorld) {
+    let listed = symptom_matched_by_id(world);
+    assert!(
+        listed.iter().any(|(id, _)| id == ENV_MISCONFIG_FIX_ID),
+        "the planted misconfiguration must be listed, or this asserts nothing: {listed:?}"
+    );
+    assert!(
+        listed.iter().all(|(_, flag)| !flag),
+        "nothing was pasted, so no cause may be credited to a paste: {listed:?}"
+    );
+}
+
+#[then("the misconfiguration on the machine is marked as found from the host alone")]
+async fn assert_env_misconfig_marked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "diagnose failed:\n{output}");
+    let block = cause_block(output, ENV_MISCONFIG_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "{ENV_MISCONFIG_FIX_ID} was not reported:\n{output}"
+    );
+    assert!(
+        block
+            .iter()
+            .any(|line| line.trim() == SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+        "the cause the paste did not contribute to must say so:\n{output}"
+    );
+}
+
+#[then("the cause the pasted error describes carries no such mark")]
+async fn assert_paste_cause_unmarked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    let block = cause_block(output, PASTE_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "{PASTE_FIX_ID} was not reported:\n{output}"
+    );
+    assert!(
+        !block
+            .iter()
+            .any(|line| line.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE)),
+        "the cause the paste contributed to must not be marked as found without it:\n{output}"
+    );
+}
+
+#[then("no listed cause is marked as found from the host alone")]
+async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "diagnose failed:\n{output}");
+    assert!(
+        !cause_block(output, ENV_MISCONFIG_FIX_ID).is_empty(),
+        "the planted misconfiguration must be reported, or this asserts nothing:\n{output}"
+    );
+    assert!(
+        !output.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+        "with nothing pasted the mark would sit on every cause and say nothing:\n{output}"
     );
 }

@@ -6,7 +6,6 @@
 //!
 //! Field-extraction logic is vendored from instinct-dash `DockerService.ts`
 //! (HIP_VISIBLE_DEVICES → gpu_ids, `--tensor-parallel-size`/`-tp`, etc.).
-//! See `../../wiki/entities/dockerode.md`.
 //!
 //! The async inherent methods are the public API. The `ServiceDiscovery` trait
 //! impl is sync-only and returns `Unsupported`: bollard requires a tokio
@@ -141,7 +140,7 @@ impl ServiceDiscovery for DockerDiscovery {
 
     fn discover(&self) -> Result<Vec<DiscoveredService>> {
         Err(CollectorError::Unsupported(
-            "DockerDiscovery is async — call discover_async() from a tokio runtime".into(),
+            "DockerDiscovery is async - call discover_async() from a tokio runtime".into(),
         ))
     }
 }
@@ -295,6 +294,7 @@ fn parse_container(inspect: &ContainerInspectResponse) -> Result<DiscoveredServi
     let port = extract_first_host_port(inspect).unwrap_or(DEFAULT_VLLM_PORT);
 
     Ok(DiscoveredService {
+        managed: false,
         container_id: id,
         container_name: name,
         model_name: model,

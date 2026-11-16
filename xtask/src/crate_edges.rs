@@ -14,6 +14,14 @@
 //!    leaf crate other subsystems build on.
 //! 3. `rocm-dash-tui` must not depend on `rocm-core`.
 //!
+//! Invariant 3 binds the presentation layer only. `rocm-dash-collectors` *does*
+//! depend on `rocm-core` (EAI-8457): it spawns `amd-smi` for the dashboard's
+//! GPU metrics and gates that spawn on the same `/dev/kfd` device, so it shares
+//! `rocm_core::device_readable_bounded` rather than restating the bounded open
+//! and its probe budget. A second copy of that primitive would be free to drift
+//! from the gate it belongs to. The TUI makes no such call and keeps the
+//! stricter rule.
+//!
 //! A literal cycle check would be a no-op: Cargo's resolver already rejects
 //! dependency cycles among normal/build dependencies. The value here is
 //! entirely in the **allowlist**: every first-party normal/build edge must be
@@ -47,6 +55,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("rocm", "rocm-dash-core"),
     ("rocm", "rocm-dash-daemon"),
     ("rocm", "rocm-dash-tui"),
+    ("rocm", "rocm-engine-aim"),
     ("rocm", "rocm-engine-lemonade"),
     ("rocm", "rocm-engine-protocol"),
     ("rocm", "rocmd"),
@@ -54,11 +63,14 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("rocmd", "rocm-core"),
     ("rocmd", "rocm-engine-protocol"),
     ("rocm-engine-protocol", "rocm-core"),
+    ("rocm-dash-collectors", "rocm-core"),
     ("rocm-dash-collectors", "rocm-dash-core"),
     ("rocm-dash-daemon", "rocm-dash-core"),
     ("rocm-dash-daemon", "rocm-dash-collectors"),
+    ("rocm-dash-tui", "rocm-dash-collectors"),
     ("rocm-dash-tui", "rocm-dash-core"),
-    ("rocm-dash-tui", "rocm-deps"),
+    ("rocm-engine-aim", "rocm-core"),
+    ("rocm-engine-aim", "rocm-engine-protocol"),
     ("rocm-engine-lemonade", "rocm-core"),
     ("rocm-engine-lemonade", "rocm-deps"),
     ("rocm-engine-lemonade", "rocm-engine-protocol"),

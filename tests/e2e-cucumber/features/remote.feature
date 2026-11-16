@@ -109,3 +109,25 @@ Feature: Working with GPU machines over a private network
     Given a reachable GPU machine on the private network
     When the user checks that machine's health
     Then the report names that machine
+
+  # `discover_started_service` (#604) refuses to publish an endpoint when the
+  # remote reused a pre-existing service instead of starting a new one — a
+  # running server cannot be given a key it did not start with. Reaching that
+  # refusal needs the service to already be live on the machine with no local
+  # session recorded for it (an operator's own `rocm serve`, or an earlier
+  # unmanaged run); a `Given`/`When` pair that both call `rocm remote serve`
+  # never gets there; the second call trips `serve_with_transport`'s local
+  # `session::exists` guard first, on the session the first call recorded.
+  # Planting the service straight on the container — the fake `rocm serve`'s
+  # service_id is keyed on the port alone, so it lands under the same id the
+  # one `remote serve` call then discovers — reproduces the real precondition
+  # instead. This is the remote-side proof that the printed stop hint is not
+  # just present but correct and directly runnable, the same proof remote-13
+  # gives the session-stop path: the scenario runs the hint itself, over the
+  # same container, and checks the service is actually gone.
+  @id:remote-serve-refuses-reusing-already-serving-session @requires-docker
+  Scenario: remote-15 - Serving again on an already-serving machine is refused with a working stop command
+    Given the machine is already serving a model, started outside any session
+    When the user serves a model on that machine
+    Then the user is told it is already serving and given the exact command to stop it
+    And running that command on the machine stops it

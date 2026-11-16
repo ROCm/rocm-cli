@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Command runner overlay (Phase 3 Wave 3).
+//! Command runner overlay.
 //!
 //! A general escape hatch: type any `rocm …` subcommand and run it through the
 //! job-bridge. Because arbitrary subcommands can't be statically classified as
@@ -27,6 +27,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// One stable console for the runner — a second command waits for the first.
 const JOB_ID: &str = "command";
@@ -112,12 +113,10 @@ pub fn on_key(
     // into the command line — `q` is not a close key in a text field.
     match key.code {
         KeyCode::Esc => *cs = None,
-        KeyCode::Backspace => {
-            c.input.pop();
-        }
         KeyCode::Enter => return request_run(c),
-        KeyCode::Char(ch) => c.input.push(ch),
-        _ => {}
+        code => {
+            apply_char_key(&mut c.input, code);
+        }
     }
     Vec::new()
 }
@@ -252,16 +251,22 @@ pub fn draw_command_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     fn type_str(cs: &mut Option<CommandScreenState>, jobs: &mut State, s: &str) {
         for ch in s.chars() {
             on_key(cs, jobs, key(KeyCode::Char(ch)));
         }
+    }
+
+    #[test]
+    fn backspace_edits_the_command_line() {
+        let mut cs = Some(CommandScreenState::default());
+        let mut jobs = State::default();
+        type_str(&mut cs, &mut jobs, "ab");
+        on_key(&mut cs, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(cs.as_ref().unwrap().input, "a");
     }
 
     #[test]

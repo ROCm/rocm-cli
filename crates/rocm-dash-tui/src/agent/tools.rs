@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Rig `Tool` ("Skill") wrappers over the cached telemetry snapshot, plus the
+//! Rig `Tool` wrappers over the cached telemetry snapshot, plus the
 //! read-only and mutating ROCm machine-inspection tools and their registration
 //! onto a Rig `AgentBuilder`.
 //!
@@ -10,6 +10,12 @@
 //! seam types (`StateSnapshot`, `AgentError`, `AgentClient`) stay in
 //! `agent/mod.rs`; the JSON summarization these tools call lives in
 //! `agent::snapshot`.
+//!
+//! This is also where a read-only tool result is shaped for the model:
+//! [`model_facing_tool_result`] drops the command output the bin's MCP
+//! envelope carries twice and bounds what is left to
+//! [`TOOL_RESULT_CHAR_BUDGET`], so one large result cannot exhaust a locally
+//! served model's context. See `docs/llm-tool-use.md`.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,12 +36,12 @@ use super::snapshot::{
 };
 
 // ---------------------------------------------------------------------------
-// Rig Tool ("Skill") wrappers. Each holds an `Arc<StateSnapshot>` (read-only)
-// and a shared `fired` log so the reply can cite which Skills ran. `call` only
-// reads the snapshot — no mutation, no network, no file I/O.
+// Rig Tool wrappers for the telemetry tools. Each holds an `Arc<StateSnapshot>`
+// (read-only) and a shared `fired` log so the reply can cite which tools ran.
+// `call` only reads the snapshot — no mutation, no network, no file I/O.
 // ---------------------------------------------------------------------------
 
-/// Shared "which Skills fired" log, threaded into every tool struct below and
+/// Shared "which tools fired" log, threaded into every tool struct below and
 /// into the three real `AgentClient` backends via `agent::clients`.
 pub(super) type FiredLog = Arc<Mutex<Vec<String>>>;
 
@@ -112,7 +118,12 @@ impl Tool for ListInstancesTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "List discovered serving instances: name, model, status, \
-                          KV-cache usage %, and running/waiting request counts."
+                          KV-cache usage %, running/waiting request counts, \
+                          the whole-node `node` figure (see tokens_per_watt), \
+                          generation tok/s, TTFT/TPOT (each with a fresh/held \
+                          flag; held means the last value, not a live reading), \
+                          and attributed_power_w (this instance's share of its \
+                          GPUs' power, not whole-board power)."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
@@ -166,7 +177,15 @@ impl Tool for TokensPerWattTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "Per-instance efficiency: generation tokens/sec divided by \
-                          the summed power (W) of the GPUs each instance occupies."
+                          the instance's attributed share of its GPUs' power (W). \
+                          GPUs shared by several instances are split between them. \
+                          Also returns `node`: whole-node tokens/sec over total \
+                          board power (whole-board, so it is not the sum of the \
+                          per-instance values), with freshness `fresh`, `held` \
+                          (carried from a prior scrape, expires within about \
+                          30 s) or null when unknown. `node` is null, meaning \
+                          no figure and not zero, when there is no traffic or \
+                          no power telemetry."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
@@ -178,114 +197,271 @@ impl Tool for TokensPerWattTool {
     }
 }
 
-/// Read-only tool exposing the rocm-dash **skills** registry (auto-config / auto-install).
-///
-/// The agent can list skills and fetch a skill's dry-run plan;
-/// it never executes a skill (execution is `--apply`-gated in the CLI).
-pub struct ListSkillsTool {
-    pub fired: FiredLog,
-}
-
-impl Tool for ListSkillsTool {
-    const NAME: &'static str = "list_skills";
-    type Error = ToolError;
-    type Args = NoArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "List the available rocm-dash skills (auto-config / \
-                          auto-install helpers like install-lemonade and \
-                          auto-config-endpoint) the user can run."
-                .to_string(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        }
-    }
-
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        record(&self.fired, Self::NAME);
-        let skills: Vec<Value> = crate::skills::builtin_skills()
-            .iter()
-            .map(|s| json!({ "name": s.name, "description": s.description }))
-            .collect();
-        Ok(json!({ "skills": skills, "skill_count": skills.len() }))
-    }
-}
-
-/// Read-only tool returning a skill's ordered dry-run plan (no execution).
-pub struct SkillPlanTool {
-    pub fired: FiredLog,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SkillPlanArgs {
-    pub name: String,
-}
-
-impl Tool for SkillPlanTool {
-    const NAME: &'static str = "skill_plan";
-    type Error = ToolError;
-    type Args = SkillPlanArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Show the ordered dry-run step plan for a named skill \
-                          WITHOUT executing it. Use after list_skills."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Skill name, e.g. install-lemonade." }
-                },
-                "required": ["name"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        record(&self.fired, Self::NAME);
-        match crate::skills::builtin_skill(&args.name) {
-            Some(m) => Ok(json!({ "name": m.name, "plan": crate::skills::build_plan(&m) })),
-            None => Ok(json!({ "error": format!("unknown skill: {}", args.name) })),
-        }
-    }
-}
-
-/// All Skill names, for definition/uniqueness checks and docs.
-pub const SKILL_NAMES: [&str; 6] = [
+/// All telemetry tool names, for definition/uniqueness checks and docs.
+pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
     GpuStatusTool::NAME,
     ListInstancesTool::NAME,
     BenchSummaryTool::NAME,
     TokensPerWattTool::NAME,
-    ListSkillsTool::NAME,
-    SkillPlanTool::NAME,
 ];
 
 // ---------------------------------------------------------------------------
 // Read-only ROCm machine-inspection tools (group B). These forward the model's
 // tool-call intent across the rocm-core-free [`crate::tool_exec`] seam to the
-// bin-supplied executor (live dash only). They are READ-ONLY: no mutating tool
-// is registered here (mutating tools + the approval UI land in Phase 4). The
-// boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
-// pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
+// bin-supplied executor (live dash only). They are READ-ONLY in the approval
+// sense: none of them performs a mutating action (an install, start, stop,
+// uninstall, configuration change, or anything else that needs operator
+// approval). An intent the bin classifies as mutating comes back as
+// `ApprovalRequired` and [`run_rocm_read_tool`] turns it into an error, and the
+// mutating tools are group D below, which only surface an approval request
+// rather than executing. That is a narrower claim than "no side effects":
+// reading can still refresh local bookkeeping and caches. `services`,
+// `service_logs`, `port_status`, `bridge_snapshot` and the `rocm_command`
+// service views reload the managed-service records, which rewrites a record
+// whose state changed (and drops the endpoint key of a service whose requested
+// stop has finished). `doctor`/`examine` can re-register the configured setup
+// runtime in the runtime registry when its entry is missing. `update_check` and
+// `install_sdk_dry_run` cache package-index metadata under the cache folder.
+// Neither prepares a Python or saves a Python path: on a host with no usable
+// Python on PATH they report the Python a real update or install would prepare
+// (`update_check` runs `rocm update`, whose text report then carries a
+// `python_note:` line saying so), and only a real apply or install, which these
+// tools never run, prepares it. `install_sdk_dry_run` fetches no `uv` either: a
+// ROCm 10 preview runs a `uv` that is already installed to resolve the package
+// versions and, with none, prints the lines that depend on them as not resolved,
+// so it creates no `tools` folder in the data folder. (`update_check` on a ROCm
+// 10 or newer runtime still resolves with `uv` and can fetch the managed `uv`
+// into the data folder, though never a Python.) The boundary type
+// (`SharedRocmToolExecutor`) is plain data — importing it does NOT pull
+// `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
+
+/// How many characters of one tool result may reach the model.
+///
+/// A tool result is not free: it is sent back as a message and counts against
+/// the model's context on that request and on every later turn of the same
+/// conversation. A locally served model is typically configured with a 32k
+/// context (llama.cpp's default `n_ctx`), of which the system prompt and the
+/// tool schemas already take a few thousand tokens, so the remaining room has
+/// to cover several turns. 16 KiB is roughly 4.5k tokens — one large result
+/// still fits alongside the prompt and a handful of turns, where an uncapped
+/// one (`rocm_command` with `["model"]` measured 204,470 characters, about
+/// 58k tokens) cannot fit in such a context at all and the provider rejects
+/// the whole request.
+pub(crate) const TOOL_RESULT_CHAR_BUDGET: usize = 16 * 1024;
+
+/// Shape one executor result for the model: drop the command output the
+/// envelope carries twice, then bound what is left to `budget`.
+///
+/// Both halves exist because the result is JSON the dash hands to the model
+/// verbatim, unlike the CLI chat path (`apps/rocm/src/chat/turn.rs`), which
+/// reads only the envelope's text.
+fn model_facing_tool_result(value: Value, budget: usize) -> Value {
+    cap_tool_result(drop_duplicated_command_output(value), budget)
+}
+
+/// Drop `structuredContent.stdout` / `.stderr` when the envelope's own text
+/// already carries them.
+///
+/// The bin's `internal_mcp_tool_result_from_command` puts a command's captured
+/// output in `content[0].text` *and* again in `structuredContent.stdout` (and
+/// `.stderr`). The MCP envelope keeps both — `rocm mcp-call` and the approval
+/// replay path read the structured fields — but the model only needs one copy,
+/// and charging it twice for the same bytes is what makes a big read-only
+/// result twice as expensive as it has to be. Only the duplicated keys go; a
+/// tool whose data lives *only* in `structuredContent` (`engines`,
+/// `bridge_snapshot`, `automations`, `gpu_snapshot`) is untouched.
+fn drop_duplicated_command_output(mut value: Value) -> Value {
+    let text = tool_result_content_text(&value);
+    if text.is_empty() {
+        return value;
+    }
+    let Some(structured) = value
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    else {
+        return value;
+    };
+    for key in ["stdout", "stderr"] {
+        let duplicated = structured
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| {
+                let trimmed = s.trim();
+                trimmed.is_empty() || text.contains(trimmed)
+            });
+        if duplicated {
+            structured.remove(key);
+        }
+    }
+    value
+}
+
+/// The text items of an MCP tool-result envelope, joined. Empty when the value
+/// is not such an envelope (a bare `{"error": …}`, say).
+fn tool_result_content_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Everything the envelope carries, rendered as plain text.
+///
+/// Used only when a result has to be truncated, so the model reads prose
+/// rather than a JSON document cut off mid-escape. Nothing is dropped
+/// silently: the text items come first, then whatever `structuredContent`
+/// still holds after [`drop_duplicated_command_output`].
+fn tool_result_plain_text(value: &Value) -> String {
+    let mut parts = Vec::new();
+    let text = tool_result_content_text(value);
+    if !text.is_empty() {
+        parts.push(text);
+    }
+    match value.get("structuredContent") {
+        Some(structured) if !structured.is_null() => {
+            parts.push(
+                serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string()),
+            );
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// The line appended to a truncated result.
+///
+/// Explicit about being a partial result and about how much is missing, so
+/// neither the model nor the user reading the model's answer can take a cut
+/// list for a complete one.
+fn truncation_marker(shown_chars: usize, total_chars: usize) -> String {
+    format!(
+        "\n[output truncated: {shown_chars} of {total_chars} characters shown, \
+         {omitted} omitted. This is NOT the whole result — say so when you use it, \
+         and run the matching `rocm` command in a terminal for the full output.]",
+        omitted = total_chars.saturating_sub(shown_chars)
+    )
+}
+
+/// Bound a tool result to `budget` characters of serialized JSON.
+///
+/// A result that already fits is returned untouched, so the common case keeps
+/// its exact shape. One that does not is replaced by the plain-text rendering
+/// cut on a line boundary plus [`truncation_marker`]; `budget` is measured
+/// against the *serialized* value, which is what actually reaches the model,
+/// so JSON escaping cannot push it back over.
+fn cap_tool_result(value: Value, budget: usize) -> Value {
+    if value.to_string().len() <= budget {
+        return value;
+    }
+    // The truncated form is a fresh object, so whatever the rest of the chat
+    // path reads off the envelope has to be carried over deliberately.
+    // `isError` is the success/failure signal (`turn.rs` reads it), and a
+    // command that failed must not read as a success merely because its
+    // output was too long to keep.
+    let is_error = value.get("isError").and_then(Value::as_bool);
+    let full = tool_result_plain_text(&value);
+    let total_chars = full.chars().count();
+    // Candidate cuts: the start, then the end of every line, so a cut never
+    // lands inside a line (and never inside a UTF-8 character).
+    let mut cuts = vec![0usize];
+    cuts.extend(full.match_indices('\n').map(|(index, _)| index + 1));
+    if !full.is_empty() && !full.ends_with('\n') {
+        cuts.push(full.len());
+    }
+    // Largest cut that still fits. `best` is only ever set to a cut that was
+    // measured as fitting, so the returned value is within budget even where
+    // the length is not perfectly monotonic in the cut (the marker's digit
+    // count shifts by one across a power of ten).
+    let (mut low, mut high, mut best) = (0usize, cuts.len() - 1, 0usize);
+    while low <= high {
+        let mid = low.midpoint(high);
+        if truncated_tool_result(&full, cuts[mid], total_chars, is_error)
+            .to_string()
+            .len()
+            <= budget
+        {
+            best = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    truncated_tool_result(&full, cuts[best], total_chars, is_error)
+}
+
+/// The truncated form of `full` kept up to the byte offset `cut`. `is_error`
+/// is the envelope's `isError`, carried over when it had one so truncating a
+/// failed command's output does not turn it into a success.
+fn truncated_tool_result(
+    full: &str,
+    cut: usize,
+    total_chars: usize,
+    is_error: Option<bool>,
+) -> Value {
+    let kept = &full[..cut];
+    let shown_chars = kept.chars().count();
+    let mut truncated = json!({
+        "truncated": true,
+        "tool_output": format!("{kept}{}", truncation_marker(shown_chars, total_chars)),
+    });
+    if let Some(is_error) = is_error {
+        truncated["isError"] = json!(is_error);
+    }
+    truncated
+}
 
 /// Shared body for every read-only ROCm tool: forward the intent to the injected
 /// executor (None ⇒ a clear "not available in this mode" message; ApprovalRequired
-/// ⇒ a "needs approval" note — read-only tools shouldn't hit it, handled defensively).
-fn run_rocm_read_tool(exec: Option<&SharedRocmToolExecutor>, name: &str, args: &Value) -> Value {
-    match exec {
-        None => json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." }),
-        Some(e) => match e.execute(name, args) {
-            RocmToolOutcome::Result(v) => v,
-            RocmToolOutcome::Error(s) => json!({ "error": s }),
-            RocmToolOutcome::ApprovalRequired(_) => {
-                json!({ "error": "this action requires approval (interactive chat only)" })
-            }
-        },
+/// ⇒ a "needs approval" error and nothing runs — `rocm_command` lands here for
+/// any argv the bin classifies as mutating, since a read tool has no approval
+/// channel).
+///
+/// `execute()` is synchronous and can block for seconds or longer: the bin's
+/// read tools run host-probe subprocesses, make HTTP readiness probes of
+/// running managed services, and can fetch a package index (the SDK install
+/// preview) or call a configured model endpoint (a provider-assisted plan). So
+/// it runs on tokio's blocking pool, as the slash-tool path does, rather than on
+/// the async worker driving the agent — where it would stall every other task
+/// queued on that worker for as long as the executor takes. If the agent's
+/// request timeout fires first, the blocking call still runs to completion,
+/// including its incidental writes (refreshed service records, the package
+/// index cache), and its result is dropped.
+async fn run_rocm_read_tool(
+    exec: Option<&SharedRocmToolExecutor>,
+    name: &'static str,
+    args: Value,
+) -> Value {
+    let Some(exec) = exec.cloned() else {
+        return json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." });
+    };
+    match tokio::task::spawn_blocking(move || exec.execute(name, &args)).await {
+        Ok(RocmToolOutcome::Result(v)) => model_facing_tool_result(v, TOOL_RESULT_CHAR_BUDGET),
+        Ok(RocmToolOutcome::Error(s)) => json!({ "error": s }),
+        Ok(RocmToolOutcome::ApprovalRequired(_)) => {
+            json!({ "error": "this action requires approval (interactive chat only)" })
+        }
+        // A panic (or cancellation at runtime shutdown): log the details rather
+        // than hand a panic payload to the model, and so to a possibly remote
+        // provider; the model only needs to know the tool failed.
+        Err(e) => {
+            tracing::warn!(tool = name, error = %e, "ROCm read tool task failed");
+            json!({ "error": format!("ROCm tool `{name}` failed to run") })
+        }
     }
 }
 
@@ -314,7 +490,7 @@ macro_rules! rocm_read_tool {
             }
             async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                 record(&self.fired, $name);
-                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, &args))
+                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, args).await)
             }
         }
     };
@@ -437,17 +613,24 @@ rocm_read_tool!(
 rocm_read_tool!(
     RocmCommandRocmTool,
     "rocm_command",
+    // The examples are deliberately the cheap commands. A small local model
+    // copies the example in a tool description literally, and the example used
+    // to be `["model"]` — the single largest read-only result there is, which
+    // on a 32k-context model used to end the turn with a provider
+    // context-overflow error instead of an answer.
     "Run a READ-ONLY rocm CLI subcommand and return its output. Allowed: \
-     model/models, config show, runtimes (list), logs, daemon status. Pass the \
-     argv as `args`, e.g. [\"model\"] or [\"config\",\"show\"]. Mutating \
-     subcommands are rejected.",
+     config show, runtimes (list), logs, daemon status, model/models. Pass the \
+     argv as `args`, e.g. [\"config\",\"show\"] or [\"runtimes\",\"list\"]. \
+     [\"model\"] lists the recommended models and [\"model\",\"--verbose\"] \
+     adds the per-recipe diagnostics, which are long. Mutating subcommands are \
+     rejected.",
     {
         "type": "object",
         "properties": {
             "args": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Argv for the rocm subcommand, e.g. [\"model\"]."
+                "description": "Argv for the rocm subcommand, e.g. [\"config\",\"show\"]."
             }
         },
         "required": ["args"]
@@ -467,7 +650,7 @@ rocm_read_tool!(
     }
 );
 
-/// All read-only ROCm tool names (mirrors [`SKILL_NAMES`]).
+/// All read-only ROCm tool names (mirrors [`TELEMETRY_TOOL_NAMES`]).
 ///
 /// Used for uniqueness/registration checks and the parity map. Mutating tools
 /// are intentionally absent. `natural_language_plan` is read-only: it plans but
@@ -592,7 +775,7 @@ rocm_mutating_tool!(
             "model": { "type": "string", "description": "Model id/name to serve." },
             "engine": { "type": "string", "description": "Optional engine, e.g. 'vllm'." },
             "host": { "type": "string", "description": "Loopback host only (e.g. 127.0.0.1)." },
-            "port": { "type": "integer", "description": "Optional TCP port." },
+            "port": { "type": "integer", "description": "TCP port. Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)." },
             "device": { "type": "string", "description": "GPU device selector (CPU is rejected)." }
         },
         "required": ["model"]
@@ -662,8 +845,9 @@ pub const ROCM_MUTATING_TOOL_NAMES: [&str; 6] = [
 
 /// Register every mutating ROCm tool on a Rig `AgentBuilder`, cloning the
 /// optional executor + approval channel + the shared `fired` log into each.
-/// Generic over the builder's model + preamble so both client paths reuse one
-/// registration site (DRY). Called after [`register_rocm_read_tools`].
+/// Generic over the builder's model + preamble so all three backends (Rig,
+/// ChatGPT, Anthropic) reuse one registration site (DRY). Called after
+/// [`register_rocm_read_tools`].
 pub(super) fn register_rocm_mutating_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     executor: Option<&SharedRocmToolExecutor>,
@@ -707,17 +891,15 @@ where
         })
 }
 
-/// Register the telemetry + skill registry tools (GpuStatus, ListInstances,
-/// BenchSummary, TokensPerWatt — snapshot-backed; ListSkills, SkillPlan —
-/// read-only registry) on a fresh Rig `AgentBuilder`, cloning the snapshot +
-/// shared `fired` log into each. Kept generic over the builder's completion
-/// model + preamble so all three backends (RigAgentClient, ChatGptAgentClient,
-/// AnthropicAgentClient) reuse one registration site (DRY — the tool list lives
-/// in exactly one place, mirroring [`register_rocm_read_tools`]). Takes the base
-/// builder (`NoToolConfig`) and returns it in `WithBuilderTools` because the
-/// first `.tool()` transitions the type-state; the ROCm read/mutating
-/// registrations chain after it. Note: ListSkillsTool/SkillPlanTool take only
-/// `fired`; the other four take `snap` + `fired`.
+/// Register the telemetry tools (GpuStatus, ListInstances, BenchSummary,
+/// TokensPerWatt — all snapshot-backed) on a fresh Rig `AgentBuilder`, cloning
+/// the snapshot + shared `fired` log into each. Kept generic over the builder's
+/// completion model + preamble so all three backends (RigAgentClient,
+/// ChatGptAgentClient, AnthropicAgentClient) reuse one registration site (DRY —
+/// the tool list lives in exactly one place, mirroring
+/// [`register_rocm_read_tools`]). Takes the base builder (`NoToolConfig`) and
+/// returns it in `WithBuilderTools` because the first `.tool()` transitions the
+/// type-state; the ROCm read/mutating registrations chain after it.
 pub(super) fn register_telemetry_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P>,
     snap: &Arc<StateSnapshot>,
@@ -744,21 +926,15 @@ where
             snap: snap.clone(),
             fired: fired.clone(),
         })
-        // Skills registry tools (read-only: list + dry-run plan; never execute).
-        .tool(ListSkillsTool {
-            fired: fired.clone(),
-        })
-        .tool(SkillPlanTool {
-            fired: fired.clone(),
-        })
 }
 
 /// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
 /// optional executor + the shared `fired` log into each. Kept generic over the
-/// builder's completion model + preamble so both the OpenAI-compatible and
-/// ChatGPT paths reuse one registration site (DRY — the tool list lives in
-/// exactly one place). The builder is already in the `WithBuilderTools` state
-/// because the telemetry/skill tools were registered first.
+/// builder's completion model + preamble so all three backends (the
+/// OpenAI-compatible, ChatGPT, and Anthropic paths) reuse one registration
+/// site (DRY — the tool list lives in exactly one place). The builder is
+/// already in the `WithBuilderTools` state because the telemetry tools were
+/// registered first.
 pub(super) fn register_rocm_read_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     executor: Option<&SharedRocmToolExecutor>,
@@ -833,17 +1009,17 @@ mod tests {
     use crate::agent::fixture_snapshot;
 
     #[test]
-    fn skill_names_are_unique_and_non_empty() {
-        for n in SKILL_NAMES {
-            assert!(!n.is_empty(), "skill name must be non-empty");
+    fn telemetry_tool_names_are_unique_and_non_empty() {
+        for n in TELEMETRY_TOOL_NAMES {
+            assert!(!n.is_empty(), "telemetry tool name must be non-empty");
         }
-        let mut sorted = SKILL_NAMES.to_vec();
+        let mut sorted = TELEMETRY_TOOL_NAMES.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(
             sorted.len(),
-            SKILL_NAMES.len(),
-            "skill names must be unique"
+            TELEMETRY_TOOL_NAMES.len(),
+            "telemetry tool names must be unique"
         );
     }
 
@@ -900,53 +1076,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn skill_tools_expose_both_demo_skills() {
-        // list_skills returns both demo skills (the agent can see them).
-        let list = ListSkillsTool {
-            fired: Arc::new(Mutex::new(Vec::new())),
-        };
-        let def = list.definition(String::new()).await;
-        assert_eq!(def.name, "list_skills");
-        let out = list.call(NoArgs::default()).await.expect("list ok");
-        let names: Vec<String> = out["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["name"].as_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains(&"install-lemonade".to_string()));
-        assert!(names.contains(&"auto-config-endpoint".to_string()));
-
-        // skill_plan returns the ordered dry-run plan for a named skill.
-        let plan_tool = SkillPlanTool {
-            fired: Arc::new(Mutex::new(Vec::new())),
-        };
-        let out = plan_tool
-            .call(SkillPlanArgs {
-                name: "install-lemonade".to_string(),
-            })
-            .await
-            .expect("plan ok");
-        let plan = out["plan"].as_array().unwrap();
-        assert!(
-            plan.iter()
-                .any(|l| l.as_str().unwrap().contains("lemonade-sdk"))
-        );
-        // Unknown skill → graceful error object, not a panic.
-        let miss = plan_tool
-            .call(SkillPlanArgs {
-                name: "nope".to_string(),
-            })
-            .await
-            .unwrap();
-        assert!(miss["error"].is_string());
-    }
-
     #[test]
-    fn skill_tool_names_registered_in_skill_names() {
-        assert!(SKILL_NAMES.contains(&"list_skills"));
-        assert!(SKILL_NAMES.contains(&"skill_plan"));
+    fn retired_skill_registry_tools_are_not_advertised() {
+        // `list_skills` / `skill_plan` described install steps (a GitHub
+        // releases download plus a `tar` extraction) that are not how the product
+        // installs an engine, and no executor ever applied their plans. They
+        // must not come back in any tool set the model is offered.
+        for gone in ["list_skills", "skill_plan"] {
+            assert!(!TELEMETRY_TOOL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(!ROCM_READ_TOOL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(
+                !ROCM_MUTATING_TOOL_NAMES.contains(&gone),
+                "{gone} is retired"
+            );
+        }
     }
 
     /// Minimal executor that echoes a fixed JSON value for any tool call.
@@ -976,6 +1119,201 @@ mod tests {
         assert_eq!(
             tool.fired.lock().unwrap().as_slice(),
             &["doctor".to_string()]
+        );
+    }
+
+    /// A command-backed MCP envelope of roughly `text_chars` characters,
+    /// shaped exactly as the bin's `internal_mcp_tool_result_from_command`
+    /// builds one: the command output in `content[0].text` and again in
+    /// `structuredContent.stdout`.
+    fn command_envelope(text_chars: usize) -> (String, serde_json::Value) {
+        let line = "Qwen/Qwen3.5-4B  Q4_K_M  fits this GPU\n";
+        let stdout = line.repeat(text_chars.div_ceil(line.len()));
+        let envelope = json!({
+            "content": [{ "type": "text", "text": format!("Ran `rocm` command.\n\n{stdout}") }],
+            "structuredContent": {
+                "argv": ["rocm", "model"],
+                "exit_status": 0,
+                "stdout": stdout,
+                "stderr": "",
+            },
+            "isError": false,
+        });
+        (stdout, envelope)
+    }
+
+    /// The `[output truncated: A of B characters shown, C omitted` figures.
+    fn truncation_figures(text: &str) -> (usize, usize, usize) {
+        let marker = text
+            .split_once("[output truncated: ")
+            .unwrap_or_else(|| panic!("no truncation marker in:\n{text}"))
+            .1;
+        let numbers = marker
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .take(3)
+            .map(|part| part.parse::<usize>().expect("marker figure"))
+            .collect::<Vec<_>>();
+        (numbers[0], numbers[1], numbers[2])
+    }
+
+    #[tokio::test]
+    async fn an_oversized_read_only_tool_result_is_capped_before_the_model_sees_it() {
+        // A ~200 KB result is what `rocm_command` with `["model"]` used to
+        // return (204,470 characters measured on a developer host). Sent whole
+        // to a locally served model it exceeds the entire context and the
+        // provider refuses the request, so the user gets an HTTP 400 instead
+        // of an answer.
+        let (_, envelope) = command_envelope(200 * 1024);
+        assert!(
+            envelope.to_string().len() > 200 * 1024,
+            "the fixture must be bigger than the budget or it proves nothing"
+        );
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool.call(json!({ "args": ["model"] })).await.expect("ok");
+
+        // What the model is handed is the serialized value, so that is what
+        // the budget is measured against.
+        let rendered = out.to_string();
+        assert!(
+            rendered.len() <= TOOL_RESULT_CHAR_BUDGET,
+            "a tool result of {} characters reached the model; the budget is {TOOL_RESULT_CHAR_BUDGET}",
+            rendered.len()
+        );
+        // It says it is partial, rather than reading as a complete answer.
+        assert_eq!(out["truncated"], json!(true), "{out}");
+        let text = out["tool_output"].as_str().expect("tool_output text");
+        assert!(
+            text.contains("[output truncated:") && text.trim_end().ends_with(']'),
+            "the marker must close the result so the model cannot miss it: {text}"
+        );
+        // …and says how much is missing, consistently.
+        let (shown, total, omitted) = truncation_figures(text);
+        assert_eq!(shown + omitted, total, "the marker's figures must add up");
+        assert!(
+            omitted > total / 2,
+            "a 200 KB result cut to {TOOL_RESULT_CHAR_BUDGET} characters must report most of it omitted, got {omitted} of {total}"
+        );
+        // The part that is shown is real output, cut on a line boundary.
+        assert!(text.contains("Qwen/Qwen3.5-4B"), "{text}");
+        assert!(
+            text.split_once("\n[output truncated:")
+                .is_some_and(|(kept, _)| kept.is_empty() || kept.ends_with('\n')),
+            "the cut must land on a line boundary: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncating_a_failed_command_keeps_it_a_failure() {
+        // The capped form is a fresh object, so `isError` survives only if it
+        // is carried over. A command that failed with a lot of output would
+        // otherwise reach the model looking like a success, and the chat path
+        // reads that field to decide exactly that.
+        let (_, mut envelope) = command_envelope(200 * 1024);
+        envelope["isError"] = json!(true);
+        envelope["structuredContent"]["exit_status"] = json!(1);
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool.call(json!({ "args": ["model"] })).await.expect("ok");
+
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "the fixture must truncate: {out}"
+        );
+        assert_eq!(
+            out["isError"],
+            json!(true),
+            "a failed command must still read as failed after truncation: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncating_a_successful_command_keeps_it_a_success() {
+        // The mirror of the case above: carrying `isError` over must not
+        // invent a failure for output that was merely long.
+        let (_, envelope) = command_envelope(200 * 1024);
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool.call(json!({ "args": ["model"] })).await.expect("ok");
+
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "the fixture must truncate: {out}"
+        );
+        assert_eq!(out["isError"], json!(false), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_command_backed_result_reaches_the_model_once_not_twice() {
+        // The bin's envelope carries the command output twice — once as the
+        // text a reader sees, once as `structuredContent.stdout` — because
+        // `rocm mcp-call` consumers read the structured field. The dash hands
+        // the whole value to the model, so without this the model pays for
+        // every byte twice.
+        let (stdout, envelope) = command_envelope(2 * 1024);
+        let before = envelope.to_string().len();
+        let tool = RocmCommandRocmTool {
+            executor: Some(Arc::new(FakeExec(envelope)) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = tool
+            .call(json!({ "args": ["config", "show"] }))
+            .await
+            .expect("ok");
+
+        // One copy survives, and it is the readable one.
+        let text = out["content"][0]["text"].as_str().expect("content text");
+        assert!(text.contains(stdout.trim()), "{out}");
+        assert!(
+            out["structuredContent"].get("stdout").is_none(),
+            "the duplicated copy must not reach the model: {out}"
+        );
+        assert!(
+            out["structuredContent"].get("stderr").is_none(),
+            "an empty stderr is pure overhead for the model: {out}"
+        );
+        // The fields that are not duplicates stay, so the model can still see
+        // what ran and whether it worked.
+        assert_eq!(out["structuredContent"]["exit_status"], json!(0), "{out}");
+        assert_eq!(out["structuredContent"]["argv"][1], json!("model"), "{out}");
+        assert!(
+            out.to_string().len() < before / 2 + 512,
+            "dropping the duplicate should roughly halve the result: {} vs {before}",
+            out.to_string().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_within_the_budget_keeps_its_exact_shape() {
+        // The cap must not reshape ordinary results: a tool whose data lives
+        // only in `structuredContent` (engines, bridge_snapshot, automations)
+        // would lose it if every result were flattened to text.
+        let value = json!({
+            "content": [{ "type": "text", "text": "Found 3 engine entries." }],
+            "structuredContent": { "engines": [{ "id": "lemonade", "available": true }] },
+            "isError": false,
+        });
+        let tool = EnginesRocmTool {
+            executor: Some(Arc::new(FakeExec(value.clone())) as SharedRocmToolExecutor),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool.call(json!({})).await.expect("ok");
+        assert_eq!(
+            out, value,
+            "an in-budget result must pass through unchanged"
         );
     }
 
@@ -1037,6 +1375,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_rocm_command_reports_approval_without_executing() {
+        // `rocm_command` is registered as a read-only tool, so it has no
+        // approval channel: when the executor classifies the argv as mutating,
+        // the tool must hand the model an error and run nothing.
+        let approved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec: SharedRocmToolExecutor = Arc::new(RecordingMutatingExec {
+            approved: approved.clone(),
+        });
+        let tool = RocmCommandRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "args": ["serve", "qwen", "--managed"] }))
+            .await
+            .expect("tool call ok");
+        assert!(
+            out.get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("requires approval")),
+            "an approval request must reach the model as an error, got {out}"
+        );
+        assert!(
+            approved.lock().unwrap().is_empty(),
+            "a read-only tool must never execute a mutating command"
+        );
+    }
+
+    #[tokio::test]
     async fn mutating_tool_none_executor_is_graceful() {
         let tool = LaunchServerRocmTool {
             executor: None,
@@ -1064,15 +1431,138 @@ mod tests {
                 "missing mutating tool: {expected}"
             );
         }
-        // Disjoint from read-only + skill names (iterates the registry itself).
+        // Disjoint from read-only + telemetry tool names (iterates the registry itself).
         for n in ROCM_MUTATING_TOOL_NAMES {
-            assert!(!SKILL_NAMES.contains(&n), "collision with skill: {n}");
+            assert!(
+                !TELEMETRY_TOOL_NAMES.contains(&n),
+                "collision with telemetry tool: {n}"
+            );
             // install_sdk_dry_run (read-only) must not clash with install_sdk.
             assert!(
                 !ROCM_READ_TOOL_NAMES.contains(&n),
                 "collision with read tool: {n}"
             );
         }
+    }
+
+    /// Executor whose `execute()` can only finish if the async runtime keeps
+    /// making progress while it runs: it spawns a task onto the current runtime
+    /// and blocks until that task has run. On an async worker thread the task
+    /// is stuck behind the blocked worker, so `execute()` gives up after
+    /// [`STALL_TIMEOUT`] and reports the stall instead of hanging the test.
+    #[derive(Debug)]
+    struct NeedsRuntimeProgressExec;
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    impl crate::tool_exec::RocmToolExecutor for NeedsRuntimeProgressExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::runtime::Handle::current().spawn(async move {
+                let _ = tx.send(());
+            });
+            match rx.recv_timeout(STALL_TIMEOUT) {
+                Ok(()) => RocmToolOutcome::Result(json!({ "ok": true })),
+                Err(_) => RocmToolOutcome::Error("async runtime stalled".to_string()),
+            }
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    #[test]
+    fn read_only_tool_call_does_not_block_the_async_runtime() {
+        // The bin's executor blocks (see `run_rocm_read_tool`). The dash runs
+        // the agent on a multi-thread runtime, which on a single-CPU host has
+        // one worker; a `call()` that ran `execute()` inline would hold that
+        // worker, and no other async task could run until the executor returned.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let tool = ExamineRocmTool {
+            executor: Some(Arc::new(NeedsRuntimeProgressExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        // Spawned like the event loop spawns `agent.complete`, so the call runs
+        // on the runtime's worker rather than on the `block_on` thread.
+        let out = rt
+            .block_on(async move { tokio::spawn(async move { tool.call(json!({})).await }).await })
+            .expect("tool task joins")
+            .expect("tool call ok");
+        assert_eq!(
+            out,
+            json!({ "ok": true }),
+            "the executor ran on an async worker and starved the runtime"
+        );
+    }
+
+    /// Executor whose `execute()` panics, standing in for a bug in the bin.
+    #[derive(Debug)]
+    struct PanickingExec;
+    impl crate::tool_exec::RocmToolExecutor for PanickingExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            panic!("executor bug");
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    /// In-memory `tracing` writer, so a test can read back what was logged.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_reports_a_panicking_executor_as_a_tool_error() {
+        // A panic inside `execute()` must come back to the model as a tool
+        // error. Unwinding instead would end the spawned agent task without a
+        // reply, leaving the chat waiting on a turn that never finishes.
+        let tool = ExamineRocmTool {
+            executor: Some(Arc::new(PanickingExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        // `#[tokio::test]` runs on one thread, so the thread-local subscriber
+        // sees the warning logged after the blocking task is joined.
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = tool.call(json!({})).await.expect("tool call ok");
+        drop(guard);
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("WARN")
+                && logged.contains("examine")
+                && logged.contains("executor bug"),
+            "the panic must be logged with the tool name and payload, got: {logged}"
+        );
+        let error = out.get("error").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            error.contains("`examine` failed to run"),
+            "expected a tool error naming the tool, got {out}"
+        );
+        assert!(
+            !error.contains("executor bug"),
+            "the panic payload must not be sent to the model, got {out}"
+        );
     }
 
     #[tokio::test]
@@ -1135,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn rocm_read_tool_names_are_complete_and_disjoint_from_skills() {
+    fn rocm_read_tool_names_are_complete_and_disjoint_from_telemetry_tools() {
         // Every expected read-only tool is registered…
         for expected in [
             "doctor",
@@ -1162,10 +1652,10 @@ mod tests {
         }
         // natural_language_plan is read-only (plans, never executes) — Phase 7.
         assert!(ROCM_READ_TOOL_NAMES.contains(&"natural_language_plan"));
-        // The telemetry/skill tools are still present and disjoint from the new set.
-        assert!(SKILL_NAMES.contains(&"gpu_status"));
+        // The telemetry tools are still present and disjoint from the new set.
+        assert!(TELEMETRY_TOOL_NAMES.contains(&"gpu_status"));
         for n in ROCM_READ_TOOL_NAMES {
-            assert!(!SKILL_NAMES.contains(&n), "name collision: {n}");
+            assert!(!TELEMETRY_TOOL_NAMES.contains(&n), "name collision: {n}");
         }
     }
 }

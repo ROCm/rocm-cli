@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Config + provider manager overlay (Phase 3 Wave 3).
+//! Config + provider manager overlay.
 //!
 //! Folds the frozen `config_manager` and `provider_manager` into one screen:
 //!
@@ -306,11 +306,8 @@ pub fn draw_config_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn show_is_read_only_and_spawns_without_approval() {

@@ -11,9 +11,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use crate::ui;
 
 use super::AppState;
-use super::scrollbar::{PaneFocus, ScrollTarget};
 use super::summary::summarize_json_value;
-use super::types::{ActiveTab, ChatConsent, ChatKeyCtx, Modal};
+use super::types::{
+    ActiveTab, ChatConsent, ChatKeyCtx, MENU_ITEMS, MenuItem, Modal, OPTIONS_TABS, PALETTE_DESTS,
+    PaneFocus, ScrollTarget,
+};
 #[cfg(test)]
 use super::types::{ChatProvider, ChatRole};
 
@@ -56,11 +58,54 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
     (cur.cast_signed() + delta).rem_euclid(n) as usize
 }
 
+/// Resolve a quit request (issue #145): a model still being served gets a
+/// confirm prompt first — opening it, not quitting, is this fn's whole job;
+/// the event loop's dedicated `quit_confirm_pending` arm owns the actual exit
+/// once the prompt resolves. Returns `true` to request immediate exit the
+/// same way `apply_action` does, so every quit entry point — the `q` key, the
+/// Esc main menu's "Quit" row, `/quit`/`/exit` (`app::slash`), and the
+/// pre-dashboard launcher's own `q`/Esc (`ui::launcher`) — shares this one
+/// gate rather than each re-deciding (and risking re-deciding wrong) whether
+/// to ask first. `Ctrl-C` is the one quit entry point that does NOT: it
+/// always exits immediately without asking (`event_loop::ctrl_c_should_exit`),
+/// except from a running job's console, where it keeps its "cancel this job"
+/// meaning instead — see the README's "First run" section.
+///
+/// `launcher_hosted` sessions (`ResolvedArgs::launcher_hosted`'s doc comment)
+/// are the one exception: this session was opened FROM the pre-dashboard
+/// launcher, which outlives it and redraws its own menu once it returns, and
+/// the launcher's own `q`/Esc already shares this exact gate — so IT is what
+/// actually governs process exit, backed by a registry read taken fresh at
+/// the top of that menu pass rather than this session's launch-time state
+/// (issue #145's launcher/Windows fix). Asking here too would open a
+/// "May still be serving — quit anyway?" whose "yes" doesn't exit the process at all
+/// — it only returns to the launcher loop, which then immediately asks the
+/// identical question again on its own next `q`. So a launcher-hosted session
+/// exits this inner loop unconditionally; only the launcher's copy of this
+/// same function ever opens the prompt for that model.
+///
+/// No focused-host entry point (Set up/Serve/Diagnose) calls this today —
+/// unreachable in practice — but if one ever did, the prompt this opens is
+/// both rendered (`ui::draw_focused`'s own `quit_confirm` arm) and able to
+/// hold the focused-exit gate open until it resolves
+/// (`AppState::focused_should_exit`'s `quit_confirm_pending` exemption);
+/// neither alone would be enough.
+pub(crate) fn request_quit(state: &mut AppState) -> bool {
+    if state.launcher_hosted {
+        return true;
+    }
+    if state.has_live_instance() {
+        state.open_quit_confirm();
+        return false;
+    }
+    true
+}
+
 /// Apply a `KeyAction` to mutable state. Returns `true` when the action
 /// requests application exit (Quit).
 pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
     match action {
-        KeyAction::Quit => return true,
+        KeyAction::Quit => return request_quit(state),
         KeyAction::SwitchTab(t) => {
             state.active_tab = t;
             state.modal = Modal::None;
@@ -154,6 +199,16 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 Modal::Help
             };
         }
+        // Reached from the `!` arm of `handle_key`, which only runs when no overlay,
+        // prompt or modal owns the keyboard, and from a click on the badge, gated
+        // on `global_hotkeys_reachable`. The check is repeated here so an opener
+        // that skipped that gate cannot hide the popup under an approval, in
+        // debug and release alike.
+        KeyAction::OpenWarnings => {
+            if state.global_hotkeys_reachable() && state.warning_count() > 0 {
+                state.modal = Modal::Warnings;
+            }
+        }
         KeyAction::CloseModal => state.modal = Modal::None,
         // The operational overlays are mutually exclusive: opening any one first
         // closes the rest (see `close_overlays`), so no open path — key, mouse,
@@ -229,33 +284,41 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::MenuMove(d) => match state.modal {
             Modal::Menu => {
-                state.menu_sel = wrap_cursor(state.menu_sel, d, crate::ui::modal::MENU_ITEMS);
+                state.menu_sel = wrap_cursor(state.menu_sel, d, MENU_ITEMS.len());
             }
             Modal::Palette => {
-                state.palette_sel =
-                    wrap_cursor(state.palette_sel, d, crate::ui::modal::PALETTE_DESTS.len());
+                state.palette_sel = wrap_cursor(state.palette_sel, d, PALETTE_DESTS.len());
             }
             _ => {}
         },
         KeyAction::OptionsTab(d) => {
             if state.modal == Modal::Options {
-                state.options_tab =
-                    wrap_cursor(state.options_tab, d, crate::ui::modal::OPTIONS_TABS.len());
+                state.options_tab = wrap_cursor(state.options_tab, d, OPTIONS_TABS.len());
             }
         }
         KeyAction::MenuActivate => match state.modal {
-            Modal::Menu => match state.menu_sel {
-                0 => {
+            Modal::Menu => match MENU_ITEMS.get(state.menu_sel) {
+                Some(MenuItem::Options) => {
                     state.modal = Modal::Options;
                     state.options_tab = 0;
                 }
-                1 => {
+                Some(MenuItem::Help) => {
                     state.modal = Modal::GlobalHelp;
                 }
-                _ => return true, // Quit
+                // Issue #145: this must share `KeyAction::Quit`'s own gate —
+                // choosing "Quit" from the Esc menu is a second, independent
+                // entry point to the same decision, not a separate one that
+                // gets to skip the confirm prompt. `request_quit` →
+                // `open_quit_confirm` closes the Esc menu itself when a
+                // prompt opens, so a decline doesn't strand the user back in
+                // it (same as every other row here already does on success).
+                Some(MenuItem::Quit) => return request_quit(state),
+                // Never set by `OpenMenu` or `MenuMove`, which keep the
+                // selection in range; do nothing rather than quit.
+                None => {}
             },
             Modal::Palette => {
-                if let Some((_, tab)) = crate::ui::modal::PALETTE_DESTS.get(state.palette_sel) {
+                if let Some((_, tab)) = PALETTE_DESTS.get(state.palette_sel) {
                     state.active_tab = *tab;
                 }
                 state.modal = Modal::None;
@@ -344,6 +407,9 @@ pub enum KeyAction {
     SelectLast,
     OpenDetail,
     ToggleHelp,
+    /// Open the warnings popup (the text behind the header `⚠ N` badge). A no-op
+    /// while the daemon reports no warnings. Closing it is `CloseModal`.
+    OpenWarnings,
     CloseModal,
     OpenThemePicker,
     ApplyThemePick,
@@ -556,6 +622,14 @@ pub(crate) fn handle_key(
             _ => KeyAction::Nothing,
         };
     }
+    // Warnings popup: absorbs everything except quit / close, like Help.
+    if *modal == Modal::Warnings {
+        return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('!') => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
+    }
     // Global help overlay (opened from the Esc menu): close, same as the
     // contextual Help above.
     if *modal == Modal::GlobalHelp {
@@ -609,6 +683,7 @@ pub(crate) fn handle_key(
         KeyCode::Esc => KeyAction::OpenMenu,
         KeyCode::Char(':') => KeyAction::OpenPalette,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
+        KeyCode::Char('!') => KeyAction::OpenWarnings,
         KeyCode::Char('t') => KeyAction::OpenThemePicker,
         KeyCode::BackTab => KeyAction::SwitchTab(current.prev()),
         KeyCode::Tab => {
@@ -645,7 +720,8 @@ pub(crate) fn handle_key(
         KeyCode::Char('w') if current == ActiveTab::Observe => KeyAction::OpenServeWizard,
         // Engine manager: use/install/reinstall serving engines.
         KeyCode::Char('e') if current == ActiveTab::Observe => KeyAction::OpenEngineManager,
-        // Examine: read-only environment check.
+        // Examine: environment check, plus a Doctor report that is sent only
+        // after approval.
         KeyCode::Char('d') if current == ActiveTab::Observe => KeyAction::OpenExamine,
         // Update: check/preview/apply ROCm package updates.
         KeyCode::Char('u') if current == ActiveTab::Observe => KeyAction::OpenUpdate,
@@ -681,17 +757,6 @@ pub(crate) fn handle_key(
     }
 }
 
-/// Translate a `MouseEvent` into the existing `KeyAction` vocabulary.
-///
-/// The caller is responsible for the surrounding state context:
-/// - `last_tab_bar_area` / `last_body_area` are read off `AppState` by the
-///   event loop so this function stays pure on the input event.
-/// - Per-tab body clicks are dispatched to the active tab module's
-///   `hit_test` from the event loop.
-///
-/// We only translate the parts of mouse handling that are tab-agnostic:
-/// the scroll wheel, and (in the event loop) the tab-bar click. Per-tab
-/// click is handled in tab modules.
 /// Map a navigation key to a job-console pan delta `(lines, cols)` while a
 /// console is showing. `None` for non-scroll keys so they fall through to the
 /// console's own action handler (Ctrl+C / q / Esc / Enter). A page is 10 lines.
@@ -707,6 +772,17 @@ pub(crate) const fn console_scroll_delta(code: KeyCode) -> Option<(i16, i16)> {
     }
 }
 
+/// Translate a `MouseEvent` into the existing `KeyAction` vocabulary.
+///
+/// The caller is responsible for the surrounding state context:
+/// - `last_tab_bar_area` / `last_body_area` are read off `AppState` by the
+///   event loop so this function stays pure on the input event.
+/// - Per-tab body clicks are dispatched to the active tab module's
+///   `hit_test` from the event loop.
+///
+/// We only translate the parts of mouse handling that are tab-agnostic:
+/// the scroll wheel, and (in the event loop) the tab-bar click. Per-tab
+/// click is handled in tab modules.
 pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction {
     // Domain-tab (ROCm/Serving) and overlay/console scroll is resolved in
     // `resolve_mouse` (it needs `&AppState` for hit-testing and overlay state).
@@ -755,7 +831,7 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
-    use super::super::test_support::press;
+    use super::super::test_support::{press, st};
 
     fn hk(c: KeyCode, tab: ActiveTab) -> KeyAction {
         handle_key(press(c), tab, &Modal::None, ChatKeyCtx::default())
@@ -783,6 +859,184 @@ mod tests {
         assert_eq!(with_modal(&Modal::Menu), KeyAction::Quit);
         assert_eq!(with_modal(&Modal::Palette), KeyAction::Quit);
         assert_eq!(with_modal(&Modal::Options), KeyAction::Quit);
+    }
+
+    #[test]
+    fn quit_exits_immediately_when_nothing_is_serving() {
+        // Regression guard (issue #145): the overwhelmingly common case —
+        // nothing running — must stay a one-keystroke quit, no prompt.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn quit_opens_a_confirm_prompt_when_a_model_is_serving() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        assert!(!apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn launcher_hosted_session_exits_immediately_even_while_serving() {
+        // Regression guard: a dashboard/chat session opened FROM the
+        // pre-dashboard launcher (`AppState::launcher_hosted`) must not open
+        // its own confirm prompt on `q` — the launcher's own gate, re-entered
+        // when control returns to it, is what actually governs process exit
+        // (see `ResolvedArgs::launcher_hosted`'s doc comment). Asking here
+        // too would be a second, redundant prompt whose "yes" doesn't
+        // actually quit anything.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.launcher_hosted = true;
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        assert!(apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn quit_key_while_a_modal_is_open_closes_it_instead_of_stranding_the_user() {
+        // Regression: `q` reaches the shared `KeyAction::Quit` arm from
+        // inside every per-modal match (ThemePicker, Detail, Help,
+        // GlobalHelp, Warnings, Menu, Palette, Options — see those arms above), not
+        // just the Esc-menu's "Quit" row. `open_quit_confirm` used to close
+        // overlays but never `modal`, so declining left the user stuck back
+        // inside whatever modal was open when they pressed `q`.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for modal in [
+            Modal::ThemePicker,
+            Modal::Detail,
+            Modal::Help,
+            Modal::GlobalHelp,
+            Modal::Warnings,
+            Modal::Palette,
+            Modal::Options,
+        ] {
+            let mut s = AppState::new("t".into(), "default-dark".into());
+            s.instances.insert(
+                "vllm-1".into(),
+                Instance {
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+            s.modal = modal.clone();
+            assert!(!apply_action(&mut s, KeyAction::Quit), "modal: {modal:?}");
+            assert!(s.quit_confirm.is_some(), "modal: {modal:?}");
+            assert_eq!(
+                s.modal,
+                Modal::None,
+                "quit-confirm must close {modal:?} so a decline doesn't strand the user in it"
+            );
+        }
+    }
+
+    #[test]
+    fn quitting_from_the_esc_menu_opens_the_same_confirm_prompt() {
+        // Regression: choosing "Quit" from the Esc main menu (Modal::Menu's
+        // last row) used to `return true` directly, a second quit entry
+        // point that completely bypassed the confirm-before-quit gate.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.modal = Modal::Menu;
+        s.menu_sel = 2; // the "Quit" row
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert!(s.quit_confirm.is_some());
+        assert_eq!(
+            s.modal,
+            Modal::None,
+            "choosing Quit must close the Esc menu like every other row, \
+             not strand it open behind the confirm prompt"
+        );
+    }
+
+    #[test]
+    fn quitting_from_the_esc_menu_exits_immediately_when_nothing_is_serving() {
+        // Regression guard: every existing Esc-menu quit test seeds a Running
+        // instance, so none of them exercise the overwhelmingly common case —
+        // the Esc-menu's own "Quit" row, with nothing serving, must still be a
+        // one-keystroke quit (no prompt), the same as the plain `q` key
+        // (`quit_exits_immediately_when_nothing_is_serving` above).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.modal = Modal::Menu;
+        s.menu_sel = 2; // the "Quit" row
+        assert!(apply_action(&mut s, KeyAction::MenuActivate));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn declining_quit_from_the_esc_menu_returns_to_the_dashboard_not_the_menu() {
+        // Regression: `request_quit` opened the confirm prompt without
+        // clearing `Modal::Menu`, so declining from the Esc-menu "Quit" row
+        // used to strand the user back in the Esc menu, unlike declining via
+        // the plain `q` key (where `modal` was already `None`).
+        //
+        // Goes through `resolve_quit_confirm_key` (not the lower-level
+        // `on_quit_confirm_key`, which only routes the key and never clears
+        // `quit_confirm` itself) so this actually exercises the Deny verdict's
+        // side effect rather than a verdict this test then applies by hand.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.modal = Modal::Menu;
+        s.menu_sel = 2;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('n')), Some(false));
+        assert!(
+            s.quit_confirm.is_none(),
+            "Deny must clear the prompt, not merely report it"
+        );
+        assert_eq!(s.modal, Modal::None);
+    }
+
+    #[test]
+    fn quit_confirm_key_approves_denies_and_cancels() {
+        // Through `resolve_quit_confirm_key`, so this covers the verdict's
+        // side effect (clearing `quit_confirm` on Deny/Cancel, leaving it set
+        // on Approve for the caller that's about to exit) and not merely
+        // `on_quit_confirm_key`'s lower-level routing.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.open_quit_confirm();
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('y')), Some(true));
+        assert!(
+            s.quit_confirm.is_some(),
+            "Approve leaves the prompt for the caller, which is about to exit"
+        );
+
+        s.open_quit_confirm();
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('n')), Some(false));
+        assert!(s.quit_confirm.is_none(), "Deny must clear the prompt");
+
+        s.open_quit_confirm();
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Esc), Some(false));
+        assert!(s.quit_confirm.is_none(), "Cancel must clear the prompt");
     }
 
     #[test]
@@ -856,7 +1110,7 @@ mod tests {
     #[test]
     fn action_activate_is_two_step_list_then_open() {
         // Serving verb 0 = "Serve a model" → OpenServeWizard.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Serving;
         s.serving_sel = 0;
         assert_eq!(s.pane_focus, PaneFocus::Actions);
@@ -871,7 +1125,7 @@ mod tests {
             "detail-focus Enter opens the manager"
         );
         // ROCm verb 2 = "Diagnose (doctor)" → OpenExamine (the other mapping).
-        let mut r = AppState::new("t".into(), "default-dark".into());
+        let mut r = st();
         r.active_tab = ActiveTab::Rocm;
         r.rocm_sel = 2;
         r.pane_focus = PaneFocus::Detail;
@@ -884,7 +1138,7 @@ mod tests {
 
     #[test]
     fn action_focus_resets_on_move_and_tab_switch() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::Move(1));
@@ -899,7 +1153,7 @@ mod tests {
         // Esc on Action is intercepted (not the global OpenMenu) so it can back
         // out of the detail pane first.
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Rocm), KeyAction::PaneEscape);
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::PaneEscape);
@@ -911,7 +1165,7 @@ mod tests {
 
     #[test]
     fn action_select_sets_verb_and_parks_on_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::PaneSelect(2));
@@ -927,7 +1181,7 @@ mod tests {
         // Activating a ROCm verb opens its manager inline (focus stays in
         // Details); `←`/Esc backs out — closing the manager and returning focus
         // to the Actions list. This mirrors the event-loop back-out arm.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.rocm_sel = 0; // Set up / Install ROCm → OpenInstall
         apply_action(&mut s, KeyAction::PaneActivate); // → Details
@@ -1129,7 +1383,7 @@ mod tests {
 
     #[test]
     fn opening_an_overlay_closes_the_others() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         apply_action(&mut s, KeyAction::OpenServices);
         assert!(s.services.is_some() && s.serve_wizard.is_none() && s.engine_manager.is_none());
         // Opening another overlay (defensive path) clears the prior one.
@@ -1199,7 +1453,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_and_activation() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         apply_action(&mut s, KeyAction::OpenMenu);
         assert_eq!(s.modal, Modal::Menu);
         // ↓ from Options(0) → Help(1); activate opens the global help.
@@ -1213,12 +1467,60 @@ mod tests {
         assert_eq!(s.modal, Modal::Options);
         // Options tab cycles and wraps.
         apply_action(&mut s, KeyAction::OptionsTab(-1));
-        assert_eq!(s.options_tab, crate::ui::modal::OPTIONS_TABS.len() - 1);
+        assert_eq!(s.options_tab, OPTIONS_TABS.len() - 1);
+    }
+
+    #[test]
+    fn esc_menu_selection_wraps_over_its_three_rows_and_each_row_runs_its_own_action() {
+        let mut s = st();
+        apply_action(&mut s, KeyAction::OpenMenu);
+        assert_eq!(s.menu_sel, 0, "the menu opens on its first row");
+        // Up from the first row wraps to the last; down from the last wraps
+        // back to the first.
+        apply_action(&mut s, KeyAction::MenuMove(-1));
+        assert_eq!(s.menu_sel, 2);
+        apply_action(&mut s, KeyAction::MenuMove(1));
+        assert_eq!(s.menu_sel, 0);
+        // A full lap of down-presses visits every row once and comes back.
+        let mut lap = Vec::new();
+        for _ in 0..3 {
+            apply_action(&mut s, KeyAction::MenuMove(1));
+            lap.push(s.menu_sel);
+        }
+        assert_eq!(lap, [1, 2, 0]);
+        assert_eq!(s.modal, Modal::Menu, "moving never closes the menu");
+
+        // Row 0 opens Options on its first tab; row 1 opens the global help;
+        // row 2 is Quit, which exits at once when nothing is being served.
+        s.options_tab = 3;
+        s.menu_sel = 0;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.modal, Modal::Options);
+        assert_eq!(s.options_tab, 0);
+        s.modal = Modal::Menu;
+        s.menu_sel = 1;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.modal, Modal::GlobalHelp);
+        s.modal = Modal::Menu;
+        s.menu_sel = 2;
+        assert!(apply_action(&mut s, KeyAction::MenuActivate));
+    }
+
+    #[test]
+    fn esc_menu_selection_past_the_last_row_does_nothing() {
+        // Nothing sets `menu_sel` out of range (`OpenMenu` resets it and
+        // `MenuMove` wraps it). If it ever were, activating must not take the
+        // destructive Quit path: no quit request, and the menu stays open.
+        let mut s = st();
+        s.modal = Modal::Menu;
+        s.menu_sel = MENU_ITEMS.len() + 4;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.modal, Modal::Menu);
     }
 
     #[test]
     fn palette_activation_switches_tab() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         apply_action(&mut s, KeyAction::OpenPalette);
         apply_action(&mut s, KeyAction::MenuMove(3)); // Home→ROCm→Serving→Observe
         apply_action(&mut s, KeyAction::MenuActivate);
@@ -1339,6 +1641,98 @@ mod tests {
             handle_mouse(scroll_down, &Modal::None, ActiveTab::Rocm),
             KeyAction::Nothing
         );
+    }
+
+    fn with_warnings(s: &mut AppState, n: usize) {
+        s.latest = Some(rocm_dash_core::metrics::Snapshot {
+            warnings: (0..n).map(|i| format!("warning {i}")).collect(),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn bang_opens_the_warnings_popup_from_every_tab() {
+        for tab in [
+            ActiveTab::Home,
+            ActiveTab::Rocm,
+            ActiveTab::Serving,
+            ActiveTab::Observe,
+            ActiveTab::Chat,
+        ] {
+            assert_eq!(
+                hk(KeyCode::Char('!'), tab),
+                KeyAction::OpenWarnings,
+                "{tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_popup_closes_on_esc_enter_and_bang_and_absorbs_other_keys() {
+        let key = |c| {
+            handle_key(
+                press(c),
+                ActiveTab::Home,
+                &Modal::Warnings,
+                ChatKeyCtx::default(),
+            )
+        };
+        for c in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('!')] {
+            assert_eq!(key(c), KeyAction::CloseModal, "{c:?}");
+        }
+        assert_eq!(key(KeyCode::Char('q')), KeyAction::Quit);
+        // Like Help: nothing underneath may react while the popup is open.
+        for c in [
+            KeyCode::Char('t'),
+            KeyCode::Char('?'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+            KeyCode::Down,
+        ] {
+            assert_eq!(key(c), KeyAction::Nothing, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn opening_warnings_shows_the_popup_and_close_modal_dismisses_it() {
+        let mut s = st();
+        with_warnings(&mut s, 2);
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::Warnings);
+        apply_action(&mut s, KeyAction::CloseModal);
+        assert_eq!(s.modal, Modal::None);
+    }
+
+    #[test]
+    fn opening_warnings_opens_nothing_when_there_are_no_warnings() {
+        let mut s = st();
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "no snapshot yet");
+        with_warnings(&mut s, 0);
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "snapshot without warnings");
+    }
+
+    #[test]
+    fn opening_warnings_is_refused_while_something_else_owns_the_keyboard() {
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.modal = Modal::Help;
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::Help, "a modal stays put");
+
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "nothing opens over a pending prompt");
+
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.active_tab = ActiveTab::Chat;
+        s.chat_focused = true;
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "focused chat input owns the keyboard");
     }
 
     #[test]
@@ -1477,7 +1871,7 @@ mod tests {
 
     #[test]
     fn chat_consent_accept_and_decline_transition_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // No endpoint → Unavailable; accept/decline are no-ops.
         s.set_chat_config(None, false);
         assert_eq!(s.chat_consent, ChatConsent::Unavailable);
@@ -1509,7 +1903,7 @@ mod tests {
 
     #[test]
     fn detect_offer_lifecycle_accept_switches_chat() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Chat;
         // Gateway-configured chat, pending consent.
         let gw = crate::llm::LlmConfig {
@@ -1549,7 +1943,7 @@ mod tests {
 
     #[test]
     fn detect_offer_dismiss_keeps_prior_config() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         let gw = crate::llm::LlmConfig {
             base_url: "https://gw/OpenAI".into(),
             model: "gpt-4o-mini".into(),
@@ -1570,7 +1964,7 @@ mod tests {
 
     #[test]
     fn save_detect_offer_accepts_and_raises_persist_edge() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // Start off-Local so the realignment on accept is observable (Local is
         // the default provider; asserting it without this would be tautological).
         s.active_provider = ChatProvider::Openai;
@@ -1592,7 +1986,7 @@ mod tests {
             Some("http://localhost:13305/v1")
         );
         // No offer → save is a no-op (no edge).
-        let mut s2 = AppState::new("t".into(), "default-dark".into());
+        let mut s2 = st();
         apply_action(&mut s2, KeyAction::ChatDetectSave);
         assert!(!s2.chat_persist_dispatch);
         assert!(s2.chat_endpoint_rebuild.is_none());
@@ -1643,7 +2037,7 @@ mod tests {
 
     #[test]
     fn chat_input_actions_mutate_buffer() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Chat;
         s.chat_focused = true;
         apply_action(&mut s, KeyAction::ChatInput('h'));
@@ -1659,7 +2053,7 @@ mod tests {
 
     #[test]
     fn chat_submit_pushes_user_turn_and_raises_dispatch() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "what's GPU-2 doing?".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         // Only the user turn is pushed; the agent reply arrives async.
@@ -1673,7 +2067,7 @@ mod tests {
 
     #[test]
     fn chat_submit_ignores_empty_input() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "   ".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat.is_empty());
@@ -1685,7 +2079,7 @@ mod tests {
     fn chat_submit_ignored_while_request_in_flight() {
         // A second submit before the first reply lands must be a no-op — no
         // second user turn, no second spawn (prevents a racing double request).
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "first".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat_sending);
@@ -1711,7 +2105,7 @@ mod tests {
         // emit `ScrollModal` for it (see `detail_modal_j_k_emit_scroll` /
         // `handle_mouse_routes_scroll_by_modal_and_tab`) and the instance
         // Detail modal's body (launch_args/env_vars) can genuinely overflow.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.modal = Modal::Detail;
         s.instance_detail_max_scroll = 10;
         apply_action(&mut s, KeyAction::ScrollModal(3));
@@ -1725,7 +2119,7 @@ mod tests {
     async fn chat_reply_path_appends_agent_turn_and_clears_sending() {
         // The wired ChatSubmit→reply path using the MockAgentClient (no LLM).
         let agent = crate::agent::MockAgentClient::new("GPU-2: 87% util, 71°C");
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "what's GPU-2 doing?".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat_sending);
@@ -1742,7 +2136,7 @@ mod tests {
 
     #[test]
     fn chat_input_handles_unicode_and_long_text() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_focused = true;
         // Multi-byte / emoji chars push as single chars, no panic.
         for c in "héllo 🚀 café ∑".chars() {
@@ -1765,7 +2159,7 @@ mod tests {
 
     #[test]
     fn chat_scroll_clamps_and_updates_follow_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_max_scroll = 20;
         s.chat_scroll = 20;
         apply_action(&mut s, KeyAction::ChatScroll(-100));
@@ -1806,7 +2200,7 @@ mod tests {
     #[tokio::test]
     async fn chat_error_path_appends_error_turn_no_panic() {
         let agent = crate::agent::MockAgentClient::failing();
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "hi".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         let snapshot = s.state_snapshot();

@@ -15,12 +15,14 @@
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes, builtin_watchers};
 use rocm_dash_daemon::runner::RunnerOptions;
 use rocm_dash_tui::app::{ActiveTab, Focus, ResolvedArgs};
+use rocm_dash_tui::registry_probe::{ManagedRegistryProbe, ManagedRegistrySnapshot};
 use rocm_dash_tui::ui::automations_manager::AutomationSummary;
 use rocm_dash_tui::ui::launcher::LauncherChoice;
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
@@ -56,10 +58,11 @@ pub fn runner_options(
         instance_tick: Duration::from_secs_f64(d.instance_tick_secs),
         disable_vllm_metrics: false,
         vllm_metrics_host: "127.0.0.1".into(),
-        // Lemonade discovery stays opt-in (mirrors a no-flag embedded daemon).
-        enable_lemonade: false,
-        lemonade_host: "127.0.0.1".into(),
-        lemonade_port: 13305,
+        // Read-only discovery of local external Lemonade; managed registry
+        // discovery remains independent of this switch.
+        enable_lemonade: d.enable_lemonade,
+        lemonade_host: d.lemonade_host.clone(),
+        lemonade_port: d.lemonade_port,
         persist_dir: Some(paths.telemetry_state_dir()),
         // D7 seam consumer: managed services from `rocm serve --managed`.
         services_dir: Some(paths.services_dir()),
@@ -126,9 +129,17 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
 /// the life of the run loop and a read that fails — including the file having
 /// been deleted — leaves the directive frozen at its last value, pinning the
 /// logical clock rather than restoring wall time. The warning goes to `tracing`, not
-/// stdout/stderr: the only caller is [`maybe_spawn_embedded_daemon`] on the
-/// `rocm dash` path, where the TUI owns the terminal (see `logging.rs`) and a
-/// stray write would corrupt the display.
+/// stdout/stderr. It is reached through [`runner_options`], which runtime code
+/// calls only from [`maybe_spawn_embedded_daemon`]; `run_async` calls that only
+/// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for an
+/// interactive `rocm chat` (including the launcher's routes into them; a
+/// non-interactive `rocm chat` renders text and never enters `run_async`), not
+/// for a focused overlay or `rocm dash --replay`/`--demo`. All of this is
+/// unix-only: on Windows [`maybe_spawn_embedded_daemon`] never calls
+/// [`runner_options`], so no entry point reaches the warning. On the paths that
+/// do reach it, the process is about to hand the terminal to the TUI, and the
+/// client log is file-only (see `logging.rs`), so a stray stdout/stderr write
+/// would corrupt the display.
 fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
     let path = paths.dash_test_clock_file();
     if !path.is_file() {
@@ -139,7 +150,7 @@ fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
         "dashboard telemetry clock is in TEST mode, not wall time: a logical \
          clock read from this file drives displayed timestamps, the timestamps \
          written into persisted session records, and every figure derived from \
-         them — generation throughput, latency averages and metric freshness. \
+         them - generation throughput, latency averages and metric freshness. \
          Only the E2E harness creates it; remove it and restart the dashboard to \
          return to wall time (deleting it mid-run pins the logical clock instead)."
     );
@@ -174,16 +185,18 @@ fn anthropic_api_key_for_dash() -> Option<String> {
 }
 
 /// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the
-/// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so the
-/// dash crates stay free of it).
+/// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so
+/// `rocm-dash-tui`, which `crate_edges.rs` still forbids one, stays free of it).
 fn model_recipe_summaries() -> Vec<ModelRecipeSummary> {
     builtin_model_recipes()
         .into_iter()
         .map(|r| ModelRecipeSummary {
+            // Same rule as the chat planner: a host-gated AIM first choice is
+            // not pre-selected when the recipe lists another engine.
+            preferred_engine: crate::freeform_planner::planner_recipe_engine(&r).map(str::to_owned),
             id: r.canonical_model_id,
             aliases: r.aliases,
             task: r.task,
-            preferred_engine: r.preferred_engines.into_iter().next(),
         })
         .collect()
 }
@@ -246,6 +259,29 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
         .collect()
 }
 
+/// Read-only managed-engine inventory, independent of GPU telemetry and
+/// endpoint liveness. An unavailable detect response means unknown, not absent.
+fn lemonade_managed_installed(paths: &AppPaths) -> Option<bool> {
+    let detect = crate::engine_ipc::engine_request::<_, rocm_engine_protocol::DetectResponse>(
+        Some(paths),
+        "lemonade",
+        rocm_engine_protocol::EngineMethod::Detect,
+        &rocm_engine_protocol::DetectRequest::default(),
+    )
+    .ok();
+    managed_installed_from_detect(detect.as_ref())
+}
+
+/// Pure verdict over a Detect result: `None` when Detect failed (unknown, not
+/// absent); otherwise installed only counts when the runtime is managed. A
+/// legacy response without `managed_env` is not proof of a managed install.
+fn managed_installed_from_detect(
+    detect: Option<&rocm_engine_protocol::DetectResponse>,
+) -> Option<bool> {
+    let detect = detect?;
+    Some(detect.installed && detect.managed_env == Some(true))
+}
+
 /// Resolve the TUI args from the unified config + environment.
 ///
 /// MUST be called on a synchronous thread *before* any tokio runtime is entered:
@@ -259,6 +295,14 @@ pub fn resolved_args(
     initial_tab: ActiveTab,
 ) -> ResolvedArgs {
     let t = &config.dashboard.tui;
+    let service_records = rocm_dash_daemon::registry::load_service_records(&paths.services_dir());
+    // One read of the managed-service registry AND one classification pass
+    // over it (`discover_managed_services`), feeding `services_past_attempts`
+    // below. `managed_registry_probe` does NOT reuse this: it needs its own
+    // fresh read on every `snapshot()` call for the life of the session (see
+    // `LiveManagedRegistryProbe`'s own doc comment), not the one-shot read
+    // taken here at launch.
+    let discovery = rocm_dash_daemon::registry::discover_managed_services(&service_records);
     ResolvedArgs {
         connect: t.connect.clone(),
         token: config.dashboard.daemon.token.clone(),
@@ -288,21 +332,94 @@ pub fn resolved_args(
         // pretraining ("ROCm is not compatible with Windows"). Compose the real
         // assistant prompt plus this host's facts here — the bin is the only
         // side with both — and hand the TUI a plain String.
-        chat_system_prompt: Some(crate::rocm_chat_tool_system_prompt_for_host(Some(paths))),
+        chat_system_prompt: Some(crate::chat::rocm_chat_tool_system_prompt_for_host(Some(
+            paths,
+        ))),
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
-        // Records for local servers that are no longer running. The overlay
-        // renders only the live instances the daemon surfaces, so nothing there
-        // would otherwise admit that a failed server was ever recorded.
-        services_past_attempts: services_past_attempts(paths),
+        services_past_attempts: services_past_attempts(&discovery),
+        // Live registry-read seam (issue #145): re-reads `services_dir` fresh
+        // on every call rather than carrying the one-shot `discovery` above
+        // (which still backs only `services_past_attempts`, an intentional
+        // snapshot — see its own doc comment). See
+        // `ManagedRegistryProbe`/`LiveManagedRegistryProbe`.
+        managed_registry_probe: Some(Arc::new(LiveManagedRegistryProbe {
+            services_dir: paths.services_dir(),
+        })),
+        // Set by the caller for a launcher-hosted session (`run`/`run_chat`);
+        // `resolved_args` itself has no opinion, so this always starts `false`
+        // here.
+        launcher_hosted: false,
+        lemonade_managed_installed: lemonade_managed_installed(paths),
     }
 }
 
+/// Live, synchronous read of the managed-service registry — the
+/// `rocm-dash-tui`-side `ManagedRegistryProbe` seam `ResolvedArgs::managed_registry_probe`
+/// carries (issue #145's live-read fix). `rocm-dash-tui` has no dependency on
+/// `rocm-core`/`rocm-dash-daemon` (crate-layering invariants, AGENTS.md §6),
+/// so the actual disk read lives here in the bin and crosses the seam as a
+/// plain trait object, mirroring `tool_exec::RocmToolExecutor`.
+///
+/// Re-reads `services_dir` fresh on every [`snapshot`](ManagedRegistryProbe::snapshot)
+/// call: a local JSON-file read, no daemon round-trip, no network I/O — cheap
+/// enough for the quit-confirm gate to call on every render while the prompt
+/// is open, and the only source of truth at all on Windows, where
+/// `rocm_dash_tui::client`'s `#[cfg(windows)]` arm does connect and stream
+/// live GPU/CPU/memory every tick but — by design, there being no
+/// `rocmdashd` unix socket to source one from (`maybe_spawn_embedded_daemon`
+/// is unix-only) — never sends an instance snapshot, so this probe is also
+/// where `AppState::instances` comes from there: the dashboard polls it
+/// (`ManagedRegistrySnapshot::instances`) once a second off the UI thread.
+///
+/// **Known divergence, same shape as [`services_past_attempts`]'s:** this
+/// reads the record's raw on-disk `status`, not process liveness. A service
+/// whose engine crashed moments ago still reads `ready`/`running` here until
+/// some `rocm services` invocation reconciles the record
+/// (`refresh_managed_service_runtime_liveness`) — see [`ManagedRegistryProbe`]'s
+/// own doc comment for why a local pid check was not added to close that gap.
+#[derive(Debug, Clone)]
+struct LiveManagedRegistryProbe {
+    services_dir: PathBuf,
+}
+
+impl ManagedRegistryProbe for LiveManagedRegistryProbe {
+    fn snapshot(&self) -> ManagedRegistrySnapshot {
+        use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+        let records = load_service_records(&self.services_dir);
+        let discovery = discover_managed_services(&records);
+        ManagedRegistrySnapshot {
+            has_live_service: discovery.svcs.iter().any(|svc| svc.status.is_serving()),
+            instances: managed_instances(&discovery),
+            managed_ids: discovery.seen,
+        }
+    }
+}
+
+/// The live managed services as dashboard instances with no telemetry yet —
+/// the same mapping the daemon applies to a newly discovered service.
+fn managed_instances(
+    discovery: &rocm_dash_daemon::registry::ManagedDiscovery,
+) -> Vec<rocm_dash_core::metrics::Instance> {
+    discovery
+        .svcs
+        .iter()
+        .map(|svc| {
+            rocm_dash_core::traits::merge_instance(
+                svc,
+                &rocm_dash_core::traits::InstanceSample::default(),
+                0,
+                0,
+            )
+        })
+        .collect()
+}
+
 /// Managed-service records that are no longer running, read from the same
-/// registry `rocm services` reads. A status-only file read: no readiness
-/// probes, no daemon.
+/// registry `rocm services` reads. A status-only read over already-loaded
+/// records: no readiness probes, no daemon, no disk I/O of its own.
 ///
 /// **Known divergence — this can read lower than `rocm services list --all`,
 /// which is the command the overlay's own note points at.** The CLI path goes
@@ -341,10 +458,8 @@ pub fn resolved_args(
 /// liveness classification in a second place that could drift from it. Reading
 /// low is the safer failure: the note under this count invites the user to run
 /// `rocm services list --all`, which then shows them the true figure.
-fn services_past_attempts(paths: &AppPaths) -> usize {
-    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
-    let records = load_service_records(&paths.services_dir());
-    discover_managed_services(&records).past_attempts
+const fn services_past_attempts(discovery: &rocm_dash_daemon::registry::ManagedDiscovery) -> usize {
+    discovery.past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -464,7 +579,18 @@ fn validate_replay_path(path: &Path) -> Result<()> {
 }
 
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
-pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
+///
+/// `launcher_hosted` is `true` only when this session was opened FROM the
+/// pre-dashboard launcher's own hub loop ([`run_launcher`]) rather than
+/// directly via `rocm dash` — see `ResolvedArgs::launcher_hosted`'s doc
+/// comment for why that changes this session's own quit behavior (issue
+/// #145's launcher double-prompt fix).
+pub fn run(
+    replay: Option<PathBuf>,
+    demo: bool,
+    chat_mock: bool,
+    launcher_hosted: bool,
+) -> Result<()> {
     // Validate a user-supplied `--replay` path up front — before building the
     // runtime or entering the alt-screen — so a missing/unreadable file fails
     // fast with a clear error and non-zero exit instead of silently taking over
@@ -500,7 +626,8 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     // `zbus::blocking`, which builds its own runtime and `block_on`s internally;
     // doing that on a dash runtime worker thread panics with "Cannot start a
     // runtime from within a runtime". See `run_async`.
-    let args = resolved_args(&config, &paths, ActiveTab::Home);
+    let mut args = resolved_args(&config, &paths, ActiveTab::Home);
+    args.launcher_hosted = launcher_hosted;
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
@@ -528,6 +655,19 @@ const fn launcher_route(choice: LauncherChoice) -> LauncherRoute {
         LauncherChoice::Chat => LauncherRoute::Chat,
         LauncherChoice::OpenDashboard => LauncherRoute::Dashboard,
     }
+}
+
+/// Whether a route escalates into a session the launcher itself hosts —
+/// `run`/`run_chat`'s own `q`/Esc must then exit straight back to this loop
+/// rather than open a second, redundant quit-confirm prompt (issue #145's
+/// double-prompt fix; see `ResolvedArgs::launcher_hosted`'s doc comment). Only
+/// `Chat` and `Dashboard` escalate at all — `Focused` runs in place via
+/// `run_focused`, which never touches `launcher_hosted`. Named and tested on
+/// its own rather than left as two independent `true` literals at the two
+/// call sites below, so a future route added by copying the nearest example
+/// can't silently pass the wrong one.
+const fn launcher_route_hosts_session(route: &LauncherRoute) -> bool {
+    matches!(route, LauncherRoute::Chat | LauncherRoute::Dashboard)
 }
 
 /// Entry point for bare `rocm`: the launcher as a persistent hub.
@@ -583,11 +723,23 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
         let serving = launcher_serving_instances(&paths);
         match rocm_dash_tui::ui::launcher::run_launcher(&theme, serving)? {
             None => return Ok(()),
-            Some(choice) => match launcher_route(choice) {
-                LauncherRoute::Focused(focus) => run_focused(focus)?,
-                LauncherRoute::Chat => run_chat(chat_mock, ChatInferenceParams::default())?,
-                LauncherRoute::Dashboard => run(None, false, chat_mock)?,
-            },
+            Some(choice) => {
+                let route = launcher_route(choice);
+                // This session's own `q`/Esc must not re-ask "May still be
+                // serving — quit anyway?" (issue #145's double-prompt fix) — the
+                // launcher's own gate, re-entered at the top of this loop, is
+                // what actually governs process exit. Derived from `route`
+                // itself (`launcher_route_hosts_session`) rather than a bare
+                // `true` literal at each arm below, so the two can't drift.
+                let launcher_hosted = launcher_route_hosts_session(&route);
+                match route {
+                    LauncherRoute::Focused(focus) => run_focused(focus)?,
+                    LauncherRoute::Chat => {
+                        run_chat(chat_mock, ChatInferenceParams::default(), launcher_hosted)?;
+                    }
+                    LauncherRoute::Dashboard => run(None, false, chat_mock, launcher_hosted)?,
+                }
+            }
         }
     }
 }
@@ -600,18 +752,7 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
 fn launcher_serving_instances(paths: &AppPaths) -> Vec<rocm_dash_core::metrics::Instance> {
     use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
     let records = load_service_records(&paths.services_dir());
-    discover_managed_services(&records)
-        .svcs
-        .into_iter()
-        .map(|svc| rocm_dash_core::metrics::Instance {
-            container_id: svc.container_id,
-            container_name: svc.container_name,
-            model_name: svc.model_name,
-            status: svc.status,
-            port: svc.port,
-            ..Default::default()
-        })
-        .collect()
+    managed_instances(&discover_managed_services(&records))
 }
 
 /// Entry point for a focused launcher flow (Set up / Serve / Diagnose).
@@ -634,13 +775,19 @@ pub fn run_focused(focus: Focus) -> Result<()> {
 /// Chat tab focused. Thin wrapper over the same runtime/`run_async` path as
 /// [`run`]; no replay/demo, embedded daemon as usual. `inference` carries the
 /// `--temperature`/`--top-p`/`--max-tokens` CLI flags, which override any
-/// values configured under `[dashboard.tui]`.
-pub fn run_chat(chat_mock: bool, inference: ChatInferenceParams) -> Result<()> {
+/// values configured under `[dashboard.tui]`. `launcher_hosted` is the same
+/// seam `run` takes — see its own doc comment.
+pub fn run_chat(
+    chat_mock: bool,
+    inference: ChatInferenceParams,
+    launcher_hosted: bool,
+) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
     // See `run`: resolve args (incl. the keyring lookup) before the runtime so the
     // secure-store `zbus::blocking` path never runs on a runtime worker thread.
     let mut args = resolved_args(&config, &paths, ActiveTab::Chat);
+    args.launcher_hosted = launcher_hosted;
     // CLI flags win over the persisted `[dashboard.tui]` chat_* values.
     if let Some(t) = inference.temperature {
         args.chat_temperature = Some(t);
@@ -731,7 +878,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .into_json()
             .with_context(|| format!("parsing the {models_url} response"))?;
         rocm_dash_tui::llm::pick_first_model(&body)
-            .with_context(|| format!("no model found at {models_url} — pass --model explicitly"))?
+            .with_context(|| format!("no model found at {models_url} - pass --model explicitly"))?
     };
 
     // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
@@ -751,7 +898,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         requests,
     };
 
-    println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
+    println!("mode: raw serving throughput (synthetic prompts) - not agent-workload.");
     if auto_ramp {
         println!(
             "endpoint={endpoint} model={model} mode=auto-ramp isl={isl} osl={osl} requests={requests}"
@@ -806,7 +953,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
                 .as_deref()
                 .unwrap_or("no reason recorded");
             eprintln!(
-                "warning: {}/{} requests failed in {} — first failure: {reason}",
+                "warning: {}/{} requests failed in {} - first failure: {reason}",
                 report.failed, report.attempted, row.cell
             );
         }
@@ -827,7 +974,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         }
     }
     println!(
-        "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
+        "note: local saturation smoke-test - client-measured throughput, not an official ROCm/AMD benchmark."
     );
     println!("wrote {} row(s) to {}", reports.len(), csv_path.display());
 
@@ -841,7 +988,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .find_map(|report| report.first_error.as_deref())
             .unwrap_or("no reason recorded");
         anyhow::bail!(
-            "every benchmark request failed against {endpoint} — first failure: {reason}"
+            "every benchmark request failed against {endpoint} - first failure: {reason}"
         );
     }
 
@@ -968,6 +1115,63 @@ async fn maybe_spawn_embedded_daemon(
 mod tests {
     use super::*;
 
+    fn detect(installed: bool, managed_env: Option<bool>) -> rocm_engine_protocol::DetectResponse {
+        let mut v = serde_json::json!({
+            "installed": installed, "env_id": null, "python_version": null,
+            "torch_version": null, "transformers_version": null,
+            "available_devices": [], "notes": [],
+            "capabilities": {"cpu": false, "rocm_gpu": false, "openai_compatible": true,
+                "tool_calling": false, "quantized_models": "", "reasoning_parser": false}
+        });
+        if let Some(m) = managed_env {
+            v["managed_env"] = m.into();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn managed_installed_verdict_follows_detect_result() {
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(true)))),
+            Some(true)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(false)))),
+            Some(false)
+        );
+        // Legacy response without the ownership field proves nothing managed.
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, None))),
+            Some(false)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(false, Some(true)))),
+            Some(false)
+        );
+        // A failed Detect is unknown, never "not installed".
+        assert_eq!(managed_installed_from_detect(None), None);
+    }
+
+    #[test]
+    fn lemonade_discovery_defaults_and_overrides_reach_daemon() {
+        let default = runner_options(&RocmCliConfig::default(), &paths(), false);
+        assert!(default.enable_lemonade);
+        assert_eq!(default.lemonade_host, "127.0.0.1");
+        assert_eq!(default.lemonade_port, 13305);
+        let config: RocmCliConfig = serde_json::from_str(
+            r#"{
+            "dashboard": {"daemon": {"enable_lemonade": false,
+                "lemonade_host": "localhost", "lemonade_port": 14567}}
+        }"#,
+        )
+        .unwrap();
+        let overridden = runner_options(&config, &paths(), false);
+        assert!(!overridden.enable_lemonade);
+        assert_eq!(overridden.lemonade_host, "localhost");
+        assert_eq!(overridden.lemonade_port, 14567);
+        assert_eq!(overridden.services_dir, Some(paths().services_dir()));
+    }
+
     fn cfg() -> RocmCliConfig {
         RocmCliConfig::default()
     }
@@ -978,6 +1182,16 @@ mod tests {
             data_dir: PathBuf::from("/tmp/rocm-data"),
             cache_dir: PathBuf::from("/tmp/rocm-cache"),
         }
+    }
+
+    /// `resolved_args` always injects a probe (issue #145's live-read fix);
+    /// read it now for the assertions below, the same way `AppState` would at
+    /// the moment it actually needs an answer.
+    fn probe_snapshot(args: &ResolvedArgs) -> ManagedRegistrySnapshot {
+        args.managed_registry_probe
+            .as_ref()
+            .expect("resolved_args always injects a live registry probe")
+            .snapshot()
     }
 
     /// The services overlay renders only live instances, so the count of
@@ -1035,8 +1249,10 @@ mod tests {
     /// `running`, and there is no process or listener behind it. That status
     /// string is the whole of what decides the count — this path never consults
     /// a pid and never probes the port, and the on-disk view it deserializes
-    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
-    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) does carry pid fields
+    /// now, for the daemon's process attribution. Discovery on this path derives
+    /// ancestry roots from them too, but the count asserted here comes from the
+    /// record's status string alone and never reads a pid. Asserting 0 is asserting that no refresh happens on this path —
     /// if someone later adds one, this test fails and they are pointed at the
     /// doc comment explaining the trade-off rather than silently flipping a
     /// launch-time read into network I/O.
@@ -1078,6 +1294,358 @@ mod tests {
             "the overlay count is a raw status snapshot; refreshing it here \
              would put per-service endpoint probes on the dashboard launch path"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Paired with `has_live_instance_trusts_a_live_registry_read_before_first_real_snapshot_lands`
+    /// (`rocm-dash-tui`, `app::mod` tests), which proves the quit-confirm gate
+    /// consults the registry read before trusting an empty `instances` map —
+    /// this is the half that proves the bin side actually reads something off
+    /// the registry rather than always returning `false`.
+    #[test]
+    fn resolved_args_reports_a_live_managed_service_at_startup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(probe_snapshot(&args).has_live_service);
+        assert_eq!(
+            probe_snapshot(&args).managed_ids,
+            std::collections::HashSet::from(["svc-live".to_string()]),
+            "the live record's id must be reachable via `rocm services stop`"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Proves the injected probe re-reads the registry on every `snapshot()`
+    /// call rather than caching the state it saw when `resolved_args` built
+    /// it. Every other `resolved_args_*` registry test writes its record(s)
+    /// *before* calling `resolved_args` and never mutates afterward, so a
+    /// probe that cached its first read would also pass every one of them —
+    /// this is the one that would actually catch that regression.
+    #[test]
+    fn live_registry_probe_reflects_a_record_written_after_resolved_args_was_built() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "reread-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+
+        // Built against an empty services dir: nothing live yet.
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        // Write a running record *after* `args` was built, with no call back
+        // into `resolved_args`. A cached probe would still report `false` here.
+        let record_path = p.services_dir().join("live.json");
+        std::fs::write(
+            &record_path,
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        assert!(
+            probe_snapshot(&args).has_live_service,
+            "the probe must re-read the registry, not cache the state it saw at build time"
+        );
+
+        // Remove it again: the probe must flip back, not latch on the first
+        // `true` it ever saw.
+        std::fs::remove_file(&record_path).unwrap();
+        assert!(
+            !probe_snapshot(&args).has_live_service,
+            "the probe must reflect the current registry state, not a one-shot snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows has no daemon, so the dashboard's instance list comes from the
+    /// probe's `instances` (see `AppState::push_host_gpu_snapshot`). A ready
+    /// Lemonade record must come through with its model and port; a stopped
+    /// record and one with no bound port must not.
+    #[test]
+    fn live_registry_probe_carries_the_live_managed_instances() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "probe-instances-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"lemonade-qwen","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M","port":11436,"status":"ready","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("stopped.json"),
+            br#"{"service_id":"lemonade-old","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct","port":11435,"status":"stopped","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"lemonade-unbound","engine":"lemonade","port":0,"status":"ready","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        let instances = probe_snapshot(&args).instances;
+        assert_eq!(
+            instances.len(),
+            1,
+            "only the live, bound record: {instances:?}"
+        );
+        let inst = &instances[0];
+        assert_eq!(inst.container_id, "lemonade-qwen");
+        assert_eq!(inst.model_name, "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M");
+        assert_eq!(inst.port, Some(11436));
+        assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Paired with `resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running`:
+    /// `managed_ids` and `has_live_service` (`ManagedRegistrySnapshot`) are two
+    /// different questions over the same live read (liveness vs. reachability), so a record
+    /// that is not live can still be a managed id — `discover_managed_services`
+    /// only drops a record for a bad status or an unbound port, not for being
+    /// `starting`/`recovering`.
+    #[test]
+    fn resolved_args_managed_ids_includes_a_starting_record() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "managed-ids-starting-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("starting.json"),
+            br#"{"service_id":"svc-starting","engine":"vllm","port":8003,"status":"starting","created_at_unix_ms":4}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+        assert_eq!(
+            probe_snapshot(&args).managed_ids,
+            std::collections::HashSet::from(["svc-starting".to_string()]),
+            "a starting (not yet live) record is still this host's to stop; a \
+             failed one is not a scrape target and must not appear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Isolated `ready`-only fixture: the sibling test above
+    /// (`resolved_args_reports_a_live_managed_service_at_startup`) writes only
+    /// a `running` record, so nothing there actually exercises the `"ready"`
+    /// status on its own (mapped to `InstanceStatus::Ready`, hence
+    /// `is_serving()`, by `registry.rs`'s `instance_status_for_record` —
+    /// `LiveManagedRegistryProbe::snapshot` now delegates to that via
+    /// `discover_managed_services` rather than matching the string itself) —
+    /// a mutation breaking that one status would still pass that sibling test
+    /// via the `running` record.
+    #[test]
+    fn resolved_args_reports_a_ready_managed_service_at_startup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-ready-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"svc-ready","engine":"vllm","port":8005,"status":"ready","created_at_unix_ms":7}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `ready`/`running` record with no bound port never becomes a live
+    /// `Instance` in the authoritative view either (`discovered_from_record`'s
+    /// own `port == 0` exclusion, `registry.rs`), so it must not count here —
+    /// otherwise this startup read would diverge from, rather than merely
+    /// precede, the real snapshot it stands in for.
+    #[test]
+    fn resolved_args_does_not_count_a_record_with_no_bound_port() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-noport-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"svc-unbound","engine":"vllm","port":0,"status":"ready","created_at_unix_ms":6}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `starting`/`recovering` records exist on disk but neither counts as
+    /// "actively serving" here — matching `Instance::status.is_serving()`
+    /// (`Ready`/`Running` only) rather than the broader `is_scrapeable_status`
+    /// set `managed_service_is_live` (`apps/rocm/src/main.rs`) uses.
+    #[test]
+    fn resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-none-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("starting.json"),
+            br#"{"service_id":"svc-starting","engine":"vllm","port":8003,"status":"starting","created_at_unix_ms":4}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `running` record still carrying a recognized `startup_phase`
+    /// (`downloading`/`loading`/`warmup`) is the supervisor's own cold-start
+    /// window — it flips the record to `running` before it starts polling
+    /// `startup_phase` from the serve log (`registry.rs::instance_status_for_record`'s
+    /// own doc comment). That record is `Starting`, not serving, in the
+    /// authoritative live view, so it must not count here either — matching
+    /// `is_serving()` exactly, not just the bare status string.
+    #[test]
+    fn resolved_args_does_not_count_a_running_record_still_in_a_startup_phase() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-phase-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("loading.json"),
+            br#"{"service_id":"svc-loading","engine":"vllm","port":8004,"status":"running","startup_phase":"loading","created_at_unix_ms":5}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1380,6 +1948,24 @@ mod tests {
     }
 
     #[test]
+    fn launcher_route_hosts_session_is_true_only_for_the_two_escalations() {
+        // `launcher_hosted` must be derived from the route
+        // (`launcher_route_hosts_session`), not a bare `true`/`false` literal
+        // written by hand at each escalation arm: a literal can be flipped
+        // without any other test failing, while deriving it from the route
+        // ties the value to what actually hosts the session, so a future
+        // route added by copying the nearest example can't silently carry
+        // the wrong value.
+        assert!(launcher_route_hosts_session(&LauncherRoute::Chat));
+        assert!(launcher_route_hosts_session(&LauncherRoute::Dashboard));
+        for focus in [Focus::Setup, Focus::Serve, Focus::Examine] {
+            assert!(!launcher_route_hosts_session(&LauncherRoute::Focused(
+                focus
+            )));
+        }
+    }
+
+    #[test]
     fn resolved_args_default_has_no_focus() {
         // Normal `rocm dash` / `rocm chat` are NOT focused hosts.
         let args = resolved_args(&cfg(), &paths(), ActiveTab::Home);
@@ -1476,6 +2062,9 @@ mod tests {
         assert_eq!(inst.model_name, "meta-llama/Llama-3.1-8B");
         assert_eq!(inst.port, Some(11435));
         assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
+        // Registry records are owned by this CLI; the flag must survive the map
+        // so lifecycle surfaces treat the launcher row as managed.
+        assert!(inst.managed, "registry-owned record must stay managed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

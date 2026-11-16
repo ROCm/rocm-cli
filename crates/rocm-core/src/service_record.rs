@@ -1,0 +1,1332 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
+//! `ManagedServiceRecord`: the on-disk manifest for a managed inference service.
+//!
+//! Identity, endpoint, process-identity (PID + start-ticks for safe stop /
+//! PID-reuse protection), and inference-readiness bookkeeping.
+//!
+//! Used by `apps/rocm` and `apps/rocmd`; `rocm-dash-daemon` also reads this
+//! on-disk format at runtime, through its own `ServiceRecord` mirror struct
+//! in `registry.rs` rather than this type, and the serde test guards that
+//! contract. `rocm-engine-protocol` mentions `ManagedServiceRecord` solely in
+//! a doc comment. `rocm-dash-core` does not depend on `rocm-core` at all;
+//! `rocm-dash-collectors` does since EAI-8457, but only for the shared bounded
+//! `/dev/kfd` probe, and it never reads this on-disk format either.
+
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::format_http_base_url;
+use crate::unix_time_millis;
+use crate::{ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AppPaths};
+use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
+
+/// Engine state-file key recording when inference was first confirmed.
+///
+/// Written by the engine healthchecks and adopted by
+/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
+/// re-probe what an engine already verified.
+pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
+
+/// Engine state-file key recording the last inference probe attempt.
+pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted_at_unix_ms";
+
+/// Minimum gap between inference probes against a service that is still loading.
+///
+/// Only a *successful* probe latches, so without this a warming model would be
+/// re-probed by every readiness poll — and each attempt costs up to
+/// [`crate::INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
+/// supervisor ticks every few seconds and `services list` sits in front of a
+/// user, so the unthrottled cost lands exactly where it is most visible. The
+/// price of throttling is that readiness can be noticed up to this late.
+pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ManagedServiceRecord {
+    pub service_id: String,
+    pub engine: String,
+    pub model_ref: String,
+    pub canonical_model_id: String,
+    /// The name the running server lists in `/v1/models`, when it differs from
+    /// `canonical_model_id` (a container engine's `canonical_model_id` is the
+    /// image to pull). Adopted from the engine state file; see
+    /// [`Self::served_model_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_id: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub endpoint_url: String,
+    pub mode: String,
+    pub status: String,
+    pub supervisor_pid: u32,
+    pub engine_pid: Option<u32>,
+    /// Kernel start-time of the supervisor (launcher) process, captured at
+    /// spawn. Paired with `supervisor_pid` it forms an identity that survives
+    /// PID recycling, so a later stop never signals a reused PID. `None` for
+    /// records written before this field existed.
+    #[serde(default)]
+    pub supervisor_start_ticks: Option<u64>,
+    /// Kernel start-time of the engine server process, adopted from the engine
+    /// state file whenever `engine_pid` is refreshed from it. The launcher and
+    /// the engine server are distinct processes, so each PID carries its own
+    /// identity token. `None` until the engine state records one.
+    #[serde(default)]
+    pub engine_start_ticks: Option<u64>,
+    /// Whether this service must never come back up without an endpoint key.
+    ///
+    /// The bind address alone cannot answer that. A service bound to loopback is
+    /// unreachable from elsewhere *until something republishes the port* — a
+    /// tailnet publish, a proxy, a container port map — and the publish outlives
+    /// the process. So the requirement has to be recorded next to the service and
+    /// survive a restart, exactly as the key itself does.
+    #[serde(default)]
+    pub requires_api_key: bool,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub env_id: Option<String>,
+    #[serde(default)]
+    pub device_policy: Option<String>,
+    #[serde(default)]
+    pub gpu_indices: Vec<u32>,
+    #[serde(default)]
+    pub engine_recipe_json: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub last_restart_unix_ms: Option<u128>,
+    /// When a stop was requested but could not confirm that every recorded
+    /// process died. It records *intent*: the operator asked for this service to
+    /// go away, so once the processes are observed gone the endpoint key may be
+    /// dropped. A service that merely crashed carries no such intent and keeps
+    /// its key, so it stays restartable/recoverable. Cleared on a confirmed stop
+    /// and on a successful respawn. `None` on records written before this field
+    /// existed, which is the safe default (keep the key).
+    #[serde(default)]
+    pub stop_requested_unix_ms: Option<u128>,
+    /// The stop marker a liveness refresh cleared off a record that named no
+    /// process, kept as the evidence that it was cleared and not by a relaunch.
+    ///
+    /// A record naming no process has nothing for a pending stop to wait on, so
+    /// the refresh drops the marker (and the key) at once. A `starting` or
+    /// `failed` record is left at that status, and a stop that began on such a
+    /// record would then find it with no marker and nothing recorded, which is
+    /// also what a relaunch that has not recorded its supervisor yet looks like.
+    /// This holds the marker's value (the stop's own request stamp), so the stop
+    /// can tell its own marker having been consumed from a relaunch having
+    /// cleared it ([`Self::is_covered_by_stop_of`]). Cleared by a restart
+    /// ([`Self::reset_for_restart`]); absent from records that never had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_stop_unix_ms: Option<u128>,
+    /// The generation of a relaunch that has begun but not yet published its
+    /// processes: stamped by `rocm services restart` once its own stop has
+    /// confirmed and before it restores the endpoint key or spawns, and cleared
+    /// when the restart publishes ([`Self::reset_for_restart`]).
+    ///
+    /// Until then the record is an empty `stopped` manifest, which is also what a
+    /// stop's own completion looks like, so a stop that read the record earlier
+    /// would claim it and delete the key the restart restored for its child. A
+    /// stop covers the record only while the record carries the generation the
+    /// stop read ([`Self::is_covered_by_stop_of`]). Absent from records that are
+    /// not between a restart's stop and its publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunch_started_unix_ms: Option<u128>,
+    /// When the last inference probe was attempted. Throttles re-probing of a
+    /// service that is listed but still loading — see
+    /// [`crate::INFERENCE_PROBE_RETRY_INTERVAL`]. Absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_probe_attempted_at_unix_ms: Option<u64>,
+    /// Coarse startup stage (`downloading`/`loading`/`warmup`) parsed from the
+    /// serve process's own log output while it is coming up. Set to `None` once
+    /// the service reaches `ready`, and absent on older on-disk records.
+    #[serde(default)]
+    pub startup_phase: Option<String>,
+    /// When a real inference request first succeeded against this service. Once
+    /// set, readiness checks stop re-probing and fall back to the cheap endpoint
+    /// query — see [`crate::managed_service_endpoint_readiness`]. Adopted from the
+    /// engine state file when present, and absent on records written before
+    /// readiness was gated on inference.
+    #[serde(default)]
+    pub inference_verified_at_unix_ms: Option<u64>,
+    /// Base URL of the Anthropic-compatible `/v1/messages` endpoint, once the
+    /// serving process has published one. Adopted from the engine state file (see
+    /// [`crate::anthropic_endpoint`]); `None` while the service is still coming up
+    /// and on records written before the endpoint existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_url: Option<String>,
+    /// How [`Self::anthropic_endpoint_url`] is provided: `proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_mode: Option<String>,
+    pub manifest_path: PathBuf,
+    pub log_path: PathBuf,
+    pub engine_state_path: PathBuf,
+    pub created_at_unix_ms: u128,
+}
+
+/// Whether the engine `Stop` verdict decides that a stop is confirmed.
+///
+/// True for engines whose service is a container rather than a recorded
+/// process: the engine `Stop` is the only thing that stops one, so its verdict,
+/// not the PID signalling, decides. For a PID-supervised
+/// engine the PIDs are authoritative and the engine `Stop` is reported only.
+/// Shared by `rocm` and `rocmd` so the two stop paths cannot disagree.
+#[must_use]
+pub fn engine_stop_decides_confirmation(engine: &str) -> bool {
+    engine == "aim"
+}
+
+/// No record exists for the requested service id.
+///
+/// [`ManagedServiceRecord::read_manifest`] returns this, as the root of its
+/// error, only when the manifest file is absent. Its message is the whole
+/// story for the user, so it carries no OS cause; a manifest that exists but
+/// cannot be read or parsed surfaces its cause instead. Callers can tell the
+/// two apart with `err.downcast_ref::<ManagedServiceNotFound>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedServiceNotFound {
+    pub service_id: String,
+}
+
+impl std::fmt::Display for ManagedServiceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No local server named `{}`. See `rocm services list --all`.",
+            self.service_id
+        )
+    }
+}
+
+impl std::error::Error for ManagedServiceNotFound {}
+
+impl ManagedServiceRecord {
+    /// Read and parse the record for `service_id` exactly as it is on disk.
+    ///
+    /// The single loader behind every command that takes a service id, in both
+    /// `rocm` and `rocmd`. A missing manifest is [`ManagedServiceNotFound`];
+    /// any other read failure (permission denied, a directory in its place) and
+    /// a manifest that does not parse keep their underlying cause. The caller
+    /// validates the id first; this only joins it onto the services directory.
+    pub fn read_manifest(paths: &AppPaths, service_id: &str) -> Result<Self> {
+        let manifest_path = paths.service_manifest_path(service_id);
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ManagedServiceNotFound {
+                    service_id: service_id.to_owned(),
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to read the record for local server `{service_id}` at {}",
+                    manifest_path.display()
+                )));
+            }
+        };
+        serde_json::from_slice::<Self>(&bytes)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        paths: &AppPaths,
+        service_id: impl Into<String>,
+        engine: impl Into<String>,
+        model_ref: impl Into<String>,
+        canonical_model_id: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        mode: impl Into<String>,
+        supervisor_pid: u32,
+        runtime_id: Option<String>,
+        env_id: Option<String>,
+        device_policy: Option<String>,
+    ) -> Self {
+        let service_id = service_id.into();
+        let engine = engine.into();
+        let host = host.into();
+        let manifest_path = paths.service_manifest_path(&service_id);
+        let log_path = paths.service_log_path(&service_id);
+        let engine_state_path = paths.service_engine_state_path(&engine, &service_id);
+        Self {
+            endpoint_url: format!("{}/v1", format_http_base_url(&host, port)),
+            service_id,
+            engine,
+            model_ref: model_ref.into(),
+            canonical_model_id: canonical_model_id.into(),
+            served_model_id: None,
+            host,
+            port,
+            mode: mode.into(),
+            status: "starting".to_owned(),
+            supervisor_pid,
+            engine_pid: None,
+            supervisor_start_ticks: None,
+            engine_start_ticks: None,
+            // Off unless a caller says otherwise: local loopback serving stays
+            // credential-free, which is the unchanged default.
+            requires_api_key: false,
+            runtime_id,
+            env_id,
+            device_policy,
+            gpu_indices: Vec::new(),
+            engine_recipe_json: None,
+            restart_count: 0,
+            last_restart_unix_ms: None,
+            stop_requested_unix_ms: None,
+            settled_stop_unix_ms: None,
+            relaunch_started_unix_ms: None,
+            startup_phase: None,
+            inference_verified_at_unix_ms: None,
+            inference_probe_attempted_at_unix_ms: None,
+            anthropic_endpoint_url: None,
+            anthropic_endpoint_mode: None,
+            manifest_path,
+            log_path,
+            engine_state_path,
+            created_at_unix_ms: unix_time_millis(),
+        }
+    }
+
+    /// The model name to look for in the endpoint's `/v1/models` and to send in
+    /// requests: the served name when the engine reported one, else the
+    /// canonical id, else the model ref.
+    #[must_use]
+    pub fn served_model_name(&self) -> &str {
+        [
+            self.served_model_id.as_deref().unwrap_or_default(),
+            self.canonical_model_id.as_str(),
+            self.model_ref.as_str(),
+        ]
+        .into_iter()
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or_default()
+    }
+
+    /// Drop the per-run state that a restart invalidates, and count the restart.
+    ///
+    /// A restart reuses this manifest but spawns a different server with an
+    /// unloaded model, so anything describing the previous run has to go. Chiefly
+    /// the inference verification: left set, it short-circuits readiness straight
+    /// back to "ready" as soon as the new server lists the model, reinstating the
+    /// false positive the probe exists to prevent. The engine's own state file is
+    /// rewritten from scratch on restart, so only this copy needs clearing — and
+    /// [`Self::refresh_from_engine_state`] only ever adopts a verification, never
+    /// clears one, so a stale value here would survive indefinitely.
+    pub fn reset_for_restart(&mut self) {
+        self.inference_verified_at_unix_ms = None;
+        self.inference_probe_attempted_at_unix_ms = None;
+        // The respawned process publishes its own endpoint; the old proxy port
+        // died with the previous run.
+        self.anthropic_endpoint_url = None;
+        self.anthropic_endpoint_mode = None;
+        // A relaunch is no longer the stop that was settled under it, and it is
+        // published now, so it is no longer waiting to be.
+        self.settled_stop_unix_ms = None;
+        self.relaunch_started_unix_ms = None;
+        self.restart_count = self.restart_count.saturating_add(1);
+        self.last_restart_unix_ms = Some(unix_time_millis());
+    }
+
+    /// Record `pid` as the supervisor, together with its start-time token.
+    ///
+    /// Call it while the process is known to be alive — just after spawning
+    /// it. A stop verifies a recorded PID against its token before signalling
+    /// it, and [`crate::identity_state`] treats a PID recorded *without* one as
+    /// a match, so a PID written on its own is signalled on trust alone once it
+    /// has been recycled. Writing the two together is what keeps that from
+    /// happening at whichever site records a PID next.
+    pub fn record_supervisor_identity(&mut self, pid: u32) {
+        self.supervisor_pid = pid;
+        self.supervisor_start_ticks = crate::process_start_ticks(pid);
+    }
+
+    /// Whether `self` and `other` — two snapshots of one service's record —
+    /// name the same processes, token for token.
+    ///
+    /// A stop reads the record, signals what it names, and only then writes its
+    /// verdict. If the record names different processes by then — a restart
+    /// recorded its new supervisor meanwhile — the verdict does not cover them,
+    /// and both `rocm services stop` and `rocmd`'s stop gate their "stopped"
+    /// claim on this.
+    pub fn names_same_processes(&self, other: &Self) -> bool {
+        self.supervisor_pid == other.supervisor_pid
+            && self.supervisor_start_ticks == other.supervisor_start_ticks
+            && self.engine_pid == other.engine_pid
+            && self.engine_start_ticks == other.engine_start_ticks
+    }
+
+    /// Whether `self`, the record as it is now, is still the record of the
+    /// service that `stopping`, the copy the stop read before it signalled
+    /// anything, was stopping: the stop's verdict covers what it names.
+    ///
+    /// True when the two name the same processes
+    /// ([`Self::names_same_processes`]), and also when `self` names none because
+    /// the same stop was completed under it: a liveness refresh that saw every
+    /// recorded process gone, with the stop requested, clears the processes and
+    /// reads the record as `stopped` (the deferred cleanup). A record reading
+    /// `stopped` that names no process has nothing left that the stop did not
+    /// handle, so the stop's own confirmation is still true of it.
+    ///
+    /// False for a restart that recorded new processes, and equally for one that
+    /// is mid-launch with none recorded yet: that record reads `starting` (or
+    /// another live status) with the stop marker cleared, not `stopped`, and
+    /// claiming it stopped, or dropping the key it will serve with, would be
+    /// false. That holds when the stopping snapshot itself names no process too:
+    /// an empty record is covered only while it still carries the stop's marker,
+    /// once it reads `stopped`, or once a liveness refresh consumed that very
+    /// marker ([`Self::settled_stop_unix_ms`]), which leaves a `starting` or
+    /// `failed` record at its status with the marker gone.
+    ///
+    /// Never true for a record in another relaunch generation than the stop read
+    /// ([`Self::relaunch_started_unix_ms`]): a restart that has stopped the
+    /// service and not yet published its child leaves an empty `stopped` record
+    /// that an older stop would otherwise take for its own completion.
+    #[must_use]
+    pub fn is_covered_by_stop_of(&self, stopping: &Self) -> bool {
+        if self.relaunch_started_unix_ms != stopping.relaunch_started_unix_ms {
+            return false;
+        }
+        if self.status == "stopped" && self.names_no_process() {
+            return true;
+        }
+        // The same processes. When they are none, that equality is also what a
+        // relaunch that has not recorded its supervisor yet looks like, so it
+        // proves nothing: the stop's own marker is what tells the two apart, since
+        // a restart clears it and a stop that is still finalizing has it on disk.
+        // A marker that is gone is the stop's own only when the refresh that
+        // consumed it left its stamp behind; a restart wipes that stamp.
+        self.names_same_processes(stopping)
+            && (!stopping.names_no_process()
+                || self.stop_requested_unix_ms.is_some()
+                || (stopping.stop_requested_unix_ms.is_some()
+                    && self.settled_stop_unix_ms == stopping.stop_requested_unix_ms))
+    }
+
+    /// Stamp the record as a relaunch that has begun and not yet published its
+    /// processes, as a generation no earlier stop or relaunch carried. See
+    /// [`Self::relaunch_started_unix_ms`].
+    pub fn begin_relaunch(&mut self) {
+        let now = unix_time_millis();
+        self.relaunch_started_unix_ms = Some(
+            now.max(
+                self.relaunch_started_unix_ms
+                    .map_or(0, |earlier| earlier + 1),
+            ),
+        );
+    }
+
+    /// Whether the record names neither a supervisor nor an engine process.
+    const fn names_no_process(&self) -> bool {
+        self.supervisor_pid == 0
+            && self.supervisor_start_ticks.is_none()
+            && self.engine_pid.is_none()
+            && self.engine_start_ticks.is_none()
+    }
+
+    /// Record `pid` as the engine, together with its start-time token. See
+    /// [`Self::record_supervisor_identity`].
+    pub fn record_engine_identity(&mut self, pid: u32) {
+        self.engine_pid = Some(pid);
+        self.engine_start_ticks = crate::process_start_ticks(pid);
+    }
+
+    /// Forget the processes this record names: the supervisor and the engine,
+    /// each with its start-time token.
+    ///
+    /// For a stop that has confirmed every one of them gone, and for nothing
+    /// else. A recorded PID goes stale the instant its process exits, and a
+    /// later stop of the same record would signal whatever the OS has since
+    /// handed that number to; a PID recorded without a token cannot be
+    /// refuted, and on Windows none can, so the tree kill would take that
+    /// process and everything under it. `rocm services stop` and `rocmd`'s stop
+    /// both call this on the confirmed path, so the two leave the same record
+    /// behind. An unconfirmed stop keeps the PIDs: the record is the only thing
+    /// that names a survivor.
+    pub const fn clear_recorded_processes(&mut self) {
+        self.supervisor_pid = 0;
+        self.supervisor_start_ticks = None;
+        self.engine_pid = None;
+        self.engine_start_ticks = None;
+    }
+
+    pub fn normalize_paths_for_host(&mut self) {
+        self.manifest_path = normalize_runtime_path_for_host(&self.manifest_path);
+        self.log_path = normalize_runtime_path_for_host(&self.log_path);
+        self.engine_state_path = normalize_runtime_path_for_host(&self.engine_state_path);
+    }
+
+    pub fn refresh_from_engine_state(&mut self) -> Result<bool> {
+        if !matches!(
+            self.status.as_str(),
+            "starting" | "running" | "recovering" | "ready"
+        ) {
+            return Ok(false);
+        }
+        self.normalize_paths_for_host();
+        if !self.engine_state_path.is_file() {
+            return Ok(false);
+        }
+        let bytes = fs::read(&self.engine_state_path)
+            .with_context(|| format!("failed to read {}", self.engine_state_path.display()))?;
+        let state = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .with_context(|| format!("failed to parse {}", self.engine_state_path.display()))?;
+        let Some(status) = state
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| matches!(*value, "ready" | "running" | "starting" | "failed"))
+        else {
+            return Ok(false);
+        };
+
+        let previous = self.status.clone();
+        status.clone_into(&mut self.status);
+        if let Some(endpoint_url) = state
+            .get("endpoint_url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            endpoint_url.clone_into(&mut self.endpoint_url);
+        }
+        // `requested_runtime_id` is the selector the launch asked for: an exact
+        // runtime key or a family id, whichever was requested. `runtime_id` is
+        // only what the engine resolved that to, which for a TheRock runtime is
+        // the manifest's family id (`therock-release:gfx120X-all`), shared by
+        // every installed version of that family. When the launch pinned an
+        // exact key, adopting the resolved form would throw away the version
+        // the service is really on, and the record is what a restart re-pins
+        // and what runtime activation compares against. Prefer the requested
+        // value, falling back to the resolved one for engines that record only
+        // that. A blank value in either field is ignored.
+        if let Some(runtime_id) = ["requested_runtime_id", "runtime_id"]
+            .into_iter()
+            .filter_map(|key| state.get(key).and_then(serde_json::Value::as_str))
+            .find(|value| !value.trim().is_empty())
+        {
+            self.runtime_id = Some(runtime_id.to_owned());
+        }
+        if let Some(env_id) = state
+            .get("env_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.env_id = Some(env_id.to_owned());
+        }
+        if let Some(served) = state
+            .get("served_model_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.served_model_id = Some(served.to_owned());
+        }
+        // Adopt the engine server PID together with ITS OWN start-time token so
+        // a later stop verifies the server process, not the launcher. The ticks
+        // key must match the PID key: `server_pid`↔`server_start_ticks`,
+        // `pid`↔`start_ticks`.
+        let engine_pid = state
+            .get("server_pid")
+            .and_then(serde_json::Value::as_u64)
+            .map(|pid| (pid, "server_start_ticks"))
+            .or_else(|| {
+                state
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|pid| (pid, "start_ticks"))
+            });
+        if let Some((pid, ticks_key)) = engine_pid
+            && let Ok(engine_pid) = u32::try_from(pid)
+        {
+            self.engine_pid = Some(engine_pid);
+            // When `server_pid` names the same process as `pid`, `start_ticks`
+            // is that process's token too. vLLM wrote its state that way —
+            // `server_pid` equal to `pid`, and only `start_ticks` — before it
+            // wrote `server_start_ticks`, so without this the PID of every such
+            // service was adopted with no token, and a stop could only signal
+            // it blind once the PID had been recycled.
+            self.engine_start_ticks = state
+                .get(ticks_key)
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    (state.get("pid").and_then(serde_json::Value::as_u64) == Some(pid))
+                        .then(|| state.get("start_ticks").and_then(serde_json::Value::as_u64))
+                        .flatten()
+                });
+        }
+        // Adopt the engine's inference verification so the CLI side does not
+        // re-probe a service the engine healthcheck already confirmed.
+        if self.inference_verified_at_unix_ms.is_none()
+            && let Some(verified_at) = state
+                .get(INFERENCE_VERIFIED_STATE_KEY)
+                .and_then(serde_json::Value::as_u64)
+        {
+            self.inference_verified_at_unix_ms = Some(verified_at);
+        }
+        // The endpoint belongs to the run that published it, so it is replaced
+        // rather than kept: a restarted proxy listens on a different port.
+        let published = |key: &str| {
+            state
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(url) = published(ANTHROPIC_ENDPOINT_URL_STATE_KEY) {
+            self.anthropic_endpoint_url = Some(url);
+            self.anthropic_endpoint_mode = published(ANTHROPIC_ENDPOINT_MODE_STATE_KEY);
+        }
+        Ok(self.status != previous)
+    }
+
+    /// Whether this record still reserves its port: the sole definition of
+    /// "live" shared between the CLI's launch-time port check and `rocmd`'s
+    /// recovery. Same predicate, not same data: the CLI's `load_managed_services`
+    /// refreshes each record's PID/endpoint liveness before this runs, while
+    /// `rocmd::persistence::load_managed_services` reads the file as-is. A
+    /// record whose process has died since its last write can therefore still
+    /// read `is_live()` to `rocmd` after the CLI would have refreshed it to
+    /// `"stopped"`. That fails safe — recovery defers rather than racing a
+    /// collision — but it can stall on a stale record until something else
+    /// rewrites it.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
+    /// Mark a launch the CLI has just abandoned — its child terminated, the
+    /// error already reported to the user — as over, while keeping the record
+    /// and log for `rocm services`/`rocm logs` to show.
+    ///
+    /// The status is `stopped`, not `failed`, on purpose: `rocmd`'s recovery
+    /// scan restarts a managed `failed` record that carries no stop marker, so
+    /// a `failed` record here could be respawned after the CLI reported the
+    /// launch as failed. A stop marker would not hold either, because the
+    /// liveness refresh clears it as soon as the recorded PIDs are gone.
+    /// `rocmd`'s `find_recoverable_service` ignores `stopped`.
+    pub fn mark_launch_abandoned(&mut self) {
+        self.status = "stopped".to_owned();
+    }
+
+    /// Whether this live record reserves `port` — the sole collision check
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check.
+    /// See [`Self::is_live`]'s doc for the data-freshness gap between the two
+    /// callers.
+    ///
+    /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
+    /// blocks the loopback address a competing bind would target, so comparing
+    /// hosts would under-detect a real collision rather than merely cost one
+    /// skipped candidate.
+    #[must_use]
+    pub fn blocks_port(&self, port: u16) -> bool {
+        self.is_live() && self.port == port
+    }
+
+    fn with_storage_paths(&self) -> Self {
+        let mut record = self.clone();
+        record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);
+        record.log_path = normalize_runtime_path_for_storage(&record.log_path);
+        record.engine_state_path = normalize_runtime_path_for_storage(&record.engine_state_path);
+        record
+    }
+
+    pub fn write(&self) -> Result<()> {
+        let mut host_record = self.clone();
+        host_record.normalize_paths_for_host();
+        let parent = host_record
+            .manifest_path
+            .parent()
+            .context("service manifest path must have a parent directory")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let storage_record = host_record.with_storage_paths();
+        let bytes = serde_json::to_vec_pretty(&storage_record)
+            .context("failed to serialize service record")?;
+        let manifest_path = &host_record.manifest_path;
+        crate::atomic_write::write_file_atomically(manifest_path, &bytes).with_context(|| {
+            format!(
+                "failed to write service manifest {}",
+                manifest_path.display()
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
+    use crate::test_support::{probe_test_record, retired_temp_path, temp_app_paths};
+
+    /// An unknown id reads as one plain sentence pointing at the listing
+    /// command, with no OS error chained under it.
+    #[test]
+    fn read_manifest_reports_a_missing_record_as_not_found_without_an_os_cause() {
+        let (root, paths) = temp_app_paths("read-manifest-missing");
+        let error =
+            ManagedServiceRecord::read_manifest(&paths, "nope").expect_err("no record was written");
+        assert_eq!(
+            error.downcast_ref::<ManagedServiceNotFound>(),
+            Some(&ManagedServiceNotFound {
+                service_id: "nope".to_owned()
+            })
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "No local server named `nope`. See `rocm services list --all`."
+        );
+        assert_eq!(error.chain().count(), 1, "{error:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A manifest path that exists but cannot be read is not "not found": the
+    /// OS error stays in the chain so the user can act on it.
+    #[test]
+    fn read_manifest_keeps_the_cause_of_an_unreadable_record() {
+        let (root, paths) = temp_app_paths("read-manifest-unreadable");
+        fs::create_dir_all(paths.service_manifest_path("svc-dir")).expect("dir in place");
+        let error = ManagedServiceRecord::read_manifest(&paths, "svc-dir")
+            .expect_err("a directory is not a readable record");
+        assert!(error.downcast_ref::<ManagedServiceNotFound>().is_none());
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some(),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("svc-dir"),
+            "names the record: {error:#}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A corrupt manifest exists, so it is a parse failure with its cause, not
+    /// "not found".
+    #[test]
+    fn read_manifest_keeps_the_cause_of_a_corrupt_record() {
+        let (root, paths) = temp_app_paths("read-manifest-corrupt");
+        let manifest = paths.service_manifest_path("svc-corrupt");
+        fs::create_dir_all(manifest.parent().expect("parent")).expect("services dir");
+        fs::write(&manifest, b"{ not json").expect("write corrupt");
+        let error = ManagedServiceRecord::read_manifest(&paths, "svc-corrupt")
+            .expect_err("corrupt json must not parse");
+        assert!(error.downcast_ref::<ManagedServiceNotFound>().is_none());
+        assert!(
+            error.to_string().starts_with("failed to parse "),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<serde_json::Error>()
+                .is_some(),
+            "{error:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restarting_drops_the_previous_runs_inference_verification() {
+        // The restarted child is a different server with an unloaded model. If the
+        // verification carried over, readiness would short-circuit to "ready" the
+        // moment the new server listed the model — the original false positive,
+        // reinstated. `refresh_from_engine_state` only ever adopts a verification,
+        // so nothing downstream would clear it.
+        let mut record = probe_test_record(11435);
+        record.inference_verified_at_unix_ms = Some(1);
+        record.inference_probe_attempted_at_unix_ms = Some(1);
+        record.restart_count = 2;
+
+        record.reset_for_restart();
+
+        assert_eq!(record.inference_verified_at_unix_ms, None);
+        assert_eq!(
+            record.inference_probe_attempted_at_unix_ms, None,
+            "the retry throttle is per-run too; the new child deserves an              immediate first probe"
+        );
+        assert_eq!(record.restart_count, 3);
+        assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    #[test]
+    fn blocks_port_needs_a_live_record_on_that_exact_port() {
+        let mut record = probe_test_record(11435);
+        record.status = "running".to_owned();
+        assert!(record.blocks_port(11435));
+        assert!(
+            !record.blocks_port(11436),
+            "a different port is not blocked"
+        );
+        record.status = "stopped".to_owned();
+        assert!(
+            !record.blocks_port(11435),
+            "a stopped record blocks nothing"
+        );
+    }
+
+    /// Writes `state` as the record's engine state file and runs the refresh.
+    fn refresh_from_state(name: &str, state: &serde_json::Value) -> ManagedServiceRecord {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-engine-state-{name}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create state dir");
+        let mut record = probe_test_record(11437);
+        record.status = "running".to_owned();
+        record.engine_state_path = dir.join("state.json");
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(state).expect("serialize state"),
+        )
+        .expect("write state");
+        record.refresh_from_engine_state().expect("refresh");
+        let _ = fs::remove_dir_all(dir);
+        record
+    }
+
+    /// The serving process publishes the Anthropic endpoint in the engine state;
+    /// the record adopts it, and a restart drops it so the next run's port wins.
+    #[test]
+    fn engine_refresh_adopts_the_published_anthropic_endpoint() {
+        let record = refresh_from_state(
+            "anthropic",
+            &serde_json::json!({
+                "status": "ready",
+                "anthropic_endpoint_url": "http://127.0.0.1:40123",
+                "anthropic_endpoint_mode": "proxy",
+            }),
+        );
+        assert_eq!(
+            record.anthropic_endpoint_url.as_deref(),
+            Some("http://127.0.0.1:40123")
+        );
+        assert_eq!(record.anthropic_endpoint_mode.as_deref(), Some("proxy"));
+
+        let mut record = record;
+        record.reset_for_restart();
+        assert_eq!(record.anthropic_endpoint_url, None);
+        assert_eq!(record.anthropic_endpoint_mode, None);
+
+        let record = refresh_from_state("no-anthropic", &serde_json::json!({ "status": "ready" }));
+        assert_eq!(record.anthropic_endpoint_url, None);
+    }
+
+    /// A container engine serves under a different name than the image it pulls;
+    /// the record adopts that name from the engine state, and every readiness
+    /// probe asks for it rather than for the image reference.
+    #[test]
+    fn engine_refresh_adopts_the_served_model_name_for_readiness_probes() {
+        let mut record = probe_test_record(11438);
+        record.canonical_model_id = "org/aim-image:1".to_owned();
+        assert_eq!(record.served_model_name(), "org/aim-image:1");
+
+        let record = refresh_from_state(
+            "served-name",
+            &serde_json::json!({ "status": "running", "served_model_id": "Org/Served-Model" }),
+        );
+        assert_eq!(record.served_model_id.as_deref(), Some("Org/Served-Model"));
+        assert_eq!(record.served_model_name(), "Org/Served-Model");
+
+        let record = refresh_from_state(
+            "blank-served-name",
+            &serde_json::json!({ "status": "running", "served_model_id": "  " }),
+        );
+        assert_eq!(record.served_model_id, None);
+    }
+
+    /// vLLM records one process as both `pid` and `server_pid` with only
+    /// `start_ticks`. The refresh prefers `server_pid`, so it has to find that
+    /// process's token under `start_ticks`, or the PID is adopted with none.
+    #[test]
+    fn engine_refresh_takes_start_ticks_when_server_pid_is_the_same_process() {
+        let record = refresh_from_state(
+            "same-pid",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 4321,
+                "server_pid": 4321,
+                "start_ticks": 987_u64,
+            }),
+        );
+        assert_eq!(record.engine_pid, Some(4321));
+        assert_eq!(record.engine_start_ticks, Some(987));
+    }
+
+    /// The fallback is only for the same process: a distinct server PID never
+    /// borrows the launcher's token, which would make the stop's identity check
+    /// refute the server and leave it running.
+    #[test]
+    fn engine_refresh_never_gives_a_server_pid_the_launchers_token() {
+        let record = refresh_from_state(
+            "distinct-pid",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 100,
+                "server_pid": 200,
+                "start_ticks": 111_u64,
+            }),
+        );
+        assert_eq!(record.engine_pid, Some(200));
+        assert_eq!(record.engine_start_ticks, None);
+
+        let record = refresh_from_state(
+            "distinct-pid-own-token",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 100,
+                "server_pid": 200,
+                "start_ticks": 111_u64,
+                "server_start_ticks": 222_u64,
+            }),
+        );
+        assert_eq!(record.engine_start_ticks, Some(222));
+    }
+
+    /// Each role is written with its own PID's token, so a stop can verify it.
+    /// A role recorded without one is signalled on trust alone once its PID has
+    /// been recycled. One live process stands in for both roles, as it does for
+    /// a `rocm serve --background` launch.
+    ///
+    /// Linux-only here, because it spawns `sleep`: `process_start_ticks` gives a
+    /// token on Linux and on Windows (the creation time) and is `None` elsewhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_a_process_identity_writes_the_pid_with_its_own_token() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let expected = crate::process_start_ticks(pid);
+        let mut record = probe_test_record(11436);
+
+        record.record_supervisor_identity(pid);
+        record.record_engine_identity(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(expected.is_some(), "precondition: a live child has a token");
+        assert_eq!(record.supervisor_pid, pid);
+        assert_eq!(record.supervisor_start_ticks, expected);
+        assert_eq!(record.engine_pid, Some(pid));
+        assert_eq!(record.engine_start_ticks, expected);
+    }
+
+    /// What a stop that confirmed its processes gone leaves behind: no PID and
+    /// no token for either role, and nothing else touched.
+    #[test]
+    fn clearing_the_recorded_processes_clears_each_pid_and_its_token_and_nothing_else() {
+        let mut record = probe_test_record(11437);
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = Some(5);
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
+        record.status = "ready".to_owned();
+        record.restart_count = 3;
+        let before = record.clone();
+
+        record.clear_recorded_processes();
+
+        assert_eq!(record.supervisor_pid, 0);
+        assert_eq!(record.supervisor_start_ticks, None);
+        assert_eq!(record.engine_pid, None);
+        assert_eq!(record.engine_start_ticks, None);
+        assert_eq!(record.service_id, before.service_id);
+        assert_eq!(record.status, "ready");
+        assert_eq!(record.restart_count, 3);
+        assert_eq!(record.port, before.port);
+        // A cleared record no longer names what it named, so a stop that read it
+        // before and finds this after does not claim the same processes.
+        assert!(!before.names_same_processes(&record));
+        assert!(record.names_same_processes(&record.clone()));
+    }
+
+    /// What a stop's verdict still covers, record by record: the same processes,
+    /// or none because the same stop was completed under it (`stopped`, nothing
+    /// recorded). A restart's record is never covered: new processes recorded, or
+    /// still starting with none recorded yet.
+    #[test]
+    fn a_stop_is_covered_by_the_same_processes_or_by_its_own_completion_and_not_by_a_relaunch() {
+        let mut stopping = probe_test_record(11438);
+        stopping.supervisor_pid = 4242;
+        stopping.supervisor_start_ticks = None;
+        stopping.engine_pid = Some(4243);
+        stopping.engine_start_ticks = Some(77);
+        stopping.status = "ready".to_owned();
+        let record_with = |status: &str, pid: u32, engine: Option<u32>| {
+            let mut record = stopping.clone();
+            status.clone_into(&mut record.status);
+            record.supervisor_pid = pid;
+            record.supervisor_start_ticks = None;
+            record.engine_pid = engine;
+            record.engine_start_ticks = None;
+            record
+        };
+        // (what the record on disk is now, whether the stop still covers it)
+        let rows = [
+            ("unchanged", stopping.clone(), true),
+            // The deferred cleanup of this very stop: every process gone, so the
+            // record is stopped and names none.
+            (
+                "completed under the stop",
+                record_with("stopped", 0, None),
+                true,
+            ),
+            // A restart that recorded new processes.
+            (
+                "relaunched, ready",
+                record_with("ready", 5555, Some(5556)),
+                false,
+            ),
+            (
+                "relaunched, starting",
+                record_with("starting", 5555, None),
+                false,
+            ),
+            // A restart mid-launch that has not recorded anything yet: not a stop.
+            (
+                "restarting, nothing recorded",
+                record_with("starting", 0, None),
+                false,
+            ),
+            (
+                "recovering, nothing recorded",
+                record_with("recovering", 0, None),
+                false,
+            ),
+            (
+                "ready, nothing recorded",
+                record_with("ready", 0, None),
+                false,
+            ),
+            // Stopped, but naming a process the stop did not handle.
+            (
+                "stopped, other process",
+                record_with("stopped", 5555, None),
+                false,
+            ),
+        ];
+        for (name, record, covered) in rows {
+            assert_eq!(record.is_covered_by_stop_of(&stopping), covered, "{name}");
+        }
+
+        // The same table from a stopping snapshot that names no process: an
+        // untouched record (the stop's own marker still on it, or completed to
+        // `stopped`) is that stop; an empty relaunch that has cleared the marker is
+        // not, and neither is one that has recorded processes.
+        let mut empty = stopping.clone();
+        empty.clear_recorded_processes();
+        empty.stop_requested_unix_ms = Some(1);
+        let with_marker = |status: &str, marker: Option<u128>, pid: u32| {
+            let mut record = empty.clone();
+            status.clone_into(&mut record.status);
+            record.stop_requested_unix_ms = marker;
+            record.supervisor_pid = pid;
+            record
+        };
+        // What a liveness refresh leaves when it consumes the stop's marker off an
+        // empty record: the marker gone, the status as it was, the marker's value
+        // kept as `settled_stop_unix_ms`.
+        let settled = |status: &str, stamp: Option<u128>| {
+            let mut record = with_marker(status, None, 0);
+            record.settled_stop_unix_ms = stamp;
+            record
+        };
+        let rows = [
+            ("empty, untouched", with_marker("ready", Some(1), 0), true),
+            ("empty, stopped", with_marker("stopped", None, 0), true),
+            // The stop's own marker consumed by a listing: not a relaunch.
+            (
+                "empty, starting, marker consumed by a listing",
+                settled("starting", Some(1)),
+                true,
+            ),
+            (
+                "empty, failed, marker consumed by a listing",
+                settled("failed", Some(1)),
+                true,
+            ),
+            // A stamp that is not this stop's (an earlier stop's), or none at all,
+            // is no evidence about this one.
+            (
+                "empty, starting, another stop's marker consumed",
+                settled("starting", Some(2)),
+                false,
+            ),
+            (
+                "empty, starting relaunch",
+                with_marker("starting", None, 0),
+                false,
+            ),
+            (
+                "empty, recovering relaunch",
+                with_marker("recovering", None, 0),
+                false,
+            ),
+            (
+                "empty, ready relaunch",
+                with_marker("ready", None, 0),
+                false,
+            ),
+            (
+                "relaunched with a process",
+                with_marker("starting", None, 5555),
+                false,
+            ),
+        ];
+        for (name, record, covered) in rows {
+            assert_eq!(record.is_covered_by_stop_of(&empty), covered, "{name}");
+        }
+
+        // Nothing is learned from two absent stamps: a snapshot without a marker
+        // of its own is not matched by a record that never consumed one.
+        let mut unmarked = empty.clone();
+        unmarked.stop_requested_unix_ms = None;
+        assert!(
+            !settled("starting", None).is_covered_by_stop_of(&unmarked),
+            "None must not equal None as evidence"
+        );
+    }
+
+    /// A restart between its own confirmed stop and the publication of its child
+    /// leaves an empty `stopped` record. A stop that read the record before that
+    /// (another generation) must not cover it, however the rest of the record
+    /// reads, while a stop that read the same generation still does.
+    #[test]
+    fn a_stop_does_not_cover_a_record_in_another_relaunch_generation() {
+        let mut stopping = probe_test_record(11440);
+        stopping.supervisor_pid = 4242;
+        stopping.status = "ready".to_owned();
+        let mut relaunching = stopping.clone();
+        relaunching.clear_recorded_processes();
+        "stopped".clone_into(&mut relaunching.status);
+        assert!(
+            relaunching.is_covered_by_stop_of(&stopping),
+            "premise: without a relaunch the completed stop covers it"
+        );
+        relaunching.begin_relaunch();
+        assert!(
+            !relaunching.is_covered_by_stop_of(&stopping),
+            "an older stop does not cover a record whose relaunch has begun"
+        );
+        // A stop that read the record during the relaunch, and an empty snapshot
+        // of the same generation, are the same stop as before.
+        let mut during = relaunching.clone();
+        during.stop_requested_unix_ms = Some(9);
+        assert!(relaunching.is_covered_by_stop_of(&during));
+        // The generation is never reused, even within one millisecond.
+        let first = relaunching.relaunch_started_unix_ms;
+        relaunching.begin_relaunch();
+        assert!(relaunching.relaunch_started_unix_ms > first);
+    }
+
+    /// A restart supersedes the stop that was settled under it: the stamp a
+    /// listing left behind does not outlive the relaunch, or a stop that began
+    /// before it would read the relaunch's empty record as its own completion.
+    #[test]
+    fn restarting_forgets_a_settled_stop() {
+        let mut record = probe_test_record(11439);
+        record.settled_stop_unix_ms = Some(7);
+        record.begin_relaunch();
+        record.reset_for_restart();
+        assert_eq!(record.settled_stop_unix_ms, None);
+        assert_eq!(
+            record.relaunch_started_unix_ms, None,
+            "publishing ends the relaunch generation"
+        );
+    }
+
+    /// Writing a service manifest never writes through a file another writer
+    /// already staged next to it. The occupied names are the ones the retired
+    /// clock-and-pid temp naming would have picked, so a write that still used
+    /// one would truncate a foreign file and rename it into place. Reading the
+    /// manifest back would pass for either writer; the foreign files are what
+    /// tell them apart.
+    #[test]
+    fn writing_a_service_manifest_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-write-foreign-temp");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-foreign-temp",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.write()?;
+        record.startup_phase = Some("loading".to_owned());
+        let manifest_path = record.manifest_path.clone();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&manifest_path, millis),
+            || record.write(),
+        )?;
+
+        let published: ManagedServiceRecord = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(published.service_id, "svc-foreign-temp");
+        assert_eq!(published.startup_phase.as_deref(), Some("loading"));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_keeps_the_runtime_selector_the_launch_requested() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-runtime-pin");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-runtime-pin",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            Some("release-pip-gfx120x-all-7-13-0".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .expect("engine state path has a parent"),
+        )?;
+        // What a vLLM server writes: `runtime_id` is the manifest's family id,
+        // shared by every installed version of that family, while
+        // `requested_runtime_id` is the selector the launch asked for, here an
+        // exact runtime key.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "running",
+                "runtime_id": "therock-release:gfx120X-all",
+                "requested_runtime_id": "release-pip-gfx120x-all-7-13-0",
+            }))?,
+        )?;
+
+        let refreshed = record.refresh_from_engine_state()?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(refreshed);
+        assert_eq!(
+            record.runtime_id.as_deref(),
+            Some("release-pip-gfx120x-all-7-13-0"),
+            "adopting the resolved family id would throw away which installed \
+             version the service is actually on — the record is what a restart \
+             re-pins and what runtime activation compares against"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_falls_back_to_the_resolved_runtime_id() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-runtime-fallback");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-runtime-fallback",
+            "lemonade",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .expect("engine state path has a parent"),
+        )?;
+        // An engine that records only the resolved runtime must still be read:
+        // preferring `requested_runtime_id` must not mean ignoring `runtime_id`.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "running",
+                "runtime_id": "lemonade-embeddable-8.1.11",
+                "requested_runtime_id": serde_json::Value::Null,
+            }))?,
+        )?;
+
+        record.refresh_from_engine_state()?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            record.runtime_id.as_deref(),
+            Some("lemonade-embeddable-8.1.11")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_ignores_a_blank_requested_runtime_id() -> Result<()> {
+        // A blank selector names no runtime, so adopting it would leave the
+        // record with an empty runtime that matches nothing and that a restart
+        // would re-pin. Both an empty string and whitespace must fall through
+        // to the resolved `runtime_id`.
+        for (blank, name) in [("", "empty"), ("   ", "whitespace")] {
+            let (root, paths) = temp_app_paths(&format!("record-runtime-blank-{name}"));
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                "svc-runtime-blank",
+                "lemonade",
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "127.0.0.1",
+                9,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            fs::create_dir_all(
+                record
+                    .engine_state_path
+                    .parent()
+                    .expect("engine state path has a parent"),
+            )?;
+            fs::write(
+                &record.engine_state_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "status": "running",
+                    "runtime_id": "lemonade-embeddable-8.1.11",
+                    "requested_runtime_id": blank,
+                }))?,
+            )?;
+
+            let refreshed = record.refresh_from_engine_state()?;
+            let _ = fs::remove_dir_all(&root);
+
+            assert!(refreshed, "{name}: the engine state must still be adopted");
+            assert_eq!(
+                record.runtime_id.as_deref(),
+                Some("lemonade-embeddable-8.1.11"),
+                "{name}: a blank requested_runtime_id must fall through to runtime_id"
+            );
+        }
+        Ok(())
+    }
+}

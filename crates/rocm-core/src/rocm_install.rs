@@ -7,7 +7,6 @@
 //! `LegacyRocmSummary`, the `discover_rocm_installs*` resolver family, the
 //! Linux-siblings/Windows-children layout search, and version ranking.
 
-use crate::examine::extract_rocm_version;
 use crate::runtime_is_windows;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -28,7 +27,7 @@ pub struct LegacyRocmSummary {
     /// declares no version anywhere.
     ///
     /// Optional and defaulted so the daemon's serialised snapshot
-    /// (`apps/rocmd/src/lib.rs`) written before this field existed still loads.
+    /// (`apps/rocmd/src/host_snapshot.rs`) written before this field existed still loads.
     #[serde(default)]
     pub version: Option<String>,
 }
@@ -226,6 +225,18 @@ pub(crate) fn rocm_install_version(root: &Path) -> Option<String> {
     extract_rocm_version(name).or_else(|| bare_version(name))
 }
 
+/// Pull `X.Y[.Z]` out of a `rocm-X.Y.Z` path component.
+fn extract_rocm_version(path: &str) -> Option<String> {
+    let idx = path.find("rocm-")?;
+    let tail = &path[idx + "rocm-".len()..];
+    let version: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let trimmed = version.trim_matches('.');
+    (trimmed.contains('.')).then(|| trimmed.to_owned())
+}
+
 /// The version a directory *name* advertises, for the given layout, or `None`
 /// when the name is not a versioned install directory at all.
 ///
@@ -345,6 +356,15 @@ mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
     use anyhow::Result;
+
+    #[test]
+    fn rocm_version_extracted_from_path() {
+        assert_eq!(
+            extract_rocm_version("/opt/rocm-6.4.1"),
+            Some("6.4.1".to_owned())
+        );
+        assert_eq!(extract_rocm_version("/opt/rocm"), None);
+    }
 
     #[test]
     fn linux_legacy_rocm_detection_ignores_rocdxg_only_directory() -> Result<()> {

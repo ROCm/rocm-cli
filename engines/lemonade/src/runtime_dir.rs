@@ -42,6 +42,22 @@ impl ParentRuntimeEnvironment {
     }
 }
 
+// Used by Linux-only fake-executable tests throughout the engine;
+// a plain `cfg(test)` leaves it unused (and dead-code denied) on other targets.
+#[cfg(all(test, target_os = "linux"))]
+impl ParentRuntimeEnvironment {
+    /// A parent environment confined to `root`: it already names a runtime
+    /// directory, so resolving it creates nothing and reads no real user dirs.
+    pub(crate) fn rooted_at(root: &Path) -> Self {
+        Self {
+            xdg_runtime_dir: Some(root.join("xdg-runtime").into_os_string()),
+            home: Some(root.join("home").into_os_string()),
+            user: Some("test".to_owned()),
+            temp_dir: root.join("tmp"),
+        }
+    }
+}
+
 /// Leaf directory the engine gets inside a fallback runtime root, so a crashing
 /// or misbehaving server cannot disturb the telemetry socket that shares the
 /// same root.
@@ -438,6 +454,20 @@ fn effective_user_id() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Why a runtime directory that could not be tightened is refused.
+///
+/// Lifted out of [`create_private_runtime_dir`] so the wording itself is
+/// reachable from a test. The branch that emits it needs a directory owned by a
+/// *second* uid, which a unit test cannot conjure, so without this split the
+/// message has no coverage at all.
+#[cfg(unix)]
+fn unsecurable_runtime_dir_context(dir: &Path) -> String {
+    format!(
+        "restricting {} to mode 0700 - it is most likely owned by another user",
+        dir.display()
+    )
+}
+
 /// Create `dir` (and its parents) restricted to the current user.
 ///
 /// This is the existing recursive behavior used for the HOME-based fallback,
@@ -463,12 +493,8 @@ fn create_private_runtime_dir(dir: &Path) -> Result<()> {
                 dir.display()
             );
         }
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!(
-                "restricting {} to mode 0700 — it is most likely owned by another user",
-                dir.display()
-            )
-        })?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| unsecurable_runtime_dir_context(dir))?;
     }
     #[cfg(not(unix))]
     fs::create_dir_all(dir)?;
@@ -481,6 +507,24 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::process::{LemonadeProcessEnvironment, lemonade_process_environment_vars};
+
+    /// ROCMAI-543: this context is printed as part of a `rocm` error on a
+    /// redirectable stream, so it has to be plain ASCII -- a Windows console on
+    /// the OEM code page renders a UTF-8 em dash as mojibake like `ΓÇö`.
+    #[cfg(unix)]
+    #[test]
+    fn the_unsecurable_runtime_dir_context_is_ascii_and_names_the_directory() {
+        let message =
+            super::unsecurable_runtime_dir_context(std::path::Path::new("/run/user/1000/rocm"));
+        assert!(
+            message.is_ascii(),
+            "the runtime-directory failure context must be ASCII-only (ROCMAI-543): {message}"
+        );
+        assert!(
+            message.contains("/run/user/1000/rocm"),
+            "the context must name the directory it is about: {message}"
+        );
+    }
 
     // `XDG_RUNTIME_DIR` is a Linux/freedesktop concept and the Lemonade server
     // only consults it there, so these are Linux-only by construction.

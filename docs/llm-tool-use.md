@@ -20,11 +20,30 @@ rocm-cli local assistants use structured tools, not shell commands.
   result shows it is useful.
 - The model must use argv-style `rocm` arguments. It must not invent PowerShell,
   Bash, `cmd`, `git`, or arbitrary package-manager commands.
+- A tool call is refused if its name or any string in its arguments carries a
+  terminal control or format character (an escape sequence, a carriage return,
+  a bidi override, a zero-width character). Those values are printed — in the
+  approval card, the request plan, tool output and error messages — and a
+  terminal acts on such a character instead of showing it. This applies to
+  every tool; `rocm_command` checks each `args` entry itself, after trimming it.
+  The provider-assisted planner's argv is held to the same rule, and a planner
+  note carrying such a character is left out and counted.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
-  loudly when the ROCm GPU path is not ready.
+  loudly when the ROCm GPU path is not ready. Keeping some of a model's layers
+  in system RAM on a GPU that is ready (llama.cpp's `--n-gpu-layers`), which
+  `rocm diagnose --model` suggests when a GGUF model does not fit in VRAM, is
+  not CPU fallback, and the assistant may relay it.
+- A `rocm serve` the model proposes through `rocm_command`, or the
+  provider-assisted planner proposes in its tool call, is refused unless it
+  asks for no public bind (`--allow-public-bind`), no CPU device, a loopback
+  `--host` if it names one, and managed serving (`--managed`, never
+  `--foreground`). One shared check applies those four rules to both, in that
+  order, and a refused call is neither proposed for approval nor planned; the
+  two refusals read alike and differ only in naming the local assistant or the
+  provider planner.
 - The built-in local assistant is fixed to `qwen`
-  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM and Lemonade are the
-  general serving engines; the assistant may inspect or manage them for model
+  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, Lemonade and AIM (a
+  Docker-based engine) are the general serving engines; the assistant may inspect or manage them for model
   serving, but it should not switch its own built-in chat engine away from
   Lemonade.
 - The assistant prompt is grounded in the host. rocm-cli detects the operating
@@ -35,6 +54,43 @@ rocm-cli local assistants use structured tools, not shell commands.
   on native Windows, and asserting it unconditionally misinformed WSL users,
   where vLLM is the supported path. The assistant should answer platform
   questions from the injected facts and must never suggest CPU fallback.
+
+## Tool Result Shape And Size
+
+A tool result is an MCP envelope: a `content` array of text items, an optional
+`structuredContent` object, and `isError`. For a command-backed tool the
+envelope carries the command's output twice — as the `content` text and again
+as `structuredContent.stdout` — because `rocm mcp-call` consumers read the
+structured field. That full envelope is what `rocm mcp-call` prints and what
+the approval replay path stores.
+
+What reaches the *model* is narrower, because a tool result is not free: it is
+sent back as a message and counts against the model's context on that request
+and on every later turn of the same conversation. A locally served model is
+commonly configured with a 32k-token context (llama.cpp's default `n_ctx`),
+and the system prompt plus the tool schemas already take a few thousand of
+those. So the dash shapes each result before the model sees it
+(`run_rocm_read_tool` in
+[tools.rs](../crates/rocm-dash-tui/src/agent/tools.rs)):
+
+- **One copy.** `structuredContent.stdout` and `.stderr` are dropped when the
+  envelope's own text already carries them. Fields that are not duplicates —
+  `argv`, `exit_status`, and the data of tools whose payload lives only in
+  `structuredContent` — are kept.
+- **A size cap.** A result is bounded to `TOOL_RESULT_CHAR_BUDGET` characters
+  of serialized JSON (16 KiB, roughly 4.5k tokens). A result within it passes
+  through unchanged. One that is not is replaced by its plain-text rendering,
+  cut on a line boundary, ending in
+  `[output truncated: A of B characters shown, C omitted ...]`. The marker is
+  part of the contract: the assistant skill tells the model to report a
+  truncated result as partial rather than as a complete answer.
+
+The CLI chat path (`rocm chat --prompt --tools`) reads only the envelope's
+text, so it never sent the duplicate copy; it does not apply the cap.
+
+Read-only commands are rendered so that the cheap form is the default:
+`rocm_command` with `["model"]` returns the curated list `rocm model` prints,
+and the per-recipe diagnostics need an explicit `["model", "--verbose"]`.
 
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the
@@ -82,7 +138,7 @@ before running it:
 ```
 
 The assistant can request installing a serving engine through the existing
-engine surface. The supported engines are `lemonade` and `vllm`:
+engine surface. The supported engines are `lemonade`, `vllm`, and `aim`:
 
 ```json
 {"name":"rocm_command","arguments":{"args":["engines","install","vllm"],"reason":"Install the vLLM serving engine."}}

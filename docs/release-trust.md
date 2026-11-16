@@ -47,12 +47,48 @@ python scripts/release_readiness.py \
 ```
 
 The verifier confirms each named archive has the required rocm-cli bundle
-files, confirms the `.sha256` sidecar matches the archive bytes and names the
-archive being published, and confirms a non-empty `.sig` sidecar exists when
-signatures are required. If a public key is provided with `--public-key`, it
-also verifies the detached signature with `openssl`. Release CI also enables
-`--require-rocm-asset-names`, which rejects branch-like, path-like, or
-otherwise unsupported archive names before upload.
+files, and confirms the `.sha256` sidecar matches the archive bytes and names
+the archive being published.
+
+`--require-signatures` requires signatures that *verify*, not merely exist: each
+archive must have a non-empty `.sig` sidecar, and that signature must check out
+against the release signing public key via `cargo xtask verify`. The key is
+taken from `--public-key` when given, then from the key file named by
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, then from the inline
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` that release and nightly CI wire from the
+signing-key secret — the same path-before-PEM precedence `install.sh` applies to
+the public key, and `cargo xtask package` to the private one. If none resolves,
+the gate fails. It deliberately does
+not fall back to checking that a `.sig` file is present: a sidecar produced by
+the wrong key, truncated, or corrupted would pass such a check, and because an
+unset GitHub secret expands to the empty string, the fallback would be reached
+silently whenever the secret was removed or rotated away. The log line
+`signature verification key:` names the key the run actually used, and is
+printed as soon as the key resolves so that a run which then fails verification
+still records which trust root it used.
+
+Verification is driven by what the run asks for, not by what happens to be in
+the environment: `--require-signatures`, `--require-production-trust` or an
+explicit `--public-key` — or the environment equivalents of the first two,
+`ROCM_CLI_REQUIRE_SIGNATURE` and `ROCM_CLI_REQUIRE_PRODUCTION_TRUST`. The
+bundle-packaging steps set `ROCM_CLI_REQUIRE_SIGNATURE=1` on the step that runs
+the gate — "Package release bundle" and "Package Windows bundle" in
+[`release.yml`](../.github/workflows/release.yml), "Package nightly bundle" and
+"Package Windows bundle" in [`nightly.yml`](../.github/workflows/nightly.yml) —
+while production trust is set once at workflow level, from the
+`ROCM_CLI_REQUIRE_PRODUCTION_TRUST` repository variable in each file's top-level
+`env:` block. Note that exporting `ROCM_CLI_REQUIRE_SIGNATURE=1` for
+packaging therefore also requires a resolvable signing key, where before it
+needed only a `.sig`.
+Previously a key present in
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` was enough to opportunistically verify even
+without those flags; that trigger was removed when the flags began to imply
+verification, so a readiness run that asks for neither now checks neither
+signature presence nor validity. Every `release.yml` and `nightly.yml`
+invocation passes `--require-signatures`, so no workflow takes that path.
+
+Release CI also enables `--require-rocm-asset-names`, which rejects branch-like,
+path-like, or otherwise unsupported archive names before upload.
 
 Release CI also enables `--require-exact-assets`. That rejects stale
 publishable files in `dist`, including old `.tar.gz`/`.zip` archives and orphan
@@ -204,7 +240,7 @@ approval, or manual-only blocking. Existing signed indexes without
 ## TheRock Source Base Overrides
 
 rocm-cli hardcodes the pip index and tarball catalog bases it resolves TheRock
-SDK artifacts from. Six of those bases can be overridden, for fixture-server
+SDK artifacts from. Eight of those bases can be overridden, for fixture-server
 testing only:
 
 ```text
@@ -214,11 +250,16 @@ ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE
 ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE
 ROCM_CLI_THEROCK_NEXT_PIP_BASE
 ROCM_CLI_THEROCK_NEXT_TARBALL_BASE
+ROCM_CLI_THEROCK_NEXT_NIGHTLY_PIP_BASE
+ROCM_CLI_THEROCK_NEXT_NIGHTLY_TARBALL_BASE
 ```
 
-The last two address the ROCm 10 ("next") source layout, which is a layout
-rather than a channel: it has no nightly counterpart and is never resolved
-unless an install explicitly pins a ROCm version of 10 or newer.
+The first four address the canonical (earlier) layout, `repo.amd.com` and
+`rocm.nightlies.amd.com`, which an install reads only when it pins a build that
+exists only there: a ROCm 7 release, or a nightly built before 2026-08-23. The
+last four address the newest layout, `stable.repo.amd.com` and
+`nightly.repo.amd.com`, which an install with no pin reads, and which a stable
+ROCm 10 or newer pin or a nightly built on or after 2026-08-23 reads too.
 
 None of these take effect unless `ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE` is also
 set to a non-empty value. Without that gate, a stray override left in a
@@ -276,17 +317,21 @@ is already trusted.
 ## Simulated Host Root
 
 rocm-cli decides what hardware it is running on by reading fixed host paths:
-`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
-under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
-`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
-`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the
+`/sys/class/kfd/kfd` class device and the KFD topology under it, the DRM cards
+under `/sys/class/drm`, the amdgpu PCI driver directory
+`/sys/bus/pci/drivers/amdgpu`, `/sys/module/amdgpu` and its `version` file,
+`/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`,
+`/proc/modules`, `/proc/1/cgroup`, the
 container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
-behind the distro name `rocm examine` reports, the modprobe configuration
-directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and `/run/modprobe.d`, the
-WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
+(falling back to `/usr/lib/os-release` when absent, per `os-release(5)`) behind
+the distro fields and name `rocm examine` reports, the modprobe
+configuration directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and
+`/run/modprobe.d`, the WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
 `lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
 `lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
-discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+discovered ROCm install, and `lib/librocdxg.so` again in each directory on
+`LD_LIBRARY_PATH`. The E2E suite can point those reads at a directory it populated with a
 simulated host instead, but only in builds compiled with the `e2e-test-hooks`
 Cargo feature:
 
@@ -314,9 +359,10 @@ Some reads stay on the real machine even in a hook build:
   two files under each discovered install's path inside the simulated root.
 - The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
   the probes execute, such as `ldconfig`.
-- Every package-manager plan, which reads the real `/etc/os-release`: the
-  OpenMPI install hints, and the driver, OpenMPI and runtime-library installs
-  `rocm` runs before serving. Their commands run against the real machine, so a
+- Every package-manager plan, which reads the real `/etc/os-release` (with the
+  same `/usr/lib/os-release` fallback): the OpenMPI, libatomic and libnuma
+  install hints, and the driver, OpenMPI and runtime-library installs `rocm`
+  runs before serving. Their commands run against the real machine, so a
   simulated host must not pick the distro they are built for.
 - Process liveness under `/proc/<pid>` and `/dev/shm` sizing. Both describe
   this process's own environment, not the hardware.
@@ -337,6 +383,23 @@ signed sidecar publication, and hosted production recipe/source-policy
 documents. Do not generate those production keys inside CI. Once published, the
 installers, metadata cache, and model recipe index can make release-channel
 signature verification mandatory by default with those keys as trust roots.
+
+Those trust roots are pinned copies of the published keys: the
+`PINNED_RELEASE_PUBLIC_KEY_CURRENT`/`_NEXT` slots in
+[install.sh](../install.sh), `$PinnedReleasePublicKeyCurrent`/`Next` in
+[install.ps1](../install.ps1), and
+`PINNED_METADATA_PUBLIC_KEY_PEM` in
+[fetch.rs](../apps/rocm/src/therock/fetch.rs). `cargo xtask verify-pinned-keys`
+fails when a pinned copy differs from its canonical file under `docs/keys/`. The
+release and nightly workflows always run it; pull-request CI runs it when a
+change matches the `heavy` path filter in
+[ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
+installers, every Rust source and `xtask/`. It reads the one assignment
+the installer actually uses, so each slot must be assigned exactly once as a
+plain declaration, a slot whose key is not published yet must stay `""`, and
+`install.sh` must mark both of its slots `readonly`. The full rules, and what a
+textual check cannot catch, are in
+[verify_pinned_keys.rs](../xtask/src/verify_pinned_keys.rs).
 
 When those owner-controlled inputs exist, release operators can add
 `--require-production-trust` or set `ROCM_CLI_REQUIRE_PRODUCTION_TRUST=1` so the

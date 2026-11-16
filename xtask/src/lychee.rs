@@ -203,9 +203,8 @@ mod tests {
     fn stub_lychee(dir: &Path, version_line: &str, exit_code: u8) -> std::path::PathBuf {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let path = dir.join("lychee");
-            std::fs::write(
+            rocm_core::fake_executable::write_fake_executable(
                 &path,
                 format!(
                     "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version_line}'; exit 0; fi\n\
@@ -213,8 +212,6 @@ mod tests {
                 ),
             )
             .expect("write stub");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod stub");
             path
         }
         #[cfg(windows)]

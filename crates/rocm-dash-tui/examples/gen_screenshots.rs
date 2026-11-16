@@ -3,13 +3,17 @@
 // SPDX-License-Identifier: MIT
 
 //! Render the TUI against a synthetic session NDJSON and dump each view to
-//! a standalone SVG. The screenshots embed cleanly in the marketing page
-//! and demo decks — no live terminal, no manual capture, no drift.
+//! a standalone SVG — no live terminal and no manual capture.
 //!
 //! Usage:
 //!   cargo run --release --example gen_screenshots -p rocm-dash-tui -- \
-//!       --input /tmp/mi355x-demo.ndjson \
-//!       --output-dir marketing/screenshots
+//!       --input session.ndjson \
+//!       --output-dir screenshots
+//!
+//! `--input` is a `PersistedEntry` NDJSON session recording, the format
+//! `rocm dash --replay` reads, such as the `session-*.ndjson` that
+//! `rocm dash --demo` writes under the `demo/` folder of the user data
+//! directory. Whatever the input, the views are marked as simulated data.
 //!
 //! Each output is the actual `ui::draw` framebuffer for a specific
 //! AppState configuration (tab + modal + theme). Cells get run-length
@@ -30,19 +34,17 @@ use rocm_dash_tui::app::{ActiveTab, AppState, ConnState, Modal};
 use rocm_dash_tui::ui;
 
 #[derive(Parser)]
-#[command(
-    name = "gen_screenshots",
-    about = "Render TUI views to SVG for marketing"
-)]
+#[command(name = "gen_screenshots", about = "Render TUI views to SVG")]
 struct Args {
-    /// Synthetic session file (produced by `make demo`).
-    #[arg(long, default_value = "/tmp/mi355x-demo.ndjson")]
+    /// Session NDJSON recording to render (`PersistedEntry` lines).
+    #[arg(long)]
     input: PathBuf,
 
-    /// Output directory. Created if absent. SVGs are named per view.
-    /// Default targets the repo-root `marketing/screenshots/` directory
-    /// when run from the `app/` workspace.
-    #[arg(long, default_value = "../marketing/screenshots")]
+    /// Output directory. Created if absent. SVGs are named per view. The
+    /// default is relative to the working directory. It is git-ignored only
+    /// when produced at the repository root; a run from elsewhere writes the
+    /// files there instead, uncovered by that rule.
+    #[arg(long, default_value = "screenshots")]
     output_dir: PathBuf,
 
     /// How many snapshots to replay before capturing. Higher = fuller
@@ -446,6 +448,17 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_is_required_and_output_dir_defaults_to_the_working_directory() {
+        let err = Args::try_parse_from(["gen_screenshots"])
+            .err()
+            .expect("no recording is produced at a fixed path, so --input has no default");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let args = Args::try_parse_from(["gen_screenshots", "--input", "session.ndjson"])
+            .expect("--input alone is enough");
+        assert_eq!(args.output_dir, PathBuf::from("screenshots"));
+    }
 
     #[test]
     fn generated_screenshot_is_marked_simulated() {

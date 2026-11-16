@@ -2,19 +2,18 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Onboarding wizard (Phase 3 Wave 2, minimal).
+//! Onboarding wizard (minimal).
 //!
-//! The first-run flow, rebuilt on the Wave-0 primitives. This is the **minimal**
-//! version the phase-3 plan calls for: get a clean machine to a working ROCm
-//! runtime two ways —
+//! The first-run flow, kept deliberately **minimal**: get a clean machine to a
+//! working ROCm runtime two ways —
 //!
 //! - **Install ROCm SDK** — a one-shot gated `rocm install sdk` with a Configure
 //!   step to pick the channel (Release/Nightly), an optional version pin
 //!   (`--build-date` / `--version`), and an optional install folder
-//!   (`--prefix`, via the same Wave-0 [`FolderBrowser`] the Adopt path uses);
+//!   (`--prefix`, via the same [`FolderBrowser`] the Adopt path uses);
 //!   defaults to `--channel release --format wheel` installed into the
 //!   default managed folder.
-//! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
+//! - **Adopt existing folder** — pick an existing ROCm env with the
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
@@ -25,8 +24,6 @@
 //! startup path reads `setup.completed`/`onboarding_dismissed` to auto-open
 //! it. Both paths run through the approval gate and the job-bridge — zero
 //! `std::thread::spawn`/`try_recv`.
-
-use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -40,11 +37,12 @@ use rocm_dash_core::state::{JobStatus, SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{display_args, exe_label, resolve_exe};
+use crate::ui::exec::{adopt_args, display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key_filtered;
 
 /// Which step of the wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -240,14 +238,14 @@ pub struct PendingOnboard {
 ///
 /// Any new nested sub-view field (like `browser` or `install_config`) added
 /// here must also be listed in `active_overlay_at_root`'s onboarding clause
-/// in `app/mod.rs` — that hand-maintained enumeration is what tells the
+/// in `app/overlays.rs` — that hand-maintained enumeration is what tells the
 /// shared Esc back-out path not to eject the whole wizard while a sub-view
 /// has focus. The same applies to every other manager-state struct that
 /// clause enumerates (`serve_wizard`, `install_manager`, `runtime_manager`,
 /// `engine_manager`, `services`, `update_manager`, `config_manager`, ...).
-/// `app::tests::active_overlay_at_root_enumeration_is_exhaustive` destructures
-/// every one of those structs without `..`, so forgetting this fails to
-/// compile rather than silently mis-gating Esc.
+/// `app::overlays::tests::active_overlay_at_root_enumeration_is_exhaustive`
+/// destructures every one of those structs without `..`, so forgetting this
+/// fails to compile rather than silently mis-gating Esc.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingState {
     pub step: OnboardingStep,
@@ -258,18 +256,6 @@ pub struct OnboardingState {
     pub approval: Option<PendingOnboard>,
     pub active_job: Option<String>,
     pub message: Option<String>,
-}
-
-/// Derive the conventional Python executable inside an env root (matches the
-/// runtime_manager / rocm-core per-host layout without a `rocm-core` dep).
-fn derive_python_executable(root: &str) -> String {
-    let root = Path::new(root);
-    let path = if cfg!(windows) {
-        root.join("Scripts").join("python.exe")
-    } else {
-        root.join("bin").join("python")
-    };
-    path.to_string_lossy().into_owned()
 }
 
 /// Handle a key while the wizard is open.
@@ -299,15 +285,7 @@ pub fn on_key(
                     // field; the user still confirms with Enter.
                     cfg.prefix = selected;
                 } else {
-                    let root = selected;
-                    let args = vec![
-                        "runtimes".to_string(),
-                        "adopt".to_string(),
-                        "--root".to_string(),
-                        root.clone(),
-                        "--python".to_string(),
-                        derive_python_executable(&root),
-                    ];
+                    let args = adopt_args(&selected);
                     stage_approval(o, OnboardingChoice::AdoptExisting, args);
                 }
             }
@@ -462,15 +440,15 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                     }
                     KeyCode::Up => cfg.pin_mode = cfg.pin_mode.prev(),
                     KeyCode::Down => cfg.pin_mode = cfg.pin_mode.next(),
-                    KeyCode::Backspace => {
-                        cfg.pin_value.pop();
+                    code => {
+                        // Only collect characters once a pin mode is selected,
+                        // so the default (None) view ignores stray keystrokes.
+                        // Backspace is never gated.
+                        let collecting = cfg.pin_mode != PinMode::None;
+                        apply_char_key_filtered(&mut cfg.pin_value, code, |c| {
+                            collecting && !c.is_control()
+                        });
                     }
-                    // Only collect characters once a pin mode is selected, so
-                    // the default (None) view ignores stray keystrokes.
-                    KeyCode::Char(c) if cfg.pin_mode != PinMode::None && !c.is_control() => {
-                        cfg.pin_value.push(c);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -715,11 +693,8 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn welcome_enter_advances_to_choose() {
@@ -1289,6 +1264,41 @@ mod tests {
                 .unwrap()
                 .pin_value,
             "2026-06"
+        );
+    }
+
+    #[test]
+    fn control_chars_are_not_collected_into_the_pin_value() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // Build date
+        type_str(&mut ob, &mut jobs, "a\u{7}b");
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .pin_value,
+            "ab"
+        );
+    }
+
+    #[test]
+    fn backspace_still_edits_pin_value_after_returning_to_no_pin_mode() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // Build date
+        type_str(&mut ob, &mut jobs, "20");
+        on_key(&mut ob, &mut jobs, key(KeyCode::Up)); // back to None
+        type_str(&mut ob, &mut jobs, "26"); // gated: ignored
+        on_key(&mut ob, &mut jobs, key(KeyCode::Backspace)); // never gated
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .pin_value,
+            "2"
         );
     }
 

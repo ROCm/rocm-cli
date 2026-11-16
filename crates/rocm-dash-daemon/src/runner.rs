@@ -10,6 +10,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod discovery;
+
+use discovery::{
+    DiscoverySource, DiscoveryState, Reconcile, TelemetryState, registry_read_warning,
+    vllm_scrape_targets,
+};
+
 use crate::bench_ring::BenchRing;
 use crate::persist::SessionWriter;
 use crate::snapshot_ring::SnapshotRing;
@@ -25,7 +32,9 @@ use rocm_dash_collectors::host::HostCollector;
 use rocm_dash_collectors::lemonade::LemonadeCollector;
 use rocm_dash_collectors::parallel::parallel_scrape;
 use rocm_dash_collectors::vllm_prom::VllmPrometheusCollector;
-use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot};
+use rocm_dash_core::metrics::{
+    GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationMetadata, Snapshot,
+};
 use rocm_dash_core::observation::GenerationObservationTracker;
 use rocm_dash_core::protocol::Event;
 use rocm_dash_core::state::{State, StateEvent};
@@ -36,6 +45,43 @@ use tracing::{info, trace, warn};
 
 /// Refresh GPU system info (versions, partition modes) every N seconds.
 const SYSINFO_REFRESH_SECS: u64 = 30;
+
+/// Row identity and accepted model names for singleton Lemonade attribution.
+#[derive(Clone)]
+struct LemonadeRow {
+    id: String,
+    model_names: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LemonadeEndpoint {
+    host: String,
+    port: u16,
+    collector: LemonadeCollector,
+    rows: Vec<LemonadeRow>,
+    /// The endpoint is the external probe (not a registry-managed target). This
+    /// decides how strictly health is read: an external server that starts to
+    /// require credentials is a failure to report, a managed target that does not
+    /// serve the Lemonade protocol is not. It is a property of the endpoint, not
+    /// of the tick.
+    external: bool,
+    /// This tick is a discovery tick: rows are rebuilt from health. External
+    /// endpoints also appear on scrape-only ticks, with this `false`.
+    discover_external: bool,
+}
+
+impl LemonadeEndpoint {
+    fn warning(&self, phase: &str, error: &impl std::fmt::Display) -> String {
+        let mut ids: Vec<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        ids.sort_unstable();
+        format!(
+            "lemonade {phase} {}:{} [{}]: {error}",
+            self.host,
+            self.port,
+            ids.join(", ")
+        )
+    }
+}
 
 /// Options for `run_loop`. Mirrors daemon CLI flags + config.
 #[derive(Debug, Clone)]
@@ -56,9 +102,10 @@ pub struct RunnerOptions {
     pub disable_vllm_metrics: bool,
     /// Hostname to scrape; `127.0.0.1` for the typical co-located daemon.
     pub vllm_metrics_host: String,
-    /// Opt-in probe-based Lemonade discovery: when enabled, probe a local
-    /// Lemonade endpoint each discovery tick and surface it as an Instance.
-    /// Off by default so hosts with no Lemonade server never poll a dead port.
+    /// Probe-based Lemonade discovery: when enabled, probe a local Lemonade
+    /// endpoint each discovery tick and surface its healthy loaded models.
+    /// `rocm dash` passes the dashboard config value, which defaults to on;
+    /// only `RunnerOptions::default()` is off, for standalone use and tests.
     pub enable_lemonade: bool,
     /// Lemonade endpoint host + port (defaults `127.0.0.1:13305`).
     pub lemonade_host: String,
@@ -70,7 +117,7 @@ pub struct RunnerOptions {
     /// When set, the daemon reads `ManagedServiceRecord`s each discovery tick and
     /// surfaces live ones as scrape targets (port from the registry), so a model
     /// served via `rocm serve` appears in the dashboard with live `gen_tps`
-    /// without Docker discovery. Off by default.
+    /// without Docker discovery. `None` by default; `rocm dash` sets it.
     pub services_dir: Option<PathBuf>,
     /// Path or command name for the `amd-smi` binary. The managed ROCm SDK
     /// ships it inside the runtime wheel's bin directory rather than on `PATH`,
@@ -88,10 +135,13 @@ pub struct RunnerOptions {
     /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
     /// that lets the amd-smi device pre-flight pass without a readable
     /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
-    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
-    /// deliberately don't depend on `rocm-core` to compute this themselves;
-    /// the caller (`apps/rocm`) does and passes the answer through. `false`
-    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    /// and `examine` already act on. This crate has no `rocm-core` dependency
+    /// to compute it with; `rocm-dash-collectors`, which does have one since
+    /// EAI-8457, still takes it threaded through rather than recomputing it, so
+    /// the dashboard cannot reach a different verdict about the same host than
+    /// `serve` and `examine` did. The caller (`apps/rocm`) computes it once and
+    /// passes the answer through both. `false` (the default) preserves the
+    /// bare-metal-only `/dev/kfd` check.
     pub amd_smi_gpu_reachable: bool,
     /// Where the caller's hardware probes put `/dev/kfd`.
     ///
@@ -313,9 +363,10 @@ pub async fn run_loop(
         None
     };
 
-    // Opt-in Lemonade discovery (probe-based; off unless a Lemonade endpoint is
-    // configured). Distinct from Docker/vLLM discovery — a local server, not a
-    // container — so it is tracked separately from `known_instances`.
+    // Probe-based Lemonade discovery, gated on `opts.enable_lemonade` (the
+    // dashboard config default is on; `RunnerOptions::default()` is off).
+    // Distinct from Docker/vLLM discovery — a local server, not a
+    // container — so it is tracked separately from the Docker known set.
     let lemonade = if opts.enable_lemonade {
         info!(
             host = %opts.lemonade_host,
@@ -330,9 +381,8 @@ pub async fn run_loop(
     } else {
         None
     };
-    // The id of the currently-live Lemonade instance, if any.
-    let mut lemonade_id: Option<String> = None;
-
+    // Persistent endpoint collectors share their reqwest connection pools across cycles.
+    let mut managed_lemonade_collectors: HashMap<(String, u16), LemonadeCollector> = HashMap::new();
     let mut bench = opts.bench_csv.as_ref().map(|p| {
         info!(path = %p.display(), "tailing benchmark CSV");
         CsvBenchTailer::new(p.clone())
@@ -349,20 +399,8 @@ pub async fn run_loop(
     } else {
         None
     };
-    let mut known_instances: HashSet<String> = HashSet::new();
-    // Managed-service registry: ids surfaced from the rocm-cli
-    // `serve` registry, and the subset whose engine is NOT vLLM (excluded from
-    // the vLLM Prometheus scrape so they aren't mis-parsed).
-    let mut known_services: HashSet<String> = HashSet::new();
-    let mut managed_non_vllm: HashSet<String> = HashSet::new();
-    // Per-instance generation-throughput tracker. Keyed by container_id.
-    // Constructed lazily from opts.instance_tick; survives scrape failures so
-    // the last-observed rate is held for the validity window before clearing.
-    let mut gen_trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-    // Previous TTFT / TPOT histogram readings (sum_s, count, at) per instance,
-    // for the windowed avg-ms derivation (mirrors `prev_gen_tokens`).
-    let mut prev_ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-    let mut prev_tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+    let mut discovery = DiscoveryState::default();
+    let mut telemetry = TelemetryState::default();
     // Per-container VRAM (MB) from the last amd-smi `process` scrape. Refreshed
     // on the instance cadence and reused every tick so the attributed value is
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
@@ -406,11 +444,18 @@ pub async fn run_loop(
 
     let mut tick_count: u64 = 0;
     let mut last_sysinfo_refresh: u64 = 0;
+    // Static per-GPU power caps (`amd-smi static`), refreshed on the sysinfo
+    // cadence and stamped onto each tick's metrics. `None` until first fetched.
+    let mut power_limits: HashMap<String, f32> = HashMap::new();
+    let mut last_power_limit_refresh: Option<u64> = None;
+    let mut warned_no_power_limits = false;
     // Discovery/scrape warnings are produced on their own (slower) cadences, so
     // holding them only for the tick that produced them makes the header ⚠ badge
     // blink on and off. Keep the last result until that cadence runs again.
     let mut docker_warn: Option<String> = None;
+    let mut registry_warn: Option<String> = None;
     let mut scrape_warns: Vec<String> = Vec::new();
+    let mut lemonade_discovery_warn: Option<String> = None;
 
     loop {
         ticker.tick().await;
@@ -465,8 +510,42 @@ pub async fn run_loop(
         }
 
         let mut warnings = Vec::new();
-        let gpus = if let Some(g) = &gpu {
-            match g.metrics().await {
+        // Power caps are static, so they refresh on the sysinfo cadence. Fetch
+        // them alongside this tick's metrics instead of ahead of it, so the
+        // refresh tick pays one amd-smi round trip, not two in a row.
+        let refresh_limits = gpu.is_some()
+            && last_power_limit_refresh
+                .is_none_or(|at| tick_count.saturating_sub(at) >= sysinfo_refresh_ticks);
+        let mut gpus = if let Some(g) = &gpu {
+            let (limits, metrics) = tokio::join!(
+                async {
+                    if refresh_limits {
+                        Some(g.power_limits().await)
+                    } else {
+                        None
+                    }
+                },
+                g.metrics()
+            );
+            if let Some(res) = limits {
+                match res {
+                    // An empty map (a schema the parser no longer matches) must
+                    // not wipe caps we already hold, and is worth saying once.
+                    Ok(l) if l.is_empty() => {
+                        if power_limits.is_empty() && !warned_no_power_limits {
+                            warn!(
+                                "amd-smi static reported no readable power cap; power stays uncolored"
+                            );
+                            warned_no_power_limits = true;
+                        }
+                    }
+                    Ok(l) => power_limits = l,
+                    // A failed fetch keeps the previous caps; retry next interval.
+                    Err(_) => {}
+                }
+                last_power_limit_refresh = Some(tick_count);
+            }
+            match metrics {
                 Ok(v) => v,
                 Err(e) => {
                     warnings.push(format!("amd-smi metric: {e}"));
@@ -487,7 +566,7 @@ pub async fn run_loop(
             // both causes are named since either is possible here.
             warnings.push(if opts.amd_smi_gpu_reachable {
                 "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
-                 detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+                 detected by other means (WSL ROCDXG bridge) - if it is installed, this GPU \
                  model may not be supported by the installed amd-smi/ROCm, or not supported on \
                  WSL yet"
                     .into()
@@ -505,6 +584,10 @@ pub async fn run_loop(
             Vec::new()
         };
 
+        for g in &mut gpus {
+            g.power_limit_w = power_limits.get(&g.device_id).copied();
+        }
+
         if gpu.is_some()
             && tick_count.saturating_sub(last_sysinfo_refresh) >= sysinfo_refresh_ticks
             && let Some(g) = &gpu
@@ -513,148 +596,33 @@ pub async fn run_loop(
             last_sysinfo_refresh = tick_count;
         }
 
-        // Service discovery — every DISCOVERY_TICKS ticks, diff vs known set,
-        // emit Discovered/Gone events, and update reducer state.
+        // Service discovery — every `discovery_ticks` ticks, reconcile each
+        // source against what it had live before, emit Discovered/Gone events,
+        // and update reducer state.
+        let discovery_due = tick_count == 1 || tick_count.is_multiple_of(discovery_ticks);
+        let mut reconcile = Reconcile {
+            state: &mut runner.state,
+            telemetry: &mut telemetry,
+            tx: &tx,
+            persist: persist.as_ref(),
+        };
         if let Some(d) = docker.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
             match d.discover_async().await {
                 Ok(svcs) => {
                     let seen: HashSet<String> =
                         svcs.iter().map(|s| s.container_id.clone()).collect();
-                    for svc in &svcs {
-                        let existing = runner.state.instances.get(&svc.container_id).cloned();
-                        // Endpoint change: same container-id, new port → new logical service.
-                        // Invalidate the rate baseline and latency windows so the new
-                        // scrape address starts fresh.
-                        let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                        if !same_endpoint {
-                            invalidate_on_endpoint_change(
-                                &svc.container_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                        let inst = merge_discovery_refresh(
-                            svc,
-                            if same_endpoint {
-                                existing.as_ref()
-                            } else {
-                                None
-                            },
-                        );
-                        runner
-                            .state
-                            .apply(StateEvent::InstanceUpserted(inst.clone()));
-                        if !known_instances.contains(&svc.container_id) {
-                            info!(
-                                id = %svc.container_id,
-                                name = %svc.container_name,
-                                model = %svc.model_name,
-                                "instance discovered"
-                            );
-                            // InstanceDiscovered is a discovery-metadata event; broadcast
-                            // a clean instance (no prior collector-owned telemetry).
-                            broadcast_and_persist(
-                                &tx,
-                                persist.as_ref(),
-                                Event::InstanceDiscovered(instance_from_discovered(svc)),
-                            );
-                        }
-                    }
-                    for gone in known_instances.difference(&seen) {
-                        info!(id = %gone, "instance gone");
-                        purge_telemetry_state(
-                            gone,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner
-                            .state
-                            .apply(StateEvent::InstanceRemoved(gone.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone {
-                                container_id: gone.clone(),
-                            },
-                        );
-                    }
-                    known_instances = seen;
+                    reconcile.reconcile_set(
+                        DiscoverySource::Docker,
+                        &svcs,
+                        &discovery.known_instances,
+                        &seen,
+                    );
+                    discovery.known_instances = seen;
                     docker_warn = None;
                 }
                 Err(e) => docker_warn = Some(format!("docker discover: {e}")),
-            }
-        }
-
-        // Lemonade discovery — probe the endpoint on the discovery cadence; add a
-        // Lemonade Instance when reachable, emit Gone when it disappears, and stay
-        // a clean no-op (no warning/panic) when no endpoint is configured.
-        //
-        // The Lemonade `container_id` encodes the host and port
-        // (`<host>:<port>`), so a port or host change produces a new id string
-        // and is treated as a full identity change (old gone, new discovered).
-        if let Some(l) = lemonade.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
-        {
-            match l.discover().await {
-                Some(svc) => {
-                    let is_new_id = lemonade_id.as_deref() != Some(svc.container_id.as_str());
-                    if is_new_id {
-                        // New identity: purge all telemetry state for the old id so
-                        // stale rate baseline, TTFT, and TPOT do not bleed across.
-                        if let Some(old_id) = lemonade_id.as_deref() {
-                            purge_telemetry_state(
-                                old_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                    }
-                    let existing = runner.state.instances.get(&svc.container_id).cloned();
-                    let inst = merge_discovery_refresh(
-                        &svc,
-                        if is_new_id { None } else { existing.as_ref() },
-                    );
-                    runner
-                        .state
-                        .apply(StateEvent::InstanceUpserted(inst.clone()));
-                    if is_new_id {
-                        info!(
-                            id = %svc.container_id,
-                            model = %svc.model_name,
-                            "lemonade instance discovered"
-                        );
-                        // InstanceDiscovered is a discovery-metadata event; broadcast
-                        // a clean instance (no prior collector-owned telemetry).
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceDiscovered(instance_from_discovered(&svc)),
-                        );
-                        lemonade_id = Some(svc.container_id.clone());
-                    }
-                }
-                None => {
-                    if let Some(id) = lemonade_id.take() {
-                        info!(id = %id, "lemonade instance gone");
-                        purge_telemetry_state(
-                            &id,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone { container_id: id },
-                        );
-                    }
-                }
             }
         }
 
@@ -663,85 +631,290 @@ pub async fn run_loop(
         // the registry's authority; non-vLLM engines are tracked so the vLLM
         // scrape below skips them. A model served via `rocm serve` thus appears
         // in the dashboard and is scraped for `gen_tps` without Docker.
+        //
+        // A pass that could not read the registry in full retires nothing, as
+        // with the Docker source above: what is known stays known (no `Gone`),
+        // and the instances keep the data they hold. Unlike Docker, whose listing
+        // is all or nothing, a registry can fail on one record while the rest
+        // read, so the readable records still add and refresh their services
+        // (announced once, as ever). Only a registry that was read in full, even
+        // an empty one, retires what it lacks.
         if let Some(services_dir) = opts.services_dir.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
-            let records = crate::registry::load_service_records(services_dir);
-            let disc = crate::registry::discover_managed_services(&records);
-            managed_non_vllm = disc.non_vllm;
-            for svc in disc.svcs {
-                let id = svc.container_id.clone();
-                let is_new = !known_services.contains(&id);
-                let existing = runner.state.instances.get(&id).cloned();
-                // Endpoint change → new logical service; reset rate baseline and
-                // latency windows so the new port starts fresh.
-                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                if !same_endpoint {
-                    invalidate_on_endpoint_change(
-                        &id,
-                        &mut gen_trackers,
-                        &mut prev_ttft,
-                        &mut prev_tpot,
+            let read = crate::registry::read_service_records(services_dir);
+            let change = discovery.registry_health.observe(&read);
+            change.log();
+            match read {
+                Ok(read) => {
+                    let disc = crate::registry::discover_managed_services(&read.records);
+                    discovery.managed_non_vllm = disc.non_vllm;
+                    discovery.managed_roots = disc.roots;
+                    let previous =
+                        std::mem::replace(&mut discovery.managed_lemonade, disc.lemonade);
+                    reconcile.reset_moved_lemonade_targets(
+                        &disc.svcs,
+                        &previous,
+                        &discovery.managed_lemonade,
                     );
+                    reconcile.reconcile_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                        &disc.seen,
+                    );
+                    discovery.known_services = disc.seen;
+                    registry_warn = None;
                 }
-                let inst = merge_discovery_refresh(
-                    &svc,
-                    if same_endpoint {
-                        existing.as_ref()
-                    } else {
-                        None
-                    },
-                );
-                runner
-                    .state
-                    .apply(StateEvent::InstanceUpserted(inst.clone()));
-                if is_new {
-                    info!(id = %id, "managed service discovered");
-                    // InstanceDiscovered is a discovery-metadata event; broadcast
-                    // a clean instance (no prior collector-owned telemetry).
-                    broadcast_and_persist(
-                        &tx,
-                        persist.as_ref(),
-                        Event::InstanceDiscovered(instance_from_discovered(&svc)),
+                Err(e) => {
+                    // The records that did read still add and refresh their
+                    // services; nothing is retired, because the one that did
+                    // not read could be any of the known ones.
+                    let mut disc = crate::registry::discover_managed_services(&e.partial.records);
+                    let previous = discovery.keep_lemonade_through_partial_registry(&mut disc);
+                    reconcile.reset_moved_lemonade_targets(
+                        &disc.svcs,
+                        &previous,
+                        &discovery.managed_lemonade,
                     );
+                    reconcile.upsert_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                    );
+                    discovery.keep_through_partial_registry(disc);
+                    registry_warn = Some(registry_read_warning(&e));
                 }
             }
-            for gone in known_services.difference(&disc.seen) {
-                info!(id = %gone, "managed service gone");
-                purge_telemetry_state(gone, &mut gen_trackers, &mut prev_ttft, &mut prev_tpot);
-                runner
-                    .state
-                    .apply(StateEvent::InstanceRemoved(gone.clone()));
-                broadcast_and_persist(
-                    &tx,
-                    persist.as_ref(),
-                    Event::InstanceGone {
-                        container_id: gone.clone(),
-                    },
-                );
-            }
-            known_services = disc.seen;
         }
         if tick_count.is_multiple_of(instance_ticks) {
             scrape_warns.clear();
         }
 
-        // Per-instance vLLM metric scrape, parallel, on its own cadence. The
-        // Lemonade instance (if any) is scraped via its own collector below, so
-        // exclude it from the vLLM Prometheus targets. Managed non-vLLM services
+        // Independent endpoints run concurrently, but health always precedes
+        // stats within each endpoint. Last-request stats have no model identity:
+        // only a singleton loaded set matching exactly one row can own the rate.
+        let scrape_now = tick_count.is_multiple_of(instance_ticks);
+        if discovery_due || scrape_now {
+            let managed_endpoint = discovery.managed_lemonade.iter().any(|target| {
+                crate::registry::endpoints_match(
+                    &target.host,
+                    target.port,
+                    &opts.lemonade_host,
+                    opts.lemonade_port,
+                )
+            });
+            let mut endpoints = Vec::new();
+            if let Some(collector) = lemonade.as_ref() {
+                if managed_endpoint && discovery_due {
+                    // Registry binding wins even if its configured model differs
+                    // from health. Never attach external controls to that binding.
+                    Reconcile {
+                        state: &mut runner.state,
+                        telemetry: &mut telemetry,
+                        tx: &tx,
+                        persist: persist.as_ref(),
+                    }
+                    .reconcile_lemonade(&[], &mut discovery.lemonade_ids);
+                    lemonade_discovery_warn = None;
+                } else if !managed_endpoint && (discovery_due || !discovery.lemonade_ids.is_empty())
+                {
+                    endpoints.push(LemonadeEndpoint {
+                        host: opts.lemonade_host.clone(),
+                        port: opts.lemonade_port,
+                        collector: collector.clone(),
+                        rows: discovery
+                            .lemonade_ids
+                            .iter()
+                            .filter_map(|id| {
+                                runner.state.instances.get(id).map(|inst| LemonadeRow {
+                                    id: id.clone(),
+                                    model_names: vec![inst.model_name.clone()],
+                                })
+                            })
+                            .collect(),
+                        external: true,
+                        discover_external: discovery_due,
+                    });
+                }
+            }
+            let mut groups: HashMap<(String, u16), Vec<LemonadeRow>> = HashMap::new();
+            for target in &discovery.managed_lemonade {
+                // Use the registry's endpoint equivalence without rewriting the
+                // selected request host or conflating IPv4 and IPv6 listeners.
+                // Prefer the cached representative so reorder keeps its client.
+                // A cached collector dials a fixed address, so it is reused
+                // only when it would dial the same host as this target.
+                let endpoint = groups
+                    .keys()
+                    .find(|(host, port)| {
+                        crate::registry::endpoints_match(host, *port, &target.host, target.port)
+                            && crate::registry::cached_collector_reusable(host, &target.host)
+                    })
+                    .or_else(|| {
+                        managed_lemonade_collectors.keys().find(|(host, port)| {
+                            crate::registry::endpoints_match(host, *port, &target.host, target.port)
+                                && crate::registry::cached_collector_reusable(host, &target.host)
+                        })
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| (target.host.clone(), target.port));
+                groups.entry(endpoint).or_default().push(LemonadeRow {
+                    id: target.service_id.clone(),
+                    model_names: vec![target.model_ref.clone(), target.canonical_model_id.clone()],
+                });
+            }
+            managed_lemonade_collectors.retain(|endpoint, _| groups.contains_key(endpoint));
+            if scrape_now {
+                for ((host, port), rows) in groups {
+                    let collector = managed_lemonade_collectors
+                        .entry((host.clone(), port))
+                        .or_insert_with(|| {
+                            LemonadeCollector::new(
+                                crate::registry::scrape_host(&host),
+                                port,
+                                Duration::from_millis(1500),
+                            )
+                        })
+                        .clone();
+                    endpoints.push(LemonadeEndpoint {
+                        host,
+                        port,
+                        collector,
+                        rows,
+                        external: false,
+                        discover_external: false,
+                    });
+                }
+            }
+            let results = parallel_scrape(endpoints, move |endpoint| async move {
+                // A managed row can be a server without the Lemonade protocol
+                // (a direct llama-server). It stays listed with throughput
+                // unavailable and no standing warning; real failures still warn.
+                let health = if endpoint.external {
+                    endpoint.collector.fetch_health().await?
+                } else if let Some(health) = endpoint.collector.fetch_health_if_router().await? {
+                    health
+                } else {
+                    return Ok((None, endpoint.rows.clone(), None, None));
+                };
+                let discovered = endpoint.discover_external.then(|| {
+                    rocm_dash_collectors::lemonade::services_from_health(
+                        &endpoint.host,
+                        endpoint.port,
+                        &health,
+                    )
+                });
+                let rows = discovered.as_ref().map_or_else(
+                    || endpoint.rows.clone(),
+                    |services| {
+                        services
+                            .iter()
+                            .map(|service| LemonadeRow {
+                                id: service.container_id.clone(),
+                                model_names: vec![service.model_name.clone()],
+                            })
+                            .collect()
+                    },
+                );
+                let attribution = health.stats_model();
+                let mut matching = rows.iter().filter(|row| {
+                    attribution
+                        .as_ref()
+                        .is_some_and(|model| row.model_names.iter().any(|name| name == model))
+                });
+                let attributed_id = matching
+                    .next()
+                    .filter(|_| matching.next().is_none())
+                    .map(|row| row.id.clone());
+                // The stats ride with the id they belong to, so a fetch cannot
+                // exist without the row that attribution picked.
+                let stats = match attributed_id.clone() {
+                    Some(id) if scrape_now => Some((id, endpoint.collector.fetch_stats().await)),
+                    _ => None,
+                };
+                Ok::<_, rocm_dash_core::traits::CollectorError>((
+                    discovered,
+                    rows,
+                    attributed_id,
+                    stats,
+                ))
+            })
+            .await;
+            for (endpoint, result) in results {
+                let (discovered, rows, attributed_id, stats) = match result {
+                    Ok(result) => {
+                        if endpoint.discover_external {
+                            lemonade_discovery_warn = None;
+                        }
+                        result
+                    }
+                    Err(error) => {
+                        // A failed external discovery still removes rows immediately,
+                        // but reports why they disappeared. A never-seen endpoint
+                        // with nothing listening stays quiet; one that answers with
+                        // an HTTP or body error warns even on first contact.
+                        // Managed failures retain only the existing hold.
+                        if endpoint.discover_external {
+                            let absent = endpoint.rows.is_empty()
+                                && rocm_dash_collectors::lemonade::is_connect_error(&error);
+                            lemonade_discovery_warn =
+                                (!absent).then(|| endpoint.warning("health", &error));
+                            (Some(Vec::new()), Vec::new(), None, None)
+                        } else {
+                            scrape_warns.push(endpoint.warning("health", &error));
+                            continue;
+                        }
+                    }
+                };
+                if let Some(services) = discovered {
+                    Reconcile {
+                        state: &mut runner.state,
+                        telemetry: &mut telemetry,
+                        tx: &tx,
+                        persist: persist.as_ref(),
+                    }
+                    .reconcile_lemonade(&services, &mut discovery.lemonade_ids);
+                }
+                // Healthy contradictory/ambiguous evidence invalidates prior
+                // attribution immediately, even off the stats cadence.
+                for row in &rows {
+                    if Some(&row.id) != attributed_id.as_ref() {
+                        telemetry.gen_trackers.remove(&row.id);
+                    }
+                }
+                if let Some((stats_id, stats)) = stats {
+                    match stats {
+                        Ok(sample) => {
+                            if let Some(rate) = sample.gen_tps {
+                                telemetry
+                                    .gen_trackers
+                                    .entry(stats_id)
+                                    .or_insert_with(|| {
+                                        GenerationObservationTracker::new(opts.instance_tick)
+                                    })
+                                    .observe_direct(rate, cycle_at);
+                            }
+                        }
+                        Err(error) => scrape_warns.push(endpoint.warning("stats", &error)),
+                    }
+                }
+            }
+        }
+
+        // Per-instance vLLM metric scrape, parallel, on its own cadence.
+        // Lemonade rows are scraped via their endpoint collectors above, so
+        // exclude them from the vLLM Prometheus targets. Managed non-vLLM services
         // are excluded too (their engine uses a different parser).
         if let Some(prom) = vllm.as_ref()
             && !runner.state.instances.is_empty()
             && tick_count.is_multiple_of(instance_ticks)
         {
-            let targets: Vec<(String, u16)> = runner
-                .state
-                .instances
-                .values()
-                .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
-                .filter(|i| !managed_non_vllm.contains(&i.container_id))
-                .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
-                .collect();
+            let targets = vllm_scrape_targets(
+                &runner.state.instances,
+                &discovery.lemonade_ids,
+                &discovery.managed_non_vllm,
+            );
             let prom = prom.clone();
             let results = parallel_scrape(targets, move |(id, port)| {
                 let prom = prom.clone();
@@ -764,7 +937,8 @@ pub async fn run_loop(
                         // cumulative counter when present; omitted counter leaves
                         // the tracker (and its held value) untouched.
                         if let Some(cur) = sample.gen_tokens_total {
-                            gen_trackers
+                            telemetry
+                                .gen_trackers
                                 .entry(id.clone())
                                 .or_insert_with(|| {
                                     GenerationObservationTracker::new(opts.instance_tick)
@@ -775,17 +949,21 @@ pub async fn run_loop(
                         // assembly below (tracker.snapshot per cycle_at).
                         //
                         // Windowed avg latency (ms) from the cumulative TTFT/TPOT
-                        // histograms; cumulative-average fallback on first scrape.
-                        let ttft_ms = avg_ms_from_histogram(
-                            &mut prev_ttft,
+                        // histograms. Only a window with new requests produces a
+                        // value; the tracker holds it, then expires it, in the
+                        // snapshot assembly below.
+                        observe_latency(
+                            &mut telemetry.prev_ttft,
                             &id,
+                            opts.instance_tick,
                             sample.ttft_sum_s,
                             sample.ttft_count,
                             cycle_at,
                         );
-                        let tpot_ms = avg_ms_from_histogram(
-                            &mut prev_tpot,
+                        observe_latency(
+                            &mut telemetry.prev_tpot,
                             &id,
+                            opts.instance_tick,
                             sample.tpot_sum_s,
                             sample.tpot_count,
                             cycle_at,
@@ -794,8 +972,6 @@ pub async fn run_loop(
                             inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                             inst.running_reqs = sample.running_reqs;
                             inst.waiting_reqs = sample.waiting_reqs;
-                            inst.ttft_ms = ttft_ms;
-                            inst.tpot_ms = tpot_ms;
                             // Docker-discovered instances have no
                             // `ManagedServiceRecord` to promote their status, so
                             // they start life as `Starting`. A successful vLLM
@@ -818,18 +994,11 @@ pub async fn run_loop(
                         // window (clamp(3×instance_tick, 6s, 30s)) and only clears
                         // it after expiry — satisfying the "held" contract.
                         //
-                        // Clear TTFT/TPOT baselines so recovery re-baselines from
-                        // the next successful scrape (latency clearing semantics
-                        // are unchanged; freshness generalization is out of scope).
-                        prev_ttft.remove(&id);
-                        prev_tpot.remove(&id);
-                        if let Some(mut inst) = runner.state.instances.get(&id).cloned()
-                            && (inst.ttft_ms.is_some() || inst.tpot_ms.is_some())
-                        {
-                            inst.ttft_ms = None;
-                            inst.tpot_ms = None;
-                            runner.state.apply(StateEvent::InstanceUpserted(inst));
-                        }
+                        // Drop the TTFT/TPOT baselines so recovery re-baselines
+                        // from the next successful scrape; the trackers keep the
+                        // last windowed value Held until its validity lapses.
+                        rebaseline_latency(&mut telemetry.prev_ttft, &id);
+                        rebaseline_latency(&mut telemetry.prev_tpot, &id);
                     }
                 }
             }
@@ -838,51 +1007,6 @@ pub async fn run_loop(
                     Some(e) => format!("vllm scrape: {fail_count} failed (last: {e})"),
                     None => format!("vllm scrape: {fail_count} failed"),
                 });
-            }
-        }
-
-        // Lemonade per-instance scrape — reports an instantaneous rate directly
-        // (`gen_tps`), so no counter-differencing. A scrape failure leaves the
-        // last-known fields and warns; it never panics.
-        if let (Some(l), Some(id)) = (lemonade.as_ref(), lemonade_id.clone())
-            && tick_count.is_multiple_of(instance_ticks)
-        {
-            match l.fetch_stats().await {
-                Ok(sample) => {
-                    // EAI-7960: drive the tracker with a direct rate reading when
-                    // the sample carries one. A missing direct rate (None) does not
-                    // erase or refresh the tracker; the held value stays valid until
-                    // the validity window expires.
-                    if let Some(rate) = sample.gen_tps {
-                        gen_trackers
-                            .entry(id.clone())
-                            .or_insert_with(|| {
-                                GenerationObservationTracker::new(opts.instance_tick)
-                            })
-                            .observe_direct(rate, cycle_at);
-                    }
-                    if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                        // gen_tps is written in the snapshot assembly below;
-                        // set the KV/request fields immediately so they are
-                        // present in state for subsequent snapshots.
-                        inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
-                        inst.running_reqs = sample.running_reqs;
-                        inst.waiting_reqs = sample.waiting_reqs;
-                        // See the vLLM scrape-success handler: a successful stats
-                        // fetch proves the instance is serving; promote out of Starting.
-                        if matches!(inst.status, InstanceStatus::Starting { .. }) {
-                            inst.status = InstanceStatus::Ready;
-                        }
-                        runner.state.apply(StateEvent::InstanceUpserted(inst));
-                    }
-                }
-                Err(e) => {
-                    trace!(id = %id, error = %e, "lemonade scrape failed");
-                    scrape_warns.push(format!("lemonade scrape: {e}"));
-                    // EAI-7960: retain tracker during validity window on failure.
-                    // gen_tps is assembled from the tracker snapshot below;
-                    // no explicit clearing needed here.
-                }
             }
         }
 
@@ -899,10 +1023,18 @@ pub async fn run_loop(
             match g.processes().await {
                 Ok(procs) => {
                     procs_nonempty = !procs.is_empty();
-                    per_container_used = rocm_dash_core::vram::aggregate_process_vram(
-                        &procs,
-                        rocm_dash_collectors::cgroup::container_id_for_pid,
-                    );
+                    // A container id when the process is in a docker/containerd
+                    // cgroup, otherwise the managed service whose engine it
+                    // descends from. Both key the same map the instances read.
+                    per_container_used =
+                        rocm_dash_core::vram::aggregate_process_vram(&procs, |pid| {
+                            rocm_dash_collectors::cgroup::container_id_for_pid(pid).or_else(|| {
+                                rocm_dash_collectors::ancestry::owner_of_pid(
+                                    pid,
+                                    &discovery.managed_roots,
+                                )
+                            })
+                        });
                 }
                 Err(e) => {
                     // Keep the last-known map; device fallback covers the gap.
@@ -916,11 +1048,20 @@ pub async fn run_loop(
         // metadata) before computing tokens_per_watt so the efficiency field
         // always derives from the current cycle's valid/held/expired rate.
         for inst in &mut instances {
-            let (gen_tps, meta) = gen_trackers
+            let (gen_tps, meta) = telemetry
+                .gen_trackers
                 .get_mut(&inst.container_id)
                 .map_or((None, None), |t| t.snapshot(cycle_at));
             inst.gen_tps = gen_tps;
             inst.gen_tps_observation = meta;
+            (inst.ttft_ms, inst.ttft_observation) =
+                snapshot_latency(&mut telemetry.prev_ttft, &inst.container_id, cycle_at);
+            (inst.tpot_ms, inst.tpot_observation) =
+                snapshot_latency(&mut telemetry.prev_tpot, &inst.container_id, cycle_at);
+            inst.gen_tps_last_request = telemetry
+                .gen_trackers
+                .get(&inst.container_id)
+                .is_some_and(GenerationObservationTracker::is_direct);
         }
         // Derive per-instance efficiency now that this tick's GPU power is known
         // and gen_tps reflects the tracker state for this cycle.
@@ -928,9 +1069,14 @@ pub async fn run_loop(
         // don't line up with any amd-smi device_id — the silent-None failure
         // mode on real hardware, surfaced via the header ⚠ badge.
         let mut id_join_misses = 0usize;
-        for inst in &mut instances {
+        // Split each GPU's power among the instances sharing it, so two
+        // instances on one board don't both claim all of it.
+        let attributed =
+            rocm_dash_core::efficiency::attribute_power_w(&instances, &gpus, &per_container_used);
+        for (inst, power_w) in instances.iter_mut().zip(attributed) {
+            inst.power_w = power_w;
             inst.tokens_per_watt =
-                rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, &inst.gpu_ids, &gpus);
+                rocm_dash_core::efficiency::instance_tokens_per_watt(inst, power_w);
             if inst.gen_tps.is_some()
                 && !inst.gpu_ids.is_empty()
                 && !gpus.is_empty()
@@ -952,7 +1098,13 @@ pub async fn run_loop(
             if let Some(entry) = runner.state.instances.get_mut(&inst.container_id) {
                 entry.gen_tps = inst.gen_tps;
                 entry.gen_tps_observation = inst.gen_tps_observation.clone();
+                entry.ttft_ms = inst.ttft_ms;
+                entry.ttft_observation = inst.ttft_observation.clone();
+                entry.tpot_ms = inst.tpot_ms;
+                entry.tpot_observation = inst.tpot_observation.clone();
+                entry.gen_tps_last_request = inst.gen_tps_last_request;
                 entry.tokens_per_watt = inst.tokens_per_watt;
+                entry.power_w = inst.power_w;
             }
         }
         // Attribute per-instance VRAM (per-process where the cgroup join hit,
@@ -961,22 +1113,23 @@ pub async fn run_loop(
         // Warn only when a real process scrape happened but an instance with
         // live GPUs still fell back to device-summed (cgroup join missed).
         if procs_nonempty {
-            let vram_fallbacks = instances
-                .iter()
-                .filter(|i| {
-                    !i.gpu_ids.is_empty()
-                        && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, &gpus)
-                        && !per_container_used.contains_key(&i.container_id)
-                })
-                .count();
+            let vram_fallbacks = count_vram_join_misses(
+                &instances,
+                &gpus,
+                &per_container_used,
+                &discovery.managed_roots,
+                &discovery.managed_non_vllm,
+            );
             if vram_fallbacks > 0 {
                 scrape_warns.push(format!(
                     "vram attribution: {vram_fallbacks} instance(s) fell back to device-summed \
-                     VRAM (no per-process cgroup match; check /proc access)"
+                     VRAM (no per-process cgroup or ancestry match; check /proc access)"
                 ));
             }
         }
         warnings.extend(docker_warn.iter().cloned());
+        warnings.extend(registry_warn.iter().cloned());
+        warnings.extend(lemonade_discovery_warn.iter().cloned());
         warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
@@ -1017,35 +1170,39 @@ pub async fn run_loop(
     }
 }
 
-/// Remove all per-service telemetry state for `id`: tracker, TTFT, and TPOT
-/// baselines.  Call on explicit removal (Docker Gone, Lemonade Gone, managed
-/// Gone) and whenever an identity change requires a clean slate.
-pub(crate) fn purge_telemetry_state(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-) {
-    gen_trackers.remove(id);
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
-}
-
-/// Invalidate the generation tracker for `id` (reset baseline without
-/// removing the map entry) and clear the TTFT/TPOT latency windows.
-/// Called when an endpoint changes within the same container/service id so
-/// the new scrape address starts with a fresh rate baseline.
-pub(crate) fn invalidate_on_endpoint_change(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-) {
-    if let Some(t) = gen_trackers.get_mut(id) {
-        t.invalidate();
-    }
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
+/// Instances that *could* have joined the per-process VRAM map but did not.
+///
+/// Two kinds of instance can hit the map: one whose id is a docker/containerd
+/// id read from `/proc/<pid>/cgroup`, and a managed `rocm serve` service that
+/// has recorded `roots` (its engine/supervisor PIDs) to match by ancestry. A
+/// managed service with no roots cannot join and falls back to device-summed
+/// VRAM by design, so it is not counted. One that is not yet `Ready`/`Running`
+/// may still be loading its model with no GPU process to attribute, so it is
+/// not counted either; a serving one always holds VRAM, so a missing entry
+/// means its ancestry walk failed (unreadable `/proc`, a recycled root PID).
+/// A non-vLLM managed service (e.g. Lemonade on a backend `amd-smi` does not
+/// list) is not counted: it may hold GPU memory without ever appearing in the
+/// process list, which is not an access problem.
+fn count_vram_join_misses<S: std::hash::BuildHasher>(
+    instances: &[Instance],
+    gpus: &[GpuMetrics],
+    per_container_used: &HashMap<String, u64, S>,
+    roots: &[rocm_dash_collectors::ancestry::Root],
+    non_vllm: &HashSet<String>,
+) -> usize {
+    instances
+        .iter()
+        .filter(|i| {
+            let can_join = rocm_dash_collectors::cgroup::is_container_id(&i.container_id)
+                || (matches!(i.status, InstanceStatus::Ready | InstanceStatus::Running)
+                    && !non_vllm.contains(&i.container_id)
+                    && roots.iter().any(|r| r.owner == i.container_id));
+            can_join
+                && !i.gpu_ids.is_empty()
+                && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, gpus)
+                && !per_container_used.contains_key(&i.container_id)
+        })
+        .count()
 }
 
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
@@ -1084,9 +1241,13 @@ pub(crate) fn merge_discovery_refresh(
         inst.waiting_reqs = ex.waiting_reqs;
         inst.gen_tps = ex.gen_tps;
         inst.gen_tps_observation = ex.gen_tps_observation.clone();
+        inst.gen_tps_last_request = ex.gen_tps_last_request;
         inst.tokens_per_watt = ex.tokens_per_watt;
+        inst.power_w = ex.power_w;
         inst.ttft_ms = ex.ttft_ms;
+        inst.ttft_observation = ex.ttft_observation.clone();
         inst.tpot_ms = ex.tpot_ms;
+        inst.tpot_observation = ex.tpot_observation.clone();
     }
     inst
 }
@@ -1114,7 +1275,6 @@ fn enrich_instance_vram(
     }
 }
 
-/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 /// Broadcast `ev` to subscribers and, if a session writer is wired, append
 /// the same event to disk for `--replay`. Persistence is best-effort — a
 /// write failure logs at warn level but does not interrupt the loop.
@@ -1132,49 +1292,82 @@ fn broadcast_and_persist(
     let _ = tx.send(ev);
 }
 
+/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 fn ticks_per(period: Duration, tick: Duration) -> u64 {
     let n = (period.as_secs_f64() / tick.as_secs_f64()).round() as i64;
     n.max(1) as u64
 }
 
-/// Upper bound on the scrape interval accepted by `avg_ms_from_histogram`.
+/// Upper bound on the scrape interval accepted by [`observe_latency`].
 /// Applies to TTFT/TPOT latency histograms only; generation-counter staleness
 /// is managed by `GenerationObservationTracker` (see `rocm-dash-core`).
-/// A gap longer than this makes the windowed delta stale (outage or forward
-/// wall-clock jump / NTP / VM resume), so the histogram falls back to the
-/// cumulative average for that sample.
+/// A gap longer than this (outage, forward wall-clock jump / NTP / VM resume)
+/// makes the windowed delta meaningless, so that sample yields no value and
+/// only re-baselines.
 const MAX_RATE_INTERVAL_S: f64 = 60.0;
 
-/// Average latency (ms) from a cumulative histogram's `_sum` (seconds) and
-/// `_count` series, windowed over successive scrapes: `(Δsum / Δcount) × 1000`.
-/// Updates the per-instance baseline in `prev`. On the FIRST reading (or after a
-/// counter reset / stale interval / no new requests) it falls back to the
-/// cumulative average `sum/count × 1000`, so a single scrape already yields a
-/// value. Returns `None` when the histogram is absent (`sum`/`count` `None`) or
-/// `count == 0` — Observe then shows `—` (never a fabricated number).
-fn avg_ms_from_histogram(
-    prev: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+/// Per-instance latency state for one histogram: the previous cumulative
+/// reading and the tracker that holds and then expires the derived average.
+pub(crate) struct LatencyWindow {
+    /// Previous `(sum_s, count, at)` reading; `None` until baselined.
+    prev: Option<(f64, f64, DateTime<Utc>)>,
+    /// Holds the last windowed average for the observation validity window.
+    tracker: GenerationObservationTracker,
+}
+
+pub(crate) type LatencyWindows = HashMap<String, LatencyWindow>;
+
+/// Feed one scrape of a cumulative latency histogram (`_sum` in seconds,
+/// `_count`) into `id`'s window. A value is recorded only when the window saw
+/// new requests: `(Δsum / Δcount) × 1000` ms. The first reading, a counter
+/// reset, a stale interval, or a window with no new requests only moves the
+/// baseline; the lifetime average is never reported, so an idle server's old
+/// latency ages out instead of persisting. An absent histogram (`None`) leaves
+/// the window untouched.
+fn observe_latency(
+    windows: &mut LatencyWindows,
     id: &str,
+    instance_tick: Duration,
     sum_s: Option<f64>,
     count: Option<f64>,
     now: DateTime<Utc>,
-) -> Option<f64> {
-    let (sum_s, count) = (sum_s?, count?);
-    let last = prev.insert(id.to_string(), (sum_s, count, now));
-    if let Some((psum, pcount, pat)) = last {
+) {
+    let (Some(sum_s), Some(count)) = (sum_s, count) else {
+        return;
+    };
+    let w = windows
+        .entry(id.to_string())
+        .or_insert_with(|| LatencyWindow {
+            prev: None,
+            tracker: GenerationObservationTracker::new(instance_tick),
+        });
+    if let Some((psum, pcount, pat)) = w.prev.replace((sum_s, count, now)) {
         let dcount = count - pcount;
         let dsum = sum_s - psum;
         let dt = (now - pat).num_milliseconds() as f64 / 1000.0;
         if dcount > 0.0 && dsum >= 0.0 && dt > 0.0 && dt <= MAX_RATE_INTERVAL_S {
-            return Some(dsum / dcount * 1000.0);
+            w.tracker.observe_direct(dsum / dcount * 1000.0, now);
         }
     }
-    // Cumulative-average fallback: first scrape, no new requests, or a reset.
-    if count > 0.0 {
-        Some(sum_s / count * 1000.0)
-    } else {
-        None
+}
+
+/// Forget the previous reading after a failed scrape so recovery re-baselines,
+/// while the tracker keeps the last value held until it expires.
+fn rebaseline_latency(windows: &mut LatencyWindows, id: &str) {
+    if let Some(w) = windows.get_mut(id) {
+        w.prev = None;
     }
+}
+
+/// Current held/fresh/expired latency for `id` at `now`.
+fn snapshot_latency(
+    windows: &mut LatencyWindows,
+    id: &str,
+    now: DateTime<Utc>,
+) -> (Option<f64>, Option<ObservationMetadata>) {
+    windows
+        .get_mut(id)
+        .map_or((None, None), |w| w.tracker.snapshot(now))
 }
 
 #[cfg(test)]
@@ -1336,40 +1529,199 @@ mod tests {
         );
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
+    pub(super) fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
+    use rocm_dash_core::metrics::ObservationFreshness;
+
+    const TICK: Duration = Duration::from_secs(2);
+
+    pub(super) fn baseline(sum_s: f64, count: f64) -> LatencyWindow {
+        LatencyWindow {
+            prev: Some((sum_s, count, at(10))),
+            tracker: GenerationObservationTracker::new(TICK),
+        }
+    }
+
+    fn snap_at(
+        w: &mut LatencyWindows,
+        id: &str,
+        secs: i64,
+    ) -> (Option<f64>, Option<ObservationFreshness>) {
+        let (v, m) = snapshot_latency(w, id, at(secs));
+        (v, m.map(|m| m.freshness))
+    }
+
+    fn inst_on(id: &str, gpu: &str) -> Instance {
+        Instance {
+            container_id: id.into(),
+            gpu_ids: vec![gpu.into()],
+            ..Instance::default()
+        }
+    }
+
     #[test]
-    fn avg_ms_first_scrape_uses_cumulative_then_windows() {
-        let mut prev = HashMap::new();
-        // First scrape: cumulative average = 2.0s / 4 × 1000 = 500 ms.
+    fn only_instances_that_can_join_count_as_vram_join_misses() {
+        use rocm_dash_collectors::ancestry::Root;
+        let docker_id = "ab".repeat(32);
+        let rooted = "vllm-qwen-qwen2-5-0-5b-instru-1793361705247";
+        let unrooted = "vllm-other-1793361705248";
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let serving = |id: &str| Instance {
+            status: InstanceStatus::Ready,
+            ..inst_on(id, "0")
+        };
+        let insts = [serving(rooted), serving(unrooted), inst_on(&docker_id, "0")];
+        let roots = [Root {
+            pid: 10,
+            start_ticks: None,
+            owner: rooted.into(),
+        }];
+        // The docker instance and the rooted managed service could both have
+        // joined and did not; the managed service with no roots never could.
+        let empty: HashMap<String, u64> = HashMap::new();
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "a", Some(2.0), Some(4.0), at(10)),
-            Some(500.0)
+            count_vram_join_misses(&insts, &gpus, &empty, &roots, &HashSet::new()),
+            2
         );
-        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms (windowed).
+        // With no roots recorded, only the docker instance is a miss.
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "a", Some(3.0), Some(14.0), at(12)),
-            Some(100.0)
+            count_vram_join_misses(&insts, &gpus, &empty, &[], &HashSet::new()),
+            1
         );
-        // Absent histogram → None (Observe shows `—`).
+        // Once both joined, nothing is missed.
+        let joined: HashMap<String, u64> = [(docker_id, 512), (rooted.to_string(), 256)].into();
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "b", None, None, at(12)),
-            None
+            count_vram_join_misses(&insts, &gpus, &joined, &roots, &HashSet::new()),
+            0
         );
-        // count == 0 (no requests yet) → None, never a divide-by-zero number.
+    }
+
+    #[test]
+    fn a_rooted_non_vllm_service_is_not_a_vram_join_miss() {
+        use rocm_dash_collectors::ancestry::Root;
+        let id = "lemonade-gguf-1793361705247";
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let serving = Instance {
+            status: InstanceStatus::Ready,
+            ..inst_on(id, "0")
+        };
+        let roots = [Root {
+            pid: 10,
+            start_ticks: None,
+            owner: id.into(),
+        }];
+        let empty: HashMap<String, u64> = HashMap::new();
+        // As a vLLM service it would be a miss; marked non-vLLM it is not, since
+        // its backend may hold GPU memory without `amd-smi` listing the process.
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "c", Some(0.0), Some(0.0), at(12)),
-            None
+            count_vram_join_misses(
+                std::slice::from_ref(&serving),
+                &gpus,
+                &empty,
+                &roots,
+                &HashSet::new()
+            ),
+            1
         );
-        // A counter reset (sum drops) re-bases to the cumulative average.
-        let mut p2 = HashMap::new();
-        avg_ms_from_histogram(&mut p2, "d", Some(10.0), Some(100.0), at(10));
+        let non_vllm: HashSet<String> = [id.to_string()].into();
         assert_eq!(
-            avg_ms_from_histogram(&mut p2, "d", Some(0.2), Some(2.0), at(12)),
-            Some(100.0),
-            "reset falls back to cumulative 0.2/2×1000"
+            count_vram_join_misses(&[serving], &gpus, &empty, &roots, &non_vllm),
+            0
+        );
+    }
+
+    #[test]
+    fn a_rooted_service_still_loading_is_not_a_vram_join_miss() {
+        use rocm_dash_collectors::ancestry::Root;
+        let id = "vllm-qwen-1793361705247";
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let loading = Instance {
+            status: InstanceStatus::Starting { phase: None },
+            ..inst_on(id, "0")
+        };
+        let roots = [Root {
+            pid: 10,
+            start_ticks: None,
+            owner: id.into(),
+        }];
+        let empty: HashMap<String, u64> = HashMap::new();
+        assert_eq!(
+            count_vram_join_misses(&[loading], &gpus, &empty, &roots, &HashSet::new()),
+            0
+        );
+    }
+
+    #[test]
+    fn latency_first_scrape_reports_nothing_then_windows() {
+        let mut w = LatencyWindows::new();
+        // First scrape only baselines: the lifetime average is not reported.
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        assert_eq!(snap_at(&mut w, "a", 10), (None, None));
+        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms, fresh.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        assert_eq!(
+            snap_at(&mut w, "a", 12),
+            (Some(100.0), Some(ObservationFreshness::Fresh))
+        );
+    }
+
+    #[test]
+    fn latency_is_held_without_new_requests_then_expires() {
+        let mut w = LatencyWindows::new();
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        // Idle scrapes: counters unchanged → no new value, previous is held.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(14));
+        assert_eq!(
+            snap_at(&mut w, "a", 14),
+            (Some(100.0), Some(ObservationFreshness::Held))
+        );
+        // Validity for a 2 s tick is the 6 s floor: still held at +6 s...
+        assert_eq!(
+            snap_at(&mut w, "a", 18),
+            (Some(100.0), Some(ObservationFreshness::Held))
+        );
+        // ...and gone just past it. The stale lifetime average never returns.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(19));
+        assert_eq!(snap_at(&mut w, "a", 19), (None, None));
+    }
+
+    #[test]
+    fn latency_absent_empty_reset_and_stale_interval_report_nothing() {
+        let mut w = LatencyWindows::new();
+        // Absent histogram / zero count never fabricate a number.
+        observe_latency(&mut w, "b", TICK, None, None, at(12));
+        assert_eq!(snap_at(&mut w, "b", 12), (None, None));
+        observe_latency(&mut w, "c", TICK, Some(0.0), Some(0.0), at(12));
+        observe_latency(&mut w, "c", TICK, Some(0.0), Some(0.0), at(14));
+        assert_eq!(snap_at(&mut w, "c", 14), (None, None));
+        // A counter reset (sum drops) only re-baselines.
+        observe_latency(&mut w, "d", TICK, Some(10.0), Some(100.0), at(10));
+        observe_latency(&mut w, "d", TICK, Some(0.2), Some(2.0), at(12));
+        assert_eq!(snap_at(&mut w, "d", 12), (None, None));
+        // A gap beyond MAX_RATE_INTERVAL_S is not a usable window.
+        observe_latency(&mut w, "e", TICK, Some(1.0), Some(10.0), at(0));
+        observe_latency(&mut w, "e", TICK, Some(2.0), Some(20.0), at(100));
+        assert_eq!(snap_at(&mut w, "e", 100), (None, None));
+    }
+
+    #[test]
+    fn failed_scrape_rebaselines_but_keeps_value_held() {
+        let mut w = LatencyWindows::new();
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        rebaseline_latency(&mut w, "a");
+        assert_eq!(
+            snap_at(&mut w, "a", 14),
+            (Some(100.0), Some(ObservationFreshness::Held))
+        );
+        // Recovery re-baselines: the first post-failure scrape yields nothing new.
+        observe_latency(&mut w, "a", TICK, Some(9.0), Some(50.0), at(15));
+        assert_eq!(
+            snap_at(&mut w, "a", 15),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
     }
 
@@ -1483,76 +1835,6 @@ mod tests {
         assert_eq!(
             ticks_per(Duration::from_secs(30), Duration::from_millis(250)),
             120
-        );
-    }
-
-    // -- Identity/endpoint cleanup helper tests -----------------------------------
-
-    fn make_tracker(tick_secs: u64) -> GenerationObservationTracker {
-        GenerationObservationTracker::new(Duration::from_secs(tick_secs))
-    }
-
-    /// `purge_telemetry_state` removes the tracker entry, TTFT baseline, and
-    /// TPOT baseline for the target id and leaves other ids untouched.
-    #[test]
-    fn purge_telemetry_state_removes_all_three_maps_for_id() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-
-        // Populate two ids.
-        trackers.insert("a".into(), make_tracker(2));
-        trackers.insert("b".into(), make_tracker(2));
-        ttft.insert("a".into(), (1.0, 1.0, at(10)));
-        ttft.insert("b".into(), (2.0, 2.0, at(10)));
-        tpot.insert("a".into(), (3.0, 3.0, at(10)));
-        tpot.insert("b".into(), (4.0, 4.0, at(10)));
-
-        purge_telemetry_state("a", &mut trackers, &mut ttft, &mut tpot);
-
-        // "a" must be gone from all maps.
-        assert!(!trackers.contains_key("a"), "tracker for a must be removed");
-        assert!(!ttft.contains_key("a"), "ttft for a must be removed");
-        assert!(!tpot.contains_key("a"), "tpot for a must be removed");
-        // "b" must be unaffected.
-        assert!(trackers.contains_key("b"), "tracker for b must survive");
-        assert!(ttft.contains_key("b"), "ttft for b must survive");
-        assert!(tpot.contains_key("b"), "tpot for b must survive");
-    }
-
-    /// `invalidate_on_endpoint_change` invalidates the tracker (resets its
-    /// window so subsequent snapshots return None) and removes the latency
-    /// baselines, without removing the tracker entry itself.
-    #[test]
-    fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-
-        let mut tracker = make_tracker(2);
-        // Give the tracker a reading so it has a non-None baseline.
-        tracker.observe_counter(100.0, at(10));
-        tracker.observe_counter(200.0, at(12));
-        trackers.insert("svc".into(), tracker);
-        ttft.insert("svc".into(), (1.0, 10.0, at(10)));
-        tpot.insert("svc".into(), (0.5, 8.0, at(10)));
-
-        invalidate_on_endpoint_change("svc", &mut trackers, &mut ttft, &mut tpot);
-
-        // Tracker still exists but its window is reset: snapshot returns None.
-        let (rate, _meta) = trackers
-            .get_mut("svc")
-            .expect("tracker entry must remain")
-            .snapshot(at(12));
-        assert!(rate.is_none(), "invalidated tracker must yield None rate");
-        // Latency baselines must be cleared.
-        assert!(
-            !ttft.contains_key("svc"),
-            "ttft baseline must be cleared on endpoint change"
-        );
-        assert!(
-            !tpot.contains_key("svc"),
-            "tpot baseline must be cleared on endpoint change"
         );
     }
 }

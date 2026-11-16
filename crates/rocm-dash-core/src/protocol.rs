@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 //! NDJSON command/event protocol between rocmdashd and rocmdash.
-//! See `../wiki/comparisons/ctux-vs-rocm-dash.md` (resolved decisions).
 
 use serde::{Deserialize, Serialize};
 

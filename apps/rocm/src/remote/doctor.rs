@@ -51,7 +51,7 @@ pub(crate) fn examine_remote(
 fn parse_examination(json: &str) -> Result<Examination> {
     serde_json::from_str::<Examination>(json.trim()).context(
         "could not understand the remote machine's system state. The remote CLI is \
-         probably a different version than this one — update whichever is older.",
+         probably a different version than this one - update whichever is older.",
     )
 }
 
@@ -221,7 +221,7 @@ fn is_stateful_sequence(fix: &rocm_core::diagnose::Fix) -> bool {
 /// it in a second layer would only make an already-correct line unreadable, and
 /// these lines exist to be read and pasted.
 fn remote_invocation(target: &str, command: &str) -> String {
-    format!("ssh {target} -- {}", super::shell_quote(command))
+    format!("ssh {target} -- {}", rocm_core::posix_shell_quote(command))
 }
 
 /// Rewrite every backtick-quoted `rocm …` so it names the target machine.
@@ -284,6 +284,28 @@ mod tests {
         // Round-tripping the snapshot is the contract; the value itself is
         // whatever this machine happens to be.
         assert!(!examination.os_family.is_empty());
+    }
+
+    #[test]
+    fn distro_id_like_survives_the_remote_round_trip() {
+        // A remote examination is only ever seen through JSON, so if this
+        // field didn't round-trip, the ID_LIKE fallback would silently never
+        // fire for `rocm remote doctor`.
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "distro_id_like".to_owned(),
+            serde_json::json!("rhel fedora"),
+        );
+        let parsed = parse_examination(&value.to_string()).expect("examined");
+        assert_eq!(parsed.distro_id_like, "rhel fedora");
+    }
+
+    #[test]
+    fn a_remote_on_an_older_cli_without_distro_id_like_still_parses() {
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().remove("distro_id_like");
+        let parsed = parse_examination(&value.to_string()).expect("older remote must parse");
+        assert_eq!(parsed.distro_id_like, "");
     }
 
     #[test]
@@ -360,6 +382,7 @@ mod tests {
     fn real_report_with_a_fix() -> DiagnoseReport {
         use rocm_core::diagnose::{Diagnosis, Fix};
         report(vec![Diagnosis {
+            symptom_matched: false,
             id: "dkms-mismatch".to_owned(),
             title: "DKMS built against another kernel".to_owned(),
             score: 90,
@@ -568,6 +591,7 @@ mod tests {
         let rendered = render_report(
             "gpu-box",
             &report(vec![Diagnosis {
+                symptom_matched: false,
                 id: "annotated".to_owned(),
                 title: "a fix that explains itself".to_owned(),
                 score: 90,
@@ -608,6 +632,7 @@ mod tests {
         let rendered = render_report(
             "gpu-box",
             &report(vec![Diagnosis {
+                symptom_matched: false,
                 id: "container".to_owned(),
                 title: "container missing devices".to_owned(),
                 score: 90,
@@ -682,6 +707,7 @@ mod tests {
         let rendered = render_report(
             "gpu-box",
             &report(vec![Diagnosis {
+                symptom_matched: false,
                 id: "wheels".to_owned(),
                 title: "wrong wheels".to_owned(),
                 score: 90,
@@ -717,5 +743,47 @@ mod tests {
         // acting on it means fixing the wrong computer.
         let rendered = render_report("gpu-box", &report(vec![]), 5);
         assert!(rendered.starts_with("Health of gpu-box"), "{rendered}");
+    }
+
+    /// The note under a cause the symptom did not contribute to describes the
+    /// examined host, which here is the remote one, and it marks only that
+    /// cause.
+    #[test]
+    fn the_symptom_note_is_true_of_a_remote_host_and_marks_only_its_cause() {
+        use rocm_core::diagnose::{Diagnosis, SYMPTOM_DID_NOT_CONTRIBUTE_NOTE};
+        let row = |id: &str, score: i32, symptom_matched: bool| Diagnosis {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            score,
+            symptom_matched,
+            ..Diagnosis::default()
+        };
+        let rendered = render_report(
+            "gpu-box",
+            &report(vec![
+                row("fix-host-only", 60, false),
+                row("fix-from-the-paste", 55, true),
+            ]),
+            5,
+        );
+        let block = |id: &str| -> Vec<&str> {
+            let marker = format!("({id})");
+            rendered
+                .lines()
+                .skip_while(|l| !l.contains(&marker))
+                .take_while(|l| !l.trim().is_empty())
+                .collect()
+        };
+        let marked = |id: &str| {
+            block(id)
+                .iter()
+                .any(|l| l.trim() == SYMPTOM_DID_NOT_CONTRIBUTE_NOTE)
+        };
+        assert!(marked("fix-host-only"), "{rendered}");
+        assert!(!marked("fix-from-the-paste"), "{rendered}");
+        assert!(
+            !SYMPTOM_DID_NOT_CONTRIBUTE_NOTE.contains("this machine"),
+            "the note is printed about a remote host too, where `this machine` is the wrong one"
+        );
     }
 }

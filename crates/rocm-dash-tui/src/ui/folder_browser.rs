@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Reusable folder browser (Phase 3 Wave 0).
+//! Reusable folder browser.
 //!
 //! A shared input primitive: pick (or create-under) a directory. Dependency of
 //! serve / install / runtime / onboarding. Models the frozen rocm-cli
@@ -21,7 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
 /// What a row in the browser represents.

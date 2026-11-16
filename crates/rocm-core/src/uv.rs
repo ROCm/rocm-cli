@@ -422,6 +422,38 @@ pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
     )
 }
 
+/// A `uv` that is already available, without acquiring one: the binary named by
+/// [`UV_BINARY_ENV`], or else the managed copy a previous install left behind.
+///
+/// This is [`ensure_uv_binary`] stopped short of its download. It never downloads,
+/// takes a lock, or creates a folder (not even the managed tools folder), and `None`
+/// is the answer when `ensure_uv_binary` would have had to fetch one. A caller that
+/// must leave the machine untouched (a preview) asks this instead and goes without
+/// `uv` on `None`. A managed copy is only reported once it runs, which is the same
+/// test `ensure_uv_binary` applies before it reuses one.
+pub fn find_uv_binary(paths: &AppPaths) -> Option<PathBuf> {
+    if let Some(path) = uv_binary_override() {
+        return Some(path);
+    }
+    find_managed_uv(paths, &uv_version())
+}
+
+/// The installed managed `uv` of `version`, when it runs. Looks and creates nothing.
+fn find_managed_uv(paths: &AppPaths, version: &str) -> Option<PathBuf> {
+    usable_uv_in(&managed_uv_install_dir(paths, version), uv_binary_name())
+}
+
+/// Where the managed `uv` of `version` is installed: `tools/uv/<version>` under the
+/// data folder. Shared by the install and by [`find_uv_binary`] so that a copy one
+/// installs is the copy the other finds.
+fn managed_uv_install_dir(paths: &AppPaths, version: &str) -> PathBuf {
+    managed_uv_root(paths).join(slug(version))
+}
+
+fn managed_uv_root(paths: &AppPaths) -> PathBuf {
+    managed_tools_dir(&paths.data_dir).join("uv")
+}
+
 /// Which `uv` release to install, resolved from the environment by
 /// [`ensure_uv_binary`] so the install itself never reads it.
 struct ManagedUvRelease {
@@ -444,9 +476,9 @@ struct ManagedUvRelease {
 /// The lock is a leaf: nothing below acquires another lock, so it cannot take part in
 /// a lock-order inversion with the managed-launch or daemon-autostart locks.
 fn install_managed_uv(paths: &AppPaths, release: &ManagedUvRelease) -> Result<PathBuf> {
-    let uv_root = managed_tools_dir(&paths.data_dir).join("uv");
+    let uv_root = managed_uv_root(paths);
     let version_slug = slug(&release.version);
-    let install_dir = uv_root.join(&version_slug);
+    let install_dir = managed_uv_install_dir(paths, &release.version);
     let binary_name = uv_binary_name();
 
     if let Some(existing) = usable_uv_in(&install_dir, binary_name) {
@@ -1216,6 +1248,76 @@ All installed packages are compatible
         Ok(std::fs::read(&archive)?)
     }
 
+    /// Plants `script` as the managed `uv` of `version`, where an install would have
+    /// left it.
+    #[cfg(unix)]
+    fn plant_managed_uv(paths: &AppPaths, version: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = managed_uv_install_dir(paths, version);
+        std::fs::create_dir_all(&dir).expect("create the managed uv folder");
+        let binary = dir.join(uv_binary_name());
+        std::fs::write(&binary, script).expect("write the stand-in uv");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in uv executable");
+        binary
+    }
+
+    // The preview's question, answered on every platform: on a clean data folder
+    // there is no managed `uv`, and asking leaves no trace. `ensure_uv_binary` would
+    // have created `tools/uv` (for its lock) before it downloaded anything, which is
+    // the state this pins as untouched.
+    #[test]
+    fn looking_for_a_managed_uv_on_a_clean_host_finds_none_and_creates_nothing() {
+        let (root, paths) = crate::test_support::temp_app_paths("uv-find-clean");
+        assert_eq!(find_managed_uv(&paths, "latest"), None);
+        assert!(
+            !managed_tools_dir(&paths.data_dir).exists(),
+            "looking for uv must not create the managed tools folder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Unix-only: the stand-in `uv` is a shell script, and Windows can only run a real
+    // executable as `uv.exe`.
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_managed_uv_is_found_where_the_install_puts_it() {
+        let (root, paths) = crate::test_support::temp_app_paths("uv-find-installed");
+        let planted = plant_managed_uv(&paths, "latest", "#!/bin/sh\nexit 0\n");
+        assert_eq!(find_managed_uv(&paths, "latest"), Some(planted.clone()));
+        // The install reuses the same copy rather than downloading: the lookup and the
+        // install agree on the location, so a copy one leaves is the copy the other
+        // finds. The release names a URL nothing listens on, so reaching for it would
+        // fail the call.
+        let reused = install_managed_uv(
+            &paths,
+            &ManagedUvRelease {
+                version: "latest".to_owned(),
+                asset: "uv-test.tar.gz".to_owned(),
+                url: "http://127.0.0.1:9/uv-test.tar.gz".to_owned(),
+            },
+        )
+        .expect("an installed uv is reused without a download");
+        assert_eq!(reused, planted);
+        // Another version is a different copy.
+        assert_eq!(find_managed_uv(&paths, "0.0.1"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_uv_that_does_not_run_is_not_reported() {
+        let (root, paths) = crate::test_support::temp_app_paths("uv-find-broken");
+        plant_managed_uv(&paths, "latest", "#!/bin/sh\nexit 1\n");
+        assert_eq!(
+            find_managed_uv(&paths, "latest"),
+            None,
+            "a copy `ensure_uv_binary` would replace is not one a preview can use"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // Unix-only: the fake `uv` is a shell script, and Windows can only run a real
     // executable as `uv.exe`. The lock and the re-check under test are
     // platform-independent.
@@ -1318,5 +1420,171 @@ All installed packages are compatible
             "staging debris left behind: {leftovers:?}"
         );
         Ok(())
+    }
+}
+
+/// Property tests for the `uv` bootstrap archive, judged on the filesystem by
+/// `crate::archive_props`. Extraction here is the system `tar` resolved from
+/// `PATH`, so these exercise the host's `tar` (GNU tar on the Linux CI
+/// runners) through `extract_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use std::path::Path;
+
+    use super::{extract_archive, find_binary_in, make_executable, uv_binary_name};
+    use crate::archive_props::{
+        ESCAPES_ONLY, Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, concretize, entries,
+        naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case, run_property,
+        run_round_trip, tar_gz_bytes,
+    };
+
+    fn property(
+        label: &str,
+        expect: Expect,
+        extract: fn(&Path, &Path) -> anyhow::Result<()>,
+    ) -> Result<(), String> {
+        note_mode_scope(label, expect.modes);
+        run_property(label, 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "archive.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| extract(archive, &layout.dest),
+            )
+            .judge(expect)
+        })
+    }
+
+    #[test]
+    fn uv_archive_extraction_never_writes_outside_the_staging_dir() {
+        property("uv", ESCAPES_ONLY, extract_archive).unwrap();
+    }
+
+    /// The other direction: a well-formed archive is extracted in full, into
+    /// the staging directory it was given. An extraction that wrote somewhere
+    /// else entirely (no `-C`) escapes the oracle above; this catches it.
+    #[test]
+    fn uv_archive_extraction_extracts_a_benign_archive_into_the_staging_dir() {
+        run_round_trip("uv-benign", |layout, entries| {
+            let archive = layout.base.join("archive.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
+    }
+
+    /// The system `tar` drops setuid/setgid and applies the umask only for an
+    /// unprivileged user, so this is judged only there (see `Modes`).
+    #[test]
+    fn uv_archive_extraction_leaves_no_setuid_or_world_writable_entry() {
+        property(
+            "uv-modes",
+            Expect {
+                modes: Modes::SafeUnlessRoot,
+                no_outward_links: false,
+            },
+            extract_archive,
+        )
+        .unwrap();
+    }
+
+    /// Unpack a one-off archive into the layout's staging dir and run the
+    /// lookup-and-chmod half of `ensure_uv_binary` on it.
+    fn stage_and_locate(layout: &Layout, entries: &[Entry]) -> Option<std::path::PathBuf> {
+        let archive = layout.base.join("uv.tar.gz");
+        std::fs::write(&archive, tar_gz_bytes(&concretize(entries, layout))).unwrap();
+        extract_archive(&archive, &layout.dest).unwrap();
+        let binary = find_binary_in(&layout.dest, uv_binary_name())?;
+        let _ = make_executable(&binary);
+        Some(binary)
+    }
+
+    /// Known defect: `find_binary_in` tests `is_file`/`is_dir`, which follow
+    /// symlinks, and `make_executable` then chmods whatever was found. An
+    /// archive whose `uv` entry is a symlink to a file outside the staging
+    /// directory gets that outside file chmodded to 0755 — the system `tar`
+    /// recreates the symlink as archived, so nothing upstream of the lookup
+    /// stops it.
+    #[test]
+    #[ignore = "known gap: uv binary lookup follows symlinks out of the staging dir (#522)"]
+    fn uv_binary_lookup_never_chmods_a_file_outside_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let layout = Layout::new();
+        let sentinel = layout.outside.join("sentinel");
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entries = [Entry {
+            name: b"uv".to_vec(),
+            kind: Kind::Symlink(format!("{OUTSIDE_TOKEN}/sentinel").into_bytes()),
+            mode: 0o777,
+        }];
+        let found = stage_and_locate(&layout, &entries);
+        let mode = std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file outside staging was chmodded via {found:?} (now {mode:o})"
+        );
+    }
+
+    /// Known defect: the same link-following walk recurses through directory
+    /// symlinks with no depth bound and no cycle check, so two `-> .` links
+    /// make it branch at every level until the kernel's 40-hop symlink limit:
+    /// on the order of 2^40 directory reads. (A link to `/` instead walks the
+    /// whole host filesystem.) This runs the lookup on a worker thread and
+    /// fails if it has not returned in 20 s; the thread is leaked on failure.
+    #[test]
+    #[ignore = "known gap: uv binary lookup does not terminate on a symlink loop (#522)"]
+    fn uv_binary_lookup_terminates_on_a_symlink_loop() {
+        let layout = Layout::new();
+        let entries = [
+            Entry {
+                name: b"a".to_vec(),
+                kind: Kind::Symlink(b".".to_vec()),
+                mode: 0o777,
+            },
+            Entry {
+                name: b"b".to_vec(),
+                kind: Kind::Symlink(b".".to_vec()),
+                mode: 0o777,
+            },
+        ];
+        let archive = layout.base.join("uv.tar.gz");
+        std::fs::write(&archive, tar_gz_bytes(&entries)).unwrap();
+        extract_archive(&archive, &layout.dest).unwrap();
+        let staging = layout.dest;
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(find_binary_in(&staging, uv_binary_name()));
+        });
+        let result = wait.recv_timeout(std::time::Duration::from_secs(20));
+        assert!(
+            result.is_ok(),
+            "find_binary_in did not finish within 20 s on a two-link symlink loop"
+        );
+    }
+
+    /// Calibration: the same property over the same generator must catch an
+    /// extractor that joins raw names. If this starts passing, the generator
+    /// has stopped producing traversal names and every "no escape" result
+    /// above is meaningless.
+    #[test]
+    fn generator_catches_a_traversing_extractor() {
+        let error = property("naive", ESCAPES_ONLY, naive_unpack)
+            .expect_err("an extractor that honours `..` must be caught");
+        // Caught for a write outside the root (an escape, not a harness
+        // failure or a link the escape check does not judge).
+        assert!(error.contains("outside the root: "), "{error}");
+    }
+
+    /// Calibration for the two-step link shape: an extractor that sanitises
+    /// every name but follows a symlink an earlier entry planted is only
+    /// caught if the generator really emits "link, then write through it".
+    #[test]
+    fn generator_catches_a_link_following_extractor() {
+        let error = property("naive-links", ESCAPES_ONLY, naive_sanitizing_unpack)
+            .expect_err("an extractor that writes through planted links must be caught");
+        assert!(error.contains("outside the root: "), "{error}");
     }
 }

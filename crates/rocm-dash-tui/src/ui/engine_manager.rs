@@ -2,13 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Engine manager overlay (Phase 3 Wave 1).
+//! Engine manager overlay.
 //!
 //! Lists the serving engines ROCm CLI knows about and runs use/install/reinstall
 //! **through the approval gate and the job-bridge** — never inline. Installs
-//! stream their output into the shared job console (the Wave-0 `running_job`
-//! replacement). This is the third operational screen on the proven primitives;
-//! it feeds the serve wizard (which engine to launch a model with).
+//! stream their output into the shared job console. It feeds the serve wizard
+//! (which engine to launch a model with).
 //!
 //! The approval *decision* is the user's, captured by the render+event seam; the
 //! CLI owns the actual mutation (`rocm config set-default-engine` /
@@ -301,11 +300,8 @@ pub fn draw_engine_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn use_action_builds_config_set_default_engine() {

@@ -14,28 +14,23 @@
 //! random text, so every branch is reached; `inputs_reach_every_region` checks
 //! that.
 
-use super::{
-    WSL_MIN_UBUNTU, distro_clears_wsl_floor, line_blacklists_amdgpu, mode_access, parse_iommu_param,
-};
+use super::WSL_MIN_UBUNTU;
+use super::host_env::parse_iommu_param;
+use super::linux_driver::{line_blacklists_amdgpu, mode_access};
+use super::wsl::distro_clears_wsl_floor;
+use crate::test_support::proptest_cases;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
-/// Case count: `default`, unless `PROPTEST_CASES` (proptest's own knob, which
-/// an explicit count would otherwise override) asks for a longer run.
-fn cases(default: u32) -> u32 {
-    std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
 /// gfx targets a real host reports, as `examine` and the install probes see
-/// them.
+/// them. At least one per raw-target arm of `normalize_therock_family`, so the
+/// family property reaches every arm. gfx90c is absent on purpose: it is a real
+/// reported target but has no TheRock family, so it cannot satisfy that property.
 const GFX_TARGETS: &[&str] = &[
-    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx90c", "gfx942", "gfx950", "gfx1010", "gfx1030",
-    "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1101",
-    "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1200", "gfx1201",
+    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1010", "gfx1030", "gfx1031",
+    "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1101", "gfx1102",
+    "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1200", "gfx1201", "gfx1250",
 ];
 
 fn ubuntu_release() -> impl Strategy<Value = (u32, u32)> {
@@ -142,7 +137,7 @@ fn spelled_target() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases(256)))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(256)))]
 
     /// The WSL distro floor is monotone: a newer Ubuntu release is never less
     /// supported than an older one.
@@ -235,7 +230,7 @@ proptest! {
 /// modprobe directive, yet it is read as one. The fix for #506 should
 /// un-ignore this, and can then let `blacklist_line` draw an empty separator.
 #[test]
-#[ignore = "known defect: a directive with no whitespace before the module is read as a blacklist (#506)"]
+#[ignore = "known gap: a directive with no whitespace before the module is read as a blacklist (#506)"]
 fn a_blacklist_directive_needs_whitespace_before_the_module() {
     for line in ["blacklistamdgpu", "  blacklistamdgpu # why"] {
         assert!(!line_blacklists_amdgpu(line), "{line:?}");

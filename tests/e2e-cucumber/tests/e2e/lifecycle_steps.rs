@@ -49,11 +49,40 @@ pub struct LifecycleState {
     /// A generated installer fixture with controlled pinned trust roots.
     installer_fixture: Option<PathBuf>,
     /// A captured Windows user PATH to restore on drop (Windows only).
-    captured_user_path: Option<String>,
+    captured_user_path: Option<CapturedUserPath>,
     /// Isolated config/data/cache directories for installed-binary smoke tests.
     smoke_config: Option<PathBuf>,
     smoke_data: Option<PathBuf>,
     smoke_cache: Option<PathBuf>,
+    /// The shell profile contents seeded before install, which uninstall must
+    /// restore exactly.
+    profile_before_install: Option<String>,
+    /// A shell profile the installer is pointed at through
+    /// `ROCM_CLI_SHELL_PROFILE`; `None` means the default `~/.bashrc`.
+    custom_profile: Option<PathBuf>,
+    /// The login shell (`$SHELL`) the installer is run under; `None` leaves the
+    /// runner's own.
+    login_shell: Option<String>,
+    /// The fish config seeded before install, which uninstall must restore
+    /// exactly.
+    fish_config_before_install: Option<String>,
+}
+
+/// The Windows user `Path` exactly as the registry holds it: its value with
+/// `%VARIABLES%` unexpanded, and its registry kind (`String` for `REG_SZ`,
+/// `ExpandString` for `REG_EXPAND_SZ`), or `None` when there is no value.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows has a user PATH to capture.
+pub struct CapturedUserPath {
+    kind: Option<String>,
+    value: String,
+}
+
+/// The shell profile the installer writes its PATH lines to in this scenario.
+fn shell_profile(st: &LifecycleState) -> PathBuf {
+    st.custom_profile
+        .clone()
+        .unwrap_or_else(|| st.home_dir.join(".bashrc"))
 }
 
 impl Drop for LifecycleState {
@@ -212,6 +241,9 @@ fn run_installer_command(
     // Isolate the installer's HOME so shell-profile writes and the seeded
     // ~/.rocm/config.json land in the scenario's tree, never the real home.
     cmd.env("HOME", &st.home_dir);
+    // fish's config lives under $XDG_CONFIG_HOME when that is set, which would
+    // point the installer's fish setup at the runner's real config.
+    cmd.env_remove("XDG_CONFIG_HOME");
     for (key, value) in public_key_env {
         cmd.env(key, value);
     }
@@ -266,7 +298,8 @@ fn which_ok(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Capture the current Windows user PATH (registry `HKCU\Environment\Path`).
+/// The current Windows user PATH (registry `HKCU\Environment\Path`), with
+/// any `%VARIABLES%` expanded, for checking which folders it names.
 #[cfg(windows)]
 fn capture_user_path() -> String {
     let output = Command::new("powershell")
@@ -282,17 +315,77 @@ fn capture_user_path() -> String {
         .unwrap_or_default()
 }
 
-/// Restore the Windows user PATH to a previously captured value.
+/// Write a value to the real Windows user PATH (`HKCU\Environment\Path`) via
+/// PowerShell's `[Environment]::SetEnvironmentVariable`, the same call
+/// `install.ps1` makes. The value travels through the child's own environment
+/// (`$env:...`), never interpolated into the script string, so this helper --
+/// unlike the `rocm fix fix-6-path` write it is used to stage around -- has no
+/// quoting exposure of its own.
+///
+/// Only for staging a known test value. Putting the runner's real PATH back is
+/// [`restore_user_path`]'s job, which goes through the registry directly to
+/// keep the value's original `REG_EXPAND_SZ`/`REG_SZ` kind.
+#[cfg(windows)]
+fn write_user_path(value: &str) -> std::io::Result<std::process::ExitStatus> {
+    let script = "[Environment]::SetEnvironmentVariable('Path', $env:ROCM_E2E_NEW_PATH, 'User')";
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .env("ROCM_E2E_NEW_PATH", value)
+        .status()
+}
+
+/// The Windows user PATH as the registry stores it, so it can be put back
+/// exactly: `[Environment]` would expand its `%VARIABLES%` on the way out and
+/// write it back as `REG_SZ`.
+#[cfg(windows)]
+fn capture_raw_user_path() -> CapturedUserPath {
+    // UTF-8 out, so a folder name outside the console code page survives the
+    // round trip back into the registry.
+    let script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment'); \
+        if ($null -ne $key -and $key.GetValueNames() -contains 'Path') { \
+            $key.GetValueKind('Path').ToString(); \
+            $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) \
+        } else { 'Missing' }";
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .expect("failed to run PowerShell to read the user PATH");
+    assert!(
+        output.status.success(),
+        "failed to read the user PATH: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (kind, value) = stdout.split_once('\n').unwrap_or((&stdout, ""));
+    let kind = kind.trim();
+    CapturedUserPath {
+        kind: (kind != "Missing").then(|| kind.to_owned()),
+        value: value.trim_end_matches(['\r', '\n']).to_owned(),
+    }
+}
+
+/// Restore the Windows user PATH to a previously captured value and kind.
 ///
 /// Runs during `Drop`, so it must not panic; a failed restore is loud on stderr
 /// instead, because a botched restore leaves the runner's real user PATH
 /// polluted with the test's temp install dir and that must be diagnosable.
 #[cfg(windows)]
-fn restore_user_path(value: &str) {
-    let script = "[Environment]::SetEnvironmentVariable('Path', $env:ROCM_E2E_PREV_PATH, 'User')";
+fn restore_user_path(previous: &CapturedUserPath) {
+    let script = "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); \
+        if ($env:ROCM_E2E_PREV_KIND -eq 'Missing') { $key.DeleteValue('Path', $false) } \
+        else { \
+            $value = if ($null -eq $env:ROCM_E2E_PREV_PATH) { '' } else { $env:ROCM_E2E_PREV_PATH }; \
+            $key.SetValue('Path', $value, [Microsoft.Win32.RegistryValueKind]$env:ROCM_E2E_PREV_KIND) \
+        }; \
+        $key.Close()";
     let status = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
-        .env("ROCM_E2E_PREV_PATH", value)
+        .env("ROCM_E2E_PREV_PATH", &previous.value)
+        .env(
+            "ROCM_E2E_PREV_KIND",
+            previous.kind.as_deref().unwrap_or("Missing"),
+        )
         .status();
     match status {
         Ok(status) if status.success() => {}
@@ -303,6 +396,60 @@ fn restore_user_path(value: &str) {
             "warning: could not run PowerShell to restore Windows user PATH ({error}); the runner PATH may still reference the test install dir"
         ),
     }
+}
+
+/// Stage a known value on the real Windows user PATH for a scenario outside
+/// this module (`diagnose_steps`'s `fix-6-path` coverage), capturing the real
+/// value first so [`LifecycleState`]'s `Drop` restores it afterward -- the
+/// same guarantee this module's own `install.ps1` scenarios get.
+///
+/// Panics on failure, unlike [`restore_user_path`]'s warn-and-continue: this
+/// runs during setup, not teardown, and a silently failed stage would run the
+/// rest of the scenario against an unknown real PATH value instead of the one
+/// it asked for.
+#[cfg(windows)]
+pub(crate) fn stage_user_path_for_test(world: &mut crate::E2eWorld, value: &str) {
+    let state = world.lifecycle.get_or_insert_with(LifecycleState::default);
+    if state.captured_user_path.is_none() {
+        state.captured_user_path = Some(capture_raw_user_path());
+    }
+    let status =
+        write_user_path(value).expect("failed to run PowerShell to stage the test User PATH");
+    assert!(
+        status.success(),
+        "failed to stage the test User PATH (exit {status})"
+    );
+}
+
+/// Off Windows there is no User-scope PATH to stage, and the only caller's
+/// scenario is `@requires-os:windows` so it resolves to skip; the stub exists
+/// purely so `diagnose_steps` compiles on every platform.
+#[cfg(not(windows))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn stage_user_path_for_test(world: &mut crate::E2eWorld, _value: &str) {
+    let _ = world;
+}
+
+/// Read back the real Windows user PATH. Exposed for `diagnose_steps`'s
+/// `fix-6-path` coverage, which asserts the state a real write left behind,
+/// not just the CLI's own report of it.
+#[cfg(windows)]
+pub(crate) fn read_user_path_for_test() -> String {
+    capture_user_path()
+}
+
+/// Off Windows there is no User-scope PATH to read back; see
+/// [`stage_user_path_for_test`]'s stub for why this arm exists at all.
+#[cfg(not(windows))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn read_user_path_for_test() -> String {
+    String::new()
 }
 
 /// The real (non-isolated) user rocm state dir, `~/.rocm`, if a home dir is
@@ -340,6 +487,16 @@ fn assert_missing(path: &Path) {
         "expected path to be removed: {}",
         path.display()
     );
+}
+
+/// Assert a path is gone within a few seconds. On Windows the running `rocm.exe`
+/// may only be deleted as the uninstalling process exits.
+async fn assert_missing_soon(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_missing(path);
 }
 
 // ── Given: setup ───────────────────────────────────────────────────────
@@ -384,6 +541,10 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_config: None,
         smoke_data: None,
         smoke_cache: None,
+        profile_before_install: None,
+        custom_profile: None,
+        login_shell: None,
+        fish_config_before_install: None,
     });
 }
 
@@ -429,11 +590,95 @@ async fn given_isolated_dirs(world: &mut E2eWorld) {
     seed_isolated_dirs(world);
 }
 
+#[given("the shell profile already holds the user's own settings")]
+async fn given_profile_user_settings(world: &mut E2eWorld) {
+    let profile = shell_profile(state(world));
+    if let Some(dir) = profile.parent() {
+        std::fs::create_dir_all(dir).expect("failed to create the shell profile's folder");
+    }
+    let contents = "# the user's own settings\nexport ROCM_E2E_USER_SETTING=1\n".to_owned();
+    std::fs::write(&profile, &contents).expect("failed to seed the shell profile");
+    state_mut(world).profile_before_install = Some(contents);
+}
+
+/// The fish config the installer writes its PATH block to in this scenario.
+fn fish_config(st: &LifecycleState) -> PathBuf {
+    st.home_dir.join(".config").join("fish").join("config.fish")
+}
+
+/// The completion file the installer writes for fish in this scenario.
+fn fish_completions(st: &LifecycleState) -> PathBuf {
+    st.home_dir
+        .join(".config")
+        .join("fish")
+        .join("completions")
+        .join("rocm.fish")
+}
+
+#[given("fish is set up with its own settings")]
+async fn given_fish_configured(world: &mut E2eWorld) {
+    // A config directory is enough for the installer to treat fish as installed,
+    // so the scenario does not depend on the runner having the fish binary.
+    let config = fish_config(state(world));
+    std::fs::create_dir_all(config.parent().expect("fish config has a folder"))
+        .expect("failed to create the fish config folder");
+    let contents = "# the user's own fish settings\nset -gx ROCM_E2E_USER_SETTING 1\n".to_owned();
+    std::fs::write(&config, &contents).expect("failed to seed the fish config");
+    state_mut(world).fish_config_before_install = Some(contents);
+}
+
+#[given("the login shell is bash")]
+async fn given_login_shell_bash(world: &mut E2eWorld) {
+    state_mut(world).login_shell = Some("/bin/bash".to_owned());
+}
+
+#[given("a signed bundle installed updating the user PATH")]
+async fn given_installed_updating_user_path(world: &mut E2eWorld) {
+    package_with_key_file(world).await;
+    when_install_update_user_path(world).await;
+    then_user_path_updated(world).await;
+}
+
+#[given("the installer writes its PATH lines to a shell profile the user chose")]
+async fn given_custom_profile(world: &mut E2eWorld) {
+    // Outside every profile `install.sh` picks by shell, so only the installer's
+    // record can tell uninstall where the lines went.
+    let st = state_mut(world);
+    st.custom_profile = Some(st.home_dir.join("dotfiles").join("rocm-path.sh"));
+}
+
+#[given("the install directory is reached through a link")]
+async fn given_linked_install_dir(world: &mut E2eWorld) {
+    #[cfg(unix)]
+    {
+        // The installer spells the folder through the link in the profile, but
+        // the installed binary sees its folder resolved, so only the
+        // installer's record of that spelling lets uninstall match the block.
+        let root = root(world);
+        let target = root.join("install-target");
+        std::fs::create_dir_all(&target).expect("failed to create the install target");
+        let link = root.join("install-link");
+        std::os::unix::fs::symlink(&target, &link).expect("failed to link the install folder");
+        state_mut(world).install_dir = link.join("bin");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = world;
+    }
+}
+
+#[given("another program is installed in the install directory")]
+async fn given_other_program(world: &mut E2eWorld) {
+    let install_dir = state(world).install_dir.clone();
+    std::fs::write(install_dir.join("other-tool"), "#!/bin/sh\n")
+        .expect("failed to seed another program");
+}
+
 #[given("the user PATH is captured for restoration")]
 async fn given_capture_user_path(world: &mut E2eWorld) {
     #[cfg(windows)]
     {
-        state_mut(world).captured_user_path = Some(capture_user_path());
+        state_mut(world).captured_user_path = Some(capture_raw_user_path());
     }
     #[cfg(not(windows))]
     {
@@ -450,6 +695,8 @@ fn seed_isolated_dirs(world: &mut E2eWorld) {
     let cache = root.join("smoke-cache");
     for dir in [&config, &data, &cache] {
         std::fs::create_dir_all(dir).expect("failed to create isolated smoke dir");
+        std::fs::write(dir.join("state-marker"), "seeded by the scenario\n")
+            .expect("failed to seed isolated smoke state");
     }
     let st = state_mut(world);
     st.smoke_config = Some(config);
@@ -573,8 +820,34 @@ async fn install_with_key_file_shell_profile(world: &mut E2eWorld) {
         "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
         st.public_key.to_string_lossy().into_owned(),
     )];
-    let shell_on = [("ROCM_CLI_UPDATE_SHELL_PATH", "1".to_string())];
+    let mut shell_on = vec![("ROCM_CLI_UPDATE_SHELL_PATH", "1".to_string())];
+    if let Some(shell) = &st.login_shell {
+        shell_on.push(("SHELL", shell.clone()));
+    }
+    if let Some(profile) = &st.custom_profile {
+        shell_on.push((
+            "ROCM_CLI_SHELL_PROFILE",
+            profile.to_string_lossy().into_owned(),
+        ));
+    }
     let (out, _ok) = run_installer(world, &install_dir, &download_base, &key_env, &shell_on);
+    state_mut(world).last_output = out;
+}
+
+#[when("the signed bundle is installed with the public key file and NO_COLOR set")]
+async fn when_install_key_file_no_color(world: &mut E2eWorld) {
+    let st = state(world);
+    let install_dir = st.install_dir.clone();
+    let download_base = st.download_base.clone();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        st.public_key.to_string_lossy().into_owned(),
+    )];
+    let extra = [
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("NO_COLOR", "1".to_string()),
+    ];
+    let (out, _ok) = run_installer(world, &install_dir, &download_base, &key_env, &extra);
     state_mut(world).last_output = out;
 }
 
@@ -904,32 +1177,31 @@ async fn when_examine_isolated(world: &mut E2eWorld) {
 
 #[when("the user uninstalls from the installed binary")]
 async fn when_uninstall(world: &mut E2eWorld) {
-    let st = state(world);
-    let rocm = installed_binary(&st.install_dir, "rocm");
-    let mut cmd = Command::new(&rocm);
-    cmd.arg("uninstall").arg("--yes");
-    apply_smoke_env(&mut cmd, st);
-    let output = cmd.output().expect("failed to run uninstall");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    state_mut(world).last_output = combined;
+    run_uninstall(world, &[]);
 }
 
 #[when("the user uninstalls from the installed binary keeping config data and cache")]
 async fn when_uninstall_keep(world: &mut E2eWorld) {
+    run_uninstall(world, &["--keep-config", "--keep-data", "--keep-cache"]);
+}
+
+#[when("the user uninstalls from the installed binary keeping the binaries")]
+async fn when_uninstall_keep_binaries(world: &mut E2eWorld) {
+    run_uninstall(world, &["--keep-binaries"]);
+}
+
+/// Run `rocm uninstall --yes` from the installed binary with `extra_args`,
+/// capturing its output and exit code.
+fn run_uninstall(world: &mut E2eWorld, extra_args: &[&str]) {
     let st = state(world);
     let rocm = installed_binary(&st.install_dir, "rocm");
     let mut cmd = Command::new(&rocm);
-    cmd.args([
-        "uninstall",
-        "--yes",
-        "--keep-config",
-        "--keep-data",
-        "--keep-cache",
-    ]);
+    cmd.args(["uninstall", "--yes"]).args(extra_args);
+    // Uninstall undoes the installer's shell-profile change, so it must see the
+    // scenario's HOME, never the runner's real one. It must find a profile the
+    // installer was pointed at from the installer's record alone.
+    cmd.env("HOME", &st.home_dir)
+        .env_remove("ROCM_CLI_SHELL_PROFILE");
     apply_smoke_env(&mut cmd, st);
     let output = cmd.output().expect("failed to run uninstall");
     let combined = format!(
@@ -937,7 +1209,9 @@ async fn when_uninstall_keep(world: &mut E2eWorld) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    state_mut(world).last_output = combined;
+    let st = state_mut(world);
+    st.last_output = combined;
+    st.last_rc = output.status.code().unwrap_or(-1);
 }
 
 /// Apply the isolated config/data/cache env for installed-binary invocations.
@@ -961,6 +1235,76 @@ async fn then_signature_verified(world: &mut E2eWorld) {
     assert!(
         out.contains("signature verified"),
         "installer did not report signature verification:\n{out}"
+    );
+}
+
+#[then("the installer prints the get-started block")]
+async fn then_get_started_block(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    for needle in ["Get started:", "install sdk", "serve qwen", "examine"] {
+        assert!(
+            out.contains(needle),
+            "installer output is missing {needle:?}:\n{out}"
+        );
+    }
+}
+
+#[then("the installer next-step hint names the installed rocm binary")]
+async fn then_hint_names_binary(world: &mut E2eWorld) {
+    // ROCM_CLI_UPDATE_SHELL_PATH=0 and the install dir is not on the caller's
+    // PATH, so bare `rocm` would not work: the hint and every example must
+    // name the binary by path. PowerShell invokes a quoted path with `&`.
+    let st = state(world);
+    let rocm = installed_binary(&st.install_dir, "rocm")
+        .display()
+        .to_string();
+    let cmd = if cfg!(windows) {
+        format!("& \"{rocm}\"")
+    } else {
+        rocm
+    };
+    let lines: Vec<&str> = st.last_output.lines().map(str::trim).collect();
+    let hint = format!("Run: {cmd} examine");
+    assert_eq!(
+        lines.iter().rev().find(|l| !l.is_empty()),
+        Some(&hint.as_str()),
+        "installer's last line is not the next-step hint:\n{}",
+        st.last_output
+    );
+    for example in ["install sdk", "serve qwen"] {
+        let want = format!("{cmd} {example}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&want)),
+            "no get-started example starts with {want:?}:\n{}",
+            st.last_output
+        );
+    }
+}
+
+#[then("the installer output has no banner art")]
+async fn then_no_banner_art(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        !out.contains('\u{2588}'),
+        "piped installer output contains the box-drawing banner:\n{out}"
+    );
+}
+
+#[then("the installer output has no ANSI escapes")]
+async fn then_no_ansi(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        !out.contains('\u{1b}'),
+        "piped installer output contains an escape byte:\n{out:?}"
+    );
+}
+
+#[then("the installer failure line is marked with the !! prefix")]
+async fn then_failure_marker(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("!! rocm-cli installer:"),
+        "installer failure line has no !! marker:\n{out}"
     );
 }
 
@@ -994,7 +1338,7 @@ async fn then_shell_profile_updated(world: &mut E2eWorld) {
 #[then("the shell profile lists the install directory")]
 async fn then_shell_profile_lists_dir(world: &mut E2eWorld) {
     let st = state(world);
-    let profile = st.home_dir.join(".bashrc");
+    let profile = shell_profile(st);
     let contents = std::fs::read_to_string(&profile).unwrap_or_default();
     let install_dir = st.install_dir.to_string_lossy();
     assert!(
@@ -1150,13 +1494,26 @@ async fn then_config_preserved(world: &mut E2eWorld) {
 
 #[then("the shell profile has exactly one rocm-cli PATH marker")]
 async fn then_single_path_marker(world: &mut E2eWorld) {
-    let profile = state(world).home_dir.join(".bashrc");
-    let contents = std::fs::read_to_string(&profile).unwrap_or_default();
+    assert_single_path_marker(state(world));
+}
+
+/// The scenario's shell profile holds the installer's marked PATH block exactly
+/// once.
+fn assert_single_path_marker(st: &LifecycleState) {
+    assert_single_path_marker_in(&shell_profile(st));
+}
+
+/// Assert `profile` holds exactly one rocm-cli PATH block, and return its text.
+fn assert_single_path_marker_in(profile: &Path) -> String {
+    let contents = std::fs::read_to_string(profile).unwrap_or_default();
     let count = contents.matches("# >>> rocm-cli path >>>").count();
     assert_eq!(
-        count, 1,
-        "expected exactly one rocm-cli PATH marker, found {count}:\n{contents}"
+        count,
+        1,
+        "expected exactly one rocm-cli PATH marker in {}, found {count}:\n{contents}",
+        profile.display()
     );
+    contents
 }
 
 #[then("examine reads only the isolated config, data, and cache directories")]
@@ -1186,20 +1543,489 @@ async fn then_examine_isolated(world: &mut E2eWorld) {
     }
 }
 
-#[then("uninstall reports skipping the running executable on Windows")]
-async fn then_skip_running_exe(world: &mut E2eWorld) {
-    let out = &state(world).last_output;
-    assert!(
-        out.contains("skipping running executable on Windows"),
-        "uninstall did not report the running-executable skip:\n{out}"
+#[then("the installed rocm binary that ran uninstall is gone")]
+async fn then_running_rocm_gone(world: &mut E2eWorld) {
+    let st = state(world);
+    let out = &st.last_output;
+    let rocm = installed_binary(&st.install_dir, "rocm");
+    // Matched by file name: the program reports its own path, which on Windows
+    // may be spelled differently (long vs 8.3 short) from the scenario's.
+    let own_name = format!(
+        "{}rocm{}",
+        std::path::MAIN_SEPARATOR,
+        std::env::consts::EXE_SUFFIX
     );
+    let reported = out.lines().any(|line| {
+        line.starts_with("removed binary ")
+            && (line.ends_with(&own_name)
+                || line.ends_with(&format!("{own_name} as this command exits")))
+    });
+    assert!(
+        reported && out.contains("uninstall complete"),
+        "uninstall did not report removing its own binary:\n{out}"
+    );
+    assert_missing_soon(&rocm).await;
 }
 
 #[then("the installed rocm and rocmd binaries are gone")]
 async fn then_binaries_gone(world: &mut E2eWorld) {
     let st = state(world);
-    assert_missing(&installed_binary(&st.install_dir, "rocm"));
+    assert_missing_soon(&installed_binary(&st.install_dir, "rocm")).await;
     assert_missing(&installed_binary(&st.install_dir, "rocmd"));
+}
+
+#[then("the shell profile is back to the user's own settings")]
+async fn then_profile_restored(world: &mut E2eWorld) {
+    let st = state(world);
+    let before = st
+        .profile_before_install
+        .as_deref()
+        .expect("the shell profile was not seeded");
+    let profile = shell_profile(st);
+    let contents = std::fs::read_to_string(&profile).unwrap_or_default();
+    assert_eq!(
+        contents, before,
+        "uninstall did not restore the shell profile to its pre-install contents"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains("removed the rocm-cli PATH lines from"),
+        "uninstall did not report removing the PATH lines:\n{out}"
+    );
+}
+
+#[then("the fish config adds the install directory to PATH once")]
+async fn then_fish_config_has_path(world: &mut E2eWorld) {
+    let st = state(world);
+    let config = fish_config(st);
+    let contents = assert_single_path_marker_in(&config);
+    // The install folder sits outside the scenario's HOME, so the block names
+    // it literally rather than as `$HOME/...`.
+    let install_dir = st.install_dir.to_string_lossy();
+    assert!(
+        contents.contains(&format!("set -gx PATH \"{install_dir}\" $PATH")),
+        "the fish config does not put {install_dir} on PATH in fish syntax:\n{contents}"
+    );
+    assert!(
+        contents.contains("# the user's own fish settings"),
+        "the installer dropped the user's own fish settings:\n{contents}"
+    );
+    // The bash profile the login shell asked for keeps POSIX syntax, not fish's.
+    let bashrc = std::fs::read_to_string(shell_profile(st)).expect("bash profile not found");
+    assert!(
+        bashrc.contains("export PATH=") && !bashrc.contains("set -gx PATH"),
+        "the bash profile did not keep POSIX syntax:\n{bashrc}"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&config.display().to_string()),
+        "installer did not report the fish profile:\n{out}"
+    );
+}
+
+#[then("the fish completions for the installed rocm are in place")]
+async fn then_fish_completions_installed(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let contents = std::fs::read_to_string(&path).expect("fish completions not found");
+    assert!(
+        contents.contains("complete -c rocm"),
+        "{} is not a rocm completion script:\n{contents}",
+        path.display()
+    );
+    // Uninstall removes the file only when this line names its own folder.
+    let marker = format!(
+        "# rocm-cli fish completions for {}\n",
+        st.install_dir.display()
+    );
+    assert!(
+        contents.starts_with(&marker),
+        "{} does not start with the installer's marker {marker:?}:\n{contents}",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains("fish completions installed:") && out.contains(&path.display().to_string()),
+        "installer did not report the fish completions:\n{out}"
+    );
+}
+
+#[then("the fish config is back to the user's own settings")]
+async fn then_fish_config_restored(world: &mut E2eWorld) {
+    let st = state(world);
+    let before = st
+        .fish_config_before_install
+        .as_deref()
+        .expect("the fish config was not seeded");
+    let contents = std::fs::read_to_string(fish_config(st)).unwrap_or_default();
+    assert_eq!(
+        contents, before,
+        "uninstall did not restore the fish config to its pre-install contents"
+    );
+}
+
+#[then("the fish completions for the uninstalled rocm are gone")]
+async fn then_fish_completions_removed(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert!(
+        !path.exists(),
+        "uninstall left {} behind for a rocm that is gone",
+        path.display()
+    );
+    assert!(
+        path.parent().is_some_and(Path::is_dir),
+        "uninstall removed the user's fish completions folder, not just rocm's script"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!("removed shell completions {}", path.display())),
+        "uninstall did not report removing the fish completions:\n{out}"
+    );
+}
+
+/// What the user writes over the installer's fish completions in a scenario.
+const USERS_OWN_COMPLETIONS: &str = "complete -c rocm -l my-own-flag\n";
+
+#[given("the user has replaced the fish completions with their own")]
+async fn given_users_own_fish_completions(world: &mut E2eWorld) {
+    let path = fish_completions(state(world));
+    assert!(path.is_file(), "the installer wrote no {}", path.display());
+    std::fs::write(&path, USERS_OWN_COMPLETIONS).expect("failed to replace the fish completions");
+}
+
+/// Set the Unix permission bits of `path`. The scenarios that use this are
+/// `@requires-os:linux`; the stub only keeps the Windows build compiling.
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_unix_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix permission bits do not apply on this platform",
+    ))
+}
+
+#[given("the fish completions folder cannot be written to")]
+async fn given_fish_completions_folder_read_only(world: &mut E2eWorld) {
+    let dir = fish_completions(state(world))
+        .parent()
+        .expect("completions have a folder")
+        .to_path_buf();
+    set_unix_mode(&dir, 0o555).expect("failed to make the fish completions folder read-only");
+    // Root writes through folder permissions, so the scenario would not reach
+    // the failure it is about.
+    let probe = dir.join(".rocm-e2e-probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = set_unix_mode(&dir, 0o755);
+        panic!(
+            "{} is still writable after chmod 0555; this scenario needs a non-root runner",
+            dir.display()
+        );
+    }
+}
+
+#[given("the user already has their own fish completions")]
+async fn given_users_fish_completions_before_install(world: &mut E2eWorld) {
+    let path = fish_completions(state(world));
+    std::fs::create_dir_all(path.parent().expect("completions have a folder"))
+        .expect("failed to create the fish completions folder");
+    std::fs::write(&path, USERS_OWN_COMPLETIONS).expect("failed to seed the fish completions");
+}
+
+#[then("the installer leaves the user's own fish completions and says why")]
+async fn then_installer_leaves_users_fish_completions(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_COMPLETIONS,
+        "the installer changed {}, which it did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "note: fish completions not installed: {} already exists and was not written by \
+             this installer",
+            path.display()
+        )),
+        "the installer did not say it left the fish completions:\n{out}"
+    );
+    assert!(
+        !out.contains("fish completions installed:"),
+        "the installer reported installing completions it did not write:\n{out}"
+    );
+    let record = std::fs::read_to_string(st.install_dir.join(".rocm-cli-path-edit"))
+        .expect("the installer wrote no PATH-edit record");
+    assert!(
+        !record.contains("completions "),
+        "the installer recorded completions it did not write, so uninstall could remove them:\n{record}"
+    );
+}
+
+#[then("the user's own fish completions are untouched")]
+async fn then_users_fish_completions_untouched(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_COMPLETIONS,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        !out.contains("removed shell completions"),
+        "uninstall reported removing completions it should not have touched:\n{out}"
+    );
+}
+
+#[then("the fish completions are still in place")]
+async fn then_fish_completions_still_in_place(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("complete -c rocm"),
+        "{} is gone after an uninstall that keeps the binaries",
+        path.display()
+    );
+    assert!(
+        !st.last_output.contains("removed shell completions"),
+        "uninstall reported removing the fish completions it was told to keep:\n{}",
+        st.last_output
+    );
+}
+
+#[then("uninstall leaves the user's own fish completions in place and says why")]
+async fn then_users_fish_completions_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        contents,
+        USERS_OWN_COMPLETIONS,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "fish completions {} left in place: it does not start with the rocm-cli \
+             installer's marker, so the installer did not write it",
+            path.display()
+        )),
+        "uninstall did not say why it left the fish completions:\n{out}"
+    );
+    assert!(
+        !out.contains("removed shell completions"),
+        "uninstall reported removing completions it kept:\n{out}"
+    );
+}
+
+#[then("uninstall warns that the fish completions could not be removed and still finishes")]
+async fn then_fish_completions_removal_warned(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let dir = path.parent().expect("completions have a folder");
+    // Put the folder back first, so the scratch tree can be cleaned up even if
+    // an assertion below fails.
+    let _ = set_unix_mode(dir, 0o755);
+    let out = &st.last_output;
+    assert_eq!(st.last_rc, 0, "uninstall did not finish:\n{out}");
+    assert!(
+        out.contains(&format!(
+            "warning: could not remove shell completions {}",
+            path.display()
+        )) && out.contains("The uninstall went on without it"),
+        "uninstall did not warn about the fish completions:\n{out}"
+    );
+    assert!(
+        out.contains("uninstall complete"),
+        "uninstall did not report finishing:\n{out}"
+    );
+    assert!(
+        path.is_file(),
+        "{} is gone, so the warning was not true",
+        path.display()
+    );
+}
+
+#[then("the shell profile still adds the install directory to PATH")]
+async fn then_profile_kept(world: &mut E2eWorld) {
+    assert_single_path_marker(state(world));
+}
+
+#[then("the record of the installer's PATH change is still in the install directory")]
+async fn then_path_record_kept(world: &mut E2eWorld) {
+    // The kept change stays undoable by a later uninstall only while its
+    // record survives.
+    assert_exists(&state(world).install_dir.join(".rocm-cli-path-edit"));
+}
+
+#[then("the record of the installer's PATH change is gone")]
+async fn then_path_record_gone(world: &mut E2eWorld) {
+    assert_missing(&state(world).install_dir.join(".rocm-cli-path-edit"));
+}
+
+#[then("the isolated XDG config, data, and cache state is still present")]
+async fn then_xdg_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    for dir in [&st.smoke_config, &st.smoke_data, &st.smoke_cache]
+        .into_iter()
+        .flatten()
+    {
+        assert_exists(&dir.join("state-marker"));
+    }
+}
+
+#[then("uninstall reports keeping the PATH change with the binaries")]
+async fn then_reports_path_kept_with_binaries(world: &mut E2eWorld) {
+    // The message is true because lifecycle-25 also asserts the state it
+    // promises: the PATH change and the fish completions stay (see
+    // `then_fish_completions_still_in_place` and the profile step).
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("binary removal disabled by --keep-binaries")
+            && out.contains("any PATH change and fish completions the installer made stay too"),
+        "uninstall did not say the PATH change stays with the binaries:\n{out}"
+    );
+}
+
+/// An entry that names an environment variable no one sets, so it reads back
+/// the same expanded or not.
+#[cfg(windows)]
+const EXPANDABLE_PATH_ENTRY: &str = r"%ROCM_E2E_UNSET_VARIABLE%\rocm-e2e-probe";
+
+#[given("the user PATH also holds an entry that uses an environment variable")]
+async fn given_expandable_user_path_entry(world: &mut E2eWorld) {
+    #[cfg(windows)]
+    {
+        // Stored as REG_EXPAND_SZ, the way Windows itself stores a Path that
+        // uses variables. Added after the install, since `install.ps1` writes
+        // the Path back through `[Environment]`, which stores REG_SZ.
+        assert!(
+            state(world).captured_user_path.is_some(),
+            "capture the user PATH for restoration first"
+        );
+        let script = "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); \
+            $raw = $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); \
+            $value = if ([string]::IsNullOrEmpty($raw)) { $env:ROCM_E2E_PATH_ENTRY } else { $raw + ';' + $env:ROCM_E2E_PATH_ENTRY }; \
+            $key.SetValue('Path', $value, [Microsoft.Win32.RegistryValueKind]::ExpandString); \
+            $key.Close()";
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .env("ROCM_E2E_PATH_ENTRY", EXPANDABLE_PATH_ENTRY)
+            .status()
+            .expect("failed to run PowerShell to edit the user PATH");
+        assert!(
+            status.success(),
+            "failed to add the expandable user PATH entry"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = world;
+    }
+}
+
+#[then("the user PATH still holds that entry and is still stored expandable")]
+async fn then_expandable_user_path_entry_kept(world: &mut E2eWorld) {
+    #[cfg(windows)]
+    {
+        let _ = world;
+        let current = capture_raw_user_path();
+        assert_eq!(
+            current.kind.as_deref(),
+            Some("ExpandString"),
+            "uninstall changed the user PATH's registry type: {current:?}"
+        );
+        assert!(
+            current
+                .value
+                .split(';')
+                .any(|entry| entry == EXPANDABLE_PATH_ENTRY),
+            "uninstall dropped or expanded the user's other PATH entry: {current:?}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = world;
+    }
+}
+
+#[then("the other program is still in the install directory")]
+async fn then_other_program_kept(world: &mut E2eWorld) {
+    assert_exists(&state(world).install_dir.join("other-tool"));
+}
+
+#[then("uninstall reports keeping the PATH change for the other program")]
+async fn then_reports_path_kept(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("PATH change left in place") && out.contains("other-tool"),
+        "uninstall did not explain keeping the PATH change:\n{out}"
+    );
+}
+
+#[then("the install directory is not on the user PATH")]
+async fn then_install_dir_off_user_path(world: &mut E2eWorld) {
+    #[cfg(windows)]
+    {
+        let st = state(world);
+        let current = capture_user_path();
+        let target = st.install_dir.to_string_lossy().to_lowercase();
+        let on_path = current.split(';').any(|entry| {
+            entry.trim().to_lowercase().trim_end_matches('\\') == target.trim_end_matches('\\')
+        });
+        assert!(!on_path, "install dir is still on the user PATH: {current}");
+        let out = &st.last_output;
+        assert!(
+            out.contains("from your user PATH"),
+            "uninstall did not report removing the user PATH entry:\n{out}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = world;
+    }
+}
+
+#[given("the shell profile cannot be rewritten")]
+async fn given_profile_unwritable(world: &mut E2eWorld) {
+    // Uninstall writes the edited profile beside the original before swapping
+    // it in; a folder in that spot makes the write fail, even for root.
+    let home = state(world).home_dir.clone();
+    std::fs::create_dir_all(home.join(".bashrc.rocm-uninstall.tmp"))
+        .expect("failed to block the profile rewrite");
+}
+
+#[when("the shell profile can be rewritten again")]
+async fn when_profile_writable(world: &mut E2eWorld) {
+    let home = state(world).home_dir.clone();
+    std::fs::remove_dir(home.join(".bashrc.rocm-uninstall.tmp"))
+        .expect("failed to unblock the profile rewrite");
+}
+
+#[then("uninstall fails saying the PATH change could not be undone")]
+async fn then_uninstall_fails_path(world: &mut E2eWorld) {
+    let st = state(world);
+    let out = &st.last_output;
+    assert_ne!(st.last_rc, 0, "uninstall succeeded:\n{out}");
+    // The scenario's next steps check that nothing else was removed.
+    assert!(
+        out.contains("could not undo the installer's PATH change")
+            && out.contains("Nothing else was removed")
+            && out.contains("`rocm uninstall` again"),
+        "uninstall did not explain the PATH failure:\n{out}"
+    );
 }
 
 #[then("the install manifest is gone")]
@@ -1210,8 +2036,8 @@ async fn then_manifest_gone(world: &mut E2eWorld) {
 
 #[then("the non-running installed rocmd binary is gone")]
 async fn then_rocmd_gone(world: &mut E2eWorld) {
-    // The keep-config uninstall skips the running rocm executable on Windows but
-    // must still remove the non-running rocmd binary (old acceptance-script check).
+    // The keep-config uninstall still removes the binaries, rocmd included
+    // (old acceptance-script check).
     let st = state(world);
     assert_missing(&installed_binary(&st.install_dir, "rocmd"));
 }
@@ -1223,9 +2049,8 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         .into_iter()
         .flatten()
     {
-        // Uninstall purges the CLI's own state; the top-level isolated dir may
-        // remain but its rocm-cli subtree must be gone.
-        let rocm_cli = dir.join("rocm-cli");
-        assert_missing(&rocm_cli);
+        // The isolated dirs are the CLI's config, data, and cache directories
+        // themselves (`ROCM_CLI_*_DIR`), so uninstall removes each one whole.
+        assert_missing(dir);
     }
 }

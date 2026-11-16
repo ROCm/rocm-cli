@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 //! Live metric types. snake_case + units encoded in field names.
-//! See `../wiki/concepts/metric-registry.md` and `../wiki/data/metric-field-index.md`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,6 +41,12 @@ pub struct GpuMetrics {
     pub gpu_utilization_pct: f32,
     pub temperature_c: f32,
     pub power_w: f32,
+    /// The board's power cap (W), when the platform reports one. Warning
+    /// thresholds are derived from it; `None` means unknown (never `0`), and
+    /// consumers must not substitute another part's limit. Serde-default so
+    /// older recordings load.
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
     pub clock_mhz: Option<f32>,
 }
 
@@ -56,7 +61,6 @@ pub struct GpuSystemInfo {
     pub memory_partition_mode: MemoryPartitionMode,
     pub compute_partition_mode: ComputePartitionMode,
     pub vram_per_logical_gpu_mb: u64,
-    pub lemond_version: Option<String>,
     pub llama_server_build: Option<String>,
     pub ccr_version: Option<String>,
     pub llamacpp_backend: Option<String>,
@@ -130,6 +134,20 @@ impl InstanceStatus {
         matches!(self, Self::Ready | Self::Running)
     }
 
+    /// True while the instance is coming up but not yet ready.
+    #[must_use]
+    pub const fn is_starting(self) -> bool {
+        matches!(self, Self::Starting { .. })
+    }
+
+    /// True for a status that belongs in a "running" listing: serving, or on
+    /// its way there (`Starting`). A starting service is otherwise invisible
+    /// until its readiness probe passes.
+    #[must_use]
+    pub const fn counts_as_running(self) -> bool {
+        self.is_serving() || self.is_starting()
+    }
+
     /// Short UPPERCASE label for status chips. `Starting` surfaces its startup
     /// phase (e.g. `LOADING`) when one is known, else the generic `STARTING`.
     #[must_use]
@@ -178,6 +196,10 @@ pub struct ObservationMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Instance {
+    /// Lifecycle ownership proven by discovery from a managed-service record.
+    /// Missing ownership in legacy snapshots is not permission to mutate.
+    #[serde(default)]
+    pub managed: bool,
     pub container_id: String,
     pub container_name: String,
     pub status: InstanceStatus,
@@ -201,22 +223,73 @@ pub struct Instance {
     /// Omitted from JSON when `None` to preserve wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen_tps_observation: Option<ObservationMetadata>,
-    /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
-    /// occupies. `None` when throughput or GPU power telemetry is unavailable.
+    /// True when [`Instance::gen_tps`] is the endpoint's most recent completed
+    /// request rate (Lemonade `/stats`), which stays unchanged while the server is
+    /// idle, rather than a live counter rate. Omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gen_tps_last_request: bool,
+    /// Efficiency: `gen_tps` ÷ the power (W) attributed to this instance
+    /// ([`Instance::power_w`]). `None` when throughput or GPU power telemetry
+    /// is unavailable.
     #[serde(default)]
     pub tokens_per_watt: Option<f64>,
+    /// Board power (W) attributed to this instance: each GPU's power split among
+    /// the instances sharing it (see `efficiency::attribute_power_w`). `None`
+    /// when no occupied GPU reports power. Serde-default for replay back-compat.
+    #[serde(default)]
+    pub power_w: Option<f64>,
     /// Live average time-to-first-token (ms), windowed from the vLLM TTFT
-    /// histogram. `None` until two scrapes (or absent for non-vLLM engines);
-    /// Observe shows `—`. Serde-default for NDJSON replay back-compat.
+    /// histogram. `None` until a window sees new requests (or absent for
+    /// non-vLLM engines); Observe shows `—`. Serde-default for NDJSON replay back-compat.
     #[serde(default)]
     pub ttft_ms: Option<f64>,
+    /// Freshness provenance for [`Instance::ttft_ms`]. A value with no new
+    /// requests in the latest scrape window is `Held` until the observation
+    /// validity window lapses, then cleared. `None` when unknown (legacy
+    /// snapshots). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_observation: Option<ObservationMetadata>,
     /// Live average time-per-output-token (ms), windowed from the vLLM TPOT
-    /// histogram. `None` until two scrapes (or absent); Observe shows `—`.
+    /// histogram. `None` until a window sees new requests (or absent);
+    /// Observe shows `—`.
     #[serde(default)]
     pub tpot_ms: Option<f64>,
+    /// Freshness provenance for [`Instance::tpot_ms`]; same semantics as
+    /// [`Instance::ttft_observation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpot_observation: Option<ObservationMetadata>,
     pub launch_args: Vec<String>,
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub log_file: Option<String>,
+}
+
+impl Instance {
+    /// External Lemonade discovery uses the engine marker, not the instance id.
+    /// This identifies provenance independently of the current serving status.
+    #[must_use]
+    pub fn is_external_lemonade(&self) -> bool {
+        !self.managed && self.container_name == "lemonade"
+    }
+
+    /// The finite throughput that is current, for figures that sum instances.
+    ///
+    /// A rate that is only the endpoint's last completed request
+    /// ([`Instance::gen_tps_last_request`]) is excluded: it stays unchanged while
+    /// the server is idle, so adding it to a node total would show an idle server
+    /// as still generating. The Instances views show such a rate, labelled, and
+    /// so do the Services overlay rows and its quick preview.
+    #[must_use]
+    pub fn live_gen_tps(&self) -> Option<f64> {
+        self.gen_tps
+            .filter(|v| v.is_finite() && !self.gen_tps_last_request)
+    }
+
+    /// [`Instance::tokens_per_watt`] when it derives from live throughput; `None`
+    /// when it derives from a last-request rate (see [`Instance::live_gen_tps`]).
+    #[must_use]
+    pub fn live_tokens_per_watt(&self) -> Option<f64> {
+        self.tokens_per_watt.filter(|_| !self.gen_tps_last_request)
+    }
 }
 
 #[cfg(test)]
@@ -236,11 +309,90 @@ mod tests {
             "log_file": null
         }"#;
         let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
+        assert!(
+            !inst.managed,
+            "legacy snapshots do not grant lifecycle control"
+        );
         assert_eq!(inst.gen_tps, None);
         assert_eq!(inst.tokens_per_watt, None);
         assert_eq!(inst.ttft_ms, None);
         assert_eq!(inst.tpot_ms, None);
         assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+
+    #[test]
+    fn gpu_metrics_deserializes_without_power_limit() {
+        // Replay back-compat: recordings made before `power_limit_w` existed
+        // must load with the limit unknown, never 0.
+        let legacy = r#"{
+            "device_id": "gpu-0", "vram_used_mb": 1, "vram_total_mb": 2,
+            "gpu_utilization_pct": 3.0, "temperature_c": 4.0, "power_w": 5.0,
+            "clock_mhz": null
+        }"#;
+        let g: GpuMetrics = serde_json::from_str(legacy).expect("legacy GPU must parse");
+        assert_eq!(g.power_limit_w, None);
+        assert!((g.power_w - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn instance_ownership_round_trips_and_defaults_to_false() {
+        assert!(!Instance::default().managed);
+        for managed in [false, true] {
+            let inst = Instance {
+                managed,
+                ..Instance::default()
+            };
+            let json = serde_json::to_value(&inst).expect("serialize");
+            assert_eq!(json["managed"], managed);
+            let back: Instance = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(back.managed, managed);
+        }
+    }
+
+    #[test]
+    fn a_last_request_rate_is_not_live_throughput_or_live_efficiency() {
+        let live = Instance {
+            gen_tps: Some(40.0),
+            tokens_per_watt: Some(0.5),
+            ..Instance::default()
+        };
+        assert_eq!(live.live_gen_tps(), Some(40.0));
+        assert_eq!(live.live_tokens_per_watt(), Some(0.5));
+        let last = Instance {
+            gen_tps_last_request: true,
+            ..live
+        };
+        assert_eq!(last.live_gen_tps(), None);
+        assert_eq!(last.live_tokens_per_watt(), None);
+        // The rate itself is still there for views that label it.
+        assert_eq!(last.gen_tps, Some(40.0));
+        for bad in [f64::NAN, f64::INFINITY] {
+            let inst = Instance {
+                gen_tps: Some(bad),
+                ..Instance::default()
+            };
+            assert_eq!(inst.live_gen_tps(), None);
+        }
+    }
+
+    #[test]
+    fn external_lemonade_predicate_ignores_ids_and_requires_engine_marker() {
+        for id in ["svc-looks-managed", "lemonade-looks-external"] {
+            for managed in [false, true] {
+                for marker in ["lemonade", "vllm", ""] {
+                    let inst = Instance {
+                        managed,
+                        container_id: id.into(),
+                        container_name: marker.into(),
+                        ..Instance::default()
+                    };
+                    assert_eq!(
+                        inst.is_external_lemonade(),
+                        !managed && marker == "lemonade"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -256,6 +408,29 @@ mod tests {
         let back: Instance = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.ttft_ms, Some(180.5));
         assert_eq!(back.tpot_ms, Some(22.0));
+    }
+
+    #[test]
+    fn instance_latency_observation_is_omitted_when_unknown_and_round_trips() {
+        // Legacy payloads carry no freshness: it stays `None`, never `Fresh`,
+        // and is not written back out.
+        let json = serde_json::to_string(&Instance::default()).expect("serialize");
+        assert!(!json.contains("ttft_observation") && !json.contains("tpot_observation"));
+        let inst = Instance {
+            ttft_ms: Some(100.0),
+            ttft_observation: Some(ObservationMetadata {
+                observed_at: Utc::now(),
+                freshness: ObservationFreshness::Held,
+            }),
+            ..Default::default()
+        };
+        let back: Instance =
+            serde_json::from_str(&serde_json::to_string(&inst).expect("serialize")).expect("parse");
+        assert_eq!(
+            back.ttft_observation.map(|m| m.freshness),
+            Some(ObservationFreshness::Held)
+        );
+        assert!(back.tpot_observation.is_none());
     }
 
     #[test]
@@ -280,6 +455,11 @@ mod tests {
             .is_serving()
         );
         assert!(!InstanceStatus::Stopped.is_serving());
+        assert!(InstanceStatus::Starting { phase: None }.counts_as_running());
+        assert!(InstanceStatus::Ready.counts_as_running());
+        assert!(!InstanceStatus::Starting { phase: None }.is_serving());
+        assert!(!InstanceStatus::Stopped.counts_as_running());
+        assert!(!InstanceStatus::Error.counts_as_running());
         assert!(!InstanceStatus::Error.is_serving());
         assert!(!InstanceStatus::Unknown.is_serving());
     }
@@ -309,6 +489,17 @@ mod tests {
             "WARMUP"
         );
         assert_eq!(InstanceStatus::Ready.label(), "READY");
+    }
+
+    #[test]
+    fn old_recordings_with_a_retired_lemond_version_key_still_load() {
+        // Recorded sessions written before the field was removed still carry
+        // the key. This guards loading them (unknown keys are ignored); it does
+        // not prove the field's removal, which the compiler already enforces.
+        let mut value = serde_json::to_value(GpuSystemInfo::default()).expect("serialize");
+        value["lemond_version"] = serde_json::json!("10.4.0");
+        let info: GpuSystemInfo = serde_json::from_value(value).expect("deserialize old snapshot");
+        assert_eq!(info.llama_server_build, None);
     }
 
     #[test]

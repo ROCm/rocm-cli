@@ -9,19 +9,24 @@
 //! directly. That is every one of these reads, and only these:
 //!
 //! - device nodes: `/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`;
-//! - `sysfs`: the KFD topology under `/sys/class/kfd/kfd/topology/nodes`, the
-//!   DRM cards under `/sys/class/drm`, `/sys/module/amdgpu` and
+//! - `sysfs`: the `/sys/class/kfd/kfd` class device and the KFD topology under
+//!   `/sys/class/kfd/kfd/topology/nodes`, the
+//!   DRM cards under `/sys/class/drm`, `/sys/bus/pci/drivers/amdgpu`,
+//!   `/sys/module/amdgpu` and
 //!   `/sys/module/amdgpu/version`;
 //! - `procfs`: `/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`,
 //!   `/proc/cmdline`, `/proc/modules` (the fallback when `lsmod` cannot run)
 //!   and `/proc/1/cgroup`;
-//! - the `/etc/os-release` behind the distro name `rocm examine` reports;
+//! - the `/etc/os-release` behind the distro fields and name `rocm examine`
+//!   reports, falling back to `/usr/lib/os-release` when the former is absent,
+//!   per `os-release(5)`;
 //! - the modprobe configuration directories `/etc/modprobe.d`,
 //!   `/usr/lib/modprobe.d` and `/run/modprobe.d`;
 //! - the WSL plumbing: the `/usr/lib/wsl/lib` directory check and
 //!   `/usr/lib/wsl/lib/libdxcore.so`;
 //! - the WSL ROCDXG check: `lib/librocdxg.so` and `share/rocdxg/dids.conf`,
-//!   looked for under `/opt/rocm` and under each discovered ROCm install;
+//!   looked for under `/opt/rocm` and under each discovered ROCm install,
+//!   and `lib/librocdxg.so` again in each directory on `LD_LIBRARY_PATH`;
 //! - the container markers `/.dockerenv` and `/run/.containerenv`.
 //!
 //! Deliberately NOT routed: anything a real process acts on rather than reads
@@ -33,20 +38,33 @@
 //! `LD_LIBRARY_PATH`; re-rooting it would put the simulated directory in front
 //! of a real loader. Programs the probes execute, such as `ldconfig`, stay on
 //! the real host too: a simulated root holds no binary to run. Every
-//! package-manager plan reads the real `/etc/os-release` — the install hints in
-//! `openmpi.rs`, and the driver, OpenMPI and runtime-library installs in the
-//! `rocm` binary — because the commands it builds run against the real
+//! package-manager plan reads the real `/etc/os-release` (with the same
+//! `/usr/lib/os-release` fallback) — the OpenMPI, libatomic and libnuma install
+//! hints in `openmpi.rs`, and the driver, OpenMPI and runtime-library installs
+//! in the `rocm` binary — because the commands it builds run against the real
 //! machine. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are
 //! about this process's environment, not the hardware.
 //!
-//! Routed, but with the real device keeping a veto: the `rocm dash` `amd-smi`
-//! pre-flight. It decides whether a real `amd-smi` process may start, so
-//! `apps/rocm/src/dash.rs` passes `host_path("/dev/kfd")` to the dash daemon
-//! and the collector requires both that path and the real `/dev/kfd` to be
-//! readable. A simulated root can hide the GPU from the dashboard but cannot
-//! start `amd-smi` on a machine without one. The WSL reachability verdict
-//! still substitutes for the whole device check, as it always has, so the veto
-//! does not cover it.
+//! Routed, but with the real device keeping a veto: the two `amd-smi`
+//! pre-flights. Each decides whether a real `amd-smi` process may start, so
+//! each requires `host_path("/dev/kfd")` *and* the real `/dev/kfd` to be
+//! readable. A simulated root can hide the GPU from them, but cannot start
+//! `amd-smi` on a machine without one. They are:
+//!
+//! - the `rocm dash` collector's, where `apps/rocm/src/dash.rs` passes the
+//!   re-rooted path down to the dash daemon. `rocm-dash-collectors` does depend
+//!   on this crate (EAI-8457) and shares [`crate::device_readable_bounded`], but
+//!   it is still *handed* the re-rooted path rather than calling [`host_path`]
+//!   itself: the path has to come from the same resolution `apps/rocm` used for
+//!   its own probes, and the daemon that carries it in between
+//!   (`rocm-dash-daemon`) has no dependency on this crate to resolve it with.
+//!   The presentation layer, `rocm-dash-tui`, has no edge to this crate at all
+//!   and is the one the `crate_edges.rs` allowlist still forbids;
+//! - the synchronous one behind `crate::amd_smi_json`, which `rocm serve` and
+//!   `rocmd` reach and which calls [`host_path`] itself.
+//!
+//! The WSL reachability verdict still substitutes for the whole device check in
+//! both, as it always has, so the veto does not cover it.
 //!
 //! In a normal build [`host_path`] is the identity: the path is returned as
 //! written and the probes read the real host. Only a build compiled with the
@@ -73,6 +91,46 @@ pub const TEST_HOST_ROOT_ENV: &str = "ROCM_CLI_TEST_HOST_ROOT";
 #[must_use]
 pub fn host_path(path: impl AsRef<Path>) -> PathBuf {
     host_path_under(hardware_root().as_deref(), path.as_ref())
+}
+
+/// [`host_path`], fixed to `&str`.
+///
+/// [`read_os_release`]'s `resolve` parameter needs a concrete
+/// `Fn(&str) -> PathBuf`, which a bare reference to the generic `host_path`
+/// cannot satisfy (the borrow checker rejects it as "not general enough"
+/// over the resolved lifetime), so every probe that must honour a simulated
+/// root passes this instead of `|p| host_path(p)`.
+#[must_use]
+pub fn host_path_for_str(path: &str) -> PathBuf {
+    host_path(path)
+}
+
+/// [`read_os_release`]'s `resolve` parameter for the real machine: the path
+/// as written. A bare `PathBuf::from` closure is rejected the same way a bare
+/// `host_path` is (see [`host_path_for_str`]), hence a named function.
+///
+/// Private: the only reader that must always see the real machine is
+/// [`real_os_release`], and having one place that names this resolver is what
+/// keeps a second, diverging copy of that reader from appearing elsewhere.
+fn identity_path_for_str(path: &str) -> PathBuf {
+    PathBuf::from(path)
+}
+
+/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
+/// when the former is absent (per `os-release(5)`).
+///
+/// The one reader for every caller that builds a package-manager plan or an
+/// install hint (`apt`, `dnf`, `zypper`, ...): those commands run against the
+/// real machine, so a simulated host root (see [`host_path`]) must not choose
+/// the distro they are written for. Deliberately not routed through
+/// [`host_path`] for that reason. The descriptive distro name and id that
+/// `examine` reports come from [`read_os_release`] with [`host_path_for_str`]
+/// instead, and do follow a simulated root.
+///
+/// Reads the same files on every platform; off Linux they are simply absent.
+#[must_use]
+pub fn real_os_release() -> OsRelease {
+    read_os_release(identity_path_for_str)
 }
 
 #[cfg(feature = "e2e-test-hooks")]
@@ -107,6 +165,116 @@ fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
     match (root, path.strip_prefix("/")) {
         (Some(root), Ok(relative)) => root.join(relative),
         _ => path.to_path_buf(),
+    }
+}
+
+/// What reading `/etc/os-release` (falling back to `/usr/lib/os-release` per
+/// `os-release(5)`) produced.
+///
+/// Kept as three states, not collapsed to `Option<String>`, so a caller can
+/// name the file it actually read in a parse-error message (`Found`'s `path`)
+/// and can tell "nothing to report" (`Absent`, the documented fallback
+/// contract: a missing file is not a failure) apart from "something is
+/// wrong" (`Unreadable`: a candidate exists but could not be read). Before
+/// this distinction existed, every caller folded both into the same empty
+/// text and reported a host with a merely-unreadable file as an unsupported
+/// distribution.
+#[derive(Debug)]
+pub enum OsRelease {
+    /// Read from `path` (`/etc/os-release` or `/usr/lib/os-release`).
+    Found { path: &'static str, text: String },
+    /// Neither candidate exists.
+    Absent,
+    /// `path` exists but could not be read, for a reason other than absence
+    /// (permission denied, a directory in its place, ...).
+    Unreadable {
+        path: &'static str,
+        error: std::io::Error,
+    },
+}
+
+impl OsRelease {
+    /// The text to parse: the file's contents when one was read, empty for
+    /// [`Self::Absent`] or [`Self::Unreadable`] — an absent file declares
+    /// nothing, and an unreadable one must be reported as itself by the
+    /// caller rather than parsed as an empty, unknown distribution.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Found { text, .. } => text,
+            Self::Absent | Self::Unreadable { .. } => "",
+        }
+    }
+
+    /// The path a parse-error message should name: the one actually read, or
+    /// `/etc/os-release` for [`Self::Absent`] — which never reaches such a
+    /// message, since empty text never fails to parse.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Found { path, .. } | Self::Unreadable { path, .. } => path,
+            Self::Absent => "/etc/os-release",
+        }
+    }
+
+    /// For tests: a [`Self::Found`] at the default `/etc/os-release` path.
+    #[cfg(test)]
+    pub(crate) fn found(text: impl Into<String>) -> Self {
+        Self::Found {
+            path: "/etc/os-release",
+            text: text.into(),
+        }
+    }
+}
+
+/// The shared opening every [`OsRelease::Unreadable`] message builds on.
+///
+/// Names the candidate path and the I/O error that made it unreadable. Each
+/// call site appends its own clause describing what that means for it (no
+/// commands planned, a probe failure, an unreported distro, ...), so only
+/// this shared part can drift if changed in one place and not another.
+#[must_use]
+pub fn unreadable_prefix(path: &str, error: &std::io::Error) -> String {
+    format!("{path} could not be read: {error}")
+}
+
+/// Reads `/etc/os-release`, falling back to `/usr/lib/os-release` per
+/// `os-release(5)` when the former is absent.
+///
+/// `resolve` maps each candidate to where it should actually be read from —
+/// [`host_path`] for a probe that must honour a simulated test root, or the
+/// identity for one that must always read the real machine (see the module
+/// doc above).
+///
+/// Falls back only when `/etc/os-release` does not exist, never for another
+/// read error (permission denied, a directory in its place, ...): `os-release(5)`
+/// defines the fallback as existence-based, and treating any error the same
+/// way would silently build commands for the wrong distro from a stale
+/// `/usr/lib/os-release` on a host where `/etc/os-release` exists but is
+/// merely unreadable.
+pub fn read_os_release(resolve: impl Fn(&str) -> PathBuf) -> OsRelease {
+    match std::fs::read_to_string(resolve("/etc/os-release")) {
+        Ok(text) => OsRelease::Found {
+            path: "/etc/os-release",
+            text,
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read_to_string(resolve("/usr/lib/os-release")) {
+                Ok(text) => OsRelease::Found {
+                    path: "/usr/lib/os-release",
+                    text,
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => OsRelease::Absent,
+                Err(error) => OsRelease::Unreadable {
+                    path: "/usr/lib/os-release",
+                    error,
+                },
+            }
+        }
+        Err(error) => OsRelease::Unreadable {
+            path: "/etc/os-release",
+            error,
+        },
     }
 }
 
@@ -181,5 +349,87 @@ mod tests {
         }
         let _empty = crate::test_env::RestoredEnvVar::set(TEST_HOST_ROOT_ENV, Path::new(""));
         assert_eq!(host_path("/dev/kfd"), PathBuf::from("/dev/kfd"));
+    }
+
+    /// Maps `/etc/os-release` to `primary` and `/usr/lib/os-release` to
+    /// `fallback` under `dir`, so [`read_os_release`]'s fallback can be tested
+    /// without touching the real host's files.
+    fn candidate(dir: &Path, name: &str) -> PathBuf {
+        match name {
+            "/etc/os-release" => dir.join("primary"),
+            "/usr/lib/os-release" => dir.join("fallback"),
+            other => panic!("unexpected os-release candidate: {other}"),
+        }
+    }
+
+    /// Extracts `(path, text)` from a [`OsRelease::Found`], panicking on any
+    /// other variant — the shape every "a candidate was read" assertion below
+    /// wants, written once so each test states only what differs.
+    fn found(read: OsRelease) -> (&'static str, String) {
+        match read {
+            OsRelease::Found { path, text } => (path, text),
+            other => panic!("expected OsRelease::Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_os_release_prefers_the_primary_candidate() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("primary"), "ID=primary\n").expect("write primary");
+        std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
+        assert_eq!(
+            found(read_os_release(|name| candidate(dir.path(), name))),
+            ("/etc/os-release", "ID=primary\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn read_os_release_falls_back_when_the_primary_is_absent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
+        assert_eq!(
+            found(read_os_release(|name| candidate(dir.path(), name))),
+            ("/usr/lib/os-release", "ID=fallback\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn read_os_release_is_absent_when_neither_candidate_exists() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        assert!(matches!(
+            read_os_release(|name| candidate(dir.path(), name)),
+            OsRelease::Absent
+        ));
+    }
+
+    /// A primary that exists but fails to read for a reason other than
+    /// absence (here, a directory in its place) must not fall back: that
+    /// would silently build commands for the wrong distro from a fallback
+    /// file that may not describe this host at all. A directory read as a
+    /// file is a portable, root-free way to get a non-`NotFound` `io::Error`.
+    /// It must also be reported as itself, not folded into `Absent`: an
+    /// unreadable file is not "nothing to report".
+    #[test]
+    fn read_os_release_does_not_fall_back_when_the_primary_errors_for_another_reason() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(dir.path().join("primary")).expect("create primary as a directory");
+        std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
+        match read_os_release(|name| candidate(dir.path(), name)) {
+            OsRelease::Unreadable { path, .. } => assert_eq!(path, "/etc/os-release"),
+            other => panic!("expected OsRelease::Unreadable, got {other:?}"),
+        }
+    }
+
+    /// The same non-absence distinction, but on the fallback candidate: a
+    /// primary that is genuinely absent and a fallback that exists but
+    /// cannot be read must not read as `Absent` either.
+    #[test]
+    fn read_os_release_reports_the_fallback_as_unreadable_when_it_errors_for_another_reason() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(dir.path().join("fallback")).expect("create fallback as a directory");
+        match read_os_release(|name| candidate(dir.path(), name)) {
+            OsRelease::Unreadable { path, .. } => assert_eq!(path, "/usr/lib/os-release"),
+            other => panic!("expected OsRelease::Unreadable, got {other:?}"),
+        }
     }
 }
