@@ -1008,7 +1008,8 @@ Feature: Model serving
   # A vLLM wheel built against a different torch installs and reports a version,
   # so the inventory called it `runtime: ready` and `serve` then died deep in
   # engine start-up. The inventory now says it is installed but not usable and
-  # names the extension. Hermetic: a stand-in interpreter answers the probe, so
+  # names the extension (read-only, so a host whose torch needs a compat shim
+  # nobody has written yet can still read `ready`). Hermetic: a stand-in interpreter answers the probe, so
   # no GPU, network or real vLLM is needed. The matching refusal in `serve` is
   # covered at unit level (`serve_refuses_a_vllm_whose_extensions_do_not_import`)
   # because reaching it end to end needs a GPU lane.
