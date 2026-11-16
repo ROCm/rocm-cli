@@ -1727,7 +1727,7 @@ rocm services logs <service-id> [--follow]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
-               [--force-dev-binaries]
+               [--allow-dev-binaries]
 ```
 
 `--follow` (`-f`) keeps printing a server's new log output, such as a model
@@ -1745,7 +1745,7 @@ do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
 Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
 exits with code 0. Any other answer cancels the same way, after a line saying
 that the answer was not understood and is treated as no. Use `--dry-run` to only
-list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
+list, and `--yes` to skip the confirmation. There is no `--force`; `--allow-dev-binaries`
 is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
@@ -1801,9 +1801,13 @@ If `rocm uninstall` cannot check whether one of those folders is there (for
 example, a link on the way loops back on itself), it stops with an error naming
 the folder before anything is removed.
 
-When you run `rocm` from a cargo `target` build, `uninstall` skips binary
-removal. Pass `--force-dev-binaries` to remove the ROCm CLI binaries in that build
-directory.
+When you run `rocm` from a cargo `target/debug` or `target/release` folder,
+`uninstall` keeps the binaries and says so under `Left alone:`. Pass
+`--allow-dev-binaries` to remove the ROCm CLI binaries in that folder (`rocm`,
+`rocmd`, `rocm-codex` and `rocm-engine-*`; the rest of the build is left alone).
+It overrides nothing else: `--keep-binaries` still keeps them, `--dry-run` still
+removes nothing, and the run still needs confirming. `--force-dev-binaries`, the
+older spelling, still works.
 
 Before removing anything, `uninstall` prints warnings about two situations:
 

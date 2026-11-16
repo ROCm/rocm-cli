@@ -931,7 +931,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             keep_config,
             keep_data,
             keep_cache,
-            force_dev_binaries,
+            allow_dev_binaries,
             force,
         }) => {
             uninstall::reject_force(force.is_some())?;
@@ -942,7 +942,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 keep_config,
                 keep_data,
                 keep_cache,
-                force_dev_binaries,
+                allow_dev_binaries,
             })
         }
         Some(Command::Completions { shell }) => {

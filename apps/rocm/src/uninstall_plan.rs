@@ -62,7 +62,7 @@ pub(crate) struct UninstallOptions {
     pub(crate) keep_config: bool,
     pub(crate) keep_data: bool,
     pub(crate) keep_cache: bool,
-    pub(crate) force_dev_binaries: bool,
+    pub(crate) allow_dev_binaries: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,9 +217,9 @@ pub(crate) fn plan_installed_binaries(
         return Ok(());
     }
     let current_exe = current_exe()?;
-    if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
+    if is_dev_binary_layout(&current_exe) && !options.allow_dev_binaries {
         plan.skipped.push(format!(
-            "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
+            "binary removal skipped because {} looks like a cargo target build; pass --allow-dev-binaries to remove the ROCm CLI binaries in that folder",
             current_exe.display()
         ));
         return Ok(());
@@ -594,6 +594,79 @@ mod tests {
             dry_run: true,
             ..UninstallOptions::default()
         }
+    }
+
+    /// A `rocm` run from a cargo build folder keeps that folder's binaries
+    /// unless `--allow-dev-binaries` is given, and says which flag removes
+    /// them; given, it plans the ROCm CLI binaries there and nothing else in
+    /// the folder; `--keep-binaries` still wins over it. The scenario
+    /// `uninstall-development-build-keeps-its-binaries-unless-allowed` runs the
+    /// real binary from such a folder.
+    #[test]
+    fn a_development_build_keeps_its_binaries_unless_allowed() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let build = root.path().join("target").join("debug");
+        fs::create_dir_all(build.join("deps"))?;
+        let exe = build.join(if cfg!(windows) { "rocm.exe" } else { "rocm" });
+        let daemon = build.join(if cfg!(windows) { "rocmd.exe" } else { "rocmd" });
+        for file in [&exe, &daemon, &build.join("rocm.d")] {
+            fs::write(file, "built")?;
+        }
+        let plan_with = |allow_dev_binaries, keep_binaries| -> Result<UninstallPlan> {
+            let mut plan = UninstallPlan::default();
+            let options = UninstallOptions {
+                keep_binaries,
+                allow_dev_binaries,
+                ..UninstallOptions::default()
+            };
+            plan_installed_binaries(&mut plan, &options, || Ok(exe.clone()), None)?;
+            Ok(plan)
+        };
+        // The running binary is planned as an action, except on Windows,
+        // where it is deleted as the command exits.
+        let planned = |plan: &UninstallPlan| {
+            let mut binaries: Vec<PathBuf> = plan
+                .actions
+                .iter()
+                .filter(|entry| entry.kind == "binary")
+                .map(|entry| entry.path.clone())
+                .chain(plan.self_delete.clone())
+                .collect();
+            binaries.sort();
+            binaries
+        };
+
+        let kept = plan_with(false, false)?;
+        assert!(planned(&kept).is_empty(), "{kept:?}");
+        assert!(
+            kept.actions.is_empty() && kept.path_edits.is_empty(),
+            "{kept:?}"
+        );
+        assert_eq!(
+            kept.skipped,
+            [format!(
+                "binary removal skipped because {} looks like a cargo target build; pass \
+                 --allow-dev-binaries to remove the ROCm CLI binaries in that folder",
+                exe.display()
+            )]
+        );
+
+        let allowed = plan_with(true, false)?;
+        let mut expected = vec![exe.clone(), daemon];
+        expected.sort();
+        assert_eq!(planned(&allowed), expected, "{allowed:?}");
+        assert!(allowed.skipped.is_empty(), "{allowed:?}");
+
+        let still_kept = plan_with(true, true)?;
+        assert!(planned(&still_kept).is_empty(), "{still_kept:?}");
+        assert!(
+            still_kept
+                .skipped
+                .iter()
+                .any(|note| note.starts_with("binary removal disabled by --keep-binaries")),
+            "{still_kept:?}"
+        );
+        Ok(())
     }
 
     /// A person at a terminal who dry-runs is told to run the same command again

@@ -1806,7 +1806,7 @@ ends by saying to run it again without `--dry-run`, and `uninstall-07` does that
 and checks the listed folder goes; a run whose stdin or stdout is not a terminal, and an
 empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
 mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
-is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
+is not answered with either spelling of `--allow-dev-binaries` (`uninstall-10`); the help starts
 its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
 ends differently, since it has no flag to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
@@ -1817,6 +1817,15 @@ with Ctrl-D, and for a plain no, each together with the config folder being left
 in place. They run on the default mock lane; the helper's other callers (`rocm fix`,
 the SDK-overwrite prompt) share it and are covered by its unit tests in
 [confirm.rs](../crates/rocm-core/src/confirm.rs).
+`uninstall-16` (Linux) runs a copy of the binary from a `target/debug` folder in
+the scenario's own folder: a dry run keeps that folder's binaries and names
+`--allow-dev-binaries`, the older spelling `--force-dev-binaries` lists them,
+allowing them without `--yes` outside a terminal is still refused and removes
+nothing, and with `--yes` they are removed. It is Linux-only because Windows
+deletes the running `rocm.exe` only after the command exits. The plan behind it
+is unit-tested by `a_development_build_keeps_its_binaries_unless_allowed` in
+[uninstall_plan.rs](../apps/rocm/src/uninstall_plan.rs), including
+`--keep-binaries` winning over the flag.
 The `uninstall` command does not start the file logger, which would otherwise
 create the data folder's `logs` folder before the plan is built:
 

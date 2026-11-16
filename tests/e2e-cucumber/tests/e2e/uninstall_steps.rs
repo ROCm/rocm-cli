@@ -7,7 +7,9 @@
 //! Black-box against the real binary. Every run is confined to the scenario's
 //! isolated root: `--keep-binaries` so the binary under test survives, and HOME,
 //! `UV_CACHE_DIR` and `HF_HOME` pointed inside the root so no uninstall can reach
-//! a shared cache the runner keeps between scenarios.
+//! a shared cache the runner keeps between scenarios. The one run that removes
+//! binaries (`uninstall-16`) runs a copy of the binary under test placed in the
+//! root, and removes only that copy; see `run_dev_build_uninstall`.
 
 use std::path::{Path, PathBuf};
 
@@ -874,8 +876,9 @@ async fn refused_and_told_to_use_yes(world: &mut E2eWorld) {
             && stderr.contains("use `--yes` to skip the confirmation"),
         "expected the refusal to name --yes:\n{stderr}"
     );
+    // Neither spelling of the flag that removes development binaries.
     assert!(
-        !stderr.contains("force-dev-binaries"),
+        !stderr.contains("dev-binaries"),
         "the refusal must not name the destructive flag:\n{stderr}"
     );
 }
@@ -892,8 +895,9 @@ async fn error_does_not_suggest_dev_binaries(world: &mut E2eWorld) {
         stderr.contains("unexpected argument"),
         "expected the unknown-argument error on stderr:\n{stderr}"
     );
+    // Neither spelling of the flag that removes development binaries.
     assert!(
-        !stderr.contains("force-dev-binaries"),
+        !stderr.contains("dev-binaries"),
         "the error must not name the destructive flag:\n{stderr}"
     );
 }
@@ -927,4 +931,209 @@ async fn help_shows_dry_run_first(world: &mut E2eWorld) {
         rows.contains(&"rocm uninstall"),
         "the examples must also show the real run:\n{examples}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A development build's binaries (uninstall-16)
+// ---------------------------------------------------------------------------
+
+/// The cargo build folder inside the scenario's own folder that the copy of
+/// the binary under test runs from. Spelled as the running copy reports its own
+/// path, with every link resolved, since that is how the plan names it.
+fn dev_build_dir(world: &E2eWorld) -> PathBuf {
+    root(world)
+        .canonicalize()
+        .expect("failed to resolve the scenario's folder")
+        .join("target")
+        .join("debug")
+}
+
+/// The ROCm CLI binaries in that folder: the copy of `rocm` under test and a
+/// stand-in `rocmd` beside it.
+fn dev_build_binaries(world: &E2eWorld) -> [PathBuf; 2] {
+    let dir = dev_build_dir(world);
+    [dir.join("rocm"), dir.join("rocmd")]
+}
+
+/// The binary under test as a file: `ROCM_CLI_BINARY` when it names a path,
+/// otherwise the `rocm` that `PATH` finds.
+fn binary_under_test() -> PathBuf {
+    let binary = crate::rocm_binary();
+    let found = if e2e_cucumber::binary_path::names_a_path(&binary) {
+        Some(PathBuf::from(&binary))
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(&binary))
+            .find(|path| path.is_file())
+    };
+    let found = found.unwrap_or_else(|| panic!("cannot find the binary under test ({binary})"));
+    found
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("failed to resolve {}: {error}", found.display()))
+}
+
+#[given("ROCm CLI is run from a development build folder")]
+async fn run_from_dev_build(world: &mut E2eWorld) {
+    let [rocm, rocmd] = dev_build_binaries(world);
+    let contents =
+        std::fs::read(binary_under_test()).expect("failed to read the binary under test");
+    std::fs::create_dir_all(dev_build_dir(world)).expect("failed to create the build folder");
+    rocm_core::fake_executable::write_fake_executable(&rocm, contents)
+        .expect("failed to copy the binary under test into the build folder");
+    std::fs::write(&rocmd, "stand-in daemon").expect("failed to write the stand-in rocmd");
+}
+
+/// Run the copy in the scenario's build folder as `rocm uninstall`, keeping the
+/// config, data and cache, so the only thing a run can remove is that folder's
+/// binaries.
+///
+/// This is the documented exception to [`assert_keeps_binaries`]: the binaries
+/// are what the scenario is about. What makes it safe is checked here, before
+/// every run: the program started is the copy, inside the scenario's own folder,
+/// and the config, data and cache are all kept.
+fn run_dev_build_uninstall(world: &mut E2eWorld, flags: &[&str]) {
+    let mut args = vec!["uninstall", "--keep-config", "--keep-data", "--keep-cache"];
+    args.extend_from_slice(flags);
+    let program = dev_build_binaries(world)[0]
+        .canonicalize()
+        .expect("the copy of the binary under test is missing");
+    let scenario_root = root(world)
+        .canonicalize()
+        .expect("failed to resolve the scenario's folder");
+    assert!(
+        program.starts_with(&scenario_root) && program != binary_under_test(),
+        "an uninstall that may remove binaries must run the copy inside the scenario's folder \
+         ({}), not {}",
+        scenario_root.display(),
+        program.display()
+    );
+    for kept in ["--keep-config", "--keep-data", "--keep-cache"] {
+        assert!(args.contains(&kept), "missing {kept}: {args:?}");
+    }
+
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args);
+    world.isolate_cmd(&mut cmd);
+    for (name, value) in isolated_env(world) {
+        cmd.env(name, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {}: {error}", program.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let rc = output.status.code().unwrap_or(-1);
+    crate::record_command(world.current_scenario.as_deref(), &args, rc, &stdout);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(String::from_utf8_lossy(&output.stderr).into_owned());
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user dry-runs an uninstall from the development build")]
+async fn dry_run_from_dev_build(world: &mut E2eWorld) {
+    run_dev_build_uninstall(world, &["--dry-run"]);
+}
+
+#[when(
+    "the user dry-runs an uninstall from the development build, allowing its binaries with the older spelling of the flag"
+)]
+async fn dry_run_from_dev_build_older_spelling(world: &mut E2eWorld) {
+    run_dev_build_uninstall(world, &["--force-dev-binaries", "--dry-run"]);
+}
+
+#[when("the user allows removing the development build's binaries without confirming")]
+async fn allow_dev_binaries_unconfirmed(world: &mut E2eWorld) {
+    run_dev_build_uninstall(world, &["--allow-dev-binaries"]);
+}
+
+#[when("the user allows removing the development build's binaries and confirms")]
+async fn allow_dev_binaries_confirmed(world: &mut E2eWorld) {
+    run_dev_build_uninstall(world, &["--allow-dev-binaries", "--yes"]);
+}
+
+fn listed_binary(path: &Path) -> String {
+    format!("  - binary: {}", path.display())
+}
+
+#[then("the dry run keeps the development build's binaries and names the flag that removes them")]
+async fn dry_run_keeps_dev_binaries(world: &mut E2eWorld) {
+    let stdout = output(world);
+    let note = format!(
+        "binary removal skipped because {} looks like a cargo target build; pass \
+         --allow-dev-binaries to remove the ROCm CLI binaries in that folder",
+        dev_build_binaries(world)[0].display()
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim_start_matches("  - ") == note),
+        "expected the note `{note}`:\n{stdout}"
+    );
+    for binary in dev_build_binaries(world) {
+        assert!(
+            !stdout.contains(&listed_binary(&binary)),
+            "a development build's binary must not be listed for removal:\n{stdout}"
+        );
+    }
+    // The older spelling works, but is not the one the user is told about.
+    assert!(!stdout.contains("force-dev-binaries"), "{stdout}");
+}
+
+#[then("the dry run lists the development build's binaries")]
+async fn dry_run_lists_dev_binaries(world: &mut E2eWorld) {
+    let stdout = output(world);
+    for binary in dev_build_binaries(world) {
+        let line = listed_binary(&binary);
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "expected a `{line}` line:\n{stdout}"
+        );
+    }
+}
+
+#[then(
+    "the uninstall is refused until it is confirmed, after listing the development build's binaries"
+)]
+async fn refused_after_listing_dev_binaries(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        world.cli_rc,
+        Some(1),
+        "an unconfirmed uninstall outside a terminal exits 1\nstdout:\n{}\nstderr:\n{stderr}",
+        output(world)
+    );
+    assert!(
+        stderr.contains("uninstall requires --yes outside an interactive terminal"),
+        "expected the --yes refusal on stderr:\n{stderr}"
+    );
+    dry_run_lists_dev_binaries(world).await;
+}
+
+#[then("the development build's binaries are still there")]
+async fn dev_binaries_still_there(world: &mut E2eWorld) {
+    for binary in dev_build_binaries(world) {
+        assert!(
+            binary.is_file(),
+            "{} was removed:\n{}",
+            binary.display(),
+            output(world)
+        );
+    }
+}
+
+#[then("the development build's binaries are gone")]
+async fn dev_binaries_gone(world: &mut E2eWorld) {
+    for binary in dev_build_binaries(world) {
+        assert!(
+            std::fs::symlink_metadata(&binary).is_err(),
+            "{} must be removed:\n{}",
+            binary.display(),
+            output(world)
+        );
+        let line = format!("removed binary {}", binary.display());
+        assert!(
+            output(world).lines().any(|l| l == line),
+            "expected a `{line}` line:\n{}",
+            output(world)
+        );
+    }
 }
