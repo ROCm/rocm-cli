@@ -577,6 +577,17 @@ Pre-warm then:
 - activates the runtime a reuse actually means — after a repair that is the
   replacement named by `target=`, not the superseded manifest the line belongs to;
 - ensures the default engine is installed even when the runtime itself is reused;
+- then fails the pre-warm if the active runtime's Python cannot `import
+  torchvision.ops` (a torch and torchvision that do not match, which would
+  otherwise fail each vLLM serve scenario after its readiness timeout). The error
+  names the runtime and the `rocm runtimes uninstall` command, with the pre-warm
+  tree's directories, that makes the next pre-warm reinstall it. If the runtime
+  was installed by that same run, the installer produced the broken pair and the
+  error says so instead. The check is skipped for a runtime with no torchvision,
+  a tree with no active runtime or no recorded interpreter, and a shared library
+  that fails to load (a warning: the probe adds no library paths). An unreadable
+  `active.json` or registry manifest, a marker without `runtime_key`, or an
+  interpreter that will not start fails the pre-warm;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
   (a pinned build newer than the index must not be rolled back and cannot be
   reproduced from the index, so it is never offered a repair), or when freshness
