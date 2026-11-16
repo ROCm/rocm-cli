@@ -145,12 +145,14 @@ fn read_symptom(reader: impl Read, source: &str) -> Result<String, SymptomFileEr
 }
 
 /// UTF-8 (a leading byte-order mark dropped), or UTF-16 announced by its
-/// byte-order mark. The error says where decoding failed. Takes the buffer by
-/// value so UTF-8 becomes the string in place, without a second buffer.
+/// byte-order mark. The error says where decoding failed, as an offset from the
+/// start of the input. Takes the buffer by value so UTF-8 becomes the string in
+/// place, without a second buffer.
 fn decode(mut bytes: Vec<u8>) -> Result<String, String> {
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        bytes.drain(..3);
-        return utf8(bytes);
+    const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    if bytes.starts_with(&UTF8_BOM) {
+        bytes.drain(..UTF8_BOM.len());
+        return utf8(bytes, UTF8_BOM.len());
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return utf16(rest, u16::from_le_bytes);
@@ -158,14 +160,17 @@ fn decode(mut bytes: Vec<u8>) -> Result<String, String> {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return utf16(rest, u16::from_be_bytes);
     }
-    utf8(bytes)
+    utf8(bytes, 0)
 }
 
-fn utf8(bytes: Vec<u8>) -> Result<String, String> {
+/// `bytes` as UTF-8. `skipped` is how many bytes of the input came before
+/// them (a byte-order mark), so the offset in an error counts from the start
+/// of the input, where the user can find the byte.
+fn utf8(bytes: Vec<u8>, skipped: usize) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|error| {
         format!(
             "it is not valid UTF-8 (invalid byte at offset {})",
-            error.utf8_error().valid_up_to()
+            skipped + error.utf8_error().valid_up_to()
         )
     })
 }
@@ -257,6 +262,13 @@ mod tests {
         assert!(message.contains("offset 10"), "{message}");
         assert!(message.contains("UTF-8"), "{message}");
 
+        // Behind a UTF-8 byte-order mark the offset still counts from the
+        // start of the input, so it points at the byte in the file.
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(b"HIP error \xff at");
+        let message = read(&with_bom).unwrap_err().to_string();
+        assert!(message.contains("offset 13"), "{message}");
+
         // A UTF-16 BOM with an odd tail, and one with a lone surrogate.
         assert!(matches!(
             read(&[0xFF, 0xFE, 0x41]),
@@ -312,6 +324,22 @@ mod tests {
             "--symptom is never trimmed: only a file's trailing line break is"
         );
         assert_eq!(resolve(None, None).unwrap(), None);
+    }
+
+    // `-` alone means standard input, so a file literally named `-` is reached
+    // as `./-`, which is what the documentation tells the user. The two
+    // spellings are different paths, and a path that is not `-` is opened as a
+    // file whatever the working directory.
+    #[test]
+    fn a_file_named_dash_is_read_as_a_file_not_as_standard_input() {
+        assert_ne!(Path::new("./-").as_os_str(), STDIN_PATH);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("-");
+        std::fs::write(&path, "from the file named dash\n").unwrap();
+        assert_eq!(
+            resolve(None, Some(&path)).unwrap().as_deref(),
+            Some("from the file named dash")
+        );
     }
 
     #[test]

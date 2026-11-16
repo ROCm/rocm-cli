@@ -4657,7 +4657,17 @@ hold the behaviour end to end, GPU or not:
   pipe), so nothing in it can run by construction; the scenario asserts the
   diagnosis, not the absence of something no shell could do. The paste is
   ASCII: Windows PowerShell 5.1 pipes text as ASCII, which is why the docs
-  send PowerShell users through a file instead.
+  send PowerShell users through a file instead. The cmd.exe and Windows
+  PowerShell runs need a Windows host, so in CI they run only on the
+  self-hosted Strix Halo Windows lanes: `e2e-gpu-strix-windows` in
+  [e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) (on pull
+  requests that touch the serve paths, on pushes to `main` and `release/**`,
+  and in the merge queue) and the scheduled
+  `e2e-gpu-nightly-strix-windows` in
+  [nightly.yml](../.github/workflows/nightly.yml). Neither is a required
+  check. The required `E2E tests` job in [ci.yml](../.github/workflows/ci.yml)
+  runs only the bash half, on Linux, and ci.yml's Windows lane does not run
+  this scenario.
 - `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
   scenario here; the Windows key is checked by hand in
   [manual-testing.md](manual-testing.md) section 13) runs
