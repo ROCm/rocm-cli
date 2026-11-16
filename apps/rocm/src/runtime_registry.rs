@@ -19,9 +19,12 @@
 //! and uninstall both need, and the on-disk active-runtime marker
 //! (`ActiveRuntimeMarker`, `active_runtime_marker_path`,
 //! `active_runtime_marker_matches`, `write_active_runtime_marker`,
-//! `forget_active_runtime_rollback_target`) that activation writes and
-//! uninstall reads and clears. The serde shape of [`InstalledRuntimeManifest`] and its probe
-//! structs is the on-disk contract of the registry files and of each install's
+//! `forget_active_runtime_rollback_target`) that activation and rollback write,
+//! and that uninstall reads, removes when it names the removed runtime as the
+//! one in use, and otherwise rewrites to drop that runtime as its rollback
+//! target; `runtimes_cmd.rs`'s module doc lists every writer and remover. The
+//! serde shape of [`InstalledRuntimeManifest`] and its probe structs is the
+//! on-disk contract of the registry files and of each install's
 //! `.rocm-cli-runtime.json`; the marker is user state too, and its serde shape
 //! is as fixed.
 

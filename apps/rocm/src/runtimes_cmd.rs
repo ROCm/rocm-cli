@@ -21,8 +21,14 @@
 //! `pub(crate)`: it is read by `append_update_activate_summary` in
 //! `update_cmd.rs`'s `apply_runtime_update` flow. The uninstall plan and apply
 //! code lives in `runtime_uninstall.rs`, and the active-runtime marker model and
-//! its one writer, `write_active_runtime_marker`, in `runtime_registry.rs`;
-//! activation and rollback here write the marker through it, as uninstall does.
+//! `write_active_runtime_marker` in `runtime_registry.rs`; activation and
+//! rollback here write the marker through it, as uninstall does when it drops a
+//! rollback target. A failed activation's restore and three removals touch the
+//! marker without it. The restore puts the earlier bytes back with
+//! `rocm_core::atomic_write::write_file_atomically`, or removes the marker when
+//! there was none before. Uninstalling the runtime in use removes it, and
+//! `rocm config set-default-runtime` and `rocm config clear-default-runtime`
+//! remove it and ignore a failed removal.
 //! `uninstall_runtime`, `should_remove_runtime_install_root`,
 //! `InstallRootDecision`, `ActiveRuntimeMarker` and `active_runtime_marker_path`
 //! are re-exported from here for `storage.rs` and `main.rs`.
