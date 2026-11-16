@@ -2757,7 +2757,12 @@ mod tests {
             .as_ref()
             .map(|grandchild| grandchild.id().to_string())
             .unwrap_or_default();
-        fs::write(marker, contents).expect("write the sleeper's marker");
+        // Written beside the marker and renamed onto it, so the spawner never
+        // reads a marker that exists but is not yet written.
+        let marker = Path::new(&marker);
+        let partial = marker.with_extension("partial");
+        fs::write(&partial, contents).expect("write the sleeper's marker");
+        fs::rename(&partial, marker).expect("publish the sleeper's marker");
         thread::sleep(Duration::from_secs(secs));
         if let Some(mut grandchild) = grandchild {
             let _ = grandchild.wait();
@@ -2810,8 +2815,12 @@ mod tests {
         }
         let mut child = command.spawn().expect("spawn sleeper child");
         let deadline = std::time::Instant::now() + Duration::from_mins(1);
+        // A marker asked to name a grandchild counts only once it does: the
+        // sleeper renames it into place, and this holds even if it did not.
         let contents = loop {
-            if let Ok(contents) = fs::read_to_string(&marker) {
+            if let Ok(contents) = fs::read_to_string(&marker)
+                && (!with_grandchild || contents.trim().parse::<u32>().is_ok())
+            {
                 break contents;
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -2835,7 +2844,7 @@ mod tests {
             contents
                 .trim()
                 .parse()
-                .expect("the sleeper names its grandchild")
+                .expect("the loop above waited for a parsable grandchild PID")
         });
         (child, grandchild)
     }
@@ -3104,6 +3113,66 @@ mod tests {
                     outcome.as_str()
                 )),
                 "{outcome:?}"
+            );
+        }
+    }
+
+    /// After an outcome that leaves the child possibly alive, a child that has in
+    /// fact already exited is still reaped, not left a zombie. The child is
+    /// waited for with `WNOWAIT` first, which sees the exit without reaping it,
+    /// so it is certainly an unreaped exited child when the call is made. A
+    /// zombie still answers `kill(pid, 0)`, so the PID being gone afterwards
+    /// means the call reaped it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)] // libc FFI: waitid
+    fn an_unconfirmed_termination_still_reaps_a_child_that_already_exited() {
+        for outcome in [
+            rocm_core::TerminationOutcome::TimedOut,
+            rocm_core::TerminationOutcome::Unverified,
+        ] {
+            // The test binary with a filter matching no test exits at once.
+            let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("no-test-has-this-name")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a child that exits at once");
+            let pid = child.id();
+            let identity = rocm_core::ProcessIdentity::capture(pid);
+            let id = libc::id_t::from(pid);
+            // SAFETY: `info` is a valid, zeroed `siginfo_t` for `waitid` to fill.
+            let waited = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::waitid(
+                    libc::P_PID,
+                    id,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(
+                waited, 0,
+                "{outcome:?}: wait for the child's exit without reaping it"
+            );
+            assert!(
+                rocm_core::process_is_running(pid),
+                "{outcome:?}: precondition: the exited child is an unreaped zombie"
+            );
+
+            let line = terminate_and_reap_with(&mut child, &identity, "engine", |_| outcome);
+            let reaped = !rocm_core::process_is_running(pid);
+            let _ = child.wait();
+
+            assert!(
+                reaped,
+                "{outcome:?}: a child that had already exited must be reaped, not left a zombie"
+            );
+            assert!(
+                line.is_some(),
+                "{outcome:?}: the unconfirmed outcome is still reported"
             );
         }
     }
@@ -3509,9 +3578,14 @@ mod tests {
                 );
                 let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
             });
-            outcome = if let Ok(outcome) = receiver.recv_timeout(Duration::from_mins(1)) {
+            let received = receiver.recv_timeout(Duration::from_mins(1));
+            outcome = if let Ok(outcome) = received {
                 outcome
             } else {
+                let panicked = matches!(
+                    received,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                );
                 // Unparseable, so the supervisor's exit write fails and it
                 // returns instead of exiting the test binary once the engine
                 // it is waiting on dies.
@@ -3525,6 +3599,11 @@ mod tests {
                     .into_iter()
                     .chain(grandchild)
                     .for_each(kill_if_running);
+                assert!(
+                    !panicked,
+                    "the supervisor thread panicked (its message is above); its engine (from \
+                     the registered seam) is killed before the test fails"
+                );
                 panic!(
                     "the supervisor did not return within a minute; its engine (from the \
                      registered seam) is killed before the test fails"
