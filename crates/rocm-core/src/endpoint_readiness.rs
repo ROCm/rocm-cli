@@ -84,22 +84,23 @@ pub fn json_state_lock_path(path: &Path) -> PathBuf {
 /// A `patch` that is not an object has no keys to merge; the file is not
 /// touched and the call succeeds.
 pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<()> {
-    merge_json_state_file_with(path, patch, || {})
+    merge_json_state_file_with(path, patch, |path| fs::read(path), || {})
 }
 
-/// [`merge_json_state_file`], running `before_publish` under the lock just
-/// before the merged document is published, so a test can observe the lock
-/// held at that moment.
+/// [`merge_json_state_file`], reading the existing file through `read` and
+/// running `before_publish` under the lock just before the merged document is
+/// published, so a test can observe the lock held at both moments.
 fn merge_json_state_file_with(
     path: &Path,
     patch: &serde_json::Value,
+    read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
     before_publish: impl FnOnce(),
 ) -> Result<()> {
     let Some(patch) = patch.as_object() else {
         return Ok(());
     };
     let _lock = FileLock::acquire(json_state_lock_path(path))?;
-    let mut object = match fs::read(path) {
+    let mut object = match read(path) {
         Ok(bytes) => existing_state_object(path, &bytes)?,
         Err(error) if error.kind() == ErrorKind::NotFound => serde_json::Map::new(),
         Err(error) => {
@@ -1566,15 +1567,56 @@ mod tests {
         fs::write(&path, br#"{"server_pid": 42}"#)?;
         let mut held = None;
 
-        merge_json_state_file_with(&path, &serde_json::json!({ "status": "ready" }), || {
-            held = Some(state_lock_is_held(&path));
-        })?;
+        merge_json_state_file_with(
+            &path,
+            &serde_json::json!({ "status": "ready" }),
+            |path| fs::read(path),
+            || {
+                held = Some(state_lock_is_held(&path));
+            },
+        )?;
 
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
         let released = !state_lock_is_held(&path);
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(held, Some(true), "the merge must publish under the lock");
         assert!(released, "the lock is released once the merge returns");
+        assert_eq!(
+            written,
+            serde_json::json!({ "server_pid": 42, "status": "ready" })
+        );
+        Ok(())
+    }
+
+    /// A merge reads the file it is about to replace while holding the lock,
+    /// so a write that lands between its read and its publish has to wait for
+    /// it rather than be overwritten by the merge's stale copy. Observed at the
+    /// moment of reading, so the result does not depend on how fast the host
+    /// is.
+    #[test]
+    fn a_state_file_merge_reads_under_the_directory_lock() -> Result<()> {
+        let dir = json_state_dir("merge-read-lock");
+        let path = dir.join("svc.json");
+        fs::write(&path, br#"{"server_pid": 42}"#)?;
+        let mut held_at_read = None;
+
+        merge_json_state_file_with(
+            &path,
+            &serde_json::json!({ "status": "ready" }),
+            |read_path| {
+                held_at_read = Some(state_lock_is_held(read_path));
+                fs::read(read_path)
+            },
+            || {},
+        )?;
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            held_at_read,
+            Some(true),
+            "the merge must read the file under the lock"
+        );
         assert_eq!(
             written,
             serde_json::json!({ "server_pid": 42, "status": "ready" })

@@ -303,11 +303,15 @@ mod tests {
         SmokeUnreachable,
         /// The state file cannot be written once the server is spawned.
         StateWrite,
-        /// The state file becomes unwritable between verification and the ready merge.
+        /// The state file is torn ([`TORN_STATE`]) between verification and the
+        /// ready merge, as a writer that rewrites it in place could leave it.
         ReadyMerge,
         WaitServer,
         FailedExit,
     }
+
+    /// A state document cut short mid-write: what [`Fail::ReadyMerge`] leaves.
+    const TORN_STATE: &[u8] = br#"{"status": "running", "server_pid": 4000000, "server_st"#;
 
     struct FakeSteps {
         runtime: LemonadeRuntime,
@@ -394,8 +398,7 @@ mod tests {
             // Asked for while the ready state is assembled, i.e. after every
             // verification step and before the merge is written.
             if self.fail == Fail::ReadyMerge {
-                std::fs::remove_file(&self.state_path).unwrap();
-                std::fs::create_dir(&self.state_path).unwrap();
+                std::fs::write(&self.state_path, TORN_STATE).unwrap();
             }
             None
         }
@@ -580,10 +583,8 @@ mod tests {
             std::fs::create_dir(&request.state_path).unwrap();
         }
         let mut steps = FakeSteps::new(temporary.path(), fail);
-        let error = format!(
-            "{:#}",
-            serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected)
-        );
+        let failure = serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected);
+        let error = format!("{failure:#}");
         assert!(error.contains(expected), "{error}");
         // The spawned server is stopped exactly once, and nothing runs after it.
         assert_eq!(
@@ -598,6 +599,24 @@ mod tests {
             "{:?}",
             steps.calls
         );
+        if fail == Fail::ReadyMerge {
+            // Refused as torn, not failed for some other reason, and true to its
+            // word: neither the ready merge nor the `failed` mark that follows
+            // replaced the file, so the torn bytes the merge found are still there.
+            let refused = failure
+                .downcast_ref::<rocm_core::JsonStateFileRefused>()
+                .unwrap_or_else(|| panic!("the merge must refuse the torn file: {error}"));
+            assert_eq!(refused.refusal, rocm_core::JsonStateRefusal::NotJson);
+            assert!(
+                request.state_path.is_file(),
+                "the state file is still a file"
+            );
+            assert_eq!(
+                std::fs::read(&request.state_path).unwrap(),
+                TORN_STATE,
+                "the torn state file must be left exactly as it was"
+            );
+        }
         if fail == Fail::WaitServer {
             // The state file is writable here, so the failure is recorded.
             let state = crate::state::read_service_state(&request.state_path).unwrap();
@@ -613,7 +632,7 @@ mod tests {
     #[test]
     fn ready_state_merge_failure_stops_the_server() {
         // The merge reads the file first, under the state directory's lock, and
-        // refuses one it cannot read rather than replace it.
+        // refuses a torn one rather than replace it.
         assert_post_spawn_failure_stops_server(
             Fail::ReadyMerge,
             "left it untouched and recorded nothing",
