@@ -21,6 +21,8 @@ use crate::E2eWorld;
 
 /// Id of the record this scenario plants.
 const SERVICE_ID: &str = "vllm-e2e-stop";
+/// The port the planted record in `plant_server_record` was started on.
+const SERVER_PORT: u16 = 9;
 /// Engine name, which also picks the engine state directory the record's
 /// third file lives in (`<data>/engines/<engine>/state/`).
 const ENGINE: &str = "vllm";
@@ -86,6 +88,17 @@ fn lists_live_server_row(listed: &str) -> bool {
     listed
         .lines()
         .any(|line| line.trim_end().strip_prefix("- ") == Some(SERVICE_ID))
+}
+
+/// The backtick spans of `output` that start with `prefix`: the commands a
+/// refusal tells the user to run.
+fn advised_spans<'a>(output: &'a str, prefix: &str) -> Vec<&'a str> {
+    output
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.starts_with(prefix))
+        .collect()
 }
 
 // ── Given ──────────────────────────────────────────────────────────
@@ -156,6 +169,45 @@ async fn managed_server_with_running_process(world: &mut E2eWorld) {
 #[given("a managed server without an endpoint key whose recorded process is running")]
 async fn keyless_managed_server_with_running_process(world: &mut E2eWorld) {
     plant_server_with_running_process(world, "127.0.0.1", false);
+}
+
+/// The server a stop leaves behind when it is bound publicly: its endpoint key
+/// is dropped by the stop, so a record read back later has none.
+#[given("a public managed server whose endpoint key is gone and whose recorded process is running")]
+async fn public_managed_server_without_its_key(world: &mut E2eWorld) {
+    plant_server_with_running_process(world, "0.0.0.0", false);
+}
+
+/// A loopback server that was launched with `--require-api-key`, which a
+/// `rocm serve` of a loopback host does not otherwise ask for, and whose key is
+/// gone: the other way a service needs a key besides a public bind. The record
+/// says it required one; nothing else about it differs from the public server's.
+#[given(
+    "a loopback managed server that required an API key, whose key is gone and whose recorded process is running"
+)]
+async fn loopback_server_that_required_a_key_without_it(world: &mut E2eWorld) {
+    plant_server_with_running_process(world, "127.0.0.1", false);
+    let manifest = manifest_path(world);
+    let mut record = read_record(world);
+    record["requires_api_key"] = serde_json::json!(true);
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to rewrite service record");
+}
+
+/// What a stop leaves behind, planted directly: a publicly bound server that is
+/// already stopped, so it names no process and no pending stop, with the key the
+/// stop dropped. Nothing is running for the scenario to own or reap.
+#[given("a public managed server that is already stopped and whose endpoint key is gone")]
+async fn public_managed_server_already_stopped(world: &mut E2eWorld) {
+    write_server_record(world, "0.0.0.0", "stopped", 0, None);
+    let listed = crate::run_rocm_ok(world, &["services", "list"]);
+    assert!(
+        !lists_live_server_row(&listed),
+        "premise: a stopped record must not read as running:\n{listed}"
+    );
 }
 
 fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key: bool) {
@@ -319,19 +371,9 @@ fn windows_process_is_running(pid: u32) -> bool {
     .unwrap_or_else(|message| panic!("{message}"))
 }
 
-/// Write the record for a ready server whose supervisor is `process`, with
-/// `ticks` as its start-time token when there is one, and take `process` into
-/// the World so the scenario (and its teardown) can check and reap it.
-fn plant_server_record(
-    world: &mut E2eWorld,
-    host: &str,
-    with_key: bool,
-    process: std::process::Child,
-    ticks: Option<u64>,
-) {
-    let pid = process.id();
-    world.recorded_process = Some(process);
-
+/// Write the record of a managed server on `host` whose recorded supervisor is
+/// `pid` (`0` for none), with `ticks` as its start-time token when there is one.
+fn write_server_record(world: &E2eWorld, host: &str, status: &str, pid: u32, ticks: Option<u64>) {
     let services = services_dir(world);
     std::fs::create_dir_all(&services).expect("failed to create services dir");
     let manifest = manifest_path(world);
@@ -341,11 +383,13 @@ fn plant_server_record(
         "model_ref": "qwen",
         "canonical_model_id": "Qwen/Qwen3.5",
         "host": host,
-        // Discard port: closed, so nothing can answer on the server's behalf.
-        "port": 9,
-        "endpoint_url": format!("http://{host}:9/v1"),
+        // Discard port: closed, so nothing can answer on the server's behalf, and
+        // outside the range `rocm serve` chooses from itself, as a server that was
+        // started on an explicit port and published behind a mapping would be.
+        "port": SERVER_PORT,
+        "endpoint_url": format!("http://{host}:{SERVER_PORT}/v1"),
         "mode": "managed",
-        "status": "ready",
+        "status": status,
         "supervisor_pid": pid,
         "supervisor_start_ticks": ticks,
         "engine_pid": null,
@@ -359,6 +403,21 @@ fn plant_server_record(
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");
+}
+
+/// Write the record for a ready server whose supervisor is `process`, with
+/// `ticks` as its start-time token when there is one, and take `process` into
+/// the World so the scenario (and its teardown) can check and reap it.
+fn plant_server_record(
+    world: &mut E2eWorld,
+    host: &str,
+    with_key: bool,
+    process: std::process::Child,
+    ticks: Option<u64>,
+) {
+    let pid = process.id();
+    world.recorded_process = Some(process);
+    write_server_record(world, host, "ready", pid, ticks);
     if with_key {
         std::fs::write(endpoint_key_path(world), "e2e-endpoint-key")
             .expect("failed to write endpoint key");
@@ -465,6 +524,30 @@ async fn stop_with_yes(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user restarts it with --yes")]
+async fn restart_with_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "restart", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+/// Run the stop the refusal printed, as printed. The refusal is the output of
+/// the restart that came before, so this reads it back before the stop replaces
+/// it.
+#[when("the user runs the stop the refusal named")]
+async fn run_the_stop_the_refusal_named(world: &mut E2eWorld) {
+    let refusal = combined_output(world);
+    let stops = advised_spans(&refusal, "rocm services stop");
+    assert_eq!(
+        stops.len(),
+        1,
+        "the refusal must name exactly one stop command:\n{refusal}"
+    );
+    let words: Vec<&str> = stops[0].split_whitespace().skip(1).collect();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &words);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the daemon's stop_server tool stops that server")]
 async fn stop_server_tool(world: &mut E2eWorld) {
     run_stop_server_tool(world, crate::rocmd_binary());
@@ -522,6 +605,195 @@ async fn record_marked_stopped(world: &mut E2eWorld) {
         record.get("status").and_then(serde_json::Value::as_str),
         Some("stopped"),
         "the on-disk record must persist the stop, got:\n{record}"
+    );
+}
+
+#[then(
+    "the CLI refuses the restart because it would reopen the public server without authentication"
+)]
+async fn restart_refused_without_authentication(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(
+        rc, 0,
+        "a restart that would reopen the server anonymously must fail:\n{combined}"
+    );
+    assert!(
+        combined.contains(
+            "managed service is bound to the public host `0.0.0.0` but has no endpoint API key, \
+             so restarting it would reopen it without authentication."
+        ),
+        "{combined}"
+    );
+}
+
+#[then(
+    "the CLI refuses the restart because it would reopen the server that required an API key without authentication"
+)]
+async fn restart_refused_for_a_required_key(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(
+        rc, 0,
+        "a restart that would reopen the server anonymously must fail:\n{combined}"
+    );
+    assert!(
+        combined.contains(
+            "managed service was launched with `--require-api-key` but has no endpoint API key, \
+             so restarting it would reopen it without authentication."
+        ),
+        "{combined}"
+    );
+    // It is the key requirement that is refused, not a public bind: the server is
+    // on loopback, and is not told it is bound to a public host.
+    assert!(!combined.contains("public host"), "{combined}");
+}
+
+/// What the refused restart must leave of the record's own claim: that the
+/// server required a key. The restart changed nothing, so it still does.
+#[then("the server's record still says it required an API key")]
+async fn record_still_requires_the_key(world: &mut E2eWorld) {
+    let record = read_record(world);
+    assert_eq!(record["requires_api_key"], true, "{record}");
+    assert_eq!(record["host"], "127.0.0.1", "{record}");
+}
+
+/// The `rocm serve` command the refusal names, run against the real parser:
+/// its `<model>` placeholder filled in, and `--help` last, so the parse ends in
+/// help only if every word before it was accepted. A command with a flag `rocm`
+/// does not have is shown to be rejected the same way, so the check cannot pass
+/// by `--help` alone.
+#[then("the refusal names a serve command that rocm accepts")]
+async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
+    check_advised_serve_command(
+        world,
+        &format!("rocm serve <model> --host 0.0.0.0 --port {SERVER_PORT} --allow-public-bind"),
+    );
+}
+
+/// The same check for the server that asked for a key on a loopback bind: the
+/// command carries the flag it asked for and nothing that moves it off the
+/// default host, which is where it was.
+#[then("the refusal names a serve command that asks for the key again and that rocm accepts")]
+async fn refusal_names_an_accepted_serve_command_with_the_key_flag(world: &mut E2eWorld) {
+    let command = check_advised_serve_command(
+        world,
+        &format!("rocm serve <model> --port {SERVER_PORT} --require-api-key"),
+    );
+    assert!(
+        !command.contains("--host") && !command.contains("--allow-public-bind"),
+        "a loopback server is not told to bind elsewhere: {command}"
+    );
+}
+
+/// Runs the `rocm serve` command the refusal names against the real parser, and
+/// returns it. `expected` is what it must contain to bring the server back where
+/// it was.
+fn check_advised_serve_command(world: &mut E2eWorld, expected: &str) -> String {
+    let combined = combined_output(world);
+    let advised = advised_spans(&combined, "rocm serve <model>");
+    assert_eq!(
+        advised.len(),
+        1,
+        "the refusal must name exactly one `rocm serve <model>` command:\n{combined}"
+    );
+    assert!(
+        advised[0].starts_with(expected),
+        "the command must bring the server back where it was, on the port it recorded ({expected}): {}",
+        advised[0]
+    );
+    let mut args: Vec<String> = advised[0]
+        .split_whitespace()
+        .skip(1)
+        .map(|word| match word {
+            "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
+            other => other.to_owned(),
+        })
+        .collect();
+    args.push("--help".to_owned());
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &words);
+    assert_eq!(rc, 0, "rocm rejected {words:?}:\n{stdout}\n{stderr}");
+
+    let mut bogus = words.clone();
+    bogus.insert(bogus.len() - 1, "--no-such-flag");
+    let (_, _, rc) = crate::run_rocm(world, &bogus);
+    assert_ne!(
+        rc, 0,
+        "a flag rocm does not have must be rejected before --help: {bogus:?}"
+    );
+    advised[0].to_owned()
+}
+
+/// The stop the refusal names comes before the launch it names, is the exact
+/// command for this server, and is one `rocm` accepts: run with `--help` last,
+/// with a bogus flag as the negative control, so nothing is stopped by it. That
+/// the server is still running afterwards is what the next step checks.
+#[then("the refusal names the stop that has to come first")]
+async fn refusal_names_the_stop_first(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    let stops = advised_spans(&combined, "rocm services stop");
+    assert_eq!(
+        stops.len(),
+        1,
+        "the refusal must name exactly one `rocm services stop` command:\n{combined}"
+    );
+    assert_eq!(
+        stops[0],
+        format!("rocm services stop {SERVICE_ID} --yes"),
+        "{combined}"
+    );
+    assert!(
+        combined.find(stops[0]).unwrap() < combined.find("rocm serve <model>").unwrap(),
+        "the stop must come before the launch:\n{combined}"
+    );
+    let mut args: Vec<String> = stops[0]
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    args.push("--help".to_owned());
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &words);
+    assert_eq!(rc, 0, "rocm rejected {words:?}:\n{stdout}\n{stderr}");
+    let mut bogus = words.clone();
+    bogus.insert(bogus.len() - 1, "--no-such-flag");
+    let (_, _, rc) = crate::run_rocm(world, &bogus);
+    assert_ne!(
+        rc, 0,
+        "a flag rocm does not have must be rejected before --help: {bogus:?}"
+    );
+}
+
+#[then("the server is left running, with no stop recorded and no key file")]
+async fn server_left_as_it_was(world: &mut E2eWorld) {
+    let pid = recorded_pid(world);
+    let process = world
+        .recorded_process
+        .as_mut()
+        .expect("scenario recorded no process");
+    assert!(
+        process
+            .try_wait()
+            .expect("failed to check the recorded process")
+            .is_none(),
+        "the refused restart stopped the running server"
+    );
+    // Not `ready` any more: the CLI's liveness refresh reads the planted server's
+    // closed port as `starting` before it gets as far as the restart. What a
+    // refused restart must not do is mark it stopped or drop its process.
+    let record = read_record(world);
+    assert_ne!(record["status"], "stopped", "{record}");
+    assert_eq!(record["supervisor_pid"], u64::from(pid), "{record}");
+    assert!(
+        record["stop_requested_unix_ms"].is_null(),
+        "a refused restart stops nothing, so it records no stop request: {record}"
+    );
+    let key = endpoint_key_path(world);
+    assert!(
+        !key.exists(),
+        "a refused restart must not create a key: {}",
+        key.display()
     );
 }
 
@@ -739,6 +1011,15 @@ async fn record_reads_stopped(world: &mut E2eWorld) {
     assert!(
         record["stop_requested_unix_ms"].is_null(),
         "a confirmed stop leaves no stop pending: {record}"
+    );
+}
+
+#[then("the server is not listed as running")]
+async fn server_not_listed_as_running(world: &mut E2eWorld) {
+    let listed = crate::run_rocm_ok(world, &["services", "list"]);
+    assert!(
+        !lists_live_server_row(&listed),
+        "a stopped server must not be listed as running:\n{listed}"
     );
 }
 

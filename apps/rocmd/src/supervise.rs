@@ -8,7 +8,7 @@ use crate::watchers::stop_requested;
 use anyhow::{Context, Result};
 use rocm_core::{AppPaths, ManagedServiceRecord};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -52,6 +52,23 @@ pub(crate) fn supervise_service(
         device_policy,
         gpu,
         engine_recipe_json,
+        crate::engine_ipc::usable_endpoint_key_file,
+    )
+}
+
+/// The respawn guard as the daemon words it: the shared guard, for this record's
+/// host and recorded requirement, as a respawn. Both of the supervisor's checks
+/// go through it — the one before the manifest write, and the one at the spawn
+/// against the key actually threaded onto the command — so they differ only in
+/// where `key_present` comes from.
+fn refuse_keyless_respawn(record: &ManagedServiceRecord, key_present: bool) -> Result<()> {
+    rocm_core::ensure_public_service_has_endpoint_key(
+        &record.host,
+        key_present,
+        record.requires_api_key,
+        rocm_core::ServiceStart::Respawn,
+        &record.service_id,
+        record.port,
     )
 }
 
@@ -72,6 +89,7 @@ fn supervise_service_on(
     device_policy: String,
     gpu: Option<String>,
     engine_recipe_json: Option<String>,
+    key_file_of: impl Fn(&AppPaths, &str) -> Option<PathBuf>,
 ) -> Result<()> {
     paths.ensure()?;
     fs::create_dir_all(paths.engine_logs_dir(&engine))?;
@@ -133,17 +151,13 @@ fn supervise_service_on(
     // at `None` would quietly withdraw that stop and hand the service straight
     // back to the daemon's recovery.
     record.stop_requested_unix_ms = existing.and_then(|existing| existing.stop_requested_unix_ms);
-    // Refuse a keyless public respawn before the manifest write, so a refused
+    // Refuse a keyless respawn that would reopen the service without
+    // authentication (a public bind, or a service launched with
+    // `--require-api-key`) before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
     // site below re-checks against the key actually threaded onto the command.
-    crate::engine_ipc::ensure_public_service_has_endpoint_key(
-        &record.host,
-        rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
-            .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
-            .is_some(),
-        record.requires_api_key,
-    )?;
+    refuse_keyless_respawn(&record, key_file_of(paths, &record.service_id).is_some())?;
     // The engine runs through the hidden commands of the `rocm` binary, which
     // `rocmd` does not have. Found before the first write, like the guard above,
     // so a supervisor that cannot find it leaves the record as it was.
@@ -174,21 +188,22 @@ fn supervise_service_on(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err));
-    // Re-thread the endpoint key file (public bind only) onto the engine child,
-    // same as the initial `rocm serve` spawn. This path also runs on daemon
-    // recovery (`restart_managed_service` re-execs `rocmd supervise`), so
-    // without this a previously-authenticated public service would come back
-    // up anonymous after a crash/recover cycle.
-    // If the key is gone the child would listen on the recorded public host with
-    // no auth, so fail closed instead — an unreachable service is recoverable,
-    // an anonymous public one is not.
-    let endpoint_key_applied =
-        crate::engine_ipc::apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    crate::engine_ipc::ensure_public_service_has_endpoint_key(
-        &record.host,
-        endpoint_key_applied,
-        record.requires_api_key,
-    )?;
+    // Re-thread the service's endpoint key file onto the engine child, same as
+    // the initial `rocm serve` spawn. This path also runs on daemon recovery
+    // (`restart_managed_service` re-execs `rocmd supervise`), so without this a
+    // previously-authenticated service would come back up anonymous after a
+    // crash/recover cycle.
+    // If the key is gone and the service needs one (a public bind, or one
+    // launched with `--require-api-key`), the child would listen with no auth, so
+    // fail closed instead — an unreachable service is recoverable, an anonymous
+    // one that was meant to be protected is not.
+    let endpoint_key_applied = crate::engine_ipc::apply_endpoint_key_env(
+        &mut command,
+        paths,
+        &record.service_id,
+        &key_file_of,
+    );
+    refuse_keyless_respawn(&record, endpoint_key_applied)?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
@@ -944,7 +959,7 @@ mod tests {
     /// call site testable at all. The arguments below are the shape a recovery
     /// re-exec passes: a loopback bind, no GPU, no recipe.
     ///
-    /// This exists because testing `ensure_public_service_has_endpoint_key`
+    /// This exists because testing `rocm_core::ensure_public_service_has_endpoint_key`
     /// directly with literal arguments cannot catch the defect that actually
     /// happened twice in this crate's history — the guard being *wired up* with
     /// the wrong value at its call site.
@@ -955,8 +970,30 @@ mod tests {
     /// suite instead of failing it. Both callers below are regression tests for
     /// a fail-*open*, which is exactly the shape that turns into a hang.
     fn supervise_at_the_guard(paths: &AppPaths, service_id: &str) -> Result<()> {
+        supervise_at_the_guard_on(paths, service_id, "127.0.0.1")
+    }
+
+    /// [`supervise_at_the_guard`] for a service recorded on `host`.
+    fn supervise_at_the_guard_on(paths: &AppPaths, service_id: &str, host: &str) -> Result<()> {
+        supervise_at_the_guard_reading(
+            paths,
+            service_id,
+            host,
+            crate::engine_ipc::usable_endpoint_key_file,
+        )
+    }
+
+    /// [`supervise_at_the_guard_on`] with the supervisor's key reader supplied, so a
+    /// test can give the two guard checks different answers.
+    fn supervise_at_the_guard_reading(
+        paths: &AppPaths,
+        service_id: &str,
+        host: &str,
+        key_file_of: impl Fn(&AppPaths, &str) -> Option<PathBuf> + Send + 'static,
+    ) -> Result<()> {
         let paths = paths.clone();
         let service_id = service_id.to_owned();
+        let host = host.to_owned();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = supervise_service_on(
@@ -968,11 +1005,12 @@ mod tests {
                 "a-model".to_owned(),
                 None,
                 None,
-                "127.0.0.1".to_owned(),
+                host,
                 11434,
                 "gpu_required".to_owned(),
                 None,
                 None,
+                key_file_of,
             );
             let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
         });
@@ -1041,6 +1079,7 @@ mod tests {
                 "gpu_required".to_owned(),
                 None,
                 None,
+                crate::engine_ipc::usable_endpoint_key_file,
             );
             let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
         });
@@ -1052,6 +1091,79 @@ mod tests {
             // failed later for a reason that is not this guard, or is still
             // running because it reached the spawn.
             _ => true,
+        }
+    }
+
+    /// The first check sits before the manifest write, so a refused attempt leaves
+    /// the record exactly as it was. The spawn-site check refuses the same
+    /// service too, but only after the write, so this is what tells the first
+    /// check apart from the second.
+    #[test]
+    fn the_check_before_the_write_leaves_the_record_as_it_was() {
+        let (root, paths) = temp_app_paths("supervise-pre-write-check");
+        seed_registry(&paths, "svc-pre-write", true);
+        // A field `supervise_service` overwrites when it rebuilds the record, so a
+        // write shows as a change.
+        let mut seeded = crate::persistence::load_service_record(&paths, "svc-pre-write").unwrap();
+        seeded.canonical_model_id = "seeded-marker".to_owned();
+        seeded.write().unwrap();
+
+        supervise_at_the_guard(&paths, "svc-pre-write")
+            .expect_err("a service that required a key is refused without one");
+
+        let stored = crate::persistence::load_service_record(&paths, "svc-pre-write").unwrap();
+        assert_eq!(
+            stored.canonical_model_id, "seeded-marker",
+            "the refusal came after the manifest write, not before it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The check at the spawn, one argument at a time. The key reader answers with
+    /// the key file for the first check and with none for the second, so only the
+    /// second can refuse it, and what it refuses with is the shared guard's text
+    /// for that service.
+    #[test]
+    fn the_check_at_the_spawn_refuses_a_key_that_is_gone_by_then() {
+        for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
+            let service_id = format!("svc-spawn-site-{}", host.replace('.', "-"));
+            let (root, paths) = temp_app_paths(&service_id);
+            seed_registry(&paths, &service_id, requires_api_key);
+            fs::write(
+                rocm_engine_protocol::endpoint_key_file_path(&paths, &service_id),
+                "a-usable-key",
+            )
+            .unwrap();
+            let reads = std::sync::atomic::AtomicUsize::new(0);
+            let error = supervise_at_the_guard_reading(
+                &paths,
+                &service_id,
+                host,
+                move |paths, service_id| {
+                    if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        crate::engine_ipc::usable_endpoint_key_file(paths, service_id)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .expect_err("a key that is gone at the spawn must refuse it");
+
+            assert_eq!(
+                format!("{error:#}"),
+                rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    requires_api_key,
+                    rocm_core::ServiceStart::Respawn,
+                    &service_id,
+                    11434,
+                )
+                .unwrap_err()
+                .to_string(),
+                "{host} requires={requires_api_key}"
+            );
+            let _ = fs::remove_dir_all(&root);
         }
     }
 
@@ -1091,8 +1203,24 @@ mod tests {
 
         let error = supervise_at_the_guard(&paths, "svc-needs-key")
             .expect_err("a service that required a key must not be recovered without one");
+        // The daemon's refusal is the shared guard's, worded for a respawn: the
+        // same text `rocm` prints for a restart, bar the action. A private copy
+        // here, or the wrong action passed, would read differently.
+        assert_eq!(
+            format!("{error:#}"),
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "127.0.0.1",
+                false,
+                true,
+                rocm_core::ServiceStart::Respawn,
+                "svc-needs-key",
+                11434,
+            )
+            .unwrap_err()
+            .to_string()
+        );
         assert!(
-            format!("{error:#}").contains("without authentication"),
+            format!("{error:#}").contains("respawning it would reopen it without authentication"),
             "{error:#}"
         );
 
@@ -1108,6 +1236,39 @@ mod tests {
             stored.requires_api_key,
             "a refused recovery must not disarm the requirement"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn supervising_a_public_service_refuses_when_its_key_is_gone_whether_or_not_it_asked_for_one() {
+        // The second rule at the real call site: the bind address alone makes a
+        // keyless respawn unsafe, so a service that never passed
+        // `--require-api-key` is refused too, and is not told it did.
+        let (root, paths) = temp_app_paths("supervise-public-no-key");
+        seed_registry(&paths, "svc-public", false);
+
+        let error = supervise_at_the_guard_on(&paths, "svc-public", "0.0.0.0")
+            .expect_err("a public service must not be respawned without its key");
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "0.0.0.0",
+                false,
+                false,
+                rocm_core::ServiceStart::Respawn,
+                "svc-public",
+                11434,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            rendered.contains("bound to the public host `0.0.0.0`"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("`--require-api-key`"), "{rendered}");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1344,6 +1505,7 @@ mod tests {
             "gpu_required".to_owned(),
             None,
             None,
+            crate::engine_ipc::usable_endpoint_key_file,
         );
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
@@ -1465,6 +1627,7 @@ mod tests {
             "gpu_required".to_owned(),
             None,
             None,
+            crate::engine_ipc::usable_endpoint_key_file,
         );
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
@@ -1826,6 +1989,7 @@ mod tests {
                     "gpu_required".to_owned(),
                     None,
                     None,
+                    crate::engine_ipc::usable_endpoint_key_file,
                 );
                 let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
             });
@@ -1893,6 +2057,7 @@ mod tests {
             "gpu_required".to_owned(),
             None,
             None,
+            crate::engine_ipc::usable_endpoint_key_file,
         );
         let after = load_service_record(&paths, service_id);
         let log_created = before.log_path.exists();

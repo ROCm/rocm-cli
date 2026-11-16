@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::daemon_host::DaemonHost;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rocm_core::AppPaths;
 use rocm_engine_protocol::{
     EngineMethod, EngineStdioOptions, HealthcheckRequest, HealthcheckResponse,
@@ -53,71 +53,53 @@ pub(crate) fn healthcheck_response_recoverable(response: &HealthcheckResponse) -
     )
 }
 
-/// Re-thread the endpoint key file (public bind only) onto an engine child's
-/// environment, mirroring the initial `rocm serve` spawn. A loopback service
-/// with no stored key leaves the command's environment untouched, matching the
-/// unauthenticated default.
+/// Re-thread the service's endpoint key file onto an engine child's
+/// environment, mirroring the initial `rocm serve` spawn. A service with no
+/// usable stored key leaves the command's environment untouched, which is
+/// right only for a service that does not need one: a loopback bind that did
+/// not ask for `--require-api-key`, the unauthenticated default.
 ///
 /// Returns whether a key was applied. Callers that spawn a *listener* must
-/// check it against the service's host — a public bind with no key would come
-/// up anonymous (see [`ensure_public_service_has_endpoint_key`]). Callers that
-/// only make a stdio plugin call can ignore it.
+/// check it against the service's record — a service that needs a key (a public
+/// bind, or one launched with `--require-api-key`) and has none would come up
+/// anonymous (see [`rocm_core::ensure_public_service_has_endpoint_key`], which
+/// refuses it). Callers that only make a stdio plugin call can ignore it.
 ///
 /// The file must hold a *usable* key, not merely exist: the engine adapters
 /// resolve it with `endpoint_api_key_from_file` and enforce nothing when that
 /// yields `None`, so treating an empty or malformed file as "protected" would
 /// let the guard pass while the endpoint served anonymously.
+///
+/// `key_file_of` answers which key file the service has: production passes
+/// [`usable_endpoint_key_file`], and the supervisor takes it as a parameter so a
+/// test can change the answer between its two guard checks.
 #[must_use]
 pub(crate) fn apply_endpoint_key_env(
     command: &mut ProcessCommand,
     paths: &AppPaths,
     service_id: &str,
+    key_file_of: impl FnOnce(&AppPaths, &str) -> Option<PathBuf>,
 ) -> bool {
-    if let Some(key_file) = usable_endpoint_key_file(paths, service_id) {
+    if let Some(key_file) = key_file_of(paths, service_id) {
         command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         return true;
     }
     false
 }
 
-/// The service's endpoint key file, when it exists and holds a usable key.
-fn usable_endpoint_key_file(paths: &AppPaths, service_id: &str) -> Option<PathBuf> {
-    rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
-        .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
+/// Whether the service has a *usable* endpoint key on disk: a file that exists
+/// and holds a key the engine adapters will enforce. This is the one answer
+/// every recovery path gives the respawn guard as its `key_present`, so the
+/// supervisor, the recovery watcher and the spawn-site check cannot disagree
+/// about what "has a key" means.
+pub(crate) fn has_usable_endpoint_key(paths: &AppPaths, service_id: &str) -> bool {
+    usable_endpoint_key_file(paths, service_id).is_some()
 }
 
-/// Refuse to respawn a recorded service on a public host without its endpoint
-/// API key, so daemon recovery cannot reopen a protected endpoint anonymously.
-///
-/// Mirrors the guard of the same name in `rocm`; the shared
-/// [`rocm_engine_protocol::is_public_bind_host`] keeps the two classifications
-/// identical for a given `ManagedServiceRecord::host`.
-pub(crate) fn ensure_public_service_has_endpoint_key(
-    host: &str,
-    key_present: bool,
-    requires_api_key: bool,
-) -> Result<()> {
-    // The bind address is not the whole story. A service bound to loopback is
-    // only private until something republishes the port, and a tailnet publish
-    // outlives both the process and this daemon. The requirement is recorded on
-    // the service precisely so recovery can honour it without re-deriving it
-    // from an address that no longer answers the question.
-    if requires_api_key && !key_present {
-        bail!(
-            "refusing to recover a service that was launched with an endpoint API key but no \
-             longer has one: it would come back up without authentication, and something \
-             outside this machine may still be publishing its port. Relaunch it with \
-             `rocm serve --require-api-key` to issue a new key."
-        );
-    }
-    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
-        bail!(
-            "refusing to respawn a service bound to the public host `{host}` without an endpoint \
-             API key: it would come back up without authentication. Relaunch it with \
-             `rocm serve --host {host} --port <port> --allow-public-bind` to issue a new key."
-        );
-    }
-    Ok(())
+/// The service's endpoint key file, when it exists and holds a usable key.
+pub(crate) fn usable_endpoint_key_file(paths: &AppPaths, service_id: &str) -> Option<PathBuf> {
+    rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
+        .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
 }
 
 /// Ask an engine a question about a managed service, through the stdio client
@@ -179,7 +161,7 @@ fn engine_request_via<R>(
 where
     R: DeserializeOwned,
 {
-    // A protected public endpoint enforces its key on every request, including
+    // A protected endpoint enforces its key on every request, including
     // this stdio-transported healthcheck — without the carrier the engine
     // adapter's HTTP probe is unauthenticated and the endpoint looks
     // unreachable, which would misclassify a healthy protected service as
@@ -228,42 +210,41 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn recovery_refuses_a_service_that_lost_a_key_it_was_launched_with() {
-        // The daemon keeps its own copy of this guard, and it only knew about
-        // public binds. A loopback service that something republishes — a
-        // tailnet publish outlives this daemon, let alone the process — would
-        // be recovered without authentication, and the rebuilt record would
-        // then disarm `rocm services restart` too.
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            let error = ensure_public_service_has_endpoint_key(host, false, true)
-                .expect_err("a service launched with a key must not be recovered without one");
-            assert!(
-                format!("{error:#}").contains("without authentication"),
-                "{error:#}"
+    fn a_key_file_is_a_key_only_when_the_engine_adapters_would_enforce_it() {
+        // The respawn guard's `key_present` is this answer. The engine adapters
+        // enforce nothing for an empty, blank or control-character key file, so
+        // counting any of them as "has a key" would let the guard pass while the
+        // endpoint served anonymously.
+        let (_root, paths) = temp_app_paths("has-usable-endpoint-key");
+        let service_id = "svc-usable-key";
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir()).unwrap();
+
+        assert!(!has_usable_endpoint_key(&paths, service_id), "no file");
+        for (contents, usable) in [
+            ("", false),
+            ("  \n", false),
+            ("bad\r\nkey", false),
+            ("a-usable-key", true),
+            ("a-usable-key\n", true),
+        ] {
+            fs::write(&key_path, contents).unwrap();
+            assert_eq!(
+                has_usable_endpoint_key(&paths, service_id),
+                usable,
+                "{contents:?}"
+            );
+            // The key an engine child is given is the same file, so what recovery
+            // reports as present is exactly what it threads onto the child.
+            let mut command = ProcessCommand::new("true");
+            assert_eq!(
+                apply_endpoint_key_env(&mut command, &paths, service_id, usable_endpoint_key_file),
+                usable,
+                "{contents:?}"
             );
         }
-        // With the key still present, recovery proceeds.
-        ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
-        // And a service that never had one is untouched.
-        ensure_public_service_has_endpoint_key("127.0.0.1", false, false).unwrap();
-    }
-
-    #[test]
-    fn recovery_respawn_fails_closed_for_a_public_service_without_a_key() {
-        // Daemon recovery re-execs `rocmd supervise` for the recorded host. With
-        // the key gone the child would listen on that public host anonymously,
-        // so the spawn must be refused instead.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
-        assert!(
-            error.to_string().contains("without authentication"),
-            "{error:#}"
-        );
-
-        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false, false)
-                .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
-        }
+        // Another service's key is not this one's.
+        assert!(!has_usable_endpoint_key(&paths, "svc-other"));
     }
 
     #[test]
@@ -274,7 +255,12 @@ mod tests {
         // Loopback service: no key file has ever been written, so the child's
         // environment must be left untouched.
         let mut command = ProcessCommand::new("true");
-        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(!apply_endpoint_key_env(
+            &mut command,
+            &paths,
+            service_id,
+            usable_endpoint_key_file
+        ));
         assert!(
             command
                 .get_envs()
@@ -289,7 +275,12 @@ mod tests {
         fs::create_dir_all(paths.services_dir()).unwrap();
         fs::write(&key_path, "secret-key").unwrap();
         let mut command = ProcessCommand::new("true");
-        assert!(apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(apply_endpoint_key_env(
+            &mut command,
+            &paths,
+            service_id,
+            usable_endpoint_key_file
+        ));
         let env_value = command
             .get_envs()
             .find_map(|(key, value)| {
@@ -302,10 +293,15 @@ mod tests {
 
         // An empty (or otherwise unusable) key file is not a key: the engine
         // adapters would enforce nothing, so reporting `true` here would let the
-        // respawn guard pass and still open an anonymous public listener.
+        // respawn guard pass and still open an anonymous listener.
         fs::write(&key_path, "   \n").unwrap();
         let mut command = ProcessCommand::new("true");
-        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
+        assert!(!apply_endpoint_key_env(
+            &mut command,
+            &paths,
+            service_id,
+            usable_endpoint_key_file
+        ));
         assert!(
             command
                 .get_envs()

@@ -117,7 +117,10 @@ pub use download::{
     download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress,
 };
-pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
+pub use endpoint_key::{
+    ServiceStart, endpoint_api_key_has_forbidden_chars, ensure_public_service_has_endpoint_key,
+    generate_endpoint_api_key, is_public_bind_host,
+};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
     engine_state_inference_verified, managed_service_endpoint_model_ready,
