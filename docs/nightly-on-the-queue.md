@@ -76,7 +76,12 @@ A pull request's run is a preset of the queue side: one GPU model (MI300X), the
 minutes to be started and runs at most 75, and a few such runs at once. The
 queue side does not take one while the nightly goes, or when it has no healthy
 MI300X worker: the gate job then fails with the reason the queue gave, which is
-capacity, not a failing test. A pull request from a fork gets no queue run, since
+capacity, not a failing test (the consolidated report's missing-report check
+then flags the lane too). A superseded push cancels the gate job, which cancels
+the run it started, freeing the runner; the queue side's lanes are left to their
+own budgets. The queue run tests the branch as it is when the run starts, not
+the pull request's merge with its base, which the self-hosted lane checks out.
+A pull request from a fork gets no queue run, since
 its token cannot dispatch and the queue only checks out branches of this
 repository. `e2e-selfhosted.yml` is the only workflow that may name
 `queue-pr-run.yml`; the runner is set up to run `queue-pr-run.yml` only as it is
@@ -294,10 +299,14 @@ log.
 
 ## What the workflow requires
 
-- a self-hosted Linux runner registered with the `queue-report` label alone,
+- self-hosted Linux runners registered with the `queue-report` label alone,
   without GitHub's default `self-hosted`, OS and architecture labels, so only a
-  job naming `queue-report` lands on it, providing
-  the queue side's publish command and read access to the queue side's results
+  job naming `queue-report` lands on them, each providing
+  the queue side's publish command and read access to the queue side's results.
+  Each run holds a runner for as long as it lasts, so there are as many runners
+  as runs may go at once (the queue side limits pull request runs to that
+  number); a job beyond them waits in GitHub's queue, outside the queue side's
+  limits, and a gate job that waits for such a job can reach its own timeout
 - a registered runner name and host name that do not identify internal
   infrastructure, since GitHub prints both into every job log
 
@@ -311,7 +320,7 @@ this repository can still name the runner's label, which is one reason the
 runner holds no credential, below. On `main`, the tests also refuse any
 other workflow that names the `queue-report` label or these workflows, so none
 sends a job to the runner or waits on them by mistake. The runner is set up to
-run only these two workflows as they are on `main`, by a check on the runner
+run only these three workflows as they are on `main`, by a check on the runner
 that runs before any step. That check lives outside this repository, so
 nothing here can verify it; the runner is still treated as untrusted, as above
 and below. Whether this
@@ -351,7 +360,7 @@ file.
 credential and sends nothing to the queue: the runner, which sits next to the
 queue side, asks it for a run of a branch, and the queue side starts it with
 its own credential. It believes the request because of where it comes from,
-which is why the runner is set up to run only these two workflows from `main`
+which is why the runner is set up to run only these three workflows from `main`
 (a setting outside this repository). A request can start a run of a branch
 already in this repository, and that branch's lane command then runs in the
 lane pods. The lane spec gives those pods no queue or cluster credential and

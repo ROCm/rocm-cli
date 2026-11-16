@@ -8283,7 +8283,7 @@ jobs:
             // repository, and never on `closed`, which skips `changes` and so it.
             PinnedIf {
                 job: "e2e-gpu-queue",
-                condition: "always() && needs.changes.result == 'success' \
+                condition: "needs.changes.result == 'success' \
                             && needs.changes.outputs.serve == 'true' \
                             && github.event_name == 'pull_request' \
                             && github.event.action != 'closed' \
@@ -9961,6 +9961,25 @@ permissions:
         );
     }
 
+    /// Anyone who can dispatch names the branch, not only the gate, so the
+    /// workflow on main checks it before the publisher sees it: a plain branch
+    /// name, which cannot start with a dash and be read as an option.
+    #[test]
+    fn queue_pr_run_checks_the_branch_name_before_it_is_published() {
+        let text = read_workflow("queue-pr-run.yml");
+        let check = text
+            .find("      - name: Check the branch name")
+            .expect("queue-pr-run.yml checks the branch name");
+        let publish = text
+            .find("      - name: Run on the queue and publish")
+            .expect("queue-pr-run.yml publishes the run");
+        assert!(check < publish, "the check must come first");
+        assert!(
+            text.contains("=~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]"),
+            "the check must accept only a plain branch name"
+        );
+    }
+
     /// What the pull request's gate job may and may not do: it holds no queue
     /// credential, dispatches the workflow as it is on main, and publishes only
     /// the queue run's release report as the MI300X one.
@@ -9976,9 +9995,21 @@ permissions:
             1,
             "the gate declares its permissions once"
         );
+        // The whole block, so a second permission written beside it fails here.
         assert!(
-            gate.contains("      actions: write\n    if:"),
+            gate.contains("    permissions:\n      actions: write\n    "),
             "the gate's only permission is `actions: write`"
+        );
+        // A job whose `if` stays true through a cancellation is not cancelled,
+        // and a superseded gate would poll its queue run for hours.
+        let condition = job_level_if(&uncommented_job_block(&text, "e2e-gpu-queue"));
+        assert!(
+            !condition.contains("always()"),
+            "the gate's `if` must not hold `always()`: {condition}"
+        );
+        assert!(
+            gate.contains("if: cancelled()") && gate.contains("gh run cancel"),
+            "the gate must cancel the queue run it started when it is cancelled"
         );
         // From main, never from the pull request's own copy of the workflow: the
         // runner runs only the file as it is on main.

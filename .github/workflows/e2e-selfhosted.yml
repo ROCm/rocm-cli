@@ -592,9 +592,10 @@ jobs:
     needs: [changes]
     permissions:
       actions: write
+    # No `always()`: a job that keeps its condition true through a cancellation
+    # is not cancelled, and a superseded push must stop this job from polling.
     if: >-
-      always()
-      && needs.changes.result == 'success'
+      needs.changes.result == 'success'
       && needs.changes.outputs.serve == 'true'
       && github.event_name == 'pull_request'
       && github.event.action != 'closed'
@@ -620,9 +621,10 @@ jobs:
           # this job, so look for that.
           run_id=""
           for _ in $(seq 1 36); do
+            # A failed call is asked again, not the end of the job.
             run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
               --limit 50 --json databaseId,displayTitle |
-              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty')
+              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
             [ -n "$run_id" ] && break
             sleep 5
           done
@@ -632,18 +634,22 @@ jobs:
           fi
           url="https://github.com/${GH_REPO}/actions/runs/${run_id}"
           echo "queue run: ${url}"
-          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          # Kept for the step that cancels the run if this job is.
+          echo "$run_id" > "${RUNNER_TEMP}/queue-run-id"
           echo "### MI300X on the queue" >> "$GITHUB_STEP_SUMMARY"
           echo "Run: ${url}" >> "$GITHUB_STEP_SUMMARY"
 
           # Polled once a minute, not `gh run watch`, which polls every few
-          # seconds against this job's token. The job's own timeout bounds this.
+          # seconds against this job's token. The job's own timeout bounds this,
+          # and a call that fails (a 502, a rate limit) is asked again.
           while true; do
-            status=$(gh run view "$run_id" --json status --jq .status)
+            status=$(gh run view "$run_id" --json status --jq .status) || status=""
             [ "$status" = completed ] && break
             sleep 60
           done
-          conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion)
+          conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) ||
+            conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) ||
+            conclusion=unknown
           echo "queue run concluded: ${conclusion}"
 
           # What the run published: the lanes' files, one directory per lane,
@@ -668,6 +674,15 @@ jobs:
           # A failing suite fails the queue run, and the report above shows
           # which scenarios; the job follows the run's verdict.
           [ "$conclusion" = success ]
+
+      # A push that supersedes this one cancels the job, which would otherwise
+      # leave its queue run holding the runner it waits on: cancel that run too.
+      # The queue side's lanes are left to their own budgets.
+      - name: Cancel the queue run this job started
+        if: cancelled()
+        run: |
+          [ -f "${RUNNER_TEMP}/queue-run-id" ] || exit 0
+          gh run cancel "$(cat "${RUNNER_TEMP}/queue-run-id")" || true
 
       # A report is uploaded whatever the verdict, as the self-hosted lane's is:
       # a failing run's report is what the consolidated grid is for.

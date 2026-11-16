@@ -47,6 +47,15 @@ jobs:
     # more, and 20 min are margin for the runner's own delays: 170 min.
     timeout-minutes: 170
     steps:
+      # Anyone who can dispatch names the branch, not only the gate job, so it is
+      # checked here, on main, and not only in the gate: a plain branch name that
+      # cannot start with a dash.
+      - name: Check the branch name
+        env:
+          BRANCH: ${{ inputs.branch }}
+        # One line: the workflow contract forbids backslashes in this file.
+        run: if [[ "${BRANCH}" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then exit 0; fi; echo "::error::not a branch name"; exit 1
+
       - name: Run on the queue and publish
         env:
           BRANCH: ${{ inputs.branch }}
