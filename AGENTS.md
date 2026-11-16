@@ -131,13 +131,13 @@ derived from the same value the branch is taken on — as `preapproved_install_l
 `apps/rocm/src/therock/consent.rs` derives it from the approval source — prefer that: a
 message computed from the decision cannot disagree with it.
 
-**A comment or doc line that states how the code behaves is checked against that code,
-and one that is the reason for a decision also names where the code makes it true.** A
-decision such as narrowing a test's scope, documenting a limitation, choosing a design, or
-dropping a guard often rests on one sentence: a reviewer who accepts the sentence accepts
-the decision, and no test reads a comment. Before pushing, open the code each claim
-describes and confirm it. Where the claim is the reason for a decision, also name the
-place as a file and a function, constant or test
+**A comment or doc line a change adds or edits that states how the code behaves is checked
+against that code, and one that is the reason for a decision also names where the code
+makes it true.** A decision such as narrowing a test's scope, documenting a limitation,
+choosing a design, or dropping a guard often rests on one sentence: a reviewer who accepts
+the sentence accepts the decision, and no test reads a comment. Before pushing, open the
+code each claim describes and confirm it. Where the claim is the reason for a decision,
+also name the place as a file and a function, constant or test
 ([runner.rs](crates/rocm-dash-daemon/src/runner.rs)'s `cycle_timestamp`), never as a line
 number, which goes stale with the next edit above it. Where the decision rests on timing
 or ordering, the claim names where the mechanism that enforces it is defined, not only
@@ -543,7 +543,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
-17. Comments and doc lines stating how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
+17. Comments and doc lines this change adds or edits that state how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
 18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
 19. Any existing scenario moved off the blocking mock `e2e` job justified as a deletion — *§8*
 20. Every commit message describes its own commit in words still true at the branch head — *§5*
