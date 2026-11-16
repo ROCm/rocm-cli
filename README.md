@@ -97,6 +97,12 @@ different goal.
    and `rocm fix` commands a person would.
 8. **Open by default.** MIT-licensed and developed in the open, with its
    documentation kept in the same repository as the code it describes.
+9. **Extensible, from local to remote.** ROCm CLI should grow with the
+   open-source ecosystem, adopting new inference engines, ROCm-based
+   libraries, and tooling for safe, scalable agentic AI (such as agent
+   sandboxing and fleet orchestration) as supported, validated extensions. It
+   should also take you from your own machine to remote GPU compute without
+   switching tools; `rocm remote` (preview) is the first step there.
 
 ## Demos
 
