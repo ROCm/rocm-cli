@@ -759,6 +759,64 @@ async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
     // actually gates on the post-resize render.
 }
 
+#[when("the user shrinks the terminal below the Esc menu's logo layout")]
+async fn shrink_below_menu_logo_layout(world: &mut E2eWorld) {
+    // ROCMAI-1042: at this height the Esc menu's modal is too short for the
+    // ROCm wordmark plus its three rows, which used to make `ui::menu` return
+    // without drawing anything — an empty bordered box with a live selection
+    // behind it. This step only resizes; the `Then` below is what gates on a
+    // post-resize frame, for the reason `shrink_until_detail_overflows`
+    // spells out.
+    session(world)
+        .use_short_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+}
+
+/// Wait for `label` to be drawn as the Esc menu's *selected* row — the cursor
+/// (`"▸ "`, `ui/menu.rs`) immediately followed by the whole label.
+///
+/// Asserting the cursor and the label together is what makes this evidence
+/// about ROCMAI-1042 rather than about the word being somewhere on screen:
+/// the empty-modal bug left the selection live behind a blank box, and the
+/// width floor this PR adds is there so the selected row is never truncated.
+/// The box at this geometry is only tall enough for two of the three rows, so
+/// "every row is on screen" would be wrong here — which row the *selection* is
+/// on is the thing that has to hold at every size.
+async fn menu_selection_is(world: &mut E2eWorld, label: &str) {
+    let wanted = format!("▸ {label}");
+    wait_for_frame(
+        session(world),
+        "the selected dashboard menu row",
+        |screen| {
+            if screen.contains(&wanted) {
+                Vec::new()
+            } else {
+                vec![wanted.clone()]
+            }
+        },
+    )
+    .await;
+}
+
+#[then("the dashboard menu shows Options as the selected action")]
+async fn dashboard_menu_selects_options(world: &mut E2eWorld) {
+    menu_selection_is(world, "Options").await;
+}
+
+#[when("the user moves the dashboard menu selection down")]
+async fn move_dashboard_menu_selection_down(world: &mut E2eWorld) {
+    // `j` is `KeyAction::MenuMove` down, the same key
+    // `select_quit_from_dashboard_menu` walks with.
+    session(world)
+        .send("j")
+        .unwrap_or_else(|e| panic!("failed to move the dashboard menu selection: {e}"));
+}
+
+#[then("the dashboard menu shows Help as the selected action")]
+async fn dashboard_menu_selects_help(world: &mut E2eWorld) {
+    menu_selection_is(world, "Help").await;
+}
+
 #[when("the user opens the services manager")]
 async fn open_services_manager(world: &mut E2eWorld) {
     // Bound to `s` only on the Observe tab (`OpenServices`) — a manager opened

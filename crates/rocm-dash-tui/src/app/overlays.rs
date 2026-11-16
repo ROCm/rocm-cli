@@ -11,6 +11,7 @@
 //! reducer focused.
 
 use super::{ActiveTab, AppState, Focus, Modal};
+use crate::ui::job_console::{ConsoleExit, console_esc_closes};
 
 impl AppState {
     /// Close every operational overlay. The overlays are mutually exclusive
@@ -49,6 +50,11 @@ impl AppState {
                     // While the serve wizard's detach-confirm modal is open,
                     // that modal owns the overlay; do not let the shared
                     // active-job console renderer mask it.
+                    // `ui::draw_active_manager` returns early whenever this is
+                    // `Some`, so leaving the job id visible here would paint the
+                    // console over the very question the user has to answer.
+                    // Pinned by
+                    // `serve_wizard::tests::detach_confirm_modal_is_drawn_over_the_running_console`.
                     if m.detach_confirm.is_some() {
                         None
                     } else {
@@ -106,6 +112,30 @@ impl AppState {
                     .as_ref()
                     .and_then(|m| m.active_job.as_deref())
             })
+    }
+
+    /// What leaving the console of [`Self::active_job_id`] does, for the two
+    /// places that have to word it: the console's own footer hint and the
+    /// dashboard footer's Esc chip.
+    ///
+    /// [`ConsoleExit::Confirmed`] only for the serve wizard's still-running
+    /// launch — the single overlay that turns `ConsoleOutcome::Closed` into a
+    /// modal instead of leaving (`ui::serve_wizard::on_key`). The terminality
+    /// test is `console_esc_closes`, the same predicate that branch uses, so a
+    /// hint can't claim a confirmation the key handler would not raise.
+    pub(crate) fn console_exit(&self) -> ConsoleExit {
+        let serve_job = self
+            .serve_wizard
+            .as_ref()
+            .and_then(|w| w.active_job.as_deref());
+        match serve_job {
+            Some(id)
+                if self.active_job_id() == Some(id) && console_esc_closes(self.jobs.job(id)) =>
+            {
+                ConsoleExit::Confirmed
+            }
+            _ => ConsoleExit::Immediate,
+        }
     }
 
     /// Whether a job console is currently displayed (a manager is open AND on its

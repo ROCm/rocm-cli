@@ -962,8 +962,12 @@ Expected result:
   that was open when you pressed `q` (the Esc menu, Options, Detail, Theme
   Picker, Help, …) is closed along with the prompt, not restored. A manager
   overlay (Services, the Serve wizard, …) can never be the thing that was
-  open in this state at all: its own `q` closes that overlay first, so the
-  prompt only ever opens with none of them open.
+  open in this state at all: its own `q` is consumed by that overlay first, so
+  the prompt only ever opens with none of them open. For most overlays that `q`
+  closes them outright; on the Serve wizard's console for a launch that is
+  still starting, it opens that wizard's own "leave the running serve?"
+  confirmation instead, and only answering `y` there leaves — so reaching this
+  quit prompt from it takes one extra keystroke.
 - Confirming (`y`/Enter) exits immediately, and `rocm services list --all`
   afterward still shows the model as `ready`/`running` — quitting never
   stops it.
