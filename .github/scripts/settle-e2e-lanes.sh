@@ -19,6 +19,10 @@
 #     but anything unfinished HARD_DEADLINE_MINUTES after it was created is
 #     abandoned too, so this job cannot wait unboundedly on a hung runner.
 #
+# If the job list cannot be read for long enough to span the hard deadline, the
+# script exits 1 instead of polling until the job's own timeout (which GitHub
+# reports as `cancelled`), so the run's canceller sees a failed settle job.
+#
 # Outputs (GITHUB_OUTPUT):
 #   lane_results     one-line JSON object, lane job id -> result, shaped like the
 #                    `needs` context the report job's missing-report check reads
@@ -42,6 +46,7 @@
 #                            still legitimately running.
 #   POLL_SECS                seconds between polls (default 60).
 #   SETTLE_NOW_EPOCH         pin "now" (seconds since the epoch); tests only.
+#   SETTLE_CALL_TIMEOUT_SECS limit on one job-list request (default 60); tests only.
 #   GH_TOKEN, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY
 #                            as GitHub provides them.
 set -euo pipefail
@@ -119,11 +124,24 @@ evaluate='
       abandoned: (map(.abandoned) | add) }
 '
 
+# A job listing that keeps failing must not leave this job polling until its own
+# cap: GitHub reports a job killed by `timeout-minutes` as `cancelled`, not
+# `failure`, and the hard deadline above is only judged once a listing arrives.
+# So after enough consecutive failures to span the hard deadline (each attempt
+# takes at most the call timeout plus the poll interval) the job fails itself,
+# which lets the run's canceller end the run. The call timeout keeps one hung
+# request from defeating that bound.
+call_timeout_secs="${SETTLE_CALL_TIMEOUT_SECS:-60}"
+attempt_secs=$((poll_secs + call_timeout_secs))
+max_failures=$(((hard_minutes * 60 + attempt_secs - 1) / attempt_secs))
+failures=0
+
 while true; do
   now="${SETTLE_NOW_EPOCH:-$(date +%s)}"
-  if run_jobs=$(gh api --paginate \
+  if run_jobs=$(timeout "${call_timeout_secs}" gh api --paginate \
     "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100&filter=latest" \
     --jq '.jobs[]' | jq -s .); then
+    failures=0
     verdict=$(jq -c \
       --argjson lanes "${lanes_json}" \
       --argjson now "${now}" \
@@ -135,7 +153,12 @@ while true; do
     fi
   else
     # A transient API failure must not end the wait early (the lanes would be
-    # reported as having produced nothing); the job's own timeout bounds it.
+    # reported as having produced nothing), but a sustained one ends it.
+    failures=$((failures + 1))
+    if ((failures >= max_failures)); then
+      echo "::error::could not list this run's jobs ${failures} times in a row; giving up so the run can be ended"
+      exit 1
+    fi
     echo "::warning::could not list this run's jobs; retrying"
   fi
   sleep "${poll_secs}"

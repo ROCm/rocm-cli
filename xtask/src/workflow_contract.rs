@@ -2418,9 +2418,12 @@ jobs:
         assert!(
             condition.starts_with("${{ always()")
                 && condition.contains("abandoned_count")
-                && condition.contains("needs.e2e-lanes-settled.result == 'failure'"),
+                && condition.contains("needs.e2e-lanes-settled.result == 'failure'")
+                && condition.contains("needs.e2e-lanes-settled.result == 'cancelled'"),
             "the canceller must run even after a failed job, and only when a lane was given up \
-             on or the settle job itself failed (nothing else bounds the wait then): {condition}"
+             on or the settle job itself failed or was cancelled (a job killed by its own \
+             timeout-minutes reports `cancelled`, and nothing else bounds the wait then): \
+             {condition}"
         );
     }
 
@@ -2876,6 +2879,93 @@ jobs:
         let (code, log, output, _, _) = run_settle(&[&listing], 5);
         assert_eq!(code, 0, "{log}");
         assert_eq!(settle_results(&output)["lane-a"]["result"], "failure");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_fails_itself_when_the_job_list_stays_unreadable() {
+        // Unreadable listings used to be retried for ever, leaving the job's own
+        // timeout-minutes (reported as `cancelled`, which the canceller did not
+        // match) as the only way out: the 24h hang this job exists to prevent.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_gh_stub(&dir.path().join("gh"), false);
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // A one-minute hard deadline with no poll delay is one 60s attempt, so
+        // the script gives up after the first failed listing.
+        let out = std::process::Command::new("timeout")
+            .arg("20")
+            .arg("bash")
+            .arg(&script)
+            .env("PATH", path)
+            .env("POLL_SECS", "0")
+            .env("LANES", "lane-a=Lane A\n")
+            .env("QUEUE_DEADLINE_MINUTES", "0")
+            .env("HARD_DEADLINE_MINUTES", "1")
+            .env("LANE_RUN_MINUTES", "0")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .output()
+            .expect("running the settle script");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a sustained failure to list jobs must fail the job (124 means it hung):\n{log}"
+        );
+        assert!(
+            log.contains("giving up so the run can be ended"),
+            "say why the job failed:\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_does_not_wait_on_a_hung_job_list_request() {
+        // A request that never returns would defeat the bound on failed
+        // listings, because no failure is ever counted. Each request is given a
+        // timeout, so a hung one counts as a failure like any other.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        let dir = tempfile::tempdir().expect("temp dir");
+        rocm_core::fake_executable::write_fake_executable(
+            &dir.path().join("gh"),
+            "#!/bin/sh\nexec sleep 30\n",
+        )
+        .expect("plant gh stub");
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // A zero-minute hard deadline allows no failed listing, so the first
+        // request that times out ends the script.
+        let out = std::process::Command::new("timeout")
+            .arg("15")
+            .arg("bash")
+            .arg(&script)
+            .env("PATH", path)
+            .env("POLL_SECS", "0")
+            .env("SETTLE_CALL_TIMEOUT_SECS", "1")
+            .env("LANES", "lane-a=Lane A\n")
+            .env("QUEUE_DEADLINE_MINUTES", "0")
+            .env("HARD_DEADLINE_MINUTES", "0")
+            .env("LANE_RUN_MINUTES", "0")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .output()
+            .expect("running the settle script");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a request that hangs must time out and fail the job (124 means it hung):\n{log}"
+        );
     }
 
     #[test]

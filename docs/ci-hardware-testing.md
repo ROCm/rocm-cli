@@ -553,11 +553,12 @@ jobs, which wait on every lane, never ran.
 - `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
   which is what stops the abandoned legs from holding the run open until the
   24-hour limit. It runs only when something was abandoned or the settle job
-  itself failed (nothing else bounds the wait then), and only after the report
-  and readiness jobs are done, because cancelling the run also skips any job
-  that is still gated on `!cancelled()`. If the run is cancelled from outside
-  before the settle job finishes, nothing is left to wait on and the run ends
-  with it.
+  itself failed or was cancelled (nothing else bounds the wait then; GitHub
+  reports a job killed by its own `timeout-minutes` as `cancelled`), and only
+  after the report and readiness jobs are done, because cancelling the run also
+  skips any job that is still gated on `!cancelled()`. The settle script fails
+  itself when the run's job list stays unreadable for long enough to span the
+  hard deadline, rather than polling until the job's cap.
 
 To try a change to these jobs from a branch without publishing a nightly
 release, dispatch the workflow with `skip_build` set:

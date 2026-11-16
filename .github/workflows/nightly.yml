@@ -1984,9 +1984,12 @@ jobs:
   # limit even though its reports are out. Cancelling is safe here only because
   # it runs after every other job: `needs` below lists them all, so what is
   # cancelled is the stragglers, never a job that is still producing a report.
-  # It also runs when the settle job itself failed (its own cap, or an
-  # infrastructure error): nothing else bounds the wait then, and the report
-  # and readiness jobs have already run on whatever finished.
+  # It also runs when the settle job itself failed or was cancelled: nothing else
+  # bounds the wait then, and the report and readiness jobs have already run on
+  # whatever finished. `cancelled` is how GitHub reports a job killed by its own
+  # timeout-minutes, and the settle script fails itself well before that when the
+  # job list stays unreadable, so this is the backstop for a hung call. If the
+  # whole run was cancelled instead, ending it again changes nothing.
   cancel-abandoned-e2e-lanes:
     name: Cancel E2E lanes that never got a runner
     runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
@@ -2004,7 +2007,7 @@ jobs:
       - release-readiness-nightly
       - release-readiness-narrative
       - publish-release-readiness-wiki
-    if: ${{ always() && (needs.e2e-lanes-settled.result == 'failure' || (needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0')) }}
+    if: ${{ always() && (needs.e2e-lanes-settled.result == 'failure' || needs.e2e-lanes-settled.result == 'cancelled' || (needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0')) }}
     steps:
       - name: Cancel the run's unfinished lanes
         env:
