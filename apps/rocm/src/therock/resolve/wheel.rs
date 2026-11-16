@@ -581,7 +581,9 @@ const fn therock_sdk_extras(include_devel: bool) -> &'static str {
 /// versions is what the resolve is for, and their published metadata depends on
 /// the exact `rocm` build, so the `rocm` pin carries them to the matching
 /// `+rocm<build>`. A line with a vLLM discover row additionally bounds both to
-/// that row's series (`torch==2.13.*`), the pairing verified on hardware.
+/// that row's series (`torch==2.13.*`), the pairing the discover table records.
+/// Only a row whose own comments cite hardware evidence (10.1) carries that
+/// guarantee; the 10.0 row's pairing is unverified there.
 /// torchaudio's metadata names no `rocm` build, so left unversioned it resolves
 /// to the newest build on the index — which is a different ROCm build for every
 /// pin but the newest — and the caller pins it to `torchaudio_version`, already

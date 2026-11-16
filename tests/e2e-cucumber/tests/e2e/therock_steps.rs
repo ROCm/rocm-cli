@@ -405,8 +405,8 @@ fn arm_pip_fixture_env(world: &mut E2eWorld) {
 /// requires its exact torch; the newer build's requires any torch, and a newer
 /// torch than it was built against is published beside it (see
 /// `NEWER_NEXT_UNPAIRED_TORCH_VERSION`). Torchaudio requires neither, so
-/// nothing in its metadata ties it to a build. `torchaudio` lists the torchaudio builds the index publishes, each
-/// with its wheel tag.
+/// nothing in its metadata ties it to a build. `torchaudio` lists the
+/// torchaudio builds the index publishes, each with its wheel tag.
 fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
     let served = root(world).join("therock-pip-fixtures").join("next");
     write_fixture(&served.join("index.html"), &aggregate_root_html());
