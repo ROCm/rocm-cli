@@ -1228,8 +1228,9 @@ an earlier ROCm 7 release because an unpinned install now reads the newest layou
 A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later, a
 nightly built since 2026-08-23, or any install with no pin, which now reads that
 layout) is held to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
-is the one step that chooses the `torch` and `torchvision` versions (the CLI
-picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+is the one step that chooses the `torch` and `torchvision` versions within the
+series the vLLM discover table pairs for that line (the CLI picks the ROCm
+version, the torchaudio pin and that series bound), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
 previous install left) and, with none, stops before that step. It then prints
 what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
@@ -1670,9 +1671,9 @@ the tagging and that they stay reachable when the opt-in is set.
 
 Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
 logs whether Docker is reachable ("Report whether Docker is reachable").
-`serve-27`'s known failure on the Strix Halo pool is an xfail row in
-`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
-means the row is stale.
+`serve-27` failed to confirm the AIM stop on the Strix Halo pool (rocm-cli#1058)
+and passed on the 2026-11-15 and 2026-11-16 nightlies, so it runs expect-pass
+there with no row in `expectations.toml`.
 
 ### Lemonade managed-serve failure evidence
 
@@ -2263,15 +2264,35 @@ on a non-default `--host` is still required: automatic selection only probes
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
 credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
-variable, or let one be generated. The key is handed to the engine via a 0600
-key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
-which is unavailable on headless serving hosts), and printed once as client
+variable, or let one be generated. The key is handed to the engine via a key
+file (never argv), persisted as a per-service file (not the OS keychain, which
+is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
-audit log. Verifying that the running server actually *rejects* an
-unauthenticated request requires a live engine; that end-to-end assertion is a
-deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
-(`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
-generation, the 0600 key file, and key-file resolution.
+audit log. Only the serving user can read the key file: it is mode 0600 on Unix
+and has a protected DACL granting only that user on Windows, and every store
+replaces it with a freshly created owner-only file, so permissions loosened in
+place do not survive a re-store. Verifying that the running server actually
+*rejects* an unauthenticated request requires a live engine; that end-to-end
+assertion is a deferred follow-up and is **not yet** exercised by the GPU
+acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
+key policy, generation, the owner-only key file (including one whose
+permissions were loosened before a re-store, and on the Windows build job the
+DACL read back from disk), and key-file resolution. The tests that fail
+without the repair of a loosened key file are `restoring_a_key_over_a_loosened_file_makes_it_0600_again`
+in [`endpoint_keys.rs`](../apps/rocm/src/endpoint_keys.rs), `write_owner_only_file_atomically_tightens_a_loosened_file`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), and on Windows
+`write_owner_only_file_atomically_replaces_a_loose_dacl_with_an_owner_only_one`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), which starts from a destination whose DACL grants Everyone. `serve-59` (`@id:serve-endpoint-key-readable-by-owner-only`
+in [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature))
+guards fresh-create behaviour only: it checks that a real serve's newly
+written key file is mode 0600 on the Linux GPU lanes, which held before this
+repair too, so it is a guard against a regression in that path, not evidence
+for the repair.
+
+```bash
+cargo test -p rocm-core --lib owner_only
+cargo test -p rocm --bin rocm endpoint_keys
+```
 
 The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
@@ -2297,15 +2318,29 @@ service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being
-deleted, so keeping its key would strand a 0600 secret belonging to a service
-that can no longer be restarted. Neither will touch a record the liveness
+deleted, so keeping its key would strand an owner-only secret belonging to a service
+that can no longer be restarted. They also delete any copy of the key a save
+killed part-way left beside it (`<id>.endpoint-key.tmp-<pid>-<millis>-<n>`):
+`remove` with its record, and `prune` with its record or, when the record is
+already gone, as a leftover under the same age rule. That copy is recognised
+only by the exact name the shared atomic writer gives it, so another service's
+key whose id happens to contain `.tmp-` is never taken for one. Neither will touch a record the liveness
 refresh still reads as running, and `prune` re-checks liveness immediately
 before each delete — but the check and the delete are not atomic, so that
 narrows the race against a concurrent `restart` rather than eliminating it.
-`features/service_record_cleanup.feature` covers both commands on the mock lane,
-asserting on the files left on disk rather than on the summary line the command
-prints — the defect they exist to fix is a file being left behind, which a
-summary claiming success cannot reveal.
+`features/service_record_cleanup.feature` covers both commands on the mock lane.
+Its scenarios assert mainly on the files left on disk, because the defect they
+exist to fix is a file being left behind, which a summary claiming success
+cannot reveal; where they read the output it is for what the user must be
+told, such as the log path before a removal. `service-cleanup-01` plants an
+interrupted-save key copy beside a record and checks `remove` deletes it and
+counts it in `files removed:`; `service-cleanup-03` plants one for the record
+`prune` removes and checks it goes with that record, and one for a record
+already deleted by hand and checks `prune` previews and sweeps it. The unit
+test `services_prune_takes_a_pruned_records_staged_endpoint_key` in
+[service_records.rs](../apps/rocm/src/service_records.rs) covers the first of
+those too, and its neighbours there cover the age rule and what the sweep
+leaves alone.
 
 Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
 and `rocm logs --service`) reads the record through one loader,
@@ -2321,7 +2356,7 @@ error names to confirm it works and does not list the id.
 
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
-writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
+writes the owner-only endpoint key before it writes the record, and `--any-age` leaves
 no age rule to hide that window behind. `serve` already holds the shared
 managed-launch lock across both writes, so `prune` acquires the same lock before
 it reads the directory.
@@ -3138,6 +3173,34 @@ catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 ([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
+fix-4 has one verify line, not two: the catalog recipe and the `Fix` that
+`rocm diagnose` builds both read `RENDER_GROUP_VERIFY` in
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs), so the two cannot
+drift apart again. `the_render_group_fix_verify_matches_the_catalog_copy` in
+[linux.rs](../crates/rocm-core/src/diagnose/linux.rs) keeps either side from
+going back to its own copy, and `diagnose-65` asserts the line that
+`rocm fix fix-4-render-group --dry-run` prints. The line passes when the user
+is in the group that owns `/dev/kfd` (read with `stat -c %G`), or in `render`
+or `video`, and `/dev/kfd` exists; the diagnosis tells the user to join the
+owning group, which need not be `render`. It checks membership, not the
+device's mode, and not `rocminfo`, whose status `head` hides.
+`the_render_group_verify_accepts_the_group_that_owns_kfd` in the same file runs
+it in `/bin/sh` with stand-in tools on Unix hosts: a member of a third owning
+group passes, and a user in none of the groups fails, also when `stat` fails or
+names no group. `diagnose-66` asserts that fix-8's title names the
+`X.Y` release, which is what `check_8_wheel_rocm_mismatch` compares
+(`the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). Both run on every lane,
+because the plan prints before the platform gate. `diagnose-67` asserts the
+other copy, the fix-8 cause `rocm diagnose` prints: its title and plan name the
+`X.Y` release and neither says "major". The scenario carries no platform tag:
+its symptom scores 75 from keywords alone (`libamdhip64.so` 50, the loader
+failure 25), above the match threshold of 50, and `check_8_wheel_rocm_mismatch`
+is registered for Linux, Windows and WSL and only adds to that score.
+`a_library_load_error_alone_raises_the_wheel_mismatch_on_every_family` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs) holds that for all three
+families.
+
 Provider audit focused test:
 
 ```bash
@@ -3666,8 +3729,17 @@ optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; assert the installer's get-started block (banner art
-only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+sidecars before activation. On Linux, with no public key supplied and no
+signature asked for, an install of a specific version with
+`ROCM_CLI_REQUIRE_SIGNATURE=0` still rejects an archive signed with a local key,
+which the pinned release key does not accept (lifecycle-36), and a release
+install with the variable unset still rejects an archive with no `.sig`
+(lifecycle-37). The missing-`.sig` case with nothing asked for is covered on
+the `release` channel only. Both scenarios are Linux-only: on Windows, the
+same default path (no key supplied, no signature asked for) has no scenario,
+and lifecycle-17 covers a no-key install only with the requirement set. The
+scenarios also assert the installer's get-started block (banner art only on a
+UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
 piped or `NO_COLOR` output (the colored TTY branch is not driven by any
 scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
@@ -3684,9 +3756,11 @@ the installer's record, and the running Windows `rocm.exe` removed. The two
 Windows scenarios that change the user `PATH` are `@serial`, since it is one
 registry value for the whole machine.
 Each scenario generates its own local keys, package, and install root under a
-per-scenario temp directory, so they are independent and use generated local
-keys only — project-owned production signing keys remain an owner-controlled
-release step.
+per-scenario temp directory, so they are independent and sign with generated
+local keys only. No scenario holds the production private key, which is an
+owner-controlled release secret; lifecycle-03 and lifecycle-36 (Linux) and
+lifecycle-17 (Windows) use the pinned production public key only to show that it
+rejects a locally signed archive.
 
 If the host does not have `libcap-dev` or `libssl-dev`, run
 `bash scripts/setup-wsl-portable-build-deps.sh` first: it downloads the Ubuntu
@@ -3718,6 +3792,23 @@ cargo test -p rocmd restart_runs_supervise_on_the_rocmd_it_is_given
 cargo test -p rocmd restart_without_a_rocmd_to_run_changes_nothing
 cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
 cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
+cargo test -p rocmd supervise_terminates_the_engine_when_recording_its_pid_fails
+cargo test -p rocmd supervise_terminates_the_engine_when_recording_ready_fails
+cargo test -p rocmd supervise_empties_a_log_left_by_an_earlier_run
+cargo test -p rocmd an_engine_child_dropped_before_its_wait_is_terminated_and_reaped
+cargo test -p rocmd an_engine_child_that_was_waited_for_is_not_signalled_on_drop
+cargo test -p rocmd terminate_recovery_supervisor_kills_and_reaps_the_child_and_its_tree
+cargo test -p rocmd a_termination_that_leaves_the_child_alive_neither_blocks_nor_stays_silent
+cargo test -p rocmd a_termination_that_stops_the_child_reaps_it_and_reports_nothing
+cargo test -p rocmd a_termination_with_unconfirmed_descendants_reaps_the_child_and_says_so
+cargo test -p rocmd an_unconfirmed_termination_still_reaps_a_child_that_already_exited
+cargo test -p rocmd a_failed_wait_leaves_the_engine_guard_armed
+cargo test -p rocmd a_dropped_engine_guard_logs_a_termination_it_could_not_confirm
+cargo test -p rocmd a_dropped_engine_guard_reports_to_stderr_by_default
+cargo test -p rocmd a_report_that_cannot_be_written_does_not_panic
+cargo test -p rocmd restart_reports_a_supervisor_it_could_not_confirm_stopped_in_its_error
+cargo test -p rocmd restart_hands_the_supervisor_its_service_log_as_stderr
+cargo test -p rocmd supervise_engine_output_does_not_overwrite_lines_appended_to_its_log
 cargo test -p rocmd engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd
 cargo test -p rocmd engine_request_without_a_rocm_beside_rocmd_names_it
 cargo test -p rocm-core sibling_binary_path_from
@@ -4691,7 +4782,17 @@ hold the behaviour end to end, GPU or not:
   pipe), so nothing in it can run by construction; the scenario asserts the
   diagnosis, not the absence of something no shell could do. The paste is
   ASCII: Windows PowerShell 5.1 pipes text as ASCII, which is why the docs
-  send PowerShell users through a file instead.
+  send PowerShell users through a file instead. The cmd.exe and Windows
+  PowerShell runs need a Windows host, so in CI they run only on the
+  self-hosted Strix Halo Windows lanes: `e2e-gpu-strix-windows` in
+  [e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) (on pull
+  requests that touch the serve paths, on pushes to `main` and `release/**`,
+  and in the merge queue) and the scheduled
+  `e2e-gpu-nightly-strix-windows` in
+  [nightly.yml](../.github/workflows/nightly.yml). Neither is a required
+  check. The required `E2E tests` job in [ci.yml](../.github/workflows/ci.yml)
+  runs only the bash half, on Linux, and ci.yml's Windows lane does not run
+  this scenario.
 - `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
   scenario here; the Windows key is checked by hand in
   [manual-testing.md](manual-testing.md) section 13) runs
