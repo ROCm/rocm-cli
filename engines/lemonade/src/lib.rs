@@ -623,10 +623,12 @@ fn serve_http(request: ServeHttpRequest) -> Result<()> {
 }
 
 /// Run a serve and make its outcome visible in the persisted state: any error,
-/// whichever step raised it, leaves a state file that exists at `failed` rather
-/// than at the `starting`/`running` it last recorded, and the error is returned
-/// unchanged. Servers spawned inside [`serve_with_context`] are stopped by the
-/// code that spawned them, which owns the child.
+/// whichever step raised it, marks a state file that exists `failed` rather
+/// than leaving the `starting`/`running` it last recorded, and the error is
+/// returned unchanged. A state file that is empty, torn or not a JSON object
+/// refuses the mark and is left as it was. Servers spawned inside
+/// [`serve_with_context`] are stopped by the code that spawned them, which owns
+/// the child.
 fn serve_http_resolving(
     mut request: ServeHttpRequest,
     resolve: impl FnOnce(&mut ServeHttpRequest) -> Result<ServeContext>,

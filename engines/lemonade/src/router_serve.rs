@@ -9,10 +9,12 @@
 //! the way it fails can be tested without a real `lemond`. Production uses
 //! [`LemondRouterSteps`]. There is deliberately no direct-server step here: any
 //! failure is returned to the caller as an error and the server is stopped. The
-//! engine state is then left at `failed`, except for a model load or
+//! engine state is then marked `failed`, except for a model load or
 //! verification failure: that is tagged [`RouterLoadFailure`] and does not write
 //! `failed`, so the caller can decide, on Linux, whether the selected GPU
-//! backend can serve the model directly instead and own the final state.
+//! backend can serve the model directly instead and own the final state. A
+//! state file that is empty, torn or not a JSON object refuses the `failed`
+//! mark like any other merge and is left as it was.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::json;
@@ -72,8 +74,11 @@ pub(crate) fn serve_router<S: RouterSteps>(
 ) -> Result<()> {
     let server_pid = steps.spawn_server()?;
     // Every step after the spawn is inside this one fallible block, so a failure
-    // anywhere in it (state writes included) stops the server and marks the state
-    // `failed`; the server has no `Drop` and would otherwise keep running.
+    // anywhere in it (state writes included) stops the server, which has no `Drop`
+    // and would otherwise keep running. The state is then marked `failed`, except
+    // after a load failure, which leaves it to the fallback (below). When the
+    // state file is itself unusable (empty, torn or not a JSON object), that mark
+    // is refused like any merge and the file is left as it was.
     let outcome = (|| -> Result<()> {
         crate::state::write_running_state_for_model(
             request,
