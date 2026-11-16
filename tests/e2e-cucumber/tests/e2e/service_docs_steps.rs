@@ -438,8 +438,10 @@ async fn user_opens_engine_docs(world: &mut E2eWorld) {
     let url = listing
         .lines()
         .find_map(|line| line.trim().strip_prefix("engine docs:"))
-        .map(|url| url.trim().to_owned())
-        .unwrap_or_else(|| panic!("the services list names no engine docs:\n{listing}"));
+        .map_or_else(
+            || panic!("the services list names no engine docs:\n{listing}"),
+            |url| url.trim().to_owned(),
+        );
     let page = get(&url).await;
     let status = page.status();
     let body = page.text().await.unwrap_or_default();
