@@ -1441,6 +1441,32 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
+### 6c. The tensorizer upgrade on Python 3.14
+
+Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only
+published vLLM build for that line). On a fresh runtime:
+
+```bash
+rocm install sdk --channel release --version 10.1.0 --yes
+rocm engines install vllm --runtime-id <that runtime>
+```
+
+The install output carries a warning that vLLM's pinned tensorizer cannot be
+imported and was upgraded, then `dependency_check: expected_divergence` with a
+`note:` naming the tensorizer release the runtime holds and `action: none`, not
+`dependency_check: violated`. Confirm with
+`<runtime>/bin/python -c "import tensorizer.serialization"`, which must import
+cleanly. Run the install a second time: no upgrade warning, the same
+`expected_divergence` block, and vLLM is not reinstalled. `rocm serve` must then
+get past engine start-up (it no longer fails with
+`KeyError: 'crypto_stream_salsa20_NONCEBYTES'`).
+
+On some GPU families `rocm install sdk` installs vLLM itself
+(`maybe_auto_install_sdk_preferred_engine`), so the same upgrade warning and the
+`expected_divergence` block appear at the end of that command, a step earlier;
+the `rocm engines install vllm` that follows then shows the block without the
+warning, and nothing more needs doing.
+
 ## 7. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

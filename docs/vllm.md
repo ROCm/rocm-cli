@@ -140,6 +140,49 @@ cannot silently install the wrong line's wheel onto this SDK. If AMD's index
 has no compatible build for a package, the resolver fails and the install
 fails instead of falling back to an unpinned or CPU install.
 
+One package is checked after the install instead. vLLM's wheel pins
+`tensorizer==2.10.1`, which cannot be imported under Python 3.14
+(`KeyError: 'crypto_stream_salsa20_NONCEBYTES'`), and ROCm 10.1.0's vLLM is
+published for Python 3.14 only. The install, and every later
+`rocm engines install vllm` on a managed runtime, imports
+`tensorizer.serialization` with the runtime's Python, under the environment the
+server is launched with (including `PYTHONPATH`) and with colour switched off.
+When that import fails inside tensorizer itself, it upgrades tensorizer to
+2.12.1 with `--no-deps` and imports it again. A torch or shared-library failure
+is not tensorizer's and is left to the device check.
+
+When this run installed vLLM (a first install, `--reinstall` or a repair), a
+failed upgrade, a check that cannot run, or a tensorizer that still cannot be
+imported after the upgrade fails the install with the exception, instead of
+ending in a startup crash at `rocm serve`. On a runtime this run did not
+install vLLM into, the same three cases are warnings, so an install that used to
+be a no-op (for example offline) stays one. A tensorizer that imports keeps
+vLLM's pin. A later `rocm engines install vllm` on a runtime whose upgrade
+failed only warns, and `rocm serve` on it keeps failing until an install
+succeeds: retrying after a failed install is deliberately not fatal.
+
+The check runs inside the engine install, before the CLI realigns the runtime's
+torch. If torch cannot load against the SDK at that moment, the probe sees a
+torch failure rather than tensorizer's, reads it as not tensorizer's and leaves
+tensorizer alone; the next `rocm engines install vllm` checks again.
+
+Because the upgraded release no longer matches vLLM's exact pin,
+`uv pip check` reports it, and `dependency_check` shows it as
+`expected_divergence` (not `violated`), with a note naming the tensorizer release
+the runtime holds. A reinstall is not needed to keep it: the install re-checks
+tensorizer and upgrades it again, provided torch can load when the check runs
+(see above).
+
+Two side effects are new. The check imports torch and tensorizer under the
+environment the server is launched with, which can write the launch's
+compatibility shims, so a `rocm engines install vllm` on an existing managed
+runtime is no longer free of side effects. The probe and the upgrade each have a
+five-minute timeout. And on the `rocm install sdk` auto-install path, a refused
+tensorizer upgrade can still print `dependency_check: satisfied` beside the
+refusal error, because a refused upgrade keeps vLLM's own pin and `uv pip check`
+only compares declared metadata; the refusal text carries the truth, and that
+output is deliberately not changed here.
+
 `flash-attn` and `amd-aiter` are the exception to the per-package series match
 above. The vLLM wheel declares the exact builds of both that it was built
 against, and the index keeps publishing newer ones it does not accept (for

@@ -62,6 +62,7 @@ pub mod user_path;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod foreign_temp_probe;
+pub mod tensorizer_override;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
@@ -244,6 +245,9 @@ pub use service_record::{
     engine_stop_decides_confirmation,
 };
 pub use sigpipe::with_sigpipe_ignored;
+pub use tensorizer_override::{
+    TENSORIZER_PYTHON314_FIX, tensorizer_override_requirement, vllm_tensorizer_override_installed,
+};
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
