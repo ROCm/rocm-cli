@@ -2371,25 +2371,32 @@ jobs:
                 Some(rest) => (rest.trim_start(), indent_of(line) + 2),
                 None => (code, indent_of(line)),
             };
-            let indicator = key.strip_prefix("run:")?.trim();
-            let folded = match indicator.chars().next()? {
-                '|' => false,
-                '>' => true,
-                _ => return None,
-            };
-            let modifiers = &indicator[1..];
-            if !modifiers
-                .chars()
-                .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
-            {
-                return None;
-            }
-            let indent = modifiers
-                .chars()
-                .find_map(|c| c.to_digit(10))
-                .map(|digit| digit as usize);
+            let (folded, indent) = block_scalar_header(key.strip_prefix("run:")?.trim())?;
             Some((at, key_column, folded, indent))
         })
+    }
+
+    /// Whether `token` is a block-scalar header — `|` or `>`, followed only by
+    /// chomping (`-`/`+`) and indentation (digit) indicators — and if so,
+    /// whether it folds (`>`) and the indentation digit it names.
+    fn block_scalar_header(token: &str) -> Option<(bool, Option<usize>)> {
+        let folded = match token.chars().next()? {
+            '|' => false,
+            '>' => true,
+            _ => return None,
+        };
+        let modifiers = &token[1..];
+        if !modifiers
+            .chars()
+            .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+        {
+            return None;
+        }
+        let indent = modifiers
+            .chars()
+            .find_map(|c| c.to_digit(10))
+            .map(|digit| digit as usize);
+        Some((folded, indent))
     }
 
     /// The script a step's block-scalar `run:` hands its shell, one entry per
@@ -5913,8 +5920,9 @@ fi
     }
 
     /// The value of the `{key}:` that sits exactly `indent` columns in, with any
-    /// continuation lines folded in and a leading block-scalar marker (`>-`, `|`)
-    /// dropped; `None` when there is no such key. Job-level keys sit at 4, and a
+    /// continuation lines folded in and a leading block-scalar header (as
+    /// [`block_scalar_header`] reads one) dropped; `None` when there is no such
+    /// key. Job-level keys sit at 4, and a
     /// step's own keys at the step's dash column plus 2.
     fn yaml_value_at(block: &str, indent: usize, key: &str) -> Option<String> {
         let marker = format!("{key}:");
@@ -5937,13 +5945,42 @@ fi
             value.push(' ');
             value.push_str(code.trim());
         }
-        Some(
+        // The header is the value's first word, which the folded first line
+        // follows after a space; a `|` or `>` with other text attached is not one.
+        let value = value.trim();
+        let (head, rest) = value.split_once(' ').unwrap_or((value, ""));
+        let body = if block_scalar_header(head).is_some() {
+            rest
+        } else {
             value
-                .trim_start_matches(">-")
-                .trim_start_matches('|')
-                .trim()
-                .to_owned(),
-        )
+        };
+        Some(body.trim().to_owned())
+    }
+
+    /// `yaml_value_at` drops a block-scalar header of every form the step
+    /// readers accept, including one with nothing after it, and keeps a plain
+    /// value and a `|` or `>` with text attached, neither of which is a header.
+    /// `run_block_header` shares the recogniser and rejects a plain `run:`.
+    #[test]
+    fn yaml_value_at_drops_only_a_block_scalar_header() {
+        let value = |text: &str| {
+            yaml_value_at(&format!("    key: {text}\n"), 4, "key").expect("the key is there")
+        };
+        for header in ["|", ">", "|-", ">-", "|+", ">+", "|2", ">2-", "|+2"] {
+            assert_eq!(
+                value(&format!("{header}\n      a b\n      c")),
+                "a b c",
+                "{header}"
+            );
+            assert_eq!(value(header), "", "{header} with no lines after it");
+        }
+        assert_eq!(value("plain text"), "plain text");
+        assert_eq!(value("|cmd"), "|cmd");
+        assert_eq!(value(">x y"), ">x y");
+        assert_eq!(value("|2x\n      a"), "|2x a");
+        assert_eq!(value("x y"), "x y");
+        assert_eq!(value("\n      - a\n      - b"), "- a - b");
+        assert!(run_block_header(&["      - run: x"]).is_none());
     }
 
     /// The aggregator's one step, as a step block. Panics unless it is the only
@@ -10543,7 +10580,7 @@ permissions:
         use std::collections::BTreeSet;
 
         use proc_macro2::{Delimiter, TokenStream, TokenTree};
-        use syn::spanned::Spanned;
+        use quote::ToTokens;
         use syn::{ImplItem, Item, TraitItem};
 
         use super::{
@@ -10648,11 +10685,11 @@ permissions:
             false
         }
 
-        /// The source text of `node`, outer attributes included, as tokens.
-        fn tokens_of(source: &str, node: &impl Spanned) -> TokenStream {
-            source[node.span().byte_range()]
-                .parse()
-                .expect("a parsed item's own text tokenizes")
+        /// `node`'s tokens, outer attributes included, taken from the parsed
+        /// node itself rather than by re-lexing the source slice its span
+        /// covers, which breaks on CRLF line endings and a byte order mark.
+        fn tokens_of(node: &impl ToTokens) -> TokenStream {
+            node.to_token_stream()
         }
 
         /// Whether `source` holds test code that only the feature-on build
@@ -10677,40 +10714,35 @@ permissions:
             let in_feature = file
                 .attrs
                 .iter()
-                .any(|attr| feature_turns_on_code(&tokens_of(source, attr)));
-            items_have_hooks_only_test_code(source, &file.items, gated, in_feature)
+                .any(|attr| feature_turns_on_code(&tokens_of(attr)));
+            items_have_hooks_only_test_code(&file.items, gated, in_feature)
         }
 
-        fn items_have_hooks_only_test_code(
-            source: &str,
-            items: &[Item],
-            gated: bool,
-            in_feature: bool,
-        ) -> bool {
+        fn items_have_hooks_only_test_code(items: &[Item], gated: bool, in_feature: bool) -> bool {
             items.iter().any(|item| {
                 let attrs = item_attrs(item);
                 let test = gated || attrs_are_test_gated(attrs).expect("attributes parse");
                 if test {
-                    return in_feature || feature_turns_on_code(&tokens_of(source, item));
+                    return in_feature || feature_turns_on_code(&tokens_of(item));
                 }
                 let in_feature = in_feature
                     || attrs
                         .iter()
-                        .any(|attr| feature_turns_on_code(&tokens_of(source, attr)));
+                        .any(|attr| feature_turns_on_code(&tokens_of(attr)));
                 match item {
                     Item::Mod(module) => match &module.content {
                         Some((_, inner)) => {
-                            items_have_hooks_only_test_code(source, inner, false, in_feature)
+                            items_have_hooks_only_test_code(inner, false, in_feature)
                         }
                         None => in_feature,
                     },
                     Item::Impl(imp) => imp.items.iter().any(|member: &ImplItem| {
                         attrs_are_test_gated(impl_item_attrs(member)).expect("attributes parse")
-                            && (in_feature || feature_turns_on_code(&tokens_of(source, member)))
+                            && (in_feature || feature_turns_on_code(&tokens_of(member)))
                     }),
                     Item::Trait(tr) => tr.items.iter().any(|member: &TraitItem| {
                         attrs_are_test_gated(trait_item_attrs(member)).expect("attributes parse")
-                            && (in_feature || feature_turns_on_code(&tokens_of(source, member)))
+                            && (in_feature || feature_turns_on_code(&tokens_of(member)))
                     }),
                     _ => false,
                 }
@@ -10817,9 +10849,6 @@ permissions:
         /// one line, is exactly `command`. Only the `run:` key is read, so a
         /// step whose name or comment quotes the command does not match, and a
         /// multi-line script folds into something longer than one command.
-        /// The value is read by `yaml_value_at`, which strips only a `|` or
-        /// `>-` block header: a command under `|-`, `>` or `|+` keeps a stray
-        /// `-`, `>` or `+` in front and does not match.
         fn runs_exactly(step: &str, command: &str) -> bool {
             let item_indent = indent_of(step.lines().next().expect("a step has a first line"));
             yaml_value_at(step, item_indent + 2, "run").as_deref() == Some(command)
@@ -11003,6 +11032,29 @@ permissions:
             }
         }
 
+        /// A Windows checkout gives `xtask/` and `tests/` CRLF line endings,
+        /// and a file can open with a byte order mark. Neither may make the
+        /// item scanner, [`has_hooks_only_test_code`], panic or change its
+        /// answer: a doc comment's span ends after the `\r` of its line
+        /// ending, and `syn::parse_file` strips a BOM before it records
+        /// offsets, so re-lexing a slice of the source by an item's span breaks
+        /// on both.
+        #[test]
+        fn crlf_line_endings_and_a_byte_order_mark_do_not_change_the_answer() {
+            let gated = "//! Inner docs.\n/// Outer docs.\nfn seam() {}\n#[cfg(test)]\nmod tests {\n    \
+                         /// A test.\n    #[cfg(feature = \"e2e-test-hooks\")]\n    #[test]\n    fn t() {}\n}\n";
+            let plain = gated.replace("#[cfg(feature = \"e2e-test-hooks\")]", "");
+            for (source, expected) in [(gated.to_owned(), true), (plain, false)] {
+                for variant in [
+                    source.replace('\n', "\r\n"),
+                    format!("\u{feff}{source}"),
+                    format!("\u{feff}{}", source.replace('\n', "\r\n")),
+                ] {
+                    assert_eq!(test_code(&variant), expected, "{variant:?}");
+                }
+            }
+        }
+
         /// Everything in a file only test builds reach is test code.
         #[test]
         fn a_gated_helper_in_a_test_only_file_is_found() {
@@ -11061,7 +11113,7 @@ permissions:
         /// with the command, since a script's status is its last command's,
         /// but the check does not reason about scripts, so it accepts only the
         /// command on its own. The command is still accepted with a trailing
-        /// comment, or alone under a `|` or `>-` block header.
+        /// comment, or alone under any block header.
         #[test]
         fn the_test_step_matcher_takes_only_the_exact_command() {
             let rocm = hooks_test_command("rocm");
@@ -11074,6 +11126,11 @@ permissions:
                 format!("{rocm} # why"),
                 format!("|\n          {rocm}"),
                 format!(">-\n          {rocm}"),
+                format!("|-\n          {rocm}"),
+                format!(">\n          {rocm}"),
+                format!("|+\n          {rocm}"),
+                format!("|2\n          {rocm}"),
+                format!(">2-\n          {rocm}"),
             ] {
                 assert!(
                     runs_exactly(&step_named_for(&rocm, &run), &rocm),
@@ -11089,16 +11146,6 @@ permissions:
                 format!("echo {rocm}"),
                 format!("|\n          set +e\n          {rocm}"),
             ] {
-                assert!(
-                    !runs_exactly(&step_named_for(&rocm, &run), &rocm),
-                    "accepted `run: {run}`"
-                );
-            }
-            // The limit `runs_exactly` documents: `yaml_value_at` strips only a
-            // `|` or `>-` header, so the command under `|-`, `>` or `|+` is
-            // rejected.
-            for header in ["|-", ">", "|+"] {
-                let run = format!("{header}\n          {rocm}");
                 assert!(
                     !runs_exactly(&step_named_for(&rocm, &run), &rocm),
                     "accepted `run: {run}`"

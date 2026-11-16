@@ -982,8 +982,8 @@ and in the merge queue the full workspace always runs. For a full local verifica
 narrows the local pre-push hooks (next section).
 
 That `cargo nextest run` builds with the `e2e-test-hooks` feature off, so the
-tests that exist only with it are not among them. Two more steps of the `test`
-job run them, each when its crate is in the selection or the selection is the
+tests that exist only with it are not among them. More steps of the `test` job
+run them, each when its crate is in the selection or the selection is the
 whole workspace. Each runs that crate's whole suite with the feature on (the
 rocm-core one its library tests), not only the tests behind the feature:
 
@@ -997,15 +997,18 @@ Tests gated on the feature being off, such as
 [dash.rs](../apps/rocm/src/dash.rs) and
 `a_build_without_the_hook_ignores_the_variable` in
 [hardware_root.rs](../crates/rocm-core/src/hardware_root.rs), are not built by
-these two steps; feature-off runs such as the plain `cargo nextest run` above
+these steps; feature-off runs such as the plain `cargo nextest run` above
 run them.
 
 A contract test in [workflow_contract.rs](../xtask/src/workflow_contract.rs),
 `ci_lints_and_tests_every_crate_with_e2e_test_hooks_gated_tests`, finds every
-crate whose library, binary, proc-macro or build-script module tree has such
-tests, and fails while one has no step like these, so a crate that gains its
-first one needs a step of its own. It does not read integration tests under a
-crate's `tests/` directory, so a test there behind the feature is not checked.
+crate whose library, binary, proc-macro or build-script module tree has test
+code the feature changes: test code holding a `cfg(..)` or `cfg!(..)` the
+feature can turn on or a `cfg_attr(..)` naming it, test code behind such a gate,
+or a `mod x;` behind the feature, whose file it does not read. It fails while
+such a crate has no step like these, so a crate that gains such test code needs
+a step of its own. It does not read integration tests under a crate's `tests/`
+directory, so a test there behind the feature is not checked.
 
 ### Pre-push hook scope
 
@@ -1022,7 +1025,7 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
   `e2e-cucumber` (its scenarios run through `cargo xtask e2e`), or
   `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
 
-The hooks build with `e2e-test-hooks` off, so the feature-on clippy and the two feature-on
+The hooks build with `e2e-test-hooks` off, so the feature-on clippy and the feature-on
 test steps run only in CI, or by hand with the commands above.
 
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,

@@ -38,4 +38,5 @@ tar = "0.4"
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+quote = "1"
 tempfile = "3"
