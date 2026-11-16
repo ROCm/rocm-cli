@@ -80,7 +80,11 @@ fn freshness_label(freshness: Option<ObservationFreshness>) -> Value {
 /// freshness metadata, and observed_at timestamp.
 ///
 /// Fields added by EAI-7960:
-/// - `gen_tps`: live generation throughput from the Instance (same as daemon)
+/// - `gen_tps`: generation throughput from the Instance (same as daemon)
+/// - `gen_tps_last_request`: `true` when `gen_tps` is only the endpoint's most
+///   recent completed request (Lemonade), which stays unchanged while the server
+///   is idle, so it must not be read as live throughput; `tokens_per_watt` is
+///   derived from it
 /// - `tokens_per_watt`: daemon-provided efficiency (never recomputed here)
 /// - `attributed_power_w`: this instance's share of its GPUs' board power
 ///   (split among instances sharing a GPU). Not the same as `gpu_status`'s
@@ -117,6 +121,7 @@ pub fn list_instances_json(snap: &StateSnapshot) -> Value {
                 "running_reqs": i.running_reqs,
                 "waiting_reqs": i.waiting_reqs,
                 "gen_tps": i.gen_tps,
+                "gen_tps_last_request": i.gen_tps_last_request,
                 "tokens_per_watt": i.tokens_per_watt,
                 "attributed_power_w": i.power_w,
                 "ttft_ms": i.ttft_ms,
@@ -164,6 +169,7 @@ pub fn tokens_per_watt_json(snap: &StateSnapshot) -> Value {
             json!({
                 "name": i.container_name,
                 "gen_tps": i.gen_tps,
+                "gen_tps_last_request": i.gen_tps_last_request,
                 "tokens_per_watt": i.tokens_per_watt,
                 "freshness": freshness,
                 "observed_at": observed_at,
@@ -347,6 +353,23 @@ mod tests {
             i["observed_at"].is_string(),
             "observed_at must be an ISO string"
         );
+    }
+
+    /// A Lemonade rate is the last completed request's, not live throughput; the
+    /// agent must be able to tell, in both tools that report `gen_tps`.
+    #[test]
+    fn instance_tools_carry_the_last_request_flag() {
+        for last_request in [true, false] {
+            let mut snap =
+                fixture_with_observation(rocm_dash_core::metrics::ObservationFreshness::Fresh);
+            snap.instances[0].gen_tps_last_request = last_request;
+            for v in [list_instances_json(&snap), tokens_per_watt_json(&snap)] {
+                assert_eq!(
+                    v["instances"][0]["gen_tps_last_request"], last_request,
+                    "{v}"
+                );
+            }
+        }
     }
 
     #[test]

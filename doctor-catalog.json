@@ -453,5 +453,13 @@
     "not_applicable": 3,
     "ok": 0,
     "unknown_id": 2
+  },
+  "exit_code_descriptions": {
+    "declined": "The fix needed confirmation and did not get it: the user answered no, or stdin is not a terminal and `--yes` was not given. Nothing the confirmation guarded was changed.",
+    "failed": "A step of the fix failed: a command it ran, a file it wrote, or a read of state it needed before planning (the current User PATH on Windows, read even under `--dry-run`). The change that step was to make was not made.",
+    "internal": "The CLI is inconsistent with itself (a recipe it says it can carry out, with nothing to carry it out with); never a fault of the machine. Exit 1 is also any other error the command reports on stderr, such as `--json` combined with a fix-id.",
+    "not_applicable": "The entry exists but cannot be used here: it is for another platform, the host lacks something the fix cannot do without (a tool it runs, or `sudo` when not root; an install it points at; the current user's name; or a home directory to write a file in), or an argument it was given is one it cannot use, such as a negative device index written `--device-index=-1`. Nothing was tried. Written with a space instead, `--device-index -1` is a usage error and exits 2 (see `unknown_id`).",
+    "ok": "Nothing failed: the fix was applied, found nothing to change (already in place, or a setting it leaves for you to edit), was previewed with `--dry-run`, or only printed what to do (steps to run yourself, or the explanation of a diagnose-only entry); or the catalog was listed. A `--dry-run` preview is not always 0: it exits 3 or 4 when the fix cannot be planned.",
+    "unknown_id": "No catalog entry has that fix-id; no fix step was run, and a stderr line starts with `Unknown fix-id:`. Exit 2 is also what the argument parser returns for a malformed command line (an unknown option, a missing value, or a value it cannot read, such as a non-number for `--device-index`, or a negative one written after a space, `--device-index -1`, which it reads as an unknown option), before any fix-id is looked up; that refusal has a stderr line starting with `error:` and never says `Unknown fix-id:`. Another line, such as a one-time `rocm:` notice, can come first. The code alone cannot tell the two apart; the message can."
   }
 }
