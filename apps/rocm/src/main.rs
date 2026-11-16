@@ -1105,17 +1105,26 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         // its reader to run the command they were already reading. It names the
         // thing that would actually settle the question instead.
         //
-        // That thing is NOT "install `vulkaninfo`", for the reason the matching
-        // arm in `host_gpu::render` spells out: on a real driverless Linux host
-        // the tool is already installed, prints "Found no drivers!" and exits 1,
-        // which is exactly what lands here. Both strings appear in the same
-        // `rocm examine` report, so advising that install would contradict the
-        // `rocm_support:` line a few lines above it.
+        // The claim and the next step are `rocm_core`'s
+        // `VULKAN_UNCONFIRMED_CLAIM` and `VULKAN_UNCONFIRMED_NEXT_STEP`,
+        // spelled out here only because this is a `const fn` returning a
+        // `&'static str` and a constant cannot be interpolated into one.
+        // `the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim`
+        // holds the two in step; both strings appear in the *same* `rocm
+        // examine` report, a few lines apart, so a divergence is visible to the
+        // user immediately.
+        //
+        // In particular this must not say "install a Vulkan driver"
+        // unconditionally: a working Windows Adrenalin machine lands in this
+        // level, since the Khronos key it reads is legacy there. Nor "install
+        // `vulkaninfo`": on a driverless Linux host that tool is already
+        // installed, prints "Found no drivers!" and exits 1, which is another
+        // of the shapes that lands here.
         rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
-             Vulkan driver is present could not be determined - install a Vulkan driver (Mesa \
-             RADV on Linux, the AMD display driver on Windows) to run models on this GPU, and \
-             run `vulkaninfo` yourself to see what it says"
+             Vulkan driver is present could not be determined here - run `vulkaninfo` yourself \
+             to see what it reports, and install a Vulkan driver (Mesa RADV on Linux, the AMD \
+             display driver on Windows) if it finds none"
         }
         rocm_core::GpuSupportLevel::NoGpuBackend => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
@@ -1331,6 +1340,34 @@ pub(crate) mod tests {
         assert_eq!(
             rocm_dash_tui::ui::examine_manager::REPORT_SENDER_NOTICE,
             rocm_core::report_delivery::SENDER_NOTICE
+        );
+    }
+
+    /// The lemonade note and `rocm examine`'s `rocm_support` line both render
+    /// `VulkanUnconfirmed`, and both appear in the same `rocm examine` report a
+    /// few lines apart. They must make the same claim about the host and offer
+    /// the same next step, so both are held against the constants `rocm-core`
+    /// defines; this note spells them out only because a `const fn` returning
+    /// `&'static str` cannot interpolate a constant.
+    ///
+    /// Neither may tell a host to install a Vulkan driver unconditionally: a
+    /// working Windows Adrenalin machine reaches this level, because the
+    /// Khronos registry key the probe reads is legacy there.
+    #[test]
+    fn the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim() {
+        let note = super::lemonade_engine_note(rocm_core::GpuSupportLevel::VulkanUnconfirmed);
+
+        assert!(
+            note.contains(rocm_core::VULKAN_UNCONFIRMED_CLAIM),
+            "the note must make the shared claim verbatim: {note}"
+        );
+        assert!(
+            note.contains(rocm_core::VULKAN_UNCONFIRMED_NEXT_STEP),
+            "and offer the shared next step verbatim: {note}"
+        );
+        assert!(
+            !note.contains("no Vulkan driver was found"),
+            "a level a working Adrenalin laptop reaches must not deny its driver: {note}"
         );
     }
 

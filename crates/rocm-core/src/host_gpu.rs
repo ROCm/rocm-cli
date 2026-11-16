@@ -75,9 +75,9 @@ pub use linux::is_amdgpu_device;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
 pub use vulkan::{
-    VulkanDevice, VulkanStatus, VulkanSupport, amd_icd_driver_label, classify_vulkan_support,
-    detect_vulkan_support, icd_driver_label, icd_is_gpu_driver, parse_vulkaninfo_summary,
-    parse_windows_vulkan_icd_listing, windows_icds_from_capture,
+    VulkanDevice, VulkanEvidence, VulkanStatus, VulkanSupport, amd_icd_driver_label,
+    classify_vulkan_support, detect_vulkan_support, icd_driver_label, icd_is_gpu_driver,
+    parse_vulkaninfo_summary, parse_windows_vulkan_icd_listing, windows_icds_from_capture,
 };
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
@@ -461,6 +461,16 @@ pub fn detect_gpu_driver_version() -> Option<String> {
     None
 }
 
+/// The [`DriverSummary::status`] word for a Windows host whose AMD display
+/// driver was read.
+///
+/// Written once because it is also a *fact about the Vulkan driver*: on Windows
+/// the display driver installs the Vulkan ICD, so `render.rs` cross-checks this
+/// word before advising an unconfirmed-Vulkan host to install one. Only
+/// [`windows_driver_summary`] produces it, which is what makes matching on it a
+/// Windows-only test.
+pub(super) const AMD_DISPLAY_DRIVER_DETECTED: &str = "amd_display_driver_detected";
+
 fn windows_driver_summary(
     detail: Option<String>,
     windows: Option<crate::windows_driver::WindowsDriverInfo>,
@@ -468,7 +478,7 @@ fn windows_driver_summary(
     DriverSummary {
         policy: "windows_validate_only".to_owned(),
         status: if detail.is_some() {
-            "amd_display_driver_detected".to_owned()
+            AMD_DISPLAY_DRIVER_DETECTED.to_owned()
         } else {
             "not_detected".to_owned()
         },

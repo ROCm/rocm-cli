@@ -578,12 +578,12 @@ pub enum GpuSupportLevel {
     /// `render.rs` that tells the two apart in what the user reads, and it only
     /// names a driver when one was actually found.
     ///
-    /// The second half of that sentence is evidence, not inference. This variant
-    /// used to be returned from the gfx table alone — "no ROCm build" was taken
-    /// to mean "Vulkan then", on a machine nobody had looked at. Every surface
-    /// that renders this level tells the user to go and serve a model on it, so
-    /// a host with no Vulkan driver installed, or with only a software
-    /// rasteriser, was sent to a backend that cannot start.
+    /// The second half of that sentence must be evidence, never inference.
+    /// Deriving it from the gfx table alone — reading "no ROCm build" as
+    /// "Vulkan then", on a machine nobody has looked at — sends a host with no
+    /// Vulkan driver, or with only a software rasteriser, to a backend that
+    /// cannot start: every surface that renders this level tells the user to go
+    /// and serve a model on it.
     VulkanOnly,
     /// Recognized, confirmed to have no ROCm/HIP build, and the Vulkan probe
     /// could not reach an answer — no ICD manifest, no enumerated device, and
@@ -593,9 +593,9 @@ pub enum GpuSupportLevel {
     /// as a confirmed fact and is serialized for JSON consumers, and this state
     /// has not earned it: on Windows the Khronos `Drivers` key is legacy and
     /// `vulkaninfo` is rarely on PATH, so a working Adrenalin laptop — the
-    /// machine shape ROCMAI-550 was reported from — can land here. Telling it
-    /// there is no GPU backend would be a worse answer than the static claim
-    /// this change replaced.
+    /// machine shape ROCMAI-550 was reported from — lands here routinely.
+    /// Telling it there is no GPU backend is a worse answer than the
+    /// unconditional Vulkan claim this level exists to replace.
     ///
     /// Nor is it [`Self::VulkanOnly`], which promises a backend that may not be
     /// there. It is its own answer: say what was looked for, that nothing was
@@ -628,22 +628,70 @@ pub enum GpuSupportLevel {
 /// classifier that decides when it is true rather than being retyped at each
 /// site.
 ///
-/// `rocm examine`'s `rocm_support` line used to interpolate this too, and
-/// deliberately no longer does. It is the one surface that pays for the Vulkan
-/// probe, so it grades the second half of the claim by what the probe actually
-/// established — an enumerated device is named, an installed-but-unenumerated
-/// driver gets a weaker sentence, an unprobed platform admits it — and the
-/// unconditional "can still be used" is exactly the promise that change exists
-/// to stop making. See `rocm_support_line` in `host_gpu/render.rs`. The two
-/// install refusals keep it because they are asked of a *target*, before and
-/// without any host probe (they classify with [`VulkanStatus::Unknown`]), so
-/// the graded wording has no evidence to grade on there.
+/// `rocm examine`'s `rocm_support` line deliberately does **not** interpolate
+/// this. It is the one surface that pays for the Vulkan probe, so it grades the
+/// second half of the claim by what the probe established — an enumerated
+/// device is named, an installed-but-unenumerated driver gets a weaker
+/// sentence, an unprobed platform admits it — and the unconditional "can still
+/// be used" is exactly the promise this PR exists to stop making. See
+/// `rocm_support_line` in `host_gpu/render.rs`. The two install refusals keep
+/// it because they are asked of a *target*, before and without any host probe
+/// (they classify with [`VulkanStatus::Unknown`]), so the graded wording has no
+/// evidence to grade on there.
 ///
 /// Deliberately just the claim, with no leading subject and no trailing
 /// punctuation: a caller supplies both. Changing the wording here changes both
 /// refusals together, which is the point.
 pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
     "not supported by ROCm; the Vulkan backend can still be used";
+
+/// What every [`GpuSupportLevel::VulkanUnconfirmed`] surface says about the
+/// host, written once.
+///
+/// Two surfaces render this level — `rocm examine`'s `rocm_support` line
+/// (`rocm_support_line` in `host_gpu/render.rs`) and the lemonade engine note
+/// (`lemonade_engine_note` in `apps/rocm/src/main.rs`) — and they appear in the
+/// *same* `rocm examine` report, a few lines apart. Sharing the claim is what
+/// stops one of them denying a driver while the other says the question is
+/// open.
+///
+/// It states a gap in the probe, never a fact about the machine. On Windows the
+/// ICD lookup reads only the legacy Khronos `Drivers` key and `vulkaninfo` is
+/// rarely on PATH, so a working Adrenalin laptop lands in this level routinely;
+/// anything stronger than "could not be determined" is false on that host.
+pub const VULKAN_UNCONFIRMED_CLAIM: &str =
+    "whether a Vulkan driver is present could not be determined here";
+
+/// The next step for a host at [`GpuSupportLevel::VulkanUnconfirmed`] when
+/// nothing is known about its display driver.
+///
+/// `vulkaninfo` comes first and the install is conditional on what it reports,
+/// because the level is reached by hosts that already have a working driver.
+/// An unconditional "install a Vulkan driver" is advice those hosts cannot act
+/// on, and AGENTS.md §3 asks that a named command be able to clear the
+/// condition it is printed for — running `vulkaninfo` can, on every host that
+/// reaches here.
+///
+/// Deliberately not "install `vulkaninfo`": on a driverless Linux host the tool
+/// is typically already installed, prints "Found no drivers!" and exits 1,
+/// which is one of the shapes that lands in this level.
+pub const VULKAN_UNCONFIRMED_NEXT_STEP: &str = "run `vulkaninfo` yourself to see what it reports, and install a Vulkan driver (Mesa RADV on \
+     Linux, the AMD display driver on Windows) if it finds none";
+
+/// The next step for a Windows host at [`GpuSupportLevel::VulkanUnconfirmed`]
+/// whose AMD display driver the summary already found.
+///
+/// The Windows AMD display driver *is* the Vulkan driver on that platform —
+/// Adrenalin installs the ICD — so `driver_status: amd_display_driver_detected`
+/// contradicts the install advice in [`VULKAN_UNCONFIRMED_NEXT_STEP`]. Only
+/// `vulkaninfo` is left to settle whether that driver exposes a device here.
+///
+/// The cross-check is Windows-only on purpose. Linux's `driver_status` reports
+/// the `amdgpu` kernel module, which says nothing about whether a userspace
+/// Vulkan ICD such as Mesa RADV is installed, so suppressing the install advice
+/// there would withhold the one step that can help.
+pub const VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER: &str = "the AMD display driver is installed (see `driver_status`), so there is nothing to install \
+     here - run `vulkaninfo` yourself to see whether it reports a device";
 
 /// Classify a GPU target's support level.
 ///
@@ -669,9 +717,9 @@ pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
 /// must not be allowed to turn a detection gap into a support claim.
 ///
 /// [`VulkanStatus::Unknown`] — the platform could not be probed at all — keeps
-/// `VulkanOnly`, because withholding the one path such a host has on the
-/// strength of a probe that never ran would be worse than the old assumption,
-/// not better.
+/// `VulkanOnly`: withholding the one path such a host has, on the strength of a
+/// probe that never ran, is a worse answer than the unconditional assumption it
+/// replaces.
 pub fn gpu_support_level(
     detected_gfx_target: Option<&str>,
     compatible_therock_family: Option<&str>,
@@ -682,19 +730,16 @@ pub fn gpu_support_level(
         (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => {
             // `Unknown` only — a platform the probe cannot look at, which keeps
             // the benefit of the doubt. `Inconclusive` is a host that WAS
-            // looked at and showed nothing, and promising it Vulkan is the
-            // symptom this change exists to remove; it is the common
-            // no-driver shape, since most such hosts have no `vulkaninfo`
-            // either. The wording it gets is hedged rather than a confirmed
-            // absence — see `render.rs`.
+            // looked at and showed nothing, and must not be promised Vulkan: it
+            // is the common no-driver shape, since most such hosts have no
+            // `vulkaninfo` either. The wording it gets is hedged rather than a
+            // confirmed absence — see `render.rs`.
             // Every variant is spelled out, with no `_` and no guard. A guard
-            // (`v if v.is_usable()`) reads well but does not count toward
-            // exhaustiveness, so the arms below had to end in a wildcard — and
-            // a wildcard here silently routes any future `VulkanStatus` to
-            // `NoGpuBackend`, which renders as a confirmed fact. Listing them
-            // makes a new variant a compile error instead, the same discipline
-            // `render.rs` uses. The first arm is `VulkanStatus::is_usable` plus
-            // `Unknown`; keep them in step.
+            // reads well but does not count toward exhaustiveness, so the arms
+            // would have to end in a wildcard — and a wildcard here silently
+            // routes any future `VulkanStatus` to `NoGpuBackend`, which renders
+            // as a confirmed fact. Listing every variant makes a new one a
+            // compile error instead, the same discipline `render.rs` uses.
             match vulkan {
                 // A device answered, or a driver is installed and nothing
                 // contradicted it.

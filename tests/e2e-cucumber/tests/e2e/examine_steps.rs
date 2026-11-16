@@ -1711,9 +1711,10 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
 /// It has to be its own step rather than reusing "the user inspects the
 /// system", because that one runs through `run_rocm`, which does not consume
 /// `World::command_env` -- so a planted host root never reaches the child and
-/// the CLI silently describes the *runner* instead. Not hypothetical: it is
-/// what made the first draft of examine-50/51/52 report the lane's own MI300X
-/// as `gfx942` while claiming to be about a Renoir APU.
+/// the CLI silently describes the *runner* instead. A scenario wired to that
+/// step still passes while reporting the lane's own GPU (`gfx942` on the MI300X
+/// runners) under a claim about a planted Renoir APU, so examine-50/51/52 must
+/// use this one.
 #[when("the user inspects that machine")]
 async fn user_inspects_planted_machine_text(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -3355,18 +3356,25 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
         // this GPU, so naming an engine would promise a run the evidence does
         // not support. A driver is what clears either condition.
         //
-        // Split out because the catch-all below demands `--engine lemonade`,
-        // which neither tier's text contains. No lane reaches that assertion
-        // today only because none carries a detected, ROCm-unsupported GPU in
-        // these tiers; dropping these arms again makes the first such runner
-        // red rather than failing here. This arm has been lost to a merge once
-        // already.
+        // Both arms are load-bearing and must stay: the catch-all below demands
+        // `--engine lemonade`, which neither tier's text contains, so a host in
+        // either tier fails examine-49 the moment one of them is dropped. No CI
+        // lane carries a detected, ROCm-unsupported GPU, so that regression is
+        // silent here and only shows up on the first such runner.
         //
         // Told apart by each tier's own wording, as the catalog arm above is:
         // `VulkanUnconfirmed` says the probe could not settle it, `NoGpuBackend`
-        // says it looked and found nothing.
-        (Some(_), None, _) if line.contains("could not confirm") => (
-            "install a Vulkan driver",
+        // says it looked and found nothing. The `VulkanUnconfirmed` guard reads
+        // `rocm_core`'s own constant rather than a copy of its text, so the two
+        // cannot drift apart when the sentence is reworded.
+        //
+        // What that tier owes is ``run `vulkaninfo` ``, not "install a Vulkan
+        // driver": `rocm_support_line` drops the install advice on a Windows
+        // host whose AMD display driver the summary already found, since that
+        // driver *is* the Vulkan driver there. `vulkaninfo` is the one step that
+        // can clear this condition on every host that reaches it.
+        (Some(_), None, _) if line.contains(rocm_core::VULKAN_UNCONFIRMED_CLAIM) => (
+            "run `vulkaninfo`",
             &["rocm install sdk", "--engine lemonade"],
         ),
         (Some(_), None, _) if line.contains("no Vulkan GPU driver was found") => {
@@ -3557,10 +3565,18 @@ async fn unsupported_gpu_without_vulkaninfo(world: &mut E2eWorld) {
 async fn assert_vulkan_unconfirmed(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     let line = rocm_support_line(output).expect("no rocm_support line");
+    // The constant itself, not a copy of its text: this is the same sentence
+    // `lemonade_engine_note` renders a few lines further down the same report,
+    // and reading it from `rocm_core` is what stops this assertion drifting away
+    // from the wording it is meant to pin.
     assert!(
-        line.contains("`vulkaninfo` could not confirm"),
-        "the support line must name the gap that stopped it confirming, not assert \
+        line.contains(rocm_core::VULKAN_UNCONFIRMED_CLAIM),
+        "the support line must say the probe could not settle it, not assert \
          a driver is absent: {line}\n{output}"
+    );
+    assert!(
+        line.contains("run `vulkaninfo`"),
+        "and still name the one step that can settle it: {line}\n{output}"
     );
     assert!(
         !line.contains("Vulkan backend") && !line.contains("runs on"),

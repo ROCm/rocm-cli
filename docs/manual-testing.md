@@ -323,8 +323,8 @@ checks, which cannot be made anywhere else:
 
   - With the AMD display driver (Windows) or Mesa RADV (Linux) installed, the
     line says models can still run through Vulkan and **names the driver**, and
-    `rocm examine --json` shows `vulkan.status` as `available` with the device
-    under `vulkan.devices`. Then actually run
+    `rocm examine --json` shows `summary.vulkan.status` as `available` with the
+    device under `summary.vulkan.devices`. Then actually run
     `rocm serve <model> --engine lemonade` — the point of the claim is that it
     is true, and this is the only place it can be confirmed against real
     hardware.

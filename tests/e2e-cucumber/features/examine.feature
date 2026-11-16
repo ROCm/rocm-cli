@@ -753,16 +753,16 @@ Feature: GPU detection and system inspection
     And the support level agrees with the GPU the inspection detected
     And the support level leaves a command that fits this host
 
-  # The three below close the gap this PR's own notes call unclosable: the
-  # `VulkanOnly` door needs a Renoir/Cezanne Vega APU, and no runner has one.
-  # It does not need the hardware, only the two signals the CLI reads for it --
-  # a KFD node naming the target, and the host's Vulkan driver state -- both of
-  # which the harness can plant. So these run on the ungated mock lane, which is
-  # the lane that has neither.
+  # The `VulkanOnly` door needs a Renoir/Cezanne Vega APU and no runner has one,
+  # but it does not need the hardware: only the two signals the CLI reads for it
+  # -- a KFD node naming the target, and the host's Vulkan driver state -- both
+  # of which the harness can plant. So these run on the ungated mock lane, which
+  # is the lane that has neither.
   #
-  # They exist because the support level used to be inferred: "no ROCm build"
-  # was taken to mean "Vulkan then", on a machine nobody had looked at. Each
-  # scenario pins one of the three answers that inference could not tell apart.
+  # Each pins one of the three answers a probe can reach where inference from the
+  # gfx table reaches only one: "no ROCm build" does not mean "Vulkan then" on a
+  # machine nobody has looked at, and the three scenarios are what keep those
+  # answers distinguishable.
   @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
   Scenario: examine-50 - A GPU the official stack rejects is told which way it can still run models
     Given a machine whose GPU has no official support but has a working Vulkan driver

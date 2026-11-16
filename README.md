@@ -565,10 +565,11 @@ separate from "no GPU backend" for the same reason in the other direction: on
 Windows the Khronos `Drivers` key is legacy and `vulkaninfo` is rarely on PATH,
 so a working machine can land there, and it has not earned a confirmed "no".
 
-`rocm examine --json` reports the evidence behind this in a `vulkan` object
-(status, ICD manifests found, devices enumerated). The field is optional, so an
-older `rocm remote doctor` summary that predates it reads as unknown rather
-than as a false "no Vulkan".
+`rocm examine --json` reports the evidence behind this in a `summary.vulkan`
+object (status, ICD manifests found, devices enumerated). The host summary is
+flattened into the document's `summary` member, so the object is there and not
+at the top level. The field is optional, so an older `rocm remote doctor`
+summary that predates it reads as unknown rather than as a false "no Vulkan".
 
 The probe runs wherever the full host summary is gathered, not on `rocm examine`
 alone: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the
