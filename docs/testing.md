@@ -1844,6 +1844,9 @@ and `config set-engine --runtime-id` store a selector without resolving it. For
 `runtimes activate`, `@id:runtime-lifecycle-case-twin-selector-refused` also
 checks that nothing became active and that naming one key exactly then works.
 
+Uninstalling a runtime that is the rollback target clears it as the rollback
+target in both the config and the active-runtime marker.
+
 Developer-only previous-runtime regression check:
 
 ```bash
