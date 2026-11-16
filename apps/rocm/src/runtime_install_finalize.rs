@@ -910,6 +910,8 @@ fn tensorizer_divergence_note(expected: &[String]) -> Option<String> {
         .iter()
         .find_map(|detail| rocm_core::vllm_tensorizer_override_installed(detail))?;
     // Parsed from a `uv pip check` line, so flattened like the other values here.
+    // The override rule only accepts letters, digits and dots, so this cannot change
+    // the value today; it stays as a guard against a looser rule.
     let installed = sanitize_log_value(&installed);
     Some(format!(
         "  note: vLLM pins an older tensorizer release; this runtime has tensorizer {installed}, at or above the fixed release {}, which the vLLM install keeps, so `uv pip check` reports vLLM's pin as unmet",
@@ -1297,7 +1299,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_note_flattens_control_characters_in_the_version_it_prints() {
+    fn a_version_with_control_characters_is_a_violation_and_is_flattened_when_printed() {
+        // A local segment may only hold letters, digits and dots, so such a version
+        // is not the override and no divergence note prints it; it is a plain
+        // violation, whose line is flattened like every other value here.
         let outcome = classify_dependency_details(
             vec![
                 "The package `vllm` requires `tensorizer==2.10.1`, but `2.12.1+x\ny` is installed"
@@ -1306,11 +1311,12 @@ pub(crate) mod tests {
             &[],
         );
 
-        let rendered = render_engine_dependency_check("vllm", &outcome);
         assert!(
-            rendered.contains("this runtime has tensorizer 2.12.1+x y, at or above"),
-            "{rendered}"
+            matches!(outcome, EngineDependencyCheck::Violated { .. }),
+            "{outcome:?}"
         );
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("`2.12.1+x y` is installed"), "{rendered}");
         assert!(!rendered.contains("\ny"), "{rendered}");
     }
 

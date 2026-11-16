@@ -29,20 +29,33 @@ pub fn tensorizer_override_requirement() -> String {
 
 /// The numeric release of a plain version, or `None` for anything else.
 ///
-/// Accepted: dotted components that are non-empty runs of ASCII digits, then
-/// optionally one last `post<digits>` component (a post-release counts as the
-/// release it follows), and then optionally a `+local` segment, which is not read.
+/// Accepted: dotted components that are runs of ASCII digits, then optionally one
+/// last `post<digits>` component (a post-release counts as the release it follows),
+/// and then optionally one `+local` segment made only of ASCII letters, digits and
+/// dots with no empty component (`+rocm10.1.0.g98dff2a81.d20261002`, `+x`). The
+/// local segment is checked but not read.
 /// Everything else has no release and fails closed: a pre-release (`2.12.1rc1`,
 /// `dev0`), a bare `post`, text after the `post<digits>` component, a marker or
 /// other trailing text, `-`, spaces, non-ASCII digits, a component too large for
-/// `u64`, and the empty string.
+/// `u64`, an empty or repeated `+` segment, and the empty string.
 ///
 /// Leading zeros read as the number (`2.10.01` is 2.10.1). Trailing zero components
 /// are kept: a longer release compares greater than its prefix, which already gives
 /// the right answer for the one release this is compared with (`2.12.1.0` is not
 /// below 2.12.1, `2.10.1.0` is, and `2.12` is) without normalising them away.
 fn release(version: &str) -> Option<Vec<u64>> {
-    let public = version.split('+').next()?;
+    let (public, local) = match version.split_once('+') {
+        Some((public, local)) => (public, Some(local)),
+        None => (version, None),
+    };
+    if let Some(local) = local
+        && !local
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        // Empty, a second `+`, or anything but letters, digits and dots.
+        return None;
+    }
     let mut parts = Vec::new();
     let mut components = public.split('.').peekable();
     while let Some(part) = components.next() {
@@ -55,9 +68,9 @@ fn release(version: &str) -> Option<Vec<u64>> {
             // `post<digits>` as the last component: the release it follows.
             break;
         }
-        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
+        // `u64::parse` is the digit guard: it rejects an empty component, a sign
+        // (`-1`; a `+` cannot reach here, the string was split on it), non-ASCII
+        // digits, anything non-numeric and an overflow.
         parts.push(part.parse::<u64>().ok()?);
     }
     (!parts.is_empty()).then_some(parts)
@@ -290,6 +303,47 @@ mod tests {
         ] {
             assert!(!tensorizer_version_is_fixed(text), "{text:?} fixed");
             assert!(!tensorizer_version_is_below_fix(text), "{text:?} below");
+        }
+    }
+
+    #[test]
+    fn a_local_segment_is_read_only_in_its_plain_shape() {
+        let pin = |required: &str| {
+            let mut pin = subject("tensorizer", Some("2.12.1"));
+            pin.required = Some(required.to_owned());
+            pin
+        };
+        // Real local segments, and the short ones, still read.
+        for local in ["+rocm10.1.0.g98dff2a81.d20261002", "+local", "+x", "+1"] {
+            assert!(
+                is_tensorizer_override(&pin(&format!("2.10.1{local}"))),
+                "pin {local}"
+            );
+            assert!(
+                tensorizer_version_is_fixed(&format!("2.12.1{local}")),
+                "installed {local}"
+            );
+        }
+        // Malformed ones do not: the pin stays a violation, the installed version
+        // is not fixed.
+        for local in [
+            "+",
+            "+a+b",
+            "+a..b",
+            "+.a",
+            "+a.",
+            "+a-b",
+            "+a b",
+            "+\u{ff11}",
+        ] {
+            assert!(
+                !is_tensorizer_override(&pin(&format!("2.10.1{local}"))),
+                "pin {local:?}"
+            );
+            assert!(
+                !tensorizer_version_is_fixed(&format!("2.12.1{local}")),
+                "installed {local:?}"
+            );
         }
     }
 

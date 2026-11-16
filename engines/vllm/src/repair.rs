@@ -326,11 +326,35 @@ mod tests {
             "{:?}",
             assessment.notes
         );
+        // The two headlines are each under 200 characters, not one joined line. The
+        // `expected divergence:` lines after them carry the raw uv text and are not
+        // bounded by this.
         assert!(
-            assessment.notes.iter().all(|note| note.len() < 200),
-            "no note should be a wall of joined findings: {:?}",
+            assessment.notes[..2].iter().all(|note| note.len() < 200),
+            "the headlines should not be a wall of joined findings: {:?}",
             assessment.notes
         );
+    }
+
+    #[test]
+    fn a_marker_qualified_or_unreadable_pin_still_forces_a_reinstall() {
+        // `violation_subject` reads the text after `==` as the required release, so
+        // a pin qualified by an environment marker is not a plain release below the
+        // fix and must not pass as the deliberate override.
+        for pin in [
+            "2.10.1; python_version >= \"3.14\"",
+            "garbage",
+            "2.10.1.postgarbage",
+        ] {
+            let detail = format!(
+                "The package `vllm` requires `tensorizer=={pin}`, but `2.12.1` is installed"
+            );
+            let subject = violation_subject(&detail).expect("a requirement line parses");
+            assert_eq!(subject.required.as_deref(), Some(pin), "{detail}");
+            let assessment =
+                repair_from_violations(&[violation("vllm", &detail)], Some(SDK_BUILD), ALIGNED);
+            assert!(assessment.needed, "{pin:?}: {assessment:?}");
+        }
     }
 
     #[test]

@@ -120,11 +120,15 @@ fn plant(world: &E2eWorld, upgrade: Upgrade, coloured: bool, extra: Extra) {
         &format!(
             r#"#!/bin/sh
 # Like a real interpreter, ignore PYTHONPATH under -E and under -I (which implies
-# -E), alone or combined with other short flags (`-sE`), before the `-c` script.
+# -E), alone or combined with other short flags (`-sE`), before the `-c` script;
+# an option's value (`-Wignore::ImportWarning`) is not a flag.
 for arg in "$@"; do
   case "$arg" in
     -c) break ;;
     --*) ;;
+    # `-W` and `-X` take a value that may contain a capital E or I
+    # (`-Wignore::ImportWarning`, `-X importtime`): not the flags.
+    -W*|-X*) ;;
     -*E*|-*I*) unset PYTHONPATH ;;
   esac
 done
