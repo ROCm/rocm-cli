@@ -1473,20 +1473,19 @@ install.
 `serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
 restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
-per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
-the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
-and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
-is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
-dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
-cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
-they stay reachable when the opt-in is set.
+Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
+them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
+i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
+`E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
+`include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
+gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
+the tagging and that they stay reachable when the opt-in is set.
 
-Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
-every nightly run, and only a manual `include_nightly` dispatch on a host with
-Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
-is reachable ("Report whether Docker is reachable"); check that line before
-relying on this coverage.
+Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
+logs whether Docker is reachable ("Report whether Docker is reachable").
+`serve-27`'s known failure on the Strix Halo pool is an xfail row in
+`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
+means the row is stale.
 
 ### Lemonade managed-serve failure evidence
 
@@ -3046,6 +3045,38 @@ tool-use translation (`tools`, `tool_choice`, `tool_use` and `tool_result`
 blocks, the `tool_use` stop reason) is unit-tested against a fake engine in the
 same module; `serve-53` is the real-engine check.
 
+A recipe may publish a different build of the same model per engine, through the
+`model_id_override` on its `engine_recipes` entry: Lemonade serves GGUF with an
+explicit quantization variant, vLLM serves the safetensors repo. The resolution
+is pinned on every host by `serve_small_assistant_resolves_the_gguf_build_on_lemonade`
+and, catalog-wide, by `every_lemonade_catalog_recipe_resolves_to_a_servable_ref`
+in [serve_cmd.rs](../apps/rocm/src/serve_cmd.rs) — the second fails for any
+recipe that *lists* Lemonade whose resolved ref is a Hugging Face `owner/repo`
+with no `:variant`, which the engine refuses only after it has already been
+launched. A recipe that lists no Lemonade entry is still handed its canonical
+id when Lemonade is reached some other way (an explicit `--engine`, a
+configured default, the platform default), and that is deliberate: such a
+recipe has no GGUF build to substitute.
+
+```bash
+cargo test -p rocm --bin rocm every_lemonade_catalog_recipe_resolves_to_a_servable_ref
+```
+
+The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
+`rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
+It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
+engine is the CLI's to pick here — so the lane that exercises the Lemonade half
+is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
+the queue nightly only) and the vLLM half falls to the Instinct lane. Of those,
+MI300X and the Strix Halo Windows and WSL2 lanes run on pull requests
+([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
+path filter matches; W7900 has no lane there any more) but none of their check names is a required status check,
+so the two unit tests above are the blocking per-PR coverage. The scenario
+carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
+unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
+their known serve failure there has not been observed, and a row claiming a
+known bug before one is seen would say something untrue.
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -4402,6 +4433,65 @@ Windows:
 cargo xtask e2e -- -n '(diagnose-48)'
 ```
 
+## Symptom From A File Or Standard Input
+
+`rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
+standard input when PATH is `-`, so a pasted error never passes through a
+shell's argument parser. How the bytes become the `--symptom` string (one
+trailing line break removed, a UTF-8 byte-order mark dropped, UTF-16 with a
+byte-order mark decoded, anything else UTF-8, and more than 16 MiB a usage
+error) is in [symptom_input.rs](../apps/rocm/src/symptom_input.rs), and its
+unit tests there pin each rule, including that a paste full of quotes,
+`$(...)`, a backtick and a leading `-` comes back byte for byte. They are the
+only tests that would fail if the trailing line break were kept: no scenario
+below depends on it, since a line break changes no cause. The clap rules (the
+two flags exclude each other, `-` is accepted as a path, a leading `-` is
+refused as `--symptom`'s value) are pinned by
+`diagnose_takes_the_symptom_from_a_file_or_stdin_but_not_with_symptom` in
+[cli.rs](../apps/rocm/src/cli.rs).
+
+```bash
+cargo nextest run -p rocm -E 'test(symptom)'
+```
+
+Three scenarios in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature), with their
+steps in
+[symptom_file_steps.rs](../tests/e2e-cucumber/tests/e2e/symptom_file_steps.rs),
+hold the behaviour end to end, GPU or not:
+
+- `diagnose-59` pipes a hostile paste through the platform's own shells (bash
+  on Linux and WSL; cmd.exe and Windows PowerShell on Windows) and requires
+  each diagnosis to equal the one for the same text passed as a single
+  argument with no shell in between: every cause, score and piece of
+  evidence, and every run exiting 0. The paste carries quotes, `$(...)` and a
+  leading `-`, but no shell parses it (each reads it from a file into the
+  pipe), so nothing in it can run by construction; the scenario asserts the
+  diagnosis, not the absence of something no shell could do. The paste is
+  ASCII: Windows PowerShell 5.1 pipes text as ASCII, which is why the docs
+  send PowerShell users through a file instead.
+- `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
+  scenario here; the Windows key is checked by hand in
+  [manual-testing.md](manual-testing.md) section 13) runs
+  `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
+  the whole exchange on screen (it has no scrollback), requires the hint
+  telling the user how to end the paste, then types the paste and Ctrl-D, the
+  Linux end-of-input key the hint names, and requires the screen, which also
+  holds the hint and the echoed paste, to contain the whole report the
+  argument form prints. It first requires that report to differ from the one
+  with no symptom, so a paste that was read and then dropped fails rather than
+  passing on a host where the host's own causes fill the report.
+- `diagnose-61` points the flag at a missing file and at one that is not
+  UTF-8, and requires a usage error (exit code 2) that names the file and the
+  reason, with nothing on stdout.
+
+None of them asserts which catalog entry matched, for the reason given at the
+top of that feature file: they compare two routes on the same host.
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(59|60|61) '
+```
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a model will run on this host
@@ -4499,7 +4589,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   memory, so the pool a recipe minimum is compared against is read separately by
   `detect_host_unified_memory_gib` in
   [unified_memory.rs](../crates/rocm-core/src/host_gpu/unified_memory.rs).
-  Scenarios `diagnose-59`, `diagnose-60` and `diagnose-61` plant a simulated host
+  Scenarios `diagnose-62`, `diagnose-63` and `diagnose-64` plant a simulated host
   (`ROCM_CLI_TEST_HOST_ROOT`) carrying a KFD node and a DRM card with both
   counters, so they run on the ungated lane and describe the same machine
   whatever GPU the runner has: an APU judged on its aperture and reported
@@ -4809,6 +4899,41 @@ it is the one to pass on. The text output names the files it could not read, and
 report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
+
+## Fix Catalog Exit Codes
+
+`rocm fix --json` publishes each exit code twice over: `exit_codes` maps a name
+to its number and `exit_code_descriptions` maps the same name to what it means.
+Both are built from one table, `exit::MEANINGS` in
+[options.rs](../crates/rocm-core/src/fix/options.rs), so a code cannot be named
+without being described. The descriptions are an added field, so
+`contract_version` did not move.
+
+Exit 2 has two causes, and the `unknown_id` description says so: a fix-id the
+catalog does not have, and a command line the argument parser rejects before
+any fix-id is looked up. They are told apart by the message (a stderr line
+starting `Unknown fix-id:` against one starting `error:`), never by the code.
+The claim is about a line, not the start of stderr, because `run()` can print a
+one-time `rocm:` notice before either refusal. Each half of that claim is
+checked where it lives:
+
+- `the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`,
+  `every_published_exit_code_is_described_once` and
+  `every_exit_constant_is_published_and_nothing_else_is` in
+  [manifest.rs](../crates/rocm-core/src/fix/manifest.rs) hold the text and the
+  table, and the table to the `exit::` constants.
+- `a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id` in
+  [main.rs](../apps/rocm/src/main.rs) parses malformed `rocm fix` command lines
+  with the real `clap` definition and checks they exit with the published
+  `unknown_id` code and have a line starting `error:`.
+- `diagnose-34` (`@id:diagnose-fix-catalog-is-machine-readable`) runs the binary:
+  it reads the catalog, then runs `rocm fix` with an unknown fix-id and with an
+  unknown option, and checks each exits with the code the catalog publishes and
+  prints the message the description names. It has no tags, so every lane runs it.
+
+The other five descriptions are claims about the runners. The comment above each
+entry in `exit::MEANINGS` names the unit tests that prove it, and the branches
+no test drives (a command that exits non-zero, a missing tool or install).
 
 ## Doctor Skill Eval Replays
 

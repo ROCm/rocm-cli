@@ -522,11 +522,20 @@ Feature: Diagnosing failures and listing fixes
   # already knows, and a copy can go stale silently. This is the machine-readable
   # form that replaces the copying — what a tool reads instead of parsing the
   # listing meant for people.
+  #
+  # A meaning is only worth publishing if it is true, so the last two steps run
+  # the CLI and hold the published text to what it does. Exit 2 is the one code
+  # with two causes: a fix-id the catalog does not have, and a command line the
+  # argument parser rejects before any fix-id is looked up. They share the code
+  # on purpose (a code of its own would change what existing readers of 2
+  # receive), so the catalog has to say so and say how to tell them apart.
   @id:diagnose-fix-catalog-is-machine-readable
-  Scenario: diagnose-34 - A tool can read the catalog without parsing prose
+  Scenario: diagnose-34 - A tool can read the catalog without parsing prose, and the shared exit code 2 can be told apart
     When a tool asks the CLI for its catalog in machine-readable form
     Then the catalog names every entry and what the CLI does with each
     And it gives the meaning of every exit code the CLI can return
+    And asking for a fix it does not offer exits with the code the catalog describes for that
+    And a malformed command line exits with that same code, as the catalog warns, and is told apart by its message
 
   # `--json` describes the whole catalog, so pairing it with one entry is a
   # question with no answer. Refusing beats ignoring the flag: a caller that
@@ -868,6 +877,53 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI what that machine's report would carry in machine-readable form
     Then the report names the CLI version that `rocm version` leads with
 
+  # A pasted error is hostile to every shell's argument parser: bash and
+  # PowerShell run a `$(...)` even inside double quotes, a stray quote ends the
+  # argument early, cmd.exe has no single quotes at all, and an error that
+  # starts with `-` is read as a flag. `--symptom-file -` takes the paste on
+  # standard input instead, so the shell only ever parses the fixed command.
+  # Each platform's own shells do the piping -- bash on Linux and WSL, cmd.exe
+  # and Windows PowerShell on Windows -- and each result is compared with the
+  # same text handed over as one argument with no shell involved. The paste
+  # matches a catalog entry that scores on every platform, so the comparison is
+  # between two real diagnoses rather than two empty ones; which entry it is,
+  # is not asserted (see the note at the top of this file). Nothing in the
+  # paste can run or be read as a flag: each shell only reads it from a file
+  # (cat, type, Get-Content) into the pipe and never parses it. That holds by
+  # how the paste is handed over, so it is stated here rather than asserted.
+  @id:diagnose-a-piped-paste-is-diagnosed-as-pasted
+  Scenario: diagnose-59 - A pasted error piped to the diagnosis is diagnosed the same as if it had been passed safely
+    Given a pasted error containing quotes, a command substitution and a leading minus sign
+    When the user pipes it to the diagnosis instead of passing it as an argument
+    Then the diagnosis matches the same failure modes as the same text passed safely as an argument
+
+  # Typing `rocm diagnose --symptom-file -` with nothing piped in leaves the CLI
+  # waiting on the terminal. It says so, and how to end the paste; the user
+  # pastes, ends it the way they were told, and the terminal then contains the
+  # whole report the same text passed as an argument gets, below the hint and
+  # the echoed paste. The step first requires that report to differ from the
+  # one without any symptom, so a paste that was read and then dropped cannot
+  # pass.
+  # @requires-os:linux like every other pseudo-terminal scenario in this suite:
+  # on Windows the step hangs under the harness's pseudo-console before the
+  # paste is diagnosed (not investigated further; the console is started with
+  # cursor inheritance, which waits on a reply the screen emulator does not
+  # send). That leaves the Windows half of the hint (Ctrl-Z then Enter) without
+  # an e2e check; docs/manual-testing.md section 13 covers it by hand.
+  @id:diagnose-a-paste-at-the-terminal-is-explained-and-diagnosed @requires-os:linux
+  Scenario: diagnose-60 - Pasting the error at the terminal is explained, and the paste is diagnosed when the user ends it
+    Given a pasted error containing quotes, a command substitution and a leading minus sign
+    When the user asks to paste the error at the terminal, pastes it and ends it as told
+    Then the CLI told the user how to end the paste
+    And the terminal shows the whole report the same text passed safely as an argument gets
+
+  @id:diagnose-an-unreadable-error-file-is-a-usage-error
+  Scenario: diagnose-61 - An error file that cannot be read, or is not text, is refused as a usage error
+    Given an error file that does not exist and one that is not text
+    When the user asks the CLI to diagnose the error in each file
+    Then each is refused as a usage error that names the file and says why
+    And nothing is diagnosed
+
   # ROCMAI-912. An APU has no private VRAM: every adapter query reports the
   # fixed BIOS carve-out as the device's memory (512 MiB on a Ryzen 7 4700U,
   # ~4 GiB on a Strix Halo) while the engine allocates out of system memory the
@@ -885,7 +941,7 @@ Feature: Diagnosing failures and listing fixes
   # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
   # it can have (see the PR text).
   @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
-  Scenario: diagnose-59 - An integrated GPU is judged on the pool it allocates from, not its carve-out
+  Scenario: diagnose-62 - An integrated GPU is judged on the pool it allocates from, not its carve-out
     Given a machine whose only GPU shares system memory, with the pool it may use readable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -901,7 +957,7 @@ Feature: Diagnosing failures and listing fixes
   # `amd-smi` already answered here, with the wrong pool, and would answer
   # identically forever.
   @id:diagnose-model-an-unreadable-shared-pool-is-said-not-guessed @requires-os:linux
-  Scenario: diagnose-60 - An integrated GPU whose pool cannot be read is told so, not given a number
+  Scenario: diagnose-63 - An integrated GPU whose pool cannot be read is told so, not given a number
     Given a machine whose only GPU shares system memory, with the pool it may use unreadable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -916,7 +972,7 @@ Feature: Diagnosing failures and listing fixes
   # planted machine carries a large aperture beside a small VRAM figure, so a
   # verdict reached on either wrong number is visible in the report.
   @id:diagnose-model-a-discrete-card-is-never-credited-with-the-aperture @requires-os:linux
-  Scenario: diagnose-61 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
+  Scenario: diagnose-64 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
     Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
