@@ -257,10 +257,10 @@ queue has (MI325X, MI350X, MI355X) is on them.
   branch, an artifact or log that cannot be downloaded or an import that fails
   never fails the nightly report: the page opens with a `Queue lanes` note
   saying that no queue lanes are in it tonight and why, and the rest is built as
-  before. The verdict does not take that absence for a failure, so the
-  `Release-Readiness` table says it too: its `E2E` row is marked "queue lanes
-  missing" and a warning under the table names the reason. Read it before
-  reading a `GO`: that `GO` does not cover the queue's GPUs.
+  before. A queue that never ran is not a pass, so the
+  release-readiness verdict is `NO-GO` with the failing gate `queue lanes
+  absent: <reason>`; its `E2E` row is marked "queue lanes missing" and a warning
+  under the table names the reason.
 
 What is public follows from the queue's own rules: the artifact is public and
 already scanned, only three of its files are used, and the log is the public job
