@@ -490,7 +490,10 @@ Feature: Release install lifecycle
   #   which masks that regression here.
   #
   # Neither can detect removal of the release channel's signature floor: while a
-  # release key is pinned, a resolved key already forces the check.
+  # release key is pinned, a resolved key already forces the check. Nor does
+  # lifecycle-36 check that the harness passes its channel through: if the step
+  # silently ran a release install instead, the floor would force the same
+  # rejection, and the second regression above would go unnoticed.
 
   @id:lifecycle-linux-default-rejects-untrusted-signer @lifecycle @requires-os:linux
   Scenario: lifecycle-36 - Linux - installing a specific version with the signature requirement turned off still checks the pinned release key and rejects an untrusted signer

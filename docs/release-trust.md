@@ -30,9 +30,9 @@ ROCM_CLI_SIGNING_PRIVATE_KEY_PATH
 
 Stable release and nightly CI set `ROCM_CLI_REQUIRE_SIGNATURE=1`, so packaging
 fails if no signing key is configured or if the `.sig` file is not produced. The
-packaging steps also stop if the `.sig` is missing and run the dist verifier with
-`--require-signatures` before anything is uploaded, and the nightly publish job
-verifies the combined asset set the same way before replacing the public
+packaging steps also stop if the `.sig` is missing and run the dist verifier
+with `--require-signatures` before anything is uploaded, and the nightly publish
+job verifies the combined asset set the same way before replacing the public
 `nightly` release, so neither workflow publishes an unsigned bundle archive. The
 nightly release's convenience assets, attached after those checks, carry no
 sidecars (see
@@ -439,8 +439,8 @@ change matches the `heavy` path filter in
 [ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
 installers, every Rust source and `xtask/`. It reads the one assignment
 the installer actually uses, so each slot must be assigned exactly once as a
-plain declaration, and `install.sh` must mark both of its slots `readonly`. The full rules, and what a
-textual check cannot catch, are in
+plain declaration, and `install.sh` must mark both of its slots `readonly`.
+The full rules, and what a textual check cannot catch, are in
 [verify_pinned_keys.rs](../xtask/src/verify_pinned_keys.rs).
 
 Once the runtime metadata public key and the signed model recipe index (with

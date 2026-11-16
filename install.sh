@@ -635,7 +635,7 @@ fi
 # false and the floor does not fire either, so a release install with no key
 # supplied would skip verification, unless ROCM_CLI_REQUIRE_SIGNATURE=1, which
 # makes it fail for want of a key. The floor is left as it is on purpose: making
-# a release install fail when no key resolves is a separate, planned change. Use
+# a release install fail when no key resolves is tracked as ROCMAI-960. Use
 # ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/PEM to point at an alternate key (e.g. a
 # private mirror).
 if [ "${CHANNEL}" = "release" ] && has_pinned_release_keys; then

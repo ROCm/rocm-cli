@@ -3448,8 +3448,12 @@ signature asked for, an install of a specific version with
 `ROCM_CLI_REQUIRE_SIGNATURE=0` still rejects an archive signed with a local key,
 which the pinned release key does not accept (lifecycle-36), and a release
 install with the variable unset still rejects an archive with no `.sig`
-(lifecycle-37). The scenarios also assert the installer's get-started block
-(banner art only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+(lifecycle-37). The missing-`.sig` case with nothing asked for is covered on
+the `release` channel only. Both scenarios are Linux-only: on Windows, the
+same default path (no key supplied, no signature asked for) has no scenario,
+and lifecycle-17 covers a no-key install only with the requirement set. The
+scenarios also assert the installer's get-started block (banner art only on a
+UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
 piped or `NO_COLOR` output (the colored TTY branch is not driven by any
 scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup

@@ -735,7 +735,7 @@ $signatureRequired = $RequireSignature -or (Test-Truthy $env:ROCM_CLI_REQUIRE_SI
 # release install with no key supplied would skip verification, unless
 # -RequireSignature or ROCM_CLI_REQUIRE_SIGNATURE=1 is given, which makes it
 # fail for want of a key. The floor is left as it is on purpose: making a release
-# install fail when no key resolves is a separate, planned change. Pass
+# install fail when no key resolves is tracked as ROCMAI-960. Pass
 # -SigningPublicKeyPath/-Pem (or the env vars) to point at an alternate key
 # (e.g. a private mirror).
 if ($Channel -eq "release" -and (Test-HasPinnedReleaseKey)) {
