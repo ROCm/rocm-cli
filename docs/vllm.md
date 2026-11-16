@@ -74,8 +74,10 @@ holds torch. That command normally hands `uv` the SDK's `torch`, `torchvision`
 and `torchaudio` along with `rocm`, which replaces the stack the engine or you
 installed (and `triton` with it). With the variable set it asks for the ROCm
 packages alone and leaves the torch stack where it is: the plan prints a
-`torch_kept:` line naming the torch it found, and `rocm install sdk --dry-run`
-shows the same reduced `command:`. A runtime with no torch yet, or an
+`torch_kept:` line naming the torch it found. `rocm install sdk --dry-run`
+runs nothing from the install folder, so it cannot ask the environment which
+torch it holds: the commands it shows install the full stack, and where the
+environment may be reused its `torch_kept:` line says it cannot tell. A runtime with no torch yet, or an
 environment recreated for another Python, still gets the full stack, since
 there is nothing to keep. The runtime's recorded composition (and so its
 runtime key and `rocm update` comparison) is unchanged.

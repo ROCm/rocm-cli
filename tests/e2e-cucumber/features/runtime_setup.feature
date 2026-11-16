@@ -788,3 +788,27 @@ Feature: Runtime configuration
     When the user previews installing the SDK into that folder with that folder's Python as ROCM_CLI_PYTHON
     Then the install fails
     And the preview stops without running that Python and says why
+
+  # The torch-alignment opt-out keeps the torch an environment already holds,
+  # and only that environment's Python can say which torch it holds. A preview
+  # runs nothing from the install folder, so with the opt-out set it says it
+  # cannot tell, rather than asking the folder's Python. The planted Python
+  # records every run, and the Then checks the record together with the line.
+  # Same hermetic setup and Linux-only reason as runtime-33.
+  @id:runtime-install-preview-opt-out-runs-nothing-from-prefix @requires-os:linux
+  Scenario: runtime-37 - Previewing an SDK install with the torch alignment opt-out runs nothing from the install folder
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's folder holds a Python environment ROCm CLI did not make
+    When the user previews installing the SDK into that folder with the torch alignment opt-out set
+    Then the preview says it cannot tell whether that environment's torch is kept and runs nothing from the folder
+
+  # `ROCM_CLI_PYTHON` may name an interpreter relative to the folder the user
+  # runs the command from. The check that the Python can create a virtual
+  # environment starts it in a folder of its own, and a relative path read from
+  # there names nothing, so the Python was reported as unusable although it
+  # works. Same hermetic setup and Linux-only reason as runtime-33.
+  @id:runtime-install-preview-relative-python @requires-os:linux
+  Scenario: runtime-38 - Previewing an SDK install with ROCM_CLI_PYTHON relative to the current folder uses that Python
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews installing the SDK into an empty folder with ROCM_CLI_PYTHON relative to the current folder
+    Then the preview accepts that Python and plans a new Python environment

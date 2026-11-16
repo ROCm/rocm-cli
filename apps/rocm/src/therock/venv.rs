@@ -492,6 +492,11 @@ pub(super) struct DryRunVenvPlan {
     pub(super) python_env: String,
     /// The `key: value` lines printed after `mode: dry-run`, `command` first.
     pub(super) lines: Vec<(&'static str, String)>,
+    /// Whether reuse of the folder's venv is the one outcome the files cannot
+    /// decide: a Python and `pyvenv.cfg` are there, and only running that Python
+    /// could tell. Anything that depends on what the venv holds is unknown then,
+    /// and known (nothing reused) in every other plan.
+    pub(super) reuse_undecided: bool,
 }
 
 /// The `--dry-run` lines for the venv step and the install command.
@@ -510,8 +515,10 @@ pub(super) struct DryRunVenvPlan {
 /// after removing the venv's own entries, which the command does not show), or
 /// a refusal, which gets no command at all since nothing would run.
 ///
-/// The commands carry `UV_VENV_CLEAR=0`, which the install pins for `uv venv`,
-/// and every argument is shell-quoted: the install root comes from a
+/// A plan that shows a `uv venv` command also prints an `env:` line naming
+/// `UV_VENV_CLEAR=0`, which the install sets for `uv venv`; it is a line of its
+/// own rather than a `VAR=value` prefix, which only POSIX shells accept. Every
+/// argument is shell-quoted: the install root comes from a
 /// `--prefix` the assistant can choose, and the line is one a user is invited
 /// to paste.
 pub(super) fn dry_run_venv_plan(
@@ -530,7 +537,7 @@ pub(super) fn dry_run_venv_plan(
     let install = format!("uv {}", display(install_args));
     let with_venv = |rebuilding: bool| {
         format!(
-            "UV_VENV_CLEAR=0 uv {} && uv {}",
+            "uv {} && uv {}",
             display(&uv_venv_command_args(
                 venv_python_arg,
                 install_root,
@@ -556,37 +563,46 @@ pub(super) fn dry_run_venv_plan(
     match (shape, venv_folder_state(paths, install_root, &finding)) {
         (_, Ok(VenvFolder::Empty)) => DryRunVenvPlan {
             python_env: "create a new Python environment in an empty folder".to_owned(),
-            lines: vec![("command", with_venv(false))],
+            reuse_undecided: false,
+            lines: vec![("command", with_venv(false)), ("env", uv_venv_env())],
         },
         (Some(found), Ok(VenvFolder::Owned)) => DryRunVenvPlan {
             python_env: format!("{rebuild} (found {found})"),
-            lines: vec![("command", with_venv(true))],
+            reuse_undecided: false,
+            lines: vec![("command", with_venv(true)), ("env", uv_venv_env())],
         },
         (None, Ok(VenvFolder::Owned)) => DryRunVenvPlan {
             python_env: format!("{reuse}; if not, {rebuild}"),
+            reuse_undecided: true,
             lines: vec![
                 ("command", install),
                 ("command_if_rebuilt", with_venv(true)),
+                ("env", uv_venv_env()),
             ],
         },
         (Some(_), Err(refusal)) => DryRunVenvPlan {
             python_env: "the install will refuse this folder".to_owned(),
+            reuse_undecided: false,
             lines: vec![
-                (
-                    "command",
-                    "none; the install will refuse this folder".to_owned(),
-                ),
+                ("command", "none".to_owned()),
                 ("refusal", format!("{refusal:#}")),
             ],
         },
         (None, Err(refusal)) => DryRunVenvPlan {
             python_env: format!("{reuse}; if not, the install will refuse this folder"),
+            reuse_undecided: true,
             lines: vec![
                 ("command", install),
                 ("refusal_if_not_reused", format!("{refusal:#}")),
             ],
         },
     }
+}
+
+/// The `env:` line beside a previewed `uv venv` command: what the install sets
+/// for it, and why, in a form that does not depend on the user's shell.
+pub(super) fn uv_venv_env() -> String {
+    "UV_VENV_CLEAR=0 for `uv venv`, as the install sets it so that a UV_VENV_CLEAR=1 in the environment cannot make uv clear the folder; set it before running the command".to_owned()
 }
 
 #[cfg(test)]
@@ -658,12 +674,10 @@ mod tests {
 
     #[cfg(unix)]
     fn plant_failing_venv_python(install_root: &Path) {
-        use std::os::unix::fs::PermissionsExt;
         let python = venv_python_path(install_root);
         fs::create_dir_all(python.parent().unwrap()).unwrap();
         let _ = fs::remove_file(&python);
-        fs::write(&python, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+        rocm_core::fake_executable::write_fake_executable(&python, "#!/bin/sh\nexit 1\n").unwrap();
     }
 
     /// What `uv venv` and `save_runtime_manifest` leave in a runtime ROCm CLI
@@ -701,7 +715,6 @@ mod tests {
     /// the way it would against a real uv.
     #[cfg(unix)]
     fn write_logging_fake_uv(dir: &Path) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log = dir.join("uv-calls.log");
         let path = dir.join("uv");
         let script = format!(
@@ -741,8 +754,7 @@ exit 1
 "#,
             log = log.display()
         );
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        rocm_core::fake_executable::write_fake_executable(&path, script).unwrap();
         (path, log)
     }
 
@@ -1073,7 +1085,7 @@ exit 1
             let (root, paths) = venv_rebuild_sandbox("real-uv");
             let log = root.join("uv-calls.log");
             let uv = root.join("uv");
-            fs::write(
+            rocm_core::fake_executable::write_fake_executable(
                 &uv,
                 format!(
                     "#!/bin/sh\necho \"$@\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
@@ -1082,10 +1094,6 @@ exit 1
                 ),
             )
             .unwrap();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
-            }
             let install_root = root.join("prefix");
             ensure_uv_venv(&paths, &uv, &python, &install_root)
                 .unwrap_or_else(|e| panic!("{}: initial venv: {e:#}", real_uv.display()));
@@ -1294,7 +1302,7 @@ exit 1
         let install_args = vec!["pip".to_owned(), "install".to_owned(), "rocm".to_owned()];
         let venv_command = |folder: &Path, allow: &str| {
             format!(
-                "UV_VENV_CLEAR=0 uv venv --python {} {}{allow} && uv pip install rocm",
+                "uv venv --python {} {}{allow} && uv pip install rocm",
                 launcher.display(),
                 folder.display()
             )
@@ -1309,23 +1317,28 @@ exit 1
             (plan.python_env, lines)
         };
         let reuse = "reuse the Python environment here if its Python runs, reports wheel tag cp312 and has this folder as its sys.prefix; this preview runs nothing from the folder, so it cannot tell whether it does";
+        // Beside every `uv venv` command, in place of a POSIX-only prefix.
+        let env_line = "env: UV_VENV_CLEAR=0 for `uv venv`, as the install sets it so that a UV_VENV_CLEAR=1 in the environment cannot make uv clear the folder; set it before running the command".to_owned();
         let rebuild = "rebuild only the venv files ROCm CLI created here: remove bin, Scripts, lib, lib64, Lib, include, Include, CACHEDIR.TAG, pyvenv.cfg first, which the command does not show, then create the venv with --allow-existing; everything else in the folder is kept";
 
         // Missing folder: a fresh venv.
         let empty = root.join("missing");
         let (env, lines) = plan(&empty);
         assert_eq!(env, "create a new Python environment in an empty folder");
-        assert_eq!(lines, [format!("command: {}", venv_command(&empty, ""))]);
+        assert_eq!(
+            lines,
+            [
+                format!("command: {}", venv_command(&empty, "")),
+                env_line.clone()
+            ]
+        );
 
         // Someone's folder with a Python but no pyvenv.cfg: certainly refused.
         let home = root.join("home");
         plant_recording_venv_python(&home, &home, &ran);
         let (env, lines) = plan(&home);
         assert_eq!(env, "the install will refuse this folder");
-        assert_eq!(
-            lines[0],
-            "command: none; the install will refuse this folder"
-        );
+        assert_eq!(lines[0], "command: none");
         assert!(
             lines[1].starts_with(&format!(
                 "refusal: refusing to create the Python environment at {}: the folder is not empty and ROCm CLI cannot show it holds a ROCm CLI install (found a Python at {} with no pyvenv.cfg beside it; no finished ROCm CLI install recorded here",
@@ -1371,6 +1384,7 @@ exit 1
                     "command_if_rebuilt: {}",
                     venv_command(&owned, " --allow-existing")
                 ),
+                env_line.clone(),
             ]
         );
 
@@ -1390,10 +1404,10 @@ exit 1
         );
         assert_eq!(
             lines,
-            [format!(
-                "command: {}",
-                venv_command(&broken, " --allow-existing")
-            )]
+            [
+                format!("command: {}", venv_command(&broken, " --allow-existing")),
+                env_line,
+            ]
         );
 
         assert!(
@@ -1427,7 +1441,25 @@ exit 1
         let cfg =
             |folder: &Path| fs::write(folder.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
 
-        for label in ["does-not-run", "no-cfg", "foreign-prefix", "wrong-tag"] {
+        // A planted Python with one answer of the recording one changed.
+        let rewrite = |python: &str, from: &str, to: &str| {
+            let script = fs::read_to_string(python).unwrap();
+            assert!(script.contains(from), "{script}");
+            rocm_core::fake_executable::write_fake_executable(
+                Path::new(python),
+                script.replace(from, to),
+            )
+            .unwrap();
+        };
+
+        for label in [
+            "does-not-run",
+            "no-cfg",
+            "foreign-prefix",
+            "no-prefix",
+            "no-tag",
+            "wrong-tag",
+        ] {
             let folder = root.join(label);
             let python = venv_python_path(&folder).display().to_string();
             let expected = match label {
@@ -1448,13 +1480,25 @@ exit 1
                         elsewhere.display()
                     )
                 }
+                "no-prefix" => {
+                    // Runs, but fails when asked for its sys.prefix.
+                    plant_recording_venv_python(&folder, &folder, &ran);
+                    rewrite(&python, "*sys.prefix*) echo", "*sys.prefix*) exit 1; echo");
+                    cfg(&folder);
+                    format!("a Python at {python} that does not report its sys.prefix")
+                }
+                "no-tag" => {
+                    // Reports this folder as its sys.prefix, but fails when
+                    // asked for its wheel tag.
+                    plant_recording_venv_python(&folder, &folder, &ran);
+                    rewrite(&python, "*) echo cp312 ;;", "*) exit 1 ;;");
+                    cfg(&folder);
+                    format!("a Python at {python} whose wheel tag could not be read")
+                }
                 _ => {
                     plant_recording_venv_python(&folder, &folder, &ran);
                     // Same Python, but reporting the cp311 tag.
-                    let script = fs::read_to_string(&python)
-                        .unwrap()
-                        .replace("cp312", "cp311");
-                    fs::write(&python, script).unwrap();
+                    rewrite(&python, "cp312", "cp311");
                     cfg(&folder);
                     format!(
                         "a Python at {python} that reports wheel tag cp311 where cp312 is required"
@@ -1509,11 +1553,10 @@ exit 1
     /// `pyvenv.cfg` that decides what that prefix really is.
     #[cfg(unix)]
     fn plant_working_venv_python(install_root: &Path, prefix: &Path) {
-        use std::os::unix::fs::PermissionsExt;
         let python = venv_python_path(install_root);
         fs::create_dir_all(python.parent().unwrap()).unwrap();
         let _ = fs::remove_file(&python);
-        fs::write(
+        rocm_core::fake_executable::write_fake_executable(
             &python,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  case \"$2\" in *sys.prefix*) echo \"{}\" ;; *) echo cp312 ;; esac\n  exit 0\nfi\necho Python 3.12.10\n",
@@ -1521,7 +1564,6 @@ exit 1
             ),
         )
         .unwrap();
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Points where a clear of an owned venv can stop, as the states they

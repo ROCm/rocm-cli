@@ -212,7 +212,7 @@ Expected result:
   the `torch` and `torchvision` versions, so on a host with no `uv` installed it
   stops before that step: the data folder still has no `tools` folder, a
   `resolution_note:` line says why, and `target:`, `runtime_key:`,
-  `package_specs:`, `command:` and `manifest:` read `not resolved by this
+  `package_specs:`, `python_env:`, `command:`, `env:` and `manifest:` read `not resolved by this
   preview`. Run the real install (or any command that fetches `uv`), then the
   preview again, and it prints the complete plan; so does a preview with
   `ROCM_CLI_UV_BINARY` naming a `uv`.
@@ -246,9 +246,12 @@ Expected result:
   the wheel tag it needs, and `rocm update` of that runtime builds the new one
   on Python 3.12 again.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
-- If the `--prefix` folder already has anything in it and its venv does not
-  run, rocm-cli rebuilds only that venv's own files, and only in a folder where
-  a wheel install finished (its `.rocm-cli-runtime.json` names the folder).
+- If the `--prefix` folder already has anything in it and its venv cannot be
+  reused (its Python does not run, has no `pyvenv.cfg` beside it, reports
+  another wheel tag, or reports another `sys.prefix`), rocm-cli rebuilds only
+  that venv's own files, and only in a folder ROCm CLI owns: one where a wheel
+  install finished (its `.rocm-cli-runtime.json` names the folder), or one
+  inside `runtimes/wheel` in ROCm CLI's data folder.
   It prints what it kept and why the venv could not be used (for example `no
   pyvenv.cfg beside it`, or `whose sys.prefix is ..., not this folder`), and
   anything else in the folder, such as `apps/comfyui`, is still there
@@ -259,17 +262,25 @@ Expected result:
   that writes a file when run, and after the preview that file does not exist.
   It reads the folder's files instead. For your home folder with a broken
   `~/bin/python` and no `pyvenv.cfg`, `python_env:` says
-  `the install will refuse this folder`, `command:` is
-  `none; the install will refuse this folder`, and a
+  `the install will refuse this folder`, `command:` is `none`, and a
   `refusal:` line gives the install's message. For a folder with both a Python
   and `pyvenv.cfg`, it cannot tell without running that Python whether the
   venv would be reused, so `python_env:` says so, `command:` shows only the
   `uv pip install`, and a `command_if_rebuilt:` or `refusal_if_not_reused:`
-  line gives the other outcome. The `uv venv` commands it shows start with
-  `UV_VENV_CLEAR=0`, as the install runs them; a rebuild first removes the
-  venv's own entries, which the command does not show. If the Python the
-  preview would check first (on `PATH`, or `ROCM_CLI_PYTHON`) is inside the
-  `--prefix` folder, the preview stops and says it did not run it.
+  line gives the other outcome. A `uv venv` command it shows is followed by an
+  `env:` line naming `UV_VENV_CLEAR=0`, which the install sets for it; a
+  rebuild first removes the venv's own entries, which the command does not
+  show. If a Python the preview would check (`ROCM_CLI_PYTHON`, the first on
+  `PATH`, or the saved managed Python) is inside the `--prefix` folder, the
+  preview stops and says it did not run it. With
+  `ROCM_CLI_DISABLE_TORCH_ALIGNMENT=1` and a folder holding a `bin/python` and
+  `pyvenv.cfg`, a `torch_kept:` line says the preview cannot tell which torch a
+  reused venv would keep, the commands shown still install the full torch
+  stack, and the file the planted Python writes still does not exist. A folder
+  the preview knows is refused or rebuilt gets no `torch_kept:` line.
+- `ROCM_CLI_PYTHON` given relative to the current folder (for example
+  `ROCM_CLI_PYTHON=.venv/bin/python`) is accepted by the install and the
+  preview when that Python works from the current folder.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned

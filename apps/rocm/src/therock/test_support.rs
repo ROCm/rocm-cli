@@ -7,10 +7,13 @@
 //! holds the fixtures every module's tests share.
 
 use super::source::FamilyResolution;
+#[cfg(unix)]
 use super::venv_python_path;
 use crate::runtime_registry::{InstalledRuntimeManifest, runtime_manifest_path};
 use anyhow::Result;
-use rocm_core::{AppPaths, unix_time_millis};
+use rocm_core::AppPaths;
+#[cfg(unix)]
+use rocm_core::unix_time_millis;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -198,14 +201,13 @@ pub(super) fn venv_rebuild_sandbox(label: &str) -> (PathBuf, AppPaths) {
 }
 
 /// A venv Python that appends a line to `ran` every time it is run, then
-/// behaves as [`plant_working_venv_python`]'s does: runs, reports `cp312`,
+/// behaves as `plant_working_venv_python` (in `venv.rs`'s tests) does: runs, reports `cp312`,
 /// and reports `prefix` as its `sys.prefix`, and creates a venv when asked.
 #[cfg(unix)]
 pub(super) fn plant_recording_venv_python(install_root: &Path, prefix: &Path, ran: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let python = venv_python_path(install_root);
     fs::create_dir_all(python.parent().unwrap()).unwrap();
-    fs::write(
+    rocm_core::fake_executable::write_fake_executable(
         &python,
         format!(
             "#!/bin/sh\necho \"$0 $*\" >> \"{}\"\nif [ \"$1\" = \"-m\" ]; then /bin/mkdir -p \"$3\"; exit 0; fi\nif [ \"$1\" = \"-c\" ]; then\n  case \"$2\" in *sys.prefix*) echo \"{}\" ;; *) echo cp312 ;; esac\n  exit 0\nfi\necho Python 3.12.10\n",
@@ -214,7 +216,6 @@ pub(super) fn plant_recording_venv_python(install_root: &Path, prefix: &Path, ra
         ),
     )
     .unwrap();
-    fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(test)]

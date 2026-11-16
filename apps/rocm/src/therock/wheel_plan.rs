@@ -15,7 +15,7 @@
 //! `command`). [`PlanStack::NeedsUv`] says those are not resolved, and why,
 //! where [`PlanStack::Resolved`] carries their values.
 
-use super::kept_torch::{self, KeptTorch};
+use super::kept_torch;
 use super::python::{PlannedPython, WheelCompatibility};
 use super::resolve::{AggregateDeviceTarget, TorchaudioPin, UnresolvedPipRuntime};
 use super::source::{RuntimeVersionSelector, TheRockChannel};
@@ -73,11 +73,12 @@ pub(super) struct ResolvedStack<'a> {
     pub(super) install_root: &'a Path,
     pub(super) runtime_key: &'a str,
     pub(super) package_specs: &'a [String],
-    /// The torch stack the install leaves alone, when the opt-out asked for that and
-    /// the environment has one. The specs above stay the runtime's composition, as
-    /// recorded in its manifest; what `uv` is handed is [`kept_torch::install_specs`]
-    /// of them.
-    pub(super) kept_torch: Option<&'a KeptTorch>,
+    /// Whether `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` is set. A preview's commands
+    /// install `package_specs` in full, as the install does for an environment it
+    /// creates or rebuilds. Where the folder's venv may be reused, which only
+    /// running its Python could tell, the install would keep the torch it holds,
+    /// so the preview prints [`super::kept_torch::preview_line`] there.
+    pub(super) torch_alignment_disabled: bool,
     pub(super) manifest_path: &'a Path,
 }
 
@@ -198,22 +199,10 @@ pub(super) fn write_wheel_plan(output: &mut String, plan: &WheelPlan<'_>) {
             let _ = writeln!(output, "  package_specs: {NOT_RESOLVED}");
         }
     }
-    let kept = match &plan.stack {
-        PlanStack::Resolved(ResolvedStack { kept_torch, .. }) => *kept_torch,
-        PlanStack::NeedsUv { .. } => None,
-    };
     let _ = writeln!(
         output,
-        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction{}",
-        if kept.is_some() {
-            " (the torch, torchvision and torchaudio requirements are resolved but not installed; see torch_kept)"
-        } else {
-            ""
-        }
+        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
     );
-    if let Some(kept) = kept {
-        let _ = writeln!(output, "{}", kept_torch::plan_line(kept));
-    }
     if let Some(warning) = plan.no_wheel_warning {
         let _ = writeln!(output, "  warning: {warning}");
     }
@@ -251,10 +240,7 @@ pub(super) fn write_dry_run_tail(
             if matches!(plan.channel, TheRockChannel::Nightly) {
                 install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
             }
-            install_args.extend(kept_torch::install_specs(
-                stack.package_specs,
-                stack.kept_torch,
-            ));
+            install_args.extend(stack.package_specs.iter().cloned());
             let venv_plan = dry_run_venv_plan(
                 paths,
                 &plan.python.venv_python_arg(),
@@ -263,6 +249,9 @@ pub(super) fn write_dry_run_tail(
                 &install_args,
             );
             let _ = writeln!(output, "  python_env: {}", venv_plan.python_env);
+            if stack.torch_alignment_disabled && venv_plan.reuse_undecided {
+                let _ = writeln!(output, "{}", kept_torch::preview_line(&env_python));
+            }
             for (key, value) in &venv_plan.lines {
                 let _ = writeln!(output, "  {key}: {value}");
             }
@@ -273,6 +262,7 @@ pub(super) fn write_dry_run_tail(
         (PlanStack::NeedsUv { .. }, _) => {
             let _ = writeln!(output, "  python_env: {NOT_RESOLVED}");
             let _ = writeln!(output, "  command: {NOT_RESOLVED}");
+            let _ = writeln!(output, "  env: {NOT_RESOLVED}");
         }
     }
     let _ = writeln!(

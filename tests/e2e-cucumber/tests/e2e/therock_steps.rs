@@ -2954,7 +2954,7 @@ async fn preview_predicts_home_refusal(world: &mut E2eWorld) {
     );
     // No command for an install that will not run one.
     assert!(
-        reported.contains("command: none; the install will refuse this folder"),
+        reported.contains("  command: none\n"),
         "the preview did not say no command will run:\n{reported}"
     );
     assert!(
@@ -2986,10 +2986,18 @@ async fn preview_shows_rebuild_in_place(world: &mut E2eWorld) {
     );
     assert!(
         reported.contains(&format!(
-            "command_if_rebuilt: UV_VENV_CLEAR=0 uv venv --python {}",
+            "command_if_rebuilt: uv venv --python {}",
             root(world).join("fake-python").join("python3.14").display()
         )) && reported.contains(&format!("{} --allow-existing &&", folder.display())),
         "the previewed uv venv command is not the one a rebuild runs:\n{reported}"
+    );
+    // The pin is printed on a line of its own rather than as a `VAR=value`
+    // prefix, which only POSIX shells accept. That the install sets it is proven
+    // by the unit tests in `apps/rocm/src/therock/venv.rs` that read the fake
+    // uv's log for `UV_VENV_CLEAR=0`.
+    assert!(
+        reported.contains("  env: UV_VENV_CLEAR=0 for `uv venv`, as the install sets it so that a UV_VENV_CLEAR=1 in the environment cannot make uv clear the folder"),
+        "the preview did not name the variable the install sets for uv venv:\n{reported}"
     );
     assert!(
         folder.join("lib").is_dir() && folder.join("pyvenv.cfg").is_file(),
@@ -3019,6 +3027,77 @@ async fn preview_sdk_install_with_python_from_folder(world: &mut E2eWorld) {
     let folder = install_folder(world, CLONED_VENV_FOLDER);
     let python = folder.join("bin").join("python");
     run_sdk_install_into_with_python(world, &folder, true, &python);
+}
+
+#[when(
+    "the user previews installing the SDK into that folder with the torch alignment opt-out set"
+)]
+async fn preview_sdk_install_with_alignment_opt_out(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1".into()));
+    run_sdk_install_into(world, &folder, true);
+}
+
+#[then(
+    "the preview says it cannot tell whether that environment's torch is kept and runs nothing from the folder"
+)]
+async fn preview_cannot_tell_kept_torch(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    let reported = reported(world);
+    assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
+    assert!(
+        reported.contains(&format!(
+            "torch_kept: cannot tell; ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set, so if the venv whose Python is {} is reused and holds torch, the install keeps that torch and hands uv only the ROCm packages, without the torch, torchvision and torchaudio requirements the commands shown include; this preview runs nothing from the install folder, so it does not know which torch that venv holds\n",
+            folder.join("bin").join("python").display()
+        )),
+        "the preview did not say it cannot tell whether torch is kept:\n{reported}"
+    );
+    // The line's claim about the real install (a reused venv keeps its torch and
+    // uv is handed only the ROCm packages) is proven by scenario
+    // `@id:runtime-torch-alignment-opt-out` and by the unit test
+    // `an_opted_out_environment_with_torch_installs_only_the_rocm_packages` in
+    // `apps/rocm/src/therock/kept_torch.rs`.
+    // The line says the commands shown carry the full torch stack; they do.
+    assert!(
+        reported
+            .lines()
+            .any(|line| line.starts_with("  command: uv pip install")
+                && line.contains("torchvision")
+                && line.contains("torchaudio")),
+        "the previewed command does not carry the torch stack the line says it does:\n{reported}"
+    );
+    assert_no_prefix_python_ran(world, &reported);
+    assert!(folder.join("bin").join("python").is_file() && folder.join("pyvenv.cfg").is_file());
+}
+
+#[when(
+    "the user previews installing the SDK into an empty folder with ROCM_CLI_PYTHON relative to the current folder"
+)]
+async fn preview_sdk_install_with_relative_python(world: &mut E2eWorld) {
+    let folder = install_folder(world, EMPTY_INSTALL_FOLDER);
+    let launcher = root(world).join("fake-python").join("python3.14");
+    write_executable(
+        &launcher,
+        "#!/bin/sh\nif [ \"$1\" = -c ]; then echo cp314; fi\nexit 0\n",
+    );
+    world.command_dir = Some(root(world).to_path_buf());
+    run_sdk_install_into_with_python(world, &folder, true, Path::new("fake-python/python3.14"));
+}
+
+#[then("the preview accepts that Python and plans a new Python environment")]
+async fn preview_accepts_relative_python(world: &mut E2eWorld) {
+    let reported = reported(world);
+    assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
+    assert!(
+        !reported.contains("is not usable"),
+        "the preview rejected a Python that works:\n{reported}"
+    );
+    assert!(
+        reported.contains("python_env: create a new Python environment in an empty folder"),
+        "the preview did not plan the environment:\n{reported}"
+    );
 }
 
 #[then("the preview stops without running that Python and says why")]

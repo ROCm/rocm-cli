@@ -494,13 +494,20 @@ fn install_wheel_runtime(
         &resolution.latest_version,
     );
     // Under the alignment opt-out an environment that already holds torch keeps it:
-    // the install then asks `uv` for the ROCm packages alone. Decided here, from the
-    // environment the install will run in, so the preview and the install name the
-    // same requirements.
+    // the install then asks `uv` for the ROCm packages alone. Only running the
+    // environment's Python can tell which torch it holds, and a preview runs nothing
+    // from the install folder, so a preview shows the full command and, where the
+    // venv may be reused, says it cannot tell; a real install asks here and again
+    // once the environment is prepared.
     let planned_env_python = venv_python_path(&install_root);
-    let planned_kept = kept_torch::kept_torch_stack(rocm_core::torch_alignment_disabled(), || {
-        kept_torch::installed_torch_stack(&planned_env_python)
-    });
+    let torch_alignment_disabled = rocm_core::torch_alignment_disabled();
+    let planned_kept = if dry_run {
+        None
+    } else {
+        kept_torch::kept_torch_stack(torch_alignment_disabled, || {
+            kept_torch::installed_torch_stack(&planned_env_python)
+        })
+    };
     let plan = WheelPlan {
         channel,
         version_selector,
@@ -521,10 +528,10 @@ fn install_wheel_runtime(
             install_root: &install_root,
             runtime_key: &runtime_key,
             package_specs: &wheel_composition.package_specs,
-            // A real install decides again once the environment is prepared (it may
-            // be recreated and lose its torch), and writes the one `torch_kept:` line
-            // then; a preview cannot know, so it prints the plan's.
-            kept_torch: if dry_run { planned_kept.as_ref() } else { None },
+            // A real install writes its one `torch_kept:` line once the environment
+            // is prepared (it may be recreated and lose its torch); a preview says
+            // what it could not tell.
+            torch_alignment_disabled,
             manifest_path: &manifest_path,
         }),
     };

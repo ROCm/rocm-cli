@@ -1109,8 +1109,9 @@ fn verify_python_can_create_venv(program: &Path) -> Result<()> {
     let probe_root = python_venv_probe_temp_root()?;
     let probe_dir = probe_root.join("env");
     let args = python_venv_args(&probe_dir);
+    let program = anchored_to_current_dir(program);
     let result = run_command_in(
-        program,
+        &program,
         args.iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
@@ -1120,6 +1121,21 @@ fn verify_python_can_create_venv(program: &Path) -> Result<()> {
     );
     let _ = fs::remove_dir_all(&probe_root);
     result
+}
+
+/// `program` as a path that still names the same file once a child is started
+/// in another folder. On Unix a program path that has a directory part
+/// (`.venv/bin/python`, as `ROCM_CLI_PYTHON` or a relative `PATH` entry gives
+/// one) is resolved against the child's working directory, so the probe's own
+/// folder would otherwise stand in for the user's; Windows resolves it
+/// differently, and an absolute path means the same on both. A bare name
+/// (`python3`) is left alone: it is looked up on `PATH`, not in a folder, and
+/// anchoring it would stop that.
+fn anchored_to_current_dir(program: &Path) -> PathBuf {
+    if program.is_absolute() || program.components().count() < 2 {
+        return program.to_path_buf();
+    }
+    std::path::absolute(program).unwrap_or_else(|_| program.to_path_buf())
 }
 
 fn python_venv_probe_temp_root() -> Result<PathBuf> {
@@ -2949,5 +2965,59 @@ echo Python 3.12.10
         );
         assert!(!ran_in.exists(), "the probe's folder is removed afterwards");
         fs::remove_dir_all(root).ok();
+    }
+
+    /// `ROCM_CLI_PYTHON=.venv/bin/python` reaches the probe as a relative path
+    /// that works from the user's directory. The probe starts in a folder of its
+    /// own, so the path has to be anchored first or the launch fails and a Python
+    /// that works is reported as unusable. The relative path starts with `src/`,
+    /// which the test's working directory (the crate root) has and the probe's
+    /// fresh folder does not, so it names nothing from the probe's folder however
+    /// deep the temp folder is; the process's directory is not changed.
+    #[test]
+    #[cfg(unix)]
+    fn the_venv_probe_accepts_an_interpreter_given_as_a_relative_path() {
+        let (root, _paths) = venv_rebuild_sandbox("probe-relative");
+        let python = root.join("python3");
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            "#!/bin/sh\nif [ \"$1\" = \"-m\" ]; then /bin/mkdir -p \"$3\"; fi\nexit 0\n",
+        )
+        .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            cwd.join("src").is_dir(),
+            "cargo runs tests from the crate root"
+        );
+        let mut relative = PathBuf::from("src");
+        for _ in cwd.components() {
+            relative.push("..");
+        }
+        relative.push(python.strip_prefix("/").unwrap());
+        assert!(relative.is_relative() && relative.components().count() > 2);
+
+        verify_python_can_create_venv(&relative)
+            .expect("a relative interpreter that works from here is usable");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// What the probe is handed, on every platform: a relative path with a
+    /// folder in it becomes the same path under the current directory, and a
+    /// bare name or an absolute path is passed on as it is.
+    #[test]
+    fn a_relative_interpreter_path_is_anchored_to_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let relative = Path::new(".venv").join("bin").join("python");
+        assert_eq!(
+            anchored_to_current_dir(&relative),
+            cwd.join(".venv").join("bin").join("python")
+        );
+        assert_eq!(
+            anchored_to_current_dir(Path::new("python3")),
+            Path::new("python3"),
+            "a bare name is looked up on PATH and stays as it is"
+        );
+        let absolute = cwd.join("python3");
+        assert_eq!(anchored_to_current_dir(&absolute), absolute);
     }
 }
