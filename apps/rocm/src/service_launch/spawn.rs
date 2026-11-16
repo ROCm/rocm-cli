@@ -102,17 +102,29 @@ fn settle_startup_death(
 /// are injected so a unit test runs the exit-detected path on every platform,
 /// including the Windows lane that actually calls it.
 ///
+/// `is_running` takes no pid, deliberately. The caller must answer from the
+/// [`rocm_core::ManagedChildLiveness`] it holds for the child it just spawned —
+/// the same check `service_control::ensure_restarted_child_survives_startup`
+/// takes on the sibling restart path — and never from a bare
+/// `rocm_core::process_is_running` pid probe. A `false` here goes straight to
+/// [`settle_startup_death`], which stamps the manifest and the engine state file
+/// `failed` and aborts the launch; `process_is_running`'s own doc comment warns
+/// that a live process this one may not open reads as not running there, so the
+/// raw probe reports a perfectly healthy new engine as a crash — ROCMAI-541's
+/// own symptom, on the platform the ticket is about. Taking the answer rather
+/// than the pid makes passing the raw probe a type error instead of a silent
+/// one; `rocm_core`'s `pid_child_is_running` pins the policy itself.
+///
 /// # Errors
 /// Fails with the startup-failure detail when `is_running` reports the child dead.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn ensure_spawned_child_survives_startup(
-    child_pid: u32,
     log_path: &Path,
     settle: impl FnOnce(),
-    is_running: impl FnOnce(u32) -> bool,
+    is_running: impl FnOnce() -> bool,
 ) -> Result<()> {
     settle();
-    if is_running(child_pid) {
+    if is_running() {
         Ok(())
     } else {
         bail!("{}", managed_engine_startup_failure_detail("", log_path))
@@ -552,15 +564,24 @@ fn launch_managed_engine_child_locked(
         // ours: cleanup binds its kill to it rather than to whatever owns the
         // pid by then.
         record.record_engine_identity(child_pid);
+        // Built *before* the early-exit check, not after it, because the check
+        // is the first thing that needs it. It used to be constructed two lines
+        // below and the check ran on a bare `rocm_core::process_is_running` pid
+        // probe, which collapses "could not query" into "gone" — so a transient
+        // `OpenProcess` denial on a healthy engine was reported as a crash and
+        // stamped `failed`, which is ROCMAI-541's own symptom. The sibling
+        // restart path (`service_control::ensure_restarted_child_survives_startup`)
+        // already asks the liveness handle; this is the same question, so it
+        // gets the same answer.
+        let mut liveness = rocm_core::ManagedChildLiveness::from_pid(child_pid);
         // The same stop-vs-crash verdict the Unix branch below makes. This
         // check is the Windows path's only early exit, and it used to just
         // bail: see `settle_startup_death` for why that missed ROCMAI-541's
         // own acceptance criterion on the platform the ticket is about.
         if let Err(error) = ensure_spawned_child_survives_startup(
-            child_pid,
             &record.log_path,
             || thread::sleep(Duration::from_millis(200)),
-            rocm_core::process_is_running,
+            || liveness.is_running(),
         ) {
             if settle_startup_death(
                 paths,
@@ -575,10 +596,7 @@ fn launch_managed_engine_child_locked(
             }
             return Err(error);
         }
-        (
-            child_pid,
-            rocm_core::ManagedChildLiveness::from_pid(child_pid),
-        )
+        (child_pid, liveness)
     };
     #[cfg(not(windows))]
     let (child_pid, liveness) = {
@@ -713,11 +731,9 @@ mod tests {
         fs::write(&log, "boom: engine could not start\n")?;
         let settled = std::cell::Cell::new(false);
         let error = ensure_spawned_child_survives_startup(
-            4242,
             &log,
             || settled.set(true),
-            |pid| {
-                assert_eq!(pid, 4242);
+            || {
                 assert!(settled.get(), "liveness must be probed after the wait");
                 false
             },
@@ -725,7 +741,48 @@ mod tests {
         .expect_err("a dead child must fail the launch");
         assert!(settled.get(), "the startup window must elapse first");
         assert!(format!("{error:#}").contains("boom"), "{error:#}");
-        ensure_spawned_child_survives_startup(4242, &log, || {}, |_| true)?;
+        ensure_spawned_child_survives_startup(&log, || {}, || true)?;
+        Ok(())
+    }
+
+    /// ROCMAI-541 review: the Windows launch path's early exit must not call a
+    /// child it merely *could not query* dead.
+    ///
+    /// The check used to be handed `rocm_core::process_is_running`, whose own
+    /// doc comment says a decision that must not take a process for gone has to
+    /// ask `probe_process` instead and keep `ProcessProbe::Unqueryable` apart.
+    /// This is such a decision: its `false` reaches `settle_startup_death`,
+    /// which stamps the manifest *and* the engine state file `failed` and aborts
+    /// the launch, so a transient `ERROR_ACCESS_DENIED` on a healthy new engine
+    /// was reported as the crash ROCMAI-541 is about. The fix routes it through
+    /// the `ManagedChildLiveness` the launch already built, exactly as the
+    /// sibling restart path does.
+    ///
+    /// Asserted here as the composed verdict rather than just the probe, because
+    /// that is what the bug cost: the three probe answers are mapped the way
+    /// `ManagedChildLiveness`'s Windows arm maps them (`rocm_core`'s
+    /// `pid_child_is_running`, which cannot be reached from this crate and is
+    /// pinned by its own test there), and only a *confirmed* exit may produce a
+    /// startup failure. A check that collapsed `Unqueryable` would fail the
+    /// middle case — the only one the two candidate probes disagree about.
+    #[test]
+    fn a_child_that_could_not_be_queried_does_not_fail_the_launch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("engine.log");
+        fs::write(&log, "boom: engine could not start\n")?;
+        for (probe, survives) in [
+            (rocm_core::ProcessProbe::Running, true),
+            (rocm_core::ProcessProbe::Unqueryable, true),
+            (rocm_core::ProcessProbe::Gone, false),
+        ] {
+            let outcome =
+                ensure_spawned_child_survives_startup(&log, || {}, || probe.may_be_running());
+            assert_eq!(
+                outcome.is_ok(),
+                survives,
+                "{probe:?} must leave the launch running={survives}"
+            );
+        }
         Ok(())
     }
 

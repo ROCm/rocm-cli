@@ -9,10 +9,35 @@
 //! for a child the caller still holds, and the distinction is the whole point
 //! of the type (see its doc comment for the zombie case it exists to handle).
 
+use crate::process::ProcessProbe;
 // Only the Windows arm calls it; the Unix arm reaps through the retained
 // `Child`. Gated to match, or the Unix `-D warnings` build rejects it unused.
 #[cfg(windows)]
 use crate::process::probe_process;
+
+/// The pid-probe liveness policy the Windows arm runs: a probe that *cannot*
+/// answer means the child **may still be running**, never that it is gone.
+///
+/// Extracted from [`ManagedChildLiveness::is_running`] and compiled on every
+/// platform — only the call site is `#[cfg(windows)]` — so the Linux lane can
+/// pin the discrimination the whole type exists for. The
+/// `ManagedChildLiveness::Windows` variant cannot even be constructed off
+/// Windows, so without this seam the policy was exercised by nothing but a real
+/// Windows CI run against a real child, which is never
+/// [`ProcessProbe::Unqueryable`] in the first place.
+///
+/// Callers turn a `false` here into a crash verdict that stamps the service
+/// record and the engine state file `failed`, so collapsing `Unqueryable` into
+/// "not running" — exactly what [`crate::process_is_running`] does, and what its
+/// own doc comment warns against — reports a healthy engine as crashed on a
+/// transient `ERROR_ACCESS_DENIED` (ROCMAI-541's own symptom).
+///
+/// The probe is a parameter purely so the tests below can drive all three
+/// answers on any platform; production always passes [`probe_process`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pid_child_is_running(pid: u32, probe: impl FnOnce(u32) -> ProcessProbe) -> bool {
+    probe(pid).may_be_running()
+}
 
 /// Confirms whether a managed-service child is still running, using a
 /// platform-appropriate check that can tell a truly running process apart from
@@ -83,7 +108,7 @@ impl ManagedChildLiveness {
             #[cfg(not(windows))]
             Self::Unix(child) => matches!(child.try_wait(), Ok(None)),
             #[cfg(windows)]
-            Self::Windows(pid) => probe_process(*pid).may_be_running(),
+            Self::Windows(pid) => pid_child_is_running(*pid, probe_process),
         }
     }
 }
@@ -91,6 +116,41 @@ impl ManagedChildLiveness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROCMAI-541 review: the pid-backed liveness policy must not read "I could
+    /// not ask" as "it is gone".
+    ///
+    /// This is the one assertion that discriminates [`pid_child_is_running`]
+    /// from the [`crate::process_is_running`] probe the launch path used to
+    /// pass: the two agree on `Running` and on `Gone`, and differ **only** on
+    /// `Unqueryable`, which `process_is_running` collapses into `false`. That
+    /// `false` is not advisory — it reaches `settle_startup_death`, which stamps
+    /// the manifest and the engine state file `failed` and aborts the launch, so
+    /// collapsing it turns a transient `OpenProcess` denial on a healthy new
+    /// engine into a reported crash.
+    ///
+    /// Runs on every platform deliberately. The real `Self::Windows` arm cannot
+    /// be built off Windows and, even on Windows, the existing child-fixture
+    /// test below can only produce `Running`/`Gone` from a real process — so the
+    /// middle answer, the only one the two candidate probes disagree about, had
+    /// nothing exercising it anywhere.
+    #[test]
+    fn an_unqueryable_pid_child_is_not_reported_gone() {
+        for (probe, expected) in [
+            (ProcessProbe::Running, true),
+            (ProcessProbe::Unqueryable, true),
+            (ProcessProbe::Gone, false),
+        ] {
+            assert_eq!(
+                pid_child_is_running(4242, |pid| {
+                    assert_eq!(pid, 4242, "the probe must be asked about the child's pid");
+                    probe
+                }),
+                expected,
+                "{probe:?} must read as running={expected}"
+            );
+        }
+    }
 
     /// ROCMAI-541: pins the core contract `ManagedChildLiveness` exists
     /// for — a child that has exited must read as not-running, and a second
