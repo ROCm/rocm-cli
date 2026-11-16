@@ -511,15 +511,14 @@ fn cannot(
 }
 
 /// Text from a stranger's header as it may be shown: every character that would
-/// change how a terminal renders the text around it (a control, a
-/// bidirectional override, a line separator) becomes `?`. The architecture name
-/// is the one header string the report prints.
+/// change how a terminal renders the text around it, or that it would not show
+/// (a control, a bidirectional override, a line separator, any other
+/// default-ignorable character: `terminal::is_display_altering`) becomes `?`.
+/// The architecture name is the one header string the report prints.
 fn shown_text(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if crate::terminal::is_control_or_format(c)
-                || crate::terminal::is_control_or_line_separator(c)
-            {
+            if crate::terminal::is_display_altering(c) {
                 '?'
             } else {
                 c
@@ -2202,6 +2201,23 @@ mod tests {
         );
         assert_eq!(result.architecture.as_deref(), Some("llama?evil?"));
         assert!(evidence_lines(&result).iter().all(|line| line.is_ascii()));
+    }
+
+    /// Invisible characters outside the `Cf` category are replaced too: a
+    /// Hangul filler draws as blank space and a variation selector draws
+    /// nothing, so either would let a name differ from what is shown.
+    #[test]
+    fn an_architecture_name_cannot_hide_text_behind_an_invisible_character() {
+        let builder = llama_like(10).string("general.architecture", "lla\u{3164}ma\u{FE0F}");
+        let (header, size) = header_of(&builder, 4096);
+        let result = estimate(
+            &header,
+            size,
+            1024,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(8.0),
+        );
+        assert_eq!(result.architecture.as_deref(), Some("lla?ma?"));
     }
 
     /// U+2028 and U+2029 are line separators, not controls: a terminal and a
