@@ -617,7 +617,6 @@ mod tests {
         plant_recording_venv_python, venv_rebuild_sandbox, write_fake_python_reporting,
         write_fake_uv_creating_venv,
     };
-    #[cfg(unix)]
     use rocm_core::unix_time_millis;
 
     #[test]
