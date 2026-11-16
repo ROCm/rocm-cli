@@ -926,6 +926,20 @@ mod tests {
         }
     }
 
+    /// The adoption marker is persisted manifest format: every runtime adopted
+    /// so far holds this exact string in its `selected_artifact_url` on disk,
+    /// and the listing recognises it by comparison. Changing the value without
+    /// a migration would make those runtimes list the marker as their package
+    /// source. In-crate code — the producer, the reader and the other unit
+    /// tests — uses the constant, so it cannot notice the value changing. Two
+    /// checks pin the on-disk literal instead: this test, and scenario
+    /// `runtime-lifecycle-19`, whose `plant_adopted_runtime` step writes the
+    /// literal into a manifest and expects it listed as `source=unrecorded`.
+    #[test]
+    fn adoption_marker_keeps_its_persisted_value() {
+        assert_eq!(ADOPTED_RUNTIME_ARTIFACT_URL, "adopted-read-only");
+    }
+
     /// A manifest from before compositions were recorded has only the field,
     /// and one older still has neither — those installs all had the toolchain.
     #[test]

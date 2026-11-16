@@ -763,65 +763,37 @@ mod tests {
     /// Adoption installs nothing, so there is no package source to name: the
     /// manifest's artifact URL holds only the adoption marker. The listing must
     /// say the source was not recorded rather than present that marker as one.
-    /// The request is the one `rocm runtimes adopt` builds with neither
-    /// `--channel` nor `--runtime-id`, so the channel is adoption's default,
-    /// `release`.
+    /// The channel is the one adoption recorded, for the request `rocm runtimes
+    /// adopt` builds with no `--runtime-id`: adoption's default, `release`, when
+    /// no `--channel` is named, and `nightly` after `--channel nightly`.
     #[test]
-    fn adopted_runtime_lists_its_source_as_unrecorded() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt-provenance");
-        let adopted =
-            adopt_test_runtime_with(&root, &paths, TestAdoptRequest::Inferred { channel: None })?;
-        let rendered =
-            crate::runtimes_cmd::render_runtimes_text(&paths, &RocmCliConfig::default())?;
-        let _ = fs::remove_dir_all(root);
+    fn adopted_runtime_lists_its_channel_and_its_source_as_unrecorded() -> Result<()> {
+        for (channel_flag, expected_channel) in [(None, "release"), (Some("nightly"), "nightly")] {
+            let (root, paths) = test_paths("runtime-adopt-provenance");
+            let adopted = adopt_test_runtime_with(
+                &root,
+                &paths,
+                TestAdoptRequest::Inferred {
+                    channel: channel_flag,
+                },
+            )?;
+            let rendered =
+                crate::runtimes_cmd::render_runtimes_text(&paths, &RocmCliConfig::default())?;
+            let _ = fs::remove_dir_all(root);
 
-        assert_eq!(adopted.channel, "release");
-        let row = format!(" {} runtime_id=", adopted.runtime_key);
-        let provenance = rendered
-            .lines()
-            .skip_while(|line| !line.contains(&row))
-            .find(|line| line.trim_start().starts_with("provenance:"))
-            .unwrap_or_else(|| panic!("no provenance line for the adopted runtime:\n{rendered}"));
-        assert_eq!(
-            provenance,
-            "      provenance: channel=release source=unrecorded \
-             source_layout_generation=unrecorded device_target=unrecorded",
-            "{rendered}"
-        );
-        Ok(())
-    }
-
-    /// An adopted runtime's channel is the one adoption recorded. With
-    /// `--channel nightly` and no `--runtime-id`, that is `nightly`, and the
-    /// listing shows it — not the `release` that adoption records when no
-    /// channel is named (`adopted_runtime_lists_its_source_as_unrecorded`).
-    #[test]
-    fn adopted_nightly_runtime_lists_its_channel_as_nightly() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt-provenance-nightly");
-        let adopted = adopt_test_runtime_with(
-            &root,
-            &paths,
-            TestAdoptRequest::Inferred {
-                channel: Some("nightly"),
-            },
-        )?;
-        let rendered =
-            crate::runtimes_cmd::render_runtimes_text(&paths, &RocmCliConfig::default())?;
-        let _ = fs::remove_dir_all(root);
-
-        assert_eq!(adopted.channel, "nightly");
-        let row = format!(" {} runtime_id=", adopted.runtime_key);
-        let provenance = rendered
-            .lines()
-            .skip_while(|line| !line.contains(&row))
-            .find(|line| line.trim_start().starts_with("provenance:"))
-            .unwrap_or_else(|| panic!("no provenance line for the adopted runtime:\n{rendered}"));
-        assert_eq!(
-            provenance,
-            "      provenance: channel=nightly source=unrecorded \
-             source_layout_generation=unrecorded device_target=unrecorded",
-            "{rendered}"
-        );
+            assert_eq!(
+                adopted.channel, expected_channel,
+                "--channel {channel_flag:?}"
+            );
+            assert_eq!(
+                crate::runtimes_cmd::tests::provenance_line(&rendered, &adopted.runtime_key),
+                format!(
+                    "      provenance: channel={expected_channel} source=unrecorded \
+                     source_layout_generation=unrecorded device_target=unrecorded"
+                ),
+                "--channel {channel_flag:?}:\n{rendered}"
+            );
+        }
         Ok(())
     }
 

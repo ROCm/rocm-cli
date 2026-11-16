@@ -1814,19 +1814,28 @@ the blank and trimming rules are pinned by
 padded values are not what `rocm install sdk` writes, but can come from a
 hand-edited manifest or one brought in with `rocm runtimes import`. An adopted
 runtime's channel is the one adoption recorded: `release` when none was named
-(`adopted_runtime_lists_its_source_as_unrecorded`) and `nightly` after
-`--channel nightly` (`adopted_nightly_runtime_lists_its_channel_as_nightly`),
-both in [runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs).
+and `nightly` after `--channel nightly`, both pinned by
+`adopted_runtime_lists_its_channel_and_its_source_as_unrecorded` in
+[runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs). The marker adoption
+writes in place of an artifact URL is persisted manifest format. Code in the
+crate refers to it only through its constant, so two checks pin the literal
+value: `adoption_marker_keeps_its_persisted_value` in
+[runtime_registry.rs](../apps/rocm/src/runtime_registry.rs), and
+`runtime-lifecycle-19` (below), which plants it in an adopted runtime's
+manifest.
 `rocm examine` prints the same four facts for the active runtime as
 `active_runtime_channel`, `active_runtime_source`,
 `active_runtime_source_layout_generation` and `active_runtime_device_target`,
 from the same fields. The unit tests
 `runtime_list_names_where_each_runtime_came_from` and
 `examine_names_the_active_runtime_provenance_the_listing_shows` in
-[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pin the values;
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pin the values, the
+latter for an active nightly runtime and an active adopted one;
 `@id:runtime-lifecycle-list-names-runtime-provenance` (`runtime-lifecycle-19`)
-checks the listing end to end with a planted nightly runtime and an older one
-that recorded neither its layout nor an exact target, and
+checks the listing end to end with a planted nightly runtime, an older one
+that recorded neither its layout nor an exact target, and an adopted one whose
+manifest holds the adoption marker as earlier releases wrote it, which must
+list `source=unrecorded`; and
 `@id:examine-reports-where-the-active-runtime-came-from` (`examine-49`) checks
 the `examine` lines. Both plant read-only manifests and run on the mock lane:
 

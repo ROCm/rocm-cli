@@ -183,6 +183,47 @@ pub(crate) fn plant_nightly_exact_target_runtime(world: &E2eWorld) {
     .expect("failed to write runtime manifest");
 }
 
+/// Key of the planted adopted runtime, in the shape `rocm runtimes adopt`
+/// derives when no key is given: `adopted-{channel}-pip-{family}-{version}`.
+const ADOPTED_KEY: &str = "adopted-release-pip-gfx1100-7-13-0";
+/// Version matching [`ADOPTED_KEY`].
+const ADOPTED_VERSION: &str = "7.13.0";
+
+/// Write a runtime manifest carrying the fields the listing reads, as adoption
+/// writes them for an environment ROCm CLI did not install: read-only,
+/// `imported_from` its own folder, no package index or source layout, and the
+/// adoption marker where an artifact URL would be. It is not everything
+/// `rocm runtimes adopt` writes (there is no SDK probe or Python), and it is
+/// planted rather than adopted because adopting needs a real ROCm SDK
+/// environment to probe.
+fn plant_adopted_runtime(world: &E2eWorld) {
+    let install_root = plant_runtime(world, ADOPTED_KEY, "gfx1100");
+    let manifest_path = registry_dir(world).join(format!("{ADOPTED_KEY}.json"));
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("failed to read planted manifest"),
+    )
+    .expect("planted manifest is not JSON");
+    let fields = manifest
+        .as_object_mut()
+        .expect("planted manifest is not an object");
+    fields.insert("version".into(), ADOPTED_VERSION.into());
+    fields.insert("format".into(), "wheel".into());
+    fields.insert("family_source".into(), "runtime_id".into());
+    fields.insert("imported_from".into(), serde_json::json!(install_root));
+    // The literal adoption has always written here, NOT the CLI's constant:
+    // runtimes adopted by earlier releases hold exactly this on disk, so the
+    // listing must keep recognising it. If the CLI changes the marker without
+    // a migration, this scenario goes red, as does the unit test
+    // `adoption_marker_keeps_its_persisted_value` in runtime_registry.rs,
+    // which pins the same literal against the constant.
+    fields.insert("selected_artifact_url".into(), "adopted-read-only".into());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write runtime manifest");
+}
+
 /// The `provenance:` line the listing prints under `runtime_key`'s row: the
 /// first one after the row that names the key.
 fn listed_provenance<'a>(out: &'a str, runtime_key: &str) -> &'a str {
@@ -517,6 +558,11 @@ async fn registered_nightly_exact_target_runtime(world: &mut E2eWorld) {
 #[given("a registered runtime installed before its source layout and GPU target were recorded")]
 async fn registered_runtime_without_recorded_provenance(world: &mut E2eWorld) {
     plant_runtime(world, FIRST_KEY, "gfx942");
+}
+
+#[given("a registered runtime adopted from an environment ROCm CLI did not install")]
+async fn registered_adopted_runtime(world: &mut E2eWorld) {
+    plant_adopted_runtime(world);
 }
 
 #[given("a runtime manifest to import")]
@@ -1526,5 +1572,17 @@ async fn older_listing_says_unrecorded(world: &mut E2eWorld) {
              source_layout_generation=unrecorded device_target=unrecorded"
         ),
         "an unrecorded fact must say so, not be inferred from the family:\n{out}"
+    );
+}
+
+#[then("the adopted runtime's listing says it has no recorded package source")]
+async fn adopted_listing_says_source_unrecorded(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert_eq!(
+        listed_provenance(&out, ADOPTED_KEY),
+        "channel=release source=unrecorded \
+         source_layout_generation=unrecorded device_target=unrecorded",
+        "adoption installed nothing, so the listing must not present the \
+         adoption marker as a package source:\n{out}"
     );
 }

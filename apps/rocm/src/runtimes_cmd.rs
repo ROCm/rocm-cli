@@ -1231,7 +1231,7 @@ pub(crate) mod tests {
 
     /// The row a runtime's `provenance:` line belongs to, found by its key: the
     /// first `provenance:` line after that runtime's marked row.
-    fn provenance_line<'a>(rendered: &'a str, runtime_key: &str) -> &'a str {
+    pub(crate) fn provenance_line<'a>(rendered: &'a str, runtime_key: &str) -> &'a str {
         let row = format!(" {runtime_key} runtime_id=");
         rendered
             .lines()
@@ -1562,51 +1562,76 @@ pub(crate) mod tests {
 
     /// `rocm examine` reports the active runtime's provenance as one line per
     /// fact. They must be the facts and words the listing shows for that same
-    /// runtime, so this compares the two outputs rather than pinning each.
+    /// runtime, so this compares the two outputs as well as pinning each.
+    /// Two active runtimes: a nightly install that recorded every fact, and an
+    /// adopted one whose manifest holds only the adoption marker where an
+    /// artifact URL would be, which must not be reported as its source.
     #[test]
     fn examine_names_the_active_runtime_provenance_the_listing_shows() -> Result<()> {
-        let (root, paths) = test_paths("examine-runtime-provenance");
-        let base = write_test_pip_runtime(
-            &paths,
-            "nightly-wheel-gfx1201-10-1-0a20260822",
-            "therock-nightly:gfx120X-all",
-            "10.1.0a20260822",
-            10,
-        )?;
-        let nightly = nightly_exact_target_manifest(base);
-        rewrite_manifest(&paths, &nightly)?;
-        let config = RocmCliConfig {
-            active_runtime_key: Some(nightly.runtime_key.clone()),
-            ..RocmCliConfig::default()
+        type Build = fn(therock::InstalledRuntimeManifest) -> therock::InstalledRuntimeManifest;
+        let adopted: Build = |base| therock::InstalledRuntimeManifest {
+            index_url: None,
+            selected_artifact_url: crate::runtime_registry::ADOPTED_RUNTIME_ARTIFACT_URL.to_owned(),
+            read_only: true,
+            imported_from: Some(base.install_root.clone()),
+            ..base
         };
+        let cases: [(&str, &str, &str, Build, [&str; 4]); 2] = [
+            (
+                "nightly-wheel-gfx1201-10-1-0a20260822",
+                "therock-nightly:gfx120X-all",
+                "10.1.0a20260822",
+                nightly_exact_target_manifest,
+                [
+                    "  active_runtime_channel: nightly",
+                    "  active_runtime_source: https://example.invalid/whl-multi-arch",
+                    "  active_runtime_source_layout_generation: next-v1",
+                    "  active_runtime_device_target: gfx1201",
+                ],
+            ),
+            (
+                "adopted-release-pip-gfx120x-all-7-13-0",
+                "therock-release:gfx120X-all",
+                "7.13.0",
+                adopted,
+                [
+                    "  active_runtime_channel: release",
+                    "  active_runtime_source: unrecorded",
+                    "  active_runtime_source_layout_generation: unrecorded",
+                    "  active_runtime_device_target: unrecorded",
+                ],
+            ),
+        ];
+        for (runtime_key, runtime_id, version, build, expected) in cases {
+            let (root, paths) = test_paths("examine-runtime-provenance");
+            let base = write_test_pip_runtime(&paths, runtime_key, runtime_id, version, 10)?;
+            let manifest = build(base);
+            rewrite_manifest(&paths, &manifest)?;
+            let config = RocmCliConfig {
+                active_runtime_key: Some(manifest.runtime_key.clone()),
+                ..RocmCliConfig::default()
+            };
 
-        let listed = render_runtimes_text(&paths, &config)?;
-        let mut examined = String::new();
-        append_examine_runtime_state(&mut examined, &paths, &config)?;
-        let _ = fs::remove_dir_all(root);
+            let listed = render_runtimes_text(&paths, &config)?;
+            let mut examined = String::new();
+            append_examine_runtime_state(&mut examined, &paths, &config)?;
+            let _ = fs::remove_dir_all(root);
 
-        let listed_pairs = provenance_line(&listed, &nightly.runtime_key)
-            .trim_start()
-            .strip_prefix("provenance: ")
-            .expect("provenance prefix")
-            .split(' ')
-            .map(|pair| pair.split_once('=').expect("name=value pair"))
-            .map(|(name, value)| format!("  active_runtime_{name}: {value}"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            listed_pairs,
-            [
-                "  active_runtime_channel: nightly",
-                "  active_runtime_source: https://example.invalid/whl-multi-arch",
-                "  active_runtime_source_layout_generation: next-v1",
-                "  active_runtime_device_target: gfx1201",
-            ]
-        );
-        for line in &listed_pairs {
-            assert!(
-                examined.lines().any(|examined_line| examined_line == line),
-                "examine must report {line:?} as the listing does:\n{examined}"
-            );
+            let listed_pairs = provenance_line(&listed, &manifest.runtime_key)
+                .trim_start()
+                .strip_prefix("provenance: ")
+                .expect("provenance prefix")
+                .split(' ')
+                .map(|pair| pair.split_once('=').expect("name=value pair"))
+                .map(|(name, value)| format!("  active_runtime_{name}: {value}"))
+                .collect::<Vec<_>>();
+            assert_eq!(listed_pairs, expected, "{runtime_key}:\n{listed}");
+            for line in expected {
+                assert!(
+                    examined.lines().any(|examined_line| examined_line == line),
+                    "{runtime_key}: examine must report {line:?} as the listing does:\n{examined}"
+                );
+            }
         }
         Ok(())
     }

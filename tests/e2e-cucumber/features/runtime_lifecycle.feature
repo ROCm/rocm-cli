@@ -267,13 +267,18 @@ Feature: Runtime lifecycle state machine
   # and exact GPU target; afterwards only its manifest still knows them. The
   # listing reads them back and says when one was never recorded rather than
   # inferring it — the older runtime's family is itself an exact target, so a
-  # guess would look like a recorded value. The planted manifests need no SDK
-  # download or GPU, so this runs on the mock lane.
+  # guess would look like a recorded value. An adopted runtime installed
+  # nothing, so it has no package source; its manifest holds only the marker
+  # adoption writes in place of one, in the on-disk form earlier releases wrote,
+  # and the listing must not show that marker as a source. The planted manifests
+  # need no SDK download or GPU, so this runs on the mock lane.
   @id:runtime-lifecycle-list-names-runtime-provenance
   Scenario: runtime-lifecycle-19 - Listing runtimes says which stream, source and GPU each runtime was installed from
     Given a registered nightly runtime installed for one exact GPU
     And a registered runtime installed before its source layout and GPU target were recorded
+    And a registered runtime adopted from an environment ROCm CLI did not install
     When the user lists the registered runtimes
     Then the nightly runtime's listing names its channel, package source, source layout and exact GPU target
     And its version shows its build date
     And the older runtime's listing says which of those facts were not recorded instead of guessing
+    And the adopted runtime's listing says it has no recorded package source
