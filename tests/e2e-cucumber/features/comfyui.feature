@@ -421,9 +421,11 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # A truncated or empty record of the ComfyUI rocm-cli started used to make
   # `status`, `logs` and `stop` fail outright, and nothing the CLI offered
   # cleared it. `status` and the plain-words status answer now say the running
-  # state is unknown and name `rocm comfyui stop` as the next step; the
-  # scenario runs that step as `status` printed it and proves what it
-  # promises: with nothing answering on ComfyUI's default address the record
+  # state is unknown and name `rocm comfyui stop` as the next step, and `logs`
+  # still shows the run log `start` wrote beside the install's `source` folder
+  # under the runtime, which it used to miss once the record could not be
+  # parsed. The scenario runs that step as `status` printed it and proves what
+  # it promises: with nothing answering on ComfyUI's default address the record
   # is moved aside to `running.json.unreadable`, no process is stopped (the
   # record names none), and `status` afterwards no longer reports it. The
   # default address is pointed at a free port so a ComfyUI the host runs
@@ -434,8 +436,8 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # error, and the atomic writes that stop `start` leaving a record cut short).
   @id:comfyui-unreadable-run-record-keeps-status-logs-and-stop-working
   Scenario: comfyui-20 - ComfyUI status, logs and stop keep working when rocm-cli's record of the ComfyUI it started cannot be parsed
-    Given ComfyUI is installed
-    And a saved ComfyUI run log
+    Given ComfyUI is installed into a ROCm runtime rocm-cli manages
+    And a run log saved when rocm-cli started that ComfyUI
     And rocm-cli's saved record of the ComfyUI it started cannot be parsed
     And nothing answers on ComfyUI's default address
     When the user checks ComfyUI status
@@ -443,7 +445,7 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     When the user asks in plain words for ComfyUI's status
     Then the answer says it cannot tell whether ComfyUI is running and does not advise starting it
     When the user reads the ComfyUI logs
-    Then the logs show the saved run log
+    Then the logs show that run log
     When the user runs the stop that status advised
     Then stop says it stopped nothing and set the unreadable record aside
     And ComfyUI status no longer reports an unreadable record
@@ -462,9 +464,23 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     And something answers on ComfyUI's default address
     When the user checks ComfyUI status
     Then status says something answers there and advises stopping it before running stop again
+    When the user asks the assistant about ComfyUI while no assistant model is running
+    Then the assistant's summary says it cannot tell whether ComfyUI is running and why
     When the user stops ComfyUI while its record cannot be parsed
     Then stop fails, keeps the record and says to stop what answers there first
     Given what answered on ComfyUI's default address has stopped
     When the user stops ComfyUI while its record cannot be parsed
     Then stop says it stopped nothing and set the unreadable record aside
     And ComfyUI status no longer reports an unreadable record
+
+  # A ComfyUI that answers on the default address but that rocm-cli has no
+  # record of starting is running. Asked in chat with no assistant model
+  # running, rocm-cli answers from its own read-only `comfyui status` call and
+  # prints a deterministic "ROCm CLI summary"; that summary must say running,
+  # as the plain-words status answer does, not "not running". No model is
+  # involved: the chat falls back to the read-only tools.
+  @id:comfyui-assistant-summary-running-outside-rocm-cli
+  Scenario: comfyui-22 - The assistant's summary calls a ComfyUI rocm-cli did not start running
+    Given something answers on ComfyUI's default address
+    When the user asks the assistant about ComfyUI while no assistant model is running
+    Then the assistant's summary says ComfyUI is running but was not started by rocm-cli

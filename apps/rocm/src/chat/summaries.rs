@@ -506,6 +506,10 @@ pub(crate) fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<Stri
             "starting".to_owned()
         } else if status_unknown {
             "unknown".to_owned()
+        } else if status.eq_ignore_ascii_case(crate::comfyui::RUNNING_OUTSIDE_ROCM_CLI_STATUS) {
+            // Something answers that rocm-cli did not start; the chat's own
+            // status answer calls this running too.
+            "running (not started by rocm-cli)".to_owned()
         } else {
             format!("not running ({status})")
         };
@@ -658,6 +662,25 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ComfyUI that answers but that rocm-cli did not start is running, as
+    /// the chat's own status answer says (`Running: yes`), not "not running".
+    #[test]
+    fn a_comfyui_running_outside_rocm_cli_is_summed_up_as_running() {
+        let status = format!(
+            "ComfyUI\n\n  installed: yes\n\nRunning\n  status: {}\n  url: \
+             http://127.0.0.1:8188\n  note: ROCm CLI did not start this ComfyUI process\n",
+            crate::comfyui::RUNNING_OUTSIDE_ROCM_CLI_STATUS.to_uppercase()
+        );
+
+        let summary = deterministic_comfyui_tool_summary(&status).expect("a summary");
+
+        assert!(
+            summary.contains("  Running: running (not started by rocm-cli)."),
+            "{summary}"
+        );
+        assert!(!summary.contains("not running"), "{summary}");
+    }
 
     /// The `Running:` label and the notes behind an unknown state come from
     /// one case-insensitive test, so a differently cased status keeps both.

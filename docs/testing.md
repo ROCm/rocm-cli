@@ -1617,21 +1617,29 @@ gate is not applied: run it only on Linux.
 answer, `logs` and `stop` do when rocm-cli's saved record of the ComfyUI it
 started (`apps/comfyui/state/running.json` under the data directory) is
 truncated, so it cannot be parsed. `status` and the answer say the running
-state is unknown and name the file; `logs` still shows the run log. With
-nothing answering on ComfyUI's default address (`comfyui-20`), `status`
-advises `rocm comfyui stop`, and that
-command, run as printed, moves the record aside to `running.json.unreadable`
-without stopping any process, after which `status` no longer reports it. With
+state is unknown and name the file; `logs` still shows the run log, which
+`comfyui-20` plants where `start` writes it: beside the install's `source`
+folder under the runtime. With nothing answering on ComfyUI's default address
+(`comfyui-20`), `status` advises `rocm comfyui stop`, and that command, run as
+printed, moves the record aside to `running.json.unreadable` without stopping
+any process, after which `status` no longer reports it. With
 something answering there (`comfyui-21`, a listener the scenario holds),
 `status` advises stopping it first, and `stop` keeps the record, says only that
 address was checked and exits non-zero; once the listener is gone the same
-`stop` goes through. Both scenarios point the default address at a port they
+`stop` goes through. `comfyui-21` and `comfyui-22` also ask the assistant about
+ComfyUI with no assistant model running, so the chat answers from its own
+read-only `comfyui status` call; its "ROCm CLI summary" must say `Running:
+unknown` with the reason over the unparseable record, and `Running: running
+(not started by rocm-cli)` with no record while something answers there. All
+three scenarios point the default address at a port they
 choose through `ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`, which only an
 `e2e-test-hooks` build reads (see [release-trust.md](release-trust.md)), so a
 ComfyUI the host runs itself cannot change the outcome. No GPU is needed. The
 unit tests `status_over_an_unreadable_record_*`,
 `chat_status_answer_over_an_unreadable_record_*`,
-`logs_over_an_unreadable_record_*`,
+`logs_over_an_unreadable_record_*` (including a start log beside the
+install's `source` folder under the runtime),
+`logs_with_a_saved_record_also_show_an_older_start_log_in_the_runtime_folder`,
 `stop_sets_an_unreadable_record_aside_and_stops_no_process` and
 `stop_over_an_unreadable_record_keeps_it_while_something_answers` cover the
 same over an empty record too (the last also the record moved aside by hand);
@@ -1666,7 +1674,7 @@ and the Unix-only
 both files are replaced atomically:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-2[01]"
+cargo xtask e2e -- -n "comfyui-2[012]"
 cargo test -p rocm --bin rocm comfyui
 ```
 

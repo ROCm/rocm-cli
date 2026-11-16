@@ -819,10 +819,12 @@ Expected result:
     found yet.`. The same file written over the activity log instead gives
     `Recent activity: none shown; the newest line is longer than the 4 MiB a log
     view reads`, not `no activity yet`.
-  - `rocm comfyui logs`, which reads the saved ComfyUI logs: write the file under
-    `apps/comfyui/logs/` in the data folder and expect `No output shown: the
-    newest line is longer than the 4 MiB a log view reads.`; an empty file there
-    gives `The saved log is empty.`.
+  - `rocm comfyui logs`, which reads the saved ComfyUI logs from the `logs/`
+    folder beside the install's `source/` folder under its runtime (where
+    `start` and `install` write), and from `apps/comfyui/logs/` in the data
+    folder too: write the file in the `logs/` folder beside `source/` and
+    expect `No output shown: the newest line is longer than the 4 MiB a log
+    view reads.`; an empty file there gives `The saved log is empty.`.
   - A stray byte that is not valid text in any of these logs shows the readable
     lines with a replacement character, not a `failed to read` line.
 - The `service_logs` tool (`rocm mcp-call service_logs --arguments-json

@@ -2015,31 +2015,58 @@ mod tests {
     /// intact record of a running ComfyUI, so the reinstall guard does not
     /// treat it as "nothing running": the preview and the real run both stop
     /// naming it, and nothing is downloaded or replaced. The refusal comes
-    /// from the check before the download, which costs nothing: the download
-    /// starts by creating the `downloads` folder, and that folder never
+    /// from the check before the download, which costs nothing: the real run
+    /// writes its install log only after that check, and no install log
     /// appears. (The check just before the swap would raise the same error,
-    /// but only after the download.)
+    /// but only after the download.) A cached archive is planted, so a guard
+    /// that regressed reads that instead of the network; it stays as planted.
     #[test]
     fn a_reinstall_stops_on_a_saved_state_it_cannot_read() -> Result<()> {
         let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-unreadable-io")?;
         let source = source_path_from_app_root(&app_root);
         let state = state_path(&paths);
         fs::create_dir_all(state.join("inside"))?;
-        let downloads = app_root.join("downloads");
-        let downloads_before = downloads.exists();
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+        let logs = app_root.join("logs");
+        let install_logs = || -> Vec<PathBuf> {
+            fs::read_dir(&logs)
+                .map(|entries| {
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with("install-"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let logs_before = install_logs();
 
         let preview = install(&paths, &config, reinstall_options(true));
         let run = install(&paths, &config, reinstall_options(false));
         let main_py = fs::read_to_string(source.join("main.py"));
-        let downloads_after = downloads.exists();
+        let logs_after = install_logs();
+        let archive = fs::read_to_string(&archive_path);
         remove_test_root(&paths);
 
-        assert!(!downloads_before, "the fixture starts with no downloads");
+        assert!(logs_before.is_empty(), "{logs_before:?}");
         assert!(
-            !downloads_after,
-            "the refusal must come before the download is even started"
+            logs_after.is_empty(),
+            "the refusal must come before the install even starts its log: {logs_after:?}"
         );
-
+        assert_eq!(
+            archive?, "not a gzip stream",
+            "the cached archive stays as planted"
+        );
         let expected = format!("failed to read {}", state.display());
         for (what, outcome) in [("preview", preview), ("reinstall", run)] {
             let error = outcome.expect_err(what);

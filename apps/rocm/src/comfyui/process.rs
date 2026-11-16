@@ -856,7 +856,10 @@ mod tests {
                 "the second stop keeps the record aside, unchanged"
             );
             assert!(
-                status_after_again.contains("  status: not started by rocm-cli\n"),
+                status_after_again.contains(&format!(
+                    "  status: {}\n",
+                    crate::comfyui::NOT_STARTED_BY_ROCM_CLI_STATUS
+                )),
                 "{status_after_again}"
             );
             // Way out two: unknown until the user moves it, then not reported.
@@ -870,7 +873,10 @@ mod tests {
                 "{after_by_hand}"
             );
             assert!(
-                after_by_hand.contains("  status: running outside rocm-cli\n"),
+                after_by_hand.contains(&format!(
+                    "  status: {}\n",
+                    crate::comfyui::RUNNING_OUTSIDE_ROCM_CLI_STATUS
+                )),
                 "{after_by_hand}"
             );
         }

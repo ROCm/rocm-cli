@@ -92,12 +92,18 @@
 //!
 //! `comfyui-20` and `comfyui-21` cover a saved record of the ComfyUI
 //! rocm-cli started that cannot be parsed: they plant a `running.json` cut
-//! off mid-write and, for `comfyui-20`, a manifest saying ComfyUI is
-//! installed. Both point the default address `status` and `stop` check at a
-//! port the scenario chooses (`ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`,
-//! read only by `e2e-test-hooks` builds): `comfyui-20` at a free one, so
-//! `stop` moves the record aside, and `comfyui-21` at one it holds open, so
-//! `stop` keeps it until the listener is dropped.
+//! off mid-write. `comfyui-20` also plants the layout an install leaves: a
+//! manifest under the data dir naming a `source` folder under the runtime,
+//! and a run log in the `logs` folder beside that `source` folder, where
+//! `start` writes it. `comfyui-22` plants no record at all. All three point
+//! the default address `status` and `stop` check at a port the scenario
+//! chooses (`ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`, read only by
+//! `e2e-test-hooks` builds): `comfyui-20` at a free one, so `stop` moves the
+//! record aside; `comfyui-21` at one it holds open, so `stop` keeps it until
+//! the listener is dropped; and `comfyui-22` at one it holds open with no
+//! record. `comfyui-21` and `comfyui-22` also run a chat turn with tools on
+//! and no assistant model running, which the CLI answers from its own
+//! read-only `comfyui status` call, and read its "ROCm CLI summary".
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1838,25 +1844,28 @@ async fn unreadable_saved_state(world: &mut E2eWorld) {
     write_fixture(&running_state_path(world), UNREADABLE_RECORD);
 }
 
-/// What `rocm comfyui install` leaves for `status` and the chat's status
-/// answer to read: a manifest saying ComfyUI is installed. Nothing here runs
-/// it.
-#[given("ComfyUI is installed")]
+/// What `rocm comfyui install` into a managed runtime leaves for `status`,
+/// the chat's status answer and `logs` to read: a manifest under rocm-cli's
+/// own app folder naming a `source` folder under the runtime, as a real
+/// install does. Nothing here runs it.
+#[given("ComfyUI is installed into a ROCm runtime rocm-cli manages")]
 async fn comfyui_is_installed(world: &mut E2eWorld) {
     let data = data_dir(world);
     let app = data.join("apps").join("comfyui");
+    let source = comfyui_source_dir(world);
+    let runtime_root = data.join("runtimes").join("roots").join(RUNTIME_KEY);
     let manifest = serde_json::json!({
         "app_id": "comfyui",
         "runtime_key": RUNTIME_KEY,
         "runtime_id": RUNTIME_KEY,
         "runtime_version": "7.0.0",
-        "runtime_root": data.join("runtimes").join(RUNTIME_KEY),
-        "python_executable": data.join("runtimes").join(RUNTIME_KEY).join("python"),
+        "runtime_root": runtime_root,
+        "python_executable": runtime_root.join("bin").join("python3"),
         "source_url": "https://example.invalid/comfyui.tar.gz",
-        "source_path": app.join("source"),
-        "requirements_path": app.join("source").join("requirements.txt"),
+        "source_path": source,
+        "requirements_path": source.join("requirements.txt"),
         "pip_cache_dir": null,
-        "log_path": app.join("logs").join("install-e2e.log"),
+        "log_path": comfyui_run_log_path(world).with_file_name("install-e2e.log"),
         "torch_version": null,
         "torch_cuda_available": true,
         "installed_at_unix_ms": 1,
@@ -1866,6 +1875,44 @@ async fn comfyui_is_installed(world: &mut E2eWorld) {
         &serde_json::to_string_pretty(&manifest).expect("manifest serializes"),
     );
     disable_startup_update_check(world);
+}
+
+/// The lines the run log `start` saved holds.
+const COMFYUI_RUN_LOG: &str = "Starting server\nTo see the GUI go to: http://127.0.0.1:8188\n";
+
+/// Where `start` writes its log for the managed-runtime install above:
+/// beside the runtime's `source` folder, outside rocm-cli's own app folder.
+fn comfyui_run_log_path(world: &E2eWorld) -> PathBuf {
+    comfyui_source_dir(world)
+        .with_file_name("logs")
+        .join("start-e2e.log")
+}
+
+#[given("a run log saved when rocm-cli started that ComfyUI")]
+async fn comfyui_run_log_saved_by_start(world: &mut E2eWorld) {
+    write_fixture(&comfyui_run_log_path(world), COMFYUI_RUN_LOG);
+}
+
+#[then("the logs show that run log")]
+async fn comfyui_logs_show_the_run_log(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let mut expected = format!(
+        "Run log\n  saved file: {}\n  latest output:\n",
+        comfyui_run_log_path(world).display()
+    );
+    for line in COMFYUI_RUN_LOG.lines() {
+        expected.push_str(&format!("    {line}\n"));
+    }
+    assert!(
+        stdout.contains(&expected),
+        "expected:\n{expected}\ngot:\n{stdout}"
+    );
 }
 
 /// A loopback port that was free a moment ago and has nothing bound to it.
@@ -2072,12 +2119,86 @@ async fn stop_kept_the_unreadable_record(world: &mut E2eWorld) {
     assert!(!unreadable_record_aside_path(world).exists());
 }
 
+/// A chat turn with tools on and the local provider, which has no model
+/// running here, so the CLI answers from its own read-only `comfyui status`
+/// call and prints its deterministic "ROCm CLI summary" of it.
+#[when("the user asks the assistant about ComfyUI while no assistant model is running")]
+async fn ask_the_assistant_about_comfyui(world: &mut E2eWorld) {
+    disable_startup_update_check(world);
+    let (stdout, stderr, rc) = run_keeping_scenario_env(
+        world,
+        &[
+            "chat",
+            "--tools",
+            "--provider",
+            "local",
+            "--prompt",
+            "Is ComfyUI running?",
+        ],
+    );
+    assert_eq!(rc, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The lines under the chat's "ROCm CLI summary" heading.
+fn assistant_summary(world: &E2eWorld) -> String {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let summary: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| *line != "ROCm CLI summary")
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .collect();
+    assert!(!summary.is_empty(), "no ROCm CLI summary in:\n{stdout}");
+    summary.join("\n")
+}
+
+#[then("the assistant's summary says ComfyUI is running but was not started by rocm-cli")]
+async fn assistant_summary_running_outside(world: &mut E2eWorld) {
+    let summary = assistant_summary(world);
+    assert!(
+        summary.contains("  Running: running (not started by rocm-cli)."),
+        "{summary}"
+    );
+    assert!(!summary.contains("not running"), "{summary}");
+    // The status the summary was read from names the address the scenario
+    // holds open, so the line is about that listener.
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let url = default_address_url(world);
+    assert!(stdout.contains(&format!("  url: {url}\n")), "{stdout}");
+}
+
+#[then("the assistant's summary says it cannot tell whether ComfyUI is running and why")]
+async fn assistant_summary_unknown(world: &mut E2eWorld) {
+    let summary = assistant_summary(world);
+    assert!(summary.contains("  Running: unknown."), "{summary}");
+    assert!(
+        summary.contains(&format!("  Note: {}", unreadable_state_note_prefix(world))),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!("  Next step: {}.", what_answers_next_step(world))),
+        "{summary}"
+    );
+    // Asking changed nothing: the record is still where it was.
+    assert_eq!(
+        std::fs::read_to_string(running_state_path(world))
+            .ok()
+            .as_deref(),
+        Some(UNREADABLE_RECORD)
+    );
+}
+
 #[then("ComfyUI status no longer reports an unreadable record")]
 async fn status_no_longer_reports_unreadable_record(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
     assert_eq!(rc, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!stdout.contains("status: unknown"), "{stdout}");
     assert!(!stdout.contains("cannot be parsed"), "{stdout}");
+    // `NOT_STARTED_BY_ROCM_CLI_STATUS` in `apps/rocm/src/comfyui.rs`; the
+    // `rocm` crate is a binary with no library, so it cannot be imported here.
     assert!(
         stdout.contains("  status: not started by rocm-cli\n"),
         "{stdout}"

@@ -37,6 +37,15 @@ const COMFYUI_SOURCE_ARCHIVE_NAME: &str = "ComfyUI-master.tar.gz";
 const COMFYUI_DEFAULT_HOST: &str = "127.0.0.1";
 const COMFYUI_DEFAULT_PORT: u16 = 8188;
 
+/// The `status:` value `rocm comfyui status` prints for a ComfyUI answering on
+/// the default address with no record of rocm-cli starting it. The chat's
+/// tool summary matches the same constant, so the two cannot drift apart.
+pub(crate) const RUNNING_OUTSIDE_ROCM_CLI_STATUS: &str = "running outside rocm-cli";
+
+/// The `status:` value `rocm comfyui status` prints when rocm-cli has no
+/// record of starting a ComfyUI and nothing answers on the default address.
+pub(crate) const NOT_STARTED_BY_ROCM_CLI_STATUS: &str = "not started by rocm-cli";
+
 /// The ComfyUI source archive URL, overridable only in `e2e-test-hooks`
 /// builds so a fixture server can exercise the real download path.
 #[cfg(feature = "e2e-test-hooks")]
@@ -538,14 +547,14 @@ fn render_status_with(
         }
         SavedRunState::Absent => {
             if let Some(url) = check_default_address().answering_url() {
-                writeln!(output, "  status: running outside rocm-cli")?;
+                writeln!(output, "  status: {RUNNING_OUTSIDE_ROCM_CLI_STATUS}")?;
                 writeln!(output, "  url: {url}")?;
                 writeln!(
                     output,
                     "  note: ROCm CLI did not start this ComfyUI process"
                 )?;
             } else {
-                writeln!(output, "  status: not started by rocm-cli")?;
+                writeln!(output, "  status: {NOT_STARTED_BY_ROCM_CLI_STATUS}")?;
             }
         }
     }
@@ -765,6 +774,12 @@ fn install_log_path_from_app_root(app_root: &Path) -> PathBuf {
 }
 
 fn start_log_path_for_manifest(manifest: &ComfyUiManifest) -> PathBuf {
+    start_logs_folder_for_manifest(manifest).join(format!("start-{}.log", unix_time_millis()))
+}
+
+/// Where `start` and `install` write their logs for this install: beside its
+/// `source` folder, which is under the runtime it was installed into.
+fn start_logs_folder_for_manifest(manifest: &ComfyUiManifest) -> PathBuf {
     manifest
         .source_path
         .parent()
@@ -773,28 +788,35 @@ fn start_log_path_for_manifest(manifest: &ComfyUiManifest) -> PathBuf {
             Path::to_path_buf,
         )
         .join("logs")
-        .join(format!("start-{}.log", unix_time_millis()))
 }
 
 fn recent_log_paths(paths: &AppPaths) -> Result<Vec<PathBuf>> {
     let mut paths_seen = Vec::<PathBuf>::new();
+    let mut logs_folders = vec![app_root(paths).join("logs")];
     if let Some(manifest) = load_manifest(paths)? {
+        let start_logs = start_logs_folder_for_manifest(&manifest);
+        if !logs_folders.contains(&start_logs) {
+            logs_folders.push(start_logs);
+        }
         push_log_path(&mut paths_seen, manifest.log_path);
     }
-    // A record that cannot be parsed names no log; a start log under the
-    // app's own `logs` folder is still found by the scan below. One that
+    // A record that cannot be parsed names no log; the start logs are still
+    // found by scanning the `logs` folder beside the install's `source`
+    // folder under the runtime, where `start` and `install` write. The
+    // `apps/comfyui/logs` folder under the data dir is scanned too. One that
     // cannot be read at all (a directory at its path, say) is an error, as it
     // is for `status` and `stop`.
     if let SavedRunState::Saved(state) = read_saved_state(paths)? {
         push_log_path(&mut paths_seen, state.log_path);
     }
-    let logs_root = app_root(paths).join("logs");
-    if logs_root.is_dir() {
-        for entry in fs::read_dir(&logs_root)
-            .with_context(|| format!("failed to read {}", logs_root.display()))?
-        {
-            let path = entry?.path();
-            push_log_path(&mut paths_seen, path);
+    for logs_root in &logs_folders {
+        if logs_root.is_dir() {
+            for entry in fs::read_dir(logs_root)
+                .with_context(|| format!("failed to read {}", logs_root.display()))?
+            {
+                let path = entry?.path();
+                push_log_path(&mut paths_seen, path);
+            }
         }
     }
     paths_seen.retain(|path| path.is_file());
@@ -1605,6 +1627,13 @@ mod tests {
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("next step: rocm comfyui start"));
         assert!(!rendered.contains("status: starting or running"));
+        // The summary the assistant prints is read from this status text.
+        let summary = crate::chat::deterministic_comfyui_tool_summary(&rendered)
+            .context("a status summary")?;
+        assert!(
+            summary.contains("  Running: not running (stopped)."),
+            "{summary}"
+        );
         Ok(())
     }
 
@@ -1817,6 +1846,100 @@ mod tests {
         Ok(())
     }
 
+    /// With a record that can be parsed, `logs` shows the log it names and
+    /// also an earlier start log beside the install's `source` folder, which
+    /// nothing else names.
+    #[test]
+    fn logs_with_a_saved_record_also_show_an_older_start_log_in_the_runtime_folder() -> Result<()> {
+        let paths = test_paths("comfyui-logs-runtime-folder-saved");
+        let runtime_app = paths
+            .data_dir
+            .join("runtimes")
+            .join("rt")
+            .join("apps")
+            .join(APP_ID);
+        let mut manifest = test_manifest_with_source_url(&paths, &comfyui_source_archive_url());
+        manifest.source_path = source_path_from_app_root(&runtime_app);
+        save_manifest(&paths, &manifest)?;
+        let logs = runtime_app.join("logs");
+        fs::create_dir_all(&logs)?;
+        let older = logs.join("start-100.log");
+        let current = logs.join("start-200.log");
+        fs::write(&older, "older run\n")?;
+        fs::write(&current, "current run\n")?;
+        save_state(
+            &paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: "http://127.0.0.1:8188".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 8188,
+                pid: 0,
+                source_path: manifest.source_path,
+                python_executable: paths.data_dir.join("python"),
+                log_path: current.clone(),
+                started_at_unix_ms: 200,
+            },
+        )?;
+
+        let rendered = render_logs(&paths, 10);
+        remove_test_root(&paths);
+
+        let rendered = rendered?;
+        for (log, line) in [(&current, "current run"), (&older, "older run")] {
+            assert!(
+                rendered.contains(&format!(
+                    "  saved file: {}\n  latest output:\n    {line}\n",
+                    log.display()
+                )),
+                "{rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `start` writes its logs beside the install's `source` folder under the
+    /// runtime. With the record unparseable nothing names that log, so `logs`
+    /// finds it through the manifest's folder.
+    #[test]
+    fn logs_over_an_unreadable_record_show_a_start_log_in_the_runtime_folder() -> Result<()> {
+        for (index, text) in UNREADABLE_RECORDS.iter().enumerate() {
+            let paths = test_paths(&format!("comfyui-logs-runtime-folder-{index}"));
+            let runtime_app = paths
+                .data_dir
+                .join("runtimes")
+                .join("roots")
+                .join("rt")
+                .join("apps")
+                .join(APP_ID);
+            let mut manifest = test_manifest_with_source_url(&paths, &comfyui_source_archive_url());
+            manifest.source_path = source_path_from_app_root(&runtime_app);
+            save_manifest(&paths, &manifest)?;
+            let start_log = start_log_path_for_manifest(&manifest);
+            fs::create_dir_all(start_log.parent().context("start log has no parent")?)?;
+            fs::write(&start_log, "run 1\nrun 2\n")?;
+            plant_unreadable_record(&paths, text)?;
+
+            let rendered = render_logs(&paths, 10);
+            remove_test_root(&paths);
+
+            let rendered = rendered?;
+            assert!(
+                start_log.starts_with(&runtime_app),
+                "{}",
+                start_log.display()
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "Run log\n  saved file: {}\n  latest output:\n    run 1\n    run 2\n",
+                    start_log.display()
+                )),
+                "{rendered}"
+            );
+        }
+        Ok(())
+    }
+
     /// `logs` over something that cannot be read at all where the record
     /// belongs fails naming it, as `status` and `stop` do, rather than
     /// showing the logs as if there were no record.
@@ -1841,30 +1964,38 @@ mod tests {
     }
 
     /// The real default-address check: a port something listens on answers,
-    /// with its URL; the same port once freed does not.
+    /// with its URL; the same port once freed does not. A test running in
+    /// parallel can bind the port the moment it is freed, so the freed half
+    /// is tried on a fresh port a few times and must hold on at least one; a
+    /// check that always answers fails every attempt.
     #[test]
     fn the_default_address_check_finds_a_listener_and_only_a_listener() -> Result<()> {
-        let listener = TcpListener::bind((COMFYUI_DEFAULT_HOST, 0))?;
-        let port = listener.local_addr()?.port();
+        let mut freed_was_quiet = false;
+        for _ in 0..5 {
+            let listener = TcpListener::bind((COMFYUI_DEFAULT_HOST, 0))?;
+            let port = listener.local_addr()?.port();
+            let url = format!("http://127.0.0.1:{port}");
 
-        let listening = check_default_address_on(port);
-        drop(listener);
-        let freed = check_default_address_on(port);
+            let listening = check_default_address_on(port);
+            drop(listener);
+            let freed = check_default_address_on(port);
 
-        let url = format!("http://127.0.0.1:{port}");
-        assert_eq!(
-            listening,
-            DefaultAddressCheck {
-                url: url.clone(),
-                answers: true
+            assert_eq!(
+                listening,
+                DefaultAddressCheck {
+                    url: url.clone(),
+                    answers: true
+                }
+            );
+            assert_eq!(freed.url, url);
+            if !freed.answers {
+                freed_was_quiet = true;
+                break;
             }
-        );
-        assert_eq!(
-            freed,
-            DefaultAddressCheck {
-                url,
-                answers: false
-            }
+        }
+        assert!(
+            freed_was_quiet,
+            "a freed port must not answer on at least one of five tries"
         );
         Ok(())
     }
@@ -2124,20 +2255,36 @@ mod tests {
                     "{answer}"
                 );
                 assert!(!answer.contains("comfyui start"), "{answer}");
+                // The summary the assistant prints is read from this very
+                // status text, so the wording is tied end to end.
+                let summary = crate::chat::deterministic_comfyui_tool_summary(&status)
+                    .context("a status summary")?;
                 assert!(
-                    status.contains(
-                        "Running\n  status: running outside rocm-cli\n  url: \
+                    summary.contains("  Running: running (not started by rocm-cli)."),
+                    "{summary}"
+                );
+                assert!(
+                    status.contains(&format!(
+                        "Running\n  status: {RUNNING_OUTSIDE_ROCM_CLI_STATUS}\n  url: \
                          http://127.0.0.1:8188\n  note: ROCm CLI did not start this ComfyUI \
                          process\n"
-                    ),
+                    )),
                     "{status}"
                 );
             } else {
                 assert!(answer.contains("Running: no\n"), "{answer}");
                 assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
                 assert!(
-                    status.contains("Running\n  status: not started by rocm-cli\n"),
+                    status.contains(&format!(
+                        "Running\n  status: {NOT_STARTED_BY_ROCM_CLI_STATUS}\n"
+                    )),
                     "{status}"
+                );
+                let summary = crate::chat::deterministic_comfyui_tool_summary(&status)
+                    .context("a status summary")?;
+                assert!(
+                    summary.contains("  Running: not running (not started by rocm-cli)."),
+                    "{summary}"
                 );
             }
             assert!(!answer.contains("unknown"), "{answer}");
