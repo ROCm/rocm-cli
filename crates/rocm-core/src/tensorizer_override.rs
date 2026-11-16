@@ -29,28 +29,36 @@ pub fn tensorizer_override_requirement() -> String {
 
 /// The numeric release of a plain version, or `None` for anything else.
 ///
-/// `uv` prints PEP 440 versions: a local segment follows `+`, and no `-` or space
-/// appears in a normalised release. A pre-release (`2.12.1rc1`, `dev0`), a version
-/// with a marker or any other trailing text, and an empty string have no plain
-/// release. A post-release counts as the release it follows.
+/// Accepted: dotted components that are non-empty runs of ASCII digits, then
+/// optionally one last `post<digits>` component (a post-release counts as the
+/// release it follows), and then optionally a `+local` segment, which is not read.
+/// Everything else has no release and fails closed: a pre-release (`2.12.1rc1`,
+/// `dev0`), a bare `post`, text after the `post<digits>` component, a marker or
+/// other trailing text, `-`, spaces, non-ASCII digits, a component too large for
+/// `u64`, and the empty string.
+///
+/// Leading zeros read as the number (`2.10.01` is 2.10.1). Trailing zero components
+/// are kept: a longer release compares greater than its prefix, which already gives
+/// the right answer for the one release this is compared with (`2.12.1.0` is not
+/// below 2.12.1, `2.10.1.0` is, and `2.12` is) without normalising them away.
 fn release(version: &str) -> Option<Vec<u64>> {
     let public = version.split('+').next()?;
     let mut parts = Vec::new();
-    for part in public.split('.') {
-        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-        // A post-release of a release is that release or later.
-        if digits.is_empty() && part.starts_with("post") {
+    let mut components = public.split('.').peekable();
+    while let Some(part) = components.next() {
+        if let Some(rest) = part.strip_prefix("post")
+            && !parts.is_empty()
+            && components.peek().is_none()
+            && !rest.is_empty()
+            && rest.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            // `post<digits>` as the last component: the release it follows.
             break;
         }
-        // `dev0` and the like: not a plain release.
-        if digits.is_empty() {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        // `1rc1`, `1a2`, `1b3`, `1; python_version >= ...`: not a plain release.
-        if digits.len() != part.len() {
-            return None;
-        }
-        parts.push(digits.parse().ok()?);
+        parts.push(part.parse::<u64>().ok()?);
     }
     (!parts.is_empty()).then_some(parts)
 }
@@ -223,6 +231,66 @@ mod tests {
             vllm_tensorizer_override_installed(&pin("vllm", "2.9.0")),
             None
         );
+    }
+
+    #[test]
+    fn a_post_release_is_read_only_in_its_plain_shape() {
+        // Accepted: post<digits> as the last component, with or without +local.
+        assert!(tensorizer_version_is_fixed("2.12.1.post1"));
+        assert!(tensorizer_version_is_fixed("2.12.1.post0+local"));
+        assert!(!tensorizer_version_is_fixed("2.12.0.post1"));
+        let pin = |required: &str| {
+            let mut pin = subject("tensorizer", Some("2.12.1"));
+            pin.required = Some(required.to_owned());
+            pin
+        };
+        assert!(is_tensorizer_override(&pin("2.10.1.post1")));
+        assert!(is_tensorizer_override(&pin("2.10.1.post1+local")));
+        // Anything else around `post` fails closed: the pin stays a violation and
+        // an installed version of that shape is not fixed.
+        for text in [
+            "2.10.1.postgarbage",
+            "2.10.1.post1.foo",
+            "2.10.1.post",
+            "2.10.1.post1x",
+            "2.10.1.post1.post2",
+            "2.10.1.post-1",
+            "post1",
+        ] {
+            assert!(!is_tensorizer_override(&pin(text)), "{text:?} pin");
+            let installed = text.replace("2.10.1", "2.12.1");
+            assert!(
+                !tensorizer_version_is_fixed(&installed),
+                "{installed:?} installed"
+            );
+        }
+    }
+
+    #[test]
+    fn spellings_of_one_release_compare_equal_and_unreadable_ones_fail_closed() {
+        // Trailing zero components and leading zeros do not change the verdict.
+        assert!(tensorizer_version_is_fixed("2.12.1.0"));
+        assert!(tensorizer_version_is_fixed("2.12.01"));
+        assert!(!tensorizer_version_is_fixed("2.12.0.0"));
+        assert!(!tensorizer_version_is_fixed("2.12"));
+        assert!(tensorizer_version_is_below_fix("2.10.1.0"));
+        assert!(tensorizer_version_is_below_fix("2.10.01"));
+        assert!(tensorizer_version_is_below_fix("2.12"));
+        assert!(!tensorizer_version_is_below_fix("2.12.1.0"));
+        assert!(!tensorizer_version_is_below_fix("2.12.01"));
+        // Unreadable: neither fixed nor below the fix.
+        for text in [
+            "",
+            "2..1",
+            ".2.1",
+            "2.10.1-1",
+            "2.10.1 ",
+            "2.１0.1",
+            "2.10.99999999999999999999999",
+        ] {
+            assert!(!tensorizer_version_is_fixed(text), "{text:?} fixed");
+            assert!(!tensorizer_version_is_below_fix(text), "{text:?} below");
+        }
     }
 
     #[test]
