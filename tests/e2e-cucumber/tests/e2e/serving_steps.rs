@@ -526,7 +526,7 @@ async fn reserve_default_serve_port(world: &mut E2eWorld) {
 /// effective serve engine: a safetensors model on vLLM (Instinct), a GGUF model
 /// on lemonade (Strix Halo / native Windows). This mirrors the two dedicated
 /// single-engine steps (`setup_gpu_model`'s old vLLM body and
-/// `setup_lemonade_model`), but lets a scenario tagged only `@requires-gpu` run
+/// `setup_lemonade_model`), but lets a scenario tagged only `@requires-real-gpu` run
 /// on whichever engine the platform actually uses.
 ///
 /// MODEL-SIZE POLICY: GPU serve scenarios use small models that still satisfy
@@ -537,7 +537,13 @@ async fn reserve_default_serve_port(world: &mut E2eWorld) {
 /// scenario (Qwen3.6-27B) — never on the per-PR path. Do not raise a serve
 /// scenario's model unless a smaller one genuinely cannot prove the assertion.
 fn host_serve_target() -> (&'static str, &'static str, &'static str) {
-    if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
+    serve_target_for_engine(&e2e_cucumber::capability::host_capability().effective_serve_engine)
+}
+
+/// The small model each engine serves in these scenarios: `(model, engine,
+/// substring the endpoint reports it under)`.
+fn serve_target_for_engine(engine: &str) -> (&'static str, &'static str, &'static str) {
+    if engine == "lemonade" {
         // GGUF via lemonade's llama.cpp backend; endpoint reports e.g.
         // Qwen3-0.6B-Q4_0.gguf, so "Qwen3-0.6B" is the distinctive substring.
         ("Qwen3-0.6B-GGUF", "lemonade", "Qwen3-0.6B")
@@ -545,6 +551,19 @@ fn host_serve_target() -> (&'static str, &'static str, &'static str) {
         // Safetensors via vLLM; "Qwen3.5-0.8B" is the distinctive substring.
         ("Qwen/Qwen3.5-0.8B", "vllm", "Qwen3.5-0.8B")
     }
+}
+
+/// [`host_serve_target`] for the machine this scenario runs against: the
+/// simulated one when the scenario planted it, so the engine follows the
+/// simulated GPU rather than the runner's.
+fn serve_target(world: &E2eWorld) -> (&'static str, &'static str, &'static str) {
+    let Some(simulated) = &world.simulated_host else {
+        return host_serve_target();
+    };
+    serve_target_for_engine(&e2e_cucumber::capability::effective_serve_engine(
+        simulated.host.gfx_target().as_deref(),
+        "linux",
+    ))
 }
 
 /// The model the default-engine (no `--engine`) serve step should request.
@@ -1207,14 +1226,14 @@ async fn setup_background_model(world: &mut E2eWorld) {
     // This precondition backs behavioural chat scenarios (tool-defs accepted,
     // end-to-end reply) whose When/Then talk to the served endpoint over HTTP and
     // never assert on real generation — only that a served model answers. So it
-    // doesn't need a real GPU serve: on a host WITH an AMD GPU we still exercise
-    // the real `rocm serve --managed` path (extra real coverage where hardware
-    // exists), but on a no-GPU host we back it with the in-process MockServer +
-    // a planted managed-service record. This lets the scenarios drop
-    // `@requires-gpu` and run on the GitHub-hosted mock lane every PR, with no
-    // coverage loss. Real inference stays covered by the `@requires-gpu`
-    // serve-*-inference scenarios.
-    if e2e_cucumber::capability::host_capability().has_amd_gpu {
+    // doesn't need a real GPU serve: on a real-hardware run with an AMD GPU we
+    // still exercise the real `rocm serve --managed` path (extra real coverage
+    // where hardware exists), but everywhere else — a no-GPU host, or a simulated
+    // run on a GPU box — we back it with the in-process MockServer + a planted
+    // managed-service record. This lets the scenarios run on the GitHub-hosted
+    // mock lane every PR, with no coverage loss. Real inference stays covered by
+    // the `@requires-real-gpu` serve-*-inference scenarios.
+    if crate::real_gpu_host() {
         setup_gpu_model(world).await;
     } else {
         let mock = MockServer::start("TestModel/E2E-1B").await;
@@ -1386,10 +1405,35 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     // a GGUF-only model would legitimately fall through to lemonade regardless of
     // platform. Qwen2.5-0.5B is the smallest vLLM-preferred catalog entry. Omit
     // `--engine` so the CLI's own default selection is what's exercised.
-    ensure_serve_port_free().await;
+    //
+    // Only serve-11 uses this step, and it always plants a simulated machine:
+    // the engine is the `fake-vllm` stand-in, which runs on any lane and on a
+    // developer's machine, so the serve gets a port nothing holds instead of
+    // the shared default, and nothing is killed to free one (the GPU lanes'
+    // `ensure_serve_port_free` SIGKILLs whatever listens on the serve and
+    // assistant ports).
+    assert!(
+        world.simulated_host.is_some(),
+        "this step serves on a simulated machine; plant one first"
+    );
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map_or_else(
+            |e| panic!("no free loopback port for the simulated serve: {e}"),
+            |addr| addr.port(),
+        );
+    world.simulated_serve_port = Some(port);
+    let port = port.to_string();
+    let args = [
+        "serve",
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--managed",
+        "--port",
+        port.as_str(),
+    ];
     let (stdout, stderr, rc) = crate::run_rocm_bounded(
         world,
-        &["serve", "Qwen/Qwen2.5-0.5B-Instruct", "--managed"],
+        &args,
         e2e_cucumber::serve_log::serve_cli_budget(serve_timeout_for(world)),
     );
     world.cli_output = Some(stdout);
@@ -1608,7 +1652,7 @@ async fn assert_serve_plan_names_memory_knob(world: &mut E2eWorld) {
 /// tripping on engine selection.
 #[when("the user serves a model under the GPU-required default")]
 async fn user_serves_gpu_required(world: &mut E2eWorld) {
-    let (model, engine, _) = host_serve_target();
+    let (model, engine, _) = serve_target(world);
     let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", model, "--engine", engine]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
@@ -1751,7 +1795,7 @@ async fn user_serves_eight_gpu_aim(world: &mut E2eWorld) {
 /// `HIP_VISIBLE_DEVICES`, so a GPU host presents as having no usable device.
 #[when("the user serves a model with every GPU masked from view")]
 async fn user_serves_with_masked_gpus(world: &mut E2eWorld) {
-    let (model, engine, _) = host_serve_target();
+    let (model, engine, _) = serve_target(world);
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &["serve", model, "--engine", engine],
@@ -1766,7 +1810,7 @@ async fn user_serves_with_masked_gpus(world: &mut E2eWorld) {
 /// names a device that does not exist on the host.
 #[when("the user serves a model pinned to a GPU index that does not exist")]
 async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
-    let (model, engine, _) = host_serve_target();
+    let (model, engine, _) = serve_target(world);
     let (stdout, stderr, rc) =
         crate::run_rocm(world, &["serve", model, "--engine", engine, "--gpu", "99"]);
     world.cli_output = Some(stdout);
@@ -1883,12 +1927,11 @@ async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
 /// host ordinal 1 exists but is masked out, so the CLI must reject it against the
 /// visible set (EAI-7194). The mask names device 0, which every GPU host has, so
 /// the visible set resolves on a single-GPU host as well and ordinal 1 is refused
-/// against it there too — which is why this scenario needs no multi-GPU gate.
-/// Either way the serve must be refused rather than remapped onto the one visible
-/// device.
+/// against it there too; serve-19 plants two GPUs and serve-59 one. Either way the
+/// serve must be refused rather than remapped onto the one visible device.
 #[when("the user serves a model pinned to a GPU hidden by the visibility mask")]
 async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
-    let (model, engine, _) = host_serve_target();
+    let (model, engine, _) = serve_target(world);
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &["serve", model, "--engine", engine, "--gpu", "1"],
@@ -1904,15 +1947,15 @@ async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
 /// ordinal 0, so ordinal 1 is outside the visible HIP set and must be refused
 /// (EAI-7194) — not read as the physical token and wrongly accepted.
 ///
-/// `@requires-multi-gpu`, because on a single-GPU host the mask token names a
-/// device that is not there: the visible set cannot be resolved and `--gpu`
-/// validation falls back to amd-smi's best-effort count, which does not honour
-/// the mask — so the outcome there depends on whether amd-smi is installed
-/// rather than on the mask. See the scenario comment in
+/// Needs a second GPU, which the scenario plants: on a single-GPU host the mask
+/// token names a device that is not there, the visible set cannot be resolved
+/// and `--gpu` validation falls back to amd-smi's best-effort count, which does
+/// not honour the mask — so the outcome there depends on whether amd-smi is
+/// installed rather than on the mask. See the scenario comment in
 /// `features/model_serving.feature` for the full note on that gap.
 #[when("the user serves a model pinned past the ROCR-reindexed visible set")]
 async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
-    let (model, engine, _) = host_serve_target();
+    let (model, engine, _) = serve_target(world);
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &["serve", model, "--engine", engine, "--gpu", "1"],
@@ -1930,7 +1973,7 @@ async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
 /// (EAI-7194) — not read the HIP mask as though it were the only one set.
 #[when("the user serves a model with ROCR hiding every GPU a HIP mask names")]
 async fn user_serves_with_rocr_hiding_hip_named_gpus(world: &mut E2eWorld) {
-    let (model, engine, _) = host_serve_target();
+    let (model, engine, _) = serve_target(world);
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &["serve", model, "--engine", engine],
@@ -3231,10 +3274,13 @@ fn screen_without_whitespace(screen: &str) -> String {
 #[then("the user is told the pinned GPU is unavailable")]
 async fn assert_masked_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // Ordinal 1 must be named and refused by the CLI's own pre-flight: against the
-    // active visibility mask ("not available under the active visibility mask") on
-    // a multi-GPU host, or as out of range where no visible set could be
-    // enumerated. Never a silent remap onto the one visible device (ordinal 0).
+    // Ordinal 1 must be named and refused by the CLI's own pre-flight against the
+    // active visibility mask ("not available under the active visibility mask").
+    // Every scenario using this step plants a simulated machine, whose visible set
+    // the CLI can always enumerate, so "out of range" is not accepted: on the
+    // one-GPU machine ordinal 1 is out of range with or without the mask, and
+    // accepting it would let a broken mask check pass there. Never a silent
+    // remap onto the one visible device (ordinal 0).
     //
     // The accepted wording is deliberately narrow. A bare "not available" would
     // also match the ENGINE's own late rejection ("requested GPU 1 is not
@@ -3244,8 +3290,7 @@ async fn assert_masked_index_message(world: &mut E2eWorld) {
     // requested ordinal.
     assert!(
         output.contains("--gpu index 1")
-            && (output.contains("not available under the active visibility mask")
-                || output.contains("out of range")),
+            && output.contains("not available under the active visibility mask"),
         "expected the masked GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
@@ -3447,6 +3492,47 @@ async fn assert_engine_auto_selected(world: &mut E2eWorld) {
     );
 }
 
+/// The flags the CLI launched the simulated vLLM with, as `fake-vllm` recorded
+/// them: `serve <model> --host 127.0.0.1 --port <the port asked for>`, and
+/// `--enforce-eager`, which keeps vLLM's CUDA-graph replay from hanging a
+/// gfx94x GPU on its first decode. Readiness alone would pass with any of
+/// them wrong, since the stand-in binds whatever it is given.
+fn assert_simulated_vllm_launch_args(world: &E2eWorld) {
+    let record = super::runtime_steps::simulated_vllm_argv_record(world);
+    let recorded = std::fs::read_to_string(&record).unwrap_or_else(|e| {
+        panic!(
+            "the simulated vLLM left no record of its arguments at {}: {e}",
+            record.display()
+        )
+    });
+    let args: Vec<&str> = recorded.lines().collect();
+    let port = world
+        .simulated_serve_port
+        .expect("the serve recorded no port")
+        .to_string();
+    let flag_value = |flag: &str| {
+        args.iter()
+            .position(|arg| *arg == flag)
+            .and_then(|at| args.get(at + 1).copied())
+    };
+    assert_eq!(args.first().copied(), Some("serve"), "{args:?}");
+    assert!(
+        args.get(1)
+            .is_some_and(|model| model.ends_with("Qwen2.5-0.5B-Instruct")),
+        "vLLM was not given the model that was served: {args:?}"
+    );
+    assert_eq!(flag_value("--host"), Some("127.0.0.1"), "{args:?}");
+    assert_eq!(
+        flag_value("--port"),
+        Some(port.as_str()),
+        "vLLM was not launched on the port the serve asked for: {args:?}"
+    );
+    assert!(
+        args.contains(&"--enforce-eager"),
+        "vLLM was launched without --enforce-eager: {args:?}"
+    );
+}
+
 #[then("vLLM is selected as the default engine")]
 async fn assert_vllm_default(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no serve output");
@@ -3469,6 +3555,22 @@ async fn assert_vllm_default(world: &mut E2eWorld) {
         engine, "vllm",
         "expected vLLM as the default engine on an Instinct GPU, got '{engine}':\n{output}"
     );
+    // `rocm serve` exits 0 whatever the readiness, so require the launch to
+    // have actually come up: the vLLM stand-in on the simulated machine answers
+    // at once. The service log is the stand-in's own stdout/stderr, so it is
+    // what says why it never answered; it is gone with the scenario's root once
+    // this step returns.
+    let service_log = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("log_path: "))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    assert!(
+        output.lines().any(|line| line.trim() == "readiness: ready"),
+        "the simulated vLLM never became ready:\n{output}\n{}\n--- service log ---\n{service_log}",
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert_simulated_vllm_launch_args(world);
 }
 
 #[then("the model is reachable")]

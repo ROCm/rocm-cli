@@ -45,7 +45,7 @@ Feature: Model serving
   # caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
   # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
-  @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
+  @id:serve-vllm-inference @requires-real-gpu @requires-engine:vllm
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
@@ -60,7 +60,7 @@ Feature: Model serving
   # checkpoint, hardware-verified on Strix Halo. These slow loads stay off the
   # ordinary per-PR path, and the longer readiness timeout also gives the first
   # inference request enough time to complete.
-  @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
+  @id:serve-large-model-inference @requires-real-gpu @serve-timeout:2400 @nightly
   Scenario: serve-06 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active
     And a large model is being served on GPU
@@ -71,7 +71,7 @@ Feature: Model serving
   # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade. The
   # lemonade per-PR canary: one real lemonade serve runs on every PR (the
   # counterpart to the vLLM canary above).
-  @id:serve-lemonade-inference @requires-gpu @requires-engine:lemonade
+  @id:serve-lemonade-inference @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-07 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
     And a GGUF model is being served on lemonade
@@ -84,7 +84,7 @@ Feature: Model serving
   # catalog entries can also serve directly on Linux when their metadata is
   # simple enough; other registered entries use Lemonade's router. Both canaries
   # use the same small checkpoint, sharing the cache without another download.
-  @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
+  @id:serve-hf-checkpoint-inference @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
     And a canonical Hugging Face GGUF checkpoint is being served on lemonade
@@ -95,7 +95,7 @@ Feature: Model serving
   # Default-engine serve (no --engine): the effective engine is the platform
   # default from the capability probe, so this covers whichever engine the host
   # would actually pick.
-  @id:serve-default-engine-working-endpoint @requires-gpu @merge-queue
+  @id:serve-default-engine-working-endpoint @requires-real-gpu @merge-queue
   Scenario: serve-09 - Serving a model without specifying an engine produces a working endpoint
     Given a managed runtime is active
     When the user serves a model without specifying an engine
@@ -103,21 +103,26 @@ Feature: Model serving
     And the model is reachable
 
   # The inference half of serve-09.
-  @id:serve-default-engine-inference @requires-gpu @merge-queue
+  @id:serve-default-engine-inference @requires-real-gpu @merge-queue
   Scenario: serve-10 - A default-engine served model responds to inference requests
     Given a managed runtime is active
     When the user serves a model without specifying an engine
     Then the model responds to inference requests
 
   # Default engine on Instinct: a vLLM-capable model served without --engine on
-  # an Instinct data-center GPU (gfx*-dcgpu) defaults to vLLM. Checks only the
-  # selection PLAN, not endpoint readiness. The assertion is vLLM-specific, so it
-  # only applies where vLLM is the effective engine — `@requires-engine:vllm`
-  # skips it on lemonade-default hosts (Strix Halo), where asserting a vLLM
-  # default would be a guaranteed false failure.
-  @id:serve-vllm-default-on-instinct @requires-gpu @requires-engine:vllm
+  # an Instinct data-center GPU (gfx*-dcgpu) defaults to vLLM, and the managed
+  # launch goes through. Both the Instinct machine and the runtime's vLLM are
+  # simulated: the CLI's own selection, runtime lookup, launch and readiness
+  # wait are real, and the vLLM at the end of them answers like one without a
+  # model on a device. It records the flags it was launched with, so the serve is
+  # also held to the host, the port it asked for (a free one, never the shared
+  # default) and `--enforce-eager`. So this holds on every Linux lane, not only
+  # on Instinct. No `@requires-engine:vllm`: the engine follows the simulated
+  # Instinct GPU, not the runner's, so a Lemonade-default host runs it too.
+  @id:serve-vllm-default-on-instinct @requires-os:linux
   Scenario: serve-11 - vLLM is the default serving engine on Instinct
-    Given a managed runtime is active
+    Given a machine with an AMD Instinct GPU
+    And a managed runtime is active
     When the user serves a vLLM-capable model without specifying an engine
     Then vLLM is selected as the default engine
 
@@ -126,7 +131,7 @@ Feature: Model serving
   # `a model is being served on GPU`), so this holds the contract on every GPU
   # platform that runs it (the merge queue skips MI300X). Readiness is gated on a real inference probe, which is what makes
   # this contract hold rather than race the model load.
-  @id:serve-readiness-contract @requires-gpu @merge-queue
+  @id:serve-readiness-contract @requires-real-gpu @merge-queue
   Scenario: serve-12 - A service reported ready can immediately serve inference
     Given a managed runtime is active
     And a model is being served on GPU
@@ -135,10 +140,11 @@ Feature: Model serving
 
   # GPU-required enforcement (EAI-7400). Under the GPU-required default, a host
   # with no usable AMD GPU must refuse to serve — before any engine is prepared or
-  # launched — with an actionable message, never a CPU or device-0 fallback. Runs
-  # on the no-GPU mock host, so it gates every PR (@requires-no-gpu, no GPU needed).
-  @id:serve-no-gpu-fails-fast @requires-no-gpu
+  # launched — with an actionable message, never a CPU or device-0 fallback. The
+  # GPU-less machine is simulated, so this holds on GPU lanes too.
+  @id:serve-no-gpu-fails-fast @requires-os:linux
   Scenario: serve-13 - Serving is refused on a host with no AMD GPU
+    Given a Linux machine with no AMD GPU
     When the user serves a model under the GPU-required default
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -153,11 +159,12 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI explains that temperature cannot be negative
 
-  # The masked-device path: on a real GPU host where every device is hidden, the
-  # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
-  # GPU hardware (Strix Halo / Instinct).
-  @id:serve-masked-devices-fail @requires-gpu @requires-os:linux
+  # The masked-device path: on a GPU host where every device is hidden, the
+  # GPU-required serve must treat it as "no GPU" and refuse, not fall back. The
+  # GPU host is simulated; the refusal happens before any engine would touch it.
+  @id:serve-masked-devices-fail @requires-os:linux
   Scenario: serve-15 - Serving is refused when every GPU is masked from view
+    Given a machine with an AMD Instinct GPU
     When the user serves a model with every GPU masked from view
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -180,7 +187,7 @@ Feature: Model serving
   # The step here accepts several refusal wordings only because which authority
   # answers depends on the lane: the visible set when it could be enumerated,
   # the raw amd-smi count when it could not.
-  @id:serve-absent-gpu-index-rejected @requires-gpu
+  @id:serve-absent-gpu-index-rejected @requires-real-gpu
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
@@ -213,17 +220,19 @@ Feature: Model serving
   # on the host but is hidden by an active visibility mask
   # (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES) must be validated against the
   # VISIBLE set and refused — never silently remapped onto a visible device. This
-  # is distinct from scenario 13 (an index beyond the device count): here the index
+  # is distinct from serve-16 (an index beyond the device count): here the index
   # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
   # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
-  # rejection directly. It holds on a single-GPU host too, so this stays ungated:
-  # the mask names device 0, which exists there, so the visible set still resolves
-  # to [0] and ordinal 1 is refused against it. (Contrast serve-20, whose mask
-  # names a device a single-GPU host does not have — see the note there.) Either
-  # way an honest refusal rather than a remap, which is what this asserts. Runs on
-  # GPU hardware.
-  @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
+  # rejection directly. It runs on a simulated two-GPU machine, the multi-GPU
+  # shape it was written for. The refusal holds on a single-GPU host too — the
+  # mask names device 0, which exists there, so the visible set still resolves to
+  # [0] and ordinal 1 is refused against it — and serve-59 is that case. (Contrast
+  # serve-20, whose mask names a device a single-GPU host does not have — see the
+  # note there.) Either way an honest refusal rather than a remap, which is what
+  # this asserts.
+  @id:serve-masked-gpu-index-rejected @requires-os:linux
   Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
+    Given a machine with two AMD Instinct GPUs
     When the user serves a model pinned to a GPU hidden by the visibility mask
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
@@ -240,7 +249,7 @@ Feature: Model serving
   # multi-GPU hardware and is covered by the `usable_amd_gpu_indices_from` unit
   # tests.
   #
-  # KNOWN GAP — why this needs `@requires-multi-gpu` rather than just a GPU:
+  # KNOWN GAP — why this needs a second GPU rather than just one:
   # a mask token `>= present` is not a device the host has, so
   # `usable_amd_gpu_indices_from` cannot resolve the visible set and reports
   # "unknown" (`None`) rather than an authoritative answer. On a SINGLE-GPU host
@@ -255,9 +264,12 @@ Feature: Model serving
   # unknown-mask fallback is deliberate (an unprobeable host must not be blocked
   # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
-  # set resolves on one GPU too and it stays ungated.
-  @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
+  # set resolves on one GPU too, which serve-59 checks.
+  #
+  # The second device is simulated, so this no longer waits for a multi-GPU lane.
+  @id:serve-rocr-reindexed-gpu-index-rejected @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
+    Given a machine with two AMD Instinct GPUs
     When the user serves a model pinned past the ROCR-reindexed visible set
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
@@ -269,10 +281,12 @@ Feature: Model serving
   # serve must therefore refuse, exactly as serve-15 does for a HIP-only empty
   # mask. Before the fix the probe preferred the HIP mask and discarded the ROCR
   # one entirely, resolved the visible set to [0], and let the serve proceed onto a
-  # device the runtime had already hidden. Runs on GPU hardware: on a no-GPU host
-  # the same refusal fires for having no device at all and would prove nothing.
-  @id:serve-rocr-empty-mask-beats-hip-mask @requires-gpu @requires-os:linux
+  # device the runtime had already hidden. Needs a GPU: on a no-GPU host the
+  # same refusal fires for having no device at all and would prove nothing. The
+  # simulated one is enough.
+  @id:serve-rocr-empty-mask-beats-hip-mask @requires-os:linux
   Scenario: serve-21 - Serving is refused when ROCR hides every GPU a HIP mask names
+    Given a machine with an AMD Instinct GPU
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -302,7 +316,7 @@ Feature: Model serving
   # device policy, which refuses before it ever builds a plan unless a ROCm
   # runtime is active — hence the same `a managed runtime is active` precondition
   # every other real-serve scenario on this lane opens with.
-  @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
+  @id:serve-vllm-low-vram-oom-guidance @requires-real-gpu @requires-engine:vllm @requires-os:linux
   Scenario: serve-23 - A vLLM serve plan on a nearly-full GPU points at the memory knob
     Given a managed runtime is active
     And the selected GPU is reported nearly out of VRAM
@@ -321,14 +335,14 @@ Feature: Model serving
   # on (engine, canonical model id) only — not a real listening port or process —
   # so a planted record is enough; no actual Lemonade load is needed. Runs on the
   # Lemonade GPU lane because `--managed` serve still refuses before reaching
-  # this guard without a live GPU, same as every other `@requires-gpu` scenario
+  # this guard without a live GPU, same as every other `@requires-real-gpu` scenario
   # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
   # bind, and the serve path's `ensure_public_bind_engine_supported` guard
   # (defined in `service_launch/endpoint_auth.rs`, called from `serve_cmd.rs`)
   # refuses that combination for Lemonade on Windows (its server can't receive the
   # key through the Windows detached-spawn primitive), so this scenario cannot
   # reach the refusal it exercises there.
-  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
+  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-real-gpu @requires-engine:lemonade @requires-os:linux
   Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
@@ -380,7 +394,7 @@ Feature: Model serving
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  @id:serve-aim-inference @requires-real-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -395,7 +409,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  @id:serve-aim-lifecycle-parity @requires-real-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim
@@ -462,7 +476,7 @@ Feature: Model serving
   # Lemonade specifically, because it is the engine that manages its own runtime
   # and therefore the one whose preparation is user-visible; the planted record
   # names lemonade too, so the engine matches and the MODEL is the only thing
-  # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
+  # keeping the pre-gate shut. serve-13 already covers the plain refusal with
   # no service planted at all, and serve-28 plants the SAME model, so neither
   # discriminates the model keying — this one does.
   #
@@ -537,7 +551,7 @@ Feature: Model serving
   # would make the last Then vacuous. With the gate wrongly open the manifest is
   # re-filed before the refusal and that Then goes red; with it shut the registry
   # is still empty.
-  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-gpu @requires-os:linux
+  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-real-gpu @requires-os:linux
   Scenario: serve-31 - A reusable live service does not pull engine work ahead of --gpu validation
     Given a live managed vLLM serve is already running
     And setup names an unregistered runtime folder
@@ -677,7 +691,7 @@ Feature: Model serving
   # watcher enabled, serve now starts no helper; the scenario's fresh config
   # has none enabled. The helper's own lifecycle once a watcher is on is
   # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
-  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  @id:serve-stop-leaves-no-background-helper @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
@@ -760,7 +774,7 @@ Feature: Model serving
   # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
   # apps/rocm/src/service_launch/launch_transaction.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
-  @id:serve-explicit-port-reserved @requires-gpu @merge-queue
+  @id:serve-explicit-port-reserved @requires-real-gpu @merge-queue
   Scenario: serve-45 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
@@ -773,12 +787,12 @@ Feature: Model serving
   # `resolve_serve_port` never reaches the "reserved by managed service" branch
   # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
   # routing to `explicit_bind_error`'s "already in use by another process"
-  # message. Needs the same `@requires-gpu` as serve-45 for the same reason:
+  # message. Needs the same `@requires-real-gpu` as serve-45 for the same reason:
   # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
   # completed model/GPU resolution in hand (GPU indices are selected earlier in
   # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
   # `serve` has no CPU fallback that gets there.
-  @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
+  @id:serve-explicit-port-in-use-by-untracked-process @requires-real-gpu @merge-queue
   Scenario: serve-46 - Serving on a port an untracked process already holds is refused
     Given a managed runtime is active
     And the default serve port is occupied
@@ -790,7 +804,7 @@ Feature: Model serving
   # the legacy default while one real managed GPU serve starts; the reported
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
-  @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
+  @id:serve-auto-port-skips-occupied @requires-real-gpu @merge-queue
   Scenario: serve-47 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
@@ -800,7 +814,7 @@ Feature: Model serving
   # An explicit --port is a demand: when an equivalent service (same engine and
   # model) is already live on a different port, serve refuses instead of
   # reporting success on the old port. Same planted record and lane as serve-24.
-  @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
+  @id:serve-explicit-port-refused-for-live-equivalent @requires-real-gpu @requires-engine:lemonade @requires-os:linux
   Scenario: serve-48 - An explicit port that differs from a running equivalent service is refused
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
@@ -826,7 +840,7 @@ Feature: Model serving
   # agnostic like `serve-readiness-contract`: the served engine follows the host.
   # Tool use is translated for non-streaming requests (serve-53); a streaming
   # request that offers tools is refused, which only the unit tests cover.
-  @id:serve-anthropic-endpoint-advertised @requires-gpu
+  @id:serve-anthropic-endpoint-advertised @requires-real-gpu
   Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
     Given a managed runtime is active
     And a model is being served on GPU
@@ -834,7 +848,7 @@ Feature: Model serving
     Then the service details include an Anthropic-compatible messages endpoint
     And the service details still include the existing OpenAI-compatible endpoint
 
-  @id:serve-anthropic-messages-inference @requires-gpu
+  @id:serve-anthropic-messages-inference @requires-real-gpu
   Scenario: serve-51 - A served model responds to an Anthropic Messages API request
     Given a managed runtime is active
     And a model is being served on GPU
@@ -842,7 +856,7 @@ Feature: Model serving
     Then the response is a valid Anthropic Messages API response
     And the Anthropic response identifies the correct model
 
-  @id:serve-anthropic-endpoint-readiness @requires-gpu
+  @id:serve-anthropic-endpoint-readiness @requires-real-gpu
   Scenario: serve-52 - Readiness covers the Anthropic-compatible endpoint
     Given a managed runtime is active
     And a model is being served on GPU
@@ -851,7 +865,7 @@ Feature: Model serving
 
   # ROCMAI-920: tool use is translated in both directions. A request offering
   # one tool and requiring it gets a `tool_use` block back.
-  @id:serve-anthropic-messages-tool-use @requires-gpu
+  @id:serve-anthropic-messages-tool-use @requires-real-gpu
   Scenario: serve-53 - A served model handles tool use via the Anthropic Messages API
     Given a managed runtime is active
     And a model is being served on GPU
@@ -859,7 +873,7 @@ Feature: Model serving
     Then the response contains a tool_use content block
     And the tool_use block names a tool and arguments from the request
 
-  @id:serve-anthropic-messages-streaming @requires-gpu
+  @id:serve-anthropic-messages-streaming @requires-real-gpu
   Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
     Given a managed runtime is active
     And a model is being served on GPU
@@ -877,7 +891,7 @@ Feature: Model serving
   # Deliberately NOT tagged @requires-engine: the engine is the CLI's to pick
   # here, and pinning one would make the harness attribute the run to an engine
   # the scenario never asked for. The host's own default engine is what gates it.
-  @id:serve-small-assistant-short-name @requires-gpu
+  @id:serve-small-assistant-short-name @requires-real-gpu
   Scenario: serve-55 - The recommended small assistant serves from its short name alone
     Given a managed runtime is active
     And the recommended small assistant is being served by its short name
@@ -892,11 +906,12 @@ Feature: Model serving
   # stopped. The refusal now comes before anything starts. It also names no
   # quantization of its own: nothing on this path reads the repository's files, so
   # a suggested label is a guess, and following a guess fails a second time on a
-  # repo that ships no GGUF at all. @requires-gpu because a host with no usable
-  # GPU is turned away earlier, for that reason instead, and never reaches this
-  # one. No @requires-os deliberately — Windows is the lane the failure was silent
-  # on, so it is the one most worth watching.
-  @id:serve-missing-gguf-variant-refused @requires-gpu @requires-engine:lemonade
+  # repo that ships no GGUF at all. @requires-real-gpu because a host with no
+  # usable GPU is turned away earlier, for that reason instead, and never reaches
+  # this one; a simulated machine would get past that gate, but it is a Linux
+  # one. No @requires-os deliberately — Windows is the lane the failure was
+  # silent on, so it is the one most worth watching.
+  @id:serve-missing-gguf-variant-refused @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-56 - Serving a Hugging Face repo with no quantization variant is refused
     When the user serves a Hugging Face repo with no quantization variant on Lemonade
     Then serving is refused before any engine starts
@@ -913,7 +928,7 @@ Feature: Model serving
   # No expectations row is added for this scenario. The flaky Linux rows cover
   # the direct llama-server route, and this scenario takes the router route, so
   # those rows' failure mode does not describe it. It is nightly-only.
-  @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
+  @id:serve-lemonade-complex-registered-inference @requires-real-gpu @requires-os:linux @requires-engine:lemonade @nightly
   Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
     Given a managed runtime is active
     And a registered vision GGUF is being served on lemonade on its own port
@@ -930,7 +945,7 @@ Feature: Model serving
   # `serve-lemonade-complex-registered-inference` covers the router route for an
   # entry that needs more. The endpoint answering would not tell the
   # two apart, so this reads the engine state's method and backend.
-  @id:serve-lemonade-simple-registered-direct-route @requires-gpu @requires-os:linux @requires-engine:lemonade
+  @id:serve-lemonade-simple-registered-direct-route @requires-real-gpu @requires-os:linux @requires-engine:lemonade
   Scenario: serve-58 - A simple registered GGUF name is served directly by the selected GPU backend
     Given a managed runtime is active
     And a simple registered GGUF is being served on lemonade on its own port
@@ -940,3 +955,41 @@ Feature: Model serving
     And the response identifies the correct model
     When the user stops the scenario's managed Lemonade service
     Then the managed service is stopped and its endpoint is closed
+
+
+  # serve-19 on a single GPU. Its mask names device 0, which a one-GPU host has,
+  # so the visible set resolves to [0] and ordinal 1 is refused against it: a
+  # host with one device must refuse the hidden ordinal exactly as a multi-GPU one
+  # does, rather than read it as out of range or let it through. Declared here
+  # rather than beside serve-19 because the scenario index is per-feature and in
+  # declaration order.
+  @id:serve-masked-gpu-index-rejected-on-one-gpu @requires-os:linux
+  Scenario: serve-59 - Serving pinned to a GPU hidden by the visibility mask is refused on a single-GPU machine
+    Given a machine with an AMD Instinct GPU
+    When the user serves a model pinned to a GPU hidden by the visibility mask
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable
+
+  # serve-13 without a simulated machine: the runner's own GPU-less Linux host
+  # (the GitHub-hosted runner, for one), so the GPU-required refusal is also held
+  # against the real GPU probe and not only the simulated machine. Linux only:
+  # off Linux there is no usable-GPU probe, `rocm serve` reads "cannot tell" as
+  # "not known to be absent" and launches, so a GPU-less Windows host is not
+  # refused today and no scenario can hold a refusal that does not exist there.
+  # Declared here rather than beside serve-13 because the scenario index is
+  # per-feature and in declaration order.
+  @id:serve-no-gpu-fails-fast-on-this-host @requires-no-gpu @requires-os:linux
+  Scenario: serve-60 - Serving is refused on this host when it has no AMD GPU
+    When the user serves a model under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+
+  # serve-15 on a real GPU host rather than a simulated one: every real device
+  # hidden by the visibility mask must still read as "no GPU" and be refused, with
+  # the runner's own driver, sysfs and amd-smi answering. Read-only, so it is
+  # cheap on any Linux GPU lane.
+  @id:serve-masked-devices-fail-on-this-host @requires-real-gpu @requires-os:linux
+  Scenario: serve-61 - Serving is refused when every GPU of this machine is masked from view
+    When the user serves a model with every GPU masked from view
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected

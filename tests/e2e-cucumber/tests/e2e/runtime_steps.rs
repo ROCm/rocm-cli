@@ -107,15 +107,60 @@ async fn assert_planned_folder_avoids_the_link(world: &mut E2eWorld) {
     );
 }
 
+/// The managed runtime a simulated machine's `a managed runtime is active` plants.
+const SIMULATED_RUNTIME_KEY: &str = "simulated-therock-7.13.0";
+
+fn simulated_runtime_data_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+}
+
+/// Where the planted runtime's `fake-vllm` records the arguments it was launched
+/// with (see `src/bin/fake-vllm.rs`): beside the `vllm` the CLI launches.
+pub(crate) fn simulated_vllm_argv_record(world: &E2eWorld) -> std::path::PathBuf {
+    simulated_runtime_data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(SIMULATED_RUNTIME_KEY)
+        .join("bin")
+        .join("vllm.argv")
+}
+
+/// On a simulated machine there is nothing to install a real SDK for, so the
+/// runtime is planted: a registry record the CLI accepts as ready, whose `vllm`
+/// is the `fake-vllm` stand-in. `rocm serve` then takes the real managed-runtime
+/// path — selection, the engine's runtime lookup, the launch and the readiness
+/// wait — and only the process at the end of it is simulated.
+fn plant_simulated_runtime(world: &mut E2eWorld) {
+    const KEY: &str = SIMULATED_RUNTIME_KEY;
+    let data = simulated_runtime_data_dir(world);
+    let install_root = super::comfyui_steps::plant_ready_runtime(&data, KEY);
+    // The engine accepts a managed runtime when `vllm` sits beside its python.
+    let vllm = install_root.join("bin").join("vllm");
+    crate::install_fixture_binary("fake-vllm", &vllm);
+    crate::run_rocm_ok(world, &["runtimes", "activate", KEY]);
+}
+
 #[given("a managed runtime is active")]
 async fn setup_active_runtime(world: &mut E2eWorld) {
-    // On a no-GPU host this is a no-op: a managed TheRock SDK runtime can only be
+    if world.simulated_host.is_some() {
+        plant_simulated_runtime(world);
+        return;
+    }
+    // Off real hardware this is a no-op: a managed TheRock SDK runtime can only be
     // installed where there's a GPU family to select wheels for (see
-    // `runtime-install-active`, @requires-gpu). The only scenarios that reach this
-    // step without `@requires-gpu` are the mock-lane chat scenarios, whose serve
-    // is backed by MockServer and needs no runtime at all — so skip the install
+    // `@id:runtime-install-sdk-active`, @requires-real-gpu), and a simulated run
+    // on a GPU box must not install one for the runner's GPU. The only scenarios
+    // that reach this step without `@requires-real-gpu` or a simulated machine
+    // are the chat scenarios, whose serve is backed by MockServer off real
+    // hardware, and serve-49, whose restart is refused from the on-disk records;
+    // off real hardware neither needs a runtime at all — so skip the install
     // rather than attempt a multi-GiB SDK pull that can't succeed here.
-    if !e2e_cucumber::capability::host_capability().has_amd_gpu {
+    if !crate::real_gpu_host() {
         return;
     }
     // This precondition only needs *a* runtime present — it does not assert a

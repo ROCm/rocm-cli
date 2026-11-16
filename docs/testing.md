@@ -951,6 +951,116 @@ export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3
   --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
+## Simulated and real GPU hardware
+
+The cucumber suite runs in one of two hardware modes, chosen by
+`E2E_HARDWARE`:
+
+- `simulated` (the default, and what every GitHub-hosted run uses) — a scenario
+  that needs a GPU describes the host it wants itself, by planting a simulated
+  one. Steps that would otherwise use the runner's own GPU — `a model is served
+  in the background` and `a managed runtime is active` off a simulated machine —
+  take the GPU-less path a GitHub-hosted runner takes (a mock server, no SDK
+  install), so a GPU box runs the same checks. The host probes a simulated
+  machine does not replace are listed below.
+- `real` — set by the self-hosted GPU lanes. Scenarios tagged
+  `@requires-real-gpu`, whose premise a simulated host cannot provide (a model
+  generating tokens on a device, a runtime really installed for it, the real
+  machine's own detection), run only here, and still only on a host with a
+  usable AMD GPU.
+
+Any other value aborts the run, so a misspelt `real` cannot silently skip the
+real-GPU scenarios. A missing one would skip them just as quietly, so
+`every_self_hosted_lane_runs_the_real_gpu_scenarios` in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs) fails when a
+self-hosted lane does not set `E2E_HARDWARE: real`, when a WSL lane does not
+forward it through `WSLENV`, when anything else in a workflow sets it (a
+GitHub-hosted job, the workflow-level `env:`, a `run:` script), or when
+[run-e2e-lane.sh](../scripts/run-e2e-lane.sh), which the shared-GPU-queue
+lanes run, stops exporting it, exports it only after running the suite, or
+names it on any other line. To run them locally on a GPU host:
+
+```bash
+E2E_HARDWARE=real cargo xtask e2e
+```
+
+A scenario describes its machine with a Given step — `a machine with an AMD
+Instinct GPU`, `a machine with two AMD Instinct GPUs`, `a machine with eight AMD
+Instinct GPUs`, `a bare-metal Linux
+machine with an AMD GPU`, `a WSL machine with an AMD GPU passed through`, `a
+Linux machine with no AMD GPU` (see
+[simulated_host_steps.rs](../tests/e2e-cucumber/tests/e2e/simulated_host_steps.rs)).
+The step writes a directory laid out as the kernel lays out `/dev`, `/sys` and
+`/proc` ([simulated_host.rs](../tests/e2e-cucumber/src/simulated_host.rs)) and
+hands it to the binary in `ROCM_CLI_TEST_HOST_ROOT`, which the hardware probes
+read in place of `/`. Only an `e2e-test-hooks` build (which `cargo xtask e2e`
+produces) honours it — see [release-trust.md](release-trust.md).
+
+The programs the CLI asks about the machine — `uname`, `lsmod`, `modinfo`,
+`ldconfig`, `lspci`, `rocminfo`, `rocm_agent_enumerator`, `amd-smi`, `mpirun`,
+`mokutil`, the kernel log (`journalctl`, `dmesg`), and the WSL interop shells
+(`powershell.exe`, `powershell`, `pwsh.exe`, `cmd.exe`) — are taken off the
+real `PATH` (`HOST_TOOLS` in the same file).
+The ones the simulated machine has come back as the `fake-host-tool` stand-in,
+answering from canned output stored in the same directory; the ones it lacks
+are simply absent. The runner's own GPU scoping (`HIP_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, `ROCM_PATH`, ...) is unset and `HOME` points into the
+scenario, so a GPU runner's GPUs, hardware tools and installs cannot answer
+for the simulated machine. A `serve` on it reaches the `fake-vllm` stand-in
+planted as the managed runtime's `vllm`. Container detection reads its markers
+(`/.dockerenv`, `/run/.containerenv`, `/proc/1/cgroup`) under the same root, so a
+simulated machine is never in a container.
+
+What is not simulated: package-manager state (the ROCm repositories,
+`dpkg`/`rpm`) and discovered ROCm installs, which the CLI prints and acts on;
+and the identity of the user running the suite. The CLI still reads `$USER`, runs
+the real `id -Gn` for the user's groups, and runs the real `stat` on the planted
+device nodes, which are plain files owned by that user, so group membership
+(`render`, `video`) and device access describe the runner, not the simulated
+machine. The per-GPU VRAM fallback `serve` uses to pick a device when `amd-smi`
+is missing reads the real `/sys/class/drm` (`gpu_vram_usage_sysfs` in
+[gpu_policy.rs](../apps/rocm/src/gpu_policy.rs)), so on a GPU box it sees the
+runner's cards. No simulated scenario asserts on any of these. Simulated scenarios
+carry `@requires-os:linux`: the Windows lane probes the registry, not a
+filesystem.
+
+A scenario on a simulated machine proves the CLI reads that machine correctly,
+not that the real kernel still looks like it. Detection on the machine the
+suite runs on is kept by twins that repeat a simulated scenario's assertions
+on the real machine:
+
+- `@id:examine-detects-this-machines-gpu-and-driver` repeats
+  `@id:examine-detects-gpu-and-driver` on every GPU lane, the Windows one
+  included (`@requires-real-gpu`).
+- `@id:serve-masked-devices-fail-on-this-host` repeats
+  `@id:serve-masked-devices-fail` on every Linux GPU lane
+  (`@requires-real-gpu`).
+- `@id:diagnose-real-wsl-never-reports-bare-metal-causes` repeats
+  `@id:diagnose-wsl-never-reports-bare-metal-causes` on the WSL lane
+  (`@requires-wsl`).
+- `@id:serve-no-gpu-fails-fast-on-this-host` repeats
+  `@id:serve-no-gpu-fails-fast` on any Linux host with no AMD GPU
+  (`@requires-no-gpu @requires-os:linux`), such as the GitHub-hosted Linux
+  runner. It is Linux only because off Linux there is no usable-GPU probe: a
+  GPU-less Windows host is not refused today, so the GPU-required refusal has no
+  Windows coverage.
+
+The other moved scenarios have no twin: their premise (several GPUs, a WSL
+remedy, a driver install plan) runs on the real machine only where a lane has
+that hardware.
+
+A simulated machine is only worth trusting while it is laid out the way the
+kernel lays out a real one, so two `@nightly` scenarios
+(`@id:examine-simulated-machine-matches-the-kernel`,
+`@id:examine-simulated-wsl-machine-matches-wsl`) hold the planted layout
+against a real GPU host and a real WSL2 distribution: on bare metal the device
+nodes, the KFD properties each GPU node states, its `gpu_id` and render node,
+the DRM cards and the shape of the `lspci` lines; on WSL2 `/dev/dxg`, DXCore and
+the kernel string in `/proc/version`. They do not compare property values,
+other `/proc` files or the stand-ins' canned output. When a kernel or driver update moves something,
+they fail with the exact difference; update
+[simulated_host.rs](../tests/e2e-cucumber/src/simulated_host.rs) to match.
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
@@ -1643,14 +1753,14 @@ cargo xtask e2e -- -n "comfyui-1[5-9]"
 
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed
 runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
-added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`
+added. It carries `@requires-real-gpu @nightly @requires-os:linux @requires-bare-metal`
 and does a real `install sdk --yes` first (system-package consent, and a sudo
 OpenMPI install on vLLM families). Those tags gate it only in a
-harness-selected run, which needs the nightly opt-in and a bare-metal Linux AMD
-GPU host:
+harness-selected run, which needs the nightly opt-in, the real-hardware opt-in
+and a bare-metal Linux AMD GPU host:
 
 ```bash
-E2E_INCLUDE_NIGHTLY=1 cargo xtask e2e
+E2E_INCLUDE_NIGHTLY=1 E2E_HARDWARE=real cargo xtask e2e
 ```
 
 Do not select it with `-n`/`--name`, or with the `name_filter` input of the
@@ -3225,7 +3335,7 @@ tool and requires it gets a `tool_use` block back) and `serve-54`
 checks the reply is an event stream that reassembles into text, with usage in
 `message_delta`) in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
-They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
+They run on the GPU lanes (`@requires-real-gpu`), with whichever engine the host
 serves with. The proxy's unit tests cover the stream event sequence, a stream
 that ends early, an engine refusal before the first byte, and the refusal of a
 streaming request that offers `tools` (no scenario covers that refusal). The
@@ -3252,7 +3362,7 @@ cargo test -p rocm --bin rocm every_lemonade_catalog_recipe_resolves_to_a_servab
 
 The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 `rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
-It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
+It carries `@requires-real-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
 the queue nightly only) and the vLLM half falls to the Instinct lane. Of those,
@@ -3885,7 +3995,7 @@ That unit test exercises `reuse_pregate_opens` directly, so on its own it cannot
 see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
 call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
 probe is a real hardware probe with no injection point. serve-31 closes it, and
-being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
+being `@requires-real-gpu` it runs on the **`E2E self-hosted`** lane only, never on
 the per-PR mock lane. The host predicate itself is the shared
 `host_has_no_usable_gpu` function, called by both the bail and the test rather
 than restated in either, so the test cannot drift from the production rule.
@@ -3971,7 +4081,7 @@ The fifth is the pre-gate's other half, and it is the one that needs real
 hardware:
 
 - serve-31, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
-  (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
+  (**`@requires-real-gpu`**, so the `E2E self-hosted` lane only) — on a host that
   *does* have a usable GPU, a live service this invocation really could reuse
   still does not pull engine or registry work ahead of `--gpu` validation. The
   record matches on liveness, engine and canonical model id, so every term of

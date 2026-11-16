@@ -26,7 +26,7 @@ const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_DOCKER_TAG: &str = "requires-docker";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
-const REQUIRES_MULTI_GPU_TAG: &str = "requires-multi-gpu";
+const REQUIRES_REAL_GPU_TAG: &str = "requires-real-gpu";
 const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
@@ -63,23 +63,85 @@ pub enum Expectation {
     Skip { reason: String },
 }
 
+/// Which hardware a run exercises — the `E2E_HARDWARE` switch.
+///
+/// `simulated` (the default) is the per-PR shape: a scenario that needs a GPU
+/// describes the host it wants itself, by planting a simulated one, and steps
+/// that would otherwise reach the runner's GPU (a real serve, a real SDK
+/// install) take their GPU-less path, so a GPU box runs what a GitHub-hosted
+/// runner runs. The hardware probes a simulated machine does not replace are
+/// listed in `docs/testing.md`. Scenarios whose premise cannot be simulated — a
+/// model generating tokens on a device, a runtime really installed for it —
+/// are tagged `@requires-real-gpu` and only run when a lane on real hardware
+/// opts in with `E2E_HARDWARE=real`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HardwareMode {
+    #[default]
+    Simulated,
+    Real,
+}
+
+impl HardwareMode {
+    /// The environment variable a lane sets to choose the mode.
+    pub const ENV: &'static str = "E2E_HARDWARE";
+
+    /// Parse the variable's value; unset or empty means simulated.
+    ///
+    /// Anything else is an error rather than a fallback: a lane that misspells
+    /// `real` would otherwise skip every real-GPU scenario and still go green.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("" | "simulated") => Ok(Self::Simulated),
+            Some("real") => Ok(Self::Real),
+            Some(other) => Err(format!(
+                "{}={other:?} is not a hardware mode; use `simulated` or `real`",
+                Self::ENV
+            )),
+        }
+    }
+
+    /// The mode this process runs in, read from [`HardwareMode::ENV`].
+    ///
+    /// # Panics
+    ///
+    /// On a value [`HardwareMode::parse`] rejects, including one that is not
+    /// valid Unicode: a lane must never fall back to a mode it did not ask for.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let value = std::env::var_os(Self::ENV).map(|value| {
+            value.into_string().unwrap_or_else(|raw| {
+                panic!(
+                    "{}={} is not a hardware mode; use `simulated` or `real`",
+                    Self::ENV,
+                    raw.display()
+                )
+            })
+        });
+        Self::parse(value.as_deref()).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Stable lowercase name, as accepted by [`HardwareMode::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Simulated => "simulated",
+            Self::Real => "real",
+        }
+    }
+}
+
 /// Facts extracted from a scenario's tags.
 #[derive(Debug, Clone)]
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
-    /// `@requires-multi-gpu`: the scenario's premise is a host with MORE THAN ONE
-    /// AMD GPU present, so a single-GPU host is not a weaker version of it — it
-    /// is a different situation in which the assertion does not hold. Skipped
-    /// wherever the probed device count is not known to exceed one.
-    ///
-    /// `@requires-gpu` cannot express this: it asks only whether *a* device is
-    /// usable, and Strix Halo answers yes with exactly one. The distinction is
-    /// load-bearing for the visibility-mask ordinal scenarios, where a mask token
-    /// that names a device the host does not have makes the product's ordinal
-    /// probe report "unknown" rather than a visible set, and `--gpu` validation
-    /// then takes its permissive fallback instead of refusing.
-    pub requires_multi_gpu: bool,
+    /// `@requires-real-gpu`: the scenario needs a physical AMD GPU, not a
+    /// simulated host — it serves a model on it, installs a runtime for it,
+    /// inspects the real machine, or checks the simulation against the real
+    /// kernel. Implies `@requires-gpu`, and additionally skips unless the
+    /// run opted into real hardware with `E2E_HARDWARE=real` (see
+    /// [`HardwareMode`]).
+    pub requires_real_gpu: bool,
     /// `@requires-gfx-target`: the scenario needs a detected chip name but does
     /// not access the GPU. This permits resolver dry-runs on WSL before GPU
     /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
@@ -181,13 +243,23 @@ pub struct ScenarioDecl {
 }
 
 impl ScenarioDecl {
+    /// Whether the scenario needs a usable AMD GPU on this host:
+    /// `@requires-gpu`, or `@requires-real-gpu`, which implies it. `resolve`
+    /// asks this rather than reading `requires_gpu` alone, so a declaration
+    /// built by hand with only `requires_real_gpu` set still skips on a host
+    /// without a GPU instead of running there.
+    #[must_use]
+    pub const fn needs_gpu(&self) -> bool {
+        self.requires_gpu || self.requires_real_gpu
+    }
+
     /// Parse a scenario's declaration from its gherkin tags, accepting the
     /// leading `@` shape cucumber-rs supplies at runtime and bare unit fixtures.
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
         let mut requires_docker = false;
         let mut requires_gpu = false;
-        let mut requires_multi_gpu = false;
+        let mut requires_real_gpu = false;
         let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
@@ -218,8 +290,11 @@ impl ScenarioDecl {
                 requires_docker = true;
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
-            } else if tag == REQUIRES_MULTI_GPU_TAG {
-                requires_multi_gpu = true;
+            } else if tag == REQUIRES_REAL_GPU_TAG {
+                // Implies `@requires-gpu`, so every gate that applies to a GPU
+                // scenario (usable device, startable engine) applies here too.
+                requires_gpu = true;
+                requires_real_gpu = true;
             } else if tag == REQUIRES_GFX_TARGET_TAG {
                 requires_gfx_target = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
@@ -245,7 +320,7 @@ impl ScenarioDecl {
         Self {
             id,
             requires_gpu,
-            requires_multi_gpu,
+            requires_real_gpu,
             requires_gfx_target,
             requires_no_gpu,
             requires_bare_metal,
@@ -293,11 +368,28 @@ pub struct Condition {
     pub has_amd_gpu: Option<bool>,
     #[serde(default)]
     pub is_wsl: Option<bool>,
+    /// The run's [`HardwareMode`]. A scenario that reaches the runner's GPU only
+    /// in a `real` run — chat-06 and chat-07 serve a real model there and talk to
+    /// the mock server otherwise — can only hit a real-serve bug in that mode, so
+    /// its row says `hardware = "real"` and a simulated run on the same GPU box
+    /// expects it to pass.
+    #[serde(default)]
+    pub hardware: Option<HardwareMode>,
 }
 
 impl Condition {
     /// Does this condition hold for the given host + resolved engine?
-    fn matches(&self, cap: &HostCapability, effective_engine: &str) -> bool {
+    fn matches(
+        &self,
+        cap: &HostCapability,
+        effective_engine: &str,
+        hardware: HardwareMode,
+    ) -> bool {
+        if let Some(mode) = self.hardware
+            && mode != hardware
+        {
+            return false;
+        }
         if let Some(e) = &self.effective_engine
             && !e.eq_ignore_ascii_case(effective_engine)
         {
@@ -369,10 +461,11 @@ impl Expectations {
         id: &str,
         cap: &HostCapability,
         effective_engine: &str,
+        hardware: HardwareMode,
     ) -> Option<u64> {
         self.entries_for(id)
             .iter()
-            .filter(|e| e.when.matches(cap, effective_engine))
+            .filter(|e| e.when.matches(cap, effective_engine, hardware))
             .filter_map(|e| e.serve_timeout_secs)
             .min()
     }
@@ -383,10 +476,15 @@ impl Expectations {
     /// `@serve-timeout:<secs>` tag on an expected-pass scenario wins, else the
     /// shortest matching xfail `serve_timeout_secs`. `None` for a scenario with
     /// no `@id:` tag or with neither, which keeps the step default.
-    pub fn serve_timeout_override(&self, decl: &ScenarioDecl, cap: &HostCapability) -> Option<u64> {
+    pub fn serve_timeout_override(
+        &self,
+        decl: &ScenarioDecl,
+        cap: &HostCapability,
+        hardware: HardwareMode,
+    ) -> Option<u64> {
         let id = decl.id.as_deref()?;
         decl.serve_timeout_secs
-            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap)))
+            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap), hardware))
     }
 
     /// Whether any declared condition for this scenario matches this host — the
@@ -397,10 +495,16 @@ impl Expectations {
     /// re-deriving applicability. Steps use it to spend effort where it changes
     /// a result: a serve backing an expect-pass scenario is worth relaunching
     /// after a stall, one backing a known bug is not.
-    pub fn is_xfail(&self, id: &str, cap: &HostCapability, effective_engine: &str) -> bool {
+    pub fn is_xfail(
+        &self,
+        id: &str,
+        cap: &HostCapability,
+        effective_engine: &str,
+        hardware: HardwareMode,
+    ) -> bool {
         self.entries_for(id)
             .iter()
-            .any(|e| e.when.matches(cap, effective_engine))
+            .any(|e| e.when.matches(cap, effective_engine, hardware))
     }
 }
 
@@ -508,21 +612,25 @@ pub struct PlatformManifest<'a> {
 /// - `merge_queue` — set only in the merge queue (via `E2E_MERGE_QUEUE`). Per-PR
 ///   runs leave it false so heavy `@merge-queue` serves stay off the PR path (a
 ///   cheaper per-engine canary covers them) and run once before the change lands.
+/// - `hardware` — [`HardwareMode::Real`] only on a lane running on a GPU host
+///   that opted in (via `E2E_HARDWARE=real`); otherwise `@requires-real-gpu`
+///   scenarios are skipped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Included {
     pub nightly: bool,
     pub lifecycle: bool,
     pub docker: bool,
     pub merge_queue: bool,
+    pub hardware: HardwareMode,
 }
 
 /// Resolve a scenario's expectation on this host.
 ///
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-docker`
-///    scenario without a usable container runtime, a `@requires-gpu` scenario on
-///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
-///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
+///    scenario without a usable container runtime, a `@requires-real-gpu`
+///    scenario outside `E2E_HARDWARE=real`, a `@requires-gpu` scenario on
+///    a host with no AMD GPU, a `@requires-bare-metal` scenario on WSL2, a
 ///    `@requires-os:<os>` scenario on a different OS, a
 ///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
 ///    or a scenario whose effective engine can't start.
@@ -542,6 +650,7 @@ pub fn resolve(
         lifecycle: include_lifecycle,
         docker: include_docker,
         merge_queue: include_merge_queue,
+        hardware,
     } = included;
     // (1) Applicability / skip.
     if decl.nightly && !include_nightly {
@@ -566,22 +675,17 @@ pub fn resolve(
                 .to_owned(),
         };
     }
-    if decl.requires_gpu && !cap.has_amd_gpu {
+    if decl.requires_real_gpu && hardware != HardwareMode::Real {
         return Expectation::Skip {
-            reason: "requires an AMD GPU; none detected on this host".to_owned(),
+            reason: format!(
+                "needs real GPU hardware; set {}=real on a GPU host to run",
+                HardwareMode::ENV
+            ),
         };
     }
-    if decl.requires_multi_gpu && cap.amd_gpu_count.is_none_or(|count| count <= 1) {
-        // An unknown count skips as well: the premise is "more than one device
-        // is present", and a host that cannot be counted has not shown that.
-        // Running there is what turned a real multi-GPU assertion into a
-        // single-GPU failure in the first place.
-        let detected = cap.amd_gpu_count.map_or_else(
-            || "the count could not be probed".to_owned(),
-            |count| format!("{count} detected"),
-        );
+    if decl.needs_gpu() && !cap.has_amd_gpu {
         return Expectation::Skip {
-            reason: format!("requires more than one AMD GPU; {detected}"),
+            reason: "requires an AMD GPU; none detected on this host".to_owned(),
         };
     }
     if decl.requires_gfx_target && cap.gfx_target.is_none() {
@@ -638,7 +742,7 @@ pub fn resolve(
     // A scenario that pins or defaults to a real engine and would actually serve
     // needs that engine to be startable here. We treat any GPU scenario with a
     // resolved engine as engine-gated; non-GPU scenarios never gate on engine.
-    if decl.requires_gpu && !cap.engine_available(engine) {
+    if decl.needs_gpu() && !cap.engine_available(engine) {
         return Expectation::Skip {
             reason: format!(
                 "engine '{engine}' cannot start on this host ({})",
@@ -650,7 +754,7 @@ pub fn resolve(
     // (2) xfail override.
     if let Some(id) = &decl.id {
         for entry in matrix.entries_for(id) {
-            if entry.when.matches(cap, engine) {
+            if entry.when.matches(cap, engine, hardware) {
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
                     reason: entry.reason.clone(),
@@ -737,7 +841,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: Some(8),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
@@ -750,7 +853,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: Some(1),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
@@ -763,7 +865,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: Some(1),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
@@ -775,17 +876,11 @@ mod tests {
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
             // it from bare metal. That is precisely why `@requires-os:linux`
             // cannot stand in for `@requires-bare-metal`.
-            //
-            // The device COUNT is unknown on every WSL host: that platform
-            // reaches the GPU through `/dev/dxg`, exposing neither a KFD
-            // topology nor an amdgpu DRM card for the count probe to read. So
-            // `@requires-multi-gpu` skips there whatever the hardware is.
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -801,7 +896,6 @@ mod tests {
                 is_wsl: true,
                 gfx_target: None,
                 has_amd_gpu: false,
-                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
@@ -816,7 +910,6 @@ mod tests {
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
-                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -829,7 +922,6 @@ mod tests {
                 is_wsl: false,
                 gfx_target: None,
                 has_amd_gpu: false,
-                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
@@ -843,6 +935,11 @@ mod tests {
     #[test]
     fn lemonade_serve_failures_track_rocmai_898_without_xfailing_mock_or_windows() {
         let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        // The lanes these rows describe run on real hardware.
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
         for id in [
             "bench-load-real-serve",
             "chat-tool-definitions-accepted",
@@ -853,24 +950,100 @@ mod tests {
             let scenario = decl(&[&format!("id:{id}")]);
             assert!(
                 matches!(
-                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
+                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, real),
                     Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCMAI-898"
                 ),
                 "{id}"
             );
             assert_eq!(
-                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade", HardwareMode::Real),
                 Some(90),
                 "{id}",
             );
             for platform in ["mock", "strix-windows"] {
                 assert_eq!(
-                    resolve(&scenario, &cap(platform), &matrix, Included::default()),
+                    resolve(&scenario, &cap(platform), &matrix, real),
                     Expectation::ExpectPass,
                     "{id} on {platform}",
                 );
             }
         }
+    }
+
+    /// chat-06 and chat-07 serve a real model only in an `E2E_HARDWARE=real`
+    /// run; in the default simulated mode they talk to the mock server and pass
+    /// on any host. Their xfail rows must follow the mode, or a simulated run on
+    /// a GPU box reads that pass as a stale XPASS and fails the run.
+    #[test]
+    fn chat_rows_xfail_only_in_a_real_hardware_run() {
+        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+        for (id, host) in [
+            ("chat-tool-definitions-accepted", "mi300x"),
+            ("chat-tool-definitions-accepted", "strix-ubuntu"),
+            ("chat-end-to-end-local-model", "strix-ubuntu"),
+        ] {
+            let scenario = decl(&[&format!("id:{id}")]);
+            assert!(
+                matches!(
+                    resolve(&scenario, &cap(host), &matrix, real),
+                    Expectation::ExpectXfail { .. }
+                ),
+                "{id} on {host} in a real run"
+            );
+            assert_eq!(
+                resolve(&scenario, &cap(host), &matrix, Included::default()),
+                Expectation::ExpectPass,
+                "{id} on {host} in a simulated run",
+            );
+            let engine = scenario.effective_engine(&cap(host)).to_owned();
+            assert!(!matrix.is_xfail(id, &cap(host), &engine, HardwareMode::Simulated));
+            assert_eq!(
+                matrix.serve_timeout_for(id, &cap(host), &engine, HardwareMode::Simulated),
+                None,
+                "{id} on {host}: no fail-fast serve window for a serve that does not happen",
+            );
+            assert_eq!(
+                matrix.serve_timeout_override(&scenario, &cap(host), HardwareMode::Simulated),
+                None,
+                "{id} on {host}: the before hook's override follows the mode too",
+            );
+            assert_eq!(
+                matrix.serve_timeout_override(&scenario, &cap(host), HardwareMode::Real),
+                Some(90),
+                "{id} on {host} in a real run",
+            );
+        }
+        // The vLLM row also needs a usable GPU: a real run on a vLLM host
+        // without one never serves for real, so chat-06 passes there.
+        let vllm_without_gpu = HostCapability {
+            has_amd_gpu: false,
+            ..cap("mi300x")
+        };
+        let scenario = decl(&["id:chat-tool-definitions-accepted"]);
+        assert_eq!(
+            resolve(&scenario, &vllm_without_gpu, &matrix, real),
+            Expectation::ExpectPass,
+            "chat-06 on a vLLM host with no usable GPU in a real run",
+        );
+    }
+
+    #[test]
+    fn a_condition_rejects_an_unknown_hardware_mode() {
+        let err = Expectations::parse(
+            r#"
+[["x"]]
+when = { hardware = "Real" }
+bug = "B"
+reason = "r"
+"#,
+        )
+        .unwrap_err();
+        // The message embeds the source line, so ask for serde's own words.
+        assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     /// The rows that carry `therock_family` and `has_amd_gpu` exist so that the
@@ -886,13 +1059,17 @@ mod tests {
     fn real_gpu_lemonade_rows_do_not_xfail_linux_hosts_without_a_usable_gpu() {
         let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         let linux_lemonade = cap("strix-ubuntu");
+        // A real-hardware run, so only the GPU and target guards decide.
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
         let hosts = [
             (
                 "linux, no GPU, no gfx target",
                 HostCapability {
                     gfx_target: None,
                     has_amd_gpu: false,
-                    amd_gpu_count: Some(0),
                     ..linux_lemonade.clone()
                 },
             ),
@@ -900,7 +1077,6 @@ mod tests {
                 "linux, gfx target reported but no usable GPU",
                 HostCapability {
                     has_amd_gpu: false,
-                    amd_gpu_count: Some(0),
                     ..linux_lemonade.clone()
                 },
             ),
@@ -920,7 +1096,7 @@ mod tests {
             let scenario = decl(&[&format!("id:{id}")]);
             for (label, host) in &hosts {
                 assert_eq!(
-                    resolve(&scenario, host, &matrix, Included::default()),
+                    resolve(&scenario, host, &matrix, real),
                     Expectation::ExpectPass,
                     "{id} on {label}",
                 );
@@ -928,7 +1104,7 @@ mod tests {
             // The full real-GPU host is the one that must still be xfailed.
             assert!(
                 matches!(
-                    resolve(&scenario, &linux_lemonade, &matrix, Included::default()),
+                    resolve(&scenario, &linux_lemonade, &matrix, real),
                     Expectation::ExpectXfail { bug, .. } if bug == "ROCMAI-898"
                 ),
                 "{id} on a real GPU host",
@@ -1031,7 +1207,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1045,7 +1222,8 @@ serve_timeout_secs = 90
                     nightly: true,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1061,7 +1239,8 @@ serve_timeout_secs = 90
                     nightly: true,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1088,7 +1267,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1102,7 +1282,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: true,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1117,7 +1298,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: true,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1220,8 +1402,11 @@ serve_timeout_secs = 90
             // sides of it: a host that lists aim runs the scenario exactly when
             // Docker is reachable, and one that does not list aim skips on the
             // engine, never on the nightly opt-in.
+            // Real hardware too: they serve on the device, and every lane
+            // that runs them sets E2E_HARDWARE=real.
             let opted_in = Included {
                 nightly: true,
+                hardware: HardwareMode::Real,
                 ..Included::default()
             };
             let mut with_aim = cap("strix-ubuntu");
@@ -1283,6 +1468,7 @@ serve_timeout_secs = 90
                     lifecycle: true,
                     merge_queue: true,
                     docker: false,
+                    hardware: HardwareMode::Simulated,
                 }
             ),
             Expectation::Skip { .. }
@@ -1309,7 +1495,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1323,7 +1510,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: true
+                    merge_queue: true,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1339,7 +1527,8 @@ serve_timeout_secs = 90
                     nightly: true,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1354,7 +1543,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: true
+                    merge_queue: true,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1389,7 +1579,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -1404,7 +1595,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1419,7 +1611,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1439,60 +1632,12 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
         ));
-    }
-
-    #[test]
-    fn multi_gpu_tag_parses_in_both_shapes() {
-        assert!(decl(&["id:x", "requires-multi-gpu"]).requires_multi_gpu);
-        assert!(decl(&["@id:x", "@requires-multi-gpu"]).requires_multi_gpu);
-        // Absent by default, and `@requires-gpu` does not imply it — otherwise
-        // every existing GPU scenario would silently stop running on Strix.
-        let gpu_only = decl(&["id:x", "requires-gpu"]);
-        assert!(!gpu_only.requires_multi_gpu);
-        assert!(gpu_only.requires_gpu);
-        // Nor the reverse: the tags are independent flags on the same scenario.
-        assert!(!decl(&["id:x", "requires-multi-gpu"]).requires_gpu);
-    }
-
-    /// Both directions of the gate. A scenario whose premise is a second device
-    /// must RUN where one exists and SKIP where it does not — a gate that only
-    /// ever skips would silently retire the assertion everywhere.
-    #[test]
-    fn requires_multi_gpu_runs_only_where_a_second_device_is_present() {
-        let m = Expectations::default();
-        let d = decl(&[
-            "id:serve-rocr-reindexed-gpu-index-rejected",
-            "requires-gpu",
-            "requires-multi-gpu",
-            "requires-os:linux",
-        ]);
-        // MI300X has eight devices → the premise holds → the scenario runs.
-        assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, Included::default()),
-            Expectation::ExpectPass
-        );
-        // Strix Halo has exactly one. `@requires-gpu` is satisfied there, which
-        // is why the scenario used to run and fail on its premise.
-        assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, Included::default()),
-            Expectation::Skip { .. }
-        ));
-        // No GPU at all, and a host whose count could not be probed (WSL), skip
-        // too: neither has SHOWN a second device.
-        for host in ["mock", "wsl2"] {
-            assert!(
-                matches!(
-                    resolve(&d, &cap(host), &m, Included::default()),
-                    Expectation::Skip { .. }
-                ),
-                "{host} must not run a multi-GPU scenario"
-            );
-        }
     }
 
     /// The tag line of a scenario in a real `.feature` file, by `@id:` slug.
@@ -1513,71 +1658,83 @@ serve_timeout_secs = 90
             .collect()
     }
 
-    /// The gate is only worth anything if the scenario in the file actually
-    /// carries it, so resolve the REAL tag line rather than a hand-written copy:
-    /// dropping `@requires-multi-gpu` from the feature file has to fail a test,
-    /// not silently restore the single-GPU failure this was added to fix.
-    ///
-    /// The sibling `serve-19` is asserted in the same breath to stay UNGATED: its
-    /// `HIP_VISIBLE_DEVICES=0` mask names a device every GPU host has, so its
-    /// visible set resolves on one GPU and the refusal holds there. Gating it too
-    /// would retire live coverage on the Strix lanes for no reason.
-    #[test]
-    fn the_rocr_reindexed_scenario_is_gated_on_multi_gpu_and_its_sibling_is_not() {
-        let feature = include_str!("../features/model_serving.feature");
-        let m = Expectations::default();
-
-        let rocr = ScenarioDecl::from_tags(&feature_tags(
-            feature,
-            "serve-rocr-reindexed-gpu-index-rejected",
-        ));
-        assert!(rocr.requires_multi_gpu, "serve-20 must carry the gate");
-        assert!(matches!(
-            resolve(&rocr, &cap("strix-ubuntu"), &m, Included::default()),
-            Expectation::Skip { .. }
-        ));
-        assert_eq!(
-            resolve(&rocr, &cap("mi300x"), &m, Included::default()),
-            Expectation::ExpectPass
-        );
-
-        let masked =
-            ScenarioDecl::from_tags(&feature_tags(feature, "serve-masked-gpu-index-rejected"));
-        assert!(
-            !masked.requires_multi_gpu,
-            "serve-19 holds on a single GPU and must keep running there"
-        );
-        for host in ["strix-ubuntu", "mi300x"] {
-            assert_eq!(
-                resolve(&masked, &cap(host), &m, Included::default()),
-                Expectation::ExpectPass,
-                "{host} must still run serve-19"
-            );
-        }
+    /// The scenario body of a real `.feature` file, by `@id:` slug: the lines
+    /// after its tag line, up to the next tag line.
+    fn feature_body(feature_text: &'static str, id: &str) -> String {
+        let mut lines = feature_text.lines().map(str::trim);
+        lines
+            .by_ref()
+            .find(|line| {
+                line.starts_with('@')
+                    && line
+                        .split_whitespace()
+                        .any(|tag| tag == format!("@id:{id}").as_str())
+            })
+            .unwrap_or_else(|| panic!("no tag line for @id:{id}"));
+        // The scenario's own lines end where the next one's comment or tags
+        // begin, so its neighbour's commentary is never read as its steps.
+        lines
+            .take_while(|line| !line.starts_with('@') && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    /// The single-GPU skip must name the count, not just repeat the `@requires-gpu`
-    /// reason: on Strix Halo a GPU *is* present, so "none detected" would send a
-    /// reader of the report looking for a missing device that is right there.
+    /// serve-19's single-GPU case: the same masked ordinal refused on a machine
+    /// with one GPU. Read from the real feature file, so a second GPU added to it
+    /// fails here instead of quietly turning it into a copy of serve-19.
     #[test]
-    fn multi_gpu_skip_reason_distinguishes_itself_from_the_no_gpu_one() {
-        let m = Expectations::default();
-        let d = decl(&["id:x", "requires-gpu", "requires-multi-gpu"]);
-        let Expectation::Skip { reason } =
-            resolve(&d, &cap("strix-ubuntu"), &m, Included::default())
-        else {
-            panic!("a single-GPU host must skip a multi-GPU scenario");
-        };
+    fn the_single_gpu_masked_index_scenario_plants_one_gpu() {
+        let feature = include_str!("../features/model_serving.feature");
+        let id = "serve-masked-gpu-index-rejected-on-one-gpu";
+        let body = feature_body(feature, id);
         assert!(
-            reason.contains("more than one") && reason.contains('1'),
-            "reason should name the shortfall, got: {reason}"
+            body.contains("Given a machine with an AMD Instinct GPU\n"),
+            "{id} must describe a one-GPU machine:\n{body}"
         );
+        assert!(
+            body.contains("pinned to a GPU hidden by the visibility mask"),
+            "{id} must serve with serve-19's mask:\n{body}"
+        );
+    }
+
+    /// serve-20's premise is a host with MORE THAN ONE GPU: on one GPU its mask
+    /// names a device that is not there and the refusal stops following from the
+    /// mask (see the scenario's comment). It plants a simulated two-GPU machine,
+    /// so the premise holds on every Linux lane. Read from the REAL feature file,
+    /// so dropping the second simulated GPU fails here rather than quietly
+    /// reinstating that single-GPU failure. Its sibling serve-19 is held the same
+    /// way; serve-19's single-GPU case is serve-59, held to one GPU above.
+    #[test]
+    fn the_rocr_reindexed_scenarios_plant_their_own_second_gpu() {
+        let feature = include_str!("../features/model_serving.feature");
+        let m = Expectations::default();
+        for id in [
+            "serve-rocr-reindexed-gpu-index-rejected",
+            "serve-masked-gpu-index-rejected",
+        ] {
+            assert!(
+                feature_body(feature, id).contains("Given a machine with two AMD Instinct GPUs"),
+                "{id} must describe a two-GPU machine"
+            );
+            let decl = ScenarioDecl::from_tags(&feature_tags(feature, id));
+            assert!(
+                !decl.requires_gpu,
+                "{id} brings its own GPUs, so it must not wait for a lane that has them"
+            );
+            for host in ["strix-ubuntu", "mi300x", "wsl2"] {
+                assert_eq!(
+                    resolve(&decl, &cap(host), &m, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} must run on {host}"
+                );
+            }
+        }
     }
 
     #[test]
     fn requires_no_gpu_runs_only_on_hosts_without_a_gpu() {
         let m = Expectations::default();
-        let d = decl(&["id:serve-no-gpu-fails-fast", "requires-no-gpu"]);
+        let d = decl(&["id:serve-no-gpu-fails-fast-on-this-host", "requires-no-gpu"]);
         // The mock host has no AMD GPU → the no-GPU premise applies → runs.
         assert_eq!(
             resolve(
@@ -1588,7 +1745,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1603,7 +1761,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1617,7 +1776,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1638,7 +1798,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::Skip { .. }
@@ -1656,7 +1817,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::ExpectPass,
@@ -1667,12 +1829,14 @@ serve_timeout_secs = 90
 
     #[test]
     fn combining_requires_os_and_requires_bare_metal_narrows_to_native_linux() {
-        // diagnose-08's exact tag set. It needs a Linux host (the assertion reads
-        // back a shell rc file) that is ALSO not WSL (the only auto-applicable
-        // fix reaching the consent gate does not apply there). Neither tag says
-        // that alone, so the pair has to compose — and a `-n` filtered local run
-        // bypasses this resolution entirely, which makes it worth pinning here
-        // rather than trusting a hand-run of the suite.
+        // The tag set a premise like diagnose-08's needs on the real host: Linux
+        // (the assertion reads back a shell rc file) that is ALSO not WSL (the
+        // only auto-applicable fix reaching the consent gate does not apply
+        // there). diagnose-08 itself now plants a simulated bare-metal machine
+        // instead, but other diagnose, driver-install and examine scenarios still
+        // carry the pair. Neither tag says that alone, so the pair has to compose — and a
+        // `-n` filtered local run bypasses this resolution entirely, which makes
+        // it worth pinning here rather than trusting a hand-run of the suite.
         let m = Expectations::default();
         let d = decl(&[
             "id:diagnose-fix-requires-agreement-before-changing-anything",
@@ -1708,7 +1872,10 @@ serve_timeout_secs = 90
     #[test]
     fn requires_wsl_runs_only_on_wsl_hosts() {
         let m = Expectations::default();
-        let d = decl(&["id:examine-detects-wsl", "requires-wsl"]);
+        let d = decl(&[
+            "id:diagnose-real-wsl-never-reports-bare-metal-causes",
+            "requires-wsl",
+        ]);
         assert!(d.requires_wsl);
         for wsl in ["wsl", "wsl2"] {
             assert_eq!(
@@ -1720,7 +1887,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::ExpectPass
@@ -1736,7 +1904,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::Skip { .. }
@@ -1769,7 +1938,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    hardware: HardwareMode::Simulated,
                 }
             ),
             Expectation::Skip { .. }
@@ -1787,7 +1957,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    hardware: HardwareMode::Simulated,
                 }
             ),
             Expectation::ExpectPass
@@ -1988,7 +2159,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -2019,7 +2191,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -2045,7 +2218,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -2060,7 +2234,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -2084,7 +2259,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -2098,7 +2274,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -2112,7 +2289,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -2132,7 +2310,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -2146,7 +2325,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -2175,7 +2355,8 @@ reason = "short-name not surfaced"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -2189,7 +2370,8 @@ reason = "short-name not surfaced"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -2222,7 +2404,8 @@ reason = "lemonade vulkan fallback"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -2237,7 +2420,8 @@ reason = "lemonade vulkan fallback"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -2258,7 +2442,12 @@ serve_timeout_secs = 90
         .unwrap();
         // MI300X: effective engine vllm → override applies (fail fast).
         assert_eq!(
-            m.serve_timeout_for("serve-default-engine-inference", &cap("mi300x"), "vllm"),
+            m.serve_timeout_for(
+                "serve-default-engine-inference",
+                &cap("mi300x"),
+                "vllm",
+                HardwareMode::Real
+            ),
             Some(90)
         );
         // Strix Windows: lemonade default → condition doesn't match → no override
@@ -2267,12 +2456,16 @@ serve_timeout_secs = 90
             m.serve_timeout_for(
                 "serve-default-engine-inference",
                 &cap("strix-windows"),
-                "lemonade"
+                "lemonade",
+                HardwareMode::Real
             ),
             None
         );
         // Unknown id → no override.
-        assert_eq!(m.serve_timeout_for("nope", &cap("mi300x"), "vllm"), None);
+        assert_eq!(
+            m.serve_timeout_for("nope", &cap("mi300x"), "vllm", HardwareMode::Real),
+            None
+        );
     }
 
     #[test]
@@ -2286,15 +2479,21 @@ reason = "vLLM readiness gap"
 "#,
         )
         .unwrap();
-        assert!(m.is_xfail("serve-default-engine-inference", &cap("mi300x"), "vllm"));
+        assert!(m.is_xfail(
+            "serve-default-engine-inference",
+            &cap("mi300x"),
+            "vllm",
+            HardwareMode::Real
+        ));
         // A condition that doesn't match this host leaves the scenario expect-pass.
         assert!(!m.is_xfail(
             "serve-default-engine-inference",
             &cap("strix-windows"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
         // No entry at all → expect-pass.
-        assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm"));
+        assert!(!m.is_xfail("nope", &cap("mi300x"), "vllm", HardwareMode::Real));
     }
 
     #[test]
@@ -2313,12 +2512,14 @@ flaky = true
         assert!(m.is_xfail(
             "chat-end-to-end-local-model",
             &cap("strix-ubuntu"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
         assert!(!m.is_xfail(
             "chat-end-to-end-local-model",
             &cap("wsl-no-passthrough"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
     }
 
@@ -2333,7 +2534,12 @@ flaky = true
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         for host in ["wsl-no-passthrough", "wsl"] {
             assert!(
-                !m.is_xfail("examine-both-forms-agree-on-gpu", &cap(host), "lemonade"),
+                !m.is_xfail(
+                    "examine-both-forms-agree-on-gpu",
+                    &cap(host),
+                    "lemonade",
+                    HardwareMode::Real
+                ),
                 "examine-08 must run, not xfail, on the {host} host"
             );
         }
@@ -2352,7 +2558,8 @@ flaky = true
         assert!(!m.is_xfail(
             "serve-hf-checkpoint-inference",
             &cap("strix-windows"),
-            "lemonade"
+            "lemonade",
+            HardwareMode::Real
         ));
     }
 
@@ -2369,12 +2576,21 @@ flaky = true
             "runtime-lemonade-backend-alignment-reported",
             "serve-large-model-inference",
         ] {
-            assert!(m.is_xfail(id, &cap("strix-windows"), "lemonade"), "{id}");
+            assert!(
+                m.is_xfail(id, &cap("strix-windows"), "lemonade", HardwareMode::Real),
+                "{id}"
+            );
             for linux in ["strix-ubuntu", "mi300x", "wsl2"] {
-                assert!(!m.is_xfail(id, &cap(linux), "lemonade"), "{id} on {linux}");
+                assert!(
+                    !m.is_xfail(id, &cap(linux), "lemonade", HardwareMode::Real),
+                    "{id} on {linux}"
+                );
             }
             // Same Windows host, other engine: the row is about lemonade.
-            assert!(!m.is_xfail(id, &cap("strix-windows"), "vllm"), "{id} vllm");
+            assert!(
+                !m.is_xfail(id, &cap("strix-windows"), "vllm", HardwareMode::Real),
+                "{id} vllm"
+            );
             let entries = m.entries_for(id);
             assert_eq!(entries.len(), 1, "{id}");
             assert!(!entries[0].flaky, "{id} is deterministic");
@@ -2387,7 +2603,11 @@ flaky = true
             "serve-large-model-inference",
         );
         assert_eq!(
-            m.serve_timeout_override(&ScenarioDecl::from_tags(&tags), &cap("strix-windows")),
+            m.serve_timeout_override(
+                &ScenarioDecl::from_tags(&tags),
+                &cap("strix-windows"),
+                HardwareMode::Real
+            ),
             Some(2400)
         );
     }
@@ -2401,12 +2621,12 @@ flaky = true
     fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         let id = "serve-stop-leaves-no-background-helper";
-        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
+        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade", HardwareMode::Real));
         assert_eq!(
-            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade", HardwareMode::Real),
             Some(90)
         );
-        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade"));
+        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade", HardwareMode::Real));
         let entries = m.entries_for(id);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].flaky);
@@ -2429,11 +2649,17 @@ flaky = true
         );
         let decl = ScenarioDecl::from_tags(&tags);
         assert_eq!(
-            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
+            m.serve_timeout_override(&decl, &cap("strix-ubuntu"), HardwareMode::Real),
             Some(90)
         );
-        assert_eq!(m.serve_timeout_override(&decl, &cap("mi300x")), Some(90));
-        assert_eq!(m.serve_timeout_override(&decl, &cap("strix-windows")), None);
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("mi300x"), HardwareMode::Real),
+            Some(90)
+        );
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("strix-windows"), HardwareMode::Real),
+            None
+        );
     }
 
     #[test]
@@ -2446,13 +2672,13 @@ flaky = true
             "serve-timeout:2400",
         ]);
         assert_eq!(
-            m.serve_timeout_override(&tagged, &cap("strix-ubuntu")),
+            m.serve_timeout_override(&tagged, &cap("strix-ubuntu"), HardwareMode::Real),
             Some(2400)
         );
         // No `@id:` tag, nothing to look up: the step default stays.
         let anonymous = decl(&["requires-engine:lemonade"]);
         assert_eq!(
-            m.serve_timeout_override(&anonymous, &cap("strix-ubuntu")),
+            m.serve_timeout_override(&anonymous, &cap("strix-ubuntu"), HardwareMode::Real),
             None
         );
     }
@@ -2463,5 +2689,100 @@ flaky = true
         assert!(glob_match("*dcgpu", "gfx94X-dcgpu"));
         assert!(!glob_match("gfx94*", "gfx1151"));
         assert!(glob_match("gfx1151", "gfx1151"));
+    }
+
+    #[test]
+    fn hardware_mode_defaults_to_simulated_and_rejects_typos() {
+        assert_eq!(HardwareMode::parse(None), Ok(HardwareMode::Simulated));
+        assert_eq!(HardwareMode::parse(Some("")), Ok(HardwareMode::Simulated));
+        assert_eq!(
+            HardwareMode::parse(Some("simulated")),
+            Ok(HardwareMode::Simulated)
+        );
+        assert_eq!(HardwareMode::parse(Some("real")), Ok(HardwareMode::Real));
+        // A misspelt `real` must not quietly fall back to simulated, which would
+        // skip every real-GPU scenario on that lane and still report green.
+        let err = HardwareMode::parse(Some("Real ")).unwrap_err();
+        assert!(err.contains("E2E_HARDWARE"), "{err}");
+        assert!(HardwareMode::parse(Some("gpu")).is_err());
+    }
+
+    #[test]
+    fn requires_real_gpu_implies_requires_gpu() {
+        let d = decl(&["@id:x", "@requires-real-gpu"]);
+        assert!(d.requires_real_gpu);
+        assert!(d.requires_gpu);
+        assert!(!decl(&["id:x", "requires-gpu"]).requires_real_gpu);
+    }
+
+    #[test]
+    fn requires_real_gpu_runs_only_on_real_hardware_with_a_gpu() {
+        let m = Expectations::default();
+        let d = decl(&["id:x", "requires-real-gpu"]);
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+
+        // Simulated (the default) skips it even on a GPU host, naming the switch.
+        match resolve(&d, &cap("mi300x"), &m, Included::default()) {
+            Expectation::Skip { reason } => {
+                assert!(reason.contains("E2E_HARDWARE=real"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+        // Real hardware with a GPU runs it.
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, real),
+            Expectation::ExpectPass
+        );
+        // Real mode does not conjure a GPU: the ordinary GPU gate still applies.
+        match resolve(&d, &cap("mock"), &m, real) {
+            Expectation::Skip { reason } => {
+                assert!(reason.contains("requires an AMD GPU"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    /// The GPU gate holds the implication itself, not only `from_tags`: a
+    /// declaration whose `requires_gpu` was left false still skips on a host
+    /// without a GPU, even with real hardware opted into.
+    #[test]
+    fn requires_real_gpu_alone_still_needs_a_gpu_on_the_host() {
+        let m = Expectations::default();
+        let mut d = decl(&["id:x", "requires-real-gpu"]);
+        d.requires_gpu = false;
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+        match resolve(&d, &cap("mock"), &m, real) {
+            Expectation::Skip { reason } => {
+                assert!(reason.contains("requires an AMD GPU"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    /// The switch only gates `@requires-real-gpu`: an ordinary scenario, and a
+    /// `@requires-gpu` one, resolve the same in either mode.
+    #[test]
+    fn hardware_mode_leaves_other_scenarios_alone() {
+        let m = Expectations::default();
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+        for tags in [&["id:plain"][..], &["id:gpu", "requires-gpu"][..]] {
+            let d = decl(tags);
+            for host in ["mock", "mi300x"] {
+                assert_eq!(
+                    resolve(&d, &cap(host), &m, Included::default()),
+                    resolve(&d, &cap(host), &m, real),
+                    "{tags:?} on {host}"
+                );
+            }
+        }
     }
 }

@@ -1668,6 +1668,195 @@ jobs:
         ]
     }
 
+    /// The names in a `$env:WSLENV = '...'` assignment inside `block`, the
+    /// variables `wsl.exe` forwards into the guest. Empty when the job has none.
+    fn wslenv_names(block: &str) -> Vec<String> {
+        block
+            .lines()
+            .map(strip_comment)
+            .filter_map(|line| line.trim().strip_prefix("$env:WSLENV ="))
+            .flat_map(|value| {
+                strip_quotes(value.trim())
+                    .split(':')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// `E2E_HARDWARE=real` is what lets a GPU lane run the `@requires-real-gpu`
+    /// scenarios. Nothing in the suite notices its absence: a lane without it
+    /// skips every one of them and stays green, so the switch's whole effect
+    /// would vanish without a red check. Derived from the workflows, so a new
+    /// self-hosted lane is covered the day it lands, and a WSL lane must also
+    /// forward the variable into the guest, which does not inherit the job's
+    /// environment. A GitHub-hosted job has no GPU to run those scenarios on,
+    /// so nothing outside a self-hosted job may set it. The shared-GPU-queue
+    /// lanes run `scripts/run-e2e-lane.sh` outside any workflow, so the script
+    /// must export it too.
+    #[test]
+    fn every_self_hosted_lane_runs_the_real_gpu_scenarios() {
+        for (workflow, text) in self_hosted_workflows() {
+            let lanes = self_hosted_e2e_jobs(&text);
+            assert!(!lanes.is_empty(), "{workflow} has no self-hosted lane");
+            for (job, _) in lanes {
+                let block = job_block(&text, &job);
+                let env = job_mapping(block, "env");
+                assert_eq!(
+                    env.get("E2E_HARDWARE").map(String::as_str),
+                    Some("real"),
+                    "{workflow} job `{job}` runs on GPU hardware but does not set \
+                     `E2E_HARDWARE: real` in its job env, so it would skip every \
+                     @requires-real-gpu scenario and still pass"
+                );
+                if block.contains("wsl.exe") {
+                    let forwarded = wslenv_names(block);
+                    assert!(
+                        forwarded.iter().any(|name| name == "E2E_HARDWARE"),
+                        "{workflow} job `{job}` runs the suite inside WSL but does not \
+                         name E2E_HARDWARE in WSLENV (it forwards {forwarded:?}), so the \
+                         guest runs in simulated mode"
+                    );
+                }
+            }
+        }
+        for (workflow, text) in all_workflows() {
+            assert_e2e_hardware_set_only_by_self_hosted_jobs(&workflow, &text);
+        }
+        // The shared-GPU-queue lanes run this script on real GPUs outside any
+        // workflow, so it has to ask for real hardware itself.
+        let script = std::fs::read_to_string(repo_root().join("scripts/run-e2e-lane.sh"))
+            .expect("reading the lane script");
+        if let Some(problem) = lane_script_hardware_problem(&script) {
+            panic!("scripts/run-e2e-lane.sh {problem}");
+        }
+    }
+
+    /// What is wrong with how the lane script sets `E2E_HARDWARE`, if anything.
+    /// It must export `real` unless the caller chose a mode, before it runs the
+    /// suite, and no other line may name the variable at all: an assignment,
+    /// `unset`, `read` or `env -u` afterwards could change what the suite sees.
+    fn lane_script_hardware_problem(script: &str) -> Option<String> {
+        const EXPORT: &str = r#"export E2E_HARDWARE="${E2E_HARDWARE-real}""#;
+        let lines: Vec<&str> = script
+            .lines()
+            .map(|line| strip_comment(line).trim())
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        let Some(export) = lines.iter().position(|line| *line == EXPORT) else {
+            return Some(
+                "runs on a real GPU but does not export E2E_HARDWARE=real, so it would skip \
+                 every @requires-real-gpu scenario and still pass"
+                    .to_owned(),
+            );
+        };
+        if let Some(run) = lines
+            .iter()
+            .position(|line| *line == "cargo xtask e2e" || line.starts_with("cargo xtask e2e "))
+            && run < export
+        {
+            return Some(format!(
+                "runs the suite ({:?}) before it exports E2E_HARDWARE=real",
+                lines[run]
+            ));
+        }
+        lines
+            .iter()
+            .enumerate()
+            .find(|(i, line)| *i != export && line.contains("E2E_HARDWARE"))
+            .map(|(_, line)| {
+                format!(
+                    "names E2E_HARDWARE again ({line:?}) besides exporting `real`, which can \
+                     change the mode the suite runs in"
+                )
+            })
+    }
+
+    #[test]
+    fn the_lane_script_check_holds_the_export_alone_and_first() {
+        let export = "export E2E_HARDWARE=\"${E2E_HARDWARE-real}\"\n";
+        let run = "cargo xtask e2e\n";
+        assert_eq!(
+            lane_script_hardware_problem(&format!("{export}{run}")),
+            None
+        );
+        assert_eq!(
+            lane_script_hardware_problem(&format!("{export}# E2E_HARDWARE=simulated\n{run}")),
+            None
+        );
+        assert!(lane_script_hardware_problem(run).is_some());
+        assert!(lane_script_hardware_problem(&format!("{run}{export}")).is_some());
+        // Prewarming is not running the suite.
+        assert_eq!(
+            lane_script_hardware_problem(&format!("cargo xtask e2e-prewarm\n{export}{run}")),
+            None
+        );
+        for later in [
+            "export E2E_HARDWARE=simulated",
+            "E2E_HARDWARE=simulated cargo xtask e2e",
+            "unset E2E_HARDWARE",
+            "read -r E2E_HARDWARE",
+            "env -u E2E_HARDWARE cargo xtask e2e",
+        ] {
+            assert!(
+                lane_script_hardware_problem(&format!("{export}{later}\n{run}")).is_some(),
+                "{later}"
+            );
+        }
+    }
+
+    /// Outside a self-hosted GPU job, nothing in `text` may set `E2E_HARDWARE`:
+    /// not the workflow-level `env:`, not another job's `env:`, not a `run:`
+    /// script. The self-hosted jobs' own blocks are cut out first, so their
+    /// `E2E_HARDWARE: real` and `WSLENV` entries do not count.
+    fn assert_e2e_hardware_set_only_by_self_hosted_jobs(workflow: &str, text: &str) {
+        let mut rest = text.to_owned();
+        for (job, _) in self_hosted_e2e_jobs(text) {
+            rest = rest.replacen(job_block(text, &job), "", 1);
+        }
+        let setting = rest.lines().map(strip_comment).find(|line| {
+            let line = line.trim_start();
+            ["E2E_HARDWARE:", "E2E_HARDWARE=", "$env:E2E_HARDWARE"]
+                .iter()
+                .any(|form| line.contains(form))
+        });
+        assert!(
+            setting.is_none(),
+            "{workflow} sets E2E_HARDWARE outside a self-hosted GPU job ({setting:?}); \
+             only real GPU hardware may run @requires-real-gpu scenarios"
+        );
+    }
+
+    #[test]
+    fn e2e_hardware_outside_a_self_hosted_job_is_refused() {
+        let hosted_job = "on: push\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps: []\n";
+        assert_e2e_hardware_set_only_by_self_hosted_jobs("ok.yml", hosted_job);
+        for bad in [
+            "env:\n  E2E_HARDWARE: real\n",
+            "jobs:\n  build:\n    runs-on: ubuntu-24.04\n    env:\n      E2E_HARDWARE: real\n",
+            "jobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: E2E_HARDWARE=real cargo xtask e2e\n",
+        ] {
+            let workflow = format!("on: push\n{bad}");
+            let workflow = if workflow.contains("jobs:") {
+                workflow
+            } else {
+                format!("{workflow}{}", &hosted_job["on: push\n".len()..])
+            };
+            let refused = std::panic::catch_unwind(|| {
+                assert_e2e_hardware_set_only_by_self_hosted_jobs("bad.yml", &workflow);
+            });
+            assert!(refused.is_err(), "not refused:\n{workflow}");
+        }
+    }
+
+    #[test]
+    fn wslenv_names_reads_the_forwarded_variables() {
+        let block =
+            "    steps:\n      - run: |\n          $env:WSLENV = 'A:E2E_HARDWARE:B' # forwarded\n";
+        assert_eq!(wslenv_names(block), ["A", "E2E_HARDWARE", "B"]);
+        assert!(wslenv_names("    steps: []\n").is_empty());
+    }
+
     #[test]
     fn every_self_hosted_lane_waits_for_an_available_gpu() {
         // `e2e-gpu-nightly` shipped without one and nothing noticed: it hung to

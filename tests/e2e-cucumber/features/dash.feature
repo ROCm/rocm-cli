@@ -332,11 +332,12 @@ Feature: Interactive dashboard
   # EAI-8450: the amd-smi device pre-flight only ever checked bare-metal
   # `/dev/kfd`, so under WSL2 (no such device node — GPU access goes through
   # WSLg's `/dev/dxg` instead) the dashboard always reported no GPU, even with
-  # a real one passed through. `@requires-wsl` rather than `@requires-gpu`
+  # a real one passed through. `@requires-wsl` rather than `@requires-real-gpu`
   # alone: the premise under test is the WSL detection path specifically.
   # Currently skipped on every CI lane — no WSL lane carries a real GPU yet
-  # (tracked separately in #223) — but still runs locally on WSL hardware.
-  @id:dash-reports-wsl-gpu-telemetry @requires-wsl @requires-gpu
+  # (tracked separately in #223) — but runs locally on WSL hardware with
+  # `E2E_HARDWARE=real`.
+  @id:dash-reports-wsl-gpu-telemetry @requires-wsl @requires-real-gpu
   Scenario: dash-24 - Dashboard displays GPU telemetry through WSL
     When the user opens the dashboard
     Then the dashboard reports live GPU telemetry
@@ -917,7 +918,7 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-real-gpu @requires-engine:lemonade
   Scenario: dash-52 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
     Given a managed runtime is active
     And the dashboard watches only managed services

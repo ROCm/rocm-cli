@@ -36,8 +36,10 @@
 //! files; only the ROCDXG existence check above looks under them through the
 //! root. The `/usr/lib/wsl/lib` loader entry goes into a real engine's
 //! `LD_LIBRARY_PATH`; re-rooting it would put the simulated directory in front
-//! of a real loader. Programs the probes execute, such as `ldconfig`, stay on
-//! the real host too: a simulated root holds no binary to run. Every
+//! of a real loader. Programs the probes execute, such as `ldconfig`, are not
+//! routed either: a simulated root holds no binary to run. They are found on
+//! `PATH`, where the e2e suite puts a stand-in that answers for the simulated
+//! machine (`fake-host-tool`). Every
 //! package-manager plan reads the real `/etc/os-release` (with the same
 //! `/usr/lib/os-release` fallback) — the OpenMPI, libatomic and libnuma install
 //! hints in `openmpi.rs`, and the driver, OpenMPI and runtime-library installs
@@ -143,6 +145,17 @@ fn hardware_root() -> Option<PathBuf> {
 #[cfg(not(feature = "e2e-test-hooks"))]
 const fn hardware_root() -> Option<PathBuf> {
     None
+}
+
+/// Whether the probes are reading a simulated host: an `e2e-test-hooks` build
+/// with [`TEST_HOST_ROOT_ENV`] set. Always `false` in a normal build.
+///
+/// For a probe that runs a program rather than reading a file: it must not
+/// reach past `PATH` to the real host's copy, which would answer for the
+/// machine the suite is running on instead of the simulated one.
+#[must_use]
+pub fn host_is_simulated() -> bool {
+    hardware_root().is_some()
 }
 
 /// [`host_path`] with the root supplied by the caller, so the re-rooting can be
