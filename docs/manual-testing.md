@@ -392,35 +392,62 @@ On Ubuntu 22.04, 24.04 and 26.04 the apt source line names the matching suite
 first prepare command prints a "from a previous installation" warning; confirm
 nothing is removed (`dpkg -s amdgpu-dkms` still reports installed afterwards).
 
+## 2c. Fix Catalog Exit Codes
+
+On any host, Windows or Linux:
+
+```bash
+rocm fix --json            # read exit_codes and exit_code_descriptions
+rocm fix fix-does-not-exist; echo $?
+rocm fix --no-such-option; echo $?
+```
+
+Expected result: every name under `exit_codes` also appears under
+`exit_code_descriptions` with a sentence of text. Both later commands exit `2`,
+the number `exit_codes.unknown_id` gives. The first prints a stderr line
+`Unknown fix-id: fix-does-not-exist`; the second prints a stderr line starting
+`error:` and never says `Unknown fix-id:`. A one-time `rocm:` notice (a moved
+uv cache, a migrated dashboard config) may come first on either. The
+`unknown_id` description says exactly that. A different exit code for either,
+or a description that no longer mentions the malformed command line, is a
+regression. In PowerShell read the code with `$LASTEXITCODE` instead of `$?`.
+
+A negative device index depends on how it is written. The parser accepts
+`rocm fix fix-9-igpu-dgpu --device-index=-1`, and the fix refuses it with exit
+`3`, which the `not_applicable` description covers. With a space,
+`--device-index -1` is read as an unknown option and exits `2` like any other
+usage error, which the `unknown_id` description covers.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
 model with the managed runtime:
 
 ```powershell
-rocm serve qwen --engine lemonade --device gpu_required --foreground --port 11435
+rocm serve qwen --engine lemonade --device gpu_required --port 11435
 ```
 
 Expected result:
 
-- The engine uses ROCm GPU execution. The deployment summary's `device:` row
-  is the engine's own account of the backend it was launched on (Lemonade reads
-  back the `backend_requested` it recorded), so check it by reading that row
-  rather than inferring it from the absence of a fallback warning. Every engine
-  reports it in the same `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect
-  something like `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted
-  when the launch pinned none (no `--gpu`, nothing recorded in the engine's
-  `gpu_indices`) and the name omitted when the host probe could not read one or
-  the machine has more than one AMD GPU (where naming one could name the wrong
-  one). `rocm services` shows the same `device` while it runs. The first word is
-  the half that decides this check.
+- The engine uses its selected supported GPU backend, ROCm or Vulkan. The
+  deployment summary's `device:` row is the engine's own account of the backend
+  it was launched on (Lemonade reads back the `backend_requested` it recorded),
+  so check it by reading that row rather than inferring it from the absence of a
+  fallback warning. Every engine reports it in the same
+  `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect something like
+  `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted when the launch
+  pinned none (no `--gpu`, nothing recorded in the engine's `gpu_indices`) and
+  the name omitted when the host probe could not read one or the machine has
+  more than one AMD GPU (where naming one could name the wrong one). `rocm
+  services` shows the same `device` while it runs. The first word is the half
+  that decides this check.
 - The whole `device:` row may be missing from the deployment summary, and that
   is not a failure of this check: the engine reports no device until it has
   verified it can serve, which a model still loading its weights has not. Run
   `rocm services list` and read the row there instead — the check is on what the
   row says, not on which surface said it first.
-- The run does not fall back to CPU or Vulkan — a `device:` whose first word is
-  `vulkan` fails this check even though the serve itself succeeds.
+- The run does not fall back to CPU, and does not select a stale ROCm binary
+  when the installed runtime selects Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 - `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.
@@ -618,6 +645,107 @@ and `driver-install-05`) cover the lines, the verdict and the "installs nothing"
 promise on the Windows GPU lane with whatever driver that machine has. Only the
 old-driver branch needs this manual check: it needs a machine whose display
 driver is dated before 27 July 2023. The logic is also covered by unit tests.
+
+### Named models and dashboard discovery
+
+On Linux or WSL, repeat the serving and inference check with a non-default
+registered model and with its explicit checkpoint:
+
+```bash
+rocm serve qwen-smoke --engine lemonade --managed --port 11435
+# Stop the test-owned service before reusing its port.
+rocm services stop <service-id> --yes
+rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0 --engine lemonade --managed --port 11435
+```
+
+`rocm serve` returns to the shell once the server is ready. Background is the
+default, and `--managed` is accepted as an explicit synonym. Only `--foreground`
+or `--verbose` attach to the log stream. Use `rocm services` to find the service id.
+
+For each run, confirm that the endpoint answers inference for the requested
+model and that `rocm dash` shows the managed model. A startup announcement alone
+is not proof of a working endpoint. Stop only the services created by this check.
+Simple single-GGUF catalog entries can use direct serving on Linux; registered
+entries needing extra files or model-specific options stay with the router, as
+does a registered checkpoint that is not a plain `owner/repo:variant`, such as
+one whose variant is `*`.
+Explicit checkpoints require the selected GPU backend and must not fall back to
+another backend or CPU when it is missing.
+
+For the complex registered-model check, stop your previous test service and run:
+
+```bash
+rocm serve Qwen3.5-0.8B-GGUF --engine lemonade --managed --port 11435
+```
+
+This catalog entry needs both its GGUF checkpoint and projector file. Confirm
+that inference identifies the requested model and the engine state records
+`load_response.method` as `lemonade-cli`, not a packaged direct-server launch.
+Stop that service with `rocm services stop <service-id> --yes` and confirm its
+endpoint closes. The automated equivalent is the nightly GPU scenario
+`serve-lemonade-complex-registered-inference` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+
+For a simple registered name on Linux, such as `Qwen3-0.6B-GGUF`, the engine
+state records `load_response.method` as `lemonade-packaged-llama-server` and a
+non-CPU `backend_requested`. The automated equivalent is
+`serve-lemonade-simple-registered-direct-route` in the same feature file.
+
+For external discovery on Linux or WSL, use a separately running Lemonade server
+with a loaded model. The embedded dashboard daemon probes `127.0.0.1:13305` by
+default. For a non-default endpoint, set these fields in the CLI's `config.json`
+(`~/.rocm/config.json`, or `config.json` in the directory named by
+`ROCM_CLI_CONFIG_DIR`), preserving other configuration:
+
+```json
+{
+  "dashboard": {
+    "daemon": {
+      "enable_lemonade": true,
+      "lemonade_host": "127.0.0.1",
+      "lemonade_port": 13305
+    }
+  }
+}
+```
+
+Confirm the following through the dashboard and the external server:
+
+- Each loaded model appears, without creating a managed service record.
+- With multiple loaded models, throughput is unavailable because endpoint-level
+  last-request statistics cannot be attributed safely. A managed direct
+  `llama-server` also shows unavailable throughput when it has no Lemonade stats API.
+- A managed Lemonade server that answers its health route with 401 or 403 (API
+  key required) stays listed with its registry status, no throughput, and no
+  repeating health warning. External discovery still warns on such a response.
+- A shown rate is the most recent completed request's rate and does not decay
+  while the server is idle. The Instances table shows the legend `Lemonade: last req
+  tok/s, not live` and the instance detail reads `last req: <rate>`
+  instead of `gen: <rate>`; a managed Lemonade row in the Services overlay reads
+  `req <rate>` instead of `gen <rate>` under the same legend, and its quick preview
+  reads `last req <rate>`. A vLLM row shows neither. The row's tok/W shows `—`,
+  not an efficiency computed from that rate. With only an idle Lemonade server
+  loaded, the Home and Observe tok/s and tok/W heroes show no throughput instead
+  of repeating that rate. At 80 columns the legend, the instance detail's freshness
+  line and the empty Instances state are all still readable.
+- The engine pane distinguishes managed installation from external availability,
+  even when GPU telemetry is unavailable. It reads the managed-runtime status once,
+  when the dashboard starts. After you install Lemonade from the Engines overlay,
+  restart the dashboard to see the new status. When the status cannot be read, the
+  pane says "unknown, run `rocm engines list`", and that command prints each
+  engine's detect result.
+- Unloading a model removes it from the running-model list; reloading restores it.
+  A healthy but unloaded server does not claim a running model.
+- In Observe, open Services with `s`. External models are not managed-service
+  targets. With only external models, the list reports no managed services;
+  pressing `s` or `r` stages no approval and starts no job. Close the list with
+  Escape and confirm the external endpoint is still reachable.
+- Closing the dashboard also leaves the external server reachable.
+- Setting `enable_lemonade` to `false` disables external discovery on the next
+  embedded-daemon launch; managed service records remain visible.
+
+Native Windows has no live dashboard telemetry. These dashboard checks apply to
+Linux and WSL, not the native Windows CLI.
 
 ## 4. Local Server Records
 
@@ -1005,7 +1133,9 @@ Expected result:
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
-  approval+job flow. The launcher's copy of the prompt does not show this
+  approval+job flow. The offer appears once the dashboard lists the service as
+  managed; for a service started a moment earlier it is absent and the printed
+  stop command is the way to stop it. The launcher's copy of the prompt does not show this
   hint or respond to `s` — it has no live Services overlay to jump to — and
   neither does the dashboard on Windows, for the same reason the model's name
   is missing there.
@@ -1716,6 +1846,9 @@ Then, in an empty directory, hand it over in each shell you have:
   `rocm diagnose --symptom-file error.txt`.
 - Any shell, nothing piped in: `rocm diagnose --symptom-file -`, paste at the
   prompt, and end the input as the hint printed on the first line says.
+- A file named `-`: save the paste as `-` and run
+  `rocm diagnose --symptom-file ./-`. It reports the same causes; a bare `-`
+  would read standard input instead.
 
 Expected result:
 
@@ -1729,3 +1862,73 @@ Expected result:
   the same command reading that file still reports the same causes, and a
   paste with a non-ASCII character in it (`é`, `→`, a typographic quote)
   reports the same causes as in PowerShell 7.
+
+## 14. Which Causes a Pasted Error Contributed To
+
+`rocm diagnose --symptom` scores the catalog from the examined host's state and
+the pasted text together, so a finding about the host can outrank the entry the
+paste added to. Each match says whether the paste contributed to its score or
+evidence; any keyword hit counts, however weak, so this is not a verdict that
+the match explains the error. On any host (PowerShell:
+`$env:HSA_OVERRIDE_GFX_VERSION = "11.0.0"` instead of the prefix):
+
+```bash
+HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --symptom 'HSA_STATUS_ERROR_INVALID_ISA' --json
+HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --symptom 'HSA_STATUS_ERROR_INVALID_ISA'
+HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --json
+```
+
+- In the first, every entry in `matched` carries `symptom_matched`:
+  `fix-2-unset-override` (raised by the override alone) is `false`, and
+  `fix-1-arch` (raised by the pasted ISA error) is `true`.
+- In the second, `fix-2-unset-override` has a line `source: the examined
+  host's state alone; the symptom text did not contribute to it`, and
+  `fix-1-arch` does not.
+- In the third, with no `--symptom`, the field is still present and `false` on
+  every entry, and the text form (the same command without `--json`) prints no
+  `source:` line.
+
+The e2e scenarios `diagnose-62`, `diagnose-63` and `diagnose-64` run these three
+checks on every lane.
+
+## 15. Dashboard Chat With A Small-Context Local Model
+
+Needs a local OpenAI-compatible endpoint serving a model with a small context
+— llama.cpp's default `n_ctx` is 32768, which is the case this checks. The
+point is that an answer survives a tool call that returns a lot of text.
+
+```bash
+rocm dash
+```
+
+In the Chat tab, ask `which LLMs can this machine support`, which is the
+question that makes the model call `rocm_command` with `["model"]`.
+
+Expected result:
+
+- A written answer listing recommended models. Not
+  `chat request failed: ... 400 Bad Request`, and not a raw JSON error body.
+- The same question asked of `rocm mcp-call` returns the curated list, and the
+  per-recipe diagnostics only when asked for:
+
+  ```bash
+  echo '{"args":["model"]}' > args.json
+  rocm mcp-call rocm_command --arguments-file args.json | wc -c
+  echo '{"args":["model","--verbose"]}' > args.json
+  rocm mcp-call rocm_command --arguments-file args.json | wc -c
+  ```
+
+  The first is a few kilobytes and matches what `rocm model` prints in a
+  terminal; the second is far larger.
+
+- To see the truncation path, ask something that makes the model read a long
+  service log (`rocm_command` with `["logs"]` on a host with a lot of history).
+  The model's answer should say the output was partial and point at running the
+  command in a terminal — it must not present a cut list as a complete one.
+
+- To see the overflow message, point the Chat tab at a model with a very small
+  context (serve one with `--ctx-size 2048`) and ask the same question. The
+  transcript should read `A ROCm check returned more text than this model can
+  read (N of M tokens). Try a more specific question, or a model with a larger
+  context.` — and `rocm-cli.log` should still carry the provider's own body
+  with `exceed_context_size_error` in it.

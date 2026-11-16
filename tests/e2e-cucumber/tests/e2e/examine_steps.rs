@@ -3327,9 +3327,17 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
         .filter(|value| *value != "<not detected>" && *value != "<unknown>");
 
     let (expected, forbidden): (&str, &[&str]) = match (detected, family, installed_sdk) {
-        // ROCm-capable with the managed SDK already in place: installing one
-        // clears nothing, so the line must point at serving instead.
-        (_, Some(_), Some(_)) => ("rocm serve <model>", &["rocm install sdk"]),
+        // ROCm-capable with the managed SDK for THIS GPU's family already in
+        // place: installing one clears nothing, so the line must point at
+        // serving instead.
+        (_, Some(family), Some(installed)) if installed == family => {
+            ("rocm serve <model>", &["rocm install sdk"])
+        }
+        // ROCm-capable with a managed SDK installed, but for another family —
+        // a GPU swap, an eGPU, or a second card. The install on disk was never
+        // built for this GPU, so the one it needs is still the next step and
+        // the line must not offer to serve on what is there.
+        (_, Some(_), Some(_)) => ("rocm install sdk", &["serve on it"]),
         // ROCm-capable with no managed SDK yet: that install is the next step.
         (_, Some(_), None) => ("rocm install sdk", &[]),
         // A GPU no package family covers. Two different tiers land here and

@@ -107,10 +107,14 @@ pub(crate) enum Command {
         /// A shell reads this text before `rocm` does, so quotes, `$(...)`
         /// and a leading `-` in a pasted error can be changed, run, or taken
         /// as a flag. Use `--symptom-file` to hand over a paste untouched.
+        ///
+        /// Each match then says whether this text contributed to it
+        /// (`symptom_matched` in --json).
         #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
         /// Read the error text from a file instead, or from standard input
-        /// when PATH is `-`, so no shell quoting is needed.
+        /// when PATH is `-`, so no shell quoting is needed. A file named `-`
+        /// is passed as `./-`.
         ///
         /// The text that arrives is matched as `--symptom` would match it,
         /// with one trailing line break removed (shells and editors add one).
@@ -257,6 +261,11 @@ pub(crate) enum Command {
         #[arg(long)]
         device_index: Option<i64>,
         /// Emit the catalog as JSON for tooling. Only valid without a fix id.
+        ///
+        /// It also names each exit code and says what it means. Exit 2 is
+        /// both an unknown fix id (a stderr line starting `Unknown fix-id:`)
+        /// and a malformed command line (a stderr line starting `error:`);
+        /// read the message to tell them apart.
         #[arg(long)]
         json: bool,
     },
@@ -702,6 +711,11 @@ rocm logs --search error timeout")]
         status: bool,
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    ///
+    /// On Linux/WSL, discovers loaded models from local Lemonade at 127.0.0.1:13305
+    /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
+    /// lemonade_port in config.json. External models have no Services stop/restart
+    /// controls; discovery is read-only and quitting leaves external servers running.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -1175,11 +1189,12 @@ pub(crate) enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
     ///
-    /// Each running server is asked which backend and GPU it is actually on, so
-    /// this takes a few seconds rather than returning instantly. The asking is
-    /// capped in total (about 18 seconds worst case, however many servers are
-    /// listed), and a server that does not answer in time simply has no device
-    /// line.
+    /// In the default table, each running server is asked which backend and GPU
+    /// it is actually on, so this takes a few seconds rather than returning
+    /// instantly. The asking is capped in total (about 18 seconds worst case,
+    /// however many servers are listed), and a server that does not answer in
+    /// time simply has no device line. `--json` asks nothing and carries no
+    /// device field: it is the stored records, returned as fast as before.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
@@ -1506,6 +1521,30 @@ mod tests {
         assert_eq!(
             FrameworkProbe::from(FrameworkArg::Skip),
             FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn dash_help_scopes_lemonade_discovery_to_linux_and_wsl() {
+        // The embedded daemon that does the discovery is Unix-only, so the help
+        // must not promise it on every platform. README.md says the same.
+        let help = Cli::command()
+            .find_subcommand_mut("dash")
+            .expect("dash subcommand")
+            .render_long_help()
+            .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("On Linux/WSL, discovers loaded models from local Lemonade"),
+            "{help}"
+        );
+        // This pins the wording only. Scenario
+        // `@id:dash-lemonade-external-protocol-discovery` proves the claim: the
+        // external server receives no request beyond reads after the dashboard
+        // quits.
+        assert!(
+            flat.contains("quitting leaves external servers running"),
+            "{help}"
         );
     }
 

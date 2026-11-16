@@ -66,6 +66,7 @@ mod serve_summary;
 mod service_control;
 mod service_hints;
 mod service_launch;
+mod service_log_follow;
 mod service_records;
 mod services_cmd;
 mod services_text;
@@ -169,13 +170,14 @@ use crate::model_fit::{
 use crate::runtimes_cmd::{current_runtime_manifest, runtimes};
 use crate::serve_cmd::{ServeArgs, serve};
 use crate::service_control::run_internal_sandbox_tool;
+use crate::service_log_follow::follow_service_logs;
 // Reached only as `super::run_approved_service_action` from
 // `advised_commands.rs`'s test, so a non-test build does not carry it.
 #[cfg(test)]
 use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
-    follow_service_logs, render_internal_status_text, render_logs_browser_text, render_logs_text,
+    render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
@@ -1435,6 +1437,134 @@ pub(crate) mod tests {
             super::exit_code_for(result),
             ExitCode::from(expected_code as u8)
         );
+    }
+
+    /// The catalog manifest tells a caller that exit 2 is shared between an
+    /// unknown fix-id and a malformed command line. That claim is about clap,
+    /// which only this crate links, so it is proved here: a bad `rocm fix`
+    /// command line really exits with the code published for `unknown_id`,
+    /// through the same `clap_exit_code -> exit_code_for` chain `main` uses,
+    /// and the refusal has a line starting with the `error:` the description
+    /// tells a caller to look for (not `Usage:`, which a missing value does not
+    /// print). The
+    /// description's own wording is pinned in
+    /// `rocm-core` (`the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`).
+    #[test]
+    fn a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id() {
+        let manifest = rocm_core::catalog_manifest();
+        let published = manifest.exit_codes["unknown_id"];
+        for argv in [
+            &["rocm", "fix", "--no-such-option"][..],
+            &["rocm", "fix", "fix-9-igpu-dgpu", "--device-index"][..],
+            &[
+                "rocm",
+                "fix",
+                "fix-9-igpu-dgpu",
+                "--device-index",
+                "not-a-number",
+            ][..],
+        ] {
+            let err = super::cli_command()
+                .try_get_matches_from(argv)
+                .expect_err("a malformed command line must be a parse error");
+            let rendered = err.render().to_string();
+            assert!(
+                rendered.lines().any(|line| line.starts_with("error:"))
+                    && !rendered.contains(rocm_core::fix_exit::UNKNOWN_ID_PREFIX),
+                "{argv:?}: the description promises `error:` and no unknown-id message:\n{rendered}"
+            );
+            let result: Result<()> = Err(super::clap_exit_code(err));
+            assert_eq!(
+                super::exit_code_for(result),
+                ExitCode::from(published as u8),
+                "{argv:?}: a usage error must exit with the code the manifest names for it"
+            );
+        }
+        assert!(
+            manifest.exit_code_descriptions["unknown_id"].contains("malformed command line"),
+            "the published description must warn that a usage error exits {published} too"
+        );
+    }
+
+    /// A negative device index exits with one of two published codes, and the
+    /// catalog says which by how it is written: `--device-index=-1` reaches the
+    /// fix, which refuses it as `not_applicable`; `--device-index -1` never gets
+    /// past the parser, which reads `-1` as an unknown option, a usage error that
+    /// exits with the `unknown_id` code. Both go through the real parser and
+    /// the same exit path `main` uses, the first through `dispatch` as well.
+    /// Under `--dry-run`, so a lost guard in the runner would only preview.
+    ///
+    /// "Reaches the fix" holds on Windows and Linux, where fix-9 applies. On
+    /// WSL it does not apply, so `apply` returns 3 from the platform gate before
+    /// the runner, and the `=-1` half cannot notice a lost runner guard there;
+    /// `a_negative_device_index_is_not_applicable_and_nothing_runs` in
+    /// `rocm-core`'s `fix/runners.rs` holds the guard on every host.
+    #[test]
+    fn a_negative_device_index_reaches_the_fix_only_when_written_with_equals() {
+        let manifest = rocm_core::catalog_manifest();
+        let not_applicable = manifest.exit_codes["not_applicable"];
+        let unknown_id = manifest.exit_codes["unknown_id"];
+
+        let cli = super::Cli::try_parse_from([
+            "rocm",
+            "fix",
+            "fix-9-igpu-dgpu",
+            "--device-index=-1",
+            "--dry-run",
+        ])
+        .expect("`--device-index=-1` must parse: the fix, not the parser, refuses it");
+        assert!(
+            matches!(
+                cli.command,
+                Some(super::Command::Fix {
+                    device_index: Some(-1),
+                    ..
+                })
+            ),
+            "the parsed value must be -1"
+        );
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        let result = super::dispatch(cli);
+        drop(env);
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(not_applicable as u8),
+            "`--device-index=-1` must exit with the code published as not_applicable"
+        );
+
+        let err = super::cli_command()
+            .try_get_matches_from([
+                "rocm",
+                "fix",
+                "fix-9-igpu-dgpu",
+                "--device-index",
+                "-1",
+                "--dry-run",
+            ])
+            .expect_err("`--device-index -1` must be a usage error");
+        let rendered = err.render().to_string();
+        assert!(
+            rendered.lines().any(|line| line.starts_with("error:"))
+                && !rendered.contains(rocm_core::fix_exit::UNKNOWN_ID_PREFIX),
+            "`--device-index -1` must be refused as a usage error:\n{rendered}"
+        );
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(unknown_id as u8),
+            "`--device-index -1` must exit with the code published as unknown_id"
+        );
+
+        for (name, spelling) in [
+            ("not_applicable", "`--device-index=-1`"),
+            ("unknown_id", "`--device-index -1`"),
+        ] {
+            assert!(
+                manifest.exit_code_descriptions[name].contains(spelling),
+                "the {name} description must name {spelling}"
+            );
+        }
     }
 
     /// Any other error must still fail with exit 1, matching what

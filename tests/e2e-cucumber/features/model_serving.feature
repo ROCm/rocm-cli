@@ -89,14 +89,11 @@ Feature: Model serving
     And the response identifies the correct model
     And the services list reports the engine's actual backend device
 
-  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
-  # bypasses Lemonade's model router and runs a packaged llama-server directly
-  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
-  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
-  # managed-lemonade fallback would mask the identical failure behind the
-  # ROCMAI-898 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
-  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
-  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  # Explicit HF-checkpoint canary: `owner/repo:variant` runs the selected GPU
+  # llama-server directly and fails if that backend binary is missing. Named
+  # catalog entries can also serve directly on Linux when their metadata is
+  # simple enough; other registered entries use Lemonade's router. Both canaries
+  # use the same small checkpoint, sharing the cache without another download.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
@@ -917,6 +914,44 @@ Feature: Model serving
     And no quantization is suggested for a repo the CLI has not inspected
     And no local server was recorded
 
+  # The pinned Lemonade catalog's smallest vision GGUF needs its mmproj file.
+  # Serving its registered name must retain the router, not flatten the entry
+  # into a single-checkpoint direct serve. Use a scenario-owned port and service;
+  # the additional model download stays off the ordinary per-PR path.
+  # Linux only: registered names take the router on Windows both with and
+  # without the direct llama-server route, so a Windows run cannot tell the
+  # two behaviours apart.
+  # No expectations row is added for this scenario. The flaky Linux rows cover
+  # the direct llama-server route, and this scenario takes the router route, so
+  # those rows' failure mode does not describe it. It is nightly-only.
+  @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
+  Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
+    Given a managed runtime is active
+    And a registered vision GGUF is being served on lemonade on its own port
+    Then the managed engine state confirms the Lemonade router loaded the registered model
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # Which runtime a registered name takes is user-observable: a simple catalog
+  # entry (one checkpoint with a variant, no extra files) is served directly by
+  # the selected GPU llama-server on Linux, while
+  # `serve-lemonade-complex-registered-inference` covers the router route for an
+  # entry that needs more. The endpoint answering would not tell the
+  # two apart, so this reads the engine state's method and backend.
+  @id:serve-lemonade-simple-registered-direct-route @requires-gpu @requires-os:linux @requires-engine:lemonade
+  Scenario: serve-58 - A simple registered GGUF name is served directly by the selected GPU backend
+    Given a managed runtime is active
+    And a simple registered GGUF is being served on lemonade on its own port
+    Then the managed engine state records direct serving by the selected GPU backend
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
   # ROCMAI-550, and the evidence that the Vulkan remediation is not a dead end.
   # `rocm install sdk` on a gfx90c APU refuses and tells the user to run `rocm
   # serve <model> --engine lemonade`; AGENTS.md section 3 only allows that if
@@ -936,7 +971,7 @@ Feature: Model serving
   # ROCM_CLI_TEST_HOST_ROOT (an `e2e-test-hooks` build), so the GPU-less mock
   # lane is where this runs.
   @id:serve-accepts-an-apu-the-kernel-gives-no-compute-node @requires-os:linux
-  Scenario: serve-57 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
+  Scenario: serve-59 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
     Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
     When the user is told to serve on Lemonade because this GPU has no ROCm build
     Then serving got past the no-GPU pre-flight and reported this host's usable GPU

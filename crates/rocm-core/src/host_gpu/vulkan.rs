@@ -62,6 +62,18 @@ pub enum VulkanStatus {
     DriverPresentDevicesUnverified,
     /// The probe looked and found no GPU Vulkan driver. A software rasteriser
     /// alone lands here, not in [`Self::Available`].
+    ///
+    /// Reachable only when both sources *answer* and answer empty — in
+    /// practice a `vulkaninfo` that exits 0 having listed no device. A real
+    /// driverless Linux host does not take this path: there `vulkaninfo` fails
+    /// to create an instance and exits non-zero, which
+    /// [`vulkan_devices_from_capture`] reads as a source that did not answer,
+    /// landing such a host in [`Self::Inconclusive`]. That is deliberate — see
+    /// [`vulkan_devices_from_capture`] for why a failing probe must not be
+    /// promoted to a confirmed absence — but it does make confirmed absence
+    /// narrower than "no driver is installed", and it is why the scenario
+    /// covering this status plants the exit-0 shape rather than reproducing a
+    /// driverless host.
     Absent,
     /// The probe came away with nothing either way: no ICD manifest, no
     /// enumerated device, and at least one of the two sources that never

@@ -37,13 +37,14 @@ use crate::service_hints::{
     self, sandbox_tool_arg_from_service_tool, service_action_command, service_action_past_tense,
     service_action_verb,
 };
+use crate::service_log_follow::follow_service_logs;
 use crate::service_records::{
     prune_managed_service_records, remove_managed_service_record_with, service_prune_min_age_hours,
 };
 use crate::services_text::{
-    follow_service_logs, render_service_action_result,
-    render_service_action_result_with_helper_note, render_service_logs_text, render_services_json,
-    render_services_text, service_stop_unconfirmed, validate_service_id,
+    render_service_action_result, render_service_action_result_with_helper_note,
+    render_service_logs_text, render_services_json, render_services_text, service_stop_unconfirmed,
+    validate_service_id,
 };
 
 pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
@@ -241,5 +242,32 @@ mod tests {
         assert!(rendered.contains("service: svc-qwen"));
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("stopped processes: 2"));
+    }
+
+    /// The stop report production hands the renderer is the one
+    /// `stop_internal_managed_service` builds: `service_id` and `status` sit
+    /// directly on `result`, not under `result.service`. Scenario
+    /// `@id:serve-lemonade-simple-registered-direct-route` asserts the service id
+    /// in the stop output, so the renderer must print it for this shape.
+    #[test]
+    fn service_stop_render_prints_the_in_process_stop_report_shape() {
+        let rendered = crate::services_text::render_service_action_result(
+            "stop_server",
+            &serde_json::json!({
+                "output": {
+                    "result": {
+                        "service_id": "svc-qwen",
+                        "status": "stopped",
+                        "engine_stop": {"attempted": true, "stopped": true, "graceful": true},
+                        "signaled_pids": [1234]
+                    }
+                }
+            }),
+        );
+
+        assert!(rendered.contains("Local server stopped"));
+        assert!(rendered.contains("service: svc-qwen"), "{rendered}");
+        assert!(rendered.contains("status: stopped"), "{rendered}");
+        assert!(rendered.contains("stopped processes: 1"));
     }
 }

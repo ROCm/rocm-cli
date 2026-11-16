@@ -771,6 +771,13 @@ Feature: GPU detection and system inspection
     And the inspection reports that models can still run through Vulkan
     And the inspection names the Vulkan driver it found
 
+  # What this plants is the exit-0-and-empty shape, not a driverless host. A
+  # host with no driver at all fails to create a Vulkan instance and exits
+  # non-zero, which the probe reads as a source that did not answer -- so such
+  # a host is reported as inconclusive, not as a confirmed absence. Confirmed
+  # absence is deliberately the narrower claim (see `VulkanStatus::Absent` for
+  # why a failing probe must not be promoted to one), and this scenario covers
+  # that narrower claim rather than the driverless host.
   @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
   Scenario: examine-51 - A machine with no way to run models is not told it has one
     Given a machine whose GPU has no official support and no Vulkan driver
