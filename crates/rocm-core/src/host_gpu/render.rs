@@ -55,19 +55,44 @@ impl ExamineSummary {
             // `detected_therock_family` is the installed managed runtime (see
             // `detect_managed_therock_family`), as opposed to
             // `compatible_therock_family`, which is what this GPU *could* run.
-            GpuSupportLevel::RocmHip => match self.detected_therock_family.as_deref() {
-                Some(installed) => format!(
-                    "  rocm_support: GPU detected ({}) with full ROCm/HIP support, and the \
-                     managed ROCm SDK for {installed} is already installed - serve on it with \
-                     `rocm serve <model>`\n",
-                    detected.unwrap_or("<unknown>")
-                ),
-                None => format!(
-                    "  rocm_support: GPU detected ({}) with full ROCm/HIP support; \
-                     install the SDK for it with `rocm install sdk`\n",
-                    detected.unwrap_or("<unknown>")
-                ),
-            },
+            //
+            // The two are computed from unrelated facts and really can differ.
+            // `compatible_therock_family` is `normalize_therock_family` applied
+            // to the gfx target detected right now; `detect_managed_therock_family`
+            // is the family of the most recently installed managed runtime on
+            // disk and never looks at the GPU at all. Swap the card, plug in an
+            // eGPU, or keep two cards and boot the other one, and the install
+            // on disk is for a family this GPU was never built for. Saying
+            // "already installed - serve on it" there would promise a serve
+            // this host cannot do, which is exactly the kind of unestablished
+            // claim ROCMAI-550 exists to remove, so the match is a condition of
+            // that sentence rather than an assumption behind it.
+            GpuSupportLevel::RocmHip => {
+                let compatible = self.compatible_therock_family.as_deref();
+                match self.detected_therock_family.as_deref() {
+                    Some(installed) if Some(installed) == compatible => format!(
+                        "  rocm_support: GPU detected ({}) with full ROCm/HIP support, and the \
+                         managed ROCm SDK for {installed} is already installed - serve on it with \
+                         `rocm serve <model>`\n",
+                        detected.unwrap_or("<unknown>")
+                    ),
+                    // An install is present but for another family, so
+                    // `rocm install sdk` still has something to do and is still
+                    // advice that can clear the condition it is printed for.
+                    Some(installed) => format!(
+                        "  rocm_support: GPU detected ({}) with full ROCm/HIP support, but the \
+                         managed ROCm SDK installed here is for {installed}, not {} - install the \
+                         one this GPU needs with `rocm install sdk`\n",
+                        detected.unwrap_or("<unknown>"),
+                        compatible.unwrap_or("<unknown>")
+                    ),
+                    None => format!(
+                        "  rocm_support: GPU detected ({}) with full ROCm/HIP support; \
+                         install the SDK for it with `rocm install sdk`\n",
+                        detected.unwrap_or("<unknown>")
+                    ),
+                }
+            }
             // The command names `rocm services list` rather than the serve
             // summary on purpose. The summary reads the device once, right
             // after `ready`, and lemonade answers `unknown` until its own
@@ -680,16 +705,18 @@ mod tests {
 
         // Same GPU, but the SDK it was being told to install is already there:
         // the advice has to be something that is still left to do (AGENTS.md
-        // wants a named command to be able to clear the condition).
+        // wants a named command to be able to clear the condition). The
+        // installed family must be the GPU's own - see
+        // `an_sdk_for_another_family_is_not_reported_as_ready_for_this_gpu`.
         let mut installed = supported;
-        installed.detected_therock_family = Some("gfx110X-dgpu".to_owned());
+        installed.detected_therock_family = family;
         let rendered = installed.render_text();
         assert!(
             rendered.contains("rocm_support: GPU detected (gfx1103) with full ROCm/HIP support"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("managed ROCm SDK for gfx110X-dgpu is already installed"),
+            rendered.contains("managed ROCm SDK for gfx110X-all is already installed"),
             "{rendered}"
         );
         assert!(
@@ -726,6 +753,56 @@ mod tests {
         assert!(
             !rendered.contains("full ROCm/HIP support"),
             "nor as supported: {rendered}"
+        );
+    }
+
+    /// A managed SDK on disk is not, by itself, an SDK for *this* GPU.
+    ///
+    /// `detected_therock_family` is the most recently installed managed runtime
+    /// (`detect_managed_therock_family` reads the registry and never looks at
+    /// the GPU); `compatible_therock_family` is normalised from the gfx target
+    /// detected right now. A GPU swap, an eGPU or a second card leaves them
+    /// pointing at different families, and the `already installed - serve on
+    /// it` sentence then promises a serve this host cannot do.
+    ///
+    /// The matching half is asserted by
+    /// `examine_render_reports_a_support_level_for_every_host`; only this one
+    /// fails if the two families stop being compared, because the wording of
+    /// the matching case is unchanged.
+    #[test]
+    fn an_sdk_for_another_family_is_not_reported_as_ready_for_this_gpu() {
+        let compatible = normalize_therock_family("gfx1103").expect("gfx1103 has a family");
+        let mut host = examine_summary_with_gpu(Some("gfx1103"), Some(&compatible));
+        // A real family, and not this GPU's: the gfx110X split between the
+        // discrete and the all-targets build is exactly the pair a user is
+        // likeliest to have both of.
+        host.detected_therock_family = Some("gfx110X-dgpu".to_owned());
+        assert_ne!(
+            host.detected_therock_family.as_deref(),
+            Some(compatible.as_str()),
+            "precondition: the installed family is not the compatible one"
+        );
+
+        let rendered = host.render_text();
+        let line = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("rocm_support:"))
+            .expect("every host gets a support line")
+            .to_owned();
+
+        assert!(
+            !line.contains("already installed"),
+            "an SDK built for another family must not be reported as this GPU's: {line}"
+        );
+        assert!(
+            line.contains("gfx110X-dgpu") && line.contains(compatible.as_str()),
+            "the line has to name both families, or the user cannot see which \
+             one is missing: {line}"
+        );
+        assert!(
+            line.contains("rocm install sdk"),
+            "there is still an install left to do, so the advice must name the \
+             command that does it: {line}"
         );
     }
 }
