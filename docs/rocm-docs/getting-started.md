@@ -12,11 +12,13 @@ SPDX-License-Identifier: MIT
      with the cross-references retargeted to this site. The include between
      them uses the end of README step 1 and the start of its closing paragraph
      as anchors; edit both together. -->
-These steps take a computer with a supported AMD GPU, running Linux, WSL2, or
-Windows, from installing ROCm CLI to a chat reply from a model served on that
-GPU. The first run downloads a lot: `rocm install sdk` fetches a ROCm runtime
-and a PyTorch stack, and `rocm serve qwen` fetches a model of about 2.5 GB. Allow
-time and disk space.
+This quickstart takes you from installing ROCm CLI to getting a chat reply from
+a model served on your GPU. You need a computer with a supported AMD GPU running
+Linux, WSL2, or Windows. The first run involves large downloads:
+`rocm install sdk` fetches a ROCm runtime and a PyTorch stack, and `rocm serve`
+fetches a model of a few GB. Allow extra time and disk space.
+
+Follow these steps:
 
 1. Install ROCm CLI with the command for your platform in
    [Installing ROCm CLI](install/installation.md). Then open a new terminal and
