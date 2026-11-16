@@ -142,7 +142,7 @@ fn label_for_root_report(dir: &Path) -> String {
 
 /// Strips the literal `${{ matrix.channel }}` template segment a channel
 /// matrix inserts into its artifact names — nightly's six GPU lanes and, per
-/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s per-PR `[release, nightly]` leg — so
+/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s `[release, nightly]` leg — so
 /// a name like `e2e-gpu-${{ matrix.channel }}-report` compares as its
 /// canonical `e2e-gpu-report` base. This scan is text-based over the raw
 /// workflow source and does not simulate matrix expansion, so the template
@@ -207,8 +207,6 @@ mod tests {
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
         "e2e-gpu-w7900-report",
-        "e2e-gpu-w7900-n-1-report",
-        "e2e-gpu-w7900-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-ubuntu-n-1-report",
         "e2e-gpu-strix-ubuntu-n-2-report",
