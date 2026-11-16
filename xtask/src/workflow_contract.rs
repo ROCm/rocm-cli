@@ -2451,11 +2451,22 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         let needs: serde_json::Map<String, serde_json::Value> = results
             .iter()
             .map(|(job, result)| {
-                let mut ctx = serde_json::json!({ "result": result });
-                if stale.contains(job) {
-                    ctx["outputs"] = serde_json::json!({ "stale": "true" });
+                // "success+skipped": a lane that skipped itself on purpose says
+                // so in its job outputs; a stale lane says `stale` in its own.
+                let (result, skipped) = result
+                    .split_once('+')
+                    .map_or((*result, ""), |(r, o)| (r, o));
+                let mut outputs = serde_json::Map::new();
+                if !skipped.is_empty() {
+                    outputs.insert("skipped".to_owned(), "true".into());
                 }
-                ((*job).to_owned(), ctx)
+                if stale.contains(job) {
+                    outputs.insert("stale".to_owned(), "true".into());
+                }
+                (
+                    (*job).to_owned(),
+                    serde_json::json!({ "result": result, "outputs": outputs }),
+                )
             })
             .collect();
         let path = format!(
@@ -2592,6 +2603,16 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         assert_eq!(
             code, 1,
             "a missing report fails whatever the needs result:\n{log}"
+        );
+
+        // A gate that skipped itself for the nightly window ends green with no
+        // report, and is not missing; the same lane without that output is.
+        let mut self_skipped = all("success");
+        self_skipped[0].1 = "success+skipped";
+        let (code, log, _) = run_report_check(&step, &self_skipped, Some(&without_victim));
+        assert_eq!(
+            code, 0,
+            "a lane that skipped itself on purpose is not missing:\n{log}"
         );
 
         let mut skipped = all("success");
@@ -10016,6 +10037,18 @@ permissions:
         assert!(
             gate.contains("gh workflow run queue-pr-run.yml --ref main -f \"branch=${HEAD_REF}\""),
             "the gate must dispatch queue-pr-run.yml on main with the PR's branch"
+        );
+        // The nightly window is a skip, not a failure: only that refusal ends
+        // green, and it says so in an output the report check reads.
+        assert!(
+            gate.contains("== nightly:* ]]")
+                && gate.contains("skipped=true")
+                && gate.contains("Re-run this job after 07:00 UTC"),
+            "a nightly-window refusal must end the gate green with a skip note"
+        );
+        assert!(
+            gate.contains("outputs:\n      skipped: ${{ steps.queue.outputs.skipped }}"),
+            "the gate must expose `skipped` for the missing-report check"
         );
         // Only a pull request from this repository: a fork cannot dispatch.
         for needed in [

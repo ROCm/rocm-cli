@@ -77,7 +77,9 @@ minutes to be started and runs at most 75, and a few such runs at once. The
 queue side does not take one while the nightly goes, or when it has no healthy
 MI300X worker: the gate job then fails with the reason the queue gave, which is
 capacity, not a failing test (the consolidated report's missing-report check
-then flags the lane too). A superseded push cancels the gate job, which cancels
+then flags the lane too). The nightly window is the exception, being by design:
+the gate ends green with a note in its summary to re-run after 07:00 UTC, and
+the consolidated report reads the lane as skipped, not missing. A superseded push cancels the gate job, which cancels
 the run it started, freeing the runner; the queue side's lanes are left to their
 own budgets. The queue run tests the branch as it is when the run starts, not
 the pull request's merge with its base, which the self-hosted lane checks out.
