@@ -7,6 +7,11 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::lifecycle_steps;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
+// The note the text report prints under a cause the paste did not contribute
+// to (diagnose-63/-64) is read from the library's own constant rather than
+// typed again here, so the real binary's output is held to the one string the
+// renderer prints from.
+use rocm_core::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE;
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -331,6 +336,16 @@ async fn user_chose_path_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-6-path".to_string());
 }
 
+#[given("a user who has chosen the fix for a missing render group")]
+async fn user_chose_render_group_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen the fix for a framework wheel built for another ROCm release")]
+async fn user_chose_wheel_mismatch_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-8-wheel-rocm".to_string());
+}
+
 #[then(
     "the printed commands and verify line avoid the constructs known to break in Windows PowerShell"
 )]
@@ -448,6 +463,45 @@ async fn assert_notes_name_the_runtime_only_case(world: &mut E2eWorld) {
                     && note.contains("Verify (Linux, WSL)")
             })),
         "no note names the runtime-only case:\n{output}"
+    );
+}
+
+#[then(
+    "the printed verify line checks the user belongs to the group that owns the GPU compute device, and shows that group"
+)]
+async fn assert_render_group_verify_shows_the_kfd_owner(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // The cause tells the user to join the group that owns `/dev/kfd`, which
+    // need not be `render`, so the check has to accept that group and show
+    // it. Text only: the line needs a Linux host to run, and
+    // `the_render_group_verify_accepts_the_group_that_owns_kfd` in
+    // crates/rocm-core/src/diagnose/linux.rs runs it with stand-in tools. That
+    // `rocm diagnose` prints this same line is held by
+    // `the_render_group_fix_verify_matches_the_catalog_copy` there; both read
+    // one constant.
+    assert!(
+        verify.starts_with("groups ")
+            && verify.contains("stat -c %G /dev/kfd")
+            && verify.contains("ls -l /dev/kfd"),
+        "the verify line must check the group that owns /dev/kfd and list it: {verify}"
+    );
+}
+
+#[then("the printed title names the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_title_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let title = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Fix:"))
+        .unwrap_or_else(|| panic!("the preview printed no Fix: line:\n{output}"))
+        .trim();
+    // Text only. The comparison the title describes, `X.Y` and not the bare
+    // major, is held by `the_wheel_mismatch_compares_the_x_y_release_and_says_so`
+    // in crates/rocm-core/src/diagnose/host.rs.
+    assert!(
+        title.contains("X.Y") && !title.contains("major"),
+        "the title must name the X.Y release it compares: {title}"
     );
 }
 
@@ -1959,7 +2013,7 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
     // allocates from, and running it again would answer identically forever --
     // so that gap earns its own reason, distinct from the no-telemetry-at-all
     // case, and no dead-end remediation. An APU whose pool IS readable never
-    // reaches this step: it reports a figure, and diagnose-62 covers it.
+    // reaches this step: it reports a figure, and diagnose-68 covers it.
     // None of the four may be reported as "this model is too big for you".
     let evidence = model_field(&model, "evidence").to_string();
     match model_verdict(&model) {
@@ -3088,6 +3142,53 @@ fn diagnose_verify_line(output: &str, fix_id: &str) -> String {
         .to_owned()
 }
 
+#[when("the user diagnoses this machine with a ROCm runtime library load failure")]
+async fn user_diagnoses_runtime_library_load_failure(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "libamdhip64.so.6: cannot open shared object file",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the wheel mismatch cause and its plan name the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_cause_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // The symptom alone raises this cause on every OS it is scoped to, whatever
+    // the host's own ROCm, so every lane sees the block. Text only: the
+    // comparison it describes is held by
+    // `the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+    // crates/rocm-core/src/diagnose/host.rs.
+    let block = cause_block(output, "fix-8-wheel-rocm");
+    assert!(
+        !block.is_empty(),
+        "no `fix-8-wheel-rocm` cause was reported:\n{output}"
+    );
+    // Only the title and the plan: they are what describe the comparison, and
+    // another line of the block may say "major" about something else.
+    let header = block[0];
+    assert!(
+        header.contains("X.Y release") && !header.contains("major"),
+        "the cause's title must name the X.Y release: {header}"
+    );
+    let plan = block
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("plan:"))
+        .unwrap_or_else(|| panic!("the cause printed no plan:\n{}", block.join("\n")));
+    assert!(
+        plan.contains("X.Y release") && !plan.contains("major"),
+        "the plan must name the X.Y release: {plan}"
+    );
+}
+
 #[given("a Linux machine whose shell has a GPU override set")]
 async fn linux_machine_with_a_gpu_override(world: &mut E2eWorld) {
     // `rocm diagnose` reads the override from the environment it examines,
@@ -4194,6 +4295,190 @@ async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
         reported,
         super::examine_steps::expected_leading_version(reference),
         "the report's cli_version does not follow from the ref ({first_line})"
+    );
+}
+
+// ── Which causes the pasted error contributed to (diagnose-62/-63/-64) ─────
+
+/// The entry an unneeded GPU override in the environment raises. It reads the
+/// environment and a page-fault paste, never an ISA error.
+const ENV_MISCONFIG_FIX_ID: &str = "fix-2-unset-override";
+
+/// The entry [`KNOWN_SYMPTOM`] scores. No host state scores it on its own.
+const PASTE_FIX_ID: &str = "fix-1-arch";
+
+#[given("a machine with a known misconfiguration in its environment")]
+async fn machine_with_env_misconfiguration(world: &mut E2eWorld) {
+    // `rocm diagnose` examines its own environment, so setting the override on
+    // the CLI child is the whole setup, on every platform the entry covers.
+    world
+        .command_env
+        .push(("HSA_OVERRIDE_GFX_VERSION", "11.0.0".into()));
+}
+
+#[given("a pasted error that describes a different failure")]
+async fn pasted_error_for_a_different_failure(world: &mut E2eWorld) {
+    world.model_name = Some(KNOWN_SYMPTOM.to_owned());
+}
+
+/// Run `rocm diagnose` with `paste` as the symptom, or with no `--symptom` at
+/// all when it is `None`.
+fn run_diagnose(world: &mut E2eWorld, paste: Option<&str>, json: bool) {
+    let mut args = vec!["diagnose", "--top", "50"];
+    if let Some(paste) = paste {
+        args.extend(["--symptom", paste]);
+    }
+    if json {
+        args.push("--json");
+    }
+    // The planted host holds for the whole scenario, and diagnose-64 asks
+    // twice, but running a command consumes the scenario environment. Put it
+    // back so the second run examines the same host as the first.
+    let host_env = world.command_env.clone();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    world.command_env = host_env;
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn diagnose_with_paste(world: &mut E2eWorld, json: bool) {
+    let paste = world.model_name.clone().expect("no paste set");
+    run_diagnose(world, Some(&paste), json);
+}
+
+#[when("the user asks for a diagnosis with that paste, in machine-readable form")]
+async fn user_diagnoses_paste_json(world: &mut E2eWorld) {
+    diagnose_with_paste(world, true);
+}
+
+#[when("the user asks for a diagnosis with that paste")]
+async fn user_diagnoses_paste_text(world: &mut E2eWorld) {
+    diagnose_with_paste(world, false);
+}
+
+#[when("the user asks for a diagnosis without pasting an error, in machine-readable form")]
+async fn user_diagnoses_without_paste_json(world: &mut E2eWorld) {
+    run_diagnose(world, None, true);
+}
+
+#[when("the user asks for a diagnosis without pasting an error")]
+async fn user_diagnoses_without_paste_text(world: &mut E2eWorld) {
+    run_diagnose(world, None, false);
+}
+
+/// The listed causes of the JSON report, each as `(id, symptom_matched)`,
+/// failing the step when the run failed or any entry lacks a boolean field.
+fn symptom_matched_by_id(world: &E2eWorld) -> Vec<(String, bool)> {
+    let stdout = world.cli_output.as_deref().expect("no diagnose output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose failed:\n{stdout}\n{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("diagnose --json is not JSON ({e}):\n{stdout}"));
+    let matched = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `matched` list:\n{report:#}"));
+    matched
+        .iter()
+        .map(|d| {
+            let flag = d["symptom_matched"].as_bool().unwrap_or_else(|| {
+                panic!("every listed cause says whether the paste contributed to it:\n{d:#}")
+            });
+            (d["id"].as_str().unwrap_or_default().to_owned(), flag)
+        })
+        .collect()
+}
+
+/// `symptom_matched` of the entry `id`, failing the step when it is not listed.
+fn symptom_matched_of(world: &E2eWorld, id: &str) -> bool {
+    let listed = symptom_matched_by_id(world);
+    listed
+        .iter()
+        .find(|(listed_id, _)| listed_id == id)
+        .map_or_else(
+            || panic!("{id} was not listed: {listed:?}"),
+            |(_, flag)| *flag,
+        )
+}
+
+#[then("the paste is reported as not contributing to the misconfiguration on the machine")]
+async fn assert_paste_did_not_contribute_to_env_misconfig(world: &mut E2eWorld) {
+    assert!(
+        !symptom_matched_of(world, ENV_MISCONFIG_FIX_ID),
+        "{ENV_MISCONFIG_FIX_ID} comes from the environment alone, so the paste must not \
+         be credited with it"
+    );
+}
+
+#[then("the paste is reported as contributing to the cause it describes")]
+async fn assert_paste_contributed_to_its_cause(world: &mut E2eWorld) {
+    assert!(
+        symptom_matched_of(world, PASTE_FIX_ID),
+        "{PASTE_FIX_ID} is scored from the paste, so the paste must be credited with it"
+    );
+}
+
+#[then("every listed cause is reported as not contributed to by a paste")]
+async fn assert_no_cause_credited_without_a_paste(world: &mut E2eWorld) {
+    let listed = symptom_matched_by_id(world);
+    assert!(
+        listed.iter().any(|(id, _)| id == ENV_MISCONFIG_FIX_ID),
+        "the planted misconfiguration must be listed, or this asserts nothing: {listed:?}"
+    );
+    assert!(
+        listed.iter().all(|(_, flag)| !flag),
+        "nothing was pasted, so no cause may be credited to a paste: {listed:?}"
+    );
+}
+
+#[then("the misconfiguration on the machine is marked as found from the host alone")]
+async fn assert_env_misconfig_marked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "diagnose failed:\n{output}");
+    let block = cause_block(output, ENV_MISCONFIG_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "{ENV_MISCONFIG_FIX_ID} was not reported:\n{output}"
+    );
+    assert!(
+        block
+            .iter()
+            .any(|line| line.trim() == SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+        "the cause the paste did not contribute to must say so:\n{output}"
+    );
+}
+
+#[then("the cause the pasted error describes carries no such mark")]
+async fn assert_paste_cause_unmarked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    let block = cause_block(output, PASTE_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "{PASTE_FIX_ID} was not reported:\n{output}"
+    );
+    assert!(
+        !block
+            .iter()
+            .any(|line| line.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE)),
+        "the cause the paste contributed to must not be marked as found without it:\n{output}"
+    );
+}
+
+#[then("no listed cause is marked as found from the host alone")]
+async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "diagnose failed:\n{output}");
+    assert!(
+        !cause_block(output, ENV_MISCONFIG_FIX_ID).is_empty(),
+        "the planted misconfiguration must be reported, or this asserts nothing:\n{output}"
+    );
+    assert!(
+        !output.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+        "with nothing pasted the mark would sit on every cause and say nothing:\n{output}"
     );
 }
 

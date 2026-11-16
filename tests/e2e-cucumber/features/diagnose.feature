@@ -924,6 +924,79 @@ Feature: Diagnosing failures and listing fixes
     Then each is refused as a usage error that names the file and says why
     And nothing is diagnosed
 
+  # A diagnosis scores the catalog from two sources at once: what the examined
+  # host shows, and the error the user pasted. A finding about the host can
+  # outrank the entry the paste added to, so the ranking alone does not say
+  # which entries the paste contributed to, and a tool reading the result needs
+  # that said per entry. "Contributed" is all it says: any keyword hit counts,
+  # however weak, so it is not a verdict that the entry explains the error. The
+  # misconfiguration is an unneeded GPU override in the environment the CLI
+  # examines, which every lane reads the same way, so this holds on Linux,
+  # Windows and WSL alike. The paste is an ISA error, which no host state scores
+  # on its own and which names nothing the override entry reads, so the two
+  # answers cannot depend on the runner.
+  @id:diagnose-json-says-which-causes-the-paste-contributed-to
+  Scenario: diagnose-62 - A tool can tell which causes the pasted error contributed to
+    Given a machine with a known misconfiguration in its environment
+    And a pasted error that describes a different failure
+    When the user asks for a diagnosis with that paste, in machine-readable form
+    Then the paste is reported as not contributing to the misconfiguration on the machine
+    And the paste is reported as contributing to the cause it describes
+
+  # The same answer, for a person. Only the cause the paste did not contribute
+  # to is marked, and the mark appears only because the paste contributed to
+  # something else in the same report.
+  @id:diagnose-text-marks-causes-the-paste-did-not-contribute-to
+  Scenario: diagnose-63 - The human-readable diagnosis marks a cause the pasted error did not contribute to
+    Given a machine with a known misconfiguration in its environment
+    And a pasted error that describes a different failure
+    When the user asks for a diagnosis with that paste
+    Then the misconfiguration on the machine is marked as found from the host alone
+    And the cause the pasted error describes carries no such mark
+
+  # With nothing pasted, nothing in a paste contributed to anything. A tool is
+  # still told so on every entry rather than the answer being left out, because
+  # a missing answer is what a CLI too old to give one prints. A person is told
+  # nothing: the mark would sit on every cause and say nothing. The host is the
+  # one diagnose-62 uses, so at least one cause is listed on every lane, and
+  # both forms are asserted against it.
+  @id:diagnose-without-a-paste-credits-no-cause-to-one
+  Scenario: diagnose-64 - Without a pasted error no cause is credited to one, and none is marked
+    Given a machine with a known misconfiguration in its environment
+    When the user asks for a diagnosis without pasting an error, in machine-readable form
+    Then every listed cause is reported as not contributed to by a paste
+    When the user asks for a diagnosis without pasting an error
+    Then no listed cause is marked as found from the host alone
+
+  # fix-4's verify line was kept in two copies, and only the one `rocm diagnose`
+  # printed listed `/dev/kfd`, so `rocm fix` told the user to check less than the
+  # diagnosis did. Both now print one line. Like diagnose-43 to -45 this sees
+  # `rocm fix <id> --dry-run`, which prints the plan before the platform gate, so
+  # it runs on every lane. That `rocm diagnose` prints the same line is held by a
+  # unit test, because the diagnosis only fires on a Linux host.
+  @id:diagnose-render-group-verify-line-shows-who-owns-the-gpu-device
+  Scenario: diagnose-65 - The verify line printed for the render-group fix shows who owns the GPU compute device
+    Given a user who has chosen the fix for a missing render group
+    When the user previews that fix without applying it
+    Then the printed verify line checks the user belongs to the group that owns the GPU compute device, and shows that group
+
+  # fix-8 compares the framework's ROCm version with the system's at X.Y, the
+  # granularity PyTorch's wheel indexes are published at, but its titles said
+  # "major". Text only; the comparison itself is unit tested.
+  @id:diagnose-wheel-mismatch-fix-names-the-release-it-compares
+  Scenario: diagnose-66 - The fix for a mismatched framework wheel names the part of the version it compares
+    Given a user who has chosen the fix for a framework wheel built for another ROCm release
+    When the user previews that fix without applying it
+    Then the printed title names the X.Y release, not the major version
+
+  # diagnose-66 sees the `rocm fix` plan; this is the other copy, the cause that
+  # `rocm diagnose` prints. The library-load error in the report raises it on
+  # its own, so it is listed on every lane whatever ROCm the runner has.
+  @id:diagnose-wheel-mismatch-cause-names-the-release-it-compares
+  Scenario: diagnose-67 - Diagnosing a failed load of the ROCm runtime library names the release the framework and the system must share
+    When the user diagnoses this machine with a ROCm runtime library load failure
+    Then the wheel mismatch cause and its plan name the X.Y release, not the major version
+
   # ROCMAI-912. An APU has no private VRAM: every adapter query reports the
   # fixed BIOS carve-out as the device's memory (512 MiB on a Ryzen 7 4700U,
   # ~4 GiB on a Strix Halo) while the engine allocates out of system memory the
@@ -941,7 +1014,7 @@ Feature: Diagnosing failures and listing fixes
   # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
   # it can have (see the PR text).
   @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
-  Scenario: diagnose-62 - An integrated GPU is judged on the pool it allocates from, not its carve-out
+  Scenario: diagnose-68 - An integrated GPU is judged on the pool it allocates from, not its carve-out
     Given a machine whose only GPU shares system memory, with the pool it may use readable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -957,7 +1030,7 @@ Feature: Diagnosing failures and listing fixes
   # `amd-smi` already answered here, with the wrong pool, and would answer
   # identically forever.
   @id:diagnose-model-an-unreadable-shared-pool-is-said-not-guessed @requires-os:linux
-  Scenario: diagnose-63 - An integrated GPU whose pool cannot be read is told so, not given a number
+  Scenario: diagnose-69 - An integrated GPU whose pool cannot be read is told so, not given a number
     Given a machine whose only GPU shares system memory, with the pool it may use unreadable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -972,7 +1045,7 @@ Feature: Diagnosing failures and listing fixes
   # planted machine carries a large aperture beside a small VRAM figure, so a
   # verdict reached on either wrong number is visible in the report.
   @id:diagnose-model-a-discrete-card-is-never-credited-with-the-aperture @requires-os:linux
-  Scenario: diagnose-64 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
+  Scenario: diagnose-70 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
     Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
