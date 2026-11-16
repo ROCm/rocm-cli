@@ -373,8 +373,8 @@ Feature: Model serving
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
   # On a host without Docker both skip (the nightly job logs whether Docker is
-  # reachable). serve-27's known failure on Strix Halo Ubuntu is an xfail row in
-  # expectations.toml, tracked in rocm-cli#1058.
+  # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
+  # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
