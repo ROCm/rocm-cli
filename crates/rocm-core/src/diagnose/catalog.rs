@@ -8,7 +8,7 @@
 use super::Diagnosis;
 use super::engine::{
     check_16_vllm_oom, check_17_torch_dlpack_cuda_variant, check_18_comgr_conflict,
-    check_19_shm_too_small,
+    check_19_shm_too_small, check_23_vllm_extension_load,
 };
 use super::host::{
     check_1_arch_not_in_wheel, check_2_hsa_override_unneeded, check_6_path_missing,
@@ -110,6 +110,9 @@ const CHECKERS: &[Checker] = &[
     // Windows only: the driver date comes from the Windows display adapter.
     // WSL2 reads the host driver through its own entries.
     (check_22_display_driver_old, &["windows"]),
+    // Linux and WSL2, like the other vLLM entries: the engine runs on both and
+    // its startup-failure hint points here on both.
+    (check_23_vllm_extension_load, &["linux", "wsl"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -605,7 +608,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
+        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20, fix-22 and fix-23 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -678,6 +681,13 @@ mod tests {
         // yet a user meets both of its copies, so it is held to the same guard.
         let display_driver_old =
             check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        let extension_load = check_23_vllm_extension_load(
+            &Examination {
+                os_family: "linux".to_owned(),
+                ..Examination::default()
+            },
+            crate::diagnose::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+        );
         for diag in [
             vllm_oom,
             msvc,
@@ -686,6 +696,7 @@ mod tests {
             hip_sdk_missing,
             adrenalin_old,
             display_driver_old,
+            extension_load,
         ] {
             if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
                 assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);

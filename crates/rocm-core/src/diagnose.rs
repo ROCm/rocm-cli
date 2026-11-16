@@ -41,7 +41,10 @@ mod test_support;
 mod windows;
 mod wsl;
 
-pub use engine::{VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM};
+pub use engine::{
+    VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
+    VLLM_OOM_CANONICAL_SYMPTOM,
+};
 pub use linux::{AMDGPU_MISSING_EVIDENCE, dkms_driver_plan_is_supported};
 pub use report::{SYMPTOM_DID_NOT_CONTRIBUTE_NOTE, render_report_text, upstream_route};
 
@@ -219,6 +222,17 @@ pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
     scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", run_all_checks)
 }
 
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for a vLLM compiled
+/// extension that failed to load, on every host family the vLLM engine runs on.
+///
+/// The engine's hint for that failure calls this the way the import hint calls
+/// [`vllm_import_symptom_is_diagnosable`], and falls back to
+/// [`VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM`] when the user's line does not pass.
+#[must_use]
+pub fn vllm_extension_load_symptom_is_diagnosable(symptom: &str) -> bool {
+    scores_on_every_engine_host(symptom, "fix-23-vllm-extension-load", run_all_checks)
+}
+
 /// Set [`Diagnosis::symptom_matched`] on every entry in `matched`.
 ///
 /// Decided by running the same catalog again on the same machine with no
@@ -263,9 +277,10 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
     //
-    // `fix-16-vllm-oom` and `fix-17-torch-dlpack` opt into `wsl` in CHECKERS for
-    // that reason: they are keyword-only checks whose failure modes are just as
-    // real under WSL2, so they still answer there alongside the WSL entries.
+    // `fix-16-vllm-oom`, `fix-17-torch-dlpack` and `fix-23-vllm-extension-load`
+    // opt into `wsl` in CHECKERS for that reason: they are keyword-only checks
+    // whose failure modes are just as real under WSL2, so they still answer
+    // there alongside the WSL entries.
     //
     // `out_of_scope` still exists, for the platforms that genuinely have no
     // entries. That case used to fall through to an empty catalog and report "no
@@ -505,6 +520,26 @@ mod tests {
             "File \"tvm_ffi/_optional_torch_c_dlpack.py\", line 42, in <module>"
         ));
         assert!(!vllm_import_symptom_is_diagnosable("an ordinary failure"));
+    }
+
+    #[test]
+    fn canonical_vllm_extension_load_symptom_is_diagnosable() {
+        // The engine always falls back to this constant for the extension-load
+        // hint, so it has to clear the threshold on Linux and on WSL2.
+        assert!(vllm_extension_load_symptom_is_diagnosable(
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+        ));
+        // And it has to stay a valid single-quoted shell argument.
+        assert!(crate::quotable_in_single_quotes(
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+        ));
+        // The import failure's symptom belongs to its own entry, not to this one.
+        assert!(!vllm_extension_load_symptom_is_diagnosable(
+            VLLM_IMPORT_CANONICAL_SYMPTOM
+        ));
+        assert!(!vllm_extension_load_symptom_is_diagnosable(
+            "an ordinary failure"
+        ));
     }
 
     #[test]

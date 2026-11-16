@@ -354,6 +354,49 @@ pub(super) const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
     ),
 ];
 
+/// A vLLM compiled extension that failed to load, met later as an op missing
+/// from `torch.ops` (ROCMAI-1058).
+///
+/// vLLM imports some of its extensions inside a `try` that only logs a warning,
+/// so the process carries on and dies at the first call to an op that extension
+/// registers: `AttributeError: '_OpNamespace' '_C' object has no attribute
+/// '<op>'`. That line is worth exactly [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH)
+/// on its own. The namespace pattern takes vLLM's own op libraries (`_C`,
+/// `_rocm_C`, `_moe_C`, `_C_cache_ops`) and not torch's (`_c10d_functional`),
+/// so an op missing from torch itself is not read as this.
+///
+/// The other entries are the cause as the loader states it, from the warning
+/// vLLM logs or from importing the extension by hand. A glibc version error is
+/// below the threshold on its own, because any binary can print one; it counts
+/// together with the vLLM extension it names.
+pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
+    (
+        r"_opnamespace'?\s+'?_(?:\w+_)?c(?:_\w+)?'?\s+object has no attribute",
+        50,
+        "an op a vLLM compiled extension registers is missing from torch.ops",
+    ),
+    (
+        r"failed to import from vllm\._\w+",
+        45,
+        "vLLM logged that one of its compiled extensions failed to import",
+    ),
+    (
+        r"vllm/_\w+\.abi3\.so",
+        40,
+        "error names a vLLM compiled extension module",
+    ),
+    (
+        "get_cuda_view_from_cpu_tensor",
+        30,
+        "error names an op registered by vllm._C_stable_libtorch",
+    ),
+    (
+        r"glibc_2\.\d+'? not found",
+        30,
+        "the host's glibc is older than the one the extension was built against",
+    ),
+];
+
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
 ///
 /// Every entry that matches counts as an independent signal. This is the

@@ -444,6 +444,23 @@
       "needs_reboot": false,
       "needs_relogin": false,
       "doc_url": "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html"
+    },
+    {
+      "id": "fix-23-vllm-extension-load",
+      "title": "Find why a vLLM compiled extension did not load (op missing from torch.ops)",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
     }
   ],
   "exit_codes": {

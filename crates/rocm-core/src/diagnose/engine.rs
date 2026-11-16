@@ -4,14 +4,16 @@
 
 //! The checks on the engine runtime that run on Linux and WSL2: the vLLM
 //! out-of-memory and import failures, a second copy of the code object manager,
-//! and a `/dev/shm` too small for a serving workload, with the two canonical
-//! symptom strings the vLLM engine falls back to. The classifiers the engine
-//! calls (`vllm_oom_symptom_is_diagnosable` and its import sibling) run the whole
-//! catalog, so they live in the module root rather than here.
+//! a `/dev/shm` too small for a serving workload, and a vLLM compiled extension
+//! that failed to load, with the three canonical symptom strings the vLLM engine
+//! falls back to. The classifiers the engine calls
+//! (`vllm_oom_symptom_is_diagnosable` and its siblings) run the whole catalog,
+//! so they live in the module root rather than here.
 
 use super::scoring::{
     KEYWORDS_COMGR_CONFLICT, KEYWORDS_SHM_TOO_SMALL, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT,
-    KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, zero,
+    KEYWORDS_VLLM_EXTENSION_LOAD, KEYWORDS_VLLM_OOM, finalize, keyword_score,
+    keyword_score_collapsing_overlaps, zero,
 };
 use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH};
 use crate::examine::Examination;
@@ -525,6 +527,70 @@ pub(super) fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosi
                  2 GiB clears that bar and can still be too small for a large model.",
                 crate::disk_space::format_bytes(SHM_MIN_BYTES)
             ),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
+/// A canonical `--symptom` string for a vLLM compiled extension that failed to
+/// load, guaranteed to clear [`MIN_SCORE_FOR_MATCH`] against
+/// [`KEYWORDS_VLLM_EXTENSION_LOAD`].
+///
+/// The real line quotes the namespace and the op name, and a `'` cannot sit
+/// inside a single-quoted shell argument, so the engine's hint always falls back
+/// to this. It is the real line with those quotes removed.
+pub const VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM: &str =
+    "AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor";
+
+/// A vLLM compiled extension failed to load, so an op it registers is missing
+/// from `torch.ops` (ROCMAI-1058).
+///
+/// Keyword-only, for the reason [`check_17_torch_dlpack_cuda_variant`] gives:
+/// the deciding facts (which extension failed, and why) live in the managed
+/// runtime and in the engine's log, not in the `Examination`.
+///
+/// The failure surfaces far from its cause. vLLM imports some extensions inside
+/// a `try` that only logs a warning, so the engine starts, and dies only when an
+/// op that extension registers is first called. The plan therefore starts by
+/// importing every extension by hand, which turns the warning back into the
+/// loader's own error, and acts on what that error names.
+pub(super) fn check_23_vllm_extension_load(_e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-23-vllm-extension-load";
+    const TITLE: &str = "vLLM compiled extension failed to load, so an op it registers is missing";
+
+    let (score, evidence) = keyword_score(symptom, KEYWORDS_VLLM_EXTENSION_LOAD);
+    if score <= 0 {
+        return zero(ID, TITLE);
+    }
+    let fix = Fix {
+        summary: "Import vLLM's compiled extensions by hand in the engine's environment to get the loader's own error, then act on what it names: a glibc older than the wheel needs, or a missing system library.".to_owned(),
+        commands: vec![
+            "# --- step 1 of 3, in YOUR shell ---".to_owned(),
+            "# Opens an INTERACTIVE subshell with the engine's environment active,".to_owned(),
+            "# and does not return until you leave it. Run this line on its own.".to_owned(),
+            "rocm engines shell vllm".to_owned(),
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---".to_owned(),
+            "# Import every vLLM op library. The first one that fails raises the".to_owned(),
+            "# loader's error, which vLLM itself only logged as a warning.".to_owned(),
+            "python -c \"import importlib, pathlib, torch, vllm; [importlib.import_module('vllm.' + p.name.split('.')[0]) for p in sorted(pathlib.Path(vllm.__file__).parent.glob('_*.so'))]; print('every vllm extension loads')\"".to_owned(),
+            "# The C library version this host has:".to_owned(),
+            "ldd --version | head -n 1".to_owned(),
+            "# Then leave the subshell:".to_owned(),
+            "exit".to_owned(),
+            "# --- step 3 of 3, back in YOUR OWN shell ---".to_owned(),
+            "# If the error says version `GLIBC_2.NN' not found, the wheel was built".to_owned(),
+            "# against a newer glibc than this host has. Run the engine on a distro".to_owned(),
+            "# whose glibc is at least 2.NN (Ubuntu 24.04 ships 2.39), on the host,".to_owned(),
+            "# in a container or in a WSL distro.".to_owned(),
+            "# If it says a library cannot be opened, install the distro package".to_owned(),
+            "# that provides that library.".to_owned(),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "rocm serve <model> --engine vllm".to_owned(),
+        notes: vec![
+            "vLLM logs the cause near the top of the startup log, as a warning that starts with `Failed to import from vllm.`, and carries on. The AttributeError comes later, from the first call to an op that extension registers.".to_owned(),
+            "Reinstalling the engine fetches the same wheel, built against the same glibc, so it does not fix a glibc version error.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -1600,5 +1666,163 @@ mod tests {
         assert!(report.out_of_scope.is_none());
         assert!(report.has_match());
         assert_eq!(report.matched[0].id, "fix-17-torch-dlpack");
+    }
+
+    /// The lines the reported failure (ROCMAI-1058) actually wrote, with the
+    /// runtime path shortened. The first is the warning vLLM logs when the
+    /// extension fails to import, the second the error the engine dies on, and
+    /// the third what importing the extension by hand prints.
+    const EXTENSION_IMPORT_WARNING: &str = "WARNING 11-16 11:48:27 [rocm.py:53] Failed to import \
+         from vllm._C_stable_libtorch with ImportError(\"/lib/x86_64-linux-gnu/libc.so.6: version \
+         `GLIBC_2.38' not found (required by /opt/rt/site-packages/vllm/_C_stable_libtorch.abi3.so)\")";
+    const EXTENSION_OP_MISSING: &str = "(EngineCore pid=629513) ERROR 11-16 11:48:44 \
+         [core.py:1374] AttributeError: '_OpNamespace' '_C' object has no attribute \
+         'get_cuda_view_from_cpu_tensor'";
+    const EXTENSION_IMPORT_BY_HAND: &str = "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version \
+         `GLIBC_2.38' not found (required by /opt/rt/site-packages/vllm/_C_stable_libtorch.abi3.so)";
+
+    #[test]
+    fn a_vllm_extension_that_failed_to_load_is_the_top_match_on_every_engine_host() {
+        for line in [
+            EXTENSION_IMPORT_WARNING,
+            EXTENSION_OP_MISSING,
+            EXTENSION_IMPORT_BY_HAND,
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+        ] {
+            for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+                let report = diagnose(&host, line);
+                let top = &report.matched[0];
+                assert_eq!(
+                    top.id, "fix-23-vllm-extension-load",
+                    "{family}: {line}\n{:?}",
+                    report.matched
+                );
+                assert!(
+                    top.score >= MIN_SCORE_FOR_MATCH,
+                    "{family}: score was {} for {line}",
+                    top.score
+                );
+                assert!(report.has_match(), "{family}: {line}");
+                let fix = top.fix.as_ref().expect("the finding must carry a plan");
+                assert!(!fix.auto_applicable, "fix-23 must be print-only");
+            }
+        }
+    }
+
+    #[test]
+    fn the_extension_load_canonical_symptom_scores_on_the_op_namespace_line() {
+        // Ties the constant the engine prints to the pattern that scores it, so
+        // rewording either one cannot leave the printed command matching on the
+        // op name alone.
+        let (score, evidence) = keyword_score(
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+            KEYWORDS_VLLM_EXTENSION_LOAD,
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH, "score was {score}");
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.contains("missing from torch.ops")),
+            "the namespace line itself has to carry the match: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn op_namespace_errors_from_other_libraries_do_not_match() {
+        // torch's own namespaces are not vLLM's op libraries, and unrelated
+        // failures must not be read as this entry.
+        for line in [
+            "AttributeError: '_OpNamespace' '_c10d_functional' object has no attribute 'foo'",
+            "AttributeError: '_OpNamespace' 'aten' object has no attribute 'foo'",
+            "AttributeError: 'NoneType' object has no attribute 'shape'",
+            "an ordinary failure",
+            "RuntimeError: Engine core initialization failed. See root cause above.",
+        ] {
+            let report = diagnose(&linux_base(), line);
+            assert!(
+                report
+                    .matched
+                    .iter()
+                    .all(|d| d.id != "fix-23-vllm-extension-load" || d.score < MIN_SCORE_FOR_MATCH),
+                "{line}: {:?}",
+                report.matched
+            );
+        }
+        // Each of vLLM's own namespaces is.
+        for ns in ["_C", "_rocm_C", "_moe_C", "_C_cache_ops"] {
+            let line =
+                format!("AttributeError: '_OpNamespace' '{ns}' object has no attribute 'op'");
+            assert_eq!(
+                diagnose(&linux_base(), &line).matched[0].id,
+                "fix-23-vllm-extension-load",
+                "{ns}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_glibc_error_alone_stays_below_the_match_threshold() {
+        // Any binary can print one; it is this entry only together with a vLLM
+        // extension.
+        let report = diagnose(
+            &linux_base(),
+            "/usr/bin/foo: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-23-vllm-extension-load")
+            .expect("the glibc keyword registers as a weak signal");
+        assert!(hit.score < MIN_SCORE_FOR_MATCH, "score was {}", hit.score);
+    }
+
+    #[test]
+    fn the_libtorch_cuda_import_failure_still_belongs_to_fix_17() {
+        // The repr-form warning names a vLLM extension too; the missing CUDA
+        // library is the more specific cause and has to keep the top slot.
+        for line in [
+            VLLM_IMPORT_CANONICAL_SYMPTOM,
+            "Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot open shared \
+             object file: No such file or directory')",
+        ] {
+            assert_eq!(
+                diagnose(&linux_base(), line).matched[0].id,
+                "fix-17-torch-dlpack",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extension_load_plan_matches_the_catalog_copy() {
+        let report = diagnose(&linux_base(), VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-23-vllm-extension-load")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+        // The probes run inside the engine's subshell, and the block says so.
+        let open = commands
+            .iter()
+            .position(|c| *c == "rocm engines shell vllm")
+            .expect("the plan opens the engine shell");
+        let leave = commands
+            .iter()
+            .position(|c| *c == "exit")
+            .expect("the plan leaves it");
+        assert!(open < leave);
+        assert!(
+            commands[open..leave]
+                .iter()
+                .any(|c| c.starts_with('#') && c.contains("INSIDE"))
+        );
+        assert!(
+            commands[leave..]
+                .iter()
+                .any(|c| c.starts_with('#') && c.contains("YOUR OWN shell"))
+        );
     }
 }

@@ -996,3 +996,20 @@ Feature: Diagnosing failures and listing fixes
   Scenario: diagnose-67 - Diagnosing a failed load of the ROCm runtime library names the release the framework and the system must share
     When the user diagnoses this machine with a ROCm runtime library load failure
     Then the wheel mismatch cause and its plan name the X.Y release, not the major version
+
+  # A vLLM compiled extension that failed to load (for example one built against
+  # a newer glibc than the host has) surfaces at engine start as an op missing
+  # from `torch.ops`. Before fix-23 the catalog had nothing for that line, so the
+  # report was the sub-threshold noise diagnose-13 describes. The symptom is the
+  # real line, apostrophes and process prefix included, because that is what a
+  # user copies out of the log; the threshold assertion follows diagnose-13 for
+  # the same reason.
+  #
+  # @requires-os:linux, not @requires-bare-metal, for diagnose-13's reasons: the
+  # checker is registered for linux and wsl and reads only the symptom text.
+  @id:diagnose-recognises-a-vllm-extension-load-failure @requires-os:linux
+  Scenario: diagnose-68 - A vLLM compiled extension that failed to load is recognised from its error text
+    Given a user who hit a vLLM compiled-extension load failure
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the CLI reports the vLLM compiled-extension load failure as an established cause
+    And the CLI can act on the fix named for the vLLM compiled-extension load failure
