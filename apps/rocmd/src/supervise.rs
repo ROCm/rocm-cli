@@ -971,8 +971,20 @@ impl Drop for EngineChild<'_> {
         }
         #[cfg(test)]
         ENGINE_CHILD_TERMINATIONS.with(|calls| calls.set(calls.get() + 1));
+        // This can run during an unwind, where a panic aborts the process. The
+        // termination does not panic: `terminate_child_tree` and the rocm-core
+        // routine under it (identity reads, the `/proc` tree walk, signalling,
+        // the Windows `taskkill` and its wait) use no `unwrap`, `expect` or
+        // unchecked indexing, and none of their arithmetic can overflow. The reap
+        // and the report write return errors, which are dropped. It blocks: on
+        // Linux for about twice `RECOVERY_CLEANUP_GRACE` at most (after `SIGTERM`,
+        // then after `SIGKILL`), on Windows for the `taskkill` of the tree (bounded
+        // by `rocm_core::MANAGED_STOP_GRACE`) and then up to one
+        // `RECOVERY_CLEANUP_GRACE`; the final blocking `wait` runs only once the
+        // child is known gone, so it returns at once.
+        //
         // The error the supervisor returns next says only why it is leaving, so
-        // this line is what records an engine that may have survived.
+        // the line below is what records an engine that may have survived.
         let unconfirmed =
             terminate_and_reap_with(self.child, &self.identity, "engine", self.terminate);
         if let Some(line) = unconfirmed {
