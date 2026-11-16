@@ -763,11 +763,20 @@ mod tests {
         use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
+        // `managed: true` is not decoration. The poller builds these through
+        // `merge_instance`, which copies `managed` from the registry record,
+        // and `discover_managed_services` only ever emits `managed: true`, so
+        // a polled instance is always managed. Hand-building it with
+        // `..Default::default()` alone would leave the field `false` — a shape
+        // the poller cannot produce — and `has_stoppable_managed_instance_with`
+        // screens on exactly that field (`is_listed_service`), because the
+        // Services overlay `s` jumps to lists only managed rows.
         let served = Instance {
             container_id: "lemonade-qwen".to_string(),
             model_name: "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M".to_string(),
             status: InstanceStatus::Ready,
             port: Some(11436),
+            managed: true,
             ..Default::default()
         };
         let mut s = st();
