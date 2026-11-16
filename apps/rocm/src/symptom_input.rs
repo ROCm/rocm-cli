@@ -326,6 +326,22 @@ mod tests {
         assert_eq!(resolve(None, None).unwrap(), None);
     }
 
+    // `-` alone means standard input, so a file literally named `-` is reached
+    // as `./-`, which is what the documentation tells the user. The two
+    // spellings are different paths, and a path that is not `-` is opened as a
+    // file whatever the working directory.
+    #[test]
+    fn a_file_named_dash_is_read_as_a_file_not_as_standard_input() {
+        assert_ne!(Path::new("./-").as_os_str(), STDIN_PATH);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("-");
+        std::fs::write(&path, "from the file named dash\n").unwrap();
+        assert_eq!(
+            resolve(None, Some(&path)).unwrap().as_deref(),
+            Some("from the file named dash")
+        );
+    }
+
     #[test]
     fn a_bad_file_is_a_usage_error_naming_the_command() {
         let error = usage_error(&SymptomFileError::TooLarge {
