@@ -72,24 +72,27 @@ queue has no Strix lane. See
 
 [`vllm-route-check.yml`](../.github/workflows/vllm-route-check.yml) runs on a
 pull request that touches the resolver that picks the default SDK
-([`source.rs`](../apps/rocm/src/therock/source.rs), `resolve.rs`, `resolve/`,
-`version.rs`), the vLLM engine's
+([`therock.rs`](../apps/rocm/src/therock.rs) and everything under
+[`therock/`](../apps/rocm/src/therock)), the vLLM engine's
 [`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs) or
 [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) (the build
 tables), or the check itself (and on `workflow_dispatch`). On GitHub-hosted
 `ubuntu-24.04`, with no GPU and no install, it runs
 `rocm install sdk --channel <release|nightly> --family <gfx942|gfx950> --dry-run`
-and fails when the selected ROCm SDK version has neither a discovery row nor a
+and reports when the selected ROCm SDK version has neither a discovery row nor a
 static pin in those tables, matched the way the engine matches them (see
 [`vllm_route_check.py`](../scripts/vllm_route_check.py)). Without a route
 `rocm engines install vllm` refuses the runtime, and every vLLM-default Instinct
 lane runs no scenarios on it: the nightly queue lanes lost their whole nightly
 channel to this on the 10.3.0a SDKs.
 
-It is **advisory and not a required check**. It resolves the live indexes, so it
-can fail a pull request that changed nothing, when an index moves to an SDK
-vLLM has no wheels for; required, that would block unrelated merges. Read a red
-run as "the default SDK has no vLLM build yet": add the discovery row once the
+It is **advisory and not a required check**. A finding shows as a warning and a
+job summary, and the job stays green, so a known gap does not leave a permanent
+red X on every pull request that touches those paths; the self-test, the build and a check
+that cannot run at all (the build tables no longer parse) still fail the job. It resolves the live
+indexes, so it can warn on a pull request that changed nothing, when an index moves to an SDK
+vLLM has no wheels for; required, that would block unrelated merges. Read a warning
+as "the default SDK has no vLLM build yet": add the discovery row once the
 wheels are published, or wait for them. Locally, with a built `rocm`:
 `python scripts/vllm_route_check.py --rocm target/release/rocm`.
 
@@ -134,6 +137,7 @@ owner of this one.
 built `rocm`: `python scripts/nightly_canary.py --rocm target/release/rocm`
 (add `--family gfx1100` to probe one arch; `--self-test` runs the rules
 against fixtures without the network).
+
 
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
