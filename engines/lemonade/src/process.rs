@@ -100,7 +100,15 @@ pub(crate) fn spawn_lemond_with_parent(
         log_mode,
     );
     #[cfg(not(target_os = "linux"))]
-    spawn_lemond_unchecked(manifest, host, port, log_path, process_env, parent, log_mode)
+    spawn_lemond_unchecked(
+        manifest,
+        host,
+        port,
+        log_path,
+        process_env,
+        parent,
+        log_mode,
+    )
 }
 
 /// [`spawn_lemond_with_parent`] on Linux, with the host's libraries given so a
@@ -118,7 +126,15 @@ fn spawn_lemond_on(
     log_mode: LogMode,
 ) -> Result<LemondChild> {
     refuse_lemond_on_too_old_host(manifest, host_libraries)?;
-    spawn_lemond_unchecked(manifest, host, port, log_path, process_env, parent, log_mode)
+    spawn_lemond_unchecked(
+        manifest,
+        host,
+        port,
+        log_path,
+        process_env,
+        parent,
+        log_mode,
+    )
 }
 
 /// Refuse to start the pinned Linux `lemond` on a host whose glibc or OpenSSL
