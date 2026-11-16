@@ -3870,14 +3870,20 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
 }
 
 /// Serve this host's small model on loopback with `--require-api-key`, so the
-/// CLI generates a key and stores it before the engine starts. Readiness is not
-/// awaited — the key file is what the scenario checks, and it exists from before
-/// the spawn — and the World's teardown stops the service.
+/// CLI generates a key and stores it before the engine starts. The serve still
+/// waits a fixed 45 seconds for the engine (`READINESS_WAIT` in
+/// `apps/rocm/src/service_launch/readiness.rs`) and then exits 0, reporting a
+/// server still loading as `starting`, but the check does not depend on
+/// readiness: the key file is what the scenario checks, it exists from before
+/// the spawn, and an engine still loading when the serve returns is not a
+/// failure here. The World's teardown stops the service.
 #[when("the user serves a model that requires an API key")]
 async fn user_serves_model_requiring_api_key(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
     ensure_serve_port_free().await;
-    let (stdout, stderr, rc) = crate::run_rocm(
+    // Bounded like `serve_and_wait`: a `rocm serve --managed` that never returns
+    // must fail this scenario, not stall the lane.
+    let (stdout, stderr, rc) = crate::run_rocm_bounded(
         world,
         &[
             "serve",
@@ -3887,6 +3893,7 @@ async fn user_serves_model_requiring_api_key(world: &mut E2eWorld) {
             "--managed",
             "--require-api-key",
         ],
+        e2e_cucumber::serve_log::serve_cli_budget(serve_timeout_for(world)),
     );
     assert_eq!(
         rc, 0,

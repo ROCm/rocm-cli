@@ -948,9 +948,12 @@ Feature: Model serving
   # by a freshly created owner-only one on every store, so a mode loosened in
   # place is tightened again; that re-store case is covered by the unit tests in
   # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
-  # the key before a restart writes it back. Readiness is not awaited: the key is
-  # written before the engine starts, and the scenario's teardown stops the
-  # service. Linux-only: on Windows the key is protected by an owner-only DACL
+  # the key before a restart writes it back. The check does not depend on
+  # readiness: the serve waits a fixed 45 seconds for the engine
+  # (`READINESS_WAIT` in `service_launch/readiness.rs`) and then exits 0,
+  # reporting a server still loading as `starting`; the key is written before
+  # the engine starts, and the scenario's teardown stops the service.
+  # Linux-only: on Windows the key is protected by an owner-only DACL
   # instead, but the Windows GPU lane serves with Lemonade, which refuses a
   # key-protected bind there (`ensure_public_bind_engine_supported` in
   # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the

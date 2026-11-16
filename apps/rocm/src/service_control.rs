@@ -612,9 +612,10 @@ fn restart_internal_managed_service_inner(
     if let Some(lease) = port_lease {
         lease.release();
     }
-    // A restarted public service comes back authenticated: its owner-only key file
-    // persists across restarts (removed only on stop), so hand the child the same
-    // file and reuse the key for the readiness probe.
+    // A restarted public service comes back authenticated: the confirmed stop above
+    // deleted its owner-only key file, and the key captured before that stop was
+    // stored back into a fresh one before this point, so hand the child that file
+    // and reuse the same key for the readiness probe.
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, &record.service_id);
     let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
     #[cfg(windows)]

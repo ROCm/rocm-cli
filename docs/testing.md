@@ -2319,12 +2319,13 @@ exist to fix is a file being left behind, which a summary claiming success
 cannot reveal; where they read the output it is for what the user must be
 told, such as the log path before a removal. `service-cleanup-01` plants an
 interrupted-save key copy beside a record and checks `remove` deletes it and
-counts it in `files removed:`; `service-cleanup-03` plants one for a record
-already deleted by hand and checks `prune` previews and sweeps it. `prune`
-deleting the copy of a record it removes is covered by the unit test
-`services_prune_takes_a_pruned_records_staged_endpoint_key` in
-[service_records.rs](../apps/rocm/src/service_records.rs), and the age rule
-and what the sweep leaves alone by its neighbours there.
+counts it in `files removed:`; `service-cleanup-03` plants one for the record
+`prune` removes and checks it goes with that record, and one for a record
+already deleted by hand and checks `prune` previews and sweeps it. The unit
+test `services_prune_takes_a_pruned_records_staged_endpoint_key` in
+[service_records.rs](../apps/rocm/src/service_records.rs) covers the first of
+those too, and its neighbours there cover the age rule and what the sweep
+leaves alone.
 
 Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
 and `rocm logs --service`) reads the record through one loader,

@@ -269,19 +269,27 @@ pub fn staged_siblings(path: &Path) -> Vec<PathBuf> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Vec::new();
     };
-    let Ok(entries) = fs::read_dir(parent) else {
+    // A bare relative name has the empty path as its parent, which cannot be
+    // read; its folder is the current one. Each result is `parent` joined with
+    // the staged file's name, so it is relative exactly when `path` is.
+    let folder = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let Ok(entries) = fs::read_dir(folder) else {
         return Vec::new();
     };
     let mut staged: Vec<PathBuf> = entries
         .flatten()
-        .map(|entry| entry.path())
+        .map(|entry| entry.file_name())
         .filter(|candidate| {
             candidate
-                .file_name()
-                .and_then(OsStr::to_str)
+                .to_str()
                 .and_then(staged_destination_name)
                 .is_some_and(|destination| OsStr::new(destination) == name)
         })
+        .map(|candidate| parent.join(candidate))
         .collect();
     staged.sort();
     staged
@@ -669,6 +677,24 @@ fn sync_parent_dir(path: &Path) {
 #[allow(clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) {}
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has entered a publish step that can reach
+    /// `ReplaceFileW`: `publish_rename_first`, which falls back to it, and
+    /// `replace_file_windows`, which calls it — and, where neither exists, the
+    /// non-Windows [`publish_temp_file`] that stands in for them. Counted where
+    /// the fallback lives rather than at one caller, so any route to it is
+    /// seen, and on every platform, so a test on any host can check that
+    /// [`write_owner_only_file_atomically`] never takes it.
+    static REPLACE_CAPABLE_PUBLISHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: count one entry into a publish step that can reach `ReplaceFileW`.
+#[cfg(test)]
+fn note_replace_capable_publish() {
+    REPLACE_CAPABLE_PUBLISHES.with(|count| count.set(count.get() + 1));
+}
+
 /// Test seam: move the staged file `tmp` over `path` in one step, replacing
 /// any existing file without first removing it.
 ///
@@ -678,6 +704,8 @@ fn sync_parent_dir(_path: &Path) {}
 #[cfg(not(windows))]
 #[doc(hidden)]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    note_replace_capable_publish();
     fs::rename(tmp, path)
 }
 
@@ -704,6 +732,8 @@ where
     R: FnOnce(&Path, &Path) -> io::Result<()>,
     P: FnOnce(&Path, &Path) -> io::Result<()>,
 {
+    #[cfg(test)]
+    note_replace_capable_publish();
     match rename(tmp, path) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
@@ -721,6 +751,9 @@ where
 fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    #[cfg(test)]
+    note_replace_capable_publish();
 
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let replacement_wide: Vec<u16> = replacement
@@ -1766,6 +1799,16 @@ mod tests {
             staged_destination_name("svc-1.endpoint-key.tmp-1-x-0"),
             None
         );
+        // Three runs, but one of them empty: not a suffix staging writes.
+        for empty_run in [
+            "x.tmp-1--3",
+            "x.tmp--2-3",
+            "x.tmp-1-2-",
+            "x.tmp---",
+            "x.tmp--",
+        ] {
+            assert_eq!(staged_destination_name(empty_run), None, "{empty_run}");
+        }
         // The key file of a service whose id itself contains the marker.
         assert_eq!(
             staged_destination_name("a.endpoint-key.tmp-x.endpoint-key"),
@@ -1792,6 +1835,73 @@ mod tests {
         let found = staged_siblings(&destination);
         let _ = fs::remove_dir_all(&root);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A destination given as a bare relative name has its staged copies found
+    /// in the current directory, and each comes back as a bare name too.
+    ///
+    /// The current directory is process-wide, so the bare-name case runs in a
+    /// re-executed copy of this test started in a scratch directory, rather
+    /// than here, where changing it would reach sibling tests and leaving it
+    /// would write into the source tree.
+    #[test]
+    fn staged_siblings_finds_the_copies_of_a_bare_relative_name() {
+        const NAME: &str = "svc.endpoint-key";
+        if std::env::var_os("ROCM_TEST_STAGED_RELATIVE_CHILD").is_some() {
+            let destination = PathBuf::from(NAME);
+            fs::write(&destination, b"published").unwrap();
+            let staged = stage_owner_only_file_unpublished(&destination, b"secret").unwrap();
+            assert_eq!(staged.parent(), Some(Path::new("")), "{staged:?}");
+            assert_eq!(staged_siblings(&destination), [staged]);
+            return;
+        }
+
+        let root = scratch_dir("staged-relative");
+        fs::create_dir_all(&root).unwrap();
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "atomic_write::tests::staged_siblings_finds_the_copies_of_a_bare_relative_name",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("ROCM_TEST_STAGED_RELATIVE_CHILD", "1")
+                .current_dir(&root)
+                .status()
+                .expect("re-exec the test in a child process");
+        let ran = root.join(NAME).exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(ran, "the child did not run the test arm");
+        assert!(status.success(), "{status:?}");
+    }
+
+    /// The owner-only writer never enters a publish step that can reach
+    /// `ReplaceFileW`, which would carry the replaced file's DACL over to the
+    /// secret. Checked on every host by counting entries into those steps,
+    /// which [`write_file_atomically`] shows are counted.
+    #[test]
+    fn write_owner_only_file_atomically_never_takes_the_publish_with_the_replace_fallback() {
+        let count = || REPLACE_CAPABLE_PUBLISHES.with(std::cell::Cell::get);
+        let root = scratch_dir("owner-only-no-replace");
+        let destination = root.join("svc.endpoint-key");
+
+        let before = count();
+        write_owner_only_file_atomically(&destination, b"new").unwrap();
+        write_owner_only_file_atomically(&destination, b"over an existing file").unwrap();
+        let owner_only = count() - before;
+
+        let before = count();
+        write_file_atomically(&root.join("other.json"), b"{}").unwrap();
+        let general = count() - before;
+        let _ = fs::remove_dir_all(&root);
+
+        // At least one: on Windows a rename that fails falls through to the
+        // replace, which counts again.
+        assert!(general >= 1, "the count does not see the general publish");
+        assert_eq!(
+            owner_only, 0,
+            "the owner-only writer published through the ReplaceFileW-capable path"
+        );
     }
 
     /// A secret file someone loosened comes back owner-only: unlike

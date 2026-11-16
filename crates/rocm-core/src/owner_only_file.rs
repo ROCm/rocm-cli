@@ -25,9 +25,11 @@
 //! never followed or opened, so a caller cannot be made to write a secret
 //! through a file or link somebody else prepared. On Windows that takes
 //! `FILE_FLAG_OPEN_REPARSE_POINT`, which `std` also passes for `create_new`,
-//! and the path goes through the same long-path (`\\?\`) conversion `std`
-//! applies, so a path longer than `MAX_PATH` works here as it does for
-//! `std::fs`. To replace an existing secret, use
+//! and the path goes through the same long-path conversion `std::fs` applies
+//! when it opens a file — every path that is not already verbatim or a short
+//! drive-absolute or UNC one, a short relative path included, is made absolute
+//! and given the `\\?\` prefix — so a path longer than `MAX_PATH` works here
+//! as it does for `std::fs`. To replace an existing secret, use
 //! [`crate::atomic_write::write_owner_only_file_atomically`], which stages the
 //! bytes in a fresh owner-only file and renames it over the old one.
 
@@ -55,27 +57,29 @@ pub fn owner_only_sddl(user_sid: &str) -> String {
     format!("D:P(A;;FA;;;{user_sid})")
 }
 
-/// The create itself, before the mode is set again on the handle: mode 0600
-/// as the file comes into existence, narrowed further by the umask but never
-/// widened. Its own function so a test can observe the file as created.
-#[cfg(unix)]
-fn create_new_at_owner_only_mode(path: &Path) -> io::Result<File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
+/// Test-only switch: when set, [`open_new_owner_only`] returns the file as the
+/// create left it, without setting its mode again on the handle, so a test can
+/// see what the create itself asked for. Set only in a re-executed test child.
+#[cfg(all(unix, test))]
+static SKIP_HANDLE_MODE_RESET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(unix)]
 fn create_new_owner_only(path: &Path) -> io::Result<File> {
-    use std::fs::Permissions;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::fs::{OpenOptions, Permissions};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let file = create_new_at_owner_only_mode(path)?;
+    // Mode 0600 as the file comes into existence, narrowed further by the umask
+    // but never widened.
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    #[cfg(test)]
+    if SKIP_HANDLE_MODE_RESET.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(file);
+    }
     // The umask can only have removed bits from 0600, never added any, so
     // nobody else can open the file even before this call. Setting the mode on
     // the handle makes it exactly 0600 whatever the umask was, so the owner can
@@ -168,7 +172,8 @@ fn usable_as_is(wide: &[u16]) -> bool {
 /// already made absolute and normalized: `C:\x` becomes `\\?\C:\x`,
 /// `\\.\x` becomes `\\?\x`, `\\server\share` becomes
 /// `\\?\UNC\server\share`, and a path already verbatim is kept. The same
-/// mapping `std` applies before it opens a file.
+/// mapping `std::fs` applies before it opens a file, to every path
+/// [`usable_as_is`] rejects whatever its length.
 #[cfg(any(windows, test))]
 fn with_verbatim_prefix(absolute: &[u16]) -> Vec<u16> {
     let (prefix, rest): (&[u16], &[u16]) = match absolute {
@@ -251,11 +256,14 @@ pub(crate) mod win32 {
 
     /// `path` as the NUL-terminated UTF-16 name `std::fs` would hand
     /// `CreateFileW`: unchanged when it is already verbatim, or short and
-    /// absolute; otherwise made absolute and given the verbatim prefix, which
-    /// lifts the `MAX_PATH` limit. `std` keeps this conversion private, so it
-    /// is repeated here on top of the public [`std::path::absolute`]; the
-    /// decisions are in [`super::usable_as_is`] and
-    /// [`super::with_verbatim_prefix`], which are tested on every host.
+    /// drive-absolute or UNC; otherwise made absolute and given the verbatim
+    /// prefix, which lifts the `MAX_PATH` limit. That includes a short relative
+    /// path: when it opens a file `std` prefers the verbatim form, unlike
+    /// [`std::path::absolute`], which returns the plain absolute form. `std`
+    /// keeps this conversion private, so it is repeated here on top of the
+    /// public [`std::path::absolute`]; the decisions are in
+    /// [`super::usable_as_is`] and [`super::with_verbatim_prefix`], which are
+    /// tested on every host.
     pub(crate) fn long_path_wide(path: &Path) -> io::Result<Vec<u16>> {
         let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         if wide.contains(&0) {
@@ -596,12 +604,18 @@ mod tests {
             // SAFETY: `umask` only swaps this process's file-creation mask;
             // this child process runs only this one test.
             let previous = unsafe { libc::umask(0) };
+            // Through the real entry point, with only the mode reset on the
+            // handle switched off, so this sees what the create asked for.
+            super::SKIP_HANDLE_MODE_RESET.store(true, std::sync::atomic::Ordering::SeqCst);
             let path = PathBuf::from(dir).join("secret");
-            let created = create_new_at_owner_only_mode(&path);
+            let created = open_new_owner_only(&path);
             // SAFETY: as above; restored before anything else creates a file.
             unsafe {
                 libc::umask(previous);
             }
+            // Switch the reset back on, so nothing else in this process sees
+            // it off.
+            super::SKIP_HANDLE_MODE_RESET.store(false, std::sync::atomic::Ordering::SeqCst);
             drop(created.unwrap());
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "mode as created under umask 0 was {mode:o}");
