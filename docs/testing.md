@@ -4850,13 +4850,25 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   memory, so the pool a recipe minimum is compared against is read separately by
   `detect_host_unified_memory_gib` in
   [unified_memory.rs](../crates/rocm-core/src/host_gpu/unified_memory.rs).
-  Scenarios `diagnose-68`, `diagnose-69` and `diagnose-70` plant a simulated host
+  Scenarios `diagnose-68`, `diagnose-69`, `diagnose-70` and `diagnose-71` plant a
+  simulated host
   (`ROCM_CLI_TEST_HOST_ROOT`) carrying a KFD node and a DRM card with both
   counters, so they run on the ungated lane and describe the same machine
   whatever GPU the runner has: an APU judged on its aperture and reported
   `degraded` because the pool is shared, an APU whose aperture is absent told so
-  rather than handed a fabricated figure, and a discrete card judged on its own
-  VRAM with the aperture beside it ignored. The Linux reader has its own planted
+  rather than handed a fabricated figure, a discrete card judged on its own
+  VRAM with the aperture beside it ignored, and a host showing two AMD DRM cards
+  credited with neither card's aperture. `diagnose-71` needs one thing the other
+  three do not: a stub `amd-smi` on `PATH` reporting the single compute device,
+  plus the `ROCM_E2E_KFD_DEVICE` seam so the pre-flight will launch it. Without
+  it the sysfs VRAM fallback's own, older ordinal-ambiguity guard
+  (`read_drm_vram_usage` in [gpu_policy.rs](../apps/rocm/src/gpu_policy.rs))
+  withholds every row as soon as a second AMD card appears, and the host is
+  classified "GPU memory unmeasured" before the aperture rule is ever consulted —
+  so a two-card scenario planted through the host root alone would pass while
+  exercising nothing. The host this rule actually decides for is an APU beside an
+  AMD display adapter ROCm does not enumerate, which is what the stub models.
+  The Linux reader has its own planted
   tree in [linux.rs](../crates/rocm-core/src/host_gpu/linux.rs). **The Windows
   source has unit coverage only**: it reads
   `DXGI_ADAPTER_DESC1::SharedSystemMemory` through COM, the host-simulation seam

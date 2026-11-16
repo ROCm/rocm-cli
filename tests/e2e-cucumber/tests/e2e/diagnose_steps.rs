@@ -4492,14 +4492,28 @@ const GFX1151_TARGET_VERSION: u32 = 110_501;
 /// part that `gfx_is_apu_family` does not match.
 const GFX1100_TARGET_VERSION: u32 = 110_000;
 
-/// A 4 GiB BIOS carve-out, in bytes: what every adapter query reports as an
+/// A 4.5 GiB BIOS carve-out, in bytes: what every adapter query reports as an
 /// APU's memory, and what a fit check must NOT be reached against.
-const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+///
+/// Deliberately **not** a whole number of GiB. `format_gib` renders a whole
+/// figure with no decimal at all (`format_gib_renders_a_whole_number_with_no_decimal`
+/// pins `format_gib(8.0) == "8 GiB"`), so a 4 GiB carve-out reaches the report
+/// as the bare string `"4 GiB"` -- which any recipe minimum of 4 GiB produces
+/// too. An assertion that the carve-out is absent could then not tell the two
+/// apart. `"4.5 GiB"` can only have come from this fixture. See
+/// [`carve_out_as_rendered`].
+const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
 
 /// A 60 GiB aperture, in bytes: a Strix-Halo-shaped `mem_info_gtt_total`. Far
 /// enough from the carve-out that a verdict reached against the wrong one is
 /// unmistakable in the report.
 const APERTURE_BYTES: u64 = 60 * 1024 * 1024 * 1024;
+
+/// A second AMD card's `mem_info_gtt_total`, in bytes. Different from
+/// [`APERTURE_BYTES`] so that a reader which picked one card over the other --
+/// whichever `read_dir` reached last -- names a figure the report can be
+/// checked for, rather than the same number either way.
+const SECOND_CARD_APERTURE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Plant a single-GPU machine under the simulated host root
 /// (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by `e2e-test-hooks` builds), as
@@ -4519,12 +4533,7 @@ fn plant_single_gpu_with_memory(
     vram_total_bytes: u64,
     gtt_total_bytes: Option<u64>,
 ) {
-    let host = world
-        .isolated_root
-        .as_ref()
-        .expect("no isolated root")
-        .path()
-        .join("host-root");
+    let host = simulated_host_root(world);
 
     // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
     // GPU rather than a CPU node.
@@ -4536,7 +4545,61 @@ fn plant_single_gpu_with_memory(
     )
     .expect("failed to write the planted KFD node properties");
 
-    let device = host.join("sys/class/drm/card0/device");
+    plant_amd_drm_card(world, "card0", vram_total_bytes, gtt_total_bytes);
+
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+
+    // An `lspci` listing an empty bus, ahead of any real one, so the PCI probe
+    // succeeds on every runner without describing the runner's own cards -- the
+    // same reason `machine_with_an_unsupported_gpu` plants one.
+    let bin = shared_pool_bin_dir(world);
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+/// The simulated host root this cluster's fixtures plant under, derived rather
+/// than carried on the World so every helper here agrees on it.
+fn simulated_host_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root")
+}
+
+/// The PATH directory this cluster's fake executables live in. One directory,
+/// prepended once by [`plant_single_gpu_with_memory`]: a second `PATH` entry on
+/// `command_env` would replace the first rather than extend it.
+fn shared_pool_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("shared-pool-bin")
+}
+
+/// Plant one amdgpu DRM card under the simulated host root.
+///
+/// `mem_info_vram_used` is planted for every card, because the sysfs VRAM
+/// fallback drops a card whose occupancy it cannot read rather than guessing it
+/// is empty. `gtt_total` is `None` for the host whose aperture is unreadable.
+fn plant_amd_drm_card(
+    world: &E2eWorld,
+    card: &str,
+    vram_total_bytes: u64,
+    gtt_total_bytes: Option<u64>,
+) {
+    let device = simulated_host_root(world).join(format!("sys/class/drm/{card}/device"));
     std::fs::create_dir_all(&device).expect("failed to create the planted DRM card");
     // The AMD PCI vendor id, which is what marks this as an amdgpu card.
     std::fs::write(device.join("vendor"), "0x1002\n").expect("failed to plant the vendor id");
@@ -4550,33 +4613,46 @@ fn plant_single_gpu_with_memory(
         std::fs::write(device.join("mem_info_gtt_total"), format!("{gtt}\n"))
             .expect("failed to plant the GTT aperture");
     }
-
-    world
-        .command_env
-        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
-
-    // An `lspci` listing an empty bus, ahead of any real one, so the PCI probe
-    // succeeds on every runner without describing the runner's own cards -- the
-    // same reason `machine_with_an_unsupported_gpu` plants one.
-    let bin = world
-        .isolated_root
-        .as_ref()
-        .expect("no isolated root")
-        .path()
-        .join("shared-pool-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
-        .expect("failed to write the fake lspci");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
 }
 
 /// Bytes as the GiB figure the report carries.
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// A planted byte count exactly as an evidence line would spell it.
+///
+/// Mirrors both branches of `rocm_core::model_readiness::format_gib`, which is
+/// `pub(crate)` and so cannot be called from the E2E binary -- including the
+/// one that renders a whole number with no decimal at all
+/// (`format_gib_renders_a_whole_number_with_no_decimal` pins
+/// `format_gib(8.0) == "8 GiB"`). Deriving the string from the fixture is the
+/// point: the guard in [`assert_unreadable_shared_pool_claims_no_figure`] used
+/// to carry a hand-typed `"offers 4.0 GiB"`, a form `format_gib` never produces
+/// for a whole-GiB figure, so it matched nothing and could not fail however
+/// wrong the report got.
+fn as_rendered(bytes: u64) -> String {
+    let value = gib(bytes);
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0} GiB")
+    } else {
+        format!("{:.1} GiB", (value * 10.0).floor() / 10.0)
+    }
+}
+
+/// The carve-out as the report would spell it.
+///
+/// [`CARVE_OUT_BYTES`] is deliberately not a whole number of GiB, and the
+/// `assert` keeps it that way: a bare `"4 GiB"` is also what a recipe minimum
+/// of 4 GiB renders as, and an assertion that the carve-out is absent could not
+/// tell the two apart.
+fn carve_out_as_rendered() -> String {
+    assert!(
+        gib(CARVE_OUT_BYTES).fract().abs() > f64::EPSILON,
+        "CARVE_OUT_BYTES must not be a whole number of GiB, or the figure below is ambiguous \
+         against a recipe minimum of the same size; see its doc comment"
+    );
+    as_rendered(CARVE_OUT_BYTES)
 }
 
 #[given("a machine whose only GPU shares system memory, with the pool it may use readable")]
@@ -4594,6 +4670,121 @@ async fn machine_with_an_unreadable_shared_pool(world: &mut E2eWorld) {
     // Same machine, minus `mem_info_gtt_total`: the shape an older kernel or a
     // container with no DRM device passed through presents.
     plant_single_gpu_with_memory(world, GFX1151_TARGET_VERSION, CARVE_OUT_BYTES, None);
+}
+
+#[given("a machine whose integrated GPU shares system memory beside a second AMD card")]
+async fn machine_with_two_amd_cards(world: &mut E2eWorld) {
+    // The APU, exactly as diagnose-68 plants it: its aperture IS readable, so
+    // a verdict of 60 GiB is what this host would get on its own. That is the
+    // premise -- the scenario is about what the second card takes away.
+    plant_single_gpu_with_memory(
+        world,
+        GFX1151_TARGET_VERSION,
+        CARVE_OUT_BYTES,
+        Some(APERTURE_BYTES),
+    );
+    // The second AMD card, with an aperture of its own. A different figure from
+    // the first on purpose: either card's number appearing in the report would
+    // name a pool, and the whole point is that neither may be attributed to the
+    // device the verdict answers for.
+    plant_amd_drm_card(
+        world,
+        "card1",
+        8 * 1024 * 1024 * 1024,
+        Some(SECOND_CARD_APERTURE_BYTES),
+    );
+    // And `amd-smi` answering for one GPU, which is what makes this host reach
+    // the APU branch at all.
+    //
+    // Not decoration. The sysfs VRAM fallback the other three scenarios rely on
+    // withholds every row once it finds a second AMD card (its own, older
+    // ordinal-ambiguity guard, `read_drm_vram_usage`), so a two-card host with
+    // no `amd-smi` never gets as far as asking which pool it allocates from --
+    // it is classified as "GPU memory unmeasured" and the aperture rule has
+    // nothing to say. The hosts where this rule is the one that decides are the
+    // ones where `amd-smi` enumerates a single compute device while sysfs shows
+    // two AMD cards: an APU beside a display adapter ROCm does not enumerate.
+    // That is the machine planted here.
+    plant_amd_smi_reporting_one_gpu(world, CARVE_OUT_BYTES);
+}
+
+/// Put an `amd-smi` on PATH that reports exactly one GPU of `total_vram_bytes`,
+/// and let the pre-flight launch it.
+///
+/// `rocm-core` refuses to spawn `amd-smi` at all unless its KFD device node
+/// opens (it can block unkillably against a wedged one), and the simulated host
+/// root cannot provide that node -- the pre-flight deliberately keeps the real
+/// `/dev/kfd`'s veto. `ROCM_E2E_KFD_DEVICE` is the seam that moves it, honoured
+/// only by `e2e-test-hooks` builds; `examine.feature` uses the same one. Here it
+/// is pointed at an ordinary planted file, which opens.
+///
+/// The stub answers `metric` and fails anything else, so the examination's own
+/// probes see what they see today on these hosts (no usable `amd-smi`) and only
+/// the VRAM reading changes.
+///
+/// `HOME` is redirected too, and that is not incidental.
+/// `resolve_amd_smi_binary` looks in `$HOME/.rocm/runtimes/registry` *before*
+/// `PATH`, because the binary ships inside the managed SDK wheel and is not on
+/// `PATH` on a real install. The harness isolates `ROCM_CLI_DATA_DIR` but
+/// deliberately not `HOME`, so on any lane with a managed ROCm SDK installed --
+/// which is every self-hosted GPU lane -- the runner's own `amd-smi` would
+/// answer here and the scenario would describe that machine instead of the
+/// planted one. Pointing `HOME` at this scenario's own empty root is what keeps
+/// the stub the only `amd-smi` in reach, and so keeps this scenario the same
+/// scenario on every lane.
+fn plant_amd_smi_reporting_one_gpu(world: &mut E2eWorld, total_vram_bytes: u64) {
+    let total_mb = total_vram_bytes / (1024 * 1024);
+    let payload = format!(
+        r#"{{"gpu_data":[{{"gpu":0,"mem_usage":{{"used_vram":{{"value":0}},"total_vram":{{"value":{total_mb}}}}}}}]}}"#
+    );
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = metric ]; then\n    printf '%s' \
+         '{payload}'\n    exit 0\n  fi\ndone\nexit 1\n"
+    );
+    rocm_core::fake_executable::write_fake_executable(
+        &shared_pool_bin_dir(world).join("amd-smi"),
+        &script,
+    )
+    .expect("failed to write the fake amd-smi");
+
+    let host = simulated_host_root(world);
+    let device = host.join("kfd-device-stand-in");
+    // Planted twice, on purpose. `kfd_readable` requires the device to open
+    // both as written AND re-rooted under `ROCM_CLI_TEST_HOST_ROOT`: a
+    // simulated root may make the gate decline, never make it allow, which is
+    // what stops a test hook from launching `amd-smi` on a machine with no GPU.
+    // Both seams are in play in this scenario, so both copies have to exist --
+    // with only the first, the gate declines, `amd-smi` is never spawned, and
+    // the host reads as "GPU memory unmeasured". That is a verdict this
+    // scenario's `Then` would otherwise have accepted while exercising nothing,
+    // and it is what the `undetermined_reason` assertion in
+    // `assert_no_cards_aperture_is_attributed` exists to catch.
+    let rerooted = host.join(
+        device
+            .strip_prefix("/")
+            .expect("the isolated root is an absolute path"),
+    );
+    std::fs::create_dir_all(
+        rerooted
+            .parent()
+            .expect("the re-rooted device path has a parent"),
+    )
+    .expect("failed to create the re-rooted KFD device directory");
+    for copy in [&device, &rerooted] {
+        std::fs::write(copy, b"").expect("failed to plant the KFD device stand-in");
+    }
+    world
+        .command_env
+        .push(("ROCM_E2E_KFD_DEVICE", device.into_os_string()));
+
+    let home = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("shared-pool-home");
+    std::fs::create_dir_all(&home).expect("failed to create the scenario's home directory");
+    world.command_env.push(("HOME", home.into_os_string()));
 }
 
 #[given("a machine whose only GPU is a discrete card that also reports a system-memory aperture")]
@@ -4675,15 +4866,85 @@ async fn assert_unreadable_shared_pool_claims_no_figure(world: &mut E2eWorld) {
          least of all, which over-estimates in the one direction that produces a wrong \
          \"it fits\": {model:#}"
     );
-    // And the carve-out must not have been smuggled in as the answer either.
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // Anchor first. The guard below says a string is absent, which an empty
+    // evidence list -- or a report whose shape changed out from under this
+    // step -- would also satisfy. This is the sentence the
+    // `UnifiedMemoryUnreadable` branch really emits; the branch does not use
+    // the "...and this host offers {}" template the old guard was written
+    // against at all.
+    let said_so = "the figure for the memory pool its engine allocates from could not be read \
+                   here";
     assert!(
-        !model_field(&model, "evidence")
-            .as_array()
-            .expect("evidence is not an array")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .any(|line| line.contains("offers 4.0 GiB")),
-        "the BIOS carve-out is not this host's pool and must not be reported as one: {model:#}"
+        evidence.iter().any(|line| line.contains(said_so)),
+        "the report must say the pool could not be read, in its own words, or everything below \
+         is asserted against a report that said something else entirely: {model:#}"
+    );
+    // And the carve-out must not have been smuggled in as the answer either --
+    // in any line, spelled the way the report would spell it.
+    let carve_out = carve_out_as_rendered();
+    assert!(
+        !evidence.iter().any(|line| line.contains(&carve_out)),
+        "the BIOS carve-out ({carve_out}) is not this host's pool and must not be reported as \
+         one: {model:#}"
+    );
+}
+
+#[then("neither card's aperture is offered as the pool the model would use")]
+async fn assert_no_cards_aperture_is_attributed(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // Non-vacuity, and the load-bearing assertion of the scenario. "Could not
+    // determine" alone would ALSO be the answer if the stub `amd-smi` had never
+    // run: the host would then have no VRAM rows at all and be classified
+    // `accelerator_memory_unknown` ("run `amd-smi` again"), which has nothing to
+    // do with the aperture. `unified_memory_unreadable` is only reachable
+    // through the APU branch -- the single compute device WAS seen, the host IS
+    // an APU, and the one thing missing is a pool that could be attributed to
+    // it. That is this rule and no other.
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "unified_memory_unreadable",
+        "the answer has to be withheld for want of an attributable pool, not for want of \
+         telemetry: a reason of `accelerator_memory_unknown` means the fixture's `amd-smi` never \
+         answered and this scenario exercised the VRAM fallback's guard instead of the \
+         aperture's: {model:#}"
+    );
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (whose, bytes) in [
+        ("the integrated GPU's", APERTURE_BYTES),
+        ("the second card's", SECOND_CARD_APERTURE_BYTES),
+    ] {
+        let figure = as_rendered(bytes);
+        assert!(
+            !evidence.iter().any(|line| line.contains(&figure)),
+            "{whose} aperture ({figure}) reached the report. The aperture is per device and the \
+             verdict answers for one of them, so on a host showing two AMD cards there is no way \
+             to tell from here which figure belongs to the part the engine would use -- handing \
+             back either one names a pool the model may never see: {model:#}"
+        );
+    }
+    // The premise the two assertions above rest on: diagnose-68 plants the same
+    // APU with the same readable 60 GiB aperture and DOES get a figure, so what
+    // is withheld here is withheld because of the second card and not because
+    // the fixture simply has nothing to report.
+    assert_eq!(
+        measured_gpu_gib(&model),
+        None,
+        "no figure may be claimed at all, not merely a different one: {model:#}"
     );
 }
 

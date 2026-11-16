@@ -1050,3 +1050,28 @@ Feature: Diagnosing failures and listing fixes
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
     Then the memory the answer was reached against is the card's own VRAM alone
+
+  # The other half of the aperture's attribution problem, and the one a user can
+  # see. `mem_info_gtt_total` is per device; the verdict answers for one device.
+  # On a host showing two AMD DRM cards there is no way to tell from the file
+  # which figure belongs to the part the engine would allocate from, so neither
+  # is reported -- the user gets "could not determine" instead of a confident
+  # number that might describe the other card. `two_amd_cards_leave_the_gtt_aperture_unattributable`
+  # proves the reader does that; this proves the CLI does.
+  #
+  # The machine is an APU beside a second AMD card that ROCm does not enumerate
+  # as a compute device, which is the shape where this rule is the one that
+  # decides. On a two-card host with no `amd-smi` at all, the sysfs VRAM
+  # fallback's own older ordinal-ambiguity guard (`read_drm_vram_usage`)
+  # withholds every row first, and the answer is "GPU memory unmeasured" before
+  # the aperture is ever consulted -- so the scenario plants a stub `amd-smi`
+  # reporting the one compute device, alongside the two cards in sysfs. The
+  # premise it rests on is diagnose-68: the same APU with the same readable
+  # 60 GiB aperture, alone, does get a figure.
+  @id:diagnose-model-two-amd-cards-leave-the-pool-unattributable @requires-os:linux
+  Scenario: diagnose-71 - An integrated GPU beside a second AMD card is credited with neither pool
+    Given a machine whose integrated GPU shares system memory beside a second AMD card
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And neither card's aperture is offered as the pool the model would use
