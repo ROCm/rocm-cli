@@ -788,10 +788,11 @@ pub(crate) fn ensure_therock_compat_shims(
     // and torch counts no devices (see `rocm_core::ensure_amd_smi_compat`). The
     // link goes in the same directory, and the launch path carries the directory
     // when either shim was written. That function also removes a leftover
-    // `libmpi_cxx.so.40` stub where the host has a real `libmpi_cxx`, since the
-    // directory can now reach the loader path for the link alone. When it answers
-    // `None` the directory is not on this launch's loader path for the link, so
-    // there is nothing to clear.
+    // `libmpi_cxx.so.40` stub where the host has a real `libmpi_cxx`, and a stale
+    // `libnuma.so.1` link, since the directory can now reach the loader path for
+    // the link alone. When it answers `None` the link is not written, but the
+    // directory still reaches this launch's loader path if only the mpi stub was
+    // written, which is why the numa link is also cleared directly below.
     let amd_smi_shim = rocm_core::ensure_amd_smi_compat(
         &compat_dir,
         &therock_library_path_entries_inner(runtime, CompatDirSignal::Checked(None)),
@@ -806,24 +807,10 @@ pub(crate) fn ensure_therock_compat_shims(
     // that stale shim here so the real numactl runtime (installed via the
     // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
     // the install/preflight.
-    remove_stale_numa_shim(&compat_dir);
+    rocm_core::remove_stale_numa_shim(&compat_dir);
     mpi_cxx_shim.or(amd_smi_shim)
 }
 
-/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
-/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
-/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
-/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
-/// path would shadow a correctly installed system libnuma. No-op when absent or
-/// when the entry is not a symlink.
-fn remove_stale_numa_shim(compat_dir: &Path) {
-    let link = compat_dir.join("libnuma.so.1");
-    if let Ok(meta) = link.symlink_metadata()
-        && meta.file_type().is_symlink()
-    {
-        let _ = fs::remove_file(&link);
-    }
-}
 /// A writable, runtime-owned directory for managed-runtime library compatibility
 /// shims (see [`therock_library_path_entries`]). Prefers the managed Python
 /// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root

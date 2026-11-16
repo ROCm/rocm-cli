@@ -83,14 +83,22 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
     // `a_launch_carries_the_amd_smi_link_even_when_no_mpi_shim_is_due` (vLLM
     // launch), `runtime_environment_carries_the_amd_smi_link_dir` (ComfyUI launch)
     // and `the_device_probe_runs_with_the_amd_smi_link_on_its_loader_path` (the
-    // install device probe). That the note shows exactly when the link is absent
-    // is `the_framework_probe_picks_up_an_existing_amd_smi_link_and_never_writes_one`.
+    // install device probe). That the note stays away while the link is in place,
+    // and that the probe never writes it, is
+    // `the_framework_probe_picks_up_an_existing_amd_smi_link_and_never_writes_one`.
+    // The note also shows while a leftover stub or `libnuma` link keeps the
+    // directory off the probe's loader path, since a launch clears those too. That
+    // clearing is `a_stale_numa_link_is_cleared_by_a_launch_and_held_back_by_a_diagnostic`
+    // (rocm-core's shared helper, which the ComfyUI launch and the install probe
+    // reach through `ensure_amd_smi_compat`) and, for the vLLM launch's own call,
+    // `apply_therock_env_actually_runs_the_compat_shim_step`.
     if crate::managed_runtime::amd_smi_link_missing(&interpreter.python, &interpreter.library_paths)
     {
         e.framework_notes.push(
             "The runtime ships libamd_smi.so.<n> without the bare libamd_smi.so name and has no usable \
-             amd-smi link yet: a launch or install writes it. Until then torch can report 0 devices \
-             (seen beside a host ROCm install)."
+             amd-smi link yet: a launch or install writes it, and clears any leftover shim beside it \
+             that would hide a host library. Until then torch can report 0 devices (seen beside a \
+             host ROCm install)."
                 .to_owned(),
         );
     }
@@ -467,6 +475,14 @@ mod tests {
         .unwrap();
         let mut with = Examination::default();
         probe_framework(&mut with, FrameworkProbe::PyTorch, Some(&interpreter));
+
+        // A leftover `libnuma.so.1` link beside the right link holds the directory
+        // back (the probe runs without it on its loader path, so the torch import
+        // still fails), and the note says a launch or install clears it.
+        std::os::unix::fs::symlink("/does/not/exist", compat.join("libnuma.so.1")).unwrap();
+        let mut held = Examination::default();
+        probe_framework(&mut held, FrameworkProbe::PyTorch, Some(&interpreter));
+        let numa_still_there = compat.join("libnuma.so.1").symlink_metadata().is_ok();
         std::fs::remove_dir_all(&root).ok();
 
         assert!(!written, "the probe wrote the shim directory");
@@ -490,6 +506,15 @@ mod tests {
         };
         assert!(link_note(&without), "{:?}", without.framework_notes);
         assert!(!link_note(&with), "{:?}", with.framework_notes);
+        assert!(numa_still_there, "the probe removed the leftover link");
+        assert_eq!(held.framework_version, "", "{:?}", held.framework_notes);
+        assert!(
+            held.framework_notes
+                .iter()
+                .any(|note| note.contains("clears any leftover shim beside it")),
+            "{:?}",
+            held.framework_notes
+        );
         assert_eq!(with.framework_version, "2.11.0+rocm7.14.1");
     }
 
