@@ -100,6 +100,9 @@ pub(crate) enum Command {
         /// A shell reads this text before `rocm` does, so quotes, `$(...)`
         /// and a leading `-` in a pasted error can be changed, run, or taken
         /// as a flag. Use `--symptom-file` to hand over a paste untouched.
+        ///
+        /// Each match then says whether this text contributed to it
+        /// (`symptom_matched` in --json).
         #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
         /// Read the error text from a file instead, or from standard input
