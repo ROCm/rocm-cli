@@ -1481,7 +1481,38 @@ On some GPU families `rocm install sdk` installs vLLM itself
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
 
-## 7. ComfyUI Verification
+## 7. vLLM Endpoint Key Coverage
+
+Needs a Linux or WSL host where the vLLM engine can start. Check that an
+endpoint key covers every route the vLLM server answers, not only `/v1`:
+
+```bash
+export ROCM_SERVE_API_KEY=manual-test-key
+rocm serve Qwen/Qwen3.5-0.8B --engine vllm --require-api-key --managed
+PORT=<the port the deployment summary's endpoint shows>
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/invocations" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"hi"}]}'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/tokenize" \
+  -H 'Content-Type: application/json' -d '{"model":"Qwen/Qwen3.5-0.8B","prompt":"hi"}'
+curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$PORT/health"
+```
+
+Expected result:
+
+- The `/invocations` and `/tokenize` calls print `401`.
+- Repeating them with `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"` prints
+  `200`.
+- The `/health` call prints `200` without the key. `GET`/`HEAD /health` and
+  CORS preflights are the only requests the server answers without it.
+
+Stop the service afterwards (`rocm services stop <service-id> --yes`). The
+automated scenario is the `@nightly` `serve-vllm-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
+which runs after merge in the nightly runs on Instinct GPUs (MI300X, and MI350P
+on the shared GPU queue).
+
+## 8. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -1560,7 +1591,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 8. Optional Cloud Provider Key
+## 9. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -1585,7 +1616,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 9. Optional Provider-Assisted Planning
+## 10. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:
@@ -1613,7 +1644,7 @@ To turn provider-assisted planning back off:
 rocm config clear-planner-provider
 ```
 
-## 10. Uninstall
+## 11. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
 `cargo` build, whose binaries uninstall leaves alone):
@@ -1689,7 +1720,7 @@ Expected result:
   either case. The same prompt is shared by `rocm fix` and the SDK-overwrite
   prompt, so the same answers behave the same way there.
 
-## 11. AIM (Docker) Engine Verification
+## 12. AIM (Docker) Engine Verification
 
 Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
 succeed). The catalog entry used below has profiles for Radeon PRO W7900 and
@@ -1754,7 +1785,7 @@ Expected result:
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
 
-## 11. Background Automation Helper
+## 12. Background Automation Helper
 
 The helper (`rocm daemon`) runs only while an automation watcher is enabled.
 Start from a fresh config (all watchers off) and use a scratch
@@ -1785,7 +1816,7 @@ Expected result:
   seconds before the helper exits) still ends with a helper running: enable
   waits for an exiting helper to finish, then starts a new one.
 
-## 12. Context-Size Estimate for a GGUF Model
+## 13. Context-Size Estimate for a GGUF Model
 
 Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
 by design) and network access to Hugging Face. The point is to check the
@@ -1848,7 +1879,7 @@ Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
 8192` prints the report with no model section, and stderr says that `--model,
 --context-size were ignored` and nothing about the model was fetched.
 
-## 13. Pasting An Error Into `rocm diagnose`
+## 14. Pasting An Error Into `rocm diagnose`
 
 `rocm diagnose --symptom-file` takes a pasted error without shell quoting.
 Copy a line that would break an argument, for example:
@@ -1886,7 +1917,7 @@ Expected result:
   paste with a non-ASCII character in it (`é`, `→`, a typographic quote)
   reports the same causes as in PowerShell 7.
 
-## 14. Which Causes a Pasted Error Contributed To
+## 15. Which Causes a Pasted Error Contributed To
 
 `rocm diagnose --symptom` scores the catalog from the examined host's state and
 the pasted text together, so a finding about the host can outrank the entry the
@@ -1914,7 +1945,7 @@ HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --json
 The e2e scenarios `diagnose-62`, `diagnose-63` and `diagnose-64` run these three
 checks on every lane.
 
-## 15. Dashboard Chat With A Small-Context Local Model
+## 16. Dashboard Chat With A Small-Context Local Model
 
 Needs a local OpenAI-compatible endpoint serving a model with a small context
 — llama.cpp's default `n_ctx` is 32768, which is the case this checks. The
@@ -1956,7 +1987,7 @@ Expected result:
   context.` — and `rocm-cli.log` should still carry the provider's own body
   with `exceed_context_size_error` in it.
 
-## 16. Serve Smoke Test Failure
+## 17. Serve Smoke Test Failure
 
 Needs any engine `rocm serve` can start (the behaviour is not vLLM-specific) and
 an interactive terminal: the smoke test and its summary run only there. The

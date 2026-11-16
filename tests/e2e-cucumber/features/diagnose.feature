@@ -909,7 +909,8 @@ Feature: Diagnosing failures and listing fixes
   # paste is diagnosed (not investigated further; the console is started with
   # cursor inheritance, which waits on a reply the screen emulator does not
   # send). That leaves the Windows half of the hint (Ctrl-Z then Enter) without
-  # an e2e check; docs/manual-testing.md section 13 covers it by hand.
+  # an e2e check; docs/manual-testing.md's "Pasting An Error Into `rocm diagnose`"
+  # section covers it by hand.
   @id:diagnose-a-paste-at-the-terminal-is-explained-and-diagnosed @requires-os:linux
   Scenario: diagnose-60 - Pasting the error at the terminal is explained, and the paste is diagnosed when the user ends it
     Given a pasted error containing quotes, a command substitution and a leading minus sign
