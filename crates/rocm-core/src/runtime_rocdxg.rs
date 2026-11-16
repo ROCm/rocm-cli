@@ -48,7 +48,8 @@
 //! replacement of a dangling link re-checks the name immediately before the
 //! rename, but a name that becomes a working link between that re-check and the
 //! rename is still replaced: `rename` has no "only if still dangling" form. The
-//! window is a few microseconds in a single-process, one-shot install.
+//! window is short in a single-process, one-shot install (not measured). A name
+//! that vanishes between the first check and the re-check is simply linked.
 //!
 //! Only wheel runtime installs and updates (`install_wheel_runtime`) link.
 //! Tarballs ship both names, and an adopted or imported runtime is never linked
@@ -278,10 +279,12 @@ pub fn link_runtime_copy(copy: &Path) -> io::Result<Linked> {
 /// Replace the dangling `link` with a link to [`SHIPPED_NAME`] without a window in
 /// which the name is absent: make a temporary link beside it, then rename over it.
 ///
-/// The name is re-checked just before the rename and left alone (an
-/// [`io::ErrorKind::AlreadyExists`] error) if it no longer dangles. That narrows
-/// the check-then-act window but cannot close it: a name that becomes a working
-/// link between the re-check and the rename is replaced. If the rename fails the
+/// The name is re-checked just before the rename. Still dangling, or gone since
+/// the first check: the temporary is renamed into place (nothing is clobbered).
+/// Resolving by now (a file or working link appeared): left alone, with an
+/// [`io::ErrorKind::AlreadyExists`] error. That narrows the check-then-act window
+/// but cannot close it: a name that becomes a working link between the re-check
+/// and the rename is replaced. If the rename fails, or the name is refused, the
 /// temporary is removed, and a failure to remove it is part of the returned error.
 ///
 /// The temporary's name carries the process id and a process-wide counter, so two
@@ -315,13 +318,12 @@ fn replace_with_link_using(
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::os::unix::fs::symlink(SHIPPED_NAME, &temporary)?;
-    let outcome = if state(link) == NameState::Dangling {
-        rename(&temporary, link)
-    } else {
-        Err(io::Error::new(
+    let outcome = match state(link) {
+        NameState::Dangling | NameState::Absent => rename(&temporary, link),
+        NameState::Resolves => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "File exists (it no longer dangles)",
-        ))
+            "File exists (it resolves now)",
+        )),
     };
     if let Err(error) = outcome {
         return Err(match remove(&temporary) {
@@ -728,19 +730,54 @@ mod tests {
         }
 
         #[test]
-        fn a_failed_replacement_removes_its_temporary_link() {
+        fn a_failed_rename_removes_the_temporary_link_from_disk() {
             let dir = runtime_dir_with_a_dangling_link();
-            // The rename fails (its destination's directory does not exist), after
-            // the temporary link was made.
-            let outcome = replace_with_link(dir.path(), &dir.path().join("no/such/librocdxg.so"));
+            let link = dir.path().join("librocdxg.so");
+            // The rename is injected to fail (the name still dangles at the
+            // re-check, so the rename is reached); removal is the real one, so the
+            // temporary link that was made on disk must be gone afterwards.
+            let outcome = replace_with_link_using(
+                dir.path(),
+                &link,
+                name_state,
+                |_, _| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "rename denied",
+                    ))
+                },
+                |path| std::fs::remove_file(path),
+            );
 
             assert!(outcome.is_err());
-            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-                .expect("read_dir")
-                .flatten()
-                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-                .collect();
-            assert!(leftovers.is_empty(), "{leftovers:?}");
+            assert_eq!(
+                temporaries_in(dir.path()),
+                0,
+                "the temporary link is removed"
+            );
+            assert_eq!(
+                name_state(&link),
+                NameState::Dangling,
+                "the dangling name is as it was"
+            );
+        }
+
+        #[test]
+        fn a_name_that_vanished_before_the_recheck_is_linked() {
+            let dir = runtime_dir_shipping_only_the_versioned_copy();
+            let link = dir.path().join("librocdxg.so");
+            // The caller saw a dangling name; by the re-check nothing is there.
+            let outcome = replace_with_link_using(
+                dir.path(),
+                &link,
+                |_| NameState::Absent,
+                |from, to| std::fs::rename(from, to),
+                |path| std::fs::remove_file(path),
+            );
+
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert_eq!(std::fs::read(&link).expect("resolves"), b"own");
+            assert_eq!(temporaries_in(dir.path()), 0);
         }
 
         /// Two threads replacing dangling links in one directory at once (two
