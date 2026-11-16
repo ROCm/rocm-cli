@@ -1332,6 +1332,28 @@ pub(crate) mod tests {
         let rendered = render_runtimes_text(&paths, &RocmCliConfig::default())?;
         let _ = fs::remove_dir_all(root);
 
+        // `cargo xtask e2e` prewarm (`assess` in xtask/src/e2e_prewarm.rs)
+        // reads the line directly after a runtime's row as its
+        // `install_root:`, so the order row, `install_root:`, `provenance:` is
+        // pinned here by index; `provenance_line` searches ahead and would not
+        // notice a reorder.
+        let lines: Vec<&str> = rendered.lines().collect();
+        let row = format!(" {} runtime_id=", nightly.runtime_key);
+        let row_index = lines
+            .iter()
+            .position(|line| line.contains(&row))
+            .unwrap_or_else(|| panic!("no row for {}:\n{rendered}", nightly.runtime_key));
+        assert_eq!(
+            lines.get(row_index + 1).copied(),
+            Some(format!("      install_root: {}", nightly.install_root.display()).as_str()),
+            "the line after the row must be its install_root:\n{rendered}"
+        );
+        assert_eq!(
+            lines.get(row_index + 2).copied(),
+            Some(provenance_line(&rendered, &nightly.runtime_key)),
+            "the line after install_root: must be its provenance:\n{rendered}"
+        );
+
         assert_eq!(
             provenance_line(&rendered, &nightly.runtime_key),
             "      provenance: channel=nightly source=https://example.invalid/whl-multi-arch \

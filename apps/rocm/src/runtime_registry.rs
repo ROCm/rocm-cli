@@ -227,10 +227,11 @@ impl InstalledRuntimeManifest {
 /// Printed in place of a provenance fact the runtime's manifest does not record.
 ///
 /// Older manifests predate some of these fields, and a tarball install never
-/// had an exact GPU target. [`InstalledRuntimeManifest::provenance`] prints this
-/// when a fact's chain of recorded fields finds nothing, or finds a blank
-/// value. It never guesses one fact from another — a target from the family,
-/// or a layout from the channel, would read as something the install recorded.
+/// had an exact GPU target. [`RuntimeProvenance::fields`] shows this for a fact
+/// [`InstalledRuntimeManifest::provenance`] left `None`: its chain of recorded
+/// fields found nothing, or found a blank value. Neither ever guesses one fact
+/// from another — a target from the family, or a layout from the channel,
+/// would read as something the install recorded.
 pub(crate) const UNRECORDED_PROVENANCE: &str = "unrecorded";
 
 /// Where an installed runtime came from: the channel, the package source it was
