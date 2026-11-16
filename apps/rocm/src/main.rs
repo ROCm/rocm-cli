@@ -66,6 +66,7 @@ mod serve_summary;
 mod service_control;
 mod service_hints;
 mod service_launch;
+mod service_log_follow;
 mod service_records;
 mod services_cmd;
 mod services_text;
@@ -169,13 +170,14 @@ use crate::model_fit::{
 use crate::runtimes_cmd::{current_runtime_manifest, runtimes};
 use crate::serve_cmd::{ServeArgs, serve};
 use crate::service_control::run_internal_sandbox_tool;
+use crate::service_log_follow::follow_service_logs;
 // Reached only as `super::run_approved_service_action` from
 // `advised_commands.rs`'s test, so a non-test build does not carry it.
 #[cfg(test)]
 use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
-    follow_service_logs, render_internal_status_text, render_logs_browser_text, render_logs_text,
+    render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
