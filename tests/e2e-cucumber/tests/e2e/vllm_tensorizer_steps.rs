@@ -10,7 +10,9 @@
 //! rather than trusting the CLI's account of it:
 //!
 //! - `tensorizer-version`: written by the stand-in `uv` when it installs
-//!   tensorizer (and reset to vLLM's pin when it installs vLLM);
+//!   tensorizer (and reset to vLLM's pin when it installs vLLM), and seeded by
+//!   the scenario itself, as the already upgraded release, for the two scenarios
+//!   that plant a violation beside the upgraded tensorizer;
 //! - `uv.log`: every `uv` invocation;
 //! - `probe-ran`: written by the stand-in Python whenever the tensorizer import
 //!   probe runs;
@@ -20,8 +22,8 @@
 //!   the stand-ins behave: `library-failure`, `library-failure-in-tensorizer`,
 //!   `key-error-in-torch`, `needs-pythonpath`, `needs-repair` and
 //!   `repair-needs-reinstall-flag`;
-//! - `bin/vllm`, which the stand-in `uv` creates when it installs vLLM into a
-//!   runtime that did not have it.
+//! - `bin/vllm`, which the stand-in `uv` writes on every vLLM install (creating
+//!   it in a runtime that did not have it).
 //!
 //! The stand-ins use only shell builtins, because the scenario runs the CLI with
 //! a PATH that holds nothing but its own shims.
