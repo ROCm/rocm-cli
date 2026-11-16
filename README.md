@@ -407,14 +407,15 @@ position.
   reads that text first: quotes, `$(...)` and a leading `-` in a pasted error
   can be changed, run, or taken as a flag.
 - `--symptom-file PATH` reads the same text from a file instead, or from
-  standard input when PATH is `-`, so no quoting is needed. It cannot be
-  combined with `--symptom`. The text that arrives is matched as `--symptom`
-  would match it, minus one trailing line break. A UTF-8 byte-order mark is
-  dropped and a UTF-16 file with a byte-order mark (what Windows PowerShell's
-  `>` writes) is decoded; anything else must be UTF-8. A file that cannot be
-  read, input that is not text, or input larger than 16 MiB is a usage error
-  (exit code 2). With nothing piped in, paste the error at the terminal and
-  end it with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+  standard input when PATH is `-`, so no quoting is needed (a file named `-`
+  is passed as `./-`). It cannot be combined with `--symptom`. The text that
+  arrives is matched as `--symptom` would match it, minus one trailing line
+  break. A UTF-8 byte-order mark is dropped and a UTF-16 file with a
+  byte-order mark (what Windows PowerShell's `>` writes) is decoded; anything
+  else must be UTF-8. A file that cannot be read, input that is not text, or
+  input larger than 16 MiB is a usage error (exit code 2). With nothing piped
+  in, paste the error at the terminal and end it with Ctrl-D at the start of
+  a line (Ctrl-Z then Enter on Windows).
 
   ```bash
   # bash (Linux, WSL): the quoted 'EOF' keeps the shell out of the paste
