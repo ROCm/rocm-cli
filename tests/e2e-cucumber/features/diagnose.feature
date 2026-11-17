@@ -1132,3 +1132,50 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI whether that model would run, in machine-readable form
     Then the CLI reports that it could not determine the answer
     And neither card's aperture is offered as the pool the model would use
+
+  # Who the shared-pool softening is allowed to speak about. It is the last
+  # thing the assessment does, and it used to fire on the host alone: every
+  # `Ready` verdict on an APU was downgraded, told "this host's integrated GPU
+  # has no dedicated VRAM" and handed a plan about closing programs and
+  # serving. For a `cpu_only` recipe that is advice about a device the model
+  # never touches -- the engine allocates from system memory, so what the
+  # accelerator's pool is shared with cannot make it worse, and the report
+  # volunteers GPU evidence no earlier branch put there.
+  #
+  # No shipped recipe is `cpu_only` today (all 49 are `gpu_required` or
+  # `gpu_preferred`), so the catalog is planted: a signed recipe index -- the
+  # only way the CLI loads one, as `model-catalog-03` does -- carrying the
+  # smallest curated recipe twice, once as shipped and once with its device
+  # policy and GPU minimum removed. Both halves are asked on the SAME host in
+  # the same scenario, because the first assertion alone would pass just as
+  # happily against a shared-pool check someone had deleted outright; the
+  # second is the premise that makes the first mean something.
+  @id:diagnose-model-a-cpu-only-recipe-is-not-softened-by-a-pool-it-never-uses @requires-os:linux
+  Scenario: diagnose-75 - A CPU-only recipe is not softened by a shared pool it never allocates from
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a recipe catalog offering the smallest curated model CPU-only beside a copy that needs the GPU
+    When the user asks the CLI whether the CPU-only recipe would run, in machine-readable form
+    Then the model is reported ready, with no GPU evidence and nothing to remediate
+    When the user asks the CLI whether the copy that needs the GPU would run, in machine-readable form
+    Then the model is reported as degraded, because the pool is shared rather than set aside
+
+  # The same distinction one layer down, for a model the catalog has no recipe
+  # for. A GGUF outside the catalog is answered with an estimate (diagnose-49),
+  # and that estimate prints the host's memory beside the model's parts with
+  # nothing to tell the two kinds of number apart. On an APU the figure is the
+  # ceiling on a pool the operating system draws on too, so a bare "fits"
+  # against it means "this machine would allow it at best", not "this much is
+  # waiting for it" -- and nothing in the estimate measured how much of the
+  # pool is free. The note is the only place a reader is told which kind of
+  # number they are looking at, and it reaches `--json` on the estimate itself.
+  #
+  # Same planted APU as diagnose-71, same tiny GGUF as diagnose-49. The
+  # aperture is asserted as the figure compared against, not merely that some
+  # note exists: a host that fell back to `cannot_estimate` would carry no
+  # figure at all and this scenario would be describing nothing.
+  @id:diagnose-model-a-gguf-estimate-says-its-pool-is-shared @requires-os:linux
+  Scenario: diagnose-76 - A GGUF estimate on an integrated GPU is told the figure is a shared ceiling, not free memory
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
+    Then the estimate is compared against the shared pool's ceiling, and says the pool is shared

@@ -2565,64 +2565,28 @@ pub(crate) fn xtask_command() -> std::process::Command {
     }
 }
 
-/// A ref that exists only in the synthetic catalog [`user_asks_about_a_ram_degraded_model`]
-/// signs and points the CLI at.
-const DEGRADED_MODEL_REF: &str = "e2e-fixtures/ram-degraded";
-
-/// A recipe that needs almost no GPU memory -- so it clears the fit check on
-/// any lane that measured a GPU at all -- but recommends more system RAM than
-/// any real test host has, so the RAM softening is the only thing left that
-/// can fire. Built fresh per scenario (mirrors the signed-catalog pattern in
-/// `artifact_steps.rs`) because no built-in recipe can produce this
-/// combination: every built-in recipe's RAM recommendation scales with its
-/// GPU requirement, and `detect_system_ram_gib` has no env-var override to
-/// fake the other side of the comparison.
-#[given("a user asking about a model that recommends far more system RAM than this host has")]
-async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
+/// Write `document` as a signed recipe index under the scenario's own root and
+/// point the CLI's three index environment variables at it.
+///
+/// Signing is not optional: a configured index that fails verification is read
+/// as an unreachable catalog, and every scenario below would then be asserting
+/// about that instead of about its recipes. `stem` names the files so two
+/// fixtures in one scenario cannot overwrite each other.
+fn sign_recipe_index_and_point_cli(world: &mut E2eWorld, stem: &str, document: &serde_json::Value) {
     let root = world
         .isolated_root
         .as_ref()
         .expect("no isolated root")
         .path()
         .to_path_buf();
-    let index = root.join("degraded-recipes.json");
-    let signature = root.join("degraded-recipes.json.sig");
-    let public_key = root.join("degraded-recipe-public.pem");
-    let private_key = root.join("degraded-recipe-private.pem");
+    let index = root.join(format!("{stem}-recipes.json"));
+    let signature = root.join(format!("{stem}-recipes.json.sig"));
+    let public_key = root.join(format!("{stem}-recipe-public.pem"));
+    let private_key = root.join(format!("{stem}-recipe-private.pem"));
 
-    let document = serde_json::json!({
-        "schema_version": 1,
-        "source": "e2e-ram-degraded",
-        "recipes": [{
-            "canonical_model_id": DEGRADED_MODEL_REF,
-            "aliases": [],
-            "task": "chat",
-            "source": "signed_recipe_index",
-            "revision": "main",
-            "loader": "transformers",
-            "trust_remote_code": false,
-            "dtype": "float16",
-            "device_policy": "gpu_required",
-            "min_gpu_mem_gb": 1,
-            "recommended_system_ram_gb": 999_999,
-            "artifacts": [],
-            "engine_recipes": [],
-            "manual_alternatives": [],
-            "featured": false,
-            "chat_template_mode": "auto",
-            // `lemonade`, not `vllm`: this scenario carries no platform tag and
-            // runs on every lane, including native Windows, where vLLM has no
-            // adapter and would be ruled out before the RAM softening this
-            // scenario exists to exercise ever runs -- turning the expected
-            // `degraded` into `blocked` on exactly the lane that also measures
-            // a GPU. `lemonade` is not ruled out on any lane this suite runs.
-            "preferred_engines": ["lemonade"],
-            "warnings": []
-        }]
-    });
     std::fs::write(
         &index,
-        serde_json::to_vec_pretty(&document).expect("failed to serialize recipe fixture"),
+        serde_json::to_vec_pretty(document).expect("failed to serialize recipe fixture"),
     )
     .expect("failed to write recipe fixture");
 
@@ -2658,6 +2622,53 @@ async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
         "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
         public_key.into_os_string(),
     ));
+}
+
+/// A ref that exists only in the synthetic catalog [`user_asks_about_a_ram_degraded_model`]
+/// signs and points the CLI at.
+const DEGRADED_MODEL_REF: &str = "e2e-fixtures/ram-degraded";
+
+/// A recipe that needs almost no GPU memory -- so it clears the fit check on
+/// any lane that measured a GPU at all -- but recommends more system RAM than
+/// any real test host has, so the RAM softening is the only thing left that
+/// can fire. Built fresh per scenario (mirrors the signed-catalog pattern in
+/// `artifact_steps.rs`) because no built-in recipe can produce this
+/// combination: every built-in recipe's RAM recommendation scales with its
+/// GPU requirement, and `detect_system_ram_gib` has no env-var override to
+/// fake the other side of the comparison.
+#[given("a user asking about a model that recommends far more system RAM than this host has")]
+async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-ram-degraded",
+        "recipes": [{
+            "canonical_model_id": DEGRADED_MODEL_REF,
+            "aliases": [],
+            "task": "chat",
+            "source": "signed_recipe_index",
+            "revision": "main",
+            "loader": "transformers",
+            "trust_remote_code": false,
+            "dtype": "float16",
+            "device_policy": "gpu_required",
+            "min_gpu_mem_gb": 1,
+            "recommended_system_ram_gb": 999_999,
+            "artifacts": [],
+            "engine_recipes": [],
+            "manual_alternatives": [],
+            "featured": false,
+            "chat_template_mode": "auto",
+            // `lemonade`, not `vllm`: this scenario carries no platform tag and
+            // runs on every lane, including native Windows, where vLLM has no
+            // adapter and would be ruled out before the RAM softening this
+            // scenario exists to exercise ever runs -- turning the expected
+            // `degraded` into `blocked` on exactly the lane that also measures
+            // a GPU. `lemonade` is not ruled out on any lane this suite runs.
+            "preferred_engines": ["lemonade"],
+            "warnings": []
+        }]
+    });
+    sign_recipe_index_and_point_cli(world, "degraded", &document);
     world.model_name = Some(DEGRADED_MODEL_REF.to_string());
 }
 
@@ -5209,5 +5220,204 @@ async fn assert_a_discrete_card_is_judged_on_its_vram(world: &mut E2eWorld) {
         "ready",
         "8 GiB of dedicated VRAM clears this recipe, and a dedicated card is not a shared \
          pool, so it stays READY: {model:#}"
+    );
+}
+
+/// A ref that exists only in the catalog [`catalog_with_a_cpu_only_copy`] signs:
+/// the smallest curated recipe with its device policy changed to `cpu_only` and
+/// its GPU minimum removed.
+const CPU_ONLY_MODEL_REF: &str = "e2e-fixtures/cpu-only-probe";
+
+#[given(
+    "a recipe catalog offering the smallest curated model CPU-only beside a copy that needs the GPU"
+)]
+async fn catalog_with_a_cpu_only_copy(world: &mut E2eWorld) {
+    // Planted rather than looked up: every one of the 49 shipped recipes is
+    // `gpu_required` or `gpu_preferred`, so `cpu_only` -- a device policy the
+    // index schema validates and accepts (`validate_model_device_policy`) --
+    // cannot be reached through the built-in catalog at all. A signed index is
+    // the only way the CLI loads any other one.
+    let gpu_required = rocm_core::resolve_builtin_model_recipe(SMALLEST_MODEL_REF)
+        .expect("the smallest curated recipe");
+    // The premise the GPU half of this scenario rests on, pinned where it is
+    // read rather than assumed: this copy has to be a recipe the shared-pool
+    // softening is allowed to speak about, which means needing the GPU *and*
+    // declaring a minimum the pool was actually weighed against.
+    assert!(
+        gpu_required.device_policy != "cpu_only" && gpu_required.min_gpu_mem_gb.is_some(),
+        "the curated recipe this scenario copies must need the GPU and declare a minimum, or \
+         the second half asserts a softening that was never licensed: {gpu_required:?}"
+    );
+    let mut cpu_only = gpu_required.clone();
+    cpu_only.canonical_model_id = CPU_ONLY_MODEL_REF.to_owned();
+    // Cleared so the two copies do not collide on a shared alias, which the
+    // index's own uniqueness check would reject outright.
+    cpu_only.aliases.clear();
+    cpu_only.device_policy = "cpu_only".to_owned();
+    cpu_only.min_gpu_mem_gb = None;
+    // Cleared so the system-RAM softening -- a different rule, with a different
+    // remediation -- cannot be what moves this verdict off `ready`.
+    cpu_only.recommended_system_ram_gb = None;
+    // Cleared because they name curated refs this trimmed index does not carry,
+    // so leaving them would only put unresolvable suggestions in the report.
+    cpu_only.manual_alternatives.clear();
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-cpu-only-on-a-shared-pool",
+        "recipes": [gpu_required, cpu_only],
+    });
+    sign_recipe_index_and_point_cli(world, "cpu-only", &document);
+}
+
+/// Ask `rocm` a question on the scenario's planted machine, and leave that
+/// machine planted for the next question.
+///
+/// Not a convenience. `scenario_command` **takes** `command_env` rather than
+/// borrowing it, so everything a `Given` planted reaches exactly one child
+/// process: a scenario that asks two questions of the *same* host gets the
+/// planted machine for the first and the runner's own for the second. That is
+/// not a failure a reader would recognise as one, it is a silent change of
+/// subject. Before this helper existed, the second half of diagnose-75
+/// answered about the dev box's real 191.9 GiB MI300X out of the built-in
+/// catalog, while reading as though it answered about the planted APU and the
+/// planted recipe. Restoring the environment is what keeps both halves of the
+/// scenario about one machine.
+fn ask_again_on_the_same_planted_machine(
+    world: &mut E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let planted = world.command_env.clone();
+    let result = crate::run_rocm_with_scenario_env(world, args);
+    world.command_env = planted;
+    result
+}
+
+#[when("the user asks the CLI whether the CPU-only recipe would run, in machine-readable form")]
+async fn user_asks_whether_the_cpu_only_recipe_would_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = ask_again_on_the_same_planted_machine(
+        world,
+        &["diagnose", "--model", CPU_ONLY_MODEL_REF, "--json"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when(
+    "the user asks the CLI whether the copy that needs the GPU would run, in machine-readable form"
+)]
+async fn user_asks_whether_the_gpu_copy_would_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = ask_again_on_the_same_planted_machine(
+        world,
+        &["diagnose", "--model", SMALLEST_MODEL_REF, "--json"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the model is reported ready, with no GPU evidence and nothing to remediate")]
+async fn assert_cpu_only_recipe_is_untouched_by_the_pool(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "ready",
+        "a recipe that never allocates from the accelerator cannot be made worse by what that \
+         accelerator's pool is shared with: {model:#}"
+    );
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // Anchor. The guard below says a sentence is absent, which a report whose
+    // shape changed -- or whose model section stopped being this recipe at all
+    // -- would satisfy just as well.
+    assert!(
+        evidence.iter().any(
+            |line| line.contains("declares no GPU memory minimum") && line.contains("cpu_only")
+        ),
+        "this has to be the CPU-only recipe's own report, or everything below is asserted \
+         against some other model's: {model:#}"
+    );
+    // And against the planted machine, not the runner's. The host's memory is
+    // reported whatever the device policy, so the aperture appearing here is
+    // what says the shared-pool branch had something to fire on and declined
+    // -- without it, a lane (or a leaked fixture) with no shared pool at all
+    // would satisfy every assertion below while exercising nothing.
+    let measured = measured_gpu_gib(&model)
+        .unwrap_or_else(|| panic!("the planted APU's pool is readable: {model:#}"));
+    assert!(
+        (measured - gib(APERTURE_BYTES)).abs() < 0.01,
+        "this answer has to be about the planted {} GiB shared pool; {measured} GiB is some \
+         other machine's memory: {model:#}",
+        gib(APERTURE_BYTES)
+    );
+    assert!(
+        !evidence
+            .iter()
+            .any(|line| line.contains("no dedicated VRAM")),
+        "the report volunteered GPU evidence for a recipe whose engine allocates from system \
+         memory: {model:#}"
+    );
+    assert!(
+        model_field(&model, "fix").is_null(),
+        "nothing here is broken, so there is nothing to remediate -- least of all closing \
+         programs to free memory for a device this model does not use: {model:#}"
+    );
+}
+
+#[then("the estimate is compared against the shared pool's ceiling, and says the pool is shared")]
+async fn assert_gguf_estimate_names_its_pool_as_shared(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    let estimate = estimate_section(&model);
+    // Non-vacuity first, and the reason this is asserted rather than the note
+    // alone: a planted host that reached `cannot_estimate` carries no
+    // `available_gib` at all, and a scenario that only looked for the absence
+    // of a wrong word would pass against that while exercising nothing. The
+    // aperture being the figure compared against is what says the shared-pool
+    // branch is the one that ran.
+    let available = estimate["available_gib"].as_f64().unwrap_or_else(|| {
+        panic!(
+            "this APU's pool is readable, so the estimate has a figure to compare against; \
+             `cannot_estimate` here means the fixture never reached the shared-pool branch: \
+             {estimate:#}"
+        )
+    });
+    assert!(
+        (available - gib(APERTURE_BYTES)).abs() < 0.01,
+        "the estimate must be compared against the {} GiB pool the engine allocates from; {} \
+         GiB is the {} GiB carve-out or something else entirely: {estimate:#}",
+        gib(APERTURE_BYTES),
+        available,
+        gib(CARVE_OUT_BYTES)
+    );
+    assert_eq!(
+        estimate["available_is_shared_pool"],
+        serde_json::Value::Bool(true),
+        "the figure above is a shared ceiling, and the flag is what lets a reader tell it from \
+         dedicated VRAM without re-deriving it: {estimate:#}"
+    );
+    let notes = estimate["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the estimate carries no notes: {estimate:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    // The flag is machine-readable; this is the only place a person reading the
+    // figures is told which kind of number sits beside them. Both are asserted
+    // because a renderer that dropped the note would still set the flag.
+    assert!(
+        notes.iter().any(|note| note
+            .contains("the ceiling on a pool it shares with the operating system")
+            && note.contains("how much is free depends on what else is running")),
+        "a bare \"fits\" against a shared ceiling reads as \"this much memory is waiting for \
+         it\", and nothing here measured how much of the pool is free, so the estimate has to \
+         say so: {notes:#?}"
     );
 }
