@@ -700,6 +700,21 @@ that runtime's own stale composition via repair, but never follows
 side-by-side runtime only when no match is found. See
 [`decide()`](../xtask/src/e2e_prewarm.rs)'s doc comment for the full rationale.
 
+Two failures of the pre-warm's installs are not the lane's failure:
+
+- **A server error from the index.** `rocm install sdk` and `rocm update --apply`
+  are run again, up to four attempts a minute apart, when the CLI reports
+  `HTTP 5xx while fetching <url>`. Anything else, a 404 included, fails on the
+  first attempt.
+- **vLLM refusing an unpinned nightly SDK** (`has no static build pin`). The pre-warm
+  records the reason in `e2e-engine-not-applicable.txt` in the runtimes directory,
+  and the suite reports the scenarios that serve with vLLM (serve, bench and chat scenarios, and any that pin the engine) as not applicable
+  instead of running each into the refusal. A pinned nightly, the release channel
+  and every other engine's failure stay fatal. This is temporary: remove it, the
+  marker and its reader in the harness once vLLM wheels for the 10.3 SDK exist and
+  the discover table in
+  [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) has a 10.3 row.
+
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,

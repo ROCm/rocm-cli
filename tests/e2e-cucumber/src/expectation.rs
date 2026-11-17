@@ -264,6 +264,20 @@ impl ScenarioDecl {
         }
     }
 
+    /// Whether the scenario starts a model server, as opposed to only needing a
+    /// GPU: one that pins an engine does, and an unpinned one does when its id
+    /// says it serves, benchmarks or chats. By id because nothing else on a
+    /// declaration says so; a GPU scenario outside those groups (examine,
+    /// runtime, diagnose, ...) needs no serving engine and still runs.
+    pub fn starts_a_model_server(&self) -> bool {
+        self.requires_engine.is_some()
+            || self.id.as_deref().is_some_and(|id| {
+                ["serve-", "bench-", "chat-"]
+                    .iter()
+                    .any(|prefix| id.starts_with(prefix))
+            })
+    }
+
     /// The engine this scenario effectively serves with: an explicit
     /// `@requires-engine` pin, else the host's default serve engine. Mirrors the
     /// product precedence (explicit `--engine` first).
@@ -532,7 +546,9 @@ pub struct Included {
 ///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
 ///    `@requires-os:<os>` scenario on a different OS, a
 ///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
-///    or a scenario whose effective engine can't start.
+///    a scenario whose effective engine can't start, or a vLLM-serving scenario
+///    on a lane whose pre-warm recorded that vLLM has no build for its SDK
+///    ([`HostCapability::engine_not_applicable`]).
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
@@ -642,6 +658,18 @@ pub fn resolve(
         };
     }
     let engine = decl.effective_engine(cap);
+    // The pre-warm could not put the engine in the shared runtime for a reason
+    // that is no failure of the lane (see `xtask e2e-prewarm`): the scenarios
+    // that need it are not applicable here, not red.
+    if decl.requires_gpu
+        && decl.starts_a_model_server()
+        && engine.eq_ignore_ascii_case("vllm")
+        && let Some(reason) = &cap.engine_not_applicable
+    {
+        return Expectation::Skip {
+            reason: format!("engine '{engine}' is not applicable on this lane: {reason}"),
+        };
+    }
     // A scenario that pins or defaults to a real engine and would actually serve
     // needs that engine to be startable here. We treat any GPU scenario with a
     // resolved engine as engine-gated; non-GPU scenarios never gate on engine.
@@ -753,6 +781,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: String::new(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -768,6 +797,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: String::new(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -783,6 +813,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: String::new(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -807,6 +838,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: "wsl_rocdxg_ready".into(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -825,6 +857,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: String::new(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -842,6 +875,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: String::new(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -857,6 +891,7 @@ mod tests {
                 dir_permissions_bind: true,
                 driver_status: String::new(),
                 probe_error: None,
+                engine_not_applicable: None,
             },
         }
     }
@@ -1844,6 +1879,7 @@ serve_timeout_secs = 90
         let folded = HostCapability {
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            engine_not_applicable: None,
             ..cap("wsl2")
         };
         let both = decl(&[
@@ -1895,6 +1931,7 @@ serve_timeout_secs = 90
         // scenario run and pass without testing anything.
         let as_root = HostCapability {
             dir_permissions_bind: false,
+            engine_not_applicable: None,
             ..cap("wsl2")
         };
         match resolve(&d, &as_root, &m, none) {
@@ -1949,6 +1986,7 @@ serve_timeout_secs = 90
         );
         let host = HostCapability {
             dir_permissions_bind: false,
+            engine_not_applicable: None,
             ..cap("strix-windows")
         };
         assert_ne!(host.os_family, "linux", "fixture must fail the OS premise");
@@ -1985,6 +2023,7 @@ reason = "unrelated open bug"
         let folded = HostCapability {
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            engine_not_applicable: None,
             ..cap("strix-ubuntu")
         };
         assert!(matches!(
@@ -2515,5 +2554,57 @@ flaky = true
         assert!(glob_match("*dcgpu", "gfx94X-dcgpu"));
         assert!(!glob_match("gfx94*", "gfx1151"));
         assert!(glob_match("gfx1151", "gfx1151"));
+    }
+
+    /// The pre-warm recorded that vLLM cannot be installed into the runtime
+    /// (the unpinned nightly SDK has no vLLM wheels yet): the scenarios that
+    /// would serve with vLLM are not applicable, and nothing else changes.
+    #[test]
+    fn an_engine_the_prewarm_could_not_install_makes_its_scenarios_not_applicable() {
+        let m = eai7333_matrix();
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let mut mi300x = cap("mi300x");
+        let vllm_serve = decl(&["id:serve-default-engine-inference", "requires-gpu"]);
+        let not_serving = decl(&["id:runtime-x"]);
+        // A GPU scenario that only needs the GPU is not a vLLM scenario.
+        let gpu_only = decl(&["id:examine-detects-gpu", "requires-gpu"]);
+        assert!(!matches!(
+            resolve(&vllm_serve, &mi300x, &m, included),
+            Expectation::Skip { .. }
+        ));
+
+        mi300x.engine_not_applicable = Some("vllm has no build for this SDK".to_owned());
+
+        let Expectation::Skip { reason } = resolve(&vllm_serve, &mi300x, &m, included) else {
+            panic!("a vLLM scenario must be skipped");
+        };
+        assert!(
+            reason.contains("vllm has no build for this SDK"),
+            "{reason}"
+        );
+        assert_eq!(
+            resolve(&gpu_only, &mi300x, &m, included),
+            Expectation::ExpectPass,
+            "a GPU scenario that starts no server still runs"
+        );
+        // A scenario that does not serve with vLLM is untouched, on the same host.
+        assert_eq!(
+            resolve(&not_serving, &mi300x, &m, included),
+            Expectation::ExpectPass
+        );
+        let lemonade = decl(&[
+            "id:serve-lemonade-x",
+            "requires-gpu",
+            "requires-engine:lemonade",
+        ]);
+        assert_eq!(
+            resolve(&lemonade, &mi300x, &m, included),
+            Expectation::ExpectPass
+        );
     }
 }
