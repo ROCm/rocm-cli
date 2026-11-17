@@ -1681,4 +1681,77 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    /// The other half of the banner, and the half nothing asserted:
+    /// `gpu_execution_line` tells a `VulkanOnly` host which backend it has,
+    /// and tells the other three that the CPU is not an alternative. Neither
+    /// sentence appeared anywhere outside that function, so merging the
+    /// `VulkanOnly` arm into the shared one below it left every test green —
+    /// including the ROCm-parity sweep above, which only reads the word "ROCm
+    /// GPU execution is required" and is satisfied by either sentence.
+    ///
+    /// The discrimination is the finding, not either sentence on its own:
+    /// `VulkanOnly` is the single level where the classifier established a GPU
+    /// backend, and "CPU execution is not supported" there is true but silent
+    /// about the backend this host actually has. So each level asserts its own
+    /// banner present *and* the other's absent, and the three no-usable-backend
+    /// levels are swept rather than sampled, so a future arm cannot quietly
+    /// pick up the Vulkan claim.
+    #[test]
+    fn engines_banner_claims_a_vulkan_backend_only_where_one_was_established() {
+        let (root, paths) = test_paths("engines-banner-vulkan-only");
+        let banner = |level| {
+            render_engine_inventory_text_for_host(Some(&paths), "lemonade", level)
+                .lines()
+                .find(|line| line.contains("GPU execution is required"))
+                .expect("every level prints the GPU-execution banner")
+                .to_owned()
+        };
+
+        let vulkan_only = banner(rocm_core::GpuSupportLevel::VulkanOnly);
+        assert!(
+            vulkan_only.contains("that is the Vulkan backend, not ROCm"),
+            "the one level with an established GPU backend must name it:\n{vulkan_only}"
+        );
+        assert!(
+            !vulkan_only.contains("CPU execution is not supported"),
+            "and must not borrow the sentence of the levels that have none:\n{vulkan_only}"
+        );
+
+        for level in [
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+            rocm_core::GpuSupportLevel::Unknown,
+        ] {
+            let line = banner(level);
+            assert!(
+                !line.contains("that is the Vulkan backend, not ROCm"),
+                "{level:?} established no Vulkan backend and must not claim one:\n{line}"
+            );
+            assert!(
+                line.contains("CPU execution is not supported"),
+                "but the refusal is what is invariant across them, so it is still \
+                 said:\n{line}"
+            );
+            assert_ne!(
+                line, vulkan_only,
+                "{level:?} must not render the `VulkanOnly` banner"
+            );
+        }
+
+        // `RocmHip` is the fourth answer, and the only one that may still
+        // require ROCm. Without it the sweep above would pass on a banner that
+        // had lost that arm too.
+        let rocm_hip = banner(rocm_core::GpuSupportLevel::RocmHip);
+        assert!(
+            rocm_hip.contains("ROCm GPU execution is required"),
+            "a ROCm-capable host keeps the original claim:\n{rocm_hip}"
+        );
+        assert_ne!(
+            rocm_hip, vulkan_only,
+            "and it is not the Vulkan sentence either"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
