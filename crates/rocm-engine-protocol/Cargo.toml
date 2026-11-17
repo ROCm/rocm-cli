@@ -11,8 +11,10 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Compiles `fake_engine`, a stand-in engine child for tests, into the `rocm` and
-# `rocmd` test builds. Never enabled in a release build.
+# Compiles the test-only modules into the test builds that turn it on (`rocm`,
+# `rocmd`, and the `lemonade`, `vllm` and `aim` engines): `fake_engine`, a
+# stand-in engine child (Unix only), and `engine_contract`, the shared engine
+# protocol contract check. Never enabled in a release build.
 test-support = []
 
 [dependencies]

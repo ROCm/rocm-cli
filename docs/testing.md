@@ -335,6 +335,77 @@ stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
 the three cases against the fake, and `engine-ipc-02` below shows the same
 message in a `stop_server` report next to what the stop did.
 
+That error also says what is wrong with what the child printed, because "failed
+to parse" alone sends the reader to the engine's source: it printed nothing on
+stdout, or other output before or after its answer (a log line on the wrong
+stream), or JSON that is not an envelope, or something that is not JSON. The
+first says only that nothing was printed. The second quotes the other output,
+and the last two the start of stdout (one line, bounded, control characters
+escaped); those three also state the rule an engine breaks: only its JSON
+answer goes to stdout, its logs go to stderr.
+Nothing is salvaged from such output. Only a top-level JSON object counts as the
+answer, so a pretty-printed answer over many lines is still one answer, and an
+envelope inside an array or another object is not mistaken for one.
+`an_unreadable_stdout_is_described_by_what_is_wrong_with_it` covers the
+classification on every platform, `an_answer_past_the_search_bound_is_not_looked_for`
+the bound on how much of stdout the search reads, and
+`output_besides_the_answer_on_stdout_is_refused_and_named` runs the same cases
+through the fake.
+
+The engine protocol version (see the contract in
+[engine-plugins.md](engine-plugins.md#the-stdio-protocol-contract)) is tested on
+both sides of the conversation and in the rule itself. The rule is a table in
+[`protocol_version.rs`](../crates/rocm-engine-protocol/src/protocol_version.rs)
+(`the_caret_rule_from_this_builds_version`, every platform), and
+`protocol_properties` adds that the field round-trips in both envelopes, that a
+missing version is judged as `0.1.0`, and that the rule is reflexive and
+symmetric. The client refuses an answer in an incompatible protocol before it
+reads `ok` (`an_answer_in_an_incompatible_protocol_is_refused_whatever_it_says`).
+The check before an `install` or `launch` is a state matrix against the fake, each
+row asserting the error together with which requests the fake recorded:
+`a_compatible_engine_is_checked_and_then_sent_the_request` (same, newer
+additive and unversioned capabilities answers: two requests, the capabilities
+check first), `a_handshaked_request_is_not_sent_when_the_check_fails`
+(incompatible, incompatible refusal, unreadable version, an error answer, a crash
+with no answer, empty stdout, contaminated stdout, not JSON: only the
+capabilities request ever reached the engine), and
+`a_request_without_a_handshake_is_sent_once` (every other method is
+sent once, and its answer's version is what is checked). The check's own child
+is pinned too: `the_check_runs_on_the_requests_environment_without_its_progress`
+reads the environment the fake recorded for each run, and
+`the_check_withholds_an_inherited_key_file_as_the_request_does` the command it
+builds. On the engine side, `answer_engine_request` in `protocol_version.rs`
+judges a request's version before its method
+(`a_request_is_judged_by_its_version_before_its_method`), and one shared check,
+`engine_contract::assert_engine_holds_protocol_contract` (behind the
+`test-support` feature), holds every engine to the same list: an incompatible or
+unreadable version refused with `incompatible_protocol` for every method in
+`EngineMethod::ALL` on the stdio path and the decoded path, and for an unknown
+method on the stdio path, `unknown_method` and `invalid_request` for the other
+unusable requests, and this build's version on every answer. Each first-party engine runs it
+(`stdio_answers_hold_the_engine_protocol_contract` in its `lib.rs`), and
+`every_built_in_engine_holds_the_protocol_contract` in `apps/rocm` runs it over
+every built-in engine through `answer_builtin_engine_stdio`, the function
+`rocm __engine-stdio` answers with; the verb's own stdin reading is covered by
+e2e `engine-ipc-08` to `-12`, which run `rocm __engine-stdio vllm`, for `vllm`
+only; of those, `-09` to `-12` fail when the verb bypasses the shared reader.
+Each engine's `tests/stdio_binary.rs` runs its built `rocm-engine-<engine>
+stdio` binary and checks that a request for another protocol and input that is
+not JSON are each answered with an error envelope and exit status 0.
+The shared check is itself tested in both directions: an engine that holds the
+contract passes it, and one that ignores the version, or reads it only on the
+decoded path, fails it. `the_contract_check_fails_an_engine_that_breaks_any_one_rule`
+adds six engines that each break one rule (named in its doc comment), and the
+check fails each of them; the check's other rules have no such engine. `engine-ipc-03` to `-07` below show the daemon's side and
+`engine-ipc-08` to `-12` the engine's.
+
+```bash
+cargo test -p rocm-engine-protocol
+cargo test -p rocm-engine-lemonade -p rocm-engine-vllm -p rocm-engine-aim --lib protocol_contract
+cargo test -p rocm-engine-lemonade -p rocm-engine-vllm -p rocm-engine-aim --test stdio_binary
+cargo test -p rocm every_built_in_engine_holds_the_protocol_contract
+```
+
 The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
 its default action, which is how `rocm` runs, because the test harness leaves it
 ignored and changing it process-wide would race sibling tests. A write that is
@@ -1933,7 +2004,6 @@ cargo test -p rocm-core model_recipe
 cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
-cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm
 cargo test -p rocm-engine-aim
@@ -2928,23 +2998,50 @@ a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
-`features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
+`features/engine_ipc.feature` (`engine-ipc-01` to `-12`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same
-`stop_server` tool. Each scenario copies the real `rocmd` into a scratch
-directory and puts a stand-in `rocm` shell script beside it, which is the
+`stop_server` tool (`-01` to `-07`), and how an engine reads a request
+(`-08` to `-12`). Each of `-01` to `-07` copies the real `rocmd` into a
+scratch directory and puts a stand-in `rocm` shell script beside it, which is the
 executable the standalone daemon runs for an engine request; the stand-in
 records its argv and the request it was sent, and prints what the scenario
-says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
+says. Each of `-08` to `-12` runs the real `rocm __engine-stdio vllm`, writes
+the scenario's request to its stdin, and reads what it prints and its exit
+status. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
 report carries the engine's answer (not an error built from the exit status).
 `engine-ipc-02` has it print something that is not an answer, write to stderr
 and exit non-zero: the report's engine error is the parse failure, naming the
-exit status the engine ended with, followed by its stderr. Both check the report together with the server's process, record and
-endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
-one `stop` request line. The server is a `vllm` one, for which the engine's
-`Stop` is advisory, so in `-02` the stop still completes; an engine whose stop
+exit status the engine ended with and what was wrong with its stdout, followed
+by its stderr. `engine-ipc-03` has the engine answer that it stopped, in an engine
+protocol this release cannot use (`9.0.0`): the report's engine result is the
+refusal naming both versions, not the answer. `engine-ipc-04` has it write a log
+line on stdout before a valid answer: the report's engine error says it wrote
+other output before its answer, quoting the line. `engine-ipc-05`, `-06`
+and `-07` have it answer in this release's protocol, in a newer one that only
+adds to it (the next patch, computed from `ENGINE_PROTOCOL_VERSION`, with a
+field this release does not know in the envelope and in the stop's data), and with
+no version at all, as an engine from before the
+field does: each is read as answered. (They are three scenarios, not one
+outline, because the suite keys each scenario's result by its `@id`.) Every one checks the report together with the server's
+process, record and endpoint key, and that the stand-in was run once as
+`__engine-stdio vllm` with one `stop` request line, written in this release's
+protocol. The server is a `vllm` one, for which the engine's
+`Stop` is advisory, so in `-02` to `-04` the stop still completes; an engine whose stop
 decides the confirmation (`aim`) is not staged here, because teardown would
-then run the real engine's stop. Run them with a hooks build and `-n
-"engine-ipc"`.
+then run the real engine's stop. `engine-ipc-08` runs the real `rocm
+__engine-stdio vllm` and sends it a `stop` request made for protocol `9.0.0` for a
+server the engine's own state file names (a live `sleep`, with its `/proc` start
+time): the answer is the `incompatible_protocol` refusal naming both versions,
+the process is still running and the engine's record still names it, where a
+`stop` the engine served would have ended it. `-09` sends a method no engine
+has (`frobnicate`) at `9.0.0`, and `-10` a stop whose `protocol_version` is the
+number `9`: each is answered `incompatible_protocol`, which only reading the
+version before the method or the rest of the envelope can produce, and `-10`
+also shows the server still running. `-11` sends `frobnicate` in this release's
+protocol (`unknown_method`) and `-12` text that is not JSON (`invalid_request`).
+Each of `-08` to `-12` pins the whole answer and an exit status of 0. Run them
+with a hooks build and `-n "engine-ipc"`; the steps take this release's version from
+`rocm_engine_protocol::ENGINE_PROTOCOL_VERSION`, a dev-dependency of the suite.
 
 Manual restricted-tool smoke:
 
