@@ -345,7 +345,7 @@ checks, which cannot be made anywhere else:
   - With the driver removed but `vulkaninfo` still installed, expect the
     *could-not-confirm* wording on Linux rather than a confirmed absence, and it
     must **not** still name a driver. This is the known gap recorded on
-    examine-53, measured rather than assumed: a real `vulkaninfo` with no
+    examine-57, measured rather than assumed: a real `vulkaninfo` with no
     reachable driver prints "Found no drivers!" and exits **1**, and the probe
     counts only an exit-0 run as having answered, so the host is classed
     inconclusive. Telling "no drivers" apart from "the tool is broken" needs the
