@@ -151,6 +151,36 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
             );
         }
     } else if latest.status == on_disk {
+        // The refresh learned nothing, so the snapshot in hand says no more
+        // than what is already on disk and must NOT be written back whole:
+        // anything a concurrent writer put there after this read was taken
+        // would go with it. That is what this early return protects, and
+        // `a_wait_death_is_a_crash_unless_a_stop_asked_for_it`'s third arm
+        // pins it by planting a key the record type does not model.
+        //
+        // But "nothing new to write" is not the same as "nothing to correct".
+        // `managed_service_status`'s liveness reconciliation demotes any
+        // record whose recorded PIDs are gone to `stopped`, unconditionally
+        // and with no idea why they went — a `rocm services` or `rocm dash`
+        // listing running alongside this wait is enough. When that lands
+        // before the read above, `on_disk` is already `stopped`, the status
+        // after the refresh matches it, and this return left the manifest
+        // reading `stopped` for a death nothing asked for: the caller
+        // correctly reports a crash while `rocm services list` shows a clean
+        // stop. That is ROCMAI-541's own acceptance criterion failing through
+        // the one interleaving the stamp above cannot reach, because by then
+        // the record no longer reads live.
+        //
+        // Corrected through the same read-modify-write merge
+        // `mark_service_failed` uses, so the fix does not reintroduce the
+        // clobber this branch exists to prevent: only the `status` key is
+        // replaced, under the state-file lock. A record already reading
+        // `failed` is left alone — the engine's own reason is on it, and
+        // rewriting it would be the invisible no-op write the guard above
+        // forbids.
+        if !deliberate && latest.status != "failed" {
+            mark_service_failed(&latest.manifest_path, &latest.engine_state_path);
+        }
         return deliberate;
     }
     let _ = latest.write();
@@ -1531,6 +1561,134 @@ mod tests {
             "the refresh learned nothing, so the stale snapshot must not be written back over \
              whatever else reached disk meanwhile: that is what the `latest.status == on_disk` \
              early return protects, and what the status assertion above cannot see"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// ROCMAI-541 review: a crash must still be recorded as one when a
+    /// concurrent listing has already reconciled the record to `stopped`.
+    ///
+    /// `managed_service_status`'s liveness refresh demotes any record whose
+    /// recorded PIDs are gone to `stopped`, unconditionally and without
+    /// knowing why they went — `rocm services` and `rocm dash` both run it. A
+    /// listing that lands between the death and `settle_exited_service`'s own
+    /// read therefore leaves `on_disk == "stopped"`, and the refresh from the
+    /// engine state file (which a SIGKILL/OOM-kill never got to write) learns
+    /// nothing, so `latest.status == on_disk` and the early return fires with
+    /// `deliberate == false`. Before this fix that returned the right verdict
+    /// to the caller — the `--wait` said the server exited — while leaving
+    /// `rocm services list` showing a clean stop forever, which is the exact
+    /// acceptance criterion this change set exists to meet.
+    ///
+    /// The planted key is the same stand-in the arm above uses, and is the
+    /// other half of the assertion: the correction has to go through
+    /// `mark_service_failed`'s read-modify-write merge, not `latest.write()`,
+    /// or it fixes the status by reintroducing the clobber the early return is
+    /// there to prevent. Both assertions have to hold at once; either one
+    /// alone admits a wrong implementation.
+    #[test]
+    fn a_crash_is_still_recorded_when_a_listing_already_reconciled_it_to_stopped() {
+        let (root, paths) = test_paths("wait-settle-after-reconcile");
+        paths.ensure().expect("paths");
+        // The record exactly as a concurrent listing's liveness refresh leaves
+        // it: demoted to `stopped` because the PIDs are gone, with neither
+        // half of the stop evidence set, because nobody asked for this death.
+        let mut record = record_tracking_pid(&paths, 0, "stopped");
+        record.stop_requested_unix_ms = None;
+        record.settled_stop_unix_ms = None;
+        record.write().expect("write");
+        let planted_manifest = fs::read_to_string(&record.manifest_path).expect("manifest");
+        let mut planted: serde_json::Value =
+            serde_json::from_str(&planted_manifest).expect("manifest json");
+        planted["written_by_someone_else"] = serde_json::json!("concurrent");
+        fs::write(
+            &record.manifest_path,
+            serde_json::to_vec_pretty(&planted).expect("serialize"),
+        )
+        .expect("plant a concurrent writer's field");
+
+        let deliberate = settle_exited_service(&paths, &record.service_id);
+
+        assert!(
+            !deliberate,
+            "a status a liveness refresh wrote is not evidence anyone asked for this death"
+        );
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(
+            after.status, "failed",
+            "the death was reported as a crash, so the manifest must not be left reading \
+             `stopped` by a listing that happened to run first"
+        );
+        let engine_state = fs::read_to_string(&record.engine_state_path).expect("engine state");
+        assert!(
+            engine_state.contains("\"failed\""),
+            "the engine state file is the one ROCMAI-541 names: {engine_state}"
+        );
+        let reread: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record.manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(
+            reread
+                .get("written_by_someone_else")
+                .and_then(serde_json::Value::as_str),
+            Some("concurrent"),
+            "the correction must be a merge of the `status` key, not a write-back of the \
+             stale snapshot: fixing the status by clobbering the concurrent writer trades \
+             one defect for the one the early return exists to prevent"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other side of the correction above: a record that already reads
+    /// `failed` has nothing to correct, so the early return must still write
+    /// nothing at all.
+    ///
+    /// Without the `!= "failed"` term the correction would run here too. The
+    /// manifest status would not visibly change — a `failed` -> `failed` merge
+    /// is invisible, which is why the sibling test's planted key cannot see it
+    /// — but `mark_service_failed` also stamps the engine state file, and
+    /// *that* is observable: a record whose engine never wrote one would come
+    /// back from a no-op settle with a state file this process invented. That
+    /// is what pins the guard.
+    #[test]
+    fn a_record_that_already_failed_is_left_entirely_alone() {
+        let (root, paths) = test_paths("wait-settle-already-failed");
+        paths.ensure().expect("paths");
+        // The engine stamped the manifest itself and got no further: its own
+        // reason is on the record, and no engine state file exists.
+        let mut record = record_tracking_pid(&paths, 0, "failed");
+        record.stop_requested_unix_ms = None;
+        record.settled_stop_unix_ms = None;
+        record.write().expect("write");
+        let _ = fs::remove_file(&record.engine_state_path);
+        let planted_manifest = fs::read_to_string(&record.manifest_path).expect("manifest");
+        let mut planted: serde_json::Value =
+            serde_json::from_str(&planted_manifest).expect("manifest json");
+        planted["written_by_someone_else"] = serde_json::json!("concurrent");
+        fs::write(
+            &record.manifest_path,
+            serde_json::to_vec_pretty(&planted).expect("serialize"),
+        )
+        .expect("plant a concurrent writer's field");
+
+        assert!(!settle_exited_service(&paths, &record.service_id));
+
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "failed");
+        let reread: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record.manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(
+            reread
+                .get("written_by_someone_else")
+                .and_then(serde_json::Value::as_str),
+            Some("concurrent"),
+            "nothing changed, so nothing may be written back"
+        );
+        assert!(
+            !record.engine_state_path.exists(),
+            "a settle with nothing to correct must not invent an engine state file the \
+             engine never wrote"
         );
         let _ = fs::remove_dir_all(root);
     }
