@@ -46,10 +46,22 @@ serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
-`GLIBCXX_3.4.32`: that is what the Lemonade engine is linked against, and every
-published build of it needs those versions, so there is no older release to fall
-back to. Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides
-glibc 2.39 and `GLIBCXX_3.4.33`.
+`GLIBCXX_3.4.32`, and OpenSSL 3.0.0 or newer (`libssl.so.3`): that is what the
+Lemonade engine is linked against. Every stable Lemonade release from 11.5.1
+through 2026.44.1, the one rocm-cli pins, needs those versions; the newest,
+2026.45.3, needs glibc 2.43 and OpenSSL 3.2.0, which is why it is not pinned.
+Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides glibc
+2.39, `GLIBCXX_3.4.33` and OpenSSL 3.0.13. On an older host,
+`rocm engines install lemonade` stops before downloading anything and says what
+falls short: the glibc version Lemonade needs and the newest the host's
+`libc.so.6` provides, or that
+the host has no `libssl.so.3`, the library of OpenSSL 3. That check reads glibc
+and OpenSSL only; `GLIBCXX_3.4.32` (libstdc++) is not checked. Where Lemonade is
+already installed, the same check refuses to reinstall it or start it, and says
+the installed copy was left as it is. The check reads the `ldconfig` cache, so a
+host that provides these libraries some other way (`LD_LIBRARY_PATH`, a Nix or
+Guix profile) can set `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`: the
+shortfall is then printed as a warning and Lemonade goes ahead.
 
 > [!IMPORTANT]
 > **Tech Preview:** This software is provided as-is, without warranty or

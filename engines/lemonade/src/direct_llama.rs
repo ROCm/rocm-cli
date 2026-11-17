@@ -1972,11 +1972,11 @@ mod tests {
     #[test]
     fn direct_serve_binary_finds_build_numbered_nesting() {
         // Some Lemonade llama.cpp releases extract one level deeper than
-        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b9752/llama-server`.
+        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b11580/llama-server`.
         let dir = scratch_dir("find-server-nested");
         let runtime_dir = dir.join("runtime");
         let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let nested = llamacpp.join("rocm-stable").join("llama-b9752");
+        let nested = llamacpp.join("rocm-stable").join("llama-b11580");
         fs::create_dir_all(&nested).unwrap();
         let server = nested.join(platform_binary_name("llama-server"));
         fs::write(&server, b"x").unwrap();
