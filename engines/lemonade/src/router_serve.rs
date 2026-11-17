@@ -9,10 +9,12 @@
 //! the way it fails can be tested without a real `lemond`. Production uses
 //! [`LemondRouterSteps`]. There is deliberately no direct-server step here: any
 //! failure is returned to the caller as an error and the server is stopped. The
-//! engine state is then left at `failed`, except for a model load or
+//! engine state is then marked `failed`, except for a model load or
 //! verification failure: that is tagged [`RouterLoadFailure`] and does not write
 //! `failed`, so the caller can decide, on Linux, whether the selected GPU
-//! backend can serve the model directly instead and own the final state.
+//! backend can serve the model directly instead and own the final state. A
+//! state file that is empty, torn or not a JSON object refuses the `failed`
+//! mark like any other merge and is left as it was.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::json;
@@ -72,8 +74,11 @@ pub(crate) fn serve_router<S: RouterSteps>(
 ) -> Result<()> {
     let server_pid = steps.spawn_server()?;
     // Every step after the spawn is inside this one fallible block, so a failure
-    // anywhere in it (state writes included) stops the server and marks the state
-    // `failed`; the server has no `Drop` and would otherwise keep running.
+    // anywhere in it (state writes included) stops the server, which has no `Drop`
+    // and would otherwise keep running. The state is then marked `failed`, except
+    // after a load failure, which leaves it to the fallback (below). When the
+    // state file is itself unusable (empty, torn or not a JSON object), that mark
+    // is refused like any merge and the file is left as it was.
     let outcome = (|| -> Result<()> {
         crate::state::write_running_state_for_model(
             request,
@@ -303,11 +308,15 @@ mod tests {
         SmokeUnreachable,
         /// The state file cannot be written once the server is spawned.
         StateWrite,
-        /// The state file becomes unwritable between verification and the ready merge.
+        /// The state file is torn ([`TORN_STATE`]) between verification and the
+        /// ready merge, as a writer that rewrites it in place could leave it.
         ReadyMerge,
         WaitServer,
         FailedExit,
     }
+
+    /// A state document cut short mid-write: what [`Fail::ReadyMerge`] leaves.
+    const TORN_STATE: &[u8] = br#"{"status": "running", "server_pid": 4000000, "server_st"#;
 
     struct FakeSteps {
         runtime: LemonadeRuntime,
@@ -394,8 +403,7 @@ mod tests {
             // Asked for while the ready state is assembled, i.e. after every
             // verification step and before the merge is written.
             if self.fail == Fail::ReadyMerge {
-                std::fs::remove_file(&self.state_path).unwrap();
-                std::fs::create_dir(&self.state_path).unwrap();
+                std::fs::write(&self.state_path, TORN_STATE).unwrap();
             }
             None
         }
@@ -580,10 +588,8 @@ mod tests {
             std::fs::create_dir(&request.state_path).unwrap();
         }
         let mut steps = FakeSteps::new(temporary.path(), fail);
-        let error = format!(
-            "{:#}",
-            serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected)
-        );
+        let failure = serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected);
+        let error = format!("{failure:#}");
         assert!(error.contains(expected), "{error}");
         // The spawned server is stopped exactly once, and nothing runs after it.
         assert_eq!(
@@ -598,6 +604,24 @@ mod tests {
             "{:?}",
             steps.calls
         );
+        if fail == Fail::ReadyMerge {
+            // Refused as torn, not failed for some other reason, and true to its
+            // word: neither the ready merge nor the `failed` mark that follows
+            // replaced the file, so the torn bytes the merge found are still there.
+            let refused = failure
+                .downcast_ref::<rocm_core::JsonStateFileRefused>()
+                .unwrap_or_else(|| panic!("the merge must refuse the torn file: {error}"));
+            assert_eq!(refused.refusal, rocm_core::JsonStateRefusal::NotJson);
+            assert!(
+                request.state_path.is_file(),
+                "the state file is still a file"
+            );
+            assert_eq!(
+                std::fs::read(&request.state_path).unwrap(),
+                TORN_STATE,
+                "the torn state file must be left exactly as it was"
+            );
+        }
         if fail == Fail::WaitServer {
             // The state file is writable here, so the failure is recorded.
             let state = crate::state::read_service_state(&request.state_path).unwrap();
@@ -612,7 +636,12 @@ mod tests {
 
     #[test]
     fn ready_state_merge_failure_stops_the_server() {
-        assert_post_spawn_failure_stops_server(Fail::ReadyMerge, "failed to write");
+        // The merge reads the file first, under the state directory's lock, and
+        // refuses a torn one rather than replace it.
+        assert_post_spawn_failure_stops_server(
+            Fail::ReadyMerge,
+            "left it untouched and recorded nothing",
+        );
     }
 
     /// The ready write fails after the model loaded and verified, and the server

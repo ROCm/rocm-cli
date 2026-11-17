@@ -48,6 +48,11 @@ pub(super) fn parse_descriptor(name: &str) -> Descriptor {
         },
     };
 
+    // A lane of the shared GPU queue (see `queue_descriptor`).
+    if let Some(lane) = core.strip_prefix("queue-") {
+        return queue_descriptor(lane, channel_from_name);
+    }
+
     // Legacy `-known-bugs` suffix (retained only as a stable secondary sort key).
     let (core, known_bugs) = match core.strip_suffix("known-bugs") {
         Some(rest) => (rest.trim_end_matches('-'), true),
@@ -82,6 +87,68 @@ pub(super) fn parse_descriptor(name: &str) -> Descriptor {
         platform: with_paren_suffix(known.platform, release_label),
         os: known.os.to_string(),
         known_bugs,
+        channel_from_name,
+    }
+}
+
+/// The marker an advisory queue lane carries in its platform label.
+///
+/// A reader of the rendered report, and `xtask release-readiness`, which reads
+/// that rendering, tell a lane the queue lets fail from one it does not by it.
+pub const ADVISORY_QUEUE_MARKER: &str = "(queue, advisory)";
+
+/// The GPU each shared-queue lane stands for, by the lane's name. The queue
+/// discovers its lanes from its fleet, so a lane missing from this table is not
+/// an error: it renders under its own name in capitals.
+const QUEUE_LANE_GPUS: &[(&str, &str)] = &[
+    ("mi300x", "MI300X"),
+    ("mi325x", "MI325X"),
+    ("mi350p", "MI350P"),
+    ("mi350x", "MI350X"),
+    ("mi355x", "MI355X"),
+    ("r9700s", "R9700"),
+    ("w7900-dual", "W7900"),
+];
+
+/// The GPU a shared-queue lane stands for (`w7900-dual` is a W7900), or the
+/// lane's own name in capitals for a lane this table does not know yet.
+pub fn queue_lane_gpu(lane: &str) -> String {
+    QUEUE_LANE_GPUS
+        .iter()
+        .find(|(name, _)| *name == lane)
+        .map_or_else(|| lane.to_uppercase(), |(_, gpu)| (*gpu).to_owned())
+}
+
+/// The artifact name `xtask e2e-queue-import` gives a queue lane's report.
+///
+/// For one channel, or none for a lane that reported no channel at all. The lane
+/// is named, not the `platform_slug` in its `platform.json`: queue lanes of
+/// different models report the same slug (an MI325X lane probes as `mi300x`, an
+/// MI355X as `mi350p`), so the slug cannot say which lane a report came from.
+/// A lane the queue does not block on carries the `-advisory` suffix.
+pub fn queue_artifact_name(lane: &str, advisory: bool, channel: Option<&str>) -> String {
+    let advisory = if advisory { "-advisory" } else { "" };
+    let channel = channel.map_or_else(String::new, |c| format!("-{c}"));
+    format!("e2e-queue-{lane}{advisory}{channel}-report")
+}
+
+/// Parse the core of a queue lane's artifact name (`mi325x`, `mi325x-advisory`;
+/// see [`queue_artifact_name`]). Always Linux: the queue runs Linux pods.
+fn queue_descriptor(lane: &str, channel_from_name: Option<&'static str>) -> Descriptor {
+    let (lane, advisory) = match lane.strip_suffix("-advisory") {
+        Some(rest) => (rest, true),
+        None => (lane, false),
+    };
+    let gpu = queue_lane_gpu(lane);
+    let queue = if advisory {
+        ADVISORY_QUEUE_MARKER
+    } else {
+        "(queue)"
+    };
+    Descriptor {
+        platform: format!("{gpu} {queue}"),
+        os: "Linux".to_owned(),
+        known_bugs: false,
         channel_from_name,
     }
 }
@@ -326,6 +393,33 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn parse_descriptor_names_each_queue_lane_and_its_gate() {
+        // Every lane name is a path segment of a queue artifact, so the table is
+        // what turns `w7900-dual` into the GPU a reader knows. A lane the table
+        // lacks keeps its own name rather than being guessed at.
+        for (lane, gpu) in QUEUE_LANE_GPUS {
+            let blocking = parse_descriptor(&queue_artifact_name(lane, false, Some("release")));
+            assert_eq!(
+                (blocking.platform.as_str(), blocking.os.as_str()),
+                (format!("{gpu} (queue)").as_str(), "Linux"),
+                "{lane}"
+            );
+            assert_eq!(blocking.channel_from_name, Some("release"));
+            let advisory = parse_descriptor(&queue_artifact_name(lane, true, Some("nightly")));
+            assert_eq!(advisory.platform, format!("{gpu} {ADVISORY_QUEUE_MARKER}"));
+            assert_eq!(advisory.channel_from_name, Some("nightly"));
+        }
+        let new_lane = parse_descriptor(&queue_artifact_name("mi400x", true, None));
+        assert_eq!(new_lane.platform, "MI400X (queue, advisory)");
+        assert_eq!(new_lane.channel_from_name, None);
+        // A queue MI300X lane is not the self-hosted MI300X lane.
+        assert_ne!(
+            parse_descriptor("e2e-queue-mi300x-report").platform,
+            parse_descriptor("e2e-gpu-report").platform
+        );
     }
 
     #[test]

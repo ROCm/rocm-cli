@@ -373,8 +373,8 @@ Feature: Model serving
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
   # On a host without Docker both skip (the nightly job logs whether Docker is
-  # reachable). serve-27's known failure on Strix Halo Ubuntu is an xfail row in
-  # expectations.toml, tracked in rocm-cli#1058.
+  # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
+  # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -940,3 +940,26 @@ Feature: Model serving
     And the response identifies the correct model
     When the user stops the scenario's managed Lemonade service
     Then the managed service is stopped and its endpoint is closed
+
+  # A served endpoint's API key sits in `<data>/services/<id>.endpoint-key`, and
+  # nobody but the user who started the server may read it. Here: a loopback
+  # serve with `--require-api-key` (so no public port is opened on the GPU box),
+  # then the key file's mode is checked to be exactly 0600. The file is replaced
+  # by a freshly created owner-only one on every store, so a mode loosened in
+  # place is tightened again; that re-store case is covered by the unit tests in
+  # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
+  # the key before a restart writes it back. The check does not depend on
+  # readiness: the serve waits a fixed 45 seconds for the engine
+  # (`READINESS_WAIT` in `service_launch/readiness.rs`) and then exits 0,
+  # reporting a server still loading as `starting`; the key is written before
+  # the engine starts, and the scenario's teardown stops the service.
+  # Linux-only: on Windows the key is protected by an owner-only DACL
+  # instead, but the Windows GPU lane serves with Lemonade, which refuses a
+  # key-protected bind there (`ensure_public_bind_engine_supported` in
+  # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the
+  # `rocm-core` unit tests that read the DACL back on the Windows build job.
+  @id:serve-endpoint-key-readable-by-owner-only @requires-gpu @requires-os:linux
+  Scenario: serve-59 - Only the user who started a key-protected server can read its key
+    Given a managed runtime is active
+    When the user serves a model that requires an API key
+    Then the server's API key is kept where only that user can read it

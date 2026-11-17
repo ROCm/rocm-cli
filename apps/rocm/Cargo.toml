@@ -75,6 +75,9 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 [dev-dependencies]
 # The fake engine child both engine IPC callers are tested against.
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
+# The Windows DACL check the tests of the owner-only key stores read their
+# files back with (`owner_only_file::owner_only_dacl_mismatch`). Test-only.
+rocm-core = { path = "../../crates/rocm-core", features = ["test-support"] }
 # Property-based tests for the byte-size formatter behind the `download:
 # approved up to …` line. "A size is printed in its own unit" has to hold at
 # every unit boundary, and the narrow band where `{:.1}` rounding reaches 1024.0

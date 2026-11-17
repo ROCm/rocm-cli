@@ -22,6 +22,7 @@ mod dash_text_edit_contract;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
+mod e2e_queue_import;
 mod e2e_report;
 mod engine_stdio_client_contract;
 mod env_mutation_contract;
@@ -331,6 +332,12 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Bring a finished run of the shared GPU queue into the nightly's E2E
+    /// report: write each lane's reports where `e2e-report` reads them, named
+    /// for the lane and for whether the queue blocks on it, and write a status
+    /// section for the top of the support matrix. With `--absent`, import
+    /// nothing and say why. See docs/nightly-on-the-queue.md.
+    E2eQueueImport(e2e_queue_import::Args),
     /// Count received Doctor reports from an export of the report mailbox.
     ///
     /// Reads `.eml` files (one message each) and raw `.json` report bodies,
@@ -497,6 +504,7 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::E2eQueueImport(args) => e2e_queue_import::run(&args)?,
         Command::ReportRollup(args) => report_rollup::run(&args)?,
         Command::ReleaseReadiness {
             since_tag,
