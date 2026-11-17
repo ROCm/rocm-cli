@@ -623,7 +623,7 @@ Pinned versions of the third-party runtimes rocm-cli manages, read from the work
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names and download URLs from them. | flat |
+| [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names, download URLs and the install `env_id` from them. | flat |
 
 ### `crates/e2e-report`
 

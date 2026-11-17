@@ -203,7 +203,7 @@ pub(crate) fn env_root_for_service(
 /// literal and had drifted several minor versions behind what is installed.
 fn managed_engine_runtime_id(engine: &str) -> String {
     match engine {
-        "lemonade" => format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
+        "lemonade" => rocm_deps::lemonade_env_id(rocm_deps::LEMONADE_VERSION),
         _ => "managed-engine-runtime".to_owned(),
     }
 }
@@ -619,6 +619,8 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("no active ROCm runtime is configured"));
+        // Spelled out rather than via `rocm_deps::lemonade_env_id`, so a change
+        // to that helper's shape turns this red.
         assert_eq!(
             resolve_engine_install_runtime_id(&paths, &RocmCliConfig::default(), "lemonade", None)?,
             format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
