@@ -39,6 +39,7 @@ mod e2e {
     pub mod planner_steps;
     pub mod remote_steps;
     pub mod runtime_lifecycle_steps;
+    pub mod runtime_side_by_side_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod service_stop_steps;
@@ -51,6 +52,7 @@ mod e2e {
     pub mod tui_driver;
     pub mod uninstall_steps;
     pub mod update_steps;
+    pub mod vllm_tensorizer_steps;
 }
 
 // ── World ──────────────────────────────────────────────────────────
@@ -195,6 +197,11 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// The runtimes a side-by-side scenario planted, with the bytes of their
+    /// install records as planted and what each activation left behind, so a
+    /// later step can tell an untouched record from a rewritten one. `Some`
+    /// only for the side-by-side scenarios in `runtime_lifecycle.feature`.
+    pub side_by_side: Option<e2e::runtime_side_by_side_steps::SideBySide>,
     /// Raw text of `skills/rocm-doctor/reference.md`, loaded by the rocm-doctor
     /// skill scenarios. That document is the EXPECTED-value fixture for the
     /// skill↔CLI contract checks — see `e2e::skill_steps`.
@@ -400,6 +407,7 @@ impl Default for E2eWorld {
             comfyui_baseline_torch_stack: None,
             comfyui_baseline_distributions: None,
             lifecycle: None,
+            side_by_side: None,
             skill_reference: None,
             skill_symptom: None,
             symptom_paste: None,

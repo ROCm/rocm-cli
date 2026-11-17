@@ -126,7 +126,7 @@ pub(super) fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagno
     let fix = Fix {
         summary: "Install the AMD HIP SDK for Windows; the HIP runtime DLLs and hipInfo.exe come from there.".to_owned(),
         commands: vec![
-            "# Download and install the HIP SDK (matched to your framework's HIP major):".to_owned(),
+            "# Download and install the HIP SDK (matched to your framework's HIP X.Y release):".to_owned(),
             "#   https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html".to_owned(),
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.".to_owned(),
         ],
