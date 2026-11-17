@@ -53,8 +53,14 @@ impl AppState {
                     // `ui::draw_active_manager` returns early whenever this is
                     // `Some`, so leaving the job id visible here would paint the
                     // console over the very question the user has to answer.
+                    //
+                    // The cost of that early return is a backdrop swap, not an
+                    // overlay: the fall-through reaches `draw_serve_wizard`,
+                    // which draws the wizard's static form under the question —
+                    // so the live console is off screen for as long as the
+                    // question is up, and `Deny` brings it back whole.
                     // Pinned by
-                    // `serve_wizard::tests::detach_confirm_modal_is_drawn_over_the_running_console`.
+                    // `serve_wizard::tests::detach_confirm_modal_replaces_the_console_with_the_static_form`.
                     if m.detach_confirm.is_some() {
                         None
                     } else {

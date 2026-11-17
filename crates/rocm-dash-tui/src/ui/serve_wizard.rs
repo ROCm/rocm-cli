@@ -811,8 +811,13 @@ fn detach_running_request(model: &str) -> ApprovalRequest {
     )
 }
 
-/// Render the overlay (form, or the folder browser, or the approval modal, or
-/// the job console — in priority order).
+/// Render the overlay: always the static form, then any open modal over it.
+///
+/// The picker, folder browser, approval and detach-confirm modals are layered
+/// on top of the form, not chosen instead of it — so whichever one is open, the
+/// form is what the user sees behind it. Never the job console: `_jobs` is
+/// unused because the shared console is drawn one level up, in
+/// `ui::draw_active_manager`, which returns before reaching this function.
 pub fn draw_serve_wizard(
     f: &mut Frame,
     area: Rect,
@@ -2185,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn detach_confirm_modal_is_drawn_over_the_running_console() {
+    fn detach_confirm_modal_replaces_the_console_with_the_static_form() {
         // The `active_job_id` suppression in `app/overlays.rs` is what makes
         // this true: `ui::draw_active_manager` draws the shared job console and
         // RETURNS whenever a job id is active, so without that suppression the
@@ -2193,6 +2198,13 @@ mod tests {
         // at all while their keys answered one. Drives the real `ui::draw`
         // path, not `draw_serve_wizard` directly, so the suppression is
         // actually exercised; reverting the `overlays.rs` hunk fails here.
+        //
+        // What the suppression costs is asserted here too, so the name cannot
+        // drift from the screen: falling through to `draw_serve_wizard` means
+        // the backdrop behind the question is the wizard's own static form, not
+        // the live console the user was watching. That is intended — the swap
+        // lasts one keystroke and `Deny` restores the full console — but it is
+        // a swap, not an overlay, and the test says which.
         use crate::app::AppState;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -2236,6 +2248,11 @@ mod tests {
         assert!(
             !screen.contains("Ctrl+C cancel"),
             "the shared job console must not be drawn over the modal:\n{screen}"
+        );
+        assert!(
+            screen.contains("[ Launch ]"),
+            "the backdrop behind the question is the wizard's static form, not \
+             the console — a string only the form draws must be on screen:\n{screen}"
         );
     }
 
