@@ -58,6 +58,55 @@ ships glibc 2.35 and cannot run the engine. Ubuntu 24.04 provides glibc 2.39 and
 > guarantee of stability. APIs, commands, and behavior might change without
 > notice. Intended for experimentation and early feedback only.
 
+## Manifesto
+
+ROCm CLI exists to make an AMD GPU the easiest place to run AI, not the
+hardest. These are the goals we build toward. As a Tech Preview the tool does
+not meet all of them yet; where it falls short, that is a bug to fix, not a
+different goal.
+
+1. **From bare metal to inference in minutes.** A fresh machine with an AMD
+   GPU should get to a served model in a few commands and a few minutes (see
+   [Driver installation](#driver-installation) and
+   [Configure ROCm and serve a model](#configure-rocm-and-serve-a-model)). A
+   step that needs a manual workaround is a gap in the tool, not homework for
+   the user.
+2. **Every AMD GPU, with an honest answer.** We aim to support the whole AMD
+   line: Instinct accelerators in the datacenter, Radeon cards on the desk,
+   and Ryzen AI APUs such as Strix Halo in laptops and mini-PCs, on Linux,
+   Windows, and WSL2. Where we know a GPU has no ROCm build, we say so rather
+   than install one meant for a different GPU.
+3. **Rock solid.** Correctness comes before features. We test on real AMD
+   hardware and review new user-visible behavior against an executable
+   scenario. Releases are checksummed and signed, and the install scripts
+   verify what they download. A failure partway through should never leave
+   your system half-changed.
+4. **The GPU or nothing.** There is no CPU fallback. If a model cannot run
+   on your GPU, serving fails rather than quietly running it somewhere
+   slower. Use `rocm diagnose --model` to check before you download.
+5. **Your machine, your call.** Nothing you have should disappear without
+   your say-so. `rocm uninstall`, `rocm runtimes uninstall` and the
+   `rocm storage` removals show the plan and ask first, and `--yes` gives that
+   approval in advance for scripts.
+6. **When it breaks, it tells you how to fix it.** `rocm diagnose` and
+   `rocm fix` match known failures against a catalog with a stable id for
+   each. Where a fix is safe to automate, `rocm fix` applies it after asking.
+   Otherwise it prints the steps to take, or says plainly that no fix exists.
+7. **Built for people, scripts, and agents alike.** A launcher and a live
+   dashboard for people, `--json` output from `examine`, `diagnose`, `fix`
+   and other inspection commands for scripts, and the
+   [`rocm-doctor` skill](https://github.com/amd/skills/tree/main/skills/rocm-doctor)
+   so AI agents can diagnose and repair a setup with the same `rocm diagnose`
+   and `rocm fix` commands a person would.
+8. **Open by default.** MIT-licensed and developed in the open, with its
+   documentation kept in the same repository as the code it describes.
+9. **Extensible, from local to remote.** ROCm CLI should grow with the
+   open-source ecosystem, adopting new inference engines, ROCm-based
+   libraries, and tooling for safe, scalable agentic AI (such as agent
+   sandboxing and fleet orchestration) as supported, validated extensions. It
+   should also take you from your own machine to remote GPU compute without
+   switching tools; `rocm remote` (preview) is the first step there.
+
 ## Demos
 
 ### ROCm CLI
