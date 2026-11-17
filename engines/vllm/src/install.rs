@@ -1111,6 +1111,25 @@ fn install_vllm_rocm10_discover(
     reinstall: bool,
     build: &VllmRocmDiscoverBuild,
 ) -> Result<VllmInstallOutcome> {
+    let mut notes: Vec<String> = Vec::new();
+    // Every failure after a fallback was taken names it, wherever it happens: a note
+    // kept only for the success path would be lost exactly when the fallback it
+    // describes is what failed.
+    match install_vllm_rocm10_discover_collecting(uv, paths, python, reinstall, build, &mut notes) {
+        Ok(pins) => Ok(VllmInstallOutcome { pins, notes }),
+        Err(err) => Err(with_fallback_notes(err, &notes)),
+    }
+}
+/// [`install_vllm_rocm10_discover`]'s sequence, recording each fallback it takes in
+/// `notes` as it goes and returning the pins installed.
+fn install_vllm_rocm10_discover_collecting(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    reinstall: bool,
+    build: &VllmRocmDiscoverBuild,
+    notes: &mut Vec<String>,
+) -> Result<Vec<String>> {
     ensure_discover_python_tag(python, build)?;
     // Discovered (or read from the SDK runtime) together, as one coherent set,
     // rather than snapshotted from whatever the SDK install resolved earlier
@@ -1136,7 +1155,6 @@ fn install_vllm_rocm10_discover(
     // not fail the install: the real install below is the authority, and it
     // reports its own error. The reason is kept, because the series match is
     // exactly the choice this probe exists to improve on.
-    let mut notes: Vec<String> = Vec::new();
     let vllm_resolution = match resolve_vllm_dependencies(uv, paths, python, &vllm, &config_file) {
         Ok(resolution) => Some(resolution),
         Err(err) => {
@@ -1182,7 +1200,7 @@ fn install_vllm_rocm10_discover(
         match &recorded_index {
             Ok(Some(_)) => {}
             Ok(None) => notes.push(format!(
-                "the runtime manifest records no wheel index for this SDK; the torch stack is \
+                "no runtime manifest for this interpreter records a wheel index; the torch stack is \
                  fetched from {}, which may not be the index the SDK was installed from",
                 build.torch_index_url
             )),
@@ -1198,17 +1216,13 @@ fn install_vllm_rocm10_discover(
     };
     let torch_args =
         vllm_rocm10_discover_torch_install_args(python, reinstall, &torch_index_url, &pins[0]);
-    run_uv_pip_install(uv, paths, python, torch_args)
-        .map_err(|err| with_fallback_notes(err, &notes))?;
+    run_uv_pip_install(uv, paths, python, torch_args)?;
 
     let mut remaining_args =
         vllm_rocm10_discover_remaining_install_args(python, reinstall, &pins[3..]);
     remaining_args.push("--config-file".to_owned());
     remaining_args.push(config_file.display().to_string());
-    // A note kept only for the success path would be lost exactly when the
-    // fallback it describes is what failed.
-    run_uv_pip_install(uv, paths, python, remaining_args)
-        .map_err(|err| with_fallback_notes(err, &notes))?;
+    run_uv_pip_install(uv, paths, python, remaining_args)?;
 
     // The full-dependency resolve above can replace torch (and, pulling it in
     // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
@@ -1217,8 +1231,7 @@ fn install_vllm_rocm10_discover(
     // `uv pip freeze` failure there must not skip restoring the trio too.
     let trio_realign_args =
         vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &pins[..3]);
-    run_uv_pip_install(uv, paths, python, trio_realign_args)
-        .map_err(|err| with_fallback_notes(err, &notes))?;
+    run_uv_pip_install(uv, paths, python, trio_realign_args)?;
 
     // The full-dependency resolve can also pull in an AMD device-kernel
     // plugin for any of the three (`amd-torch-device-gfx*`,
@@ -1247,13 +1260,12 @@ fn install_vllm_rocm10_discover(
     if !device_pins.is_empty() {
         let device_realign_args =
             vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &device_pins);
-        run_uv_pip_install(uv, paths, python, device_realign_args)
-            .map_err(|err| with_fallback_notes(err, &notes))?;
+        run_uv_pip_install(uv, paths, python, device_realign_args)?;
     }
 
     let mut pins = pins;
     pins.extend(device_pins);
-    Ok(VllmInstallOutcome { pins, notes })
+    Ok(pins)
 }
 #[cfg(test)]
 mod tests {
@@ -2126,14 +2138,15 @@ exit 0
     fn run_ten_two_discover_with_fake_uv(
         prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
     ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
-        run_discover_row_with_fake_uv("10.2.0", false, prepare)
+        run_discover_row_with_fake_uv("10.2.0", None, prepare)
     }
-    /// [`run_ten_two_discover_with_fake_uv`] for any row, optionally with every
-    /// real `--no-deps` install (the torch install and the realigns) failing.
+    /// [`run_ten_two_discover_with_fake_uv`] for any row, optionally failing the
+    /// `fail_install`th real `uv pip install` (1 torch, 2 remaining deps, 3 trio
+    /// realign, 4 device realign; the dry-runs and `pip freeze` are not counted).
     #[cfg(unix)]
     fn run_discover_row_with_fake_uv(
         row: &str,
-        fail_torch_stack_installs: bool,
+        fail_install: Option<u32>,
         prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
     ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
         use rocm_core::fake_executable::write_fake_executable;
@@ -2156,6 +2169,15 @@ echo "$@" >> "{log}"
 last=""
 for a in "$@"; do last="$a"; done
 case "$*" in
+  *--dry-run*|*"pip freeze"*) ;;
+  *)
+    n=$(cat "{count}" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "{count}"
+    if [ "$n" = "{fail_at}" ]; then echo 'error: boom' >&2; exit 1; fi
+    ;;
+esac
+case "$*" in
   *--dry-run*--config-file*)
     echo "Resolved 3 packages" >&2
     ;;
@@ -2165,9 +2187,6 @@ case "$*" in
       *'*'*) echo " + ${{pkg}}==9.9.9" >&2 ;;
       *) echo " + ${{last}}" >&2 ;;
     esac
-    ;;
-  *--no-deps*)
-    {fail}
     ;;
   *"pip freeze"*)
     echo "torch==2.14.0+rocm10.2.0"
@@ -2179,21 +2198,12 @@ esac
 exit 0
 "#,
                 log = log.display(),
-                fail = if fail_torch_stack_installs {
-                    "echo 'error: boom' >&2; exit 1"
-                } else {
-                    "true"
-                }
+                count = root.path().join("uv.count").display(),
+                fail_at = fail_install.unwrap_or(0)
             ),
         )?;
         let build = vllm_rocm_discover_build(row).expect("the row has a discover build");
         let outcome = install_vllm_rocm10_discover(&uv, &paths, &python, true, build);
-        // A test may have made the registry unreadable; let the temp dir clean up.
-        let registry = paths.data_dir.join("runtimes").join("registry");
-        if registry.is_dir() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o755))?;
-        }
         let calls = std::fs::read_to_string(&log)?
             .lines()
             .map(str::to_owned)
@@ -2249,15 +2259,17 @@ exit 0
         )?;
         Ok(())
     }
-    /// Makes the registry unreadable, or reports that it cannot be: the owner of a
-    /// mode-000 directory still reads it as root, so a root run skips what needs it.
+    /// Makes the registry unreadable: a directory where a manifest file belongs
+    /// cannot be read as a file by anyone, root included, unlike a mode-000 registry.
     #[cfg(unix)]
-    fn make_registry_unreadable(paths: &AppPaths) -> Result<bool> {
-        use std::os::unix::fs::PermissionsExt;
-        let registry = paths.data_dir.join("runtimes").join("registry");
-        std::fs::create_dir_all(&registry)?;
-        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o000))?;
-        Ok(std::fs::read_dir(&registry).is_err())
+    fn make_registry_unreadable(paths: &AppPaths) -> Result<()> {
+        let broken = paths
+            .data_dir
+            .join("runtimes")
+            .join("registry")
+            .join("broken.json");
+        std::fs::create_dir_all(broken)?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2278,27 +2290,22 @@ exit 0
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("records no wheel index")),
+                .any(|note| note.contains("records a wheel index")),
             "{notes:?}"
         );
         assert!(on_row_index(&calls));
 
         // A registry that cannot be read: the same index, and the install says so.
-        let mut skipped = false;
-        let (outcome, calls) = run_ten_two_discover_with_fake_uv(|paths, _| {
-            skipped = !make_registry_unreadable(paths)?;
-            Ok(())
-        })?;
-        if !skipped {
-            let notes = outcome?.notes;
-            assert!(
-                notes
-                    .iter()
-                    .any(|note| note.contains("could not read the runtime registry")),
-                "{notes:?}"
-            );
-            assert!(on_row_index(&calls));
-        }
+        let (outcome, calls) =
+            run_ten_two_discover_with_fake_uv(|paths, _| make_registry_unreadable(paths))?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not read the runtime registry")),
+            "{notes:?}"
+        );
+        assert!(on_row_index(&calls));
         Ok(())
     }
 
@@ -2308,20 +2315,17 @@ exit 0
     -> Result<()> {
         // 10.1's index is fixed by design, so an unreadable registry or a manifest
         // with no index is not something its install has a reason to mention.
-        let mut skipped = false;
-        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", false, |paths, _| {
-            skipped = !make_registry_unreadable(paths)?;
-            Ok(())
+        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", None, |paths, _| {
+            make_registry_unreadable(paths)
         })?;
         let notes = outcome?.notes;
-        let _ = skipped; // the assertion holds whether or not the registry was unreadable
         assert!(
             notes
                 .iter()
                 .all(|note| !note.contains("registry") && !note.contains("wheel index")),
             "{notes:?}"
         );
-        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", false, |paths, python| {
+        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", None, |paths, python| {
             plant_manifest(paths, python, "")
         })?;
         assert!(
@@ -2335,19 +2339,25 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn a_failed_torch_stack_install_on_the_fallback_index_names_the_fallback() -> Result<()> {
-        let (outcome, _) = run_discover_row_with_fake_uv("10.2.0", true, |paths, python| {
-            plant_manifest(paths, python, "")
-        })?;
-        let err = format!("{:#}", outcome.expect_err("the torch install fails"));
-        assert!(err.contains("boom"), "{err}");
-        assert!(
-            err.contains("records no wheel index") && err.contains("Fallbacks used"),
-            "the uv failure must carry the note about the index it ran against: {err}"
-        );
+    fn a_failed_install_step_on_the_fallback_index_names_the_fallback() -> Result<()> {
+        // Each real install in turn: the torch install, the remaining deps, the trio
+        // realign and the device realign all run after the index fell back.
+        for step in 1..=4 {
+            let (outcome, _) =
+                run_discover_row_with_fake_uv("10.2.0", Some(step), |paths, python| {
+                    plant_manifest(paths, python, "")
+                })?;
+            let err = format!("{:#}", outcome.expect_err("an install step fails"));
+            assert!(err.contains("boom"), "step {step}: {err}");
+            assert!(
+                err.contains("records a wheel index") && err.contains("Fallbacks used"),
+                "step {step}: the uv failure must carry the note about the index it ran \
+                 against: {err}"
+            );
+        }
 
         // With the SDK's own index recorded there is nothing to add to the failure.
-        let (outcome, _) = run_discover_row_with_fake_uv("10.2.0", true, |paths, python| {
+        let (outcome, _) = run_discover_row_with_fake_uv("10.2.0", Some(1), |paths, python| {
             plant_manifest(
                 paths,
                 python,
