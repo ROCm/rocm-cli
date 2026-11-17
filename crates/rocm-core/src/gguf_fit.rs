@@ -282,8 +282,23 @@ pub struct ContextEstimate {
     pub total_bytes: Option<u64>,
     /// KV cache bytes added by each token of context at `kv_cache_type`.
     pub kv_cache_bytes_per_token: Option<f64>,
-    /// Dedicated VRAM, when it was measured.
+    /// The memory `total_gib` was compared against, when it was measured.
+    ///
+    /// Dedicated VRAM on a discrete card; on an APU, the ceiling on the pool
+    /// the engine shares with the operating system. Which one it is cannot be
+    /// read off the number, so [`Self::available_is_shared_pool`] carries it.
     pub available_gib: Option<f64>,
+    /// Whether [`Self::available_gib`] is a shared pool rather than dedicated
+    /// VRAM.
+    ///
+    /// Carried on the estimate rather than re-derived by each renderer: the
+    /// note in `notes` and the evidence line in [`evidence_lines`] both have to
+    /// describe the same figure, and when they derived it separately they
+    /// disagreed in one report -- "the GPU with the most dedicated VRAM ... has
+    /// 24576 MiB" a few lines above "this host's integrated GPU has no
+    /// dedicated VRAM".
+    #[serde(default)]
+    pub available_is_shared_pool: bool,
     /// The largest context that fits at `kv_cache_type`: a multiple of 256, or
     /// the context the model was trained for when that fits and is the limit.
     /// `None` when not even one 256-token step fits, or when nothing was
@@ -352,6 +367,7 @@ impl ContextEstimate {
             total_bytes: None,
             kv_cache_bytes_per_token: None,
             available_gib: None,
+            available_is_shared_pool: false,
             max_context: None,
             training_context: None,
             conservative_ceiling: false,
@@ -743,6 +759,7 @@ pub fn estimate_fit(
         total_bytes: None,
         kv_cache_bytes_per_token: None,
         available_gib: memory.measured_gib(),
+        available_is_shared_pool: false,
         max_context: None,
         training_context: trained_context(header),
         conservative_ceiling: header.sliding_window,
@@ -857,6 +874,7 @@ pub fn estimate_fit(
     // estimate itself, because the figure is printed beside the totals with
     // nothing else to tell the two kinds of number apart.
     if memory.is_shared_pool() {
+        estimate.available_is_shared_pool = true;
         estimate.notes.push(
             "this host's integrated GPU has no dedicated VRAM: the memory compared against is \
              the ceiling on a pool it shares with the operating system, so how much is free \
@@ -1144,11 +1162,20 @@ pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
     }
     if let Some(available) = estimate.available_gib {
         let offered = whole_mib_offered(available);
-        lines.push(format!(
-            "the GPU with the most dedicated VRAM that ROCm can see has {offered} MiB ({}) in \
-             total; memory other processes already hold is not subtracted",
-            format_gib(available)
-        ));
+        lines.push(if estimate.available_is_shared_pool {
+            format!(
+                "the pool this host's integrated GPU allocates from has {offered} MiB ({}) in \
+                 total; that is a ceiling it shares with the operating system, and memory other \
+                 processes already hold is not subtracted",
+                format_gib(available)
+            )
+        } else {
+            format!(
+                "the GPU with the most dedicated VRAM that ROCm can see has {offered} MiB ({}) \
+                 in total; memory other processes already hold is not subtracted",
+                format_gib(available)
+            )
+        });
         let conservative = if estimate.conservative_ceiling {
             " (conservative for this model: its sliding-window layers are sized at the full \
              context)"
@@ -1673,6 +1700,51 @@ mod tests {
     /// `is_shared_pool()` block outright left every test in this file green
     /// before this one existed, and a test that only asserted presence would
     /// still pass against a block that pushed the note unconditionally.
+    /// The report may not call one figure both "dedicated VRAM" and "no
+    /// dedicated VRAM".
+    ///
+    /// `evidence_lines` and the shared-pool note describe the same number from
+    /// two places, and `model_readiness` prints both in one report -- evidence
+    /// bullets first, then the estimate's notes. While they derived the
+    /// shared-pool fact separately, an APU got "the GPU with the most dedicated
+    /// VRAM ... has 24576 MiB" a few lines above "this host's integrated GPU
+    /// has no dedicated VRAM". Asserted as a relation between the two renderers
+    /// rather than as two literal strings, so rewording either cannot quietly
+    /// restore the contradiction.
+    #[test]
+    fn the_evidence_line_and_the_note_cannot_disagree_about_what_the_figure_is() {
+        let (header, size) = llama(GIB_U as usize / 1024);
+        for (memory, shared) in [
+            (
+                AcceleratorMemory::Unified {
+                    gtt_total_gib: 24.0,
+                    vram_carveout_gib: Some(0.5),
+                },
+                true,
+            ),
+            (AcceleratorMemory::Dedicated(24.0), false),
+        ] {
+            let estimate = estimate(&header, size, 4096, KvCacheType::F16, memory);
+            assert!(
+                estimate.available_gib.is_some(),
+                "premise: both hosts must measure something, or neither renderer speaks"
+            );
+            let evidence = evidence_lines(&estimate).join("\n");
+            let says_dedicated = evidence.contains("dedicated VRAM");
+            let notes = estimate.notes.join("\n");
+            let denies_dedicated = notes.contains("no dedicated VRAM");
+            assert!(
+                !(says_dedicated && denies_dedicated),
+                "shared={shared}: one report called the same figure dedicated VRAM and not \
+                 dedicated VRAM.\nevidence:\n{evidence}\nnotes:\n{notes}"
+            );
+            assert_eq!(
+                says_dedicated, !shared,
+                "shared={shared}: the evidence line names the wrong kind of memory:\n{evidence}"
+            );
+        }
+    }
+
     #[test]
     fn a_shared_pool_is_compared_against_its_ceiling_and_said_to_be_shared() {
         const SHARED: &str = "shares with the operating system";
