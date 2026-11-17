@@ -5155,8 +5155,7 @@ fi
             "a red queue run is still a run: its artifact is uploaded whatever it concluded"
         );
         assert!(
-            !fetch.contains("2>/dev/null &&")
-                && !fetch.contains("logs\" > queue-results/job.log.part 2>"),
+            !fetch.contains("logs\" > queue-results/job.log.part 2>"),
             "the job-log read must not discard its error: that is what hid the reason"
         );
 

@@ -2417,6 +2417,33 @@ message=connect timed out after 30 s";
         );
     }
 
+    /// The pre-warm recognises two failures by the text of messages other crates
+    /// print. Reword either and the retry stops, or every MI nightly goes red on
+    /// the vLLM refusal, with no test failing: so tie each consumer here to the
+    /// text its producer still carries.
+    #[test]
+    fn the_messages_the_prewarm_matches_are_still_what_their_producers_print() {
+        let root = workspace_root().expect("workspace root");
+        let read = |path: &str| {
+            std::fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+        };
+        // The refusal is one `bail!` whose text is split across source lines with
+        // a trailing backslash, so read it as the string the compiler builds.
+        let refusal = read("engines/vllm/src/wheel_builds.rs")
+            .replace("\\\n", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            refusal.contains("has no static build pin"),
+            "engines/vllm no longer prints the refusal `engine_is_not_applicable` matches"
+        );
+        assert!(
+            read("apps/rocm/src/therock/fetch.rs").contains("\"HTTP {} while fetching {url}\""),
+            "the CLI no longer prints the fetch error `is_transient_http_failure` matches"
+        );
+    }
+
     /// The marker belongs to one pre-warm: it is written for a refusal, read back
     /// by the harness, and gone after the next pre-warm clears it.
     #[test]

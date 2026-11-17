@@ -1652,7 +1652,9 @@ jobs:
   # uploaded no report, which is a broken nightly, and that is when the grid is
   # most worth reading (run 44029433287 skipped the page for exactly that). The
   # grid guard in the step below keeps a degenerate report off the page, and the
-  # report job uploads its output whatever its own result.
+  # report job uploads `consolidated/` whatever its own result. A report job
+  # that failed before writing it (checkout, toolchain) leaves nothing to
+  # download, so this job fails at the download instead of publishing.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
     runs-on: ubuntu-24.04 # one LTS: publishing only
@@ -1869,11 +1871,11 @@ jobs:
           path: release-readiness/narrative.md
           if-no-files-found: ignore
 
-  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
-  # but unlike that job this one also runs (and publishes an explicit
-  # "evidence unavailable" notice) when release-readiness-nightly fails
-  # outright, rather than just skipping and leaving the wiki showing
-  # whatever verdict the last successful run left there.
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki.
+  # Like that job it also runs when its upstream failed, and this one then
+  # publishes an explicit "evidence unavailable" notice when
+  # release-readiness-nightly fails outright, rather than leaving the wiki
+  # showing whatever verdict the last successful run left there.
   publish-release-readiness-wiki:
     name: Publish release readiness to wiki
     runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only

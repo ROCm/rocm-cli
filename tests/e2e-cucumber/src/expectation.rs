@@ -2573,6 +2573,15 @@ flaky = true
         let not_serving = decl(&["id:runtime-x"]);
         // A GPU scenario that only needs the GPU is not a vLLM scenario.
         let gpu_only = decl(&["id:examine-detects-gpu", "requires-gpu"]);
+        // What does start one: a vLLM pin whatever the id says, and the id
+        // groups that serve, benchmark or chat on the host's default engine.
+        let pinned = decl(&[
+            "id:runtime-torch-alignment-opt-out",
+            "requires-gpu",
+            "requires-engine:vllm",
+        ]);
+        let bench = decl(&["id:bench-vllm-throughput", "requires-gpu"]);
+        let chat = decl(&["id:chat-reply", "requires-gpu"]);
         assert!(!matches!(
             resolve(&vllm_serve, &mi300x, &m, included),
             Expectation::Skip { .. }
@@ -2592,6 +2601,16 @@ flaky = true
             Expectation::ExpectPass,
             "a GPU scenario that starts no server still runs"
         );
+        for starts_a_server in [&pinned, &bench, &chat] {
+            assert!(
+                matches!(
+                    resolve(starts_a_server, &mi300x, &m, included),
+                    Expectation::Skip { .. }
+                ),
+                "{:?} starts a vLLM server and must be skipped",
+                starts_a_server.id
+            );
+        }
         // A scenario that does not serve with vLLM is untouched, on the same host.
         assert_eq!(
             resolve(&not_serving, &mi300x, &m, included),
