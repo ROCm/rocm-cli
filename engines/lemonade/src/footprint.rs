@@ -137,6 +137,10 @@ pub(crate) fn plan_install_preflight(
 
 /// The runtime folder of a tree of the pinned Lemonade already extracted where
 /// this install goes, or `None` when the install would download and extract one.
+///
+/// Linux only outside tests, like its one caller, the host-library refusal
+/// ([`crate::host_libraries`]): Windows has no such check.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn pinned_tree_in_place(paths: &AppPaths, env_root: Option<&Path>) -> Option<PathBuf> {
     let runtime_dir = runtime_dir_in(&lemonade_root(paths, env_root));
     let extraction = needs_extraction(
@@ -152,6 +156,7 @@ pub(crate) fn pinned_tree_in_place(paths: &AppPaths, env_root: Option<&Path>) ->
 /// install was on: a fresh install had a download ahead of it, while a tree of
 /// the pinned version already in place had nothing to fetch and is left as it
 /// is, though it cannot start either.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn host_refusal_outcome(installed_tree: Option<&Path>) -> String {
     match installed_tree {
         None => "Nothing was downloaded.".to_owned(),
