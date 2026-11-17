@@ -2412,9 +2412,10 @@ Local model engines
     }
 
     /// Stderr written after the kill still reaches the caller: the drain runs
-    /// after a timeout too. A grandchild that inherited stderr writes `late`
-    /// half a second after the 1 s deadline killed its parent, and the grace
-    /// leaves time to collect it.
+    /// after a timeout too. A grandchild holding only stderr (its stdout goes
+    /// to `/dev/null`) writes `late` half a second after the 1 s deadline
+    /// killed its parent. Stdout is closed by then, so only the wait on stderr
+    /// can collect it; the 10 s grace leaves time for that.
     #[cfg(unix)]
     #[test]
     fn stderr_written_after_the_kill_is_drained_into_the_timeout() {
@@ -2422,7 +2423,10 @@ Local model engines
         let result = run_probe_bounded(
             std::ffi::OsStr::new("sh"),
             tmp.path(),
-            &["-c", "(sleep 1.5; echo late >&2) & exec sleep 30"],
+            &[
+                "-c",
+                "(sleep 1.5; echo late >&2) >/dev/null & exec sleep 30",
+            ],
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(10),
         );

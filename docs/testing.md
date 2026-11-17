@@ -4109,7 +4109,8 @@ to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
 the harness and the product agree the host has no usable GPU, which is what the
 mock lane has.) Note also that `-n` matches the scenario *name* (`serve-28 -
 Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
-silently selects nothing.
+selects nothing and the run fails with `0 scenarios executed` (see
+[E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
 
 - serve-28, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
   matches an already-running vLLM service on a GPU-less host is not refused: it
@@ -4260,7 +4261,8 @@ for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
 (`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
-passing an id to it silently selects nothing.
+passing an id to it selects nothing and the run fails with
+`0 scenarios executed` (see [E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
 
 - serve-41, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
   GPU memory blames this launch, names the knobs, and quotes the engine's own
