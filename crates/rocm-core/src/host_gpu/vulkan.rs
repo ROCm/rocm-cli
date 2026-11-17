@@ -84,10 +84,23 @@ pub enum VulkanStatus {
     /// covering this status plants the exit-0 shape rather than reproducing a
     /// driverless host.
     Absent,
-    /// The probe came away with nothing either way: no ICD manifest, no
-    /// enumerated device, and at least one of the two sources that never
-    /// answered — `vulkaninfo` missing or failing, or (on Windows) a registry
-    /// listing that could not be run.
+    /// The probe came away with nothing either way: no ICD manifest *that
+    /// names a GPU driver*, no enumerated device, and at least one of the two
+    /// sources that never answered — `vulkaninfo` missing or failing, or (on
+    /// Windows) a registry listing that could not be run.
+    ///
+    /// `icds` is therefore not necessarily empty here, and the first clause is
+    /// written that way deliberately. A host whose only manifest is a software
+    /// rasteriser — `lvp_icd.x86_64.json` and nothing else — has found no GPU
+    /// driver, but it has not *ruled one out* either: the ICD search is not
+    /// exhaustive (a fixed directory list on Linux that ignores
+    /// `VK_ICD_FILENAMES`/`VK_DRIVER_FILES`, the legacy Khronos key alone on
+    /// Windows), so "lavapipe is the only manifest I can see" leaves a GPU
+    /// driver this probe never reads perfectly possible. Without `vulkaninfo`'s
+    /// answer behind it that host lands here rather than in [`Self::Absent`],
+    /// which is what
+    /// `a_lavapipe_only_install_is_not_a_confirmed_absence_until_vulkaninfo_answers`
+    /// holds.
     ///
     /// Distinct from [`Self::Unknown`], which is a platform that cannot be
     /// probed at all. The difference decides what the host is told: an
