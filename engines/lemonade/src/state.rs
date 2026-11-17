@@ -150,6 +150,13 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
 /// with every merge (`rocm_core::write_json_state_file`), so a full rewrite
 /// never lands inside another writer's merge, and publishes atomically, so a
 /// lock-free reader such as `rocm services list` never sees half a document.
+///
+/// It replaces every key merged before it, with one exception that
+/// `write_json_state_file` owns: an Anthropic endpoint published by this very
+/// process is carried through. The proxy that publishes it is a thread of this
+/// process and publishes exactly once, so the rewrite that happens moments
+/// after the server is spawned would otherwise lose it for good — see
+/// `a_running_state_write_keeps_the_anthropic_endpoint_this_process_published`.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
     rocm_core::write_json_state_file(path, value)
 }
@@ -309,6 +316,82 @@ mod tests {
     use crate::test_support::scratch_dir;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    /// ROCMAI-550 regression, on the real writer: the `running` state write
+    /// happens immediately after `serve_router` spawns the server, and since
+    /// ROCMAI-550 it spends a host GPU probe (`rocm_core::pinned_gpu_name`,
+    /// `pnputil` plus a PowerShell CIM query on Windows) building its document
+    /// before writing it. The Anthropic proxy `rocm` starts on a thread of this
+    /// same process publishes its endpoint as soon as the server lists a model
+    /// — inside that window — and nothing publishes twice, so a rewrite that
+    /// drops the endpoint drops it for the life of the service. That is what
+    /// left five Windows e2e scenarios with a ready service and no
+    /// `anthropic endpoint:` row.
+    ///
+    /// This drives the production call, not the primitive underneath it, so it
+    /// also holds the routing: a `write_state` that went back to a plain
+    /// `fs::write` would fail here while `rocm-core`'s own tests stayed green.
+    #[test]
+    fn a_running_state_write_keeps_the_anthropic_endpoint_this_process_published() {
+        let dir = scratch_dir("anthropic-endpoint-survives-rewrite");
+        let request = ServeHttpRequest {
+            service_id: "svc".to_owned(),
+            model_ref: "Qwen3-0.6B-GGUF".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: rocm_engine_protocol::DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: None,
+            env_id: None,
+            state_path: dir.join("svc.json"),
+            log_path: None,
+            engine_recipe: None,
+        };
+        let runtime = LemonadeRuntime {
+            manifest: LemonadeInstallManifest {
+                env_id: "test".to_owned(),
+                version: "test".to_owned(),
+                runtime_dir: dir.join("runtime"),
+                lemond: dir.join("lemond"),
+                lemonade: dir.join("lemonade"),
+                backend_recipe: crate::LLAMACPP_RECIPE.to_owned(),
+                backend_name: "rocm".to_owned(),
+                installed_at_unix_ms: 0,
+            },
+        };
+
+        // The serve's own first write, then the proxy thread's publication.
+        write_running_state(&request, &runtime, std::process::id(), None, "starting").unwrap();
+        rocm_core::publish_anthropic_endpoint(
+            &request.state_path,
+            "http://127.0.0.1:41000",
+            rocm_core::AnthropicEndpointMode::Proxy,
+        )
+        .unwrap();
+
+        // The post-spawn rewrite, which replaces the whole document.
+        write_running_state(
+            &request,
+            &runtime,
+            std::process::id(),
+            Some(4242),
+            "running",
+        )
+        .unwrap();
+
+        let state = read_service_state(&request.state_path).unwrap();
+        assert_eq!(
+            state["anthropic_endpoint_url"], "http://127.0.0.1:41000",
+            "the rewrite dropped the endpoint its own process published, so \
+             `rocm services list` will never show an `anthropic endpoint:` row \
+             for this service: {state}"
+        );
+        assert_eq!(state["anthropic_endpoint_mode"], "proxy");
+        // The rewrite still does its own job.
+        assert_eq!(state["status"], "running");
+        assert_eq!(state["server_pid"], 4242);
+        fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn identity_from_state_prefers_server_pid_and_its_start_ticks() {
