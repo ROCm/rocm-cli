@@ -666,8 +666,8 @@ case, at one of five levels:
 | --- | --- |
 | ROCm/HIP-supported | A TheRock package family covers this GPU. |
 | Vulkan-only | No ROCm build, **and** either a Vulkan GPU driver was found here, or the platform cannot be probed for one at all (anything other than Linux and Windows, or a summary from an older `rocm remote doctor` that predates the probe). The `rocm_support` line says which of the two it is, and only names a driver when one was actually found. |
-| Vulkan-unconfirmed | No ROCm build, and the probe could not reach an answer — no ICD, no enumerated device, and no `vulkaninfo` to ask. |
-| no GPU backend | No ROCm build, **and** the probe looked and found no Vulkan GPU driver. |
+| Vulkan-unconfirmed | No ROCm build, and the probe could not reach an answer: nothing was found, and at least one of the two sources — the ICD/registry listing or `vulkaninfo` — never answered. Either one can be the source that went unread (on Windows the registry read is a separate PowerShell call that can fail on its own), and the `vulkan:` line names which. |
+| no GPU backend | No ROCm build, **and** the probe looked and found no Vulkan GPU driver. This takes `vulkaninfo`'s own answer: the ICD listing is not exhaustive on either platform, so it never denies a driver by itself. |
 | unknown | No GPU detected, or a target this build's catalog does not recognize. |
 
 The last row is a detection gap rather than a verdict about the hardware, which

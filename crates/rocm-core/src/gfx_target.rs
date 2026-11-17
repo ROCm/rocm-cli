@@ -586,8 +586,10 @@ pub enum GpuSupportLevel {
     /// and serve a model on it.
     VulkanOnly,
     /// Recognized, confirmed to have no ROCm/HIP build, and the Vulkan probe
-    /// could not reach an answer — no ICD manifest, no enumerated device, and
-    /// no `vulkaninfo` to ask.
+    /// could not reach an answer — nothing was found, and at least one of its
+    /// two sources never answered. Either one can be the source that went
+    /// unread: `vulkaninfo` missing or failing, or (on Windows, where the
+    /// registry read is its own PowerShell call) the driver listing.
     ///
     /// Deliberately NOT folded into [`Self::NoGpuBackend`]. That level renders
     /// as a confirmed fact and is serialized for JSON consumers, and this state
@@ -734,6 +736,7 @@ pub fn gpu_support_level(
             // is the common no-driver shape, since most such hosts have no
             // `vulkaninfo` either. The wording it gets is hedged rather than a
             // confirmed absence — see `render.rs`.
+            //
             // Every variant is spelled out, with no `_` and no guard. A guard
             // reads well but does not count toward exhaustiveness, so the arms
             // would have to end in a wildcard — and a wildcard here silently
