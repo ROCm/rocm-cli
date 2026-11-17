@@ -4,8 +4,8 @@
 # Dispatched by a pull request's gate job in e2e-selfhosted.yml, on main, with the
 # branch to test. It is queue-run.yml with the pull request preset: the queue side
 # runs one GPU model on the release channel, with a shorter wait and run time than
-# the nightly, up to three at once, and it does not take one while the nightly
-# goes (it refuses, and this job then fails with that reason in refused.txt).
+# the nightly, a limited number at once (the queue side sets the limit), and it
+# does not take one while the nightly goes (it refuses, and this job then fails with that reason in refused.txt).
 # Like queue-run.yml it needs no credential and no permission, and the runner
 # runs only the allow-listed workflows as they are on main; that is enforced on
 # the runner, outside this repository.

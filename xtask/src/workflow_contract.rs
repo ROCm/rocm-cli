@@ -8309,7 +8309,8 @@ jobs:
                             && github.event_name == 'pull_request' \
                             && github.event.action != 'closed' \
                             && github.event.pull_request.head.repo.full_name \
-                            == github.repository"
+                            == github.repository \
+                            && github.actor != 'dependabot[bot]'"
                     .to_owned(),
                 matrix_lane: false,
             },
@@ -10051,7 +10052,7 @@ permissions:
         assert!(
             gate.contains("== nightly:* ]]")
                 && gate.contains("skipped=true")
-                && gate.contains("Re-run this job after 07:00 UTC"),
+                && gate.contains("Re-run this job once the window has passed"),
             "a nightly-window refusal must end the gate green with a skip note"
         );
         assert!(
@@ -10063,6 +10064,8 @@ permissions:
             "github.event_name == 'pull_request'",
             "github.event.action != 'closed'",
             "github.event.pull_request.head.repo.full_name == github.repository",
+            // Dependabot's token is read-only whatever `permissions:` says.
+            "github.actor != 'dependabot[bot]'",
         ] {
             assert!(
                 gate.contains(needed),
@@ -10143,6 +10146,14 @@ permissions:
         conclusion: &'a str,
         /// What the artifact holds, `(path, content)`; `None` is no artifact.
         results: Option<Vec<(&'a str, &'a str)>>,
+        /// The repository variable `QUEUE_PR_GATE`.
+        switch: &'a str,
+        /// Run the step that cancels the queue run instead of the main one, with
+        /// the files the main step leaves in `RUNNER_TEMP`: whether it got as far
+        /// as dispatching, and the run id it found, if it did.
+        cancel_step: bool,
+        dispatched: bool,
+        run_id_file: Option<&'a str>,
     }
 
     #[cfg(unix)]
@@ -10159,6 +10170,10 @@ permissions:
                 conclusion_fail: 0,
                 conclusion: "success",
                 results: Some(vec![(QUEUE_REPORT_PATH, "{}")]),
+                switch: "true",
+                cancel_step: false,
+                dispatched: true,
+                run_id_file: None,
             }
         }
     }
@@ -10188,8 +10203,16 @@ permissions:
     fn run_gate_script(gate: &Gate) -> GateRun {
         let text = read_workflow("e2e-selfhosted.yml");
         let block = job_block(&text, "e2e-gpu-queue");
-        let script = dedent(&run_block(block).expect("the gate's first step has a `run: |` block"))
-            .expect("the gate's script is not empty");
+        let block = if gate.cancel_step {
+            block
+                .split_once("      - name: Cancel the queue run")
+                .expect("the gate has a cancel step")
+                .1
+        } else {
+            block
+        };
+        let script = dedent(&run_block(block).expect("the step has a `run: |` block"))
+            .expect("the step's script is not empty");
         let dir = tempfile::tempdir().expect("temp dir");
         let bin = dir.path().join("bin");
         let state = dir.path().join("state");
@@ -10199,6 +10222,12 @@ permissions:
             std::fs::create_dir_all(d).expect("make dir");
         }
         std::fs::write(dir.path().join("gate.sh"), script).expect("write script");
+        if gate.dispatched {
+            std::fs::write(dir.path().join("queue-dispatched"), "").expect("write marker");
+        }
+        if let Some(id) = gate.run_id_file {
+            std::fs::write(dir.path().join("queue-run-id"), id).expect("write run id");
+        }
         for f in ["output", "summary"] {
             std::fs::write(dir.path().join(f), "").expect("write file");
         }
@@ -10291,6 +10320,7 @@ esac
             .env("RESULTS", &results)
             .env("GH_REPO", "owner/repo")
             .env("HEAD_REF", gate.head_ref)
+            .env("QUEUE_PR_GATE", gate.switch)
             .env("GITHUB_RUN_ID", "7")
             .env("GITHUB_RUN_ATTEMPT", "1")
             .env("GITHUB_OUTPUT", dir.path().join("output"))
@@ -10439,7 +10469,11 @@ esac
         });
         assert_eq!(window.code, 0, "{}", window.log);
         assert!(window.output.contains("skipped=true"), "{}", window.output);
-        assert!(window.summary.contains("07:00 UTC"), "{}", window.summary);
+        assert!(
+            window.summary.contains("window has passed"),
+            "{}",
+            window.summary
+        );
         assert!(window.report.is_empty());
         // Any other refusal stays red, with the queue's reason, and is no skip.
         // Only the first line counts: `nightly:` later in the file is not a window.
@@ -10598,6 +10632,105 @@ esac
                 assert!(!run.log.contains(bad), "{bad:?} is echoed: {}", run.log);
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn queue_gate_script_does_nothing_until_the_queue_side_switch_is_on() {
+        if !jq_available() {
+            return;
+        }
+        for switch in ["", "false", "TRUE", "1"] {
+            let run = run_gate_script(&Gate {
+                switch,
+                ..Gate::default()
+            });
+            assert_eq!(run.code, 0, "{switch:?}: {}", run.log);
+            assert!(
+                run.output.contains("skipped=true"),
+                "{switch:?}: {}",
+                run.output
+            );
+            assert!(run.summary.contains("QUEUE_PR_GATE"), "{}", run.summary);
+            assert!(
+                run.calls.is_empty(),
+                "{switch:?}: nothing is called: {:?}",
+                run.calls
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn queue_gate_script_gives_up_on_a_run_it_cannot_read() {
+        if !jq_available() {
+            return;
+        }
+        let run = run_gate_script(&Gate {
+            status_fail: 99,
+            ..Gate::default()
+        });
+        assert_eq!(run.code, 1, "{}", run.log);
+        assert_eq!(
+            run.calls_starting("run view 222 --json status"),
+            10,
+            "{:?}",
+            run.calls
+        );
+        assert!(run.log.contains("10 times in a row"), "{}", run.log);
+        // Failures that are not in a row do not add up: 9, a success, 9 more is fine.
+        let spaced = run_gate_script(&Gate {
+            status_fail: 9,
+            ..Gate::default()
+        });
+        assert_eq!(spaced.code, 0, "{}", spaced.log);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn queue_gate_cancel_step_finds_a_run_that_is_not_listed_yet() {
+        if !jq_available() {
+            return;
+        }
+        let cancel = |gate: Gate| {
+            run_gate_script(&Gate {
+                cancel_step: true,
+                ..gate
+            })
+        };
+        // Dispatched, id not found: asked again until the run is listed.
+        let late = cancel(Gate {
+            list_fail: 3,
+            ..Gate::default()
+        });
+        assert_eq!(late.code, 0, "{}", late.log);
+        assert_eq!(late.calls_starting("run list"), 4, "{:?}", late.calls);
+        assert!(
+            late.calls.contains(&"run cancel 222".to_owned()),
+            "{:?}",
+            late.calls
+        );
+        // Never listed: it stops after as many tries as the main step allows.
+        let never = cancel(Gate {
+            listed: false,
+            ..Gate::default()
+        });
+        assert_eq!(never.code, 0, "{}", never.log);
+        assert_eq!(never.calls_starting("run list"), 36, "{:?}", never.calls);
+        assert_eq!(never.calls_starting("run cancel"), 0);
+        // Nothing dispatched: nothing to look for, and nothing is asked.
+        let none = cancel(Gate {
+            dispatched: false,
+            ..Gate::default()
+        });
+        assert_eq!(none.code, 0, "{}", none.log);
+        assert!(none.calls.is_empty(), "{:?}", none.calls);
+        // The id is known: cancelled at once, without a lookup.
+        let known = cancel(Gate {
+            run_id_file: Some("333"),
+            ..Gate::default()
+        });
+        assert_eq!(known.calls, ["run cancel 333"], "{:?}", known.calls);
     }
 
     /// The gate's half of the queue contract is in the script and in the doc

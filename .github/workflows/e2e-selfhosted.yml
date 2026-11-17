@@ -605,15 +605,28 @@ jobs:
       && github.event_name == 'pull_request'
       && github.event.action != 'closed'
       && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      QUEUE_PR_GATE: ${{ vars.QUEUE_PR_GATE }}
     steps:
       - name: Run on the queue
         id: queue
         run: |
           set -euo pipefail
+          # The switch for the queue side: the gate does nothing until the
+          # repository variable QUEUE_PR_GATE is `true`, which is set once the queue
+          # side (the runner's allow-list and the pull request run kind) is
+          # deployed. Without it, a merge of queue-pr-run.yml ahead of the queue
+          # side would turn every pull request red.
+          if [ "${QUEUE_PR_GATE:-}" != true ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the queue lane is switched off: the repository variable QUEUE_PR_GATE is not true"
+            echo "The queue lane is switched off until the queue side is deployed: set the repository variable QUEUE_PR_GATE to true." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # The branch name is the PR author's: checked before it goes anywhere.
           if ! [[ "$HEAD_REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then
             echo "::error::the branch name is not one the queue takes: it must start with a letter, a digit or an underscore, hold only letters, digits and . _ / -, and be at most 200 characters"
@@ -638,6 +651,9 @@ jobs:
           fi
           caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh workflow run queue-pr-run.yml --ref main -f "branch=${HEAD_REF}" -f "caller=${caller}"
+          # The run is not listed at once: the step that cancels it looks for it
+          # when this job ends before the id was found, but only after a dispatch.
+          touch "${RUNNER_TEMP}/queue-dispatched"
 
           # The dispatch does not say which run it started; the run's title names
           # this job, so look for that.
@@ -664,8 +680,20 @@ jobs:
           # Polled once a minute, not `gh run watch`, which polls every few
           # seconds against this job's token. The job's own timeout bounds this,
           # and a call that fails (a 502, a rate limit) is asked again.
+          failures=0
           while true; do
-            status=$(gh run view "$run_id" --json status --jq .status) || status=""
+            if status=$(gh run view "$run_id" --json status --jq .status); then
+              failures=0
+            else
+              status=""
+              failures=$((failures + 1))
+              # A run that cannot be read (deleted, a token problem) would
+              # otherwise hold this job to its timeout.
+              if [ "$failures" -ge 10 ]; then
+                echo "::error::could not read the queue run's status ${failures} times in a row"
+                exit 1
+              fi
+            fi
             [ "$status" = completed ] && break
             sleep 60
           done
@@ -692,7 +720,7 @@ jobs:
           if [ -f queue-results/refused.txt ] && [[ "$(head -n 1 queue-results/refused.txt)" == nightly:* ]]; then
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             echo "::notice::the queue lane does not run for this push: the nightly window"
-            echo "The queue lane will not run for this push: the nightly's GPUs are reserved (02:00-07:00 UTC). Re-run this job after 07:00 UTC." >> "$GITHUB_STEP_SUMMARY"
+            echo "The queue lane will not run for this push: the queue side keeps its GPUs for the nightly while the nightly's window lasts. Re-run this job once the window has passed." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           if [ -f queue-results/refused.txt ]; then
@@ -722,13 +750,18 @@ jobs:
         run: |
           run_id=""
           [ -f "${RUNNER_TEMP}/queue-run-id" ] && run_id=$(cat "${RUNNER_TEMP}/queue-run-id")
-          # The run was dispatched but its id was never found: look once more,
-          # by the same title.
-          if [ -z "$run_id" ]; then
+          # The run was dispatched but its id was not found yet: look for it by the
+          # same title, as long as the main step would have (a run is not listed
+          # at once). Nothing was dispatched without the marker: nothing to look for.
+          if [ -z "$run_id" ] && [ -f "${RUNNER_TEMP}/queue-dispatched" ]; then
             caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
-              --limit 50 --json databaseId,displayTitle |
-              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+            for _ in $(seq 1 36); do
+              run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+                --limit 50 --json databaseId,displayTitle |
+                jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+              [ -n "$run_id" ] && break
+              sleep 5
+            done
           fi
           [ -n "$run_id" ] || exit 0
           gh run cancel "$run_id" || true
