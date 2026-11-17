@@ -1089,6 +1089,49 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         rocm_core::GpuSupportLevel::RocmHip => {
             "default embedded Lemonade server with ROCm llama.cpp backend"
         }
+        // Looked at and inconclusive. Says the same "no ROCm/HIP" fact as the
+        // arm below, but stops short of its claim about Vulkan, because
+        // nothing here established it either way.
+        //
+        // Reached by every caller that passes a real `VulkanStatus`, which is
+        // `rocm examine` *and* `build_codex_bridge_snapshot` (the
+        // `InternalBridgeSnapshot` command and the MCP `bridge_snapshot` tool),
+        // which builds the level from `examine.vulkan_status()` rather than the
+        // cheap `host_gpu_support_level`. The MCP `engines` tool is deliberately
+        // NOT in that list: it goes through `host_gpu_support_level`, which
+        // always passes `VulkanStatus::Unknown`, so it can never land on these
+        // two arms.
+        //
+        // So the advice cannot be "run `rocm examine`": this very note is
+        // rendered *inside* that command's own output, through
+        // `examine_human_report` -> `append_examine_engine_inventory`, and told
+        // its reader to run the command they were already reading. It names the
+        // thing that would actually settle the question instead.
+        //
+        // The claim and the next step are `rocm_core`'s
+        // `VULKAN_UNCONFIRMED_CLAIM` and `VULKAN_UNCONFIRMED_NEXT_STEP`,
+        // spelled out here only because this is a `const fn` returning a
+        // `&'static str` and a constant cannot be interpolated into one.
+        // `the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim`
+        // holds the two in step; both strings appear in the *same* `rocm
+        // examine` report, a few lines apart, so a divergence is visible to the
+        // user immediately.
+        //
+        // In particular this must not say "install a Vulkan driver"
+        // unconditionally: a working Windows Adrenalin machine lands in this
+        // level, since the Khronos key it reads is legacy there. Nor "install
+        // `vulkaninfo`": on a driverless Linux host that tool is already
+        // installed, prints "Found no drivers!" and exits 1, which is another
+        // of the shapes that lands here.
+        rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
+             Vulkan driver is present could not be determined here - run `vulkaninfo` yourself \
+             to see what it reports, and install a Vulkan driver (Mesa RADV on Linux, the AMD \
+             display driver on Windows) if it finds none"
+        }
+        rocm_core::GpuSupportLevel::NoGpuBackend => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
+        }
         rocm_core::GpuSupportLevel::Unknown => {
             "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
         }
@@ -1101,8 +1144,21 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
 /// The same two inputs `rocm examine` derives it from, read through
 /// `detect_host_gpu_summary` rather than the full examine gather — exactly what
 /// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
+///
+/// **The Vulkan probe is deliberately not run here**, so this stays the cheap
+/// probe its callers chose it for: the probe spawns `vulkaninfo` on Linux and
+/// PowerShell on Windows, and `rocm engines` is a listing command that would
+/// pay that on every invocation. Passing [`VulkanStatus::Unknown`] keeps these
+/// surfaces answering exactly as they did before this probe existed — a
+/// Vulkan-capable-by-the-table host still reads `VulkanOnly` — while `rocm
+/// examine`, which already gathers the probe, is the surface that can tell a
+/// host with a Vulkan driver from one without. That split is why
+/// `lemonade_engine_note` sends the user to `rocm examine` for a real answer.
 pub(crate) fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
-    rocm_core::gpu_support_level_for_host_gpu(&rocm_core::detect_host_gpu_summary(paths))
+    rocm_core::gpu_support_level_for_host_gpu(
+        &rocm_core::detect_host_gpu_summary(paths),
+        rocm_core::VulkanStatus::Unknown,
+    )
 }
 
 fn refresh_startup_update_check_quietly() {
@@ -1287,6 +1343,34 @@ pub(crate) mod tests {
         assert_eq!(
             rocm_dash_tui::ui::examine_manager::REPORT_SENDER_NOTICE,
             rocm_core::report_delivery::SENDER_NOTICE
+        );
+    }
+
+    /// The lemonade note and `rocm examine`'s `rocm_support` line both render
+    /// `VulkanUnconfirmed`, and both appear in the same `rocm examine` report a
+    /// few lines apart. They must make the same claim about the host and offer
+    /// the same next step, so both are held against the constants `rocm-core`
+    /// defines; this note spells them out only because a `const fn` returning
+    /// `&'static str` cannot interpolate a constant.
+    ///
+    /// Neither may tell a host to install a Vulkan driver unconditionally: a
+    /// working Windows Adrenalin machine reaches this level, because the
+    /// Khronos registry key the probe reads is legacy there.
+    #[test]
+    fn the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim() {
+        let note = super::lemonade_engine_note(rocm_core::GpuSupportLevel::VulkanUnconfirmed);
+
+        assert!(
+            note.contains(rocm_core::VULKAN_UNCONFIRMED_CLAIM),
+            "the note must make the shared claim verbatim: {note}"
+        );
+        assert!(
+            note.contains(rocm_core::VULKAN_UNCONFIRMED_NEXT_STEP),
+            "and offer the shared next step verbatim: {note}"
+        );
+        assert!(
+            !note.contains("no Vulkan driver was found"),
+            "a level a working Adrenalin laptop reaches must not deny its driver: {note}"
         );
     }
 

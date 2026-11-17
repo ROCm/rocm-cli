@@ -125,26 +125,6 @@ Expected result:
   lines.
 - The active runtime is ready, or the output gives one clear next command.
 
-Then read the same listing as JSON:
-
-```powershell
-rocm runtimes list --json | python -m json.tool
-```
-
-Expected result:
-
-- `python -m json.tool` accepts the output and prints it back. Only stdout
-  enters the pipeline (stderr still shows on the console), so this checks that
-  stdout holds the document alone; a parse error means something else, such as
-  a banner, progress or hint line, reached stdout.
-- The runtime the text form marks `*` has `"active": true`, and it is the only
-  one; the runtime marked `-`, if any, has `"rollback_target": true`.
-- The runtime marked active is the one `rocm examine` reports: its
-  `install_root` is the `active_runtime_root` that `rocm examine` prints.
-- Each runtime's `provenance` object names the same `channel`, `source`,
-  `source_layout_generation` and `device_target` as its `provenance:` line in
-  the text, with `null` where the text shows `unrecorded`.
-
 Optional: an unreadable settings file. Copy `config.json` from the config
 directory aside, cut the original off part-way through, and run `rocm version`
 without `ROCM_CLI_DATA_DIR` set. Expected result:
@@ -343,12 +323,45 @@ checks, which cannot be made anywhere else:
 
 - `rocm examine` shows `detected_gfx_target: gfx90c` with an empty
   `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
-  detected but not supported by ROCm and that the Vulkan backend can still be
-  used. A `<unknown>` target, or a missing `rocm_support` line, means detection
-  regressed. That line is printed on **every** host, at one of three levels —
-  ROCm/HIP-supported, Vulkan-only (this case), or unknown — so on a supported
-  card or a machine with no GPU it must still be there, saying the level that
-  host's hardware implies rather than being absent.
+  detected but not supported by ROCm. A `<unknown>` target, or a missing
+  `rocm_support` line, means detection regressed. That line is printed on
+  **every** host, at one of five levels — ROCm/HIP-supported, Vulkan-only,
+  Vulkan-unconfirmed, no-GPU-backend, or unknown — so on a supported card or a
+  machine with no GPU it must still be there, saying the level that host's
+  hardware implies rather than being absent.
+
+  Which of the three middle levels this machine gets is **not** decided by the
+  gfx table: `rocm examine` probes for a Vulkan driver, so the answer depends on
+  what is installed. This is the check that cannot be made in CI, because no
+  lane has this silicon. Walk it in both directions:
+
+  - With the AMD display driver (Windows) or Mesa RADV (Linux) installed, the
+    line says models can still run through Vulkan and **names the driver**, and
+    `rocm examine --json` shows `summary.vulkan.status` as `available` with the
+    device under `summary.vulkan.devices`. Then actually run
+    `rocm serve <model> --engine lemonade` — the point of the claim is that it
+    is true, and this is the only place it can be confirmed against real
+    hardware.
+  - With the driver removed but `vulkaninfo` still installed, expect the
+    *could-not-confirm* wording on Linux rather than a confirmed absence, and it
+    must **not** still name a driver. This is the known gap recorded on
+    examine-53, measured rather than assumed: a real `vulkaninfo` with no
+    reachable driver prints "Found no drivers!" and exits **1**, and the probe
+    counts only an exit-0 run as having answered, so the host is classed
+    inconclusive. Telling "no drivers" apart from "the tool is broken" needs the
+    loader's own message, which the shared capture discards. Seeing "could not
+    confirm" here is correct, not a regression.
+  - With neither installed, the line says the check could not be made — the same
+    level as the bullet above — and tells you to install a Vulkan driver, while
+    pointing at running `vulkaninfo` yourself to see what it reports. It must
+    **not** say the driver is absent, and it must **not** tell you to *install*
+    `vulkaninfo`: on the host above, that tool is already there, so that advice
+    could never clear the state. The absence claim is the Windows-laptop case
+    ROCMAI-550 came from, and declaring absence there is the regression
+    `VulkanUnconfirmed` exists to prevent.
+
+  A software rasteriser (`lavapipe`, `swiftshader`) must never be reported as a
+  GPU path in any of the three.
 - A plain `rocm install sdk`, with no `--family`, gives the same refusal with
   the wording for a *detected* GPU rather than a requested one.
 - `rocm diagnose` reports `info-20-gpu-no-rocm-support`, naming `gfx90c` and

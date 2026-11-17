@@ -63,14 +63,18 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     ///
-    /// A `rocm_support` line is printed on every host, at one of three
-    /// levels: ROCm/HIP-supported, Vulkan-only, or unknown. Vulkan-only covers
-    /// a GPU that is recognized but has no ROCm build at all (`gfx90c`, the
-    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs), which still
-    /// works through Lemonade's Vulkan backend. Unknown covers both no GPU
-    /// detected and a target this build's catalog does not recognize: those
-    /// are detection gaps, not a verdict on the hardware, which is why an
-    /// empty `compatible_therock_family` does not read as a failed probe.
+    /// A `rocm_support` line is printed on every host, at one of five
+    /// levels: ROCm/HIP-supported, Vulkan-only, Vulkan-unconfirmed, no GPU
+    /// backend, or unknown. The three middle levels are decided by probing for
+    /// a Vulkan driver rather than by the gfx table: a GPU that is recognized
+    /// but has no ROCm build at all (`gfx90c`, the Vega iGPU in Renoir,
+    /// Lucienne, Cezanne and Barcelo APUs) runs through Lemonade's Vulkan
+    /// backend only if a driver is actually installed. Vulkan-unconfirmed means
+    /// the probe could not reach an answer, which is not the same as finding
+    /// none. Unknown covers both no GPU detected and a target this build's
+    /// catalog does not recognize: those are detection gaps, not a verdict on
+    /// the hardware, which is why an empty `compatible_therock_family` does not
+    /// read as a failed probe.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -1011,11 +1015,7 @@ pub(crate) enum RuntimesCommand {
     /// generation and exact GPU target as its manifest recorded them. A fact
     /// recorded nowhere, or recorded blank, is shown as `unrecorded`; nothing
     /// is guessed from other facts.
-    List {
-        /// Print the runtime list as JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
@@ -2163,24 +2163,6 @@ mod tests {
             }) => assert_eq!(runtime, "release-pip-x"),
             other => panic!("expected runtimes activate, got {other:?}"),
         }
-    }
-
-    /// `--json` belongs to `list` alone: bare `rocm runtimes` stays the text
-    /// listing, so a script has to name the subcommand to get JSON.
-    #[test]
-    fn runtimes_json_is_a_list_flag() {
-        for (args, json) in [(&["list", "--json"][..], true), (&["list"][..], false)] {
-            match parse_runtimes(args).expect("runtimes list parses").command {
-                Some(Command::Runtimes {
-                    command: Some(RuntimesCommand::List { json: parsed }),
-                }) => assert_eq!(parsed, json, "{args:?}"),
-                other => panic!("expected runtimes list, got {other:?}"),
-            }
-        }
-        assert!(
-            parse_runtimes(&["--json"]).is_err(),
-            "`rocm runtimes --json` must be rejected, not read as `list --json`"
-        );
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {

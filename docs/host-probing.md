@@ -188,6 +188,32 @@ Proposal: the summary stack's inventory survives and `probe_gpus_windows` builds
 
 Hosts: this pair is native Windows only; on WSL `gpus[]` is already empty (see the host table), so rebuilding it from the inventory changes nothing there. The characterisation test covers an inventory that answers with one AMD adapter, with an AMD and an NVIDIA adapter, with an NVIDIA adapter only, with no adapter, that fails, and that times out, because `None` in the summary and an empty `gpus[]` with a `probe_failures` entry in the examination are different answers to "no adapter" and "could not ask", and the convergence must keep that distinction.
 
+## Vulkan support
+
+Verdict: not a duplicate — only the summary stack reads it — but it is a spawned process on a path that several commands reach, so it belongs in this note.
+
+`detect_vulkan_support` in [vulkan.rs](../crates/rocm-core/src/host_gpu/vulkan.rs) answers two questions: which ICD manifests the loader would find, and which devices actually enumerate.
+
+| | Linux | Windows |
+|---|---|---|
+| ICDs | the manifest directories, read from the filesystem | `powershell` over the Khronos `Drivers` registry keys |
+| Devices | `vulkaninfo --summary` | `vulkaninfo --summary` as well — there is no registry source for devices — but it is rarely on PATH, so this source usually does not answer at all |
+| Timeout | 1.5 s (`OPTIONAL_COMMAND_TIMEOUT`), per candidate spelling | the same 1.5 s, which a cold PowerShell start can exceed |
+| Failure | `None` from `capture_optional_command`, which does not distinguish "not installed" from "timed out" | the same |
+| Lookup ran? | always true: reading directories that may not exist is still a lookup | `false` whenever `powershell` is missing, exits non-zero or times out |
+
+The two sources do not return a bare list. Each arrives as a `VulkanEvidence<T>` — `VulkanEvidence<String>` for the ICD manifests, `VulkanEvidence<VulkanDevice>` for the enumerated devices — whose `did_answer()` is whether that source *answered* at all, as opposed to answering with nothing. The last row of the table is the ICD side of that; `vulkan_devices_from_capture` is the `vulkaninfo` side, mapping a `None` capture to `VulkanEvidence::unanswered()`. The two monomorphizations are distinct types, so passing one source's evidence where the other belongs is a compile error rather than a silent status flip. `classify_vulkan_support` reads them as the local bindings `icds_listed` and `enumerated`.
+
+What it does with them: `vulkaninfo` must have answered before any empty-or-software result may be reported as a confirmed `VulkanStatus::Absent`, because neither the Linux directory list nor the Windows Khronos key is exhaustive and so neither can deny a driver on its own. Where nothing at all was found, the ICD listing must have answered too — an empty `icds` is also what a PowerShell read that failed or timed out produces. Anything short of that is `Inconclusive`. On a platform that is neither Linux nor Windows both flags are `false` — there is nothing to read there — though the classifier never consults them, since `vulkan_is_probeable()` returns `Unknown` first.
+
+A driver the ICD listing *did* find is also evidence in the other direction: a host carrying `radeon_icd.x86_64.json` whose `vulkaninfo` enumerates only `llvmpipe` (the ordinary shape of a missing `render`-group membership) is `DriverPresentDevicesUnverified`, not `Absent`. Denying the driver there would print "no Vulkan GPU driver was found - install one" beside the `icds` field naming the driver that is already installed.
+
+Who pays it. The probe runs once per full gather, so every caller of `ExamineSummary::gather` pays one: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'s host snapshot, MCP and sandbox paths. It is deliberately *not* run by the lean scope, `gather_without_driver_facts`, which the runtime-install finalizer uses to read the GPU target and nothing else; that scope leaves `vulkan` as `None` and `vulkan_status` reports `Unknown`. `the_summary_without_driver_facts_does_not_probe_vulkan` pins that, so restoring an unconditional probe fails a test rather than quietly adding a process to the install path.
+
+What a user can see: on a Windows host whose PowerShell start is slower than 1.5 s, the probe times out and the host reads Vulkan-unconfirmed rather than Vulkan-capable. It is no longer told the *same thing* as a host with a genuinely empty registry key, which is what `icds_listed` buys: the timed-out host is told the driver list could not be read, never that no driver was found, and it can no longer reach `Absent` at all. The collapse that remains is inside `capture_optional_command`, which still cannot say *which* failure it was ("not installed" and "timed out" are one `None`), so the sentence names the possibilities rather than the cause. `windows_icds_from_capture` is the pure seam where that `None` is turned into "did not answer", and it is unit-tested on every platform.
+
+What the Windows ICD path's tests do and do not reach, stated exactly, because an overstated coverage claim is what leaves a gap nobody goes looking for. `windows_icds_through` takes the subprocess as an argument, so the program name, the flags and the script handed to PowerShell — and what the resulting capture becomes, all the way through `classify_vulkan_support` — are driven from every lane by `the_windows_registry_lookup_runs_the_khronos_script_through_powershell`. The one step no test in this repository executes is starting the process: nothing calls `detect_icds` on Windows, so the `windows-build-and-test` job *compiles* that call without ever running it. What that leaves uncovered is PowerShell's own behaviour on a real host — the script's output encoding, an execution policy that blocks it, a cold start past the 1.5 s timeout. All three arrive as a `None`, which the seam routes to `Inconclusive`, so the untested step can make the answer less useful but not false.
+
 ## Marketing name to gfx target
 
 Verdict: confirmed duplicate, but not equivalent. The two cover different names.

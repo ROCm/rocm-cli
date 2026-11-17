@@ -6,18 +6,112 @@
 
 use super::ExamineSummary;
 use super::os_facts::format_gib_value;
-use crate::gfx_target::{GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level};
+use super::vulkan::VulkanStatus;
+use crate::gfx_target::{GpuSupportLevel, gpu_support_level};
 
 impl ExamineSummary {
+    /// What the Vulkan probe found, or [`VulkanStatus::Unknown`] when this
+    /// summary carries no probe result — an older host's JSON read back by
+    /// `rocm remote doctor`, or a caller that built the struct by hand.
+    ///
+    /// Public because the `rocm` binary classifies its own support level from a
+    /// summary it already gathered, and must read the probe result the same way
+    /// this module does rather than reaching into the field and inventing its
+    /// own `None` handling.
+    #[must_use]
+    pub fn vulkan_status(&self) -> VulkanStatus {
+        self.vulkan
+            .as_ref()
+            .map_or(VulkanStatus::Unknown, |vulkan| vulkan.status)
+    }
+
+    /// The `vulkan` line: the status, and the evidence behind it.
+    fn vulkan_line(&self) -> String {
+        let Some(vulkan) = self.vulkan.as_ref() else {
+            return "<not probed>".to_owned();
+        };
+        // `VulkanStatus::as_str`, not a second table here: this word and the
+        // one `--json` prints are the same status, and a local mapping lets the
+        // two renderings of one report drift apart silently.
+        let status = vulkan.status.as_str();
+        vulkan.detail.as_deref().map_or_else(
+            || status.to_owned(),
+            |detail| format!("{status} ({detail})"),
+        )
+    }
+
+    /// Whether this summary's own evidence already contradicts "install a
+    /// Vulkan driver".
+    ///
+    /// `DriverSummary::status` only ever reads `AMD_DISPLAY_DRIVER_DETECTED`
+    /// on Windows — `windows_driver_summary` is the sole producer of that word
+    /// — so matching on it *is* the Windows cross-check, with no second read
+    /// of `os` to keep in step with it. On that platform the display driver
+    /// carries the Vulkan ICD, so its presence contradicts that advice: the
+    /// report would print `driver_status: amd_display_driver_detected` a few
+    /// lines above a sentence telling the reader to go and install what it
+    /// names.
+    ///
+    /// The cross-check is Windows-only for that reason, and not by accident:
+    /// Linux's `driver_status` reports the `amdgpu` kernel module, which says
+    /// nothing about whether a userspace ICD such as Mesa RADV is installed,
+    /// so suppressing the install advice there would withhold the one step
+    /// that can help.
+    ///
+    /// One predicate rather than a test spelled out in each arm that gives
+    /// install advice. Two arms now need it — `VulkanUnconfirmed` and
+    /// `NoGpuBackend` — and the second one shipped without it precisely
+    /// because the first one's check lived inside that first one's `match`
+    /// arm. Each arm's own test pins its half:
+    /// `examine_render_does_not_tell_a_windows_host_to_install_the_driver_it_has`
+    /// and
+    /// `examine_render_does_not_tell_a_no_backend_windows_host_to_install_the_driver_it_has`.
+    fn install_advice_is_contradicted_by_the_driver(&self) -> bool {
+        self.driver.status == super::AMD_DISPLAY_DRIVER_DETECTED
+    }
+
+    /// What a [`GpuSupportLevel::VulkanUnconfirmed`] host is told to do next.
+    fn vulkan_unconfirmed_next_step(&self) -> &'static str {
+        if self.install_advice_is_contradicted_by_the_driver() {
+            crate::gfx_target::VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER
+        } else {
+            crate::gfx_target::VULKAN_UNCONFIRMED_NEXT_STEP
+        }
+    }
+
+    /// What a [`GpuSupportLevel::NoGpuBackend`] host is told to do next.
+    ///
+    /// The unconditional branch is the whole story on a host with nothing
+    /// installed: both halves of the level are established facts, there is
+    /// nothing left to go and find out, and installing a driver is the one
+    /// thing that can clear it.
+    ///
+    /// The other branch is a Windows host that already has the driver that
+    /// sentence names. Its probe answered — `VulkanStatus::Absent` is never
+    /// reached without `vulkaninfo`'s answer behind it — so "run `vulkaninfo`"
+    /// is not left either, the way it is under `VulkanUnconfirmed`. What is
+    /// left is the display driver itself: it is installed and is exposing no
+    /// Vulkan GPU device here, which a repair or update of that driver can
+    /// change and a fresh install cannot.
+    fn no_gpu_backend_next_step(&self) -> &'static str {
+        if self.install_advice_is_contradicted_by_the_driver() {
+            "the AMD display driver is installed (see `driver_status`) but is exposing no Vulkan \
+             GPU device here, so repairing or updating it is the step that could open one"
+        } else {
+            "install one (Mesa RADV on Linux, the AMD display driver on Windows) to run models on \
+             this GPU"
+        }
+    }
+
     /// The `rocm_support` line of the examine text.
     ///
     /// ROCMAI-550 asks `rocm examine` to "report the support level with one
     /// line of what the user can do", so every level gets a line — including
-    /// the ones where the answer is "this build cannot tell". The earlier draft
-    /// printed only the `VulkanOnly` line, which made this report unable to
-    /// answer the very question the other surfaces send people here to ask:
-    /// `lemonade_engine_note` in `apps/rocm/src/main.rs` tells an `Unknown`
-    /// host to run `rocm examine`, and silence there is not an answer.
+    /// the ones where the answer is "this build cannot tell". Printing only the
+    /// `VulkanOnly` line leaves this report unable to answer the very question
+    /// the other surfaces send people here to ask: `lemonade_engine_note` in
+    /// `apps/rocm/src/main.rs` tells an `Unknown` host to run `rocm examine`,
+    /// and silence there is not an answer.
     ///
     /// Without the `VulkanOnly` line specifically,
     /// `compatible_therock_family: <unknown>` reads like a probe failure when
@@ -34,14 +128,95 @@ impl ExamineSummary {
     /// blank line.
     fn rocm_support_line(&self) -> String {
         let detected = self.detected_gfx_target.as_deref();
-        match gpu_support_level(detected, self.compatible_therock_family.as_deref()) {
+        let vulkan = self.vulkan_status();
+        match gpu_support_level(detected, self.compatible_therock_family.as_deref(), vulkan) {
             // `VulkanOnly` is only ever returned for a detected target, so the
             // fallback below is unreachable; it keeps the arm total without a
             // panic path.
+            //
+            // The claim is graded by what the probe actually established. An
+            // enumerated device is named, because naming it is what lets the
+            // reader check the claim rather than take it; an installed-but-
+            // unenumerated driver says so instead of borrowing the stronger
+            // sentence; and a platform that could not be probed admits it. All
+            // three still point at the same command, because all three are
+            // hosts worth trying.
             GpuSupportLevel::VulkanOnly => format!(
-                "  rocm_support: GPU detected ({}) but {VULKAN_ONLY_SUPPORT_CLAIM} - \
-                 serve on it with `rocm serve <model> --engine lemonade`\n",
-                detected.unwrap_or_default()
+                "  rocm_support: GPU detected ({}) but not supported by ROCm; {} - serve on it \
+                 with `rocm serve <model> --engine lemonade`\n",
+                detected.unwrap_or_default(),
+                match vulkan {
+                    VulkanStatus::Available => self.vulkan.as_ref().map_or_else(
+                        || "the Vulkan backend can be used".to_owned(),
+                        |support| support.driver_label().map_or_else(
+                            || "the Vulkan backend can be used".to_owned(),
+                            |driver| format!("the Vulkan backend can be used ({driver})"),
+                        ),
+                    ),
+                    VulkanStatus::DriverPresentDevicesUnverified =>
+                        "a Vulkan driver is installed, so the Vulkan backend is expected to work"
+                            .to_owned(),
+                    VulkanStatus::Unknown =>
+                        "Vulkan was not probed on this platform, so the Vulkan backend is \
+                         unconfirmed"
+                            .to_owned(),
+                    // Unreachable: `gpu_support_level` routes `Inconclusive` to
+                    // `VulkanUnconfirmed` and `Absent` to `NoGpuBackend`, so
+                    // neither can arrive under `VulkanOnly`. Kept spelled out
+                    // rather than folded into a `_` so that adding a
+                    // `VulkanStatus` stays a compile error here, and worded
+                    // hedged rather than promising so that a future routing
+                    // change cannot silently resurrect the claim this level
+                    // exists to stop making.
+                    VulkanStatus::Inconclusive | VulkanStatus::Absent =>
+                        "the Vulkan backend is unconfirmed".to_owned(),
+                }
+            ),
+            // Looked at and nothing settled either way. Says the probe could
+            // not determine it and how to settle it, rather than promising a
+            // backend or declaring one absent — neither of which the evidence
+            // supports. See `GpuSupportLevel::VulkanUnconfirmed`.
+            //
+            // The claim comes from `VULKAN_UNCONFIRMED_CLAIM` because
+            // `lemonade_engine_note` renders the same level a few lines further
+            // down the same report; one constant is what keeps the two from
+            // contradicting each other.
+            //
+            // The next step is cross-checked against `driver.status`, the one
+            // other fact on this summary that bears on it. On Windows the AMD
+            // display driver *is* the Vulkan driver, so a host that already has
+            // it must not be told to install one — the exact misdirection this
+            // level exists to avoid, reached through its own advice. The
+            // cross-check is Windows-only: Linux's `driver_status` reports the
+            // `amdgpu` kernel module, which says nothing about whether a
+            // userspace ICD is installed.
+            GpuSupportLevel::VulkanUnconfirmed => format!(
+                "  rocm_support: GPU detected ({}) but not supported by ROCm; {} - {}\n",
+                detected.unwrap_or_default(),
+                crate::gfx_target::VULKAN_UNCONFIRMED_CLAIM,
+                self.vulkan_unconfirmed_next_step(),
+            ),
+            // Both halves are established facts: the catalog confirmed there is
+            // no ROCm build, and the probe looked for a Vulkan driver and found
+            // none. Unlike `VulkanUnconfirmed` above, there is nothing left to
+            // go and find out on this host. Only `Absent` reaches this level —
+            // `gpu_support_level` routes the probed-but-inconclusive host to
+            // `VulkanUnconfirmed` precisely so that this sentence is never said
+            // to one.
+            //
+            // The next step is cross-checked against `driver.status` for the
+            // same reason `VulkanUnconfirmed`'s is, and through the same
+            // predicate: a Windows host whose report already says
+            // `driver_status: amd_display_driver_detected` must not be told, a
+            // few lines below, to install the driver it is showing. The
+            // confirmed absence itself is unaffected — the probe did look and
+            // did find no Vulkan GPU device — only what the host can do about
+            // it differs.
+            GpuSupportLevel::NoGpuBackend => format!(
+                "  rocm_support: GPU detected ({}) but not supported by ROCm, and no Vulkan GPU \
+                 driver was found - {}\n",
+                detected.unwrap_or_default(),
+                self.no_gpu_backend_next_step(),
             ),
             // The covering family is the fact; it is already printed on its own
             // line above, so this one says what it means rather than repeating
@@ -201,7 +376,7 @@ impl ExamineSummary {
             "false (this run's output is captured, so the CLI will not prompt)"
         };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n{}  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_librocdxg_on_ld_library_path: {}\n  wsl_librocdxg_beside_runtime: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n{}  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  vulkan: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n{}  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_librocdxg_on_ld_library_path: {}\n  wsl_librocdxg_beside_runtime: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n{}  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -219,6 +394,7 @@ impl ExamineSummary {
             self.detected_therock_family
                 .as_deref()
                 .unwrap_or("<not detected>"),
+            self.vulkan_line(),
             self.driver.policy,
             self.driver.status,
             self.driver.detail.as_deref().unwrap_or("<unknown>"),
@@ -282,8 +458,8 @@ mod tests {
     use super::*;
     use crate::LegacyRocmSummary;
     use crate::gfx_target::normalize_therock_family;
-    use crate::host_gpu::DriverSummary;
     use crate::host_gpu::tests::windows_summary_with_driver;
+    use crate::host_gpu::{DriverSummary, VulkanDevice, VulkanSupport};
     use std::path::PathBuf;
 
     #[test]
@@ -300,6 +476,7 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: Some("gfx120X-all".to_owned()),
             detected_therock_family: None,
+            vulkan: None,
             driver: DriverSummary {
                 policy: "windows_validate_only".to_owned(),
                 status: "amd_display_driver_detected".to_owned(),
@@ -380,6 +557,7 @@ mod tests {
             detected_gfx_target: detected_gfx_target.map(str::to_owned),
             compatible_therock_family: compatible_therock_family.map(str::to_owned),
             detected_therock_family: None,
+            vulkan: None,
             driver: DriverSummary {
                 policy: "windows_validate_only".to_owned(),
                 status: "amd_display_driver_detected".to_owned(),
@@ -403,12 +581,41 @@ mod tests {
         }
     }
 
+    /// A gfx90c summary carrying the given Vulkan evidence.
+    ///
+    /// gfx90c is detected from its PCI ID but has no ROCm package family, so it
+    /// is the target that reaches the Vulkan-graded arms at all.
+    fn gfx90c_summary_with_vulkan(vulkan: Option<VulkanSupport>) -> ExamineSummary {
+        let family = normalize_therock_family("gfx90c");
+        let mut summary = examine_summary_with_gpu(Some("gfx90c"), family.as_deref());
+        summary.vulkan = vulkan;
+        summary
+    }
+
+    fn vulkan_support(status: VulkanStatus, detail: &str) -> Option<VulkanSupport> {
+        Some(VulkanSupport {
+            status,
+            detail: Some(detail.to_owned()),
+            devices: vec![VulkanDevice {
+                name: "AMD Radeon Graphics (RADV RENOIR)".to_owned(),
+                driver_name: Some("radv".to_owned()),
+                vendor_id: Some("0x1002".to_owned()),
+                device_type: Some("PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU".to_owned()),
+                ..VulkanDevice::default()
+            }],
+            ..VulkanSupport::default()
+        })
+    }
+
     #[test]
     fn examine_render_says_a_gpu_without_a_rocm_family_is_unsupported() {
-        // gfx90c is detected from its PCI ID but has no ROCm package family.
-        let family = normalize_therock_family("gfx90c");
-        let summary = examine_summary_with_gpu(Some("gfx90c"), family.as_deref());
+        let summary = gfx90c_summary_with_vulkan(vulkan_support(
+            VulkanStatus::Available,
+            "AMD Radeon Graphics (RADV RENOIR) through radv",
+        ));
+
         let rendered = summary.render_text();
+
         assert!(
             rendered.contains("detected_gfx_target: gfx90c"),
             "{rendered}"
@@ -418,15 +625,19 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("the Vulkan backend can still be used"),
-            "{rendered}"
+            rendered.contains("the Vulkan backend can be used (radv)"),
+            "a confirmed device must be named, so the claim can be checked: {rendered}"
+        );
+        assert!(
+            rendered.contains("vulkan: available"),
+            "the evidence line must carry the verdict too: {rendered}"
         );
         // AGENTS.md §3: advice naming a command is asserted together with the
-        // behaviour. Saying the Vulkan backend "can still be used" without
-        // naming how to use it leaves the user where they started, so the
-        // command is part of the claim, not decoration — without this
-        // assertion the recommendation could be deleted or garbled and this
-        // test would still pass.
+        // behaviour. Saying the Vulkan backend "can be used" without naming
+        // how to use it leaves the user where they started, so the command is
+        // part of the claim, not decoration — without this assertion the
+        // recommendation could be deleted or garbled and this test would still
+        // pass.
         //
         // That the named command *parses* (the subcommand exists and accepts
         // `--engine lemonade`) is proved mechanically rather than here:
@@ -441,16 +652,314 @@ mod tests {
         );
     }
 
+    /// The defect this guards against: promising "the Vulkan backend can still
+    /// be used" on every gfx90c host, from the gfx table alone. That sends a
+    /// Renoir laptop with no Vulkan driver installed to serve a model on a
+    /// backend that cannot start — and under the GPU-required policy there is
+    /// nothing for it to fall back to.
+    #[test]
+    fn examine_render_does_not_promise_vulkan_on_a_host_that_has_none() {
+        let mut summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+            status: VulkanStatus::Absent,
+            detail: Some("no Vulkan driver found".to_owned()),
+            ..VulkanSupport::default()
+        }));
+        // The shared fixture is a Windows host carrying
+        // `AMD_DISPLAY_DRIVER_DETECTED`, which is the one state where "install
+        // one" is the wrong advice (see
+        // `examine_render_does_not_tell_a_no_backend_windows_host_to_install_the_driver_it_has`).
+        // This test is about the host that genuinely has nothing, so it plants
+        // that host rather than asserting the install sentence on a summary
+        // whose own `driver_status` line contradicts it.
+        summary.os = "linux".to_owned();
+        summary.driver = DriverSummary {
+            policy: "amdgpu_dkms".to_owned(),
+            status: "amdgpu_module_loaded".to_owned(),
+            detail: None,
+            windows: None,
+        };
+
+        let rendered = summary.render_text();
+
+        assert!(
+            !rendered.contains("the Vulkan backend can be used"),
+            "a host with no Vulkan driver must not be promised one: {rendered}"
+        );
+        assert!(
+            rendered.contains("no Vulkan GPU driver was found"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("install one"),
+            "the advice must be able to clear the condition it is printed for: {rendered}"
+        );
+        assert!(rendered.contains("vulkan: absent"), "{rendered}");
+    }
+
+    /// An installed driver that enumerated no device is a weaker claim than a
+    /// device that answered, and says so rather than borrowing the stronger
+    /// sentence.
+    #[test]
+    fn examine_render_separates_an_installed_driver_from_a_confirmed_device() {
+        let summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+            status: VulkanStatus::DriverPresentDevicesUnverified,
+            detail: Some("Mesa RADV is installed, but no device was enumerated".to_owned()),
+            ..VulkanSupport::default()
+        }));
+
+        let rendered = summary.render_text();
+
+        assert!(
+            rendered.contains("a Vulkan driver is installed, so the Vulkan backend is expected"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("vulkan: driver_present_devices_unverified"),
+            "{rendered}"
+        );
+    }
+
+    /// A summary with no probe result at all — an older host's JSON read back
+    /// through `rocm remote doctor` — must not read as "no Vulkan". It keeps
+    /// the Vulkan advice, because withholding the only path such a host has on
+    /// the strength of a probe that never ran would be worse than the
+    /// assumption this change replaces.
+    #[test]
+    fn examine_render_treats_an_unprobed_summary_as_unconfirmed_not_absent() {
+        let summary = gfx90c_summary_with_vulkan(None);
+
+        let rendered = summary.render_text();
+
+        assert!(rendered.contains("vulkan: <not probed>"), "{rendered}");
+        assert!(
+            rendered.contains("the Vulkan backend is unconfirmed"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("no Vulkan GPU driver was found"),
+            "an unprobed host is not a host without Vulkan: {rendered}"
+        );
+        assert!(
+            rendered.contains("rocm serve <model> --engine lemonade"),
+            "it is still worth trying, so the command stays: {rendered}"
+        );
+    }
+
+    /// The motivating case, and the one nothing rendered: a host that **was**
+    /// probed and showed nothing either way — no ICD, no enumerated device, and
+    /// no `vulkaninfo` to ask. On Windows the Khronos `Drivers` key is legacy
+    /// and `vulkaninfo` is rarely on PATH, so a working Adrenalin laptop (the
+    /// machine ROCMAI-550 was reported from) lands here.
+    ///
+    /// `gfx_target.rs` pins that the classifier turns this into
+    /// `VulkanUnconfirmed`; this pins what the user actually reads, which is the
+    /// half that can go wrong on its own. Both directions are asserted: it must
+    /// not promise a backend, and it must not declare one absent either.
+    #[test]
+    fn examine_render_hedges_a_host_that_was_probed_and_showed_nothing() {
+        // Built directly rather than through `vulkan_support`, which plants an
+        // AMD device: an enumerated device is the one thing this state cannot
+        // have, and a fixture that contradicts its own status proves nothing.
+        let summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+            status: VulkanStatus::Inconclusive,
+            detail: Some(
+                "no installed Vulkan driver was listed, and `vulkaninfo` could not confirm \
+                 anything either (not installed, or it failed to run), so nothing here shows \
+                 whether a driver is present"
+                    .to_owned(),
+            ),
+            ..VulkanSupport::default()
+        }));
+
+        let rendered = summary.render_text();
+
+        assert!(
+            rendered.contains(crate::gfx_target::VULKAN_UNCONFIRMED_CLAIM),
+            "it must say the probe could not settle it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("the Vulkan backend can be used"),
+            "nothing here established a Vulkan path: {rendered}"
+        );
+        assert!(
+            !rendered.contains("and no Vulkan GPU driver was found - install one"),
+            "and nothing established its absence either, so the confirmed-absence \
+             sentence must not be used: {rendered}"
+        );
+        assert!(rendered.contains("vulkan: inconclusive"), "{rendered}");
+    }
+
+    /// The Windows machine this level exists for: the Khronos `Drivers` key it
+    /// reads is legacy and `vulkaninfo` is rarely on PATH, so an **Adrenalin
+    /// laptop with a working Vulkan driver** lands in `VulkanUnconfirmed`.
+    /// Telling it to install the AMD display driver is advice it has already
+    /// taken, and nothing it does can clear the state.
+    ///
+    /// `driver_status` is the summary's own evidence against that advice, and
+    /// on Windows the display driver carries the Vulkan ICD, so its presence is
+    /// decisive. The line must say so instead, and still name the one step that
+    /// can settle the question.
+    #[test]
+    fn examine_render_does_not_tell_a_windows_host_to_install_the_driver_it_has() {
+        let mut summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+            status: VulkanStatus::Inconclusive,
+            detail: Some("the legacy Khronos key listed nothing".to_owned()),
+            ..VulkanSupport::default()
+        }));
+        summary.os = "windows".to_owned();
+        summary.driver = DriverSummary {
+            policy: "windows_validate_only".to_owned(),
+            status: super::super::AMD_DISPLAY_DRIVER_DETECTED.to_owned(),
+            detail: Some("AMD display driver 31.0.21925.1001".to_owned()),
+            windows: None,
+        };
+
+        let rendered = summary.render_text();
+        let support = rendered
+            .lines()
+            .find(|line| line.contains("rocm_support:"))
+            .expect("every host gets a support line");
+
+        assert!(
+            !support.contains("install a Vulkan driver"),
+            "this host already has the driver that would be installed: {support}"
+        );
+        assert!(
+            support.contains("the AMD display driver is installed"),
+            "and it is owed the reason that advice does not apply: {support}"
+        );
+        assert!(
+            support.contains("run `vulkaninfo`"),
+            "the one step that can still settle it must stay: {support}"
+        );
+        assert!(
+            support.contains(crate::gfx_target::VULKAN_UNCONFIRMED_CLAIM),
+            "the claim is the same on both platforms; only the next step differs: {support}"
+        );
+
+        // The Linux shape of the same status, which is what makes the two halves
+        // a discrimination rather than one assertion twice. `driver` has to be
+        // overwritten explicitly: the shared fixture is a Windows host and
+        // already carries `AMD_DISPLAY_DRIVER_DETECTED`, so reusing it unchanged
+        // would re-enter the branch above and assert nothing about Linux.
+        //
+        // There `driver_status` reports the `amdgpu` kernel module, which says
+        // nothing about whether a userspace ICD such as Mesa RADV is installed,
+        // so the install advice is the true one and must survive.
+        let mut linux = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+            status: VulkanStatus::Inconclusive,
+            detail: Some("no ICD manifest was found".to_owned()),
+            ..VulkanSupport::default()
+        }));
+        linux.os = "linux".to_owned();
+        linux.driver = DriverSummary {
+            policy: "amdgpu_dkms".to_owned(),
+            status: "amdgpu_module_loaded".to_owned(),
+            detail: None,
+            windows: None,
+        };
+        let linux = linux.render_text();
+        assert!(
+            linux.contains(crate::gfx_target::VULKAN_UNCONFIRMED_NEXT_STEP),
+            "a host with no display-driver evidence still gets the install step: {linux}"
+        );
+        assert!(
+            !linux.contains("the AMD display driver is installed"),
+            "and must not be told about a Windows driver it cannot have: {linux}"
+        );
+    }
+
+    /// The same misdirection one level down, and the one the
+    /// `VulkanUnconfirmed` cross-check above did not stop: a Windows host whose
+    /// report prints `driver_status: amd_display_driver_detected` must not be
+    /// told, a few lines higher in the same output, to install the AMD display
+    /// driver.
+    ///
+    /// `NoGpuBackend` keeps the confirmed absence — the probe did look and did
+    /// find no Vulkan GPU device, and that is not in question here — but the
+    /// *advice* has to be one the host can act on, and "install the driver you
+    /// are already showing" is not. `vulkaninfo` is not offered as the next
+    /// step either, unlike under `VulkanUnconfirmed`: reaching `Absent` takes
+    /// `vulkaninfo`'s own answer, so that question is already settled.
+    ///
+    /// Both directions are asserted, against the two hosts that differ only in
+    /// `driver_status`, so an arm that dropped the cross-check again fails here
+    /// rather than passing on the Linux half alone.
+    #[test]
+    fn examine_render_does_not_tell_a_no_backend_windows_host_to_install_the_driver_it_has() {
+        let absent = || {
+            Some(VulkanSupport {
+                status: VulkanStatus::Absent,
+                detail: Some("no Vulkan driver found".to_owned()),
+                ..VulkanSupport::default()
+            })
+        };
+        // The shared fixture is already a Windows host carrying
+        // `AMD_DISPLAY_DRIVER_DETECTED` — the exact summary this arm shipped
+        // being rendered against, and the reason the omission was invisible.
+        let windows = gfx90c_summary_with_vulkan(absent());
+        assert_eq!(
+            windows.driver.status,
+            super::super::AMD_DISPLAY_DRIVER_DETECTED,
+            "this test is only a discrimination while the fixture it reuses is the \
+             display-driver host"
+        );
+        let windows = windows.render_text();
+        let support = windows
+            .lines()
+            .find(|line| line.contains("rocm_support:"))
+            .expect("every host gets a support line");
+
+        assert!(
+            windows.contains("driver_status: amd_display_driver_detected"),
+            "the contradiction this guards against is between two lines of one report: {windows}"
+        );
+        assert!(
+            !support.contains("install one"),
+            "this host already has the driver that sentence names: {support}"
+        );
+        assert!(
+            support.contains("repairing or updating it"),
+            "and it is owed the step that can actually open a GPU path: {support}"
+        );
+        assert!(
+            support.contains("no Vulkan GPU driver was found"),
+            "the confirmed absence itself is unchanged; only the advice is: {support}"
+        );
+        assert!(
+            !support.contains("run `vulkaninfo`"),
+            "`Absent` already has `vulkaninfo`'s answer behind it, so there is nothing \
+             left to ask it: {support}"
+        );
+
+        // The Linux shape of the same status: `driver_status` there reports the
+        // `amdgpu` kernel module, which says nothing about a userspace ICD, so
+        // the install advice is true and must survive.
+        let mut linux = gfx90c_summary_with_vulkan(absent());
+        linux.os = "linux".to_owned();
+        linux.driver = DriverSummary {
+            policy: "amdgpu_dkms".to_owned(),
+            status: "amdgpu_module_loaded".to_owned(),
+            detail: None,
+            windows: None,
+        };
+        let linux = linux.render_text();
+        assert!(
+            linux.contains("install one (Mesa RADV on Linux, the AMD display driver on Windows)"),
+            "a host with no display-driver evidence still gets the install step: {linux}"
+        );
+        assert!(
+            !linux.contains("repairing or updating it"),
+            "and must not be told about a Windows driver it cannot have: {linux}"
+        );
+    }
+
     /// An unmapped target must not be *claimed* unsupported, even though every
     /// host now gets a `rocm_support` line.
     ///
-    /// This replaces `examine_render_omits_the_support_note_for_supported_or_missing_gpus`,
-    /// which asserted the line was absent for supported, missing and unmapped
-    /// GPUs. ROCMAI-550 deliberately reverses the absence: silence could not
-    /// answer the question `lemonade_engine_note` sends users here to ask. The
-    /// half of that test worth keeping is the discrimination it protected —
-    /// "no ROCm build" is a fact about gfx90c, and a gap in this catalog is not
-    /// the same claim about gfx803.
+    /// Every host gets the line, so what this protects is the discrimination
+    /// rather than the silence: "no ROCm build" is a fact about gfx90c, and a
+    /// gap in this catalog is not the same claim about gfx803.
     #[test]
     fn examine_render_never_claims_an_unmapped_target_is_unsupported() {
         for (gfx, family) in [
@@ -594,6 +1103,7 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
+            vulkan: None,
             driver: DriverSummary {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
@@ -649,6 +1159,7 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
+            vulkan: None,
             driver: DriverSummary {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
@@ -749,7 +1260,7 @@ mod tests {
             .find(|l| l.trim_start().starts_with("rocm_support:"))
             .expect("every host gets a support line");
         assert_eq!(
-            gpu_support_level(None, None),
+            gpu_support_level(None, None, VulkanStatus::Unknown),
             GpuSupportLevel::Unknown,
             "precondition: nothing detected is the Unknown tier"
         );

@@ -137,7 +137,9 @@ pub use fix::{
     list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
-    GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level, gpu_support_level_for_host_gpu,
+    GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, VULKAN_UNCONFIRMED_CLAIM,
+    VULKAN_UNCONFIRMED_NEXT_STEP, VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER,
+    gpu_support_level, gpu_support_level_for_host_gpu,
 };
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
@@ -146,10 +148,11 @@ pub use gfx_target::{
 pub use hardware_root::host_path;
 pub use host_gpu::ldconfig_cache;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
-    WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
-    detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
-    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
+    DriverSummary, ExamineSummary, HostGpuSummary, VulkanDevice, VulkanEvidence, VulkanStatus,
+    VulkanSupport, WSL_ROCDXG_READY, WindowsGpuListing, WslHostDriverProbe, WslSummary,
+    default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
+    detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
+    detect_system_ram_gib, detect_vulkan_support, has_usable_amd_gpu, is_amdgpu_device,
     is_wsl_host, pinned_gpu_name, preferred_serve_engine_for_host_gpu_summary,
     usable_amd_gpu_indices, windows_amd_gpu_listing,
 };

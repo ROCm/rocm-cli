@@ -54,6 +54,7 @@ mod gpu_visibility;
 pub(crate) mod linux;
 mod os_facts;
 mod render;
+mod vulkan;
 mod windows_inventory;
 mod wsl;
 
@@ -73,6 +74,11 @@ pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
+pub use vulkan::{
+    VulkanDevice, VulkanEvidence, VulkanStatus, VulkanSupport, amd_icd_driver_label,
+    classify_vulkan_support, detect_vulkan_support, icd_driver_label, icd_is_gpu_driver,
+    parse_vulkaninfo_summary, parse_windows_vulkan_icd_listing, windows_icds_from_capture,
+};
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
 use windows_inventory::parse_windows_examine_inventory;
@@ -134,6 +140,15 @@ pub struct ExamineSummary {
     pub compatible_therock_family: Option<String>,
     #[serde(default)]
     pub detected_therock_family: Option<String>,
+    /// What the Vulkan probe found, when it could run.
+    ///
+    /// `#[serde(default)]` is load-bearing in the *reverse* direction: `rocm
+    /// remote doctor` deserializes summaries produced by other hosts, which may
+    /// be running a build from before this field existed. `None` means "not
+    /// probed", which [`ExamineSummary::vulkan_status`] maps to
+    /// [`VulkanStatus::Unknown`] — never to "no Vulkan".
+    #[serde(default)]
+    pub vulkan: Option<VulkanSupport>,
     pub driver: DriverSummary,
     pub legacy_rocm: LegacyRocmSummary,
     #[serde(default)]
@@ -247,17 +262,29 @@ impl ExamineSummary {
         Self::gather_scoped(true, Some(&examination.kernel_release))
     }
 
-    /// The host summary without the Windows driver version and date, for a
-    /// caller that reads neither. On an AMD Windows host that skips the
-    /// PowerShell video-controller query `gather` adds for them; the GPU
-    /// target, CPU, RAM and every other field are the same.
+    /// The host summary without the probes that spawn a process purely to
+    /// describe the host, for a caller that reads none of their fields: the
+    /// Windows driver version and date, and the Vulkan probe.
+    ///
+    /// On an AMD Windows host that skips the PowerShell video-controller query
+    /// `gather` adds for the driver facts, and on every platform it skips the
+    /// `vulkaninfo` (or Windows registry) read behind [`vulkan`](Self::vulkan),
+    /// which is left `None` — "not probed", which
+    /// [`vulkan_status`](Self::vulkan_status) maps to [`VulkanStatus::Unknown`]
+    /// and never to "no Vulkan". The GPU target, CPU, RAM and every other field
+    /// are the same.
     pub fn gather_without_driver_facts() -> Result<Self> {
         Self::gather_scoped(false, None)
     }
 
-    fn gather_scoped(driver_facts: bool, examined_kernel: Option<&str>) -> Result<Self> {
+    /// `host_probes` buys the fields that cost a spawned process to describe
+    /// the host — the Windows driver facts and the Vulkan probe. It is not a
+    /// detail of either one: a caller that wants neither must pay for neither,
+    /// which is what [`gather_without_driver_facts`](Self::gather_without_driver_facts)
+    /// is for.
+    fn gather_scoped(host_probes: bool, examined_kernel: Option<&str>) -> Result<Self> {
         let paths = AppPaths::discover()?;
-        let windows_inventory = if driver_facts {
+        let windows_inventory = if host_probes {
             detect_windows_examine_inventory_with_driver_facts()
         } else {
             detect_windows_examine_inventory()
@@ -295,6 +322,7 @@ impl ExamineSummary {
             detected_gfx_target,
             compatible_therock_family,
             detected_therock_family,
+            vulkan: host_probes.then(detect_vulkan_support),
             driver: detect_driver_summary_with_windows_inventory(
                 windows_inventory.as_ref(),
                 wsl.as_ref(),
@@ -445,6 +473,16 @@ pub fn detect_gpu_driver_version() -> Option<String> {
     None
 }
 
+/// The [`DriverSummary::status`] word for a Windows host whose AMD display
+/// driver was read.
+///
+/// Written once because it is also a *fact about the Vulkan driver*: on Windows
+/// the display driver installs the Vulkan ICD, so `render.rs` cross-checks this
+/// word before advising an unconfirmed-Vulkan host to install one. Only
+/// [`windows_driver_summary`] produces it, which is what makes matching on it a
+/// Windows-only test.
+pub(super) const AMD_DISPLAY_DRIVER_DETECTED: &str = "amd_display_driver_detected";
+
 fn windows_driver_summary(
     detail: Option<String>,
     windows: Option<crate::windows_driver::WindowsDriverInfo>,
@@ -452,7 +490,7 @@ fn windows_driver_summary(
     DriverSummary {
         policy: "windows_validate_only".to_owned(),
         status: if detail.is_some() {
-            "amd_display_driver_detected".to_owned()
+            AMD_DISPLAY_DRIVER_DETECTED.to_owned()
         } else {
             "not_detected".to_owned()
         },
@@ -767,6 +805,7 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
+            vulkan: None,
             driver: windows_driver_summary(
                 Some("AMD Radeon(TM) Graphics driver 30.0.13014.8".to_owned()),
                 info,
@@ -842,11 +881,12 @@ mod tests {
         }
     }
 
-    /// `gather_without_driver_facts` is `gather` minus the driver version and
-    /// date: the GPU target a caller reads is the same, and it never carries a
-    /// driver record the full summary lacks. That it starts no PowerShell query
-    /// for them is the `the_startup_paths_do_not_start_the_driver_fact_query`
-    /// test, which counts the sources the same scope runs.
+    /// `gather_without_driver_facts` is `gather` minus the fields that cost a
+    /// spawned process: the GPU target a caller reads is the same, and it never
+    /// carries a driver record the full summary lacks. That it starts no
+    /// PowerShell query for them is the
+    /// `the_startup_paths_do_not_start_the_driver_fact_query` test, which counts
+    /// the sources the same scope runs.
     #[test]
     fn the_summary_without_driver_facts_keeps_the_gpu_target() {
         let full = ExamineSummary::gather().expect("full summary");
@@ -862,6 +902,29 @@ mod tests {
             "{:?} vs {:?}",
             lean.driver.windows,
             full.driver.windows
+        );
+    }
+
+    /// The lean scope must not run the Vulkan probe. This is the assertion, not
+    /// a timing measurement: the probe spawns `vulkaninfo` on Linux and starts
+    /// PowerShell on Windows, and the whole point of this scope is that a caller
+    /// reading only the GPU target does not pay for a process it will not read.
+    ///
+    /// Restoring `vulkan: Some(detect_vulkan_support())` in `gather_scoped`
+    /// fails this. `None` is not a loss of information: it is the "not probed"
+    /// value the field documents, which `vulkan_status` reports as `Unknown`
+    /// rather than as an absence of Vulkan.
+    #[test]
+    fn the_summary_without_driver_facts_does_not_probe_vulkan() {
+        let lean = ExamineSummary::gather_without_driver_facts().expect("lean summary");
+        assert_eq!(
+            lean.vulkan, None,
+            "the lean scope probed Vulkan; it must stay out of the cheap paths"
+        );
+        assert_eq!(
+            lean.vulkan_status(),
+            VulkanStatus::Unknown,
+            "an unprobed host must read as Unknown, never as having no Vulkan"
         );
     }
 

@@ -335,77 +335,6 @@ stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
 the three cases against the fake, and `engine-ipc-02` below shows the same
 message in a `stop_server` report next to what the stop did.
 
-That error also says what is wrong with what the child printed, because "failed
-to parse" alone sends the reader to the engine's source: it printed nothing on
-stdout, or other output before or after its answer (a log line on the wrong
-stream), or JSON that is not an envelope, or something that is not JSON. The
-first says only that nothing was printed. The second quotes the other output,
-and the last two the start of stdout (one line, bounded, control characters
-escaped); those three also state the rule an engine breaks: only its JSON
-answer goes to stdout, its logs go to stderr.
-Nothing is salvaged from such output. Only a top-level JSON object counts as the
-answer, so a pretty-printed answer over many lines is still one answer, and an
-envelope inside an array or another object is not mistaken for one.
-`an_unreadable_stdout_is_described_by_what_is_wrong_with_it` covers the
-classification on every platform, `an_answer_past_the_search_bound_is_not_looked_for`
-the bound on how much of stdout the search reads, and
-`output_besides_the_answer_on_stdout_is_refused_and_named` runs the same cases
-through the fake.
-
-The engine protocol version (see the contract in
-[engine-plugins.md](engine-plugins.md#the-stdio-protocol-contract)) is tested on
-both sides of the conversation and in the rule itself. The rule is a table in
-[`protocol_version.rs`](../crates/rocm-engine-protocol/src/protocol_version.rs)
-(`the_caret_rule_from_this_builds_version`, every platform), and
-`protocol_properties` adds that the field round-trips in both envelopes, that a
-missing version is judged as `0.1.0`, and that the rule is reflexive and
-symmetric. The client refuses an answer in an incompatible protocol before it
-reads `ok` (`an_answer_in_an_incompatible_protocol_is_refused_whatever_it_says`).
-The check before an `install` or `launch` is a state matrix against the fake, each
-row asserting the error together with which requests the fake recorded:
-`a_compatible_engine_is_checked_and_then_sent_the_request` (same, newer
-additive and unversioned capabilities answers: two requests, the capabilities
-check first), `a_handshaked_request_is_not_sent_when_the_check_fails`
-(incompatible, incompatible refusal, unreadable version, an error answer, a crash
-with no answer, empty stdout, contaminated stdout, not JSON: only the
-capabilities request ever reached the engine), and
-`a_request_without_a_handshake_is_sent_once` (every other method is
-sent once, and its answer's version is what is checked). The check's own child
-is pinned too: `the_check_runs_on_the_requests_environment_without_its_progress`
-reads the environment the fake recorded for each run, and
-`the_check_withholds_an_inherited_key_file_as_the_request_does` the command it
-builds. On the engine side, `answer_engine_request` in `protocol_version.rs`
-judges a request's version before its method
-(`a_request_is_judged_by_its_version_before_its_method`), and one shared check,
-`engine_contract::assert_engine_holds_protocol_contract` (behind the
-`test-support` feature), holds every engine to the same list: an incompatible or
-unreadable version refused with `incompatible_protocol` for every method in
-`EngineMethod::ALL` on the stdio path and the decoded path, and for an unknown
-method on the stdio path, `unknown_method` and `invalid_request` for the other
-unusable requests, and this build's version on every answer. Each first-party engine runs it
-(`stdio_answers_hold_the_engine_protocol_contract` in its `lib.rs`), and
-`every_built_in_engine_holds_the_protocol_contract` in `apps/rocm` runs it over
-every built-in engine through `answer_builtin_engine_stdio`, the function
-`rocm __engine-stdio` answers with; the verb's own stdin reading is covered by
-e2e `engine-ipc-08` to `-12`, which run `rocm __engine-stdio vllm`, for `vllm`
-only; of those, `-09` to `-12` fail when the verb bypasses the shared reader.
-Each engine's `tests/stdio_binary.rs` runs its built `rocm-engine-<engine>
-stdio` binary and checks that a request for another protocol and input that is
-not JSON are each answered with an error envelope and exit status 0.
-The shared check is itself tested in both directions: an engine that holds the
-contract passes it, and one that ignores the version, or reads it only on the
-decoded path, fails it. `the_contract_check_fails_an_engine_that_breaks_any_one_rule`
-adds six engines that each break one rule (named in its doc comment), and the
-check fails each of them; the check's other rules have no such engine. `engine-ipc-03` to `-07` below show the daemon's side and
-`engine-ipc-08` to `-12` the engine's.
-
-```bash
-cargo test -p rocm-engine-protocol
-cargo test -p rocm-engine-lemonade -p rocm-engine-vllm -p rocm-engine-aim --lib protocol_contract
-cargo test -p rocm-engine-lemonade -p rocm-engine-vllm -p rocm-engine-aim --test stdio_binary
-cargo test -p rocm every_built_in_engine_holds_the_protocol_contract
-```
-
 The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
 its default action, which is how `rocm` runs, because the test harness leaves it
 ignored and changing it process-wide would race sibling tests. A write that is
@@ -1857,88 +1786,6 @@ List registered managed or read-only runtimes and their exact side-by-side keys:
 
 ```bash
 rocm runtimes list
-rocm runtimes list --json
-```
-
-`--json` prints the same listing as one JSON document on stdout and nothing
-else: unset values are `null` rather than `<unset>`, each runtime carries
-`active` and `rollback_target` flags computed from the same values the text's
-`*`/`-` markers are drawn from, and the empty-registry next-step hint is
-text-only. The rules every `--json` command follows, and which commands have
-one, are in [json-output.md](json-output.md). Scenarios
-`@id:runtime-lifecycle-list-json-marks-active-and-rollback`
-(`runtime-lifecycle-23`) and `@id:runtime-lifecycle-list-json-empty-registry`
-(`runtime-lifecycle-24`) parse the whole of stdout as one document, so a stray
-line before or after it fails them; `runtime-lifecycle-23` also checks each
-runtime's values as planted, lists the same state as text and checks that the
-`*`/`-` rows name the runtimes the JSON flags, and `runtime-lifecycle-07` covers
-the text markers on their own.
-`@id:runtime-lifecycle-list-json-reports-unusable-runtime`
-(`runtime-lifecycle-25`) deletes a runtime's folder and reads
-`"status": "unusable"` with the reason `install root is missing: <folder>`, and
-`@id:runtime-lifecycle-list-json-reports-missing-active-manifest`
-(`runtime-lifecycle-26`) deletes the active runtime's registry entry and reads
-`active_problem` of kind `missing_manifest_for_key`.
-`@id:runtime-lifecycle-list-json-failure-prints-nothing-on-stdout`
-(`runtime-lifecycle-30`) covers the failure half of those rules: it replaces a
-registry entry with a folder of the same name, so the listing cannot read it
-(an entry that reads but does not parse is skipped, not an error), and checks
-that `--json` exits 1 with nothing on stdout and a plain-text error on stderr
-naming that entry. No scenario checks the
-listing's order: scenario 23's two runtimes share one install time, and the
-registry is read in filesystem order, which can match key order by chance.
-The order is pinned by unit tests:
-`runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
-plants five runtimes with one install time in reverse key order beside older
-and newer ones, and `registry_sort_is_newest_install_first_then_by_key` tests
-the sort on its own.
-
-Which runtimes the listing marks `active` and `rollback_target`, and when it
-reports `active_problem`, are in
-[json-output.md](json-output.md#which-runtimes-are-marked): the listing asks
-the resolver `rocm examine`, `rocm runtimes activate`/`rollback`,
-`rocm runtimes uninstall` and `rocm update` use, and the surfaces that still
-resolve differently are listed there.
-`@id:runtime-lifecycle-list-default-id-in-other-letter-case`
-(`runtime-lifecycle-27`) sets the first runtime's id in upper case through
-`rocm config set-default-runtime` and checks that the JSON marks that runtime
-active with `active_problem` `null`, and that the text marks it `*` with no
-`active_status:` line.
-`@id:runtime-lifecycle-list-active-key-in-other-letter-case`
-(`runtime-lifecycle-28`) edits the config's active runtime key to the first
-runtime's key in upper case while the default id still names the second, and
-checks that both forms mark the first runtime active with no problem and that
-`rocm examine --json` reports the first runtime's folder as
-`active_runtime_root`.
-`@id:runtime-lifecycle-list-dead-active-key-falls-back-to-default`
-(`runtime-lifecycle-29`) edits the key to one no runtime has while the default
-id still names the second runtime, and checks that both forms mark the second
-runtime active, that the JSON reports `missing_manifest_for_key` and the text
-the matching `active_status:` line, and that `rocm examine --json` reports the
-second runtime's folder.
-The `listing_state_*` unit tests in
-[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) list a state matrix in
-memory, one test per row (no config; an active key exact, in other case, or naming nothing with
-the default id resolving one, none or several; no active key with the default
-id matching none, one, one in other case, two, or two differing in case; keys
-differing only in case; a previous key exact, in other case, given as a runtime
-id, with whitespace, naming nothing, ambiguous, or naming one of two case twins
-exactly; and a dead key falling back to the rollback target). Each checks the
-JSON flags, `active_problem`, the text markers and the `active_status:` line,
-and that `active` and `rollback_target` are what `current_runtime_manifest` and
-`select_runtime_manifest` resolve. Keys differing only in case are built in
-memory, so these tests hold on a case-insensitive filesystem too.
-`runtimes_list_json_writes_a_non_utf8_path_lossily` (Unix only) lists a data
-folder whose path is not valid UTF-8, and
-`runtime_toolchain_text_and_json_words_agree_for_every_variant` holds the
-`toolchain` words in the text and the JSON together:
-
-```bash
-cargo xtask e2e -- -n "runtime-lifecycle-(07|23|24|25|26|27|28|29|30|31) "
-cargo test -p rocm --bin rocm runtimes_list
-cargo test -p rocm --bin rocm listing_state
-cargo test -p rocm --bin rocm runtime_toolchain_text_and_json_words_agree_for_every_variant
-cargo test -p rocm --bin rocm registry_sort_is_newest_install_first_then_by_key
 ```
 
 Each runtime's row is followed by its `install_root:` and a `provenance:` line
@@ -1996,32 +1843,6 @@ the `examine` lines. Both plant read-only manifests and run on the mock lane:
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-22 |examine-54 '
-```
-
-`rocm runtimes list --json` gives each runtime the same four facts as a
-`provenance` object under the same names, with `null` where the text prints
-`unrecorded` ([json-output.md](json-output.md)). Both
-forms render from one listing, and the JSON takes its names and order from
-`RuntimeProvenance::recorded_fields`, the list `RuntimeProvenance::fields`
-shows. `runtimes_list_json_names_recorded_provenance_and_null_for_unrecorded`
-in [runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pins the whole object
-for a nightly, an older, an adopted, a tarball, a padded and an all-blank
-runtime; `runtimes_list_text_and_json_name_the_same_provenance` checks over the
-same runtimes that the text line and the JSON object name the same facts with
-the same values; and
-`runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
-pins the object's key set.
-`@id:runtime-lifecycle-list-json-names-runtime-provenance`
-(`runtime-lifecycle-31`) plants the runtimes of `runtime-lifecycle-22`, reads
-each one's provenance from the JSON, and compares it with the text listing of
-the same state. It sets `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, as the
-examine scenarios that plant a runtime do: with wheel runtimes registered, the
-startup update check looks for a Python and the network and can print a
-progress line on stdout ahead of the document. It runs on the mock lane:
-
-```bash
-cargo xtask e2e -- -n 'runtime-lifecycle-31 '
-cargo test -p rocm --bin rocm runtimes_list
 ```
 
 Activate one validated runtime:
@@ -2151,7 +1972,6 @@ Focused unit coverage:
 
 ```bash
 cargo test -p rocm --bin rocm runtime_activation
-cargo test -p rocm --bin rocm runtimes_list
 cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
 cargo test -p rocm --bin rocm runtime_install_writes
@@ -2170,6 +1990,7 @@ cargo test -p rocm-core model_recipe
 cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
+cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm
 cargo test -p rocm-engine-aim
@@ -3213,50 +3034,23 @@ a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
-`features/engine_ipc.feature` (`engine-ipc-01` to `-12`, Linux, mock lane)
+`features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same
-`stop_server` tool (`-01` to `-07`), and how an engine reads a request
-(`-08` to `-12`). Each of `-01` to `-07` copies the real `rocmd` into a
-scratch directory and puts a stand-in `rocm` shell script beside it, which is the
+`stop_server` tool. Each scenario copies the real `rocmd` into a scratch
+directory and puts a stand-in `rocm` shell script beside it, which is the
 executable the standalone daemon runs for an engine request; the stand-in
 records its argv and the request it was sent, and prints what the scenario
-says. Each of `-08` to `-12` runs the real `rocm __engine-stdio vllm`, writes
-the scenario's request to its stdin, and reads what it prints and its exit
-status. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
+says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
 report carries the engine's answer (not an error built from the exit status).
 `engine-ipc-02` has it print something that is not an answer, write to stderr
 and exit non-zero: the report's engine error is the parse failure, naming the
-exit status the engine ended with and what was wrong with its stdout, followed
-by its stderr. `engine-ipc-03` has the engine answer that it stopped, in an engine
-protocol this release cannot use (`9.0.0`): the report's engine result is the
-refusal naming both versions, not the answer. `engine-ipc-04` has it write a log
-line on stdout before a valid answer: the report's engine error says it wrote
-other output before its answer, quoting the line. `engine-ipc-05`, `-06`
-and `-07` have it answer in this release's protocol, in a newer one that only
-adds to it (the next patch, computed from `ENGINE_PROTOCOL_VERSION`, with a
-field this release does not know in the envelope and in the stop's data), and with
-no version at all, as an engine from before the
-field does: each is read as answered. (They are three scenarios, not one
-outline, because the suite keys each scenario's result by its `@id`.) Every one checks the report together with the server's
-process, record and endpoint key, and that the stand-in was run once as
-`__engine-stdio vllm` with one `stop` request line, written in this release's
-protocol. The server is a `vllm` one, for which the engine's
-`Stop` is advisory, so in `-02` to `-04` the stop still completes; an engine whose stop
+exit status the engine ended with, followed by its stderr. Both check the report together with the server's process, record and
+endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
+one `stop` request line. The server is a `vllm` one, for which the engine's
+`Stop` is advisory, so in `-02` the stop still completes; an engine whose stop
 decides the confirmation (`aim`) is not staged here, because teardown would
-then run the real engine's stop. `engine-ipc-08` runs the real `rocm
-__engine-stdio vllm` and sends it a `stop` request made for protocol `9.0.0` for a
-server the engine's own state file names (a live `sleep`, with its `/proc` start
-time): the answer is the `incompatible_protocol` refusal naming both versions,
-the process is still running and the engine's record still names it, where a
-`stop` the engine served would have ended it. `-09` sends a method no engine
-has (`frobnicate`) at `9.0.0`, and `-10` a stop whose `protocol_version` is the
-number `9`: each is answered `incompatible_protocol`, which only reading the
-version before the method or the rest of the envelope can produce, and `-10`
-also shows the server still running. `-11` sends `frobnicate` in this release's
-protocol (`unknown_method`) and `-12` text that is not JSON (`invalid_request`).
-Each of `-08` to `-12` pins the whole answer and an exit status of 0. Run them
-with a hooks build and `-n "engine-ipc"`; the steps take this release's version from
-`rocm_engine_protocol::ENGINE_PROTOCOL_VERSION`, a dev-dependency of the suite.
+then run the real engine's stop. Run them with a hooks build and `-n
+"engine-ipc"`.
 
 Manual restricted-tool smoke:
 
@@ -4793,22 +4587,49 @@ row is the backend and ordinal with no name — correct and unspecific, rather
 than specific and wrong. No CI lane has two AMD GPUs, so that branch is covered
 by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
 
-**`rocm examine` prints a `rocm_support` line on every host**, at one of three
-levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, or unknown.
-Unknown covers both "nothing detected" and "a target this build's catalog does
-not recognise" — conflating the latter with "confirmed to have no ROCm build"
-would turn a detection gap into a claim about the hardware. `examine-55` holds
-the line against the `detected_gfx_target` and `compatible_therock_family` the
-same report prints, so every lane checks the level its own hardware implies:
+**`rocm examine` prints a `rocm_support` line on every host**, at one of five
+levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only,
+Vulkan-unconfirmed, no-GPU-backend, or unknown. Unknown covers both "nothing
+detected" and "a target this build's catalog does not recognize" — conflating
+the latter with "confirmed to have no ROCm build" would turn a detection gap
+into a claim about the hardware. `examine-55` holds the line against the
+`detected_gfx_target` and `compatible_therock_family` the same report prints,
+so every lane checks the level its own hardware implies:
 
 ```bash
 cargo xtask e2e -- -n '(examine-55)'
 ```
 
-Vulkan-only here is inferred from the gfx table, not probed: there are three
-support levels and this section describes three. Probing the host for a Vulkan
-driver, and the further levels that evidence would make knowable, is separate
-work.
+The three levels below ROCm/HIP are decided by the Vulkan probe, not by the
+gfx table, and each has its own scenario because each is a different
+evidentiary state rather than a different wording of one:
+
+| Scenario | Host it plants | Level asserted |
+| --- | --- | --- |
+| `examine-56` | An ICD and an enumerated AMD GPU. | Vulkan-only |
+| `examine-57` | A `vulkaninfo` that runs and reports nothing. | no GPU backend |
+| `examine-58` | Only a software rasteriser (lavapipe). | no GPU backend |
+| `examine-59` | No ICD, no device, and no `vulkaninfo` to ask. | Vulkan-unconfirmed |
+| `examine-60` | A GPU ICD whose `vulkaninfo` enumerates only a software rasteriser. | Vulkan-only, through `DriverPresentDevicesUnverified` |
+
+```bash
+cargo xtask e2e -- -n '(examine-56|examine-57|examine-58|examine-59|examine-60)'
+```
+
+`examine-57` and `examine-59` are the pair worth keeping straight: both end
+with nothing found, and they differ only in whether a tool was there to look.
+That difference is the whole reason `VulkanUnconfirmed` exists, so a change
+that collapses them will pass one of these and fail the other rather than
+silently reporting a confirmed absence to a host nobody probed.
+
+`examine-58` and `examine-60` are the second such pair, and they differ only in
+which ICD manifest is planted beside the same software-only enumeration. A
+lavapipe manifest leaves nothing to contradict the devices, so that host is a
+confirmed absence; `radeon_icd.x86_64.json` is a GPU driver the report itself
+lists, so telling that host "no Vulkan GPU driver was found - install one"
+would contradict the same report's `icds` field with advice it cannot act on.
+`examine-60` is also the only scenario that reaches
+`VulkanStatus::DriverPresentDevicesUnverified` at all.
 
 ## Windows Tool Notes
 
