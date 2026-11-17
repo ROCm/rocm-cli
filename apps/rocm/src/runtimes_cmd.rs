@@ -3100,10 +3100,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A runtime can be both the active one and the recorded rollback target
-    /// when the config says so (`rocm runtimes activate` and `rollback` never
-    /// write that, but the config file is read as it is). Both JSON flags are true;
-    /// the text has one marker column, and active wins it.
     /// Plants the runtimes whose provenance the JSON tests read: one per way a
     /// fact can be recorded or not. Returns their keys, in this order: a
     /// nightly that recorded every fact, a runtime from before the layout and
@@ -3301,6 +3297,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A runtime can be both the active one and the recorded rollback target
+    /// when the config says so (`rocm runtimes activate` and `rollback` never
+    /// write that, but the config file is read as it is). Both JSON flags are true;
+    /// the text has one marker column, and active wins it.
     #[test]
     fn runtimes_list_marks_a_runtime_both_active_and_rollback_target_as_active() -> Result<()> {
         let (root, paths) = test_paths("runtime-list-active-and-rollback");

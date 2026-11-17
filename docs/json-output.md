@@ -18,6 +18,15 @@ commands that do not have it yet.
   progress and warnings go to stderr. A command that has no single document to
   print is listed below as unsupported rather than given a `--json` that mixes
   the two.
+
+  One known exception, tracked as a follow-up: the startup update check that
+  runs before most commands can print a progress line on stdout ahead of the
+  document, such as `Python from PATH is not usable for this ROCm install`.
+  It runs at most once per check interval, and prints only when the runtime it
+  checks is a wheel install whose recorded Python is not usable and a Python
+  it finds instead (on `PATH`, or a saved managed one) does not fit. Setting
+  `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK` turns the check off, and with it the
+  line.
 - **Errors are not JSON today.** A command that fails with `--json` prints its
   error to stderr, prints nothing on stdout, and exits 1, unless the command
   documents its own code, as `rocm fix` does. Command lines the argument parser
