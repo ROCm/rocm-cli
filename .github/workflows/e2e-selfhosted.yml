@@ -125,8 +125,8 @@ jobs:
       # merge_group) and its
       # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
-      # ROCMAI-430: the three most recent rows of the official release list
-      # (rocm.docs.amd.com/en/latest/release/versions.html, see
+      # ROCMAI-430: the three newest final releases on the release channel's
+      # package indexes (resolved at run time, see
       # xtask/src/rocm_releases.rs), fanned out ONLY on a release-branch push —
       # everywhere else (PR, merge queue, manual dispatch) this stays a
       # single-element `current` matrix, same cost as before this existed.
