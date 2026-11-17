@@ -22,6 +22,7 @@ mod dash_text_edit_contract;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
+mod e2e_prewarm_vision;
 mod e2e_queue_import;
 mod e2e_report;
 mod engine_stdio_client_contract;

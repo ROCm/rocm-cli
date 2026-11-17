@@ -623,6 +623,32 @@ Pre-warm then:
 - activates the runtime a reuse actually means — after a repair that is the
   replacement named by `target=`, not the superseded manifest the line belongs to;
 - ensures the default engine is installed even when the runtime itself is reused;
+- removes the active runtime before deciding when its Python cannot `import
+  torchvision.ops` because torch and torchvision do not match (the
+  `operator torchvision::nms does not exist` error) and the default engine
+  imports torch, so the decision that follows installs afresh. It does not do
+  this for a pre-warm pinned to an exact version, for a runtime the report
+  marks `ahead_of_index`, or when `rocm update` cannot say which: the runtime
+  stays, and the check below fails with the manual advice. Any other import
+  failure is left for the check below. A mismatch that the engine install itself
+  creates on a reused runtime is found by that check, fails this run, and is
+  removed at the start of the next one;
+- then fails the pre-warm if the active runtime's Python cannot `import
+  torchvision.ops`, where the default engine imports torch (every engine but
+  Lemonade; for Lemonade the finding is a warning). A mismatch would otherwise
+  fail each vLLM serve scenario after its readiness timeout. The probe runs the
+  runtime's own interpreter, which is where vLLM installs its packages, with the
+  library directories the runtime's manifest records on the loader path, and is
+  killed after 120 seconds. The error names the runtime; for a mismatch it says
+  to run the pre-warm again, which removes the runtime and reinstalls, and for
+  another failure, or a mismatch the repair declined, it gives the `rocm runtimes uninstall` command with the
+  pre-warm tree's directories. If the runtime was installed by that same run,
+  the installer produced the broken pair and the error says so instead. The
+  check is skipped for a runtime with no torchvision, a tree with no active
+  runtime or no recorded interpreter, and a shared library that fails to load
+  when the manifest records no library directories to supply (a warning). An
+  unreadable `active.json` or registry manifest, a marker without
+  `runtime_key`, or an interpreter that will not start fails the pre-warm;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
   (a pinned build newer than the index must not be rolled back and cannot be
   reproduced from the index, so it is never offered a repair), or when freshness
