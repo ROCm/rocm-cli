@@ -1227,6 +1227,13 @@ mod tests {
         );
     }
 
+    /// A covering TheRock family is the whole answer, which is why that arm
+    /// ignores `detected_gfx_target` — and `resolve_family` depends on it:
+    /// it asks this about a target named with `--family`, where there may be
+    /// no detected target at all. Until the `None`/`Some(_)` case below, every
+    /// call in this suite passed `Some`/`Some`, `None`/`None` or `Some`/`None`,
+    /// so the arm could be narrowed to `(Some(_), Some(_))` with nothing
+    /// noticing.
     #[test]
     fn gpu_support_level_is_rocm_hip_when_a_family_covers_it() {
         assert_eq!(
@@ -1237,6 +1244,17 @@ mod tests {
         // nothing still has ROCm, and must not be downgraded for it.
         assert_eq!(
             gpu_support_level(Some("gfx90a"), Some("gfx90a"), VulkanStatus::Absent),
+            GpuSupportLevel::RocmHip
+        );
+        assert_eq!(
+            gpu_support_level(None, Some("gfx90a"), VulkanStatus::Absent),
+            GpuSupportLevel::RocmHip
+        );
+        // Even for a target this file's own table says has no ROCm build: the
+        // family the caller resolved is a statement about ROCm support, and a
+        // detected target cannot outvote it.
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), Some("gfx90a"), VulkanStatus::Absent),
             GpuSupportLevel::RocmHip
         );
     }

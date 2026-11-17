@@ -89,12 +89,13 @@ use windows_inventory::{
 };
 #[cfg(target_os = "linux")]
 use wsl::detect_wsl_windows_display_probe_text;
+pub use wsl::ldconfig_cache;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
 pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
-    ldconfig_cache, ldconfig_lists_librocdxg,
+    ldconfig_lists_librocdxg,
 };
 use wsl::{detect_wsl_windows_display_gfx_target_fast, wsl_driver_summary};
 
@@ -551,7 +552,7 @@ pub fn pinned_gpu_name(gpu_indices: &[u32]) -> Option<String> {
     // uses it: off Windows nothing is probed here at all, and on Windows the
     // count already needed it before any of the decisions below could run.
     //
-    // The cost, stated rather than implied (raised in review on #678): this
+    // The cost, stated rather than implied: this
     // deduplicates *within* a call and is **not** cached across calls. Each
     // engine's `write_running_state` calls it, and that runs more than once per
     // launch (`starting`, then `running`), so a Windows launch pays that many
@@ -1046,6 +1047,27 @@ mod tests {
         assert_eq!(
             gpu_name_for_single_gpu_host(&[0], Some(2), false, || Some("AMD".to_owned())),
             None
+        );
+    }
+
+    /// The ordinal guard on its own, with the host count agreeing there is one
+    /// GPU — the disagreement its doc comment names (a `--gpu 1` that got past
+    /// validation on a host now reporting a single card).
+    ///
+    /// Every other case here supplies a count that already declines, so
+    /// deleting the ordinal branch left the whole suite green. This is the
+    /// only call that reaches it.
+    #[test]
+    fn a_pinned_ordinal_the_host_count_contradicts_withholds_the_name() {
+        let mut probed = false;
+        let name = gpu_name_for_single_gpu_host(&[1], Some(1), false, || {
+            probed = true;
+            Some("AMD Instinct MI300X".to_owned())
+        });
+        assert_eq!(name, None);
+        assert!(
+            !probed,
+            "an ordinal the host's own count contradicts must not be probed"
         );
     }
 

@@ -164,7 +164,7 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
 
     let state_path = crate::state::state_path(&request.service_id);
 
-    let served_model_id = run_container(
+    let run = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -178,10 +178,11 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         &state_path,
         &request.service_id,
         &request.model_ref,
-        served_model_id.as_deref(),
+        run.canonical_name.as_deref(),
         &request.host,
         request.port,
         device_policy,
+        &run.gpu_indices,
         engine_recipe.as_ref(),
     )?;
 
@@ -246,8 +247,22 @@ fn plan_gpus(requested: &[u32], usable: Option<Vec<u32>>, windows: bool) -> Resu
     })
 }
 
+/// What [`run_container`] established about the container it left running.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContainerRun {
+    /// The model name the image says it serves under, if known.
+    canonical_name: Option<String>,
+    /// The GPU ordinals the container was narrowed to through
+    /// `HIP_VISIBLE_DEVICES`, for [`crate::state::write_running_state`] to
+    /// record so the `device:` row can name one (ROCMAI-550). Empty when no
+    /// GPU was attached, and when the container was already running — that
+    /// launch chose the ordinals and this call cannot know which.
+    gpu_indices: Vec<u32>,
+}
+
 /// Starts the named service's container unless it is already running, and
-/// returns the model name the image says it serves under, if known.
+/// reports the model name the image says it serves under together with the
+/// GPUs the container was given.
 ///
 /// Container names are unique in Docker, so `docker run --name X` against a
 /// name still held by an exited container (a crash, a reboot, a failed
@@ -261,15 +276,18 @@ fn run_container(
     device_policy: &DevicePolicy,
     requested_gpus: &[u32],
     extra_env: Option<&BTreeMap<String, String>>,
-) -> Result<Option<String>> {
+) -> Result<ContainerRun> {
     let name = crate::docker::container_name(service_id);
     // Normalize once so the pull, the metadata and the run all use the same image.
     let image_ref = crate::registry::normalize_image_ref(model_ref);
 
     match crate::docker::container_state(&name)? {
         ContainerState::Running => {
-            return Ok(crate::registry::local_image_metadata(&image_ref)
-                .and_then(|metadata| metadata.canonical_name));
+            return Ok(ContainerRun {
+                canonical_name: crate::registry::local_image_metadata(&image_ref)
+                    .and_then(|metadata| metadata.canonical_name),
+                gpu_indices: Vec::new(),
+            });
         }
         ContainerState::Exited(_) => crate::docker::remove(&name)?,
         ContainerState::Missing => {}
@@ -313,6 +331,9 @@ fn run_container(
     if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
         env.insert("VLLM_API_KEY".to_owned(), api_key);
     }
+    // The one place the attached ordinals are decided, so the container and the
+    // state file cannot disagree about them.
+    let gpu_indices = if use_gpu { gpus.indices } else { Vec::new() };
     crate::docker::run(&crate::docker::RunSpec {
         name: &name,
         image: &image_ref,
@@ -320,11 +341,14 @@ fn run_container(
         port,
         container_port: crate::DEFAULT_AIM_PORT,
         use_gpu,
-        gpu_indices: if use_gpu { &gpus.indices } else { &[] },
+        gpu_indices: &gpu_indices,
         render_gid,
         env: &env,
     })?;
-    Ok(metadata.canonical_name)
+    Ok(ContainerRun {
+        canonical_name: metadata.canonical_name,
+        gpu_indices,
+    })
 }
 
 /// Enforces `device_policy` instead of treating GPU use as a soft heuristic:
@@ -357,7 +381,7 @@ fn resolve_use_gpu(
 
 pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let name = crate::docker::container_name(&request.service_id);
-    let label_name = run_container(
+    let run = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -377,10 +401,11 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.state_path,
         &request.service_id,
         &request.model_ref,
-        label_name.as_deref(),
+        run.canonical_name.as_deref(),
         &request.host,
         request.port,
         request.device_policy,
+        &run.gpu_indices,
         request.engine_recipe.as_ref(),
     )?;
 
@@ -391,7 +416,7 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &name,
         &request.host,
         request.port,
-        label_name.as_deref(),
+        run.canonical_name.as_deref(),
         aim_ready_timeout(),
     ) {
         Ok(served_model_id) => {

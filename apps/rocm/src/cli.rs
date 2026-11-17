@@ -243,7 +243,18 @@ pub(crate) enum Command {
     /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
     /// marked that way today: a GPU ROCm has no runtime build for is a fact
     /// about the hardware, not something to put right).
-    /// Use `--dry-run` to see any fix's plan without changing anything.
+    /// Use `--dry-run` to see a fix's plan without changing anything.
+    ///
+    /// A fix whose command fails exits 4 and says why on stderr. A command that
+    /// does not finish within its time limit is stopped and also exits 4; the
+    /// change may then be partial, so the message names how to check it and the
+    /// `rocm fix` command to re-run. On Windows, `fix-2-unset-override`,
+    /// `fix-6-path` and `fix-9-igpu-dgpu --device-index N` read the current
+    /// value of the variable they change before planning; when that read
+    /// fails they stop before changing anything, with exit 4. Under
+    /// `--dry-run` they stop the same way and show no plan; the catalog entry
+    /// printed first is the fix's generic description, not a preview of the
+    /// change on this machine.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
@@ -254,7 +265,11 @@ pub(crate) enum Command {
         /// Fixes that only print steps never ask.
         #[arg(long)]
         yes: bool,
-        /// Show the plan without changing anything.
+        /// Show the plan without changing anything. On Windows, a dry run of a
+        /// fix that reads the current value of the variable it would change
+        /// stops with exit 4 and shows no plan when that read fails; the
+        /// catalog entry printed first is the fix's generic description, not a
+        /// preview of the change on this machine.
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
@@ -2736,9 +2751,9 @@ mod tests {
     /// Sibling of `every_help_text_in_the_command_tree_is_ascii`, for the same
     /// reason one level down: clap renders a doc comment verbatim, with no
     /// markdown processing anywhere in its pipeline, so `**every**` written in
-    /// a doc comment reaches the user's terminal as literal asterisks. Review
-    /// on #678 caught exactly that on `Examine`, which the ASCII test could
-    /// not see because `*` and `_` are ASCII.
+    /// a doc comment reaches the user's terminal as literal asterisks. That had
+    /// already happened on `Examine`, where the ASCII test could not see it
+    /// because `*` and `_` are ASCII.
     ///
     /// Only `**` and `__` are rejected, and only those: they have no honest
     /// use in plain help text. A single `*` does (`gfx110*`, a glob in an

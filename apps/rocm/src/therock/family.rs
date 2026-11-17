@@ -178,7 +178,7 @@ pub(super) fn resolve_family(
 ///
 /// Asked of [`gpu_support_level`] rather than re-tested here. The install path
 /// used to call `gfx_target_has_no_rocm_build` directly, which was *exactly*
-/// equivalent (review on #678 checked that it was) and still wrong to keep: it
+/// equivalent, and still wrong to keep: it
 /// made this a second, independent definition of the tier whose claim these
 /// messages then go on to make, so a change to the classification would have
 /// left `rocm examine` and `rocm install sdk` disagreeing about the same GPU
