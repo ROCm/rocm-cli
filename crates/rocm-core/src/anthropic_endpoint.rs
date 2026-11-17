@@ -19,6 +19,14 @@
 //! file, and the engine adapters write it whole. [`publish_anthropic_endpoint`]
 //! and `carry_published_anthropic_endpoint` are the two halves that keep the
 //! whole-file write from dropping what the sibling thread published.
+//!
+//! The carry reaches a whole-file write only when that write goes through
+//! [`crate::write_json_state_file`], which is
+//! `carry_published_anthropic_endpoint`'s single caller. All three built-in
+//! adapters' `write_state` do (`engines/lemonade`, `engines/vllm`,
+//! `engines/aim`). An out-of-tree engine plugin that writes the state file
+//! itself takes neither this nor the state directory's lock, and would drop
+//! the publication.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
