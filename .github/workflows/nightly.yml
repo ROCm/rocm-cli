@@ -1553,6 +1553,9 @@ jobs:
               echo "- :no_entry_sign: \`$job\` skipped itself as stale; it has no column in the grid above" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
+            # A lane that said it skipped itself on purpose (the queue's nightly
+            # window) uploads nothing and is not missing.
+            [ "$(jq -r --arg job "$job" '.[$job].outputs.skipped // ""' <<<"$NEEDS")" = true ] && continue
             IFS=',' read -ra wanted <<<"$artifacts"
             for artifact in "${wanted[@]}"; do
               if ! grep -qxF "$artifact" <<<"$uploaded"; then

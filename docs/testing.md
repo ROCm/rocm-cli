@@ -3768,8 +3768,9 @@ It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
 the queue nightly only) and the vLLM half falls to the Instinct lane. Of all
-these lanes only MI300X and the Strix Halo Windows and WSL2 lanes run on pull
-requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
+these lanes only MI300X (two checks, `e2e-gpu-queue` on the shared GPU queue
+and `e2e-gpu` on a self-hosted runner, the same silicon) and the Strix Halo
+Windows and WSL2 lanes run on pull requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
 the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
 on the queue nightly), and none of their check names is a required status
 check, so the two unit tests above are the blocking per-PR coverage. The scenario
