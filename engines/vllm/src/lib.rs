@@ -190,8 +190,7 @@ pub fn run_cli() -> Result<()> {
             gpu_selection: crate::process::parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
-            let envelope = read_request()?;
-            print_json(&handle_envelope(envelope))?;
+            print_json(&answer_stdio(&read_request()?))?;
         }
         CommandKind::ServeHttp {
             service_id,
@@ -260,6 +259,11 @@ pub fn builtin_serve_http(
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    // Refuse a request made for a protocol this engine cannot serve before its
+    // payload is read: in another protocol the payload may mean something else.
+    if let Some(refusal) = rocm_engine_protocol::incompatible_request_response(&envelope) {
+        return refusal;
+    }
     match envelope.method {
         EngineMethod::Detect => {
             deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |_| {
@@ -309,7 +313,10 @@ where
             Ok(response) => EngineResponseEnvelope::success(response),
             Err(error) => EngineResponseEnvelope::failure("request_failed", error.to_string()),
         },
-        Err(error) => EngineResponseEnvelope::failure("invalid_payload", error.to_string()),
+        Err(error) => EngineResponseEnvelope::failure(
+            rocm_engine_protocol::INVALID_PAYLOAD_CODE,
+            error.to_string(),
+        ),
     }
 }
 
@@ -379,12 +386,21 @@ pub(crate) const fn windows_unsupported_message() -> &'static str {
     "vLLM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows vLLM is skipped. No CPU fallback is used."
 }
 
-fn read_request() -> Result<EngineRequestEnvelope> {
+/// The request text on stdin, read to its end. It is decoded by
+/// [`answer_stdio`], which judges its protocol version first.
+fn read_request() -> Result<String> {
     let mut buffer = String::new();
     std::io::stdin()
         .read_to_string(&mut buffer)
         .context("failed to read stdin for engine request")?;
-    serde_json::from_str(&buffer).context("failed to parse engine request envelope")
+    Ok(buffer)
+}
+
+/// The answer to the request `text` read on stdin: its protocol version is
+/// judged before its method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), then it is handled.
+fn answer_stdio(text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle_envelope)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -457,36 +473,56 @@ mod tests {
         ];
 
         for (method, payload) in success_cases {
-            let response = handle_envelope(EngineRequestEnvelope { method, payload });
+            let response = handle_envelope(EngineRequestEnvelope::new(method, payload));
             assert!(
                 response.ok,
                 "expected protocol method to return a typed success envelope: {:?}",
                 response.error
             );
+            assert_eq!(
+                response.protocol_version.as_deref(),
+                Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+            );
         }
 
-        let endpoint = handle_envelope(EngineRequestEnvelope {
-            method: EngineMethod::Endpoint,
-            payload: json!({
+        let endpoint = handle_envelope(EngineRequestEnvelope::new(
+            EngineMethod::Endpoint,
+            json!({
                 "service_id": service_id.as_str()
             }),
-        });
+        ));
         assert!(!endpoint.ok);
+        assert_eq!(
+            endpoint.protocol_version.as_deref(),
+            Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+        );
         assert_eq!(
             endpoint.error.as_ref().map(|error| error.code.as_str()),
             Some("request_failed")
         );
 
         for method in [EngineMethod::Install, EngineMethod::Launch] {
-            let response = handle_envelope(EngineRequestEnvelope {
-                method,
-                payload: json!({}),
-            });
+            let response = handle_envelope(EngineRequestEnvelope::new(method, json!({})));
             assert!(!response.ok);
             assert_eq!(
+                response.protocol_version.as_deref(),
+                Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+            );
+            assert_eq!(
                 response.error.as_ref().map(|error| error.code.as_str()),
-                Some("invalid_payload")
+                Some(rocm_engine_protocol::INVALID_PAYLOAD_CODE)
             );
         }
+    }
+
+    /// The engine protocol contract, the same check every engine runs: see
+    /// [`rocm_engine_protocol::engine_contract`].
+    #[test]
+    fn stdio_answers_hold_the_engine_protocol_contract() {
+        rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+            "vllm",
+            answer_stdio,
+            handle_envelope,
+        );
     }
 }

@@ -28,8 +28,9 @@
 //! (`engine_request`, `engine_request_with_env_root`,
 //! `engine_stdio_child_request`), the `ScopedEnvVar`/
 //! `with_scoped_builtin_engine_env` env-scoping helpers and the
-//! `BUILTIN_ENGINE_ENV_LOCK` mutex they serialize on, `builtin_engine_request`,
-//! `run_builtin_engine_stdio`, and the built-in HTTP-serving path
+//! `BUILTIN_ENGINE_ENV_LOCK` mutex they serialize on, `builtin_engine_handler`,
+//! `builtin_engine_request`, `run_builtin_engine_stdio` with
+//! `answer_builtin_engine_stdio`, and the built-in HTTP-serving path
 //! (`builtin_engine_available`, `run_builtin_engine_serve_http`,
 //! `builtin_engine_serve_http_args`).
 //!
@@ -238,35 +239,51 @@ fn with_scoped_builtin_engine_env<R>(
     result
 }
 
-fn builtin_engine_request(
-    engine: &str,
-    envelope: &EngineRequestEnvelope,
-) -> Option<EngineResponseEnvelope> {
+/// How a built-in engine answers a decoded request.
+type BuiltinEngineHandler = fn(EngineRequestEnvelope) -> EngineResponseEnvelope;
+
+/// The handler of the engine built into this binary under `engine`, or `None`.
+/// The in-process request path, `rocm __engine-stdio` and
+/// [`builtin_engine_available`] all ask it; `run_builtin_engine_serve_http`
+/// keeps its own match over the same engines.
+fn builtin_engine_handler(engine: &str) -> Option<BuiltinEngineHandler> {
     match engine {
-        "lemonade" => Some(rocm_engine_lemonade::builtin_handle_envelope(
-            envelope.clone(),
-        )),
-        "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope(envelope.clone())),
-        "aim" => Some(rocm_engine_aim::builtin_handle_envelope(envelope.clone())),
+        "lemonade" => Some(rocm_engine_lemonade::builtin_handle_envelope),
+        "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope),
+        "aim" => Some(rocm_engine_aim::builtin_handle_envelope),
         _ => None,
     }
 }
 
+fn builtin_engine_request(
+    engine: &str,
+    envelope: &EngineRequestEnvelope,
+) -> Option<EngineResponseEnvelope> {
+    builtin_engine_handler(engine).map(|handle| handle(envelope.clone()))
+}
+
 pub(crate) fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
+    let handle = builtin_engine_handler(engine)
+        .with_context(|| format!("engine `{engine}` is not built into this rocm binary"))?;
     let mut input = String::new();
     io::stdin()
         .read_to_string(&mut input)
         .context("failed to read engine stdio request")?;
-    let envelope: EngineRequestEnvelope =
-        serde_json::from_str(&input).context("failed to parse engine stdio request")?;
-    let response = builtin_engine_request(engine, &envelope)
-        .with_context(|| format!("engine `{engine}` is not built into this rocm binary"))?;
+    let response = answer_builtin_engine_stdio(handle, &input);
     print!("{}", serde_json::to_string(&response)?);
     Ok(())
 }
 
+/// The answer a built-in engine's `handle` gives to the request `text` read on
+/// stdin: the version is judged before the method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), as a separately built
+/// engine's `stdio` command does.
+fn answer_builtin_engine_stdio(handle: BuiltinEngineHandler, text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle)
+}
+
 pub(crate) fn builtin_engine_available(engine: &str) -> bool {
-    matches!(engine, "lemonade" | "vllm" | "aim")
+    builtin_engine_handler(engine).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,6 +429,73 @@ mod tests {
         }
     }
 
+    /// Every engine built into this binary holds the engine protocol contract on
+    /// both of its paths: the decoded request `rocm` hands it in-process, and
+    /// `answer_builtin_engine_stdio`, the function `rocm __engine-stdio <engine>`
+    /// (which `rocmd` runs) answers request text with. The verb's own stdin
+    /// reading is not run here; e2e engine-ipc-08 to -12 cover it, for `vllm`
+    /// only. A refusal reaches the caller through the same
+    /// `decode_engine_response` as a child's answer, naming the engine's code.
+    #[test]
+    fn every_built_in_engine_holds_the_protocol_contract() {
+        assert!(!builtin_engine_available("not-an-engine"));
+        assert!(
+            builtin_engine_request(
+                "not-an-engine",
+                &EngineRequestEnvelope::new(EngineMethod::Capabilities, serde_json::json!({}))
+            )
+            .is_none()
+        );
+        for engine in crate::cli::SUPPORTED_ENGINES {
+            assert!(builtin_engine_available(engine), "{engine}");
+            let handle = builtin_engine_handler(engine).expect("built in");
+            rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+                engine,
+                |text| answer_builtin_engine_stdio(handle, text),
+                |envelope| builtin_engine_request(engine, &envelope).expect("built in"),
+            );
+            let mut request = EngineRequestEnvelope::new(EngineMethod::Stop, serde_json::json!({}));
+            request.protocol_version = Some("9.0.0".to_owned());
+            let refusal = builtin_engine_request(engine, &request).expect("built in");
+            assert_eq!(
+                decode_engine_response::<serde_json::Value>(refusal)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "incompatible_protocol: this engine speaks engine protocol \
+                     {}; the request was made for protocol 9.0.0, which \
+                     it cannot serve",
+                    rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
+                ),
+                "{engine}"
+            );
+        }
+    }
+
+    /// Each built-in engine id reaches that engine's own handler: its
+    /// capabilities answer is the one the engine crate itself gives, and the
+    /// three engines' answers differ, so a swapped mapping shows.
+    #[test]
+    fn each_built_in_engine_id_reaches_its_own_engine() {
+        let capabilities =
+            || EngineRequestEnvelope::new(EngineMethod::Capabilities, serde_json::json!({}));
+        let own: [(&str, BuiltinEngineHandler); 3] = [
+            ("lemonade", rocm_engine_lemonade::builtin_handle_envelope),
+            ("vllm", rocm_engine_vllm::builtin_handle_envelope),
+            ("aim", rocm_engine_aim::builtin_handle_envelope),
+        ];
+        let mut answers = Vec::new();
+        for (engine, handle) in own {
+            let mapped = builtin_engine_handler(engine).expect("built in");
+            let expected = handle(capabilities()).data;
+            assert_eq!(mapped(capabilities()).data, expected, "{engine}");
+            answers.push(expected);
+        }
+        assert_ne!(answers[0], answers[1]);
+        assert_ne!(answers[1], answers[2]);
+        assert_ne!(answers[0], answers[2]);
+    }
+
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {
         let (root, paths) = test_paths("engine-plugin");
@@ -491,7 +575,7 @@ mod tests {
         const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
 
         fn envelope(method: EngineMethod, payload: serde_json::Value) -> EngineRequestEnvelope {
-            EngineRequestEnvelope { method, payload }
+            EngineRequestEnvelope::new(method, payload)
         }
 
         fn stop_request() -> EngineRequestEnvelope {
@@ -538,7 +622,11 @@ mod tests {
             assert_eq!(engine.argv(), ["stdio"]);
             assert_eq!(
                 engine.stdin(),
-                "{\"method\":\"stop\",\"payload\":{\"service_id\":\"svc\"}}\n"
+                format!(
+                    "{{\"protocol_version\":\"{}\",\"method\":\"stop\",\
+                     \"payload\":{{\"service_id\":\"svc\"}}}}\n",
+                    rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
+                )
             );
         }
 
