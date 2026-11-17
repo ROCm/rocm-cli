@@ -16,7 +16,7 @@
 //! stay behaviorally identical.
 //!
 //! This file keeps the public types, the two score thresholds, [`diagnose`]
-//! itself and the two `vllm_*_symptom_is_diagnosable` classifiers that run the
+//! itself and the `vllm_*_symptom_is_diagnosable` classifiers that run the
 //! whole catalog. The rest is in child modules: `catalog` holds the `CHECKERS` table,
 //! `scoring` the keyword tables and scoring helpers, `report` the routing and the
 //! text report, and `linux`, `windows`, `wsl`, `host` and `engine` the checks.
