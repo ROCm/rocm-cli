@@ -101,7 +101,8 @@ definitions when no existing scenario already covers it:
 - if a scenario for the behavior already exists, say in the PR text which `@id:` it is
   and that the change makes it pass — do not silently rely on it
 - if the scenario can only run on a gated lane (`@requires-gpu`, `@nightly`), say so in
-  the PR text and name the lane that will exercise it
+  the PR text and name the lane that will exercise it; moving an existing scenario off the
+  blocking mock `e2e` job onto such a lane is justified as §8 says
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
@@ -129,6 +130,21 @@ different files, so nothing links them by construction. Where the printed line c
 derived from the same value the branch is taken on — as `preapproved_install_line` in
 `apps/rocm/src/therock/consent.rs` derives it from the approval source — prefer that: a
 message computed from the decision cannot disagree with it.
+
+**A comment or doc line a change adds or edits that states how the code behaves is checked
+against that code, and one that is the reason for a decision also names where the code
+makes it true.** A decision such as narrowing a test's scope, documenting a limitation,
+choosing a design, or dropping a guard often rests on one sentence: a reviewer who accepts
+the sentence accepts the decision, and no test reads a comment. Before pushing, open the
+code each claim describes and confirm it. Where the claim is the reason for a decision,
+also name the place as a file and a function, constant or test
+([runner.rs](crates/rocm-dash-daemon/src/runner.rs)'s `cycle_timestamp`), never as a line
+number, which goes stale with the next edit above it. Where the decision rests on timing
+or ordering, the claim names where the mechanism that enforces it is defined, not only
+that one exists. State an invariant rather than a count: "every engine crate" survives a
+new engine, where "the three engine crates" silently stops being true. When a review
+finding makes you rewrite such a sentence, check the replacement the same way: a narrower
+claim is harder to doubt, not more likely to be right.
 
 **A new test is shown to fail when the code it covers is broken.** Before pushing, break
 the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
@@ -194,6 +210,17 @@ Understand existing patterns first:
 - sibling implementations in `apps/`, `crates/`, and `engines/`
 - existing tests and conventions in `docs/testing.md`
 
+Read the project's goals in the [Manifesto](README.md#manifesto) section of
+`README.md` before planning a change. Where the approach a request or ticket
+asks for would work against one of them (a manual workaround step, a build
+installed for a GPU it was not built for), raise the conflict with the user
+before implementing it. Where nobody can be asked, implement nothing that
+conflicts, do the rest only where it stands on its own, and name the conflict
+in the final report. The request states one need, and the goals are what the
+project has decided to trade other needs against. The goals only govern
+choices this file leaves open; every rule elsewhere in it, such as §6's ban on
+silent CPU fallback, still binds whatever the user answers.
+
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
@@ -227,12 +254,24 @@ Keep docs and behavior claims in sync while editing:
   file outside it), and a link leaving a skill folder in `skills/`
   (published or embedded elsewhere, §7). This covers citations you add or
   edit, not converting existing bare paths in an unrelated change
+- when you add, rename or remove a production source file, update its entry in
+  `docs/architecture.md` in the same change; `cargo xtask check-architecture-doc`
+  fails on a file with no entry (§6), but not on an entry whose description
+  went stale
 - when a statement such as "X is not supported" or "there is no Y" becomes false,
   grep the same surfaces for the old claim before pushing
 - write the PR body from the final diff, not the first commit, and re-read it after
   every review-fix commit: it lists every user-visible change (including ones on other
   platforms), names the lane that exercises the new behavior, and states the reason when
   there is no scenario
+- hold the branch's commit messages to the same bar: pull requests here are normally
+  squash-merged with the branch's commit messages as the default squash body (rebase-merge
+  is also enabled; either way each commit message lands in public history). Each
+  describes what its own commit does, in words still true at the branch head. A message
+  whose words a later commit made misleading — a cross-reference to a section, item or
+  name that a later commit changed — is reworded before merge; a commit whose whole
+  subject a later commit removed is folded into that commit or dropped instead. Either
+  rewrites pushed commits, which needs a force-push, which needs approval (§1)
 
 ## 6) rocm-cli Architecture Guardrails
 
@@ -246,7 +285,7 @@ Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps
 
 Shared (`crates/rocm-core`):
 
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each behind `require_yes_or_interactive` (below); [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no, and writes to the stream it is given a newline when the input ended without one and a line saying so when the answer was neither yes nor no (declined either way). Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each behind `require_yes_or_interactive` (below); [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
 - [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`require_yes_or_interactive(yes, action)`** — the guard in front of a mutating command that confirms with that `[y/N]` prompt. `Ok(true)` means `--yes` already approved it (skip the prompt), `Ok(false)` means there is no `--yes` but a terminal, so the caller still asks, and otherwise it bails with `"{action} requires --yes outside an interactive terminal"`. A new `--yes`-gated command reuses it instead of re-deriving the `yes` / `interactive_terminal()` / `bail!` sequence. Not for a refusal that deliberately differs: [`therock/consent.rs`](apps/rocm/src/therock/consent.rs)'s `sdk_install_approval` names two consents that are not interchangeable, and [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` has its own exit code and checks stdin only
 
 CLI:
@@ -263,16 +302,18 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
 - **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
 - **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `StatusTone` and `Theme::tone_color` — the shared status→color mapping. A status enum gets one exhaustive `fn …_tone(status) -> StatusTone` beside them (`job_status_tone`, `instance_status_tone`) and a `Theme::…_color` wrapper (`job_status_color`, `instance_status_color`); screens call the wrapper (or `tone_color(…)` on a tone) instead of an inline `match … => theme.ok/warn/err`. To color a new status enum, add its tone function there rather than a bespoke match per screen
-- **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them
+- **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them. `cargo test -p xtask dash_text_edit_contract` ([`dash_text_edit_contract.rs`](xtask/src/dash_text_edit_contract.rs)) fails on a hand-rolled `push`/`pop` text edit under `crates/rocm-dash-tui/src/` outside `widgets.rs`; a new exception is a reviewed entry in that test's `ALLOWED` list.
 - **[`scroll.rs`](crates/rocm-dash-tui/src/app/scroll.rs)**'s `ScrollState` (in `app/`, not `ui/`, beside the `AppState` scroll methods) — an offset plus its upper bound, whose `scroll_by(delta)` is the one "add a signed delta, clamp into `[0, max]`, saturate to `u16`" implementation. The job console (both axes), the LOGS dock and the instance Detail modal clamp through it; a new scrollable surface that keeps a `u16` offset with a known bound builds a `ScrollState` from them and stores `pos` back instead of repeating the `i32` clamp arithmetic. The chat transcript and the GPU list clamp with a `min()` against a measured bound (chat also follows the tail) and stay out of it
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
 
 Guardrails:
 
-- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum usually goes in [`cli.rs`](apps/rocm/src/cli.rs) with the rest of the command tree, and its dispatch function usually stays in `main.rs`; `bootstrap.rs` and `remote/mod.rs` are the exceptions that own their enum and dispatch outright — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
+- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum usually goes in [`cli.rs`](apps/rocm/src/cli.rs) with the rest of the command tree, and its dispatch function goes in the domain module (`comfyui::run`) or a `*_cmd.rs` sibling, with only the top-level `dispatch()` match staying in `main.rs`; `bootstrap.rs` and `remote/mod.rs` are the exceptions that own their enum as well — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - first-party crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`); a new first-party dependency edge failing that check means the edge needs review, not a bypass
+- source file size is checked by `cargo xtask check-module-size` ([`module_size.rs`](xtask/src/module_size.rs)): no source file may exceed 1,500 production lines (test-gated items excluded), with one limit for every file and no exemption mechanism. A PR that would push a file past it splits the file in the same change; do not raise the limit or opt a file out. The check blocks merges: the `clippy` CI job, a required check that also runs on merge-queue runs, fails when any source file is over the limit, so a file over it is split before anything else merges. The `cargo-module-size` pre-commit hook is its local mirror: it runs the same check and refuses the commit, for anyone who installed the hooks; see `docs/architecture.md`
+- every production source file (a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src`), and every `.rs` file under `xtask/src`, `tests/e2e-cucumber/src` and `tests/e2e-cucumber/tests`, has an entry in `docs/architecture.md`, enforced by `cargo xtask check-architecture-doc` ([architecture_doc.rs](xtask/src/architecture_doc.rs)) in the `clippy` CI job and in the `architecture-doc` prek hook at commit and push. Add the entry in the same change as the file. The check has no exemption list: document the file. The check reads no prose, so keeping an entry's description true is still on you
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
@@ -318,7 +359,7 @@ Required consistency points:
 ### `skills/rocm-doctor/` — published from here, and a test fixture
 
 `skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
-(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+(`include_str!` in `apps/rocm/src/chat/turn.rs`). `skills/rocm-doctor/` is different
 on two counts, and both change how you edit it:
 
 - **This repo is its source of truth.** The skill is a thin driver over the
@@ -393,13 +434,25 @@ Minimum quality gate before upstream-ready status:
 ```bash
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-python scripts/smoke_local.py
+cargo xtask smoke
 ```
 
 Deleting or weakening a test is a change in its own right: every crate has a committed
 coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops
 below it. If a drop is legitimate, re-bless with `cargo xtask coverage --bless` and say in
 the commit why — do not re-bless to clear a red check.
+
+Moving a scenario off the blocking mock `e2e` job is a deletion too, in any change
+including CI plumbing, and no coverage floor catches it. A tag that makes an existing
+scenario skip there (`@nightly`, `@requires-gpu`; the tag table in
+[the e2e README](tests/e2e-cucumber/README.md) says what
+each tag resolves to) removes its pre-merge coverage as surely as deleting it, though the
+diff shows only a tag. Justify it as a deletion: the PR text names, for each direction the
+behavior could be broken in (for a flag, hardcoded on and hardcoded off), which blocking
+check still fails. A scenario that is the only pre-merge guard for a seam no unit test
+reaches says so in a comment beside it, as
+`@id:therock-next-09-wheel-devel-adds-the-toolchain` does; when such a scenario slows or
+destabilizes a neighbor, fix the neighbor at its own layer instead of moving the guard.
 
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
@@ -446,6 +499,17 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - before resuming review-feedback work on a PR you authored, first check for review comments with no reply yet (same `in_reply_to_id` cross-reference technique below)
 - automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
+- when reviewing a revision that answers review feedback, diff it whole against the revision you last reviewed, the same way the author does (**Review-fix commits** below), not only the lines your finding named: a remediation is written in a narrow window, gets the least scrutiny, and is where new defects arrive
+- when reviewing, treat a comment or doc line in the diff that states how the code behaves as a claim to check against that code (§3), not as context; one that is the reason for a decision (§3 says which) is checked before you approve, including that it names where the code makes it true
+- when reviewing, before marking an objection blocking because it rests on a timing, ordering, concurrency or "this cannot happen" argument, name the mechanism it assumes and where that is defined (file and symbol); an objection whose mechanism you cannot locate is posted as a question, not a blocking finding
+- when reviewing, read the commit messages as well as the diff: each lands in public history on `main`, in the squash commit's body or, under rebase-merge, as a commit of its own (§5)
+
+**Review-fix commits** — a commit answering review feedback is reviewed by its author as a whole change:
+
+- diff it against the head the reviewer saw (the `commit.oid` of the review it answers, from `gh pr view <pr> --json reviews`, §1), not only the lines the finding named, and say in the reply whether it changes behavior outside the finding
+- once the base has moved into the branch since the review, by a rebase or by merging the base in, `git diff <reviewed-head>..HEAD` also shows everything the base gained. Fetch the PR's base branch (for a stacked PR, the branch it depends on, not `main`) and diff with `git range-diff origin/<base> <reviewed-head> HEAD` instead, reading in full each commit it marks new or changed. A commit it marks removed is either the base's old history, where the base was force-pushed, or a commit dropped from the branch since the review, so check which before setting one aside. `git range-diff` skips merge commits, so read a merge that resolved conflicts with `git show <merge>`
+- once a force-push has taken the reviewed head off the branch, a clone that never had it fetches it by its full SHA first, while the host still retains it (`git fetch origin <reviewed-head>`)
+- a review-fix commit does not widen what a documented user-facing option means or authorizes (a `--yes` that starts granting a second consent); where widening is needed, it is its own commit, described as such in the PR body, that changes the option's help text and docs together with its behavior
 
 **Stacked and dependent PRs:**
 
@@ -466,8 +530,9 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
-After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
-of sequence or a clippy lint cost more than running them first.
+After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6
+and §11's review-fix commit rules before pushing. Round-trips spent on a scenario number
+out of sequence or a clippy lint cost more than running them first.
 
 ## 13) Upstream Pre-flight Checklist
 
@@ -489,6 +554,10 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
+17. Comments and doc lines this change adds or edits that state how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*
+18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
+19. Any existing scenario moved off the blocking mock `e2e` job justified as a deletion — *§8*
+20. Every commit message describes its own commit in words still true at the branch head — *§5*
 
 ## 14) Related Internal Workflows
 

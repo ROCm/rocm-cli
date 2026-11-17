@@ -59,6 +59,27 @@ would have installed and the one it kept. The device check still runs, so an
 opt-out that leaves the runtime unable to serve says so instead of failing later
 during serving.
 
+The opt-out covers the packages the SDK installs together with torch
+(torchvision, torchaudio and triton) as well. vLLM pins an exact build of each.
+The install check spares them when it settled on a torch divergence, and the
+engine's built-in repair spares them whenever the opt-out is set; in both cases
+they are reported as expected divergences rather than violations, and vLLM is
+not reinstalled over them, because that reinstall would put the engine's own
+torch back. The trade-off: under the opt-out a genuinely broken torchvision,
+torchaudio or triton (including one that is not installed at all) is neither
+reported as a violation nor repaired.
+
+The opt-out also applies to `rocm install sdk` run over a runtime that already
+holds torch. That command normally hands `uv` the SDK's `torch`, `torchvision`
+and `torchaudio` along with `rocm`, which replaces the stack the engine or you
+installed (and `triton` with it). With the variable set it asks for the ROCm
+packages alone and leaves the torch stack where it is: the plan prints a
+`torch_kept:` line naming the torch it found, and `rocm install sdk --dry-run`
+shows the same reduced `command:`. A runtime with no torch yet, or an
+environment recreated for another Python, still gets the full stack, since
+there is nothing to keep. The runtime's recorded composition (and so its
+runtime key and `rocm update` comparison) is unchanged.
+
 Use it when you are deliberately running a torch that the alignment would
 replace, such as a locally built wheel, a version under test, or a stack pinned
 for a reproduction. It is an escape hatch, not a supported configuration: the
@@ -78,9 +99,15 @@ so there is no fixed filename to pin in the adapter.
 The wheel's own tag shows the other thing that changes on this route: ROCm
 10.x's vLLM, flash-attn, and amd-aiter are published for **`cp314` only**, unlike
 every earlier ROCm SDK version's `cp312` wheels. ROCm CLI provisions a matching
-interpreter for a 10.x install automatically. A Python already on `PATH`, or
-already installed as ROCm CLI's managed Python, is rejected if it is not
-`cp314`, with a message naming the required tag.
+interpreter for a 10.x install automatically. By default, a Python already on
+`PATH`, or already installed as ROCm CLI's managed Python, is rejected if it is
+not `cp314`, with a message naming the required tag; with `--python-version`
+(below) the tag it names is the one you chose.
+That 3.14 is the default for a ROCm 10.x SDK install, not a limit of the SDK: the
+SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
+--python-version` picks one of them for an install that does not need vLLM. The
+vLLM install then refuses that runtime; re-running the install with
+`--python-version 3.14` moves it back.
 
 This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
 through *different* rows: they pin different vLLM minors and read vLLM from
@@ -112,6 +139,49 @@ installing, so an index that happens to serve more than one ROCm line at once
 cannot silently install the wrong line's wheel onto this SDK. If AMD's index
 has no compatible build for a package, the resolver fails and the install
 fails instead of falling back to an unpinned or CPU install.
+
+One package is checked after the install instead. vLLM's wheel pins
+`tensorizer==2.10.1`, which cannot be imported under Python 3.14
+(`KeyError: 'crypto_stream_salsa20_NONCEBYTES'`), and ROCm 10.1.0's vLLM is
+published for Python 3.14 only. The install, and every later
+`rocm engines install vllm` on a managed runtime, imports
+`tensorizer.serialization` with the runtime's Python, under the environment the
+server is launched with (including `PYTHONPATH`) and with colour switched off.
+When that import fails inside tensorizer itself, it upgrades tensorizer to
+2.12.1 with `--no-deps` and imports it again. A torch or shared-library failure
+is not tensorizer's and is left to the device check.
+
+When this run installed vLLM (a first install, `--reinstall` or a repair), a
+failed upgrade, a check that cannot run, or a tensorizer that still cannot be
+imported after the upgrade fails the install with the exception, instead of
+ending in a startup crash at `rocm serve`. On a runtime this run did not
+install vLLM into, the same three cases are warnings, so an install that used to
+be a no-op (for example offline) stays one. A tensorizer that imports keeps
+vLLM's pin. A later `rocm engines install vllm` on a runtime whose upgrade
+failed only warns, and `rocm serve` on it keeps failing until an install
+succeeds: retrying after a failed install is deliberately not fatal.
+
+The check runs inside the engine install, before the CLI realigns the runtime's
+torch. If torch cannot load against the SDK at that moment, the probe sees a
+torch failure rather than tensorizer's, reads it as not tensorizer's and leaves
+tensorizer alone; the next `rocm engines install vllm` checks again.
+
+Because the upgraded release no longer matches vLLM's exact pin,
+`uv pip check` reports it, and `dependency_check` shows it as
+`expected_divergence` (not `violated`), with a note naming the tensorizer release
+the runtime holds. A reinstall is not needed to keep it: the install re-checks
+tensorizer and upgrades it again, provided torch can load when the check runs
+(see above).
+
+Two side effects are new. The check imports torch and tensorizer under the
+environment the server is launched with, which can write the launch's
+compatibility shims, so a `rocm engines install vllm` on an existing managed
+runtime is no longer free of side effects. The probe and the upgrade each have a
+five-minute timeout. And on the `rocm install sdk` auto-install path, a refused
+tensorizer upgrade can still print `dependency_check: satisfied` beside the
+refusal error, because a refused upgrade keeps vLLM's own pin and `uv pip check`
+only compares declared metadata; the refusal text carries the truth, and that
+output is deliberately not changed here.
 
 `flash-attn` and `amd-aiter` are the exception to the per-package series match
 above. The vLLM wheel declares the exact builds of both that it was built

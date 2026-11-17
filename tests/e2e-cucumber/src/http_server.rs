@@ -76,7 +76,20 @@ impl Drop for ServerHandle {
 /// For servers started from async code that then yields normally (`.await`s)
 /// while the server is in use.
 pub async fn spawn(app: Router) -> ServerHandle {
-    let listener = bind().await;
+    spawn_on(app, 0).await
+}
+
+/// Like [`spawn`], but binds a caller-specified port.
+///
+/// For scenarios that plant a managed-service record naming an exact port and
+/// need a real listener behind it (e.g. so the CLI's liveness probe doesn't
+/// demote the record before an explicit-port collision check runs).
+pub async fn spawn_on_port(app: Router, port: u16) -> ServerHandle {
+    spawn_on(app, port).await
+}
+
+async fn spawn_on(app: Router, port: u16) -> ServerHandle {
+    let listener = bind(port).await;
     let addr = local_addr(&listener);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tokio::spawn(serve(listener, app, shutdown_rx));
@@ -103,7 +116,7 @@ pub fn spawn_on_own_thread(app: Router) -> ServerHandle {
             .build()
             .expect("failed to build test server runtime");
         runtime.block_on(async move {
-            let listener = bind().await;
+            let listener = bind(0).await;
             // A dropped receiver means the starter gave up before the bind
             // completed; there is nothing left to serve.
             if addr_tx.send(local_addr(&listener)).is_err() {
@@ -139,10 +152,10 @@ pub fn loopback_url(port: u16) -> Url {
     root_url(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
 
-async fn bind() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0")
+async fn bind(port: u16) -> TcpListener {
+    TcpListener::bind(("127.0.0.1", port))
         .await
-        .expect("failed to bind test server listener")
+        .unwrap_or_else(|e| panic!("failed to bind test server listener on port {port}: {e}"))
 }
 
 fn local_addr(listener: &TcpListener) -> SocketAddr {

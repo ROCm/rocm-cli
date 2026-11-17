@@ -2,19 +2,18 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Onboarding wizard (Phase 3 Wave 2, minimal).
+//! Onboarding wizard (minimal).
 //!
-//! The first-run flow, rebuilt on the Wave-0 primitives. This is the **minimal**
-//! version the phase-3 plan calls for: get a clean machine to a working ROCm
-//! runtime two ways —
+//! The first-run flow, kept deliberately **minimal**: get a clean machine to a
+//! working ROCm runtime two ways —
 //!
 //! - **Install ROCm SDK** — a one-shot gated `rocm install sdk` with a Configure
 //!   step to pick the channel (Release/Nightly), an optional version pin
 //!   (`--build-date` / `--version`), and an optional install folder
-//!   (`--prefix`, via the same Wave-0 [`FolderBrowser`] the Adopt path uses);
+//!   (`--prefix`, via the same [`FolderBrowser`] the Adopt path uses);
 //!   defaults to `--channel release --format wheel` installed into the
 //!   default managed folder.
-//! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
+//! - **Adopt existing folder** — pick an existing ROCm env with the
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
@@ -25,8 +24,6 @@
 //! startup path reads `setup.completed`/`onboarding_dismissed` to auto-open
 //! it. Both paths run through the approval gate and the job-bridge — zero
 //! `std::thread::spawn`/`try_recv`.
-
-use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -40,7 +37,7 @@ use rocm_dash_core::state::{JobStatus, SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{display_args, exe_label, resolve_exe};
+use crate::ui::exec::{adopt_args, display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
@@ -261,18 +258,6 @@ pub struct OnboardingState {
     pub message: Option<String>,
 }
 
-/// Derive the conventional Python executable inside an env root (matches the
-/// runtime_manager / rocm-core per-host layout without a `rocm-core` dep).
-fn derive_python_executable(root: &str) -> String {
-    let root = Path::new(root);
-    let path = if cfg!(windows) {
-        root.join("Scripts").join("python.exe")
-    } else {
-        root.join("bin").join("python")
-    };
-    path.to_string_lossy().into_owned()
-}
-
 /// Handle a key while the wizard is open.
 pub fn on_key(
     ob: &mut Option<OnboardingState>,
@@ -300,15 +285,7 @@ pub fn on_key(
                     // field; the user still confirms with Enter.
                     cfg.prefix = selected;
                 } else {
-                    let root = selected;
-                    let args = vec![
-                        "runtimes".to_string(),
-                        "adopt".to_string(),
-                        "--root".to_string(),
-                        root.clone(),
-                        "--python".to_string(),
-                        derive_python_executable(&root),
-                    ];
+                    let args = adopt_args(&selected);
                     stage_approval(o, OnboardingChoice::AdoptExisting, args);
                 }
             }

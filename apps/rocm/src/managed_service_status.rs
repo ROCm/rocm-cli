@@ -5,33 +5,34 @@
 //! Managed-service liveness classification and the dashboard-sidebar
 //! status/counts helpers derived from it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-211) of the `main.rs` modularization (see
-//! `docs/architecture.md`). `dispatch()`'s call sites are unaffected: none of
-//! this module's functions are called directly from `dispatch()`.
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`). `dispatch()`'s call sites are
+//! unaffected: none of this module's functions are called directly from
+//! `dispatch()`.
 //!
 //! This module owns: reading and liveness-refreshing the on-disk managed-service
 //! registry (`load_managed_services`, `refresh_managed_service_runtime_liveness`,
 //! `recorded_service_pids`, `settle_pending_stop_key_cleanup`), the idempotency
 //! guard that finds an already-live service for a given engine+model
-//! (`existing_live_managed_service`, and its records-in-hand form
-//! `find_live_managed_service`), the serve reuse pre-gate that decides whether
+//! (`existing_live_managed_service_in`, and the records-in-hand match rule
+//! `find_live_managed_service` serve's reuse check uses), the serve reuse pre-gate that decides whether
 //! asking the engine about reuse is worth a round-trip
 //! (`live_managed_services_for_model`), the "is this record live" classifier
 //! (`managed_service_is_live`), and the dashboard sidebar's ready/starting/past-
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/
 //! `local_server_sidebar_status`) plus the engine display-name helper
-//! (`friendly_engine_label`), which only `chat.rs` reads. `service_records.rs`
+//! (`friendly_engine_label`), which only `chat/summaries.rs` reads. `service_records.rs`
 //! calls into it for the in-use check behind service-record removal and pruning
 //! (`managed_service_is_live`, `recorded_service_pids`) and for
 //! `load_managed_services` in prune planning, and `bridge_snapshot.rs` calls
 //! `load_managed_services` for the codex-bridge snapshot;
 //! `services_text.rs` reads the sidebar helpers for the local-servers view;
-//! `chat.rs` calls into it for the deterministic services-tool summary;
+//! `chat/turn.rs` and `chat/mcp_bridge.rs` call into it for the services tool
+//! and the local-assistant readiness check;
 //! `runtime_services.rs` calls into it when reconciling live servers against a
 //! runtime activation; `service_launch.rs` is the only caller of the
-//! `existing_live_managed_service` duplicate-launch guard it runs before
+//! `existing_live_managed_service_in` duplicate-launch guard it runs before
 //! spawning a new managed service. Shared types/config (`ManagedServiceRecord`,
 //! `AppPaths`) and the `endpoint_keys` module stay reachable through
 //! `crate::`/`rocm_core::`, as for other mechanically relocated modules.
@@ -41,8 +42,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rocm_core::{
-    AppPaths, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
-    managed_service_endpoint_readiness, process_is_running,
+    AppPaths, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord, ProcessProbe,
+    managed_service_endpoint_readiness,
 };
 
 use crate::endpoint_keys;
@@ -79,15 +80,13 @@ pub(crate) fn managed_service_sidebar_counts(
 }
 
 pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
-    matches!(
-        record.status.as_str(),
-        "ready" | "running" | "starting" | "recovering"
-    )
+    record.is_live()
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
-/// service for this engine+model, if any. The caller compares its effective
-/// launch recipe before deciding whether reuse is safe.
+/// service for this engine+model, if any, from an already-refreshed live set.
+/// The caller compares its effective launch recipe before deciding whether reuse
+/// is safe.
 ///
 /// Keyed on `(engine, canonical_model_id)` — NOT `service_id`. `generate_service_id`
 /// embeds `unix_time_millis()`, so every launch mints a unique id; matching on it
@@ -97,20 +96,21 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
 /// the newest live match. Prevents a second `serve --managed` for the same
 /// engine+model from spawning a duplicate process once the TUI job-bridge guard
 /// has cleared.
-pub(crate) fn existing_live_managed_service(
-    paths: &AppPaths,
+///
+/// Takes the snapshot rather than the paths so the allocation transaction loads
+/// it once and uses it for both this check and the port reservations: duplicate
+/// detection and candidate selection can never observe different states.
+pub(crate) fn existing_live_managed_service_in<'a>(
+    live: &'a [ManagedServiceRecord],
     engine: &str,
     canonical_model_id: &str,
-) -> Option<ManagedServiceRecord> {
-    find_live_managed_service(
-        &load_managed_services(paths).ok()?,
-        engine,
-        canonical_model_id,
-    )
-    .cloned()
+) -> Option<&'a ManagedServiceRecord> {
+    live.iter()
+        .find(|record| record.engine == engine && record.canonical_model_id == canonical_model_id)
 }
 
-/// [`existing_live_managed_service`]'s match rule, over records already in hand.
+/// The serve-side match rule behind [`existing_live_managed_service_in`] (which
+/// takes a set already filtered to live records), over records already in hand.
 ///
 /// Split out so a caller that has just loaded and liveness-refreshed the
 /// registry can ask the same question again without a second disk scan, and so
@@ -190,34 +190,113 @@ pub(crate) fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
         .collect()
 }
 
+/// Whether any process the record names may still be running: everything but a
+/// confirmed exit counts (see [`ProcessProbe::may_be_running`]), and a `0`
+/// placeholder PID is never asked about.
+///
+/// The one reading behind every destructive decision made from a recorded
+/// process's liveness: the deferred key cleanup, the reconciliation to
+/// `stopped`, and the in-use check behind `rocm services remove` and `prune`.
+/// Kept in one place so those cannot drift apart on what counts as gone.
+pub(crate) fn recorded_pids_may_be_running(
+    record: &ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
+    recorded_service_pids(record)
+        .iter()
+        .any(|pid| probe(*pid).may_be_running())
+}
+
+/// Whether the record is a container-backed engine's stop that was requested and
+/// has not been confirmed.
+///
+/// Such a stop is decided by the engine `Stop` (`engine_stop_decides_confirmation`),
+/// not by the recorded supervisor, which can be gone while the container still
+/// runs. Until a `services stop` confirms it, nothing here may read the record as
+/// stopped, complete its cleanup, or let `remove`/`prune` delete it, on the
+/// evidence of the supervisor's PID alone.
+pub(crate) fn container_stop_unresolved(record: &ManagedServiceRecord) -> bool {
+    record.stop_requested_unix_ms.is_some()
+        && rocm_core::engine_stop_decides_confirmation(&record.engine)
+}
+
 /// Complete a stop that was requested but could not confirm termination, once
-/// the processes are actually observed gone: drop the endpoint key and clear the
-/// marker. Returns whether the record changed.
+/// the processes are actually observed gone: drop the endpoint key, clear the
+/// marker, forget the recorded processes and read the record as stopped. Returns
+/// whether the record changed.
 ///
 /// This is deliberately keyed on `stop_requested_unix_ms` rather than on "the
 /// tracked pids are dead". A *crashed* service also has dead pids, but its
 /// operator never asked for it to go away and will want it back: dropping the
 /// key there would make `rocm services restart` and daemon recovery refuse it
 /// permanently — fail-closed guards have no way to re-mint a key. The cost of
-/// this choice is that a crashed public service's 0600 key file outlives the
+/// this choice is that a crashed public service's owner-only key file outlives the
 /// process until the service is stopped or successfully restarted.
 ///
 /// Called before the liveness gate in
 /// [`refresh_managed_service_runtime_liveness`], so a record that reached
 /// "stopped" by another route still gets its deferred cleanup rather than
 /// stranding the key.
-fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedServiceRecord) -> bool {
+///
+/// A container-backed engine never completes this way: its supervisor can exit
+/// while the container runs, so only a stop whose engine `Stop` confirms may end
+/// it.
+///
+/// "Observed gone" means every recorded process is *confirmed* gone: a process
+/// that could not be queried (on Windows, a live one this process may not open)
+/// is not gone, and the stop that reported it unverified must keep its key and
+/// its marker until it is.
+fn settle_pending_stop_key_cleanup(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
     if record.stop_requested_unix_ms.is_none() {
         return false;
     }
-    if recorded_service_pids(record)
-        .iter()
-        .any(|pid| process_is_running(*pid))
-    {
+    // A container-backed engine (`engine_stop_decides_confirmation`) is stopped by
+    // its engine `Stop`, not by the recorded supervisor: that process can be gone
+    // while the container still runs, so PID evidence alone cannot say the stop
+    // completed. The stop that could not confirm keeps its key, marker and
+    // recorded processes, and the next `services stop` asks the engine again.
+    if container_stop_unresolved(record) {
+        return false;
+    }
+    if recorded_pids_may_be_running(record, probe) {
         return false;
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
-    record.stop_requested_unix_ms = None;
+    let consumed_marker = record.stop_requested_unix_ms.take();
+    // A record that named no process has no stop to complete: the key and the
+    // stale marker go, as they always did, but it is not read as stopped. It may
+    // be a launch that has not recorded its supervisor yet. The marker's value
+    // stays on the record (`settled_stop_unix_ms`), because a stop that began on
+    // this empty record and finds it with no marker would otherwise read this
+    // cleanup as a relaunch and report itself unconfirmed.
+    if recorded_service_pids(record).is_empty() {
+        record.settled_stop_unix_ms = consumed_marker;
+        return true;
+    }
+    // Every recorded process is confirmed gone, so none of them is the
+    // service's any more, and their PIDs are stale from here on. Left in the
+    // record, a later `services stop` would signal whatever the OS has handed
+    // those numbers to, and a PID recorded without a start-time token cannot be
+    // refuted, so on Windows the tree kill would take that process and its
+    // subtree. The same forgetting as a stop that confirmed the exit itself
+    // (`clear_recorded_processes`), and it is done only here, behind the
+    // confirmed-gone check above: a process that may still be running stays named.
+    record.clear_recorded_processes();
+    // And the status a confirmed stop leaves, whatever the record read before:
+    // `stopped`, as `rocm services stop` and `rocmd`'s stop set on a confirmed
+    // stop for a `failed` record too. Set here rather than left to the
+    // reconciliation below, which has no PID to read once they are cleared, so a
+    // `ready` or `running` record would stay live; and not only for a live status,
+    // because a `failed` record with its processes cleared is not the `stopped`
+    // record `is_covered_by_stop_of` accepts as this same stop completing, so a
+    // stop still finalizing would report itself unconfirmed. Setting it also makes
+    // the caller's liveness gate return at once, so the one write the caller makes
+    // covers the key cleanup, the cleared processes and the status together.
+    "stopped".clone_into(&mut record.status);
     true
 }
 
@@ -225,7 +304,20 @@ pub(crate) fn refresh_managed_service_runtime_liveness(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> bool {
-    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record);
+    refresh_managed_service_runtime_liveness_with(paths, record, rocm_core::probe_process)
+}
+
+/// [`refresh_managed_service_runtime_liveness`] with the read of each recorded
+/// PID supplied by the caller, so a test drives the answer a host can give for a
+/// process it cannot query. Every decision here that a process is gone (the
+/// deferred key cleanup, the status reconciled to `stopped`) takes a confirmed
+/// exit; a process that could not be queried counts as possibly running.
+pub(crate) fn refresh_managed_service_runtime_liveness_with(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
+    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record, &probe);
     if !managed_service_is_live(record) {
         return settled_pending_stop;
     }
@@ -269,9 +361,14 @@ pub(crate) fn refresh_managed_service_runtime_liveness(
         return settled_pending_stop || outcome.record_changed;
     }
 
+    // An unresolved container stop is not read as stopped from the supervisor's
+    // PID, whether or not the endpoint answers: only the engine `Stop` decides it.
+    if container_stop_unresolved(record) {
+        return settled_pending_stop || outcome.record_changed;
+    }
     let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
-    let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
+    let has_live_pid = recorded_pids_may_be_running(record, &probe);
     if has_tracked_pid && !has_live_pid {
         // Reconcile the status only. The endpoint key is *not* dropped here:
         // dead pids alone do not distinguish a stopped service from a crashed
@@ -568,145 +665,6 @@ mod tests {
         );
         fs::remove_dir_all(root).ok();
         Ok(())
-    }
-
-    #[test]
-    fn duplicate_managed_launch_detected_across_distinct_service_ids() -> Result<()> {
-        // `generate_service_id` embeds a timestamp, so a second launch for the
-        // same engine+model has a DIFFERENT service_id. The guard must still
-        // detect the live service by (engine, canonical_model_id), and return
-        // the newest live match. `starting` skips the endpoint probe; the
-        // current process id is a guaranteed-live PID.
-        let (root, paths) = test_paths("dup-managed-distinct-ids");
-        paths.ensure()?;
-
-        // Older, dead manifest for the same engine+model (distinct service_id).
-        let mut dead = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-1000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11500,
-            "managed",
-            999_999_999,
-            None,
-            None,
-            None,
-        );
-        dead.status = "ready".to_owned();
-        dead.engine_pid = Some(999_999_999);
-        dead.created_at_unix_ms = 1000;
-        dead.write()?;
-
-        // Newer, live manifest for the same engine+model (distinct service_id).
-        let mut live = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-2000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11501,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        live.status = "starting".to_owned();
-        live.engine_pid = Some(std::process::id());
-        live.created_at_unix_ms = 2000;
-        live.write()?;
-
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-
-        let found = found.expect("a live managed service should be detected by engine+model");
-        assert_eq!(
-            found.service_id, "lemonade-qwen-2000",
-            "should return the newest live match"
-        );
-        assert!(managed_service_is_live(&found));
-        Ok(())
-    }
-
-    #[test]
-    fn dead_managed_service_allows_relaunch() -> Result<()> {
-        // A stale manifest with dead PIDs must NOT block a relaunch: liveness
-        // refresh demotes it to "stopped", so the guard returns None.
-        let (root, paths) = test_paths("dup-managed-dead");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-3000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11502,
-            "managed",
-            999_999_999,
-            None,
-            None,
-            None,
-        );
-        record.status = "ready".to_owned();
-        record.engine_pid = Some(999_999_999);
-        record.write()?;
-
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-
-        assert!(
-            found.is_none(),
-            "a dead managed service must not block relaunch"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn live_service_for_other_model_does_not_block() -> Result<()> {
-        // A live service for a DIFFERENT model must not match — the guard keys
-        // on the model, not just the engine.
-        let (root, paths) = test_paths("dup-managed-other-model");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-other-1",
-            "lemonade",
-            "other",
-            "other-canonical",
-            "127.0.0.1",
-            11503,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        record.status = "starting".to_owned();
-        record.engine_pid = Some(std::process::id());
-        record.write()?;
-
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-
-        assert!(
-            found.is_none(),
-            "a live service for a different model must not match"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn missing_manifest_allows_launch() {
-        // No services dir / manifests → nothing to detect, launch proceeds.
-        let (root, paths) = test_paths("dup-managed-missing");
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-        assert!(found.is_none());
     }
 
     /// A public record with a dead pid and a stored endpoint key, for the
@@ -1042,11 +1000,18 @@ mod tests {
 
         let records = live_managed_services_for_model(&paths, "lemonade", "qwen")
             .expect("the planted live record opens the pre-gate");
+        // What the spawn-time guard sees: the same registry, narrowed to live
+        // records, as `service_launch`'s allocation transaction loads it.
+        let live: Vec<_> = records
+            .iter()
+            .filter(|r| managed_service_is_live(r))
+            .cloned()
+            .collect();
         assert_eq!(
             find_live_managed_service(&records, "lemonade", "qwen-canonical")
                 .map(|r| r.service_id.clone()),
-            existing_live_managed_service(&paths, "lemonade", "qwen-canonical")
-                .map(|r| r.service_id),
+            existing_live_managed_service_in(&live, "lemonade", "qwen-canonical")
+                .map(|r| r.service_id.clone()),
         );
         assert!(
             find_live_managed_service(&records, "lemonade", "not-this-model").is_none(),
@@ -1054,5 +1019,261 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// A record whose stop was requested but not confirmed, with its endpoint
+    /// key on disk: the state a stop leaves when a recorded process cannot be
+    /// verified.
+    fn pending_stop_record(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "key-123")?;
+        Ok(record)
+    }
+
+    /// A process that cannot be queried (on Windows, a live one this process may
+    /// not open) is not one that is gone. Whatever is reading liveness must keep
+    /// the key and the stop marker the unverified stop left, and must not
+    /// reconcile the record to `stopped`; only a confirmed exit may.
+    #[test]
+    fn a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried() -> Result<()> {
+        let (root, paths) = test_paths("liveness-unqueryable-pending-stop");
+        paths.ensure()?;
+        let service_id = "svc-unqueryable";
+        let mut record = pending_stop_record(&paths, service_id)?;
+        // The dangerous shape: a supervisor recorded without a start-time token,
+        // and an engine with one.
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = None;
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
+
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Unqueryable
+        });
+        assert_eq!(
+            (
+                record.supervisor_pid,
+                record.engine_pid,
+                record.engine_start_ticks
+            ),
+            (4242, Some(4243), Some(77)),
+            "a process that may still be running stays named: the record is the only thing that names it"
+        );
+
+        assert!(
+            endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
+            "the key of a service that may still be running is kept"
+        );
+        assert_eq!(
+            record.stop_requested_unix_ms,
+            Some(1),
+            "so is the stop marker that hands the cleanup to a later confirmed exit"
+        );
+        assert_ne!(
+            record.status, "stopped",
+            "a process that could not be looked at does not make the service stopped"
+        );
+
+        // The same record once the process is confirmed gone: now the deferred
+        // cleanup and the reconciliation both happen.
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+        assert!(
+            endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none(),
+            "a confirmed exit drops the key"
+        );
+        assert_eq!(record.stop_requested_unix_ms, None);
+        assert_eq!(record.status, "stopped");
+        assert_eq!(
+            (
+                record.supervisor_pid,
+                record.supervisor_start_ticks,
+                record.engine_pid,
+                record.engine_start_ticks
+            ),
+            (0, None, None, None),
+            "the processes confirmed gone are forgotten, so a later stop cannot reach a recycled PID"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The deferred cleanup forgets the PIDs, so the reconciliation after it has
+    /// none to read: every live status must still end as `stopped`, in the one
+    /// refresh, rather than a record such as `starting` staying live with no
+    /// process behind it, and a `failed` one must too, as a confirmed stop makes it.
+    /// A container-backed engine's supervisor can be gone while the container
+    /// still runs, and its stop is decided by the engine `Stop`, which the
+    /// unconfirmed stop did not get. A listing that sees the supervisor gone must
+    /// not complete that stop: key, marker and recorded processes stay for the
+    /// next `services stop`. A process engine with the same PID evidence does
+    /// complete (the sibling tests above).
+    #[test]
+    fn a_pending_stop_of_a_container_engine_is_not_completed_by_a_gone_supervisor() -> Result<()> {
+        assert!(rocm_core::engine_stop_decides_confirmation("aim"));
+        let (root, paths) = test_paths("liveness-container-pending-stop");
+        paths.ensure()?;
+        let service_id = "svc-container";
+        let mut record = pending_stop_record(&paths, service_id)?;
+        "aim".clone_into(&mut record.engine);
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = Some(5);
+
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+
+        assert!(
+            endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
+            "the key stays: the container may still be serving with it"
+        );
+        assert_eq!(record.stop_requested_unix_ms, Some(1));
+        assert_eq!(
+            (record.supervisor_pid, record.supervisor_start_ticks),
+            (4242, Some(5)),
+            "the record keeps naming what the stop could not confirm"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A record that names no process has no stop to complete: a `starting`
+    /// record with a stale stop marker gets the marker and key cleaned, as before,
+    /// but is not read as stopped, since it may be a launch that has not recorded
+    /// its supervisor yet.
+    #[test]
+    fn a_stale_stop_marker_on_a_record_naming_no_process_is_cleaned_without_reading_it_stopped()
+    -> Result<()> {
+        let (root, paths) = test_paths("liveness-pending-stop-no-process");
+        paths.ensure()?;
+        let service_id = "svc-no-process";
+        let mut record = pending_stop_record(&paths, service_id)?;
+        "starting".clone_into(&mut record.status);
+        record.clear_recorded_processes();
+
+        let changed = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+
+        assert!(changed, "the stale marker is consumed and persisted");
+        assert_eq!(record.stop_requested_unix_ms, None);
+        assert!(endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none());
+        assert_eq!(record.status, "starting", "it is not read as stopped");
+        assert_eq!(
+            record.settled_stop_unix_ms,
+            Some(1),
+            "the consumed marker's stamp stays, so a stop that began on this record can tell its own marker was consumed from a relaunch having cleared it"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn a_completed_pending_stop_reads_stopped_whatever_live_status_it_had() -> Result<()> {
+        for status in ["starting", "running", "ready", "recovering", "failed"] {
+            let (root, paths) = test_paths(&format!("liveness-pending-stop-{status}"));
+            paths.ensure()?;
+            let mut record = pending_stop_record(&paths, "svc-status")?;
+            record.status = status.to_owned();
+
+            let changed =
+                refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+                    ProcessProbe::Gone
+                });
+
+            assert!(changed, "{status}");
+            assert_eq!(record.status, "stopped", "{status}");
+            assert_eq!(record.supervisor_pid, 0, "{status}");
+            assert_eq!(
+                record.settled_stop_unix_ms, None,
+                "{status}: a record that names processes reads stopped and needs no stamp"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_pending_stop_keeps_its_key_and_marker_while_a_process_runs() -> Result<()> {
+        let (root, paths) = test_paths("liveness-running-pending-stop");
+        paths.ensure()?;
+        let service_id = "svc-running";
+        let mut record = pending_stop_record(&paths, service_id)?;
+
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Running
+        });
+
+        assert!(endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some());
+        assert_eq!(record.stop_requested_unix_ms, Some(1));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The one reading behind the three destructive decisions: any recorded
+    /// process that is not confirmed gone counts, both roles are asked about, and
+    /// a placeholder `0` PID never is.
+    #[test]
+    fn recorded_pids_may_be_running_unless_every_recorded_process_is_confirmed_gone() {
+        use std::cell::RefCell;
+
+        let (root, paths) = test_paths("recorded-pids-may-be-running");
+        let mut record = pending_stop_record(&paths, "svc-pids").expect("record");
+        let _ = fs::remove_dir_all(root);
+        record.supervisor_pid = 111;
+        record.engine_pid = Some(222);
+
+        let asked_cell = RefCell::new(Vec::new());
+        let asked = &asked_cell;
+        let by_pid = |running: &'static [(u32, ProcessProbe)]| {
+            move |pid: u32| {
+                asked.borrow_mut().push(pid);
+                running
+                    .iter()
+                    .find(|(candidate, _)| *candidate == pid)
+                    .map_or(ProcessProbe::Gone, |(_, probe)| *probe)
+            }
+        };
+
+        assert!(recorded_pids_may_be_running(
+            &record,
+            by_pid(&[(222, ProcessProbe::Unqueryable)])
+        ));
+        assert!(recorded_pids_may_be_running(
+            &record,
+            by_pid(&[(111, ProcessProbe::Running)])
+        ));
+        assert!(!recorded_pids_may_be_running(&record, by_pid(&[])));
+        let engine_only = asked.borrow().iter().filter(|pid| **pid == 222).count();
+        assert!(engine_only >= 1, "the engine PID is asked about too");
+
+        record.supervisor_pid = 0;
+        record.engine_pid = None;
+        asked.borrow_mut().clear();
+        assert!(!recorded_pids_may_be_running(
+            &record,
+            by_pid(&[(0, ProcessProbe::Running)])
+        ));
+        assert!(asked.borrow().is_empty(), "a 0 placeholder is never probed");
     }
 }

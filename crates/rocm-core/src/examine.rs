@@ -37,6 +37,8 @@ use host_env::{
     probe_container, probe_cpu_linux, probe_cpu_windows, probe_dmesg_amdgpu, probe_env, probe_os,
     probe_shared_memory,
 };
+#[cfg(test)]
+pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
 use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};
@@ -113,6 +115,21 @@ pub struct WslFacts {
     /// unreadable cache is not an unregistered library, and reporting it as one
     /// told users with a working install to re-run `ldconfig`.
     pub ldconfig_librocdxg: Option<bool>,
+    /// Whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`, which the
+    /// loader searches before the linker cache. A library there loads without
+    /// being registered, so only [`Self::librocdxg_unloadable`] -- not the cache
+    /// answer alone -- says the runtime cannot find it. `false` from the
+    /// `--distro` probe, which runs a non-login shell and sees none of the
+    /// user's environment.
+    #[serde(default)]
+    pub librocdxg_on_ld_library_path: bool,
+    /// Whether `librocdxg.so` is in the same `lib` directory as a
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` search path. A
+    /// TheRock tarball is laid out this way and is never in the linker cache.
+    /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
+    /// can ask it from outside the distribution.
+    #[serde(default)]
+    pub librocdxg_beside_runtime: bool,
     /// Whether `rocminfo` is on PATH.
     pub rocminfo: bool,
     /// Whether ROCm can actually enumerate a GPU here.
@@ -141,6 +158,27 @@ pub struct WslFacts {
     /// run, and a caller must say so rather than let "nothing matched" read as
     /// a clean bill of health.
     pub locally_probed: bool,
+}
+
+impl WslFacts {
+    /// `librocdxg.so` exists somewhere the probe looked: under a ROCm install, or
+    /// in a directory on `LD_LIBRARY_PATH`. A library reached only through the
+    /// variable (a source build in a home directory) is on disk even though no
+    /// ROCm root holds it.
+    #[must_use]
+    pub const fn librocdxg_present(&self) -> bool {
+        self.librocdxg || self.librocdxg_on_ld_library_path
+    }
+
+    /// The linker cache positively lacks ROCDXG and neither `LD_LIBRARY_PATH` nor
+    /// the runtime's own directory supplies it. `None` from the cache (ldconfig
+    /// could not run) is not evidence, so it is not "unloadable".
+    #[must_use]
+    pub const fn librocdxg_unloadable(&self) -> bool {
+        matches!(self.ldconfig_librocdxg, Some(false))
+            && !self.librocdxg_on_ld_library_path
+            && !self.librocdxg_beside_runtime
+    }
 }
 
 /// One copy of a ROCm library found on the machine.
@@ -233,8 +271,22 @@ pub struct Examination {
     pub has_discrete_amd: bool,
 
     // driver / runtime (Linux)
+    /// amdgpu is present: listed as a module, or registered as a PCI driver
+    /// (`/sys/bus/pci/drivers/amdgpu`), which it is whether amdgpu is loaded
+    /// as a module or built into the kernel (where it never appears in
+    /// `lsmod`), or kfd is present on the host (kfd is linked into amdgpu).
+    ///
+    /// This is the driver being present, not a GPU being bound to it: a
+    /// built-in driver registers at boot with or without a matching GPU, as a
+    /// loaded module does when `modprobe`d on any machine. Whether there is an
+    /// AMD GPU is `has_amd_gpu`. `diagnose` reads only `Some(false)`, as a
+    /// module that failed to load (DKMS, a blacklist, Secure Boot), none of
+    /// which can stop a driver that is present.
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
+    /// kfd is available: as a separate `amdkfd` module on kernels before 4.20
+    /// (where kfd was merged into `amdgpu.ko`), or through `/sys/class/kfd/kfd`
+    /// or `/dev/kfd` on current ones. The name predates the merge.
     pub amdkfd_loaded: Option<bool>,
     pub secure_boot: String,
     pub iommu_kernel_param: String,
@@ -495,6 +547,29 @@ impl Examination {
         Self::probe_with_interpreter(framework, None)
     }
 
+    /// Probe this host and gather its summary from the examination, returning
+    /// both: what `rocm examine --json` prints as one document.
+    ///
+    /// The pairing is made here so no caller can hand the summary an
+    /// examination of another host. The summary takes the examination's kernel
+    /// release (a failed read included) instead of running `uname -r` again, so
+    /// one inspection reads it once: `summary.kernel` and `kernel_release`
+    /// cannot disagree on a transient failure, and a hung `uname` costs one
+    /// timeout rather than two. Probing is as [`Self::probe_with_interpreter`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the host summary cannot be gathered (the application
+    /// directories cannot be resolved); the examination itself never fails.
+    pub fn probe_with_summary(
+        framework: FrameworkProbe,
+        interpreter: Option<&FrameworkInterpreter>,
+    ) -> anyhow::Result<(Self, crate::ExamineSummary)> {
+        let examination = Self::probe_with_interpreter(framework, interpreter);
+        let summary = crate::ExamineSummary::gather_after(&examination)?;
+        Ok((examination, summary))
+    }
+
     /// As [`Self::probe`], but running the framework probe under `interpreter`
     /// when one is given.
     ///
@@ -597,7 +672,12 @@ impl Examination {
     /// Coarse machine-readable verdict reported via the `status` field. The
     /// process exit code does NOT encode this — `rocm examine` always exits 0
     /// when it ran; callers branch on `status` instead.
-    fn compute_status(&self) -> String {
+    ///
+    /// Public so that a tool which edits a recorded examination (the skill-eval
+    /// recordings do) can recompute the verdict from the same rule the probe uses,
+    /// instead of typing a `status` that could disagree with the other fields.
+    #[must_use]
+    pub fn compute_status(&self) -> String {
         let value = if self.is_wsl {
             "wsl"
         } else if !matches!(self.os_family.as_str(), "linux" | "windows") {

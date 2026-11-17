@@ -4,15 +4,17 @@
 
 //! `rocm diagnose` and `rocm fix`: the command handlers (`diagnose`, `fix`) and
 //! the report step behind `rocm diagnose --report` — `show_prepared_report`
-//! prints what a report would carry and offers it through `perform_delivery`,
+//! prints what a report would carry (built by `prepare_cli_report`, which names
+//! this build's leading version) and offers it through `perform_delivery`,
 //! which acts on a delivery decision with an injected `Opener`, and
 //! `established_entry` picks the catalog entry a report names.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change; see
-//! `docs/architecture.md`. `diagnose` and `fix` are `pub(crate)`: `dispatch()`
-//! calls them through the re-import `use crate::diagnose_cmd::{diagnose,
-//! fix};`. The other three functions have no caller outside this module and
-//! stay private. `diagnose` gets its `--model` verdict from
+//! Relocated from `main.rs` with no behavior change; see
+//! `docs/architecture.md`. Since then `--model` has gained the GGUF estimate's
+//! flags, and `--report` ignores a model question and says so on stderr.
+//! `diagnose` and `fix` are `pub(crate)`: `dispatch()` calls them through the
+//! re-import `use crate::diagnose_cmd::{diagnose, fix};`. The other functions
+//! have no caller outside this module and stay private. `diagnose` gets its `--model` verdict from
 //! `model_fit.rs`'s `assess_model_on_this_host`, and `fix` reports a failing
 //! exit code to `main()` through `FixExitCode`, which stays in `main.rs` with
 //! the rest of the exit-code plumbing and is reached as `crate::FixExitCode`.
@@ -31,6 +33,7 @@ use serde::Serialize;
 
 use crate::FixExitCode;
 use crate::cli_report::{JsonOrText, print_json_or_text};
+use crate::diagnose_model;
 use crate::model_fit::assess_model_on_this_host;
 
 pub(crate) fn diagnose(
@@ -38,7 +41,7 @@ pub(crate) fn diagnose(
     top: usize,
     json: bool,
     distro: Option<String>,
-    model: Option<String>,
+    model: Option<diagnose_model::ModelQuery>,
     report_requested: bool,
     send: bool,
 ) -> Result<()> {
@@ -95,8 +98,18 @@ pub(crate) fn diagnose(
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
     let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
-    if let Some(model_ref) = &model {
-        report.model = Some(assess_model_on_this_host(model_ref, &examination));
+    // A prepared report carries no model verdict, and a GGUF estimate may read
+    // the model's header from the network -- which `--report` promises it never
+    // does -- so under `--report` the model is not assessed at all.
+    if report_requested && let Some(query) = &model {
+        eprintln!("{}", diagnose_model::report_ignores_model_note(query));
+    }
+    if let Some(query) = model.as_ref().filter(|_| !report_requested) {
+        report.model = Some(assess_model_on_this_host(
+            &query.model_ref,
+            &examination,
+            &query.context,
+        ));
     }
     if report_requested {
         return show_prepared_report(&examination, &report, json, send);
@@ -212,6 +225,21 @@ fn perform_delivery(
     format!("{SENDER_NOTICE}\n{outcome}")
 }
 
+/// The report this machine would contribute, naming this build's leading
+/// version: the one `rocm version` starts with.
+fn prepare_cli_report(
+    examination: &rocm_core::Examination,
+    entry: Option<&str>,
+    fix_offered: bool,
+) -> std::result::Result<rocm_core::Report, rocm_core::ReportRefusal> {
+    rocm_core::prepare_report(
+        examination,
+        entry,
+        fix_offered,
+        &crate::cli_version_number(),
+    )
+}
+
 /// Print the report this machine would contribute, and send nothing.
 fn show_prepared_report(
     examination: &rocm_core::Examination,
@@ -225,7 +253,7 @@ fn show_prepared_report(
     // looking for a fault. Anything scripting this reads the outcome from
     // `--json` rather than from the exit code, exactly as `rocm diagnose` itself
     // already asks callers to do.
-    match rocm_core::prepare_report(examination, entry, fix_offered) {
+    match prepare_cli_report(examination, entry, fix_offered) {
         Ok(prepared) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&prepared)?);
@@ -330,6 +358,35 @@ mod tests {
     use rocm_core::report_delivery::Delivery;
 
     use super::*;
+
+    /// `rocm diagnose --report` publishes the version `rocm version` leads
+    /// with, not `rocm-core`'s frozen package version. The e2e side is
+    /// `@id:diagnose-report-names-the-cli-version`.
+    #[test]
+    fn a_problem_report_names_the_version_rocm_version_leads_with() {
+        let examination = rocm_core::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            distro_version: "22.04".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![rocm_core::examine::Gpu {
+                name: "test".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+                pci_id: String::new(),
+                is_apu: Some(false),
+                is_amd: true,
+            }],
+            ..rocm_core::Examination::default()
+        };
+        let report = prepare_cli_report(&examination, None, false)
+            .expect("a released GPU must produce a report");
+        let number = crate::cli_version_number();
+        assert_eq!(report.cli_version, number);
+        assert!(
+            crate::cli_version_string().starts_with(&format!("{number} (")),
+            "{number:?} does not lead `rocm version`'s string"
+        );
+    }
 
     /// An opener that records rather than opens, and can be told to fail.
     ///
@@ -474,6 +531,7 @@ mod tests {
         rocm_core::DiagnoseReport {
             has_match,
             matched: vec![rocm_core::Diagnosis {
+                symptom_matched: false,
                 id: id.to_owned(),
                 title: "under test".to_owned(),
                 score,
@@ -570,6 +628,7 @@ mod tests {
             route: None,
             undetermined_reason: None,
             warnings: Vec::new(),
+            estimate: None,
         };
         let readiness_text = rocm_core::model_readiness::render_model_readiness_text(&readiness);
         report.model = Some(readiness);

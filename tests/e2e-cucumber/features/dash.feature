@@ -75,7 +75,13 @@ Feature: Interactive dashboard
     When the user opens the dashboard
     And the user opens the Observe view
     Then the managed model is displayed
-    When the user quits the dashboard
+    When the user opens the managed services overlay
+    Then the Services overlay lists the managed model with its port
+    When the user asks to stop the listed service
+    Then a stop approval prompt names the managed model and its port
+    When the user declines the approval prompt
+    And the user closes the managed services overlay
+    And the user quits the dashboard
     Then the dashboard exits successfully
 
 
@@ -623,13 +629,16 @@ Feature: Interactive dashboard
   # placeholder shown before the first snapshot arrives at all, is not covered
   # here (the unit test `gpu_telemetry_pending_while_connected_but_no_snapshot_yet`
   # pins it): it closes in well under a second and there's no hook to freeze the daemon
-  # mid-handshake, so asserting on it would be asserting on a race.
+  # mid-handshake, so asserting on it would be asserting on a race. Nothing is
+  # served either, so the T/S row must read "—" too: an empty sum of rates is
+  # -0.0 in Rust, which used to render as "-0".
   @id:dash-reports-no-gpu-telemetry @requires-os:linux
   Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
     Given a machine with no GPU
     When the user opens the dashboard
     Then the dashboard home view is displayed
     And the hero reports no GPU telemetry available
+    And the hero reports no generation throughput
     When the user quits the dashboard
     Then the dashboard exits successfully
 
@@ -738,5 +747,228 @@ Feature: Interactive dashboard
     When the user opens instance detail
     Then instance details are displayed
     And the instance detail lists recent throughput samples
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The dashboard follows the managed-service registry on a timer. A pass that
+  # cannot read the registry says nothing about the services in it, so it must
+  # not retire the model that is on screen: the header warns that the registry
+  # is not being read, and the model stays. The registry is made unreadable by
+  # adding one record that cannot be opened (a link to itself), in a single step
+  # that leaves the model's own record in place, so no poll of the registry can
+  # see it empty or absent, and no permission setup of the runner (running as
+  # root) can make it readable. A registry that reads but is empty does retire
+  # a service; that contrast, the recovery path and the once-per-streak log
+  # line are asserted by the daemon's own tests in
+  # `crates/rocm-dash-daemon/tests/`, where the loop runs without a terminal.
+  @id:dash-managed-model-survives-unreadable-registry @requires-os:linux
+  Scenario: dash-43 - A managed model stays on screen while its registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    Then the header warns that the registry is not being read
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The same registry failure, from the other side: a service whose record can be
+  # read is still added while some other record cannot be opened. The dashboard
+  # reads what it can and retires nothing, so a model that is started beside a
+  # stale unreadable record appears on screen (and the first model stays). The
+  # daemon's own tests in `crates/rocm-dash-daemon/tests/` assert the rest of the
+  # matrix: a record removed during the failure is not retired until the registry
+  # reads in full, and a record that becomes unreadable is not announced again
+  # when it reads again.
+  @id:dash-new-model-appears-beside-unreadable-record @requires-os:linux
+  Scenario: dash-44 - A newly served model appears while another record in the registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    And another managed model is served
+    Then the other managed model is displayed
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+
+  @id:dash-serve-wizard-opens-collapsed @requires-os:linux
+  Scenario: dash-45 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    Then the serve wizard shows only the model, Advanced settings, and Launch
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
+  Scenario: dash-46 - Escape cancels an in-progress host edit without closing the serve wizard
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user expands the serve wizard's Advanced settings
+    And the user starts editing the serve wizard's Host field
+    And the user types "nope" into the serve wizard
+    And the user presses Escape
+    Then the serve wizard is still open with the host unchanged
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
+  Scenario: dash-47 - An automatic serve form stages a bare serve command with an automatic port
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 2 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard asks to approve "serve demo-model" with an automatic port
+    When the user presses Escape
+    Then the serve wizard approval closes and the wizard stays open
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
+  Scenario: dash-48 - A custom host with an automatic port is refused in the form
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "localhost" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "set Port to Custom"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-public-host @requires-os:linux
+  Scenario: dash-49 - A public host is refused in the form with the CLI pointer
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "0.0.0.0" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "Dash serves on loopback only"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #796: on an idle host the Observe CPU panel drew a few scattered dots
+  # instead of a graph. Any sample whose fill rounded below one braille dot row
+  # was dropped, which on an idle machine is nearly every sample. The widget
+  # tests pin the dot maths; this scenario pins what the user sees, since the
+  # regression was only ever visible as a picture. The recording reports 2%
+  # overall and 1% per core, the idle host the demo generator never produces:
+  # that generator oscillates around 28%, far above the rounding that caused
+  # the bug. Sixty entries two seconds apart outlast the scenario, the
+  # recording technique dash-39 introduced.
+  #
+  # Observe gives its CPU slot about four rows, too few for the separate
+  # per-core box, so the dashboard keeps the box carrying history and folds the
+  # core count into its title. Both halves of that are asserted here: the count
+  # survived the dropped box, and the idle trace is a line rather than a gap.
+  @id:dash-idle-cpu-graph-is-continuous @requires-os:linux
+  Scenario: dash-50 - The CPU graph stays a line when the host is idle
+    When the user opens the dashboard replaying an idle host
+    When the user opens the Observe view
+    Then the CPU graph is drawn as a continuous line
+    And the CPU box reports the host's core count
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The other half of #796's layout change. dash-50 replays a 64-core host,
+  # which leaves the slot too narrow to split, so the per-core box is dropped
+  # and nothing there exercises the side-by-side layout.
+  #
+  # The core count decides this, not the terminal: the split wants two columns
+  # per core on each half, and widening does not help, because Observe grows
+  # side docks past a certain width and its centre column comes out *narrower*
+  # than at the detail geometry. So this replays a 16-core host at the same
+  # geometry dash-50 uses.
+  @id:dash-cpu-boxes-side-by-side @requires-os:linux
+  Scenario: dash-51 - A modest core count puts the CPU graph beside the per-core strip
+    When the user opens the dashboard replaying an idle 16-core host
+    When the user opens the Observe view
+    Then the CPU graph and the per-core strip sit side by side
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  Scenario: dash-52 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
+    Given a managed runtime is active
+    And the dashboard watches only managed services
+    And a GGUF model is being served on lemonade
+    Then the model responds to inference requests
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the real managed Lemonade model is displayed
+    When the user opens instance detail
+    Then the managed model's instance detail shows it ready on the port it was served on
+    When the user closes instance detail
+    And the user selects engine status in the Serving view
+    Then Lemonade is shown as a managed runtime installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the model responds to inference requests
+
+  @id:dash-lemonade-external-protocol-discovery @requires-os:linux
+  Scenario: dash-53 - External Lemonade protocol discovery displays every loaded model without adopting the service
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the user opens the managed services overlay
+    Then the Services overlay has no managed servers
+    When the user attempts to stop and restart the external models
+    Then the Services overlay closes without an approval prompt or job
+    And both loaded models are still displayed
+    And the external server received no lifecycle request and no managed record exists
+    When the user selects engine status in the Serving view
+    Then Lemonade is shown as externally running without a managed installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the external server received no lifecycle request and no managed record exists
+
+  @id:dash-lemonade-external-protocol-transitions @requires-os:linux
+  Scenario: dash-54 - External Lemonade protocol models disappear on unload, return on reload, and disappear again when the server stops responding
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the external Lemonade server unloads its second model
+    Then only the first model is displayed, with its throughput
+    When the external Lemonade server unloads every model
+    Then no loaded model is displayed and none are reported as discovered
+    When the external Lemonade server loads both models again
+    Then both loaded models are displayed with throughput shown as unknown
+    And the external server received no lifecycle request and no managed record exists
+    When the external Lemonade server stops responding
+    Then no loaded model is displayed and none are reported as discovered
+    When the user selects engine status in the Serving view
+    Then Lemonade returns to the managed installation status without external availability
     When the user quits the dashboard
     Then the dashboard exits successfully

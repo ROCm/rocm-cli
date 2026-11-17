@@ -8,6 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "../../../crates/rocm-core/tests/common/proptest_cases.rs"]
+mod proptest_cases;
+pub(crate) use proptest_cases::proptest_cases;
+
 /// A fresh, empty scratch directory under the crate's `target/`, named
 /// `lemonade-fs-test-<tag>-<pid>-<millis>-<counter>`.
 ///
@@ -34,6 +38,15 @@ pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// The temp name the retired `rocm_core::write_atomic` picked when it
+/// replaced `backend_versions.json`: `with_extension("pins.tmp-<millis>-<pid>")`
+/// swapped the `json` extension for `pins`, so the name was
+/// `backend_versions.pins.tmp-<millis>-<pid>`, with this process's pid. It was
+/// fixed by the clock and the pid alone, so a test can occupy it ahead of time.
+pub(crate) fn retired_pin_temp_path(pin_file: &Path, millis: u128) -> PathBuf {
+    pin_file.with_extension(format!("pins.tmp-{millis}-{}", std::process::id()))
 }
 
 mod tests {

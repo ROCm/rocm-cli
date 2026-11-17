@@ -15,8 +15,8 @@
 //! live in `cli.rs` with the rest of the `Command`/`Cli` definition.
 //! `dispatch()` calls `install` through the re-import `use
 //! crate::install_cmd::{...};`. `therock_install_version_selector` is also
-//! `pub(crate)`: `chat.rs`'s `render_install_sdk_dry_run_for_args` calls it as
-//! `crate::therock_install_version_selector` through that re-import, which is
+//! `pub(crate)`: `chat/mcp_bridge.rs`'s `render_install_sdk_dry_run_for_args`
+//! calls it as `crate::therock_install_version_selector` through that re-import, which is
 //! why `sdk_install_request` moved here rather than staying in `chat.rs` —
 //! this module does not depend on `chat.rs`. `sdk_install_request` keeps the
 //! `pub(crate)` it had in `chat.rs`, although only `install` and this module's
@@ -73,6 +73,7 @@ pub(crate) const fn sdk_install_request<'a>(
     prefix: Option<PathBuf>,
     version_selector: Option<therock::RuntimeVersionSelector>,
     family_override: Option<&'a str>,
+    python_version: Option<&'a str>,
     dry_run: bool,
     devel: bool,
     consent: therock::SdkInstallConsent,
@@ -83,6 +84,7 @@ pub(crate) const fn sdk_install_request<'a>(
         prefix,
         version_selector,
         family_override,
+        python_version,
         dry_run,
         include_devel: devel,
         consent,
@@ -100,6 +102,7 @@ pub(crate) fn install(target: InstallTarget) -> Result<()> {
             version,
             build_date,
             family,
+            python_version,
             dry_run,
             yes,
             approve_replacing_active_default,
@@ -125,6 +128,7 @@ pub(crate) fn install(target: InstallTarget) -> Result<()> {
                     prefix,
                     version_selector,
                     family.as_deref(),
+                    python_version.as_deref(),
                     dry_run,
                     devel,
                     consents.replace_active_default,
@@ -301,6 +305,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 devel,
                 therock::SdkInstallConsent::Ask,
@@ -315,6 +320,7 @@ mod tests {
         let dry_run_only = sdk_install_request(
             "release",
             "wheel",
+            None,
             None,
             None,
             None,
@@ -345,6 +351,7 @@ mod tests {
             let request = sdk_install_request(
                 "release",
                 "wheel",
+                None,
                 None,
                 None,
                 None,

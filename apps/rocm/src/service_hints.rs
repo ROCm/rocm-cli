@@ -38,6 +38,16 @@ pub(crate) fn service_action_hint(action: &str, service_id: &str) -> String {
     format!("rocm services {action} {} --yes", shell_quote(service_id))
 }
 
+/// The directly-runnable `rocm services remove <id> --force --yes` hint: the
+/// removal that goes ahead for a record whose recorded processes cannot be
+/// queried (see `remove_managed_service_record`).
+pub(crate) fn service_forced_remove_hint(service_id: &str) -> String {
+    format!(
+        "rocm services remove {} --force --yes",
+        shell_quote(service_id)
+    )
+}
+
 /// The directly-runnable `rocm services stop <id> --yes` hint.
 pub(crate) fn service_stop_hint(service_id: &str) -> String {
     service_action_hint("stop", service_id)

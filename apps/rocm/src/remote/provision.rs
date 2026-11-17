@@ -422,10 +422,11 @@ fn tempdir_for_download() -> Result<PathBuf> {
 /// signature stops that, and today one is always required: `resolve_public_keys`
 /// falls back to the pinned release key with no channel argument, so
 /// `public_keys` is non-empty on every channel and the `|| [ -n "${public_keys}" ]`
-/// arm at `install.sh:431` fires regardless of the channel-gated `require_sig`
-/// above it. Clearing both pinned key slots is the only way to reach an unsigned
-/// install. 0700 is still what keeps a second local user out of the gap in the
-/// meantime — and what keeps this sound if a channel ever ships without a key.
+/// arm of install.sh's signature check fires regardless of the channel-gated
+/// `require_sig` before it. Clearing both pinned key slots is the only way to
+/// reach an unsigned install. 0700 is still what keeps a second local user out
+/// of the gap in the meantime — and what keeps this sound if a channel ever
+/// ships without a key.
 ///
 /// (The signing key itself never lands here. It travels in the command prefix,
 /// and install.sh writes it into its own `mktemp -d` on the far side.)

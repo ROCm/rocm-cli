@@ -181,7 +181,7 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-1-gpu-not-exposed` | `/dev/dxg` is missing. Names which of the three causes applies: a container started without the device, a distro with no WSL GPU support wired in, or the Windows host driver |
 | `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
 | `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
-| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache |
+| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but the loader has no way to find it: it is absent from the linker cache and from the `LD_LIBRARY_PATH` of the shell running the check, and is not in the same directory as a `libhsa-runtime64` |
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
@@ -189,8 +189,8 @@ Eight entries that are not WSL-specific also run on WSL: `fix-1-arch`,
 `fix-2-unset-override`, `fix-6-path`, `fix-8-wheel-rocm`, `fix-16-vllm-oom`,
 `fix-17-torch-dlpack`, `fix-18-comgr-conflict`, and `fix-19-shm-too-small`.
 `fix-16-vllm-oom` and `fix-17-torch-dlpack` are driven by the error text you
-pass with `--symptom` and read nothing from the environment or the ROCm
-install. `fix-18-comgr-conflict` and
+pass with `--symptom` (or `--symptom-file`) and read nothing from the
+environment or the ROCm install. `fix-18-comgr-conflict` and
 `fix-19-shm-too-small` apply when you run `rocm diagnose` inside the distro. A
 `--distro` run skips both (see
 [Diagnose a distro from Windows](#diagnose-a-distro-from-windows) later in this
@@ -264,7 +264,14 @@ collects a fixed set of data. This leaves four limits:
   distro reports.
 - **No environment checks.** The script collects no environment, so the checks
   that read one do not run: `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the
-  framework and ROCm version pairing.
+  framework and ROCm version pairing. That includes `LD_LIBRARY_PATH`: a
+  library the loader reaches only through that variable is not in the linker
+  cache, so `--distro` can still report `fix-wsl-4` for an install that
+  `rocm diagnose` inside the distro finds healthy. A library beside its runtime,
+  the layout of a TheRock tarball, is a file check, so `--distro` does see that
+  one. The finding's evidence says
+  the variable could not be checked from outside the distribution, rather than
+  claiming it was.
 - **No library or shared-memory checks.** The script does not collect the data
   that `fix-18-comgr-conflict` and `fix-19-shm-too-small` need, so those two do
   not run either.
@@ -296,8 +303,54 @@ below.
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
 - `librocdxg.so` presence, resolved across every ROCm install rather than
-  assuming `/opt/rocm`
+  assuming `/opt/rocm`, and counted as present when it is in a directory on
+  `LD_LIBRARY_PATH` even if no ROCm install holds it (the `wsl_librocdxg` line
+  stays `false` for such a library; `driver_status` and the `missing` detail
+  treat it as found)
 - `librocdxg` linker-cache visibility from `ldconfig -p`
+- whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`
+  (`wsl_librocdxg_on_ld_library_path`). The loader searches that variable
+  before the cache, so an install exported there is reachable without a cache
+  entry
+- whether `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`
+  (`wsl_librocdxg_beside_runtime`). The runtime opens `librocdxg.so` by name and
+  searches its own directory (`$ORIGIN`; the wheel runtimes' `libhsa-runtime64.so.1`
+  carries it as a `DT_RPATH`, per `readelf -d`), so a TheRock tarball under `/opt/rocm-<version>`,
+  which keeps the two side by side and registers nothing with `ldconfig`, loads
+  with neither the cache nor the variable. `driver_status` is
+  `wsl_rocdxg_ready` when any of the three sources finds the library, and
+  `wsl_rocdxg_missing` only when none does
+- a managed wheel runtime whose own `librocdxg.so.1` its runtime does not load
+  (`wsl_runtime_librocdxg` in the text form, `summary.unlinked_runtime_librocdxg`
+  in `--json`; printed only when there is one). The wheel ships
+  `librocdxg.so.1` beside `libhsa-runtime64`, but the runtime opens
+  `librocdxg.so`, which the wheel does not ship (or which is a link to a file
+  that is missing: the loader's `open` fails on a broken link as on an absent
+  file), so it loads the host's copy.
+  A host `rocdxg-roct` older than the runtime expects then fails at first GPU
+  use, for example ROCm 10.2 and 10.3 nightly runtimes against `rocdxg-roct`
+  1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`, then a segmentation
+  fault), while `driver_status` still reads `wsl_rocdxg_ready`, which describes
+  the host's plumbing. Wheel runtime installs and updates (`rocm install sdk`, `rocm update --apply`)
+  link `librocdxg.so` to the runtime's own copy on WSL (tarballs ship both
+  names, and an adopted runtime is never linked); for a runtime installed earlier the line names the
+  `ln -sfn librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same
+  (`-fn` so that it also replaces a dangling `librocdxg.so`; the install replaces
+  one atomically, and leaves alone a `librocdxg.so` that resolves when it is
+  checked; the install refuses at its final check if the name resolves by then,
+  and a name that becomes a working link between that check and the rename is
+  replaced). The
+  versioned name is the fixed `librocdxg.so.1`: a wheel whose soname changes is
+  not detected or linked, and a dangling `librocdxg.so` beside a runtime with no
+  `librocdxg.so.1` is not detected. A `librocdxg.so.1` that is itself dangling or
+  a link loop is not listed or linked either, and is deliberately not reported
+  (nothing valid to link to).
+  The mechanism (the unversioned open skipping the runtime's directory and
+  landing on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2
+  nightly; which component requests `hsaKmtSetPersistingCacheSize` is not
+  identified. The line is a pointer, not a verdict: it appears for every such runtime,
+  including ones that work with the host's copy, because the files alone do not
+  say which symbols the runtime needs
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
@@ -312,6 +365,12 @@ it from inside the distro: `rocm_sees_gpu` under `wsl` answers that. `has_apu`
 and `has_discrete_amd` stay `false`: the Windows side reports a gfx target, not
 a listing that says whether the part is an APU or a discrete card, so
 `has_amd_gpu: true` beside both `false` is the expected WSL shape.
+
+## How `rocm serve` Finds The GPU On WSL
+
+On WSL `rocm serve` does not look for `/dev/kfd`, which does not exist there. Under the default `gpu_required` policy it asks the same question `rocm examine` answers, whether the WSL GPU path is ready (`driver_status: wsl_rocdxg_ready`): one usable device when it is, none when it is not, with `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` still applied on top. `--gpu auto` therefore selects GPU 0 on a ready host.
+
+When the path is not ready, `serve` refuses with `no usable AMD GPU detected` before any engine is prepared, and on WSL its advice is to run `rocm examine`, check that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what is missing. A `librocdxg.so` the loader finds through `LD_LIBRARY_PATH`, or beside the runtime that opens it, counts as ready, wherever it lives: a library in a non-ROCm directory such as a source build in your home directory is counted once its directory is on `LD_LIBRARY_PATH`. A TheRock tarball is laid out the second way and needs nothing exported; for a library that sits alone, export its `lib` directory in the shell that runs `rocm` (see [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
 
 ## Install UX Recommendations
 

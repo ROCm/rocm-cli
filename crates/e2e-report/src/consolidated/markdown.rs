@@ -10,7 +10,10 @@
 //! command-coverage table from `command_coverage.rs`. Re-exported from the
 //! crate root by `lib.rs`.
 
-use super::{CellOutcome, Grid, LEGEND_ENTRIES, PlatformReports, ScenarioReference, platform_cell};
+use super::{
+    CellOutcome, Grid, LEGEND_ENTRIES, MOCK_GATES_PR, OTHER_LANES_NON_BLOCKING, PlatformReports,
+    ScenarioReference, platform_cell,
+};
 use crate::command_coverage::command_coverage_markdown;
 
 /// Render the consolidated result from a [`PlatformReports`] bundle as a
@@ -57,6 +60,12 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
             s if s.is_empty() => plat_base,
             s => format!("{plat_base}<br><sub>{s}</sub>"),
         };
+        // Exact target and package source on their own line, so a reader can see
+        // what the run installed from, not only which versions it ended up with.
+        let plat_cell = match r.versions.provenance() {
+            p if p.is_empty() => plat_cell,
+            p => format!("{plat_cell}<br><sub>{p}</sub>"),
+        };
         let os_cell = match r.versions.os.as_deref() {
             Some(v) if v != r.desc.os => format!("{}<br><sub>{}</sub>", r.desc.os, v),
             _ => r.desc.os.clone(),
@@ -80,18 +89,21 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
         "| **Total** | | {t_total} | {t_pass} | {t_fail} | {t_skip} | {t_xfail} | |",
     );
 
-    out.push_str(
+    // The gating policy's two phrases come from `MOCK_GATES_PR` /
+    // `OTHER_LANES_NON_BLOCKING`, shared with the HTML legend.
+    let _ = write!(
+        out,
         "\n**Mock** runs the real `rocm` CLI, but fakes the inference backend: instead \
          of downloading a runtime and launching a real engine (vLLM/lemonade) on a \
          GPU, a tiny in-process HTTP server stands in for the OpenAI-compatible \
          endpoint that engine would expose (`/v1/models`, `/v1/chat/completions`). \
          This exercises CLI behaviour — alias resolution, service discovery, chat \
          forwarding — with no GPU, no model download, and no engine process, so it \
-         runs on a GitHub-hosted runner. It **gates the PR**: it runs on every push, \
+         runs on a GitHub-hosted runner. It **{MOCK_GATES_PR}**: it runs on every push, \
          and if it fails the PR's required check goes red and the PR cannot merge. \
          **Every other platform** is a real self-hosted GPU host running real \
          engines — the rows below are the list, so naming them here would only go \
-         stale as lanes are added. They are **non-blocking**: they still run and \
+         stale as lanes are added. They are **{OTHER_LANES_NON_BLOCKING}**: they still run and \
          are reported here, but \
          a failure does NOT block the PR from merging (the hardware/runners are still \
          being proven out, so their results are informational rather than a merge \
@@ -350,6 +362,54 @@ mod tests {
         let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("Needs attention"));
         assert!(md.contains("XPASS"));
+    }
+
+    #[test]
+    fn summary_explanation_paragraphs_are_unchanged() {
+        // Pins the explanatory text under the summary table byte for byte, so
+        // building it from shared fragments (see `MOCK_GATES_PR`) cannot
+        // change a character of what the step summary shows. This pins the text
+        // only: that Mock is the required check and the rest are not is branch
+        // protection, which lives outside this repository.
+        let report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let inputs = vec![("e2e-report".to_string(), report.path().to_path_buf())];
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
+        let expected = "\n**Mock** runs the real `rocm` CLI, but fakes the inference backend: instead \
+             of downloading a runtime and launching a real engine (vLLM/lemonade) on a \
+             GPU, a tiny in-process HTTP server stands in for the OpenAI-compatible \
+             endpoint that engine would expose (`/v1/models`, `/v1/chat/completions`). \
+             This exercises CLI behaviour — alias resolution, service discovery, chat \
+             forwarding — with no GPU, no model download, and no engine process, so it \
+             runs on a GitHub-hosted runner. It **gates the PR**: it runs on every push, \
+             and if it fails the PR's required check goes red and the PR cannot merge. \
+             **Every other platform** is a real self-hosted GPU host running real \
+             engines — the rows below are the list, so naming them here would only go \
+             stale as lanes are added. They are **non-blocking**: they still run and \
+             are reported here, but \
+             a failure does NOT block the PR from merging (the hardware/runners are still \
+             being proven out, so their results are informational rather than a merge \
+             gate).\n\n\
+             Column meanings: **Pass** = scenarios that passed as expected; \
+             **Xfail** = known bugs that failed as expected (healthy — the bug still \
+             reproduces); **Skip** = not applicable on this platform (e.g. a GPU-only \
+             scenario on Mock); **Fail** = unexpected — a scenario that should pass but \
+             failed, or a known bug that unexpectedly passed (its tag is now stale). \
+             **Status** is PASS unless a platform has any Fail.\n";
+        assert!(
+            md.contains(expected),
+            "summary explanation text changed:\n{md}"
+        );
+        // The pin above would still pass if the paragraph hardcoded the words
+        // while a shared constant's value moved on; these tie the rendered text
+        // to the constants themselves.
+        assert!(
+            md.contains(MOCK_GATES_PR),
+            "summary must render MOCK_GATES_PR ({MOCK_GATES_PR:?}):\n{md}"
+        );
+        assert!(
+            md.contains(OTHER_LANES_NON_BLOCKING),
+            "summary must render OTHER_LANES_NON_BLOCKING ({OTHER_LANES_NON_BLOCKING:?}):\n{md}"
+        );
     }
 
     #[test]
@@ -734,6 +794,44 @@ mod tests {
         ] {
             assert!(md.contains(token), "matrix cell missing {token:?}:\n{md}");
         }
+    }
+
+    #[test]
+    fn matrix_cell_names_the_exact_target_and_package_source() {
+        // platform.json carries the runtime's exact GFX target and package source;
+        // the matrix Platform cell shows both so a reader can tell what the run
+        // installed from. A platform.json without them shows neither.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let with = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"rocm":"7.14.0a20260601","channel":"nightly","gfx_target":"gfx942",
+                         "source":"https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)"},
+            "expectations": [{"id":"serve-x","effective_engine":"vllm","expected":"pass"}]
+        }"#;
+        let (_d, path) = write_platform(&report, with);
+        let md =
+            consolidated_summary_markdown(&load_platform_reports(&[("mi300x".to_string(), path)]));
+        assert!(
+            md.contains(
+                "GFX gfx942 · source https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)"
+            ),
+            "target and source missing from the Platform cell:\n{md}"
+        );
+
+        let without = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"rocm":"7.14.0"},
+            "expectations": [{"id":"serve-x","effective_engine":"vllm","expected":"pass"}]
+        }"#;
+        let (_d, path) = write_platform(&report, without);
+        let md =
+            consolidated_summary_markdown(&load_platform_reports(&[("mi300x".to_string(), path)]));
+        assert!(
+            !md.contains("GFX gfx") && !md.contains("source http"),
+            "{md}"
+        );
     }
 
     #[test]

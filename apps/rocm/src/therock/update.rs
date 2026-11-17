@@ -4,42 +4,50 @@
 
 //! Whether an installed runtime has something newer to offer, and the bounded
 //! startup check that asks. `runtime_update_plan` resolves the latest source for
-//! one runtime (`resolve_latest_for_manifest`, which re-resolves a wheel
-//! runtime through `resolve_pip_runtime_with_timeout` and a tarball one through
+//! one runtime, and `runtime_update_check` does the same for a caller that
+//! changes nothing (the report, the JSON, the startup check and an apply's
+//! preview). They differ in `PythonAccess`: given a wheel runtime that records
+//! no usable Python, the plan prepares a managed Python (an apply needs one),
+//! while the check works the wheel tag out from the interpreter the layout
+//! requires and carries a `python_note` saying the preparation was left undone
+//! (`resolve_latest_for_manifest` re-resolves a wheel runtime through
+//! `resolve_pip_runtime_with_timeout` and a tarball one through
 //! `resolve_tarball_artifact_with_timeout`, on the layout the runtime was
 //! installed from) and `runtime_freshness` classifies it (`RuntimeFreshness`:
 //! up to date, update available, repair available, or ahead of the index) into
 //! a `RuntimeUpdatePlan`. `render_update_report` and `render_update_json` show
 //! the plans for `rocm update` (the JSON form is what the dashboard's update
-//! check parses), and `maybe_refresh_startup_update_check` keeps one
+//! check parses and carries no `python_note`), and `maybe_refresh_startup_update_check` keeps one
 //! `StartupUpdateCheckRecord` in the cache so the check runs at most once an
 //! interval and is bounded by a short download timeout.
 //!
 //! Builds on `family`, `io`, `process`, `python`, `resolve`, `source` and
 //! `version`, and on `runtime_registry` for the manifests; `runtime_key`,
-//! `wheel_runtime_key` and `has_nontrivial_directory_contents`, which name and
-//! inspect the install a plan targets, stay in `therock.rs` with the other keys
-//! and roots helpers.
+//! `wheel_runtime_key`, which name the install a plan targets, stay in
+//! `therock.rs` with the other keys and roots helpers. Whether an install root
+//! holds anything is `rocm_core::install_root_has_payload`, the one rule the
+//! install and activation paths share.
 
 use super::family::family_override_or_recovered_arch;
-use super::io::write_file_atomically;
 use super::process::SuppressProgressOutput;
 use super::python::{
-    PythonLauncher, python_launcher_install_ready, python_requirement, resolve_python_launcher,
-    wheel_compatibility_for_python,
+    PythonLauncher, PythonRequirement, PythonSource, plan_python_launcher,
+    python_launcher_install_ready, python_requirement, python_requirement_for_tag,
+    resolve_python_launcher, wheel_compatibility_for_python,
 };
 use super::resolve::{
     AggregateDeviceTarget, resolve_pip_runtime_with_timeout, resolve_tarball_artifact_with_timeout,
     wheel_runtime_composition,
 };
-use super::source::{SourceLayout, TheRockChannel};
-use super::version::{runtime_version_display, version_relation};
-use super::{has_nontrivial_directory_contents, runtime_key, wheel_runtime_key};
+use super::source::{SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel};
+use super::version::{parse_version, runtime_version_display, version_relation};
+use super::{runtime_key, wheel_runtime_key};
 use crate::runtime_registry::{
     InstalledRuntimeManifest, WheelRuntimeComposition, load_runtime_manifests,
     wheel_composition_device_target,
 };
 use anyhow::{Context, Result, bail};
+use rocm_core::atomic_write::write_file_atomically;
 use rocm_core::{AppPaths, unix_time_millis};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -83,6 +91,22 @@ pub(crate) struct RuntimeUpdatePlan {
     pub source_layout_generation: Option<String>,
     pub repair_required: bool,
     pub update_available: bool,
+    /// Set when the runtime records no usable Python and the check left one
+    /// unprepared: what an update would do about it.
+    pub python_note: Option<String>,
+}
+
+/// Whether resolving a wheel runtime's latest version may prepare a Python.
+///
+/// Reading the index needs the interpreter's wheel tag. A runtime that records
+/// a usable Python supplies it. For one that does not, an apply goes on to
+/// prepare a managed Python (it needs one for the install that follows), but a
+/// check changes nothing, so it works the tag out from the interpreter the
+/// layout requires and says it left the preparation undone.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PythonAccess {
+    MayPrepare,
+    SearchOnly,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -116,6 +140,7 @@ struct ResolvedRuntimeUpdate {
     format: String,
     source_layout_generation: String,
     wheel_composition: Option<WheelRuntimeComposition>,
+    python_note: Option<String>,
 }
 
 pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
@@ -144,7 +169,7 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     }
 
     for manifest in &manifests {
-        let plan = match runtime_update_plan(paths, manifest, &manifests, None) {
+        let plan = match runtime_update_check(paths, manifest, &manifests, None) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 let _ = writeln!(
@@ -181,6 +206,9 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
             manifest.install_root.display()
         );
         let _ = writeln!(output, "    source: {}", plan.latest_source);
+        if let Some(note) = &plan.python_note {
+            let _ = writeln!(output, "    python_note: {note}");
+        }
         if plan.update_available {
             let next_step = if plan.repair_required {
                 format!(
@@ -247,7 +275,7 @@ pub(crate) fn render_update_json(
     let manifests = load_runtime_manifests(paths)?;
     let mut runtimes = Vec::with_capacity(manifests.len());
     for manifest in &manifests {
-        match runtime_update_plan(paths, manifest, &manifests, download_timeout_secs) {
+        match runtime_update_check(paths, manifest, &manifests, download_timeout_secs) {
             Ok(plan) => runtimes.push(UpdateJsonRuntime {
                 runtime_key: manifest.runtime_key.clone(),
                 channel: manifest.channel.clone(),
@@ -295,7 +323,7 @@ fn replacement_runtime_is_installed(
             && candidate.format == source.format
             && candidate.family == source.family
             && candidate.wheel_composition.as_ref() == Some(required_composition)
-            && has_nontrivial_directory_contents(&candidate.install_root).unwrap_or(false)
+            && rocm_core::install_root_has_payload(&candidate.install_root).unwrap_or(false)
     })
 }
 
@@ -356,13 +384,49 @@ fn runtime_freshness_with_manifests(
     }
 }
 
+/// The plan an apply works from. A wheel runtime that records no usable Python
+/// has one prepared here, since the install that follows needs it.
 pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     manifests: &[InstalledRuntimeManifest],
     download_timeout_secs: Option<u64>,
 ) -> Result<RuntimeUpdatePlan> {
-    let latest = resolve_latest_for_manifest(paths, manifest, download_timeout_secs)?;
+    plan_runtime_update(
+        paths,
+        manifest,
+        manifests,
+        download_timeout_secs,
+        PythonAccess::MayPrepare,
+    )
+}
+
+/// The same plan for a caller that changes nothing: the update report, the JSON
+/// the dashboard reads, and the preview of an apply. It never prepares a Python.
+pub(crate) fn runtime_update_check(
+    paths: &AppPaths,
+    manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
+    download_timeout_secs: Option<u64>,
+) -> Result<RuntimeUpdatePlan> {
+    plan_runtime_update(
+        paths,
+        manifest,
+        manifests,
+        download_timeout_secs,
+        PythonAccess::SearchOnly,
+    )
+}
+
+fn plan_runtime_update(
+    paths: &AppPaths,
+    manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
+    download_timeout_secs: Option<u64>,
+    python_access: PythonAccess,
+) -> Result<RuntimeUpdatePlan> {
+    let latest =
+        resolve_latest_for_manifest(paths, manifest, download_timeout_secs, python_access)?;
     let freshness = runtime_freshness_with_manifests(
         manifests,
         manifest,
@@ -385,6 +449,7 @@ pub(crate) fn runtime_update_plan(
         source_layout_generation: Some(latest.source_layout_generation),
         repair_required: freshness == RuntimeFreshness::RepairAvailable,
         update_available: freshness.update_available(),
+        python_note: latest.python_note,
     })
 }
 
@@ -396,12 +461,7 @@ pub(crate) fn runtime_update_plan(
 /// a base can be overridden or rehosted, and the recorded generation is the only
 /// statement about the stream that survives that.
 fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceLayout> {
-    SourceLayout::from_generation(manifest.source_layout_generation.as_deref().or_else(|| {
-        manifest
-            .wheel_composition
-            .as_ref()
-            .map(|composition| composition.source_layout_generation.as_str())
-    }))
+    SourceLayout::from_generation(manifest.recorded_source_layout_generation())
 }
 
 /// The family override to re-resolve a wheel manifest's update *plan* with.
@@ -412,10 +472,71 @@ fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String
     family_override_or_recovered_arch(&manifest.family, recorded_arch)
 }
 
+/// The layout whose interpreters `manifest`'s runtime was built against.
+///
+/// The recorded source layout is not enough: an unpinned or build-date nightly
+/// install records the canonical layout even when the channel's newest build is
+/// ROCm 10 and the install went on the ROCm 10 Python (see
+/// `canonical_auto_select_needs_next_python`). The recorded ROCm version is the
+/// other half of the answer, so a ROCm 10+ runtime counts as `Next` whichever
+/// layout it was read from.
+fn python_layout_of(manifest: &InstalledRuntimeManifest, layout: SourceLayout) -> SourceLayout {
+    let rocm_10_or_newer = parse_version(&manifest.version)
+        .is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR);
+    if layout == SourceLayout::Next || rocm_10_or_newer {
+        SourceLayout::Next
+    } else {
+        SourceLayout::Canonical
+    }
+}
+
+/// The interpreter an update of `manifest` goes on with.
+///
+/// A ROCm 10+ runtime installed with `--python-version` keeps the Python it was
+/// built on, so an update does not silently move it to the layout's default
+/// (which would also leave it unable to carry the packages it was chosen for).
+/// Anything else follows the layout.
+fn recorded_python_requirement(
+    manifest: &InstalledRuntimeManifest,
+    layout: SourceLayout,
+) -> PythonRequirement {
+    let tag = manifest
+        .python_executable
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .and_then(|path| wheel_compatibility_for_python(&path).ok())
+        .map(|compatibility| compatibility.python_tag);
+    requirement_for_recorded_tag(manifest, layout, tag.as_deref())
+}
+
+/// [`recorded_python_requirement`] once the recorded interpreter's wheel tag has
+/// been read (`None` when it is missing or unreadable), so the decision runs
+/// without a Python on disk.
+fn requirement_for_recorded_tag(
+    manifest: &InstalledRuntimeManifest,
+    layout: SourceLayout,
+    tag: Option<&str>,
+) -> PythonRequirement {
+    let layout = python_layout_of(manifest, layout);
+    tag.and_then(|tag| python_requirement_for_tag(layout, tag))
+        .unwrap_or_else(|| python_requirement(layout))
+}
+
+/// The `--python-version` an update of `manifest` reinstalls with: the one the
+/// runtime was built on, for a ROCm 10+ wheel runtime, and none for any other (a
+/// tarball runtime has no Python of its own to carry over).
+pub(crate) fn recorded_python_version(manifest: &InstalledRuntimeManifest) -> Option<&'static str> {
+    let layout = manifest_source_layout(manifest).ok()?;
+    (manifest.format == "wheel" && python_layout_of(manifest, layout) == SourceLayout::Next)
+        .then(|| recorded_python_requirement(manifest, layout).version)
+}
+
 fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     download_timeout_secs: Option<u64>,
+    python_access: PythonAccess,
 ) -> Result<ResolvedRuntimeUpdate> {
     let channel = TheRockChannel::parse(&manifest.channel)?;
     let layout = manifest_source_layout(manifest)?;
@@ -425,7 +546,7 @@ fn resolve_latest_for_manifest(
             // interpreter, so the recorded one is re-checked rather than trusted
             // on `is_file()` alone; otherwise a canonical cp312 venv would carry
             // into a next-layout update and resolve nothing.
-            let requirement = python_requirement(layout);
+            let requirement = recorded_python_requirement(manifest, layout);
             let manifest_python = manifest
                 .python_executable
                 .as_deref()
@@ -434,14 +555,19 @@ fn resolve_latest_for_manifest(
                 .filter(|path| python_launcher_install_ready(path, requirement).is_ok())
                 .map(|executable| PythonLauncher {
                     executable,
-                    source: "manifest",
+                    source: PythonSource::Manifest,
                 });
-            let python_executable = match manifest_python {
-                Some(python) => python,
-                None => resolve_python_launcher(paths, requirement)?,
+            let (wheel_compatibility, python_note) = match (manifest_python, python_access) {
+                (Some(python), _) => (wheel_compatibility_for_python(&python.executable)?, None),
+                (None, PythonAccess::MayPrepare) => {
+                    let python = resolve_python_launcher(paths, requirement)?;
+                    (wheel_compatibility_for_python(&python.executable)?, None)
+                }
+                (None, PythonAccess::SearchOnly) => {
+                    let planned = plan_python_launcher(paths, requirement)?;
+                    (planned.wheel_compatibility()?, planned.update_note())
+                }
             };
-            let wheel_compatibility =
-                wheel_compatibility_for_python(&python_executable.executable)?;
             let family_override = manifest_wheel_family_override(manifest);
             let resolution = resolve_pip_runtime_with_timeout(
                 paths,
@@ -459,17 +585,12 @@ fn resolve_latest_for_manifest(
             // a fresh host probe. Planning must predict the key an apply will
             // produce, and re-probing would disagree with the installed runtime on
             // any host whose GPU is absent, hidden, or simply a second card.
-            let device_target =
-                wheel_composition_device_target(manifest.wheel_composition.as_ref()).map_or_else(
-                    || resolution.device_target.clone(),
-                    |target| {
-                        AggregateDeviceTarget::resolve(
-                            Some(target),
-                            &resolution.family,
-                            &resolution.published_device_targets,
-                        )
-                    },
-                );
+            let device_target = AggregateDeviceTarget::prefer_recorded(
+                &resolution.device_target,
+                wheel_composition_device_target(manifest.wheel_composition.as_ref()),
+                &resolution.family,
+                &resolution.published_device_targets,
+            );
             // No exact target means no reproducible composition, so freshness
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
@@ -492,6 +613,7 @@ fn resolve_latest_for_manifest(
                 format: "wheel".to_owned(),
                 source_layout_generation: resolution.layout.generation().to_owned(),
                 wheel_composition,
+                python_note,
             })
         }
         "tarball" => {
@@ -516,6 +638,7 @@ fn resolve_latest_for_manifest(
                 format: "tarball".to_owned(),
                 source_layout_generation: artifact.layout.generation().to_owned(),
                 wheel_composition: None,
+                python_note: None,
             })
         }
         other => bail!("unknown manifest format `{other}`"),
@@ -589,7 +712,12 @@ fn build_startup_update_check_record(
     now_unix_ms: u128,
     download_timeout_secs: Option<u64>,
 ) -> StartupUpdateCheckRecord {
-    match resolve_latest_for_manifest(paths, manifest, download_timeout_secs) {
+    match resolve_latest_for_manifest(
+        paths,
+        manifest,
+        download_timeout_secs,
+        PythonAccess::SearchOnly,
+    ) {
         Ok(latest) => {
             let freshness = runtime_freshness_with_manifests(
                 manifests,
@@ -658,11 +786,15 @@ mod tests {
     use super::super::process::{PROGRESS_LINE_SINK, progress_output_suppressed};
     use super::super::python::{OverridePythonResolverEnv, PythonResolverEnv};
     use super::super::source::THEROCK_SOURCE_LAYOUT_GENERATION;
+    #[cfg(unix)]
+    use super::super::test_support::RestoredEnv;
     use super::super::test_support::{
         test_paths, test_runtime_manifest, write_test_runtime_manifest,
     };
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
+    #[cfg(unix)]
+    use std::path::Path;
 
     /// Updating a next-layout manifest whose family is a group label (as
     /// `gfx125X-dcgpu` always is) must recover the exact arch this runtime was
@@ -693,6 +825,66 @@ mod tests {
         let manifest = test_runtime_manifest("v1:gfx120X-all", "canonical:gfx120X-all", 0);
 
         assert_eq!(manifest_wheel_family_override(&manifest), "gfx120X-all");
+    }
+
+    /// The engine auto-install skip reads this: a ROCm 7 (canonical) runtime has no
+    /// recorded Python choice even when it was installed with a redundant
+    /// `--python-version 3.12`, so vLLM is never skipped on it.
+    #[test]
+    fn recorded_python_version_is_only_reported_for_a_rocm_10_runtime() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-release:gfx94X-dcgpu", 0);
+        assert_eq!(recorded_python_version(&manifest), None);
+
+        manifest.source_layout_generation = Some("next-v1".to_owned());
+        manifest.format = "wheel".to_owned();
+        assert_eq!(
+            recorded_python_version(&manifest),
+            Some(super::super::NEXT_MANAGED_PYTHON_VERSION)
+        );
+
+        manifest.format = "tarball".to_owned();
+        assert_eq!(recorded_python_version(&manifest), None);
+    }
+
+    /// An unpinned nightly install that resolved to ROCm 10 records the canonical
+    /// layout, yet it runs on the ROCm 10 Python; the chosen interpreter must still
+    /// be carried over, and a ROCm 7 runtime on the same layout must not.
+    #[test]
+    fn nightly_rocm_10_runtime_recorded_as_canonical_keeps_its_chosen_python() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-nightly:gfx94X-dcgpu", 0);
+        manifest.channel = "nightly".to_owned();
+        manifest.version = "10.0.0a20261105".to_owned();
+        manifest.source_layout_generation = Some("multi-arch-v2".to_owned());
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Canonical
+        );
+
+        let layout = SourceLayout::Canonical;
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, Some("cp312")).version,
+            "3.12"
+        );
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, Some("cp314")).version,
+            super::super::NEXT_MANAGED_PYTHON_VERSION
+        );
+        // Interpreter missing or unreadable: the ROCm 10 default, not cp312.
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, None).version,
+            super::super::NEXT_MANAGED_PYTHON_VERSION
+        );
+        assert_eq!(
+            recorded_python_version(&manifest),
+            Some(super::super::NEXT_MANAGED_PYTHON_VERSION)
+        );
+
+        manifest.version = "7.13.0a20260416".to_owned();
+        assert_eq!(recorded_python_version(&manifest), None);
+        assert_eq!(
+            requirement_for_recorded_tag(&manifest, layout, Some("cp312")).tag,
+            "cp312"
+        );
     }
 
     /// An installed runtime must keep resolving the stream it came from, and a
@@ -775,6 +967,7 @@ mod tests {
         let resolver_env_guard = OverridePythonResolverEnv::new(PythonResolverEnv {
             python_override: None,
             search_dirs: vec![bin_dir],
+            ..PythonResolverEnv::from_process_env()
         });
 
         PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
@@ -1071,6 +1264,55 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// A replacement counts as installed by `rocm_core::install_root_has_payload`:
+    /// a root holding only the runtime's own dot-marker was prepared but never
+    /// filled, so the repair is still on offer; one entry beside the marker is a
+    /// real install, so it is not. The runtime directory vanishing is covered by
+    /// `an_installed_replacement_sibling_suppresses_repeat_repair`.
+    #[test]
+    fn a_replacement_counts_as_installed_by_the_shared_payload_rule() {
+        let required = test_wheel_composition("gfx942");
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+        let mut source = test_runtime_manifest(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        source.version = "7.14.0".to_owned();
+        let mut replacement =
+            test_runtime_manifest(&target_runtime_key, "therock-release:gfx94X-dcgpu", 2);
+        replacement.version = "7.14.0".to_owned();
+        replacement.wheel_composition = Some(required.clone());
+        let (root, _) = test_paths("replacement-shared-payload-rule");
+        replacement.install_root = root.join("replacement");
+        fs::create_dir_all(&replacement.install_root).unwrap();
+        fs::write(
+            replacement.install_root.join(".rocm-cli-runtime.json"),
+            b"{}",
+        )
+        .unwrap();
+        let manifests = vec![source.clone(), replacement.clone()];
+        let freshness = |manifests: &[InstalledRuntimeManifest]| {
+            runtime_freshness_with_manifests(
+                manifests,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            )
+        };
+
+        assert_eq!(
+            freshness(&manifests),
+            RuntimeFreshness::RepairAvailable,
+            "a root with only the dot-marker has no payload, so it is not a replacement"
+        );
+
+        fs::write(replacement.install_root.join("installed.marker"), b"ok").unwrap();
+        assert_eq!(freshness(&manifests), RuntimeFreshness::UpToDate);
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn update_json_reports_no_managed_runtimes_as_empty_list() -> Result<()> {
         let (root, paths) = test_paths("update-json-empty");
@@ -1194,6 +1436,143 @@ mod tests {
         assert_eq!(record.status, "up_to_date");
         assert!(!paths.cache_dir.join("therock").join("metadata").exists());
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The bug: a read-only look at a wheel runtime that records no usable Python,
+    /// on a host with none, went on to prepare one (download a managed `uv`, have
+    /// it install Python, save the path in the configuration). Driven here, each
+    /// against the same host: the update report, the JSON the dashboard reads,
+    /// the startup check, `runtime_update_check` itself, and
+    /// `apply_runtime_update` with `dry_run` (the preview of an apply, which takes
+    /// the check). Each must leave `uv` unrun and the configuration and managed
+    /// tools absent, and each must still reach the index (the connection to the
+    /// unreachable index is what each error names), so the absences are not a
+    /// check that stopped early. `runtime_update_plan` and a real
+    /// `apply_runtime_update` do prepare one on the same host, which is also what
+    /// shows the stand-in `uv` is reachable. That a `--dry-run` takes the check and
+    /// an apply the plan is pinned on every platform by
+    /// `a_dry_run_takes_the_check_and_an_apply_takes_the_plan` in `update_cmd.rs`;
+    /// which function is the check is pinned only here and by scenario `update-10`
+    /// on Linux, and no test on Windows pins it. The Gherkin scenarios `update-09`
+    /// and `update-10` drive the report and the preview through the built binary.
+    #[cfg(unix)]
+    #[test]
+    fn the_update_checks_prepare_no_python_and_the_apply_plan_does() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+
+        let _env_lock = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = test_paths("update-checks-prepare-no-python");
+
+        let marker = root.join("uv-was-run");
+        let tools = root.join("tools");
+        fs::create_dir_all(&tools)?;
+        let uv = tools.join("uv");
+        write_fake_executable(
+            &uv,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", marker.display()),
+        )?;
+        let search = root.join("search");
+        fs::create_dir_all(&search)?;
+        // Port 9 refuses the connection at once, so a check that gets past
+        // Python fails at the index without touching the network.
+        let unreachable_index = "http://127.0.0.1:9/";
+        let _env = RestoredEnv::set(&[
+            ("ROCM_CLI_UV_BINARY", Some(uv.as_path())),
+            ("ROCM_CLI_PYTHON", None),
+            ("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", None),
+            ("ROCM_CLI_MANAGED_PYTHON_VERSION", None),
+            ("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", None),
+            ("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", Some(Path::new("1"))),
+            (
+                "ROCM_CLI_THEROCK_RELEASE_PIP_BASE",
+                Some(Path::new(unreachable_index)),
+            ),
+        ]);
+        let _resolver = OverridePythonResolverEnv::new(PythonResolverEnv {
+            python_override: None,
+            search_dirs: vec![search],
+            ..PythonResolverEnv::from_process_env()
+        });
+
+        // The fixture's recorded interpreter does not exist, so the runtime
+        // records no usable Python.
+        let manifest = test_runtime_manifest("wheel-no-python", "therock-release:gfx120X-all", 1);
+        write_test_runtime_manifest(&paths, &manifest)?;
+        let manifests = load_runtime_manifests(&paths)?;
+
+        let prepared_nothing = |what: &str| {
+            assert!(!marker.exists(), "{what} ran uv");
+            assert!(
+                !paths.config_path().exists(),
+                "{what} saved a Python path in the configuration"
+            );
+            assert!(
+                !rocm_core::managed_tools_dir(&paths.data_dir).exists(),
+                "{what} created the managed tools folder"
+            );
+        };
+
+        let report = render_update_report(&paths)?;
+        assert!(report.contains("127.0.0.1:9"), "{report}");
+        prepared_nothing("the update report");
+
+        let document = render_update_json(&paths, Some(1))?;
+        assert_eq!(document.runtimes[0].status, "error");
+        assert!(
+            document.runtimes[0]
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("127.0.0.1:9")),
+            "{document:?}"
+        );
+        prepared_nothing("the update JSON");
+
+        let record = maybe_refresh_startup_update_check_at(&paths, None, 0)?
+            .expect("a registered runtime is checked at startup");
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("127.0.0.1:9")),
+            "{record:?}"
+        );
+        prepared_nothing("the startup check");
+
+        let error = runtime_update_check(&paths, &manifest, &manifests, Some(1))
+            .expect_err("the index is unreachable")
+            .to_string();
+        assert!(error.contains("127.0.0.1:9"), "{error}");
+        prepared_nothing("the update check");
+
+        let mut config = rocm_core::RocmCliConfig::default();
+        let preview =
+            crate::update_cmd::apply_runtime_update(&paths, &mut config, None, false, true)
+                .expect_err("the index is unreachable")
+                .to_string();
+        assert!(preview.contains("127.0.0.1:9"), "{preview}");
+        prepared_nothing("the --dry-run preview");
+
+        // Control: the plan an apply works from does reach `uv` on this host, and
+        // so does a real apply, which takes that plan.
+        assert!(runtime_update_plan(&paths, &manifest, &manifests, Some(1)).is_err());
+        assert!(
+            marker.exists(),
+            "the stand-in uv is not reachable, so the checks above prove nothing"
+        );
+        fs::remove_file(&marker)?;
+        assert!(
+            crate::update_cmd::apply_runtime_update(&paths, &mut config, None, false, false)
+                .is_err()
+        );
+        assert!(
+            marker.exists(),
+            "a real apply did not take the plan that prepares a Python"
+        );
+
+        fs::remove_dir_all(&root).ok();
         Ok(())
     }
 }

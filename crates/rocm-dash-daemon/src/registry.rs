@@ -23,16 +23,35 @@
 //! (`EngineKind::default_port`, `docker.rs`, `lemonade.rs`) remain only as a
 //! fallback for *unmanaged/external* discovery.
 //!
-//! **Co-located scope (known limitation):** scrape targets carry only a port;
-//! the runner's vLLM collector scrapes `opts.vllm_metrics_host` (default
-//! `127.0.0.1`), so `record.host` is honored only for the co-located daemon
-//! (the same assumption the Docker-discovery path already makes). A managed
-//! service on a non-loopback host is surfaced but its metrics are scraped at the
-//! local address. Per-host scrape targeting is tracked as a D7 follow-up.
+//! **Lifecycle ownership:** only this registry seam marks discovered services
+//! as managed. External protocol and container discovery remain read-only;
+//! instance ids and engine markers are not evidence of lifecycle ownership.
+//!
+//! **Host scope:** managed Lemonade telemetry honors `record.host` and port.
+//! The vLLM collector still scrapes `opts.vllm_metrics_host` (default
+//! `127.0.0.1`) at the record's port, so a non-loopback vLLM service is surfaced
+//! but its metrics use the configured collector host. External Lemonade
+//! discovery uses its own configured host and port.
+//!
+//! **A registry that cannot be read in full (trade-off):** a record file that
+//! exists but cannot be opened (a root-owned file left by `sudo rocm serve`, a
+//! symlink loop) makes [`read_service_records`] fail the pass, because the
+//! service that file held cannot be told apart from one that is gone, and the
+//! daemon's rule is that a failed read never retires anything. The failure
+//! carries what the pass did read ([`RegistryReadError::partial`]), so the daemon
+//! still adds and refreshes those services: a new `rocm serve` appears on the
+//! next discovery tick even beside a stale unreadable record. What stays frozen,
+//! for as long as the file is unreadable (there is no timeout), is retirement:
+//! a service that has stopped or whose record was removed keeps its row (with its
+//! last live fields) until the registry reads in full, and the header warning
+//! names the unreadable path throughout. Retiring on a deadline would reintroduce
+//! the wrongly vanishing row this rule exists to prevent, so the freeze is
+//! visible rather than bounded.
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use rocm_dash_collectors::engine_registry::EngineKind;
 use rocm_dash_core::metrics::{InstanceStatus, StartupPhase};
@@ -41,9 +60,10 @@ use serde::Deserialize;
 
 /// Minimal read-only view of a rocm-cli `ManagedServiceRecord` on disk.
 ///
-/// Mirrors the stable subset the scrape seam needs; unknown fields (manifest paths,
-/// pids, recipe json, …) are ignored. Every field defaults so partial/older
-/// records still parse.
+/// Mirrors the stable subset the scrape seam needs; the engine and supervisor
+/// pids (with their start times) are kept to match GPU processes by ancestry;
+/// unknown fields (manifest paths, recipe json, …) are ignored. Every field
+/// defaults so partial/older records still parse.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceRecord {
     #[serde(default)]
@@ -70,8 +90,44 @@ pub struct ServiceRecord {
     /// joins it to GPU power and VRAM.
     #[serde(default)]
     pub gpu_indices: Vec<u32>,
+    /// The launcher process rocm-cli recorded for the service.
+    #[serde(default)]
+    pub supervisor_pid: u32,
+    /// Kernel start time of the supervisor, which tells it from a recycled PID.
+    #[serde(default)]
+    pub supervisor_start_ticks: Option<u64>,
+    /// The engine server process, once the supervisor has seen it.
+    #[serde(default)]
+    pub engine_pid: Option<u32>,
+    /// Kernel start time of the engine server process.
+    #[serde(default)]
+    pub engine_start_ticks: Option<u64>,
     #[serde(default)]
     pub created_at_unix_ms: u128,
+}
+
+impl ServiceRecord {
+    /// The recorded processes whose descendants are this service's GPU
+    /// processes: the engine server and its launcher. Either can be absent on
+    /// an old or half-written record, and a PID that is zero (not recorded) or
+    /// 1 (init, an ancestor of everything) is never a root, since it would claim
+    /// processes that belong to no service.
+    pub fn ancestry_roots(&self) -> Vec<rocm_dash_collectors::ancestry::Root> {
+        let root = |pid: u32, start_ticks| rocm_dash_collectors::ancestry::Root {
+            pid,
+            start_ticks,
+            owner: self.service_id.clone(),
+        };
+        let usable = |pid: u32| pid >= rocm_dash_collectors::ancestry::MIN_ROOT_PID;
+        let mut roots = Vec::new();
+        if let Some(pid) = self.engine_pid.filter(|p| usable(*p)) {
+            roots.push(root(pid, self.engine_start_ticks));
+        }
+        if usable(self.supervisor_pid) {
+            roots.push(root(self.supervisor_pid, self.supervisor_start_ticks));
+        }
+        roots
+    }
 }
 
 /// Service statuses worth scraping.
@@ -119,30 +175,160 @@ fn instance_status_for_record(status: &str, startup_phase: Option<&str>) -> Inst
     }
 }
 
-/// Load every managed-service record under `services_dir`, newest first.
+/// What one read of the registry directory found.
+#[derive(Debug, Default)]
+pub struct RegistryRead {
+    /// Every well-formed record, newest first.
+    pub records: Vec<ServiceRecord>,
+    /// `*.json` files that were read but are not a JSON object this module can
+    /// parse, sorted by path. They are left out of `records`, and nothing else is
+    /// hidden by them: one corrupt record does not stop the others loading.
+    pub malformed: Vec<PathBuf>,
+}
+
+/// The registry could not be read in full, so what it holds is unknown.
 ///
-/// Best-effort and side-effect-free: a missing directory yields an empty list,
-/// and an individual unreadable/malformed `*.json` is skipped rather than
-/// failing the whole load (mirrors the canonical rocm-cli `load_managed_services`
-/// semantics, minus the engine-state status overlay which the supervisor owns).
-pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
-    let Ok(entries) = fs::read_dir(services_dir) else {
-        return Vec::new();
+/// This is not the same as an empty registry: a caller that retires services
+/// which are missing from a read must not do so on this. It may still use what was read
+/// around the failure ([`RegistryReadError::partial`]) to add or refresh services,
+/// because a record that was read is evidence that its service exists, whereas a
+/// record that was not read is no evidence of anything.
+#[derive(Debug)]
+pub struct RegistryReadError {
+    /// The directory that could not be listed, or the first record file that
+    /// could not be read.
+    pub path: PathBuf,
+    pub source: std::io::Error,
+    /// What the pass did read: every well-formed record it could open, and the
+    /// malformed ones. Empty when the directory itself could not be listed.
+    pub partial: RegistryRead,
+}
+
+impl std::fmt::Display for RegistryReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot read {}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for RegistryReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Read every managed-service record under `services_dir`, telling a registry
+/// that is confirmed empty apart from one that could not be read.
+///
+/// * A directory that does not exist is confirmed empty: it is created the first
+///   time something is served, so its absence means there are no services. A
+///   directory that exists but cannot be listed (or a regular file where it
+///   should be) is a read failure with nothing partial to offer.
+/// * A record file that vanishes between the listing and the read was removed
+///   on purpose and is skipped. Any other failure to read a record (a permission
+///   or I/O error) is a read failure for the pass: the record's service cannot be
+///   told apart from one that is gone, and nothing is known about which service
+///   the unreadable file belonged to. The scan still reads the remaining records,
+///   so [`RegistryReadError::partial`] holds every record that could be read.
+/// * A record that reads but does not parse is malformed. It is reported in
+///   [`RegistryRead::malformed`] and the other records still load, because the
+///   rocm-cli writer replaces a record atomically, so a corrupt file is corrupt
+///   for good rather than half-written.
+///
+/// Side-effect-free, and the canonical rocm-cli `load_managed_services` semantics
+/// minus the engine-state status overlay, which the supervisor owns.
+pub fn read_service_records(services_dir: &Path) -> Result<RegistryRead, RegistryReadError> {
+    read_service_records_with(services_dir, |path| fs::read(path))
+}
+
+/// [`read_service_records`] with the record reader injected, so a test can make
+/// one record unreadable on every platform (a mode-000 file works only on Unix,
+/// and not as root).
+fn read_service_records_with(
+    services_dir: &Path,
+    read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<RegistryRead, RegistryReadError> {
+    let entries = match fs::read_dir(services_dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            let absent = matches!(
+                fs::metadata(services_dir),
+                Err(ref e) if e.kind() == ErrorKind::NotFound
+            );
+            return if absent {
+                Ok(RegistryRead::default())
+            } else {
+                Err(RegistryReadError {
+                    path: services_dir.to_path_buf(),
+                    source,
+                    partial: RegistryRead::default(),
+                })
+            };
+        }
     };
-    let mut records = Vec::new();
-    for entry in entries.flatten() {
+    let mut read = RegistryRead::default();
+    // The first failure; later ones add nothing a caller can act on.
+    let mut failure: Option<(PathBuf, std::io::Error)> = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                // The rest of the listing is unknown, so stop reading it.
+                failure.get_or_insert_with(|| (services_dir.to_path_buf(), source));
+                break;
+            }
+        };
         let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+        if path.extension().and_then(|v| v.to_str()) != Some("json") || path.is_dir() {
             continue;
         }
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(record) = serde_json::from_slice::<ServiceRecord>(&bytes)
-        {
-            records.push(record);
+        let bytes = match read_record(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(source) => {
+                failure.get_or_insert((path, source));
+                continue;
+            }
+        };
+        match serde_json::from_slice::<ServiceRecord>(&bytes) {
+            Ok(record) => read.records.push(record),
+            Err(_) => read.malformed.push(path),
         }
     }
-    records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
-    records
+    read.records
+        .sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
+    read.malformed.sort();
+    match failure {
+        None => Ok(read),
+        Some((path, source)) => Err(RegistryReadError {
+            path,
+            source,
+            partial: read,
+        }),
+    }
+}
+
+/// Load every managed-service record under `services_dir`, newest first.
+///
+/// Best-effort, for the one-shot readers (the dashboard's launcher and exit
+/// prompt) that have nothing to retire: a directory that cannot be listed yields
+/// an empty list, and a record that cannot be read or parsed is skipped on its
+/// own, so one bad file never hides the services beside it. The daemon's
+/// discovery loop must not use this, because it cannot tell an unreadable
+/// registry from an empty one; it calls [`read_service_records`] and keeps the
+/// services it could not confirm gone.
+pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
+    load_service_records_with(services_dir, |path| fs::read(path))
+}
+
+/// [`load_service_records`] with the record reader injected (see
+/// [`read_service_records_with`]).
+fn load_service_records_with(
+    services_dir: &Path,
+    read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Vec<ServiceRecord> {
+    read_service_records_with(services_dir, read_record)
+        .unwrap_or_else(|failed| failed.partial)
+        .records
 }
 
 /// Convert a managed-service record into a [`DiscoveredService`] for the
@@ -167,6 +353,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         record.model_ref.clone()
     };
     Some(DiscoveredService {
+        managed: true,
         container_id: record.service_id.clone(),
         container_name: record.service_id.clone(),
         model_name,
@@ -194,6 +381,8 @@ pub struct ManagedDiscovery {
     pub svcs: Vec<DiscoveredService>,
     pub seen: HashSet<String>,
     pub non_vllm: HashSet<String>,
+    /// Read-only Lemonade telemetry targets at registry-owned endpoints.
+    pub lemonade: Vec<ManagedLemonadeTarget>,
     /// How many records were skipped because they are no longer running
     /// (`failed`/`stopped`/unrecognized status). These are dropped from the
     /// scrape set on purpose - polling a dead port is pointless - but they are
@@ -203,6 +392,90 @@ pub struct ManagedDiscovery {
     /// A live record with no bound port is NOT counted: it is skipped for a
     /// different reason and is not a past attempt.
     pub past_attempts: usize,
+    /// Ancestry roots of every live service surfaced, so a GPU process can be
+    /// attributed to the managed service it belongs to.
+    pub roots: Vec<rocm_dash_collectors::ancestry::Root>,
+    /// Ids of records that were read in this pass and found no longer running.
+    /// A partial read keeps what it did not see; it must still drop the roots
+    /// of a service it saw stop, or a dead service's PID would stay matchable.
+    pub retired: HashSet<String>,
+}
+
+/// A managed Lemonade endpoint, including both display and canonical names so
+/// a CLI alias does not prevent safe last-request attribution.
+#[derive(Debug, Clone)]
+pub struct ManagedLemonadeTarget {
+    pub service_id: String,
+    pub host: String,
+    pub port: u16,
+    pub model_ref: String,
+    pub canonical_model_id: String,
+}
+
+/// The loopback families a bind host is reachable through. `::` is a
+/// dual-stack wildcard (both loopbacks); `::1` is IPv6-only; `localhost`,
+/// empty, `127.0.0.1` and `0.0.0.0` are IPv4-only. No DNS is resolved.
+enum HostReach {
+    Loopback { v4: bool, v6: bool },
+    Other(String),
+}
+
+fn normalized_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn host_reach(host: &str) -> HostReach {
+    let host = normalized_host(host);
+    match host.as_str() {
+        "" | "localhost" | "127.0.0.1" | "0.0.0.0" => HostReach::Loopback {
+            v4: true,
+            v6: false,
+        },
+        "::" => HostReach::Loopback { v4: true, v6: true },
+        "::1" => HostReach::Loopback {
+            v4: false,
+            v6: true,
+        },
+        _ => HostReach::Other(host),
+    }
+}
+
+/// Whether two co-located HTTP bindings address the same service. Wildcard
+/// binds are reachable through loopback (`::` through both families); unrelated
+/// remote hosts are not aliases.
+pub fn endpoints_match(left_host: &str, left_port: u16, right_host: &str, right_port: u16) -> bool {
+    if left_port != right_port {
+        return false;
+    }
+    match (host_reach(left_host), host_reach(right_host)) {
+        (HostReach::Loopback { v4: l4, v6: l6 }, HostReach::Loopback { v4: r4, v6: r6 }) => {
+            (l4 && r4) || (l6 && r6)
+        }
+        (HostReach::Other(left), HostReach::Other(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The host a collector should dial for a registry bind host: wildcards are not
+/// valid destinations on every platform, so `::` is reached through `::1`.
+pub fn scrape_host(host: &str) -> String {
+    match normalized_host(host).as_str() {
+        "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "::1" => "::1".to_string(),
+        host => host.to_string(),
+    }
+}
+
+/// Whether a collector cached for `cached_host` may serve `target_host`.
+///
+/// `endpoints_match` is deliberately non-transitive (`::` covers `127.0.0.1`), so
+/// a match alone is not enough: the cached collector dials a fixed address, and
+/// reusing it for a target in another address family probes the wrong listener.
+pub fn cached_collector_reusable(cached_host: &str, target_host: &str) -> bool {
+    scrape_host(cached_host) == scrape_host(target_host)
 }
 
 /// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
@@ -210,10 +483,9 @@ pub struct ManagedDiscovery {
 /// Non-scrapeable records (bad status / port 0) are dropped; vLLM-engine services flow to the
 /// Prometheus scrape, others are flagged in `non_vllm`.
 ///
-/// NOTE: gen_tps for managed **non-vLLM** engines (e.g. Lemonade) is not yet
-/// wired — they appear in the dashboard but are excluded from the vLLM scrape
-/// and not routed to a per-engine collector here. vLLM (the Phase-2 acceptance
-/// target) is fully wired. Non-vLLM managed scraping is a D7 follow-up.
+/// Managed Lemonade endpoints are routed to the existing Lemonade collector.
+/// Servers without that protocol (including direct llama-server) keep their
+/// registry row, with throughput unavailable rather than fabricated.
 pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery {
     let mut out = ManagedDiscovery::default();
     for record in records {
@@ -222,10 +494,29 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
             // live record with no bound port. Only the first is a past attempt.
             if !is_scrapeable_status(&record.status) {
                 out.past_attempts += 1;
+                out.retired.insert(record.service_id.clone());
             }
             continue;
         };
+        if engine_kind_for(record) == Some(EngineKind::Lemonade) {
+            // Keep a `::` bind as `::`: it is dual-stack, which only
+            // `endpoints_match` can see. The runner dials it via `scrape_host`.
+            let host = match record.host.trim() {
+                "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
+                "[::]" => "::".to_string(),
+                "[::1]" => "::1".to_string(),
+                host => host.to_string(),
+            };
+            out.lemonade.push(ManagedLemonadeTarget {
+                service_id: svc.container_id.clone(),
+                host,
+                port: record.port,
+                model_ref: record.model_ref.clone(),
+                canonical_model_id: record.canonical_model_id.clone(),
+            });
+        }
         out.seen.insert(svc.container_id.clone());
+        out.roots.extend(record.ancestry_roots());
         if engine_kind_for(record) != Some(EngineKind::Vllm) {
             out.non_vllm.insert(svc.container_id.clone());
         }
@@ -241,6 +532,82 @@ mod tests {
     use rocm_dash_core::observation::GenerationObservationTracker;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn endpoint_matching_does_not_conflate_distinct_ports_hosts_or_ip_families() {
+        let same = [
+            ("localhost", "127.0.0.1"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("", "127.0.0.1"),
+            ("[::]", "::1"),
+            ("::", "::1"),
+            ("::", "127.0.0.1"),
+            ("[::]", "localhost"),
+            ("::", "0.0.0.0"),
+            ("::", "::"),
+            ("::1", "[::1]"),
+            ("Remote.Example", "remote.example"),
+        ];
+        for (l, r) in same {
+            assert!(endpoints_match(l, 13305, r, 13305), "{l} ~ {r}");
+            assert!(endpoints_match(r, 13305, l, 13305), "{r} ~ {l}");
+        }
+        let distinct = [
+            ("::1", "127.0.0.1"),
+            ("::1", "localhost"),
+            ("::1", "0.0.0.0"),
+            ("::1", ""),
+            ("::", "remote.example"),
+            ("127.0.0.1", "remote.example"),
+            ("remote.example", "other.example"),
+        ];
+        for (l, r) in distinct {
+            assert!(!endpoints_match(l, 13305, r, 13305), "{l} !~ {r}");
+            assert!(!endpoints_match(r, 13305, l, 13305), "{r} !~ {l}");
+        }
+        assert!(!endpoints_match("::", 13306, "::", 13305));
+        assert!(!endpoints_match("127.0.0.1", 13306, "127.0.0.1", 13305));
+    }
+
+    #[test]
+    fn cached_collector_is_reused_only_when_it_dials_the_same_host() {
+        // Same dialed address: reuse across spelling differences.
+        for (cached, target) in [
+            ("127.0.0.1", "localhost"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::]"),
+            ("::1", "::"),
+            ("remote.example", "remote.example"),
+        ] {
+            assert!(
+                cached_collector_reusable(cached, target),
+                "{cached} -> {target}"
+            );
+        }
+        // `endpoints_match` accepts these, but the cached collector would dial
+        // the other address family.
+        for (cached, target) in [("::", "127.0.0.1"), ("127.0.0.1", "::"), ("::", "0.0.0.0")] {
+            assert!(endpoints_match(cached, 13305, target, 13305));
+            assert!(
+                !cached_collector_reusable(cached, target),
+                "{cached} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_stack_bind_keeps_its_host_and_is_dialed_through_ipv6_loopback() {
+        let record: ServiceRecord = serde_json::from_str(
+            r#"{"service_id":"s","engine":"lemonade","model_ref":"m","host":"::","port":13305,"status":"ready"}"#,
+        )
+        .unwrap();
+        let disc = discover_managed_services(&[record]);
+        assert_eq!(disc.lemonade[0].host, "::");
+        assert_eq!(scrape_host("::"), "::1");
+        assert_eq!(scrape_host("[::]"), "::1");
+        assert_eq!(scrape_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(scrape_host("10.0.0.5"), "10.0.0.5");
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
@@ -340,6 +707,248 @@ mod tests {
     }
 
     #[test]
+    fn read_missing_dir_is_confirmed_empty() {
+        let dir = test_dir("read-absent").join("nope");
+        let read = read_service_records(&dir).expect("an absent registry is confirmed empty");
+        assert!(read.records.is_empty());
+        assert!(read.malformed.is_empty());
+    }
+
+    #[test]
+    fn read_empty_dir_is_confirmed_empty() {
+        let dir = test_dir("read-empty");
+        let read = read_service_records(&dir).expect("an empty registry is confirmed empty");
+        assert!(read.records.is_empty());
+        assert!(read.malformed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_regular_file_where_the_dir_should_be_is_a_read_failure() {
+        let dir = test_dir("read-file-not-dir");
+        let not_a_dir = dir.join("services");
+        fs::write(&not_a_dir, "not a directory").unwrap();
+
+        let err = read_service_records(&not_a_dir)
+            .expect_err("a file where the registry should be must not read as empty");
+        assert_eq!(err.path, not_a_dir);
+        assert!(err.to_string().contains("cannot read"), "{err}");
+        assert!(
+            err.partial.records.is_empty() && err.partial.malformed.is_empty(),
+            "a directory that cannot be listed has nothing partial to offer"
+        );
+        // The best-effort wrapper keeps its old answer for the one-shot readers.
+        assert!(load_service_records(&not_a_dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_keeps_well_formed_records_beside_a_malformed_one() {
+        let dir = test_dir("read-malformed");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.json"),
+            record_json("svc-b", "vllm", 8001, "running", 200),
+        )
+        .unwrap();
+        fs::write(dir.join("bad.json"), "{ not valid").unwrap();
+        fs::write(dir.join("also-bad.json"), "42").unwrap();
+        fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+
+        let read = read_service_records(&dir).expect("a malformed record is not a read failure");
+        let ids: Vec<&str> = read.records.iter().map(|r| r.service_id.as_str()).collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        assert_eq!(
+            read.malformed,
+            [dir.join("also-bad.json"), dir.join("bad.json")]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_skips_a_directory_named_like_a_record() {
+        let dir = test_dir("read-dir-named-json");
+        fs::create_dir(dir.join("looks-like-a-record.json")).unwrap();
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+
+        let read = read_service_records(&dir).expect("a stray directory is not a read failure");
+        assert_eq!(read.records.len(), 1);
+        assert!(read.malformed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unix only (no mode bits on Windows), and skipped when the process can
+    /// read a mode-000 file anyway (running as root).
+    #[cfg(unix)]
+    #[test]
+    fn read_unreadable_record_file_is_a_read_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("read-unreadable-record");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        let locked = dir.join("locked.json");
+        fs::write(
+            &locked,
+            record_json("svc-locked", "vllm", 8001, "running", 200),
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            eprintln!("skipped: this process can read a mode-000 file (running as root)");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let result = read_service_records(&dir);
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+        let err = result.expect_err("an unreadable record must not read as a missing one");
+        assert_eq!(err.path, locked);
+        assert_eq!(err.partial.records.len(), 1, "the readable record is kept");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The one-shot readers (launcher, exit prompt, services overlay) stay
+    /// best-effort per record: one unreadable record file hides only itself,
+    /// while the strict reader the daemon's loop uses fails on the same
+    /// registry. Unix only for the real mode-000 file, and skipped as root; the
+    /// portable twin below injects the failing read.
+    #[cfg(unix)]
+    #[test]
+    fn load_skips_one_unreadable_record_and_keeps_the_readable_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("load-unreadable-record");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.json"),
+            record_json("svc-b", "vllm", 8001, "running", 300),
+        )
+        .unwrap();
+        let locked = dir.join("locked.json");
+        fs::write(
+            &locked,
+            record_json("svc-locked", "vllm", 8002, "running", 200),
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            eprintln!("skipped: this process can read a mode-000 file (running as root)");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let loaded = load_service_records(&dir);
+        let strict = read_service_records(&dir);
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+        let ids: Vec<&str> = loaded.iter().map(|r| r.service_id.as_str()).collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        assert_eq!(
+            strict.expect_err("the strict reader must still fail").path,
+            locked
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A registry with three records, one of which the injected reader refuses
+    /// with a permission error. Runs on every platform, unlike the mode-000 test.
+    fn registry_with_one_record_refused() -> (PathBuf, impl Fn(&Path) -> std::io::Result<Vec<u8>>) {
+        let dir = test_dir("scan-refused-record");
+        for (name, id, created) in [
+            ("a", "svc-a", 100),
+            ("locked", "svc-locked", 200),
+            ("b", "svc-b", 300),
+        ] {
+            fs::write(
+                dir.join(format!("{name}.json")),
+                record_json(id, "vllm", 8000, "running", created),
+            )
+            .unwrap();
+        }
+        let refused = dir.join("locked.json");
+        let read_record = move |path: &Path| {
+            if path == refused {
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            } else {
+                fs::read(path)
+            }
+        };
+        (dir, read_record)
+    }
+
+    #[test]
+    fn load_keeps_the_readable_records_beside_one_that_cannot_be_read() {
+        let (dir, read_record) = registry_with_one_record_refused();
+        let loaded = load_service_records_with(&dir, read_record);
+        let ids: Vec<&str> = loaded.iter().map(|r| r.service_id.as_str()).collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_fails_the_pass_on_a_record_that_cannot_be_read() {
+        let (dir, read_record) = registry_with_one_record_refused();
+        let err = read_service_records_with(&dir, read_record)
+            .expect_err("the strict reader must not read an unreadable record as a missing one");
+        assert_eq!(err.path, dir.join("locked.json"));
+        assert_eq!(err.source.kind(), ErrorKind::PermissionDenied);
+        // The failure does not stop the scan: both readable records are in the
+        // partial read, newest first, whichever side of the locked one they sort.
+        let ids: Vec<&str> = err
+            .partial
+            .records
+            .iter()
+            .map(|r| r.service_id.as_str())
+            .collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        assert!(err.partial.malformed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The compatibility loader and the strict reader share one scan, and a
+    /// registry with one corrupt record and two readable ones gives both the two
+    /// readable records (a corrupt record is malformed in both, never a failure).
+    #[test]
+    fn load_and_read_agree_on_a_registry_with_one_corrupt_record() {
+        let dir = test_dir("load-read-corrupt");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        fs::write(dir.join("corrupt.json"), "{ not valid").unwrap();
+        fs::write(
+            dir.join("b.json"),
+            record_json("svc-b", "vllm", 8001, "running", 200),
+        )
+        .unwrap();
+
+        let loaded: Vec<String> = load_service_records(&dir)
+            .into_iter()
+            .map(|r| r.service_id)
+            .collect();
+        let read = read_service_records(&dir).expect("a corrupt record is not a read failure");
+        let strict: Vec<String> = read.records.into_iter().map(|r| r.service_id).collect();
+        assert_eq!(loaded, ["svc-b", "svc-a"]);
+        assert_eq!(strict, loaded);
+        assert_eq!(read.malformed, [dir.join("corrupt.json")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn discovered_uses_registry_port_as_authority() {
         let dir = test_dir("port-authority");
         // A non-default port (8123, not the vLLM hardcoded 8000) must survive.
@@ -350,6 +959,7 @@ mod tests {
         .unwrap();
         let records = load_service_records(&dir);
         let svc = discovered_from_record(&records[0]).expect("live record converts");
+        assert!(svc.managed, "registry discovery proves lifecycle ownership");
         assert_eq!(svc.port, Some(8123));
         assert_eq!(svc.container_id, "svc-hot");
         assert_eq!(svc.model_name, "meta-llama/Llama-3.1-8B");
@@ -394,6 +1004,104 @@ mod tests {
                 .unwrap_or_else(|| panic!("status {status:?} must be scrapeable"));
             assert_eq!(svc.status, expected, "status {status:?}");
         }
+    }
+
+    #[test]
+    fn ancestry_roots_come_from_the_recorded_engine_and_supervisor() {
+        let with = record_json("svc", "vllm", 8000, "ready", 1).replace(
+            r#""supervisor_pid": 4242,"#,
+            r#""supervisor_pid": 4242, "supervisor_start_ticks": 11, "engine_pid": 4300, "engine_start_ticks": 22,"#,
+        );
+        let rec: ServiceRecord = serde_json::from_str(&with).unwrap();
+        let roots = rec.ancestry_roots();
+        let got: Vec<_> = roots.iter().map(|r| (r.pid, r.start_ticks)).collect();
+        assert_eq!(got, vec![(4300, Some(22)), (4242, Some(11))]);
+        assert!(roots.iter().all(|r| r.owner == "svc"));
+        // An old record: no engine yet, no start times. The supervisor alone.
+        let old: ServiceRecord =
+            serde_json::from_str(&record_json("svc", "vllm", 8000, "ready", 1)).unwrap();
+        let got: Vec<_> = old
+            .ancestry_roots()
+            .iter()
+            .map(|r| (r.pid, r.start_ticks))
+            .collect();
+        assert_eq!(got, vec![(4242, None)]);
+        // Zero is "not recorded" and 1 is init: neither is ever a root, or it
+        // would own every process on the host.
+        for bad in [0, 1] {
+            let json = format!(
+                r#"{{"service_id":"z","engine":"vllm","port":1,"status":"ready","supervisor_pid":{bad},"engine_pid":{bad}}}"#
+            );
+            let rec: ServiceRecord = serde_json::from_str(&json).unwrap();
+            assert!(
+                rec.ancestry_roots().is_empty(),
+                "pid {bad} must not be a root"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_pids_survive_the_producer_to_daemon_serde_handoff() {
+        // Same contract as the startup-phase test above, for the pid fields the
+        // ancestry join reads: serialize the producer's real type and read it
+        // back as ours, so a rename or retype on either side fails here.
+        use rocm_core::{AppPaths, ManagedServiceRecord};
+
+        let root = PathBuf::from("/tmp/rocm-xcrate-pids");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let mut produced = ManagedServiceRecord::new(
+            &paths,
+            "svc-pids",
+            "vllm",
+            "M/pids",
+            "M/pids",
+            "127.0.0.1",
+            8000,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        );
+        produced.status = "ready".to_owned();
+        produced.supervisor_start_ticks = Some(111);
+        produced.engine_pid = Some(4300);
+        produced.engine_start_ticks = Some(222);
+
+        let json = serde_json::to_string(&produced).expect("producer record serializes");
+        let consumed: ServiceRecord =
+            serde_json::from_str(&json).expect("daemon record deserializes the producer's JSON");
+        let got: Vec<_> = consumed
+            .ancestry_roots()
+            .iter()
+            .map(|r| (r.pid, r.start_ticks, r.owner.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (4300, Some(222), "svc-pids".to_string()),
+                (4242, Some(111), "svc-pids".to_string()),
+            ],
+            "engine and supervisor pids and start times must cross the serde handoff by name"
+        );
+    }
+
+    #[test]
+    fn discover_managed_services_collects_roots_only_for_live_services() {
+        let live = record_json("live", "vllm", 8000, "ready", 1);
+        let dead = record_json("dead", "vllm", 8001, "stopped", 1).replace("4242", "5252");
+        let recs: Vec<ServiceRecord> = [live, dead]
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect();
+        let disc = discover_managed_services(&recs);
+        let owners: Vec<_> = disc.roots.iter().map(|r| r.owner.as_str()).collect();
+        assert_eq!(owners, vec!["live"], "a stopped service owns nothing");
+        assert!(disc.retired.contains("dead") && !disc.retired.contains("live"));
     }
 
     #[test]

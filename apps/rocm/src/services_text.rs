@@ -9,7 +9,10 @@
 //! Mechanically relocated from `main.rs` with no behavior change, and later
 //! narrowed: the process-control cluster (stop, restart and the internal
 //! sandbox-tool runner) lives in `service_control.rs` (see
-//! `docs/architecture.md`).
+//! `docs/architecture.md`). The `--follow` tail (`FollowCursor`, `FollowFooter`,
+//! `follow_service_logs`) is new code written here, not relocated. A
+//! `FollowCursor` follows a growing file; it is not `rocm_core::LogTail`, the
+//! result of a bounded tail read that the log views here use.
 //!
 //! This module owns: the CLI/TUI logs browser (`render_logs_text`,
 //! `render_logs_browser_text`, `render_logs_browser_page_text`,
@@ -20,14 +23,17 @@
 //! status surfaces (`render_services_text`, `render_services_json`,
 //! `render_service_logs_text`, `render_service_logs_text_with_options`,
 //! `render_service_action_result`, `read_managed_service_manifest`,
-//! `load_managed_service`), the internal `rocmd`-compatible status surface
-//! (`render_internal_status_text`), the `stop_server` answer shape
+//! `load_managed_service`), the `--follow` tail behind `rocm logs --service
+//! <id> --follow` and `rocm services logs <id> --follow`
+//! (`follow_service_logs`, `follow_service_logs_with`, the `FollowCursor` and
+//! `LogSegment` types, `write_log_segments`), the internal `rocmd`-compatible
+//! status surface (`render_internal_status_text`), the `stop_server` answer shape
 //! (`internal_stop_server_value`, `service_stop_unconfirmed`) and its renderer
 //! (`render_unconfirmed_service_stop`, `process_check_command`), plus
 //! `validate_service_id`, `list_log_files`, `read_optional_tail_lines`, and the
 //! CLI-lifecycle-log tail formatting helpers (`format_cli_lifecycle_tail_line`,
 //! `lifecycle_event_label`, `humanize_log_label`, `lifecycle_field`,
-//! `read_tail_lines`).
+//! `read_log_tail`).
 //!
 //! The `LogBrowserEntry` struct moved here with the logs browser and stays
 //! private.
@@ -36,8 +42,9 @@
 //! `render_internal_status_text`, `render_service_logs_text`,
 //! `render_logs_browser_text`, and `render_logs_text` — re-imported via
 //! `use crate::services_text::{...};`. `services_cmd.rs`'s `services()` calls
-//! `render_services_text`, `render_services_json` and `render_service_logs_text`
-//! through its own imports, and its `run_approved_service_action` and
+//! `render_services_text`, `render_services_json`, `render_service_logs_text`
+//! and `follow_service_logs` through its own imports, `dispatch()` calls
+//! `follow_service_logs` for `rocm logs --service <id> --follow`, and its `run_approved_service_action` and
 //! `finish_service_action` also read `render_service_action_result`,
 //! `service_stop_unconfirmed` and `validate_service_id`. `service_records.rs`
 //! reads `validate_service_id` (in `service_record_artifacts` and
@@ -49,10 +56,10 @@
 //! `service_control.rs` and from `managed_service_status.rs`'s own test module;
 //! `read_managed_service_manifest`, `internal_stop_server_value` and
 //! `process_check_command` are `pub(crate)` for `service_control.rs` (the last
-//! one only for its tests); `read_tail_lines`, `render_logs_text`,
+//! one only for its tests); `read_log_tail`, `render_logs_text`,
 //! `render_logs_browser_text`, `render_services_text` and
-//! `render_service_logs_text` are also `pub(crate)` and read from `chat.rs`'s
-//! deterministic tool-output summaries; `validate_service_id` is also
+//! `render_service_logs_text` are also `pub(crate)` and read from
+//! `chat/mcp_bridge.rs`'s read-only command runner; `validate_service_id` is also
 //! `pub(crate)` and read from `tool_policy.rs`'s service-tool validation,
 //! `services_cmd.rs` and `service_records.rs`; `read_optional_tail_lines` and
 //! `render_service_action_result` are also `pub(crate)` and read from
@@ -72,11 +79,12 @@
 //! classification respectively — stay in `main.rs`'s shared `mod tests`
 //! instead.
 
-use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, ManagedServiceRecord};
@@ -169,16 +177,22 @@ fn render_logs_browser_page_text_with_options(
     if query.is_some() {
         let _ = writeln!(output, "Recent activity: filtered by search");
     } else {
-        let recent_lines = read_optional_tail_lines(&lifecycle_path, 8, "CLI lifecycle log");
-        if recent_lines.is_empty() {
+        let recent = read_optional_log_tail(&lifecycle_path, 8, "CLI lifecycle log");
+        if recent.newest_line_exceeds_the_read_bound() {
+            let _ = writeln!(
+                output,
+                "Recent activity: none shown; {}",
+                rocm_core::newest_line_exceeds_bound_notice()
+            );
+        } else if recent.lines.is_empty() {
             let _ = writeln!(output, "Recent activity: no activity yet");
         } else {
             let _ = writeln!(
                 output,
                 "Recent activity: last {} line(s)",
-                recent_lines.len()
+                recent.lines.len()
             );
-            for line in recent_lines {
+            for line in recent.lines {
                 let _ = writeln!(output, "  {}", format_cli_lifecycle_tail_line(&line));
             }
         }
@@ -242,7 +256,15 @@ struct LogBrowserEntry {
 fn collect_log_browser_entries(paths: &AppPaths) -> Vec<LogBrowserEntry> {
     let lifecycle_path = cli_lifecycle_log_path(paths);
     let mut entries = Vec::new();
-    for line in read_optional_tail_lines(&lifecycle_path, 8, "CLI lifecycle log") {
+    let lifecycle = read_optional_log_tail(&lifecycle_path, 8, "CLI lifecycle log");
+    if lifecycle.newest_line_exceeds_the_read_bound() {
+        // Not a lifecycle record, so it is not formatted as one.
+        entries.push(LogBrowserEntry {
+            source: "lifecycle".to_owned(),
+            line: omitted_output_placeholder("CLI lifecycle log"),
+        });
+    }
+    for line in lifecycle.lines {
         entries.push(LogBrowserEntry {
             source: "lifecycle".to_owned(),
             line: format_cli_lifecycle_tail_line(&line),
@@ -353,6 +375,31 @@ fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id
     let _ = writeln!(output, "  Reclaim the space: rocm services prune");
 }
 
+/// The `anthropic endpoint:` row of a service listing.
+///
+/// Only a service that reports `ready` is probed: the endpoint is published when
+/// the engine first lists its model and is gone with the process, so for any
+/// other status the answer would say nothing the status does not. The probe is
+/// the same cheap `/v1/models` listing the OpenAI endpoint is judged by.
+fn anthropic_endpoint_line(paths: &AppPaths, record: &ManagedServiceRecord, url: &str) -> String {
+    let responding = record.status != "ready"
+        || rocm_core::anthropic_endpoint_ready(
+            url,
+            Some(record.served_model_name()),
+            crate::endpoint_keys::endpoint_api_key(paths, &record.service_id).as_deref(),
+            Duration::from_millis(750),
+        );
+    format_anthropic_endpoint_line(url, responding)
+}
+
+fn format_anthropic_endpoint_line(url: &str, responding: bool) -> String {
+    if responding {
+        format!("  anthropic endpoint: {url}")
+    } else {
+        format!("  anthropic endpoint: {url} (not responding)")
+    }
+}
+
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
     // Counts describe the WHOLE registry, not the rows this view keeps. The
     // default view hides records that are not live, and counting the filtered
@@ -409,6 +456,13 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if let Some(anthropic) = &record.anthropic_endpoint_url {
+            let _ = writeln!(
+                output,
+                "{}",
+                anthropic_endpoint_line(paths, &record, anthropic)
+            );
+        }
         let _ = writeln!(
             output,
             "  logs: rocm services logs {}",
@@ -472,8 +526,7 @@ fn render_service_logs_text_with_options(
     show_file_locations: bool,
 ) -> Result<String> {
     let record = load_managed_service(paths, service_id)?;
-    let recent_lines =
-        read_optional_tail_lines(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log");
+    let recent = read_optional_log_tail(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log");
 
     let mut output = String::new();
     let _ = writeln!(output, "Service Log");
@@ -499,11 +552,17 @@ fn render_service_logs_text_with_options(
         let _ = writeln!(output, "  Choose Show file locations to see exact paths.");
     }
     let _ = writeln!(output);
-    if recent_lines.is_empty() {
+    if recent.newest_line_exceeds_the_read_bound() {
+        let _ = writeln!(
+            output,
+            "Recent output: none shown; {}",
+            rocm_core::newest_line_exceeds_bound_notice()
+        );
+    } else if recent.lines.is_empty() {
         let _ = writeln!(output, "Recent output: no output yet");
     } else {
-        let _ = writeln!(output, "Recent output: last {} line(s)", recent_lines.len());
-        for line in recent_lines {
+        let _ = writeln!(output, "Recent output: last {} line(s)", recent.lines.len());
+        for line in recent.lines {
             let _ = writeln!(output, "  {line}");
         }
     }
@@ -519,11 +578,449 @@ pub(crate) fn render_service_action_result_with_helper_note(
 ) -> String {
     let mut text = render_service_action_result(tool, value);
     if tool == "stop_server"
-        && let Some(note) = crate::service_launch::background_helper_note(paths)
+        && let Some(note) = crate::background_helper::background_helper_note(paths)
     {
         let _ = writeln!(text, "  note: {}", note.text);
     }
     text
+}
+
+/// How often `--follow` looks for new log output.
+const LOG_FOLLOW_POLL: Duration = Duration::from_millis(500);
+/// How often `--follow` re-reads the service record to see whether it stopped.
+const LOG_FOLLOW_LIVENESS_EVERY: Duration = Duration::from_secs(2);
+
+/// Reads whatever a growing log file gained since the last [`Self::poll`].
+/// Not `rocm_core::LogTail`, which is what a bounded read of the end of a log
+/// returns.
+///
+/// Download bars (tqdm, huggingface_hub) redraw in place with `\r`, so a
+/// finished segment ends at either `\r` or `\n`; a trailing partial segment is
+/// held back until its terminator arrives.
+struct FollowCursor {
+    path: PathBuf,
+    offset: u64,
+    pending: Vec<u8>,
+}
+
+/// One completed piece of log output and whether it ended in a carriage return.
+#[derive(Debug, PartialEq, Eq)]
+struct LogSegment {
+    text: String,
+    redraw: bool,
+}
+
+impl FollowCursor {
+    /// Start following at the file's current end.
+    fn at_end(path: &Path) -> Self {
+        let offset = fs::metadata(path).map_or(0, |meta| meta.len());
+        Self {
+            path: path.to_path_buf(),
+            offset,
+            pending: Vec::new(),
+        }
+    }
+
+    fn poll(&mut self) -> Vec<LogSegment> {
+        let Ok(mut file) = fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let len = file.metadata().map_or(0, |meta| meta.len());
+        if len < self.offset {
+            // Truncated or replaced (a restart reuses the path): start over.
+            self.offset = 0;
+            self.pending.clear();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut fresh = Vec::new();
+        if file.read_to_end(&mut fresh).is_err() {
+            return Vec::new();
+        }
+        self.offset += fresh.len() as u64;
+        self.pending.extend_from_slice(&fresh);
+
+        let mut segments = Vec::new();
+        let mut start = 0;
+        let mut index = 0;
+        while index < self.pending.len() {
+            let byte = self.pending[index];
+            // A `\r` at the very end of the data may be the first half of a `\r\n`
+            // that the next poll completes; hold it back rather than emit an
+            // empty segment (which would erase a final redraw frame on a tty).
+            if byte == b'\r' && index + 1 == self.pending.len() {
+                break;
+            }
+            if byte == b'\n' || byte == b'\r' {
+                let mut redraw = byte == b'\r';
+                // The footer's row bookkeeping assumes the log text moves no cursor.
+                let text = rocm_core::terminal::strip_terminal_control_sequences(
+                    &String::from_utf8_lossy(&self.pending[start..index]),
+                );
+                // `\r\n` is one line break, not a redraw followed by an empty line.
+                if redraw && self.pending.get(index + 1) == Some(&b'\n') {
+                    redraw = false;
+                    index += 1;
+                }
+                segments.push(LogSegment { text, redraw });
+                start = index + 1;
+            }
+            index += 1;
+        }
+        self.pending.drain(..start);
+        segments
+    }
+
+    /// The unterminated output still held back, for when following ends: a
+    /// last write cut short by a crash is otherwise never shown.
+    fn finish(&mut self) -> Option<LogSegment> {
+        let mut bytes = std::mem::take(&mut self.pending);
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        // Same stripping as `poll`: a cut-off write can end mid-escape.
+        (!bytes.is_empty()).then(|| LogSegment {
+            text: rocm_core::terminal::strip_terminal_control_sequences(&String::from_utf8_lossy(
+                &bytes,
+            )),
+            redraw: false,
+        })
+    }
+}
+
+/// Writes `segments`; returns whether the last one was a redraw, which leaves the
+/// cursor on that row (the next segment erases it first) instead of a fresh one.
+fn write_log_segments(
+    out: &mut impl io::Write,
+    segments: &[LogSegment],
+    tty: bool,
+) -> Result<bool> {
+    for segment in segments {
+        match (tty, segment.redraw) {
+            // Redraw the same terminal row, as the engine's own bar does.
+            (true, true) => write!(out, "\r\x1b[2K{}", segment.text)?,
+            (true, false) => writeln!(out, "\r\x1b[2K{}", segment.text)?,
+            (false, _) => writeln!(out, "{}", segment.text)?,
+        }
+    }
+    out.flush()?;
+    Ok(tty && segments.last().is_some_and(|segment| segment.redraw))
+}
+
+/// The "how to stop" hint kept on the row just below the newest log output of a
+/// terminal follow, so it stays in view however much the log scrolls.
+///
+/// While drawn, the cursor sits on the footer row. [`Self::erase`] puts it back
+/// where the log output left off: on a fresh row, or, after a redraw segment
+/// (a download bar), at the end of that still-open row, one row up.
+struct FollowFooter {
+    text: String,
+    drawn: bool,
+    /// The row above the footer is an unfinished redraw row.
+    open_row: bool,
+}
+
+/// Led by the part that says the server keeps running: service ids run 40+
+/// characters, so on a narrow terminal the end of the hint is what gets cut.
+fn follow_hint(service_id: &str) -> String {
+    format!("Ctrl-C stops following, the server keeps running. Following {service_id}")
+}
+
+impl FollowFooter {
+    fn new(service_id: &str) -> Self {
+        Self {
+            text: follow_hint(service_id),
+            drawn: false,
+            open_row: false,
+        }
+    }
+
+    fn erase(&mut self, out: &mut impl io::Write) -> Result<()> {
+        if self.drawn {
+            write!(out, "\r\x1b[2K")?;
+            if self.open_row {
+                write!(out, "\x1b[1A")?;
+            }
+            self.drawn = false;
+        }
+        Ok(())
+    }
+
+    /// Clear the footer and end an unfinished redraw row, leaving the cursor on
+    /// a fresh row.
+    fn finish(&mut self, out: &mut impl io::Write) -> Result<()> {
+        self.erase(out)?;
+        if self.open_row {
+            writeln!(out)?;
+            self.open_row = false;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// One line of the follow's own, written below the log output with the
+    /// footer redrawn under it. An unfinished download bar row is ended first,
+    /// not overwritten.
+    fn write_notice(
+        &mut self,
+        out: &mut impl io::Write,
+        text: &str,
+        cols: Option<usize>,
+    ) -> Result<()> {
+        self.finish(out)?;
+        writeln!(out, "{text}")?;
+        self.draw(out, false, cols)
+    }
+
+    /// `cols` truncates the text so it never wraps onto a second row, which the
+    /// one-row erase could not clear.
+    fn draw(
+        &mut self,
+        out: &mut impl io::Write,
+        open_row: bool,
+        cols: Option<usize>,
+    ) -> Result<()> {
+        if open_row {
+            writeln!(out)?;
+        }
+        let shown: String = match cols {
+            Some(cols) => {
+                crate::cli_progress::truncate_to_width(&self.text, cols.saturating_sub(1))
+            }
+            None => self.text.clone(),
+        };
+        write!(out, "\r\x1b[2K{shown}")?;
+        out.flush()?;
+        self.drawn = true;
+        self.open_row = open_row;
+        Ok(())
+    }
+
+    /// Write a batch of new output with the footer kept below it. A batch with
+    /// nothing in it leaves the screen alone (no flicker on an idle log).
+    fn write_batch(
+        &mut self,
+        out: &mut impl io::Write,
+        segments: &[LogSegment],
+        cols: Option<usize>,
+    ) -> Result<()> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        self.erase(out)?;
+        let open_row = write_log_segments(out, segments, true)?;
+        self.draw(out, open_row, cols)
+    }
+}
+
+fn terminal_cols() -> Option<usize> {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, _)| usize::from(cols))
+}
+
+/// `rocm logs --service <id> --follow`: print the recent output, then keep
+/// printing new output until the service is no longer starting or running.
+/// Ctrl-C ends the follow and leaves the service running.
+pub(crate) fn follow_service_logs(paths: &AppPaths, service_id: &str) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let mut out = io::stdout();
+    let tty = out.is_terminal();
+    follow_service_logs_with(
+        paths,
+        service_id,
+        &mut out,
+        &mut io::stderr(),
+        tty,
+        LOG_FOLLOW_POLL,
+        LOG_FOLLOW_LIVENESS_EVERY,
+        &terminal_cols,
+    )
+}
+
+/// True once, the first time `status` reads `ready`.
+fn newly_ready(announced: &mut bool, status: &str) -> bool {
+    let ready = status == "ready" && !*announced;
+    *announced |= ready;
+    ready
+}
+
+/// A line about the follow itself (the hint, "is ready.", "stopped following.").
+/// On a terminal it shares the log's stream and row layout; piped, it goes to
+/// `err` so `rocm logs -f | grep error` sees log text only.
+fn write_note(
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    line: &str,
+) -> Result<()> {
+    if tty {
+        writeln!(out, "{line}")?;
+    } else {
+        writeln!(err, "{line}")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn follow_service_logs_with(
+    paths: &AppPaths,
+    service_id: &str,
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    poll: Duration,
+    liveness_every: Duration,
+    cols: &dyn Fn() -> Option<usize>,
+) -> Result<()> {
+    follow_service_logs_via(
+        paths,
+        service_id,
+        &|| load_managed_service(paths, service_id),
+        out,
+        err,
+        tty,
+        poll,
+        liveness_every,
+        cols,
+    )
+}
+
+/// [`follow_service_logs_with`] with the record read injected: a `ready` status
+/// only sticks while the endpoint answers, so a test cannot plant one on disk.
+#[allow(clippy::too_many_arguments)]
+fn follow_service_logs_via(
+    paths: &AppPaths,
+    service_id: &str,
+    load: &dyn Fn() -> Result<ManagedServiceRecord>,
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    poll: Duration,
+    liveness_every: Duration,
+    cols: &dyn Fn() -> Option<usize>,
+) -> Result<()> {
+    let record = load()?;
+    // Open the tail before the snapshot: output written in between is then shown
+    // twice (in the snapshot and by the first poll) rather than lost, and the
+    // tail can start mid-line.
+    let mut tail = FollowCursor::at_end(&record.log_path);
+    write!(out, "{}", render_service_logs_text(paths, service_id)?)?;
+    out.flush()?;
+    if !managed_service_is_live(&record) {
+        write_note(
+            out,
+            err,
+            tty,
+            &format!(
+                "\nService {service_id} is {}; not following.",
+                record.status
+            ),
+        )?;
+        // Same outcome as a follow that sees the server fail: not a success.
+        if record.status == "failed" {
+            bail!("service {service_id} failed; see the log output above");
+        }
+        return Ok(());
+    }
+    // On a terminal the hint is a footer that stays under the newest output; a
+    // pipe or log file gets it once, since it has no row to keep it on.
+    let mut footer = tty.then(|| FollowFooter::new(service_id));
+    match footer.as_mut() {
+        Some(footer) => footer.draw(out, false, cols())?,
+        None => write_note(out, err, tty, &format!("\n{}", follow_hint(service_id)))?,
+    }
+    out.flush()?;
+
+    let result = follow_loop(
+        load,
+        &record,
+        &mut tail,
+        &mut footer,
+        out,
+        err,
+        tty,
+        poll,
+        liveness_every,
+        cols,
+    );
+    if result.is_err()
+        && let Some(footer) = footer.as_mut()
+    {
+        // Leave the terminal on a clean row so the caller's `Error:` is not glued
+        // to the footer or to an unfinished download bar.
+        let _ = footer.finish(out);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn follow_loop(
+    load: &dyn Fn() -> Result<ManagedServiceRecord>,
+    record: &ManagedServiceRecord,
+    tail: &mut FollowCursor,
+    footer: &mut Option<FollowFooter>,
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    poll: Duration,
+    liveness_every: Duration,
+    cols: &dyn Fn() -> Option<usize>,
+) -> Result<()> {
+    let service_id = record.service_id.as_str();
+    let mut announced_ready = record.status == "ready";
+    let mut since_check = Duration::ZERO;
+    loop {
+        thread::sleep(poll);
+        match footer.as_mut() {
+            Some(footer) => footer.write_batch(out, &tail.poll(), cols())?,
+            None => {
+                write_log_segments(out, &tail.poll(), tty)?;
+            }
+        }
+        since_check += poll;
+        if since_check < liveness_every {
+            continue;
+        }
+        since_check = Duration::ZERO;
+        let record = load()?;
+        if newly_ready(&mut announced_ready, &record.status) {
+            let line = format!("Service {service_id} is ready.");
+            match footer.as_mut() {
+                Some(footer) => footer.write_notice(out, &line, cols())?,
+                None => write_note(out, err, tty, &line)?,
+            }
+        }
+        if !managed_service_is_live(&record) {
+            // Output written between the last poll and the exit.
+            let mut last = tail.poll();
+            last.extend(tail.finish());
+            let mut open_row = false;
+            if let Some(footer) = footer.as_mut() {
+                footer.erase(out)?;
+                open_row = footer.open_row;
+            }
+            open_row = write_log_segments(out, &last, tty)? || (open_row && last.is_empty());
+            if open_row {
+                writeln!(out)?;
+            }
+            write_note(
+                out,
+                err,
+                tty,
+                &format!(
+                    "Service {service_id} is {}; stopped following.",
+                    record.status
+                ),
+            )?;
+            // Same outcome as `serve --wait`: a server that failed is not a success.
+            if record.status == "failed" {
+                bail!("service {service_id} failed; see the log output above");
+            }
+            return Ok(());
+        }
+    }
 }
 
 pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String {
@@ -532,11 +1029,21 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
         return render_unconfirmed_service_stop(output);
     }
     let action = service_action_past_tense(tool);
-    let service = output.get("service").or_else(|| {
-        output
-            .get("result")
-            .and_then(|result| result.get("service"))
-    });
+    // Restart nests the record under `service`; the in-process stop report
+    // ([`stop_internal_managed_service`]) is itself the record's summary, with
+    // `service_id` and `status` directly on `result`.
+    let service = output
+        .get("service")
+        .or_else(|| {
+            output
+                .get("result")
+                .and_then(|result| result.get("service"))
+        })
+        .or_else(|| {
+            output
+                .get("result")
+                .filter(|result| result.get("service_id").is_some())
+        });
     let mut text = String::new();
     let _ = writeln!(text, "Local server {action}");
     if let Some(service) = service {
@@ -575,9 +1082,20 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
 ///
 /// - a process that was signalled and that, or a process under it, outlived
 ///   the deadline (`timed_out`);
+/// - a process that is gone, with the separate kill of the processes under it
+///   not completed (`descendants_unconfirmed`, Windows): this stop saw the
+///   recorded process exit, so it does not say anything outlived a deadline, but
+///   one of the processes under it may still be running;
+/// - a recorded process that exited by itself before the processes under it
+///   could be taken down (`exited_before_tree_kill`, Windows), with no other
+///   recorded process confirmed gone to vouch for what was under it: nothing
+///   was signalled, and one of them may still be running;
 /// - a process that was not signalled because its identity could not be
-///   verified (`unverified`), with how to look at it. It may have exited
-///   meanwhile: the identity read can fail because the process is going away;
+///   verified (`unverified`), with how to look at it. There are two routes to
+///   it: a recorded start-time that can no longer be read back from a running
+///   process, and, on Windows, a PID that cannot be queried at all. It may have
+///   exited meanwhile: the identity read can fail because the process is going
+///   away;
 /// - the record changed while the stop ran, typically because a restart
 ///   recorded new processes, so the stop's verdict says nothing about what the
 ///   record names now.
@@ -612,6 +1130,10 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
             .collect()
     };
     let timed_out = with_outcome(rocm_core::TerminationOutcome::TimedOut.as_str());
+    let descendants_unconfirmed =
+        with_outcome(rocm_core::TerminationOutcome::DescendantsUnconfirmed.as_str());
+    let exited_before_tree_kill =
+        with_outcome(rocm_core::TerminationOutcome::ExitedBeforeTreeKill.as_str());
     let unverified = with_outcome(rocm_core::TerminationOutcome::Unverified.as_str());
 
     let mut text = String::new();
@@ -633,6 +1155,18 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
         let _ = writeln!(
             text,
             "  still running: process {pid} ({role}) or a process under it did not exit after it was signaled"
+        );
+    }
+    for (pid, role) in &descendants_unconfirmed {
+        let _ = writeln!(
+            text,
+            "  not confirmed: process {pid} ({role}) exited, but a process under it may still be running, because taking the processes under it down did not complete; rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"
+        );
+    }
+    for (pid, role) in &exited_before_tree_kill {
+        let _ = writeln!(
+            text,
+            "  not confirmed: process {pid} ({role}) was already gone when the processes under it were to be taken down, and nothing else the server recorded vouches for them, so one of them may still be running; rocm does not keep this warning, so a later stop or listing will find the process gone and report the stop confirmed"
         );
     }
     for (pid, role) in &unverified {
@@ -697,11 +1231,24 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
 /// stop left alone because it could not verify it. Not a `rocm` command: the
 /// CLI deliberately does not act on that process, so the user decides.
 ///
-/// A Linux command because only Linux can produce that outcome: it needs a
-/// recorded start-time that can no longer be read back, and
-/// `rocm_core::process_start_ticks` records one only on Linux.
+/// Linux and Windows can both produce that outcome, by two routes. On both, a
+/// recorded start-time that can no longer be read back from a running process
+/// (`rocm_core::process_start_ticks` records one on both). On Windows also, a PID
+/// that cannot be queried at all, such as a live process this one may not open,
+/// which reads as unverifiable with or without a recorded token. So the command
+/// is the one the host has: `ps` on Linux, `tasklist` on Windows.
 pub(crate) fn process_check_command(pid: u64) -> String {
-    format!("ps -p {pid} -o pid,args")
+    process_check_command_for(cfg!(windows), pid)
+}
+
+/// [`process_check_command`] for a chosen platform, so a test reads both forms
+/// on every host.
+fn process_check_command_for(windows: bool, pid: u64) -> String {
+    if windows {
+        format!("tasklist /FI \"PID eq {pid}\"")
+    } else {
+        format!("ps -p {pid} -o pid,args")
+    }
 }
 
 /// A managed service's record exactly as it is on disk, without the engine-state
@@ -805,13 +1352,42 @@ fn list_log_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
     paths.into_iter().take(limit).collect()
 }
 
+/// The last `limit` lines of a log that may not exist. A log that has content
+/// but none of it fits the read budget comes back as one
+/// [`omitted_output_placeholder`] line, like a read error comes back as one
+/// `<failed to read ...>` line, so a caller that lists the lines never takes a
+/// log with content for an empty one. A missing or empty log is an empty list.
 pub(crate) fn read_optional_tail_lines(path: &Path, limit: usize, label: &str) -> Vec<String> {
-    if !path.is_file() {
-        return Vec::new();
+    let tail = read_optional_log_tail(path, limit, label);
+    if tail.newest_line_exceeds_the_read_bound() {
+        vec![omitted_output_placeholder(label)]
+    } else {
+        tail.lines
     }
-    match read_tail_lines(path, limit, label) {
-        Ok(lines) => lines,
-        Err(error) => vec![format!("<failed to read {label}: {error}>")],
+}
+
+/// The line that stands in for a log whose newest line is longer than the
+/// budget a log view reads, so nothing of it could be shown.
+fn omitted_output_placeholder(label: &str) -> String {
+    format!(
+        "<no output shown from {label}: {}>",
+        rocm_core::newest_line_exceeds_bound_notice()
+    )
+}
+
+/// [`read_optional_tail_lines`], keeping what the byte budget left unread so
+/// a caller that describes an empty result can tell an empty log from one
+/// whose newest line is too long to show.
+pub(crate) fn read_optional_log_tail(path: &Path, limit: usize, label: &str) -> rocm_core::LogTail {
+    if !path.is_file() {
+        return rocm_core::LogTail::default();
+    }
+    match read_log_tail(path, limit, label) {
+        Ok(tail) => tail,
+        Err(error) => rocm_core::LogTail {
+            lines: vec![format!("<failed to read {label}: {error}>")],
+            skipped_bytes: 0,
+        },
     }
 }
 
@@ -877,23 +1453,17 @@ fn lifecycle_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))?;
-    let reader = io::BufReader::new(file);
-    let mut lines = VecDeque::with_capacity(limit);
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("failed to read {label} {}", path.display()))?;
-        if lines.len() == limit {
-            lines.pop_front();
-        }
-        lines.push_back(line);
-    }
-    Ok(lines.into_iter().collect())
+/// The last `limit` lines of a log, read through the shared bounded tail
+/// routine, with what the byte budget left unread; `label` names the log in the
+/// error ("service log", "CLI action log").
+pub(crate) fn read_log_tail(path: &Path, limit: usize, label: &str) -> Result<rocm_core::LogTail> {
+    rocm_core::tail_log_decoded(
+        path,
+        limit,
+        rocm_core::LOG_VIEW_MAX_TAIL_READ,
+        rocm_core::LogDecode::PLAIN,
+    )
+    .with_context(|| format!("failed to read {label} {}", path.display()))
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -904,6 +1474,146 @@ pub(crate) mod tests {
     use crate::providers;
     use crate::service_control::run_internal_sandbox_tool;
     use crate::tests::test_paths;
+
+    /// The lines of [`read_log_tail`], for the tests that only look at those.
+    fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>> {
+        Ok(read_log_tail(path, limit, label)?.lines)
+    }
+
+    fn tail_fixture(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let (root, _paths) = test_paths(name);
+        fs::create_dir_all(&root)?;
+        let path = root.join("service.log");
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not streamed whole.
+        let log = tail_fixture("services-tail-large", &large_log_with_head_marker())?;
+
+        let lines = read_tail_lines(&log, 10_000, "service log")?;
+        fs::remove_file(&log)?;
+
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        assert!(lines.len() < 5122, "got {} lines", lines.len());
+        assert!(lines.len() > 3500, "the window holds about 4 MiB of lines");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_shows_a_sixteen_bit_log_as_lossy_text_instead_of_failing() -> Result<()> {
+        // Service logs are the child's own bytes, read as UTF-8; a UTF-16 log
+        // is not detected here (only the ComfyUI log view does that), but it no
+        // longer aborts the view.
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "[INFO] one\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let log = tail_fixture("services-tail-utf16", &bytes)?;
+
+        let lines = read_tail_lines(&log, 5, "service log")?;
+
+        assert!(
+            lines[0].starts_with("\u{FFFD}\u{FFFD}["),
+            "the byte order mark is replaced, the rest kept: {lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_ansi_colour_codes() -> Result<()> {
+        let log = tail_fixture("services-tail-ansi", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        assert_eq!(
+            read_tail_lines(&log, 5, "service log")?,
+            vec!["\u{1b}[32mgreen\u{1b}[0m done"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
+        let log = tail_fixture("services-tail-invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        let expected = vec![
+            "ok".to_owned(),
+            "bad\u{FFFD}byte".to_owned(),
+            "last".to_owned(),
+        ];
+        assert_eq!(read_tail_lines(&log, 5, "service log")?, expected);
+        // The optional reader shows the same lines, not a failure placeholder.
+        assert_eq!(read_optional_tail_lines(&log, 5, "service log"), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_labelled_error_naming_the_path() {
+        let (root, _paths) = test_paths("services-tail-missing");
+        let missing = root.join("absent.log");
+
+        let error =
+            read_tail_lines(&missing, 5, "service log").expect_err("a missing log must not read");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read service log {}", missing.display())
+        );
+        assert!(
+            format!("{error:#}").contains(&format!("failed to open {}", missing.display())),
+            "the cause names the failing step: {error:#}"
+        );
+        // read_optional_tail_lines guards on is_file first and stays quiet.
+        assert!(read_optional_tail_lines(&missing, 5, "service log").is_empty());
+    }
+
+    #[test]
+    fn read_tail_lines_limit_zero_returns_nothing_without_opening_the_file() {
+        let (root, _paths) = test_paths("services-tail-zero");
+
+        let lines = read_tail_lines(&root.join("absent.log"), 0, "service log")
+            .expect("limit 0 returns before the file is opened");
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let log = tail_fixture("services-tail-few", b"a\nb\n")?;
+
+        assert_eq!(read_tail_lines(&log, 50, "service log")?, vec!["a", "b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let log = tail_fixture("services-tail-no-newline", b"a\nb\nc")?;
+
+        assert_eq!(read_tail_lines(&log, 2, "service log")?, vec!["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let log = tail_fixture("services-tail-crlf", b"a\r\nb\r\n")?;
+
+        assert_eq!(read_tail_lines(&log, 5, "service log")?, vec!["a", "b"]);
+        Ok(())
+    }
 
     #[test]
     fn render_logs_text_preserves_directory_summary() {
@@ -1114,6 +1824,775 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn log_tail_yields_only_new_complete_segments() -> Result<()> {
+        let (root, paths) = test_paths("log-tail");
+        paths.ensure()?;
+        let log = root.join("tail.log");
+        fs::write(&log, "old line\n")?;
+        let mut tail = FollowCursor::at_end(&log);
+        assert!(tail.poll().is_empty());
+
+        // tqdm-style bar redraws with `\r`; the last piece has no terminator yet.
+        fs::write(&log, "old line\n 28%|##\r 33%|###\rdone\r\nhalf")?;
+        let segments = tail.poll();
+        assert_eq!(
+            segments,
+            vec![
+                LogSegment {
+                    text: " 28%|##".into(),
+                    redraw: true
+                },
+                LogSegment {
+                    text: " 33%|###".into(),
+                    redraw: true
+                },
+                LogSegment {
+                    text: "done".into(),
+                    redraw: false
+                },
+            ]
+        );
+        // The held-back partial segment completes on the next poll.
+        let mut file = fs::OpenOptions::new().append(true).open(&log)?;
+        std::io::Write::write_all(&mut file, b" line\n")?;
+        assert_eq!(
+            tail.poll(),
+            vec![LogSegment {
+                text: "half line".into(),
+                redraw: false
+            }]
+        );
+
+        // A truncated log (restart reusing the path) is read from the start.
+        fs::write(&log, "new\n")?;
+        assert_eq!(
+            tail.poll(),
+            vec![LogSegment {
+                text: "new".into(),
+                redraw: false
+            }]
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_holds_back_a_trailing_cr_and_flushes_the_rest_on_finish() -> Result<()> {
+        let (root, paths) = test_paths("log-tail-edges");
+        paths.ensure()?;
+        let log = root.join("edges.log");
+        fs::write(&log, "")?;
+        let mut tail = FollowCursor::at_end(&log);
+
+        // A `\r` ending the data may be half of a `\r\n`: it is not a redraw yet.
+        fs::write(&log, " 99%|#\r")?;
+        assert!(tail.poll().is_empty());
+        let mut file = fs::OpenOptions::new().append(true).open(&log)?;
+        std::io::Write::write_all(&mut file, b"\n")?;
+        assert_eq!(
+            tail.poll(),
+            vec![LogSegment {
+                text: " 99%|#".into(),
+                redraw: false
+            }],
+            "the held `\\r` joins the next `\\n` instead of yielding an empty segment"
+        );
+
+        // Output cut short before any terminator is shown when following ends.
+        std::io::Write::write_all(&mut file, b"crashed mid-wri")?;
+        assert!(tail.poll().is_empty());
+        assert_eq!(
+            tail.finish(),
+            Some(LogSegment {
+                text: "crashed mid-wri".into(),
+                redraw: false
+            })
+        );
+        assert_eq!(tail.finish(), None);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn write_log_segments_redraws_in_place_only_on_a_tty() -> Result<()> {
+        let segments = [
+            LogSegment {
+                text: "28%".into(),
+                redraw: true,
+            },
+            LogSegment {
+                text: "done".into(),
+                redraw: false,
+            },
+        ];
+        let mut tty = Vec::new();
+        write_log_segments(&mut tty, &segments, true)?;
+        // A redraw segment leaves the cursor on its row; the next segment (or
+        // line) erases the row first, and a plain line ends with a newline.
+        assert_eq!(String::from_utf8(tty)?, "\r\x1b[2K28%\r\x1b[2Kdone\n");
+
+        let mut piped = Vec::new();
+        write_log_segments(&mut piped, &segments, false)?;
+        assert_eq!(String::from_utf8(piped)?, "28%\ndone\n");
+        Ok(())
+    }
+
+    fn seg(text: &str, redraw: bool) -> LogSegment {
+        LogSegment {
+            text: text.into(),
+            redraw,
+        }
+    }
+
+    const ERASE: &str = "\r\x1b[2K";
+
+    #[test]
+    fn follow_footer_is_redrawn_under_each_batch_of_new_lines() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let hint = footer.text.clone();
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, None)?;
+        assert_eq!(String::from_utf8(out.clone())?, format!("{ERASE}{hint}"));
+
+        out.clear();
+        footer.write_batch(&mut out, &[seg("one", false), seg("two", false)], None)?;
+        // Footer row cleared, lines written over it, footer redrawn on the next row.
+        assert_eq!(
+            String::from_utf8(out)?,
+            format!("{ERASE}{ERASE}one\n{ERASE}two\n{ERASE}{hint}")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follow_footer_leaves_an_idle_screen_alone() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, None)?;
+        out.clear();
+        footer.write_batch(&mut out, &[], None)?;
+        assert!(out.is_empty(), "{out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn follow_footer_keeps_a_download_bar_on_its_own_row_above_it() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let hint = footer.text.clone();
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, None)?;
+        out.clear();
+
+        footer.write_batch(&mut out, &[seg("28%", true)], None)?;
+        // The bar row stays open; the footer goes on the row below it.
+        assert_eq!(
+            String::from_utf8(out.clone())?,
+            format!("{ERASE}{ERASE}28%\n{ERASE}{hint}")
+        );
+
+        out.clear();
+        footer.write_batch(&mut out, &[seg("43%", true)], None)?;
+        // Erase the footer, step back up onto the bar row, redraw it in place.
+        assert_eq!(
+            String::from_utf8(out.clone())?,
+            format!("{ERASE}\x1b[1A{ERASE}43%\n{ERASE}{hint}")
+        );
+
+        out.clear();
+        footer.write_batch(&mut out, &[seg("done", false)], None)?;
+        // A finished line replaces the bar, and the footer is back on a fresh row.
+        assert_eq!(
+            String::from_utf8(out)?,
+            format!("{ERASE}\x1b[1A{ERASE}done\n{ERASE}{hint}")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follow_footer_is_cut_to_one_terminal_row() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, Some(30))?;
+        // One column short of the width, so it never wraps, and what is kept is
+        // the head of the hint: the part saying the server keeps running.
+        let drawn = String::from_utf8(out)?;
+        let shown = drawn.strip_prefix(ERASE).expect("erase prefix");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(shown), 29, "{shown}");
+        assert!(shown.starts_with("Ctrl-C stops following, the"), "{shown}");
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_strips_cursor_escapes_from_engine_output() -> Result<()> {
+        let (root, _paths) = test_paths("tail-escapes");
+        fs::create_dir_all(&root)?;
+        let log = root.join("engine.log");
+        fs::write(&log, "")?;
+        let mut tail = FollowCursor::at_end(&log);
+        fs::write(&log, "before\x1b[1Aafter\n")?;
+        let segments = tail.poll();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "beforeafter");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_finish_strips_cursor_escapes_from_a_cut_off_write() -> Result<()> {
+        let (root, _paths) = test_paths("tail-finish-escapes");
+        fs::create_dir_all(&root)?;
+        let log = root.join("engine.log");
+        fs::write(&log, "")?;
+        let mut tail = FollowCursor::at_end(&log);
+        fs::write(&log, "last\x1b[1Aword")?;
+        assert!(tail.poll().is_empty());
+        let segment = tail.finish().expect("unterminated output is returned");
+        assert_eq!(segment.text, "lastword");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_keeps_the_hint_under_new_output_on_a_tty() -> Result<()> {
+        let (root, paths) = test_paths("follow-tty");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_tty",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11438,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "before\n")?;
+
+        let log_path = record.log_path;
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            let appended = (|| -> Result<()> {
+                thread::sleep(Duration::from_millis(150));
+                let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+                std::io::Write::write_all(&mut file, b"Downloading 43%\n")?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })();
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_tty")?;
+            record.status = "stopped".to_owned();
+            record.write()?;
+            appended
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_tty",
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        )?;
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        let hint = FollowFooter::new("svc_follow_tty").text;
+        // The hint is drawn again right under the line that scrolled it away,
+        // and only the stop message follows it, after the footer row is cleared.
+        assert!(
+            out.contains(&format!("Downloading 43%\n{ERASE}{hint}")),
+            "{out:?}"
+        );
+        assert!(
+            out.ends_with(&format!(
+                "{hint}{ERASE}Service svc_follow_tty is stopped; stopped following.\n"
+            )),
+            "{out:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_ends_an_open_download_bar_row_before_the_stop_message() -> Result<()> {
+        let (root, paths) = test_paths("follow-tty-bar");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_bar",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11440,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "")?;
+
+        let log_path = record.log_path;
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            let appended = (|| -> Result<()> {
+                thread::sleep(Duration::from_millis(150));
+                let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+                std::io::Write::write_all(&mut file, b"28%\r43%\r\r")?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })();
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_bar")?;
+            record.status = "stopped".to_owned();
+            record.write()?;
+            appended
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_bar",
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        )?;
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        // The footer is erased and the cursor goes back up onto the bar's row; that row
+        // is then ended with a newline so the stop message starts on its own row.
+        assert!(
+            out.ends_with(&format!(
+                "{ERASE}\x1b[1A\nService svc_follow_bar is stopped; stopped following.\n"
+            )),
+            "{out:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_draws_no_footer_for_a_stopped_service_on_a_tty() -> Result<()> {
+        let (root, paths) = test_paths("follow-tty-stopped");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_tty_stopped",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11439,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write()?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_tty_stopped",
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &|| None,
+        )?;
+        let out = String::from_utf8(out)?;
+        assert!(!out.contains("Following"), "{out:?}");
+        assert!(out.contains("not following."), "{out:?}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_prints_snapshot_and_returns_for_a_stopped_service() -> Result<()> {
+        let (root, paths) = test_paths("follow-stopped");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_stopped",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11436,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "Downloading 86%\n")?;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_stopped",
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &|| None,
+        )?;
+        let out = String::from_utf8(out)?;
+        let err = String::from_utf8(err)?;
+        assert!(out.contains("Downloading 86%"), "{out}");
+        // The notice is not log text, so a pipe keeps it off stdout.
+        assert!(!out.contains("not following"), "{out}");
+        assert!(
+            err.contains("Service svc_follow_stopped is stopped; not following."),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn newly_ready_fires_once_on_the_first_ready_status() {
+        let mut announced = false;
+        assert!(!newly_ready(&mut announced, "starting"));
+        assert!(newly_ready(&mut announced, "ready"));
+        assert!(!newly_ready(&mut announced, "ready"));
+        // A follow that began on an already-ready server has announced nothing new.
+        let mut announced = true;
+        assert!(!newly_ready(&mut announced, "ready"));
+    }
+
+    #[test]
+    fn follow_service_logs_fails_when_the_service_failed() -> Result<()> {
+        let (root, paths) = test_paths("follow-ready-failed");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_fail",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11438,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "before\n")?;
+
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(200));
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_fail")?;
+            record.status = "failed".to_owned();
+            record.write()
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = follow_service_logs_with(
+            &paths,
+            "svc_follow_fail",
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        );
+        writer.join().expect("writer thread")?;
+        let err = String::from_utf8(err)?;
+        assert!(err.contains("is failed; stopped following"), "{err}");
+        let error = result.expect_err("a failed service must not exit 0");
+        assert!(
+            error.to_string().contains("svc_follow_fail failed"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_streams_new_output_until_the_service_stops() -> Result<()> {
+        let (root, paths) = test_paths("follow-live");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_live",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11437,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "before\n")?;
+
+        let log_path = record.log_path;
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            let appended = (|| -> Result<()> {
+                thread::sleep(Duration::from_millis(150));
+                let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+                std::io::Write::write_all(&mut file, b"Downloading 43%\n")?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })();
+            // Stop the service even when the append failed, so the follow loop
+            // under test always ends instead of hanging the run.
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_live")?;
+            record.status = "stopped".to_owned();
+            record.write()?;
+            appended
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_live",
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        )?;
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        let err = String::from_utf8(err)?;
+        // Piped: stdout is the log text alone, with no terminal escapes, and the
+        // follow's own lines go to stderr, the hint exactly once.
+        assert!(out.contains("Downloading 43%"), "{out}");
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(!out.contains("Following"), "{out}");
+        assert!(!out.contains("stopped following"), "{out}");
+        assert_eq!(err.matches("Following svc_follow_live").count(), 1, "{err}");
+        assert!(err.contains("stopped following"), "{err}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn starting_record(paths: &AppPaths, id: &str, port: u16) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            id,
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        Ok(record)
+    }
+
+    /// A record read that walks through `statuses` (the last one repeats).
+    fn scripted_statuses(
+        base: ManagedServiceRecord,
+        statuses: &'static [&'static str],
+    ) -> impl Fn() -> Result<ManagedServiceRecord> {
+        let calls = std::cell::Cell::new(0_usize);
+        move || {
+            let call = calls.get();
+            calls.set(call + 1);
+            let mut record = base.clone();
+            record.status = statuses[call.min(statuses.len() - 1)].to_owned();
+            Ok(record)
+        }
+    }
+
+    #[test]
+    fn follow_service_logs_announces_ready_once_when_the_server_comes_up() -> Result<()> {
+        let (root, paths) = test_paths("follow-ready-line");
+        paths.ensure()?;
+        let record = starting_record(&paths, "svc_follow_ready", 11441)?;
+        fs::write(&record.log_path, "before\n")?;
+        // Initial read, then one read per liveness check.
+        let load = scripted_statuses(
+            record,
+            &["starting", "starting", "ready", "ready", "stopped"],
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_via(
+            &paths,
+            "svc_follow_ready",
+            &load,
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            &|| None,
+        )?;
+        let err = String::from_utf8(err)?;
+        assert_eq!(
+            err.matches("Service svc_follow_ready is ready.").count(),
+            1,
+            "{err}"
+        );
+        assert!(!String::from_utf8(out)?.contains("is ready."));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_ends_a_download_bar_row_before_the_ready_line_on_a_tty() -> Result<()> {
+        let (root, paths) = test_paths("follow-ready-bar");
+        paths.ensure()?;
+        let record = starting_record(&paths, "svc_follow_rbar", 11442)?;
+        fs::write(&record.log_path, "")?;
+        let log_path = record.log_path.clone();
+        let appender = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(50));
+            let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+            std::io::Write::write_all(&mut file, b"28%\r43%\r")?;
+            Ok(())
+        });
+        // The bar is on screen when the status turns ready (liveness check 3 on).
+        let calls = std::cell::Cell::new(0_usize);
+        let base = record;
+        let load = move || -> Result<ManagedServiceRecord> {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call >= 3 {
+                thread::sleep(Duration::from_millis(30));
+            }
+            let mut record = base.clone();
+            record.status = match call {
+                0..=7 => "starting",
+                8..=9 => "ready",
+                _ => "stopped",
+            }
+            .to_owned();
+            Ok(record)
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_via(
+            &paths,
+            "svc_follow_rbar",
+            &load,
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            &|| None,
+        )?;
+        appender.join().expect("appender thread")?;
+        let out = String::from_utf8(out)?;
+        // The bar's row is ended with a newline, then the ready line gets its own
+        // row; it never replaces the bar.
+        assert!(
+            out.contains(&format!(
+                "{ERASE}\x1b[1A\nService svc_follow_rbar is ready.\n"
+            )),
+            "{out:?}"
+        );
+        assert!(err.is_empty(), "a terminal follow writes nothing to stderr");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_clears_the_footer_when_the_follow_errors() -> Result<()> {
+        let (root, paths) = test_paths("follow-error");
+        paths.ensure()?;
+        let record = starting_record(&paths, "svc_follow_gone", 11443)?;
+        fs::write(&record.log_path, "")?;
+        let manifest = record.manifest_path;
+        // The service record disappears mid-follow, so the next liveness read fails.
+        let remover = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(100));
+            fs::remove_file(manifest)?;
+            Ok(())
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = follow_service_logs_with(
+            &paths,
+            "svc_follow_gone",
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        );
+        remover.join().expect("remover thread")?;
+        assert!(result.is_err(), "a vanished record must end the follow");
+        let out = String::from_utf8(out)?;
+        // The footer row is erased, so `Error:` starts on a clean row.
+        assert!(out.ends_with(ERASE), "{out:?}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_fails_for_a_service_that_is_already_failed() -> Result<()> {
+        let (root, paths) = test_paths("follow-already-failed");
+        paths.ensure()?;
+        let mut record = starting_record(&paths, "svc_follow_dead", 11444)?;
+        record.status = "failed".to_owned();
+        record.supervisor_pid = 0;
+        record.write()?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = follow_service_logs_with(
+            &paths,
+            "svc_follow_dead",
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &|| None,
+        );
+        let error = result.expect_err("a failed service must not exit 0");
+        assert!(
+            error.to_string().contains("svc_follow_dead failed"),
+            "{error}"
+        );
+        assert!(String::from_utf8(err)?.contains("is failed; not following."));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn render_service_logs_text_tails_manifest_log() -> Result<()> {
         let (root, paths) = test_paths("service-logs");
         paths.ensure()?;
@@ -1157,6 +2636,239 @@ pub(crate) mod tests {
         assert!(rendered.contains("entry-090"));
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// What `rocm services logs` prints for a service whose log holds `bytes`
+    /// (or has no file when `None`), with the log's size on disk, so a message
+    /// is asserted together with the state it describes.
+    fn render_service_log_with(name: &str, bytes: Option<&[u8]>) -> Result<(String, Option<u64>)> {
+        let (root, paths) = test_paths(name);
+        paths.ensure()?;
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc_tail_notice",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_preferred".to_owned()),
+        );
+        record.write()?;
+        let size = match bytes {
+            Some(bytes) => {
+                fs::write(&record.log_path, bytes)?;
+                Some(fs::metadata(&record.log_path)?.len())
+            }
+            None => None,
+        };
+        let rendered = render_service_logs_text(&paths, "svc_tail_notice")?;
+        let _ = fs::remove_dir_all(root);
+        Ok((rendered, size))
+    }
+
+    #[test]
+    fn service_logs_say_no_output_only_for_an_empty_log_and_name_the_bound_otherwise() -> Result<()>
+    {
+        let bound = rocm_core::LOG_VIEW_MAX_TAIL_READ;
+        assert_eq!(
+            bound,
+            4 * 1024 * 1024,
+            "the notice below names this many MiB"
+        );
+        let notice =
+            "Recent output: none shown; the newest line is longer than the 4 MiB a log view reads";
+        let over_the_bound = usize::try_from(bound)? + 1024;
+
+        // No log file and an empty one: nothing was written, and it says so.
+        let (rendered, size) = render_service_log_with("service-logs-none", None)?;
+        assert_eq!(size, None);
+        assert!(
+            rendered.contains("Recent output: no output yet"),
+            "{rendered}"
+        );
+        let (rendered, size) = render_service_log_with("service-logs-empty", Some(b""))?;
+        assert_eq!(size, Some(0));
+        assert!(
+            rendered.contains("Recent output: no output yet"),
+            "{rendered}"
+        );
+
+        // One line longer than the bound, with and without a final newline:
+        // the file has content, so "no output yet" would be false.
+        let one_line = "x".repeat(over_the_bound).into_bytes();
+        let mut with_newline = one_line.clone();
+        with_newline.push(b'\n');
+        for (name, bytes) in [
+            ("service-logs-long-line", one_line),
+            ("service-logs-long-line-newline", with_newline),
+        ] {
+            let (rendered, size) = render_service_log_with(name, Some(&bytes))?;
+            assert!(size.is_some_and(|size| size > bound), "{name}: {size:?}");
+            assert!(rendered.contains(notice), "{name}: {rendered}");
+            assert!(!rendered.contains("no output yet"), "{name}: {rendered}");
+            assert!(!rendered.contains("last 0 line(s)"), "{name}: {rendered}");
+        }
+
+        // A big log whose newest lines are short is shown, not described.
+        let (rendered, size) =
+            render_service_log_with("service-logs-big", Some(&large_log_with_head_marker()))?;
+        assert!(size.is_some_and(|size| size > bound));
+        assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
+        assert!(!rendered.contains(notice), "{rendered}");
+        Ok(())
+    }
+
+    /// One newline-terminated line longer than the budget a log view reads.
+    fn line_longer_than_the_read_bound() -> Result<Vec<u8>> {
+        let mut bytes = vec![b'x'; usize::try_from(rocm_core::LOG_VIEW_MAX_TAIL_READ)? + 1024];
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    #[test]
+    fn read_optional_tail_lines_names_a_log_it_could_not_show_instead_of_returning_nothing()
+    -> Result<()> {
+        let over = tail_fixture(
+            "services-optional-over",
+            &line_longer_than_the_read_bound()?,
+        )?;
+        let empty = tail_fixture("services-optional-empty", b"")?;
+
+        assert_eq!(
+            read_optional_tail_lines(&over, 5, "CLI action log"),
+            vec![
+                "<no output shown from CLI action log: the newest line is longer than the 4 MiB a log view reads>"
+            ]
+        );
+        // An empty log has nothing to show and stays an empty list.
+        assert!(read_optional_tail_lines(&empty, 5, "CLI action log").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_logs_browser_does_not_call_a_log_with_an_oversized_line_absent() -> Result<()> {
+        let over = line_longer_than_the_read_bound()?;
+        // Each log holds the one oversized line and nothing else, in turn.
+        for (name, relative) in [
+            ("logs-over-action", "logs/cli/probe-action.log"),
+            ("logs-over-screen", "logs/tui/probe-screen.log"),
+        ] {
+            let (root, paths) = test_paths(name);
+            let path = paths.data_dir.join(relative);
+            fs::create_dir_all(path.parent().expect("a log has a directory"))?;
+            fs::write(&path, &over)?;
+
+            let rendered = render_logs_text(&paths);
+            let _ = fs::remove_dir_all(root);
+
+            let label = if relative.contains("cli") {
+                "CLI action log"
+            } else {
+                "screen command log"
+            };
+            assert!(
+                !rendered.contains("No logs found yet."),
+                "{name}: {rendered}"
+            );
+            assert!(
+                rendered.contains("  Lines: 1 of 1 recent line(s)"),
+                "{name}: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "<no output shown from {label}: the newest line is longer than the 4 MiB a log view reads>"
+                )),
+                "{name}: {rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_recent_activity_summary_does_not_call_an_oversized_lifecycle_entry_no_activity()
+    -> Result<()> {
+        let (root, paths) = test_paths("logs-over-lifecycle");
+        let lifecycle = cli_lifecycle_log_path(&paths);
+        fs::create_dir_all(lifecycle.parent().expect("a log has a directory"))?;
+        fs::write(&lifecycle, line_longer_than_the_read_bound()?)?;
+
+        let rendered = render_logs_text(&paths);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(!rendered.contains("no activity yet"), "{rendered}");
+        assert!(
+            rendered.contains("  Lines: 1 of 1 recent line(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Recent activity: none shown; the newest line is longer than the 4 MiB a log view reads"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("No logs found yet."), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_startup_failure_detail_does_not_call_a_log_with_an_oversized_line_empty() -> Result<()> {
+        let over = tail_fixture("startup-detail-over", &line_longer_than_the_read_bound()?)?;
+        let empty = tail_fixture("startup-detail-empty", b"")?;
+
+        let detail =
+            crate::service_launch::managed_engine_startup_failure_detail(" with status 1", &over);
+        assert!(
+            detail.ends_with(
+                "recent startup log output:\n<no output shown from service log: the newest line is longer than the 4 MiB a log view reads>"
+            ),
+            "{detail}"
+        );
+        // A log that really is empty still gets the short form.
+        let detail =
+            crate::service_launch::managed_engine_startup_failure_detail(" with status 1", &empty);
+        assert_eq!(
+            detail,
+            format!(
+                "managed engine exited immediately with status 1; inspect {}",
+                empty.display()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_endpoint_row_says_when_the_endpoint_is_not_responding() {
+        assert_eq!(
+            format_anthropic_endpoint_line("http://127.0.0.1:41000", true),
+            "  anthropic endpoint: http://127.0.0.1:41000"
+        );
+        assert_eq!(
+            format_anthropic_endpoint_line("http://127.0.0.1:41000", false),
+            "  anthropic endpoint: http://127.0.0.1:41000 (not responding)"
+        );
+    }
+
+    #[test]
+    fn services_listing_shows_the_published_anthropic_endpoint_without_probing_a_stopped_service()
+    -> Result<()> {
+        let (_guard, paths) = test_paths("services-anthropic-row");
+        let mut record = crate::tests::plant_service_record(&paths, "svc-anthropic", "stopped", 0)?;
+        record.anthropic_endpoint_url = Some("http://127.0.0.1:1".to_owned());
+        record.anthropic_endpoint_mode = Some("proxy".to_owned());
+        record.write()?;
+
+        let rendered = render_services_text(&paths, true)?;
+
+        assert!(
+            rendered.contains("\n  anthropic endpoint: http://127.0.0.1:1\n"),
+            "{rendered}"
+        );
         Ok(())
     }
 
@@ -1599,5 +3311,25 @@ pub(crate) mod tests {
             "signaled_pids": [],
         }));
         assert_eq!(answer["status"], "stop_unconfirmed", "{answer}");
+    }
+
+    /// The check a stop that could not verify a process tells the user to run
+    /// is a command the host has: `ps` on Linux, `tasklist` on Windows, where a
+    /// Windows record now carries a creation time that can fail to read back.
+    /// The wording is pinned here; that the Windows form shows whether a PID is
+    /// running is what the `service-stop-07` steps rely on, which look a PID up
+    /// with the same `tasklist /FI "PID eq <pid>"` filter.
+    #[test]
+    fn the_process_check_command_is_the_one_the_host_has() {
+        assert_eq!(process_check_command_for(false, 42), "ps -p 42 -o pid,args");
+        assert_eq!(
+            process_check_command_for(true, 42),
+            "tasklist /FI \"PID eq 42\""
+        );
+        assert_eq!(
+            process_check_command(42),
+            process_check_command_for(cfg!(windows), 42),
+            "production picks by the host it runs on"
+        );
     }
 }

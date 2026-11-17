@@ -7,29 +7,29 @@
 //! to (`EngineSelection`, `resolve_engine_selection`,
 //! `validate_engine_selection_runtime`, `single_ready_runtime_key`,
 //! `resolve_runtime_selector_to_exact_key`), small argv-building helpers used
-//! when relaunching a managed engine (`optional_arg`,
-//! `engine_recipe_json_arg`, `parse_engine_recipe_json_arg`,
+//! when relaunching a managed engine (`engine_recipe_json_arg`,
+//! `parse_engine_recipe_json_arg`,
 //! `daemon_run_argv`, `managed_service_launcher_path`), the `ROCM_CLI_*`
 //! environment variables every managed child inherits
-//! (`app_path_env_vars`/`app_path_env_var_values`/`app_path_env_var_refs`/
-//! `apply_app_path_env`), and polling a freshly launched service until it can
+//! (`app_path_env_var_values`/`app_path_env_var_refs`, over
+//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`), and polling a freshly launched service until it can
 //! actually answer inference requests (`wait_for_service_http_ready`,
 //! `wait_for_service_http_ready_with_progress`,
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `http_post_local_service_json`, `service_http_readiness_response_ready`,
 //! `lemonade_health_ready_for_model`, `model_list_ready_for_model`,
-//! `service_model_gpu_ready`, `service_model_reports_rocm_backend`,
+//! `service_model_gpu_ready`, `service_model_reports_gpu_backend`,
 //! `service_model_names_match`).
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-215) of the `main.rs` modularization (see
-//! `docs/architecture.md`). This is the last sub-phase of the `main.rs`
-//! Phase 6f split that lands before the file's single shared
-//! `#[cfg(test)] mod tests` block starts: the function immediately after this
-//! cluster in the original file, `treat_as_natural_language`, is
-//! dispatch-adjacent natural-language-invocation routing left over from an
-//! earlier phase (ROCMAI-87) and stays in `main.rs` on purpose — it is not
-//! part of this module and is not touched by this change.
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`). The cluster ended where the
+//! file's single shared `#[cfg(test)] mod tests` block starts: the function
+//! immediately after it in the original file, `treat_as_natural_language`, is
+//! dispatch-adjacent natural-language-invocation routing that stays in
+//! `main.rs` on purpose — it is not part of this module and is not touched by
+//! this change. Behavior here has changed since the move: a Lemonade router
+//! entry served on Vulkan now counts as ready (`service_model_gpu_ready`), not
+//! only one served on ROCm.
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
 //! instead of moving: `const fn status_for_readiness` sits between
@@ -57,16 +57,14 @@
 //! `resolve_runtime_selector_to_exact_key` is also `pub(crate)`: `engines_cmd.rs`
 //! calls it in production, and `runtimes_cmd.rs`'s own test module calls it
 //! directly too. `single_ready_runtime_key` is called only from
-//! `validate_engine_selection_runtime` in this same module and stays private.
-//! `optional_arg` and
-//! `engine_recipe_json_arg` are `pub(crate)`, read from `engine_ipc.rs`'s
+//! `validate_engine_selection_runtime` in this same module and stays private;
+//! it does not decide which runtime counts as "the one ready runtime" itself,
+//! it asks `runtime_adopt::select_single_ready_runtime`, the rule
+//! `rocm comfyui install` shares.
+//! `engine_recipe_json_arg` is `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
-//! `app_path_env_vars`/`apply_app_path_env` are `pub(crate)`, read from
-//! `engine_ipc.rs`, `app_path_env_vars` is also read from `chat.rs`, and
-//! `apply_app_path_env` is also read from `engines_cmd.rs`,
-//! `service_launch.rs`, and `service_control.rs`'s
-//! `restart_internal_managed_service_with`; `app_path_env_var_values`/
+//! `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
 //! and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
@@ -76,11 +74,11 @@
 //! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
 //! is `pub(crate)`, read from `service_launch.rs`. `http_post_local_service_json`
 //! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
-//! `service_model_names_match` is `pub(crate)`, read from `chat.rs`.
+//! `service_model_names_match` is `pub(crate)`, read from `chat/turn.rs`.
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `service_http_readiness_response_ready`, `lemonade_health_ready_for_model`,
 //! `model_list_ready_for_model`, `service_model_gpu_ready`, and
-//! `service_model_reports_rocm_backend` have no callers outside this module
+//! `service_model_reports_gpu_backend` have no callers outside this module
 //! and stay private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
@@ -92,7 +90,6 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
 
@@ -103,10 +100,8 @@ use rocm_core::{
 };
 use rocm_engine_protocol::EngineRecipeHint;
 
-use crate::runtimes_cmd::{
-    recover_setup_runtime_registration, select_runtime_manifest,
-    validate_runtime_manifest_for_activation,
-};
+use crate::runtime_adopt::{SetupRecovery, SingleReadyRuntime, select_single_ready_runtime};
+use crate::runtimes_cmd::{recover_setup_runtime_registration, select_runtime_manifest};
 use crate::therock;
 
 #[derive(Debug, Clone)]
@@ -211,16 +206,14 @@ pub(crate) fn validate_engine_selection_runtime(
 
 fn single_ready_runtime_key(paths: &AppPaths) -> Result<Option<String>> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
-    recover_setup_runtime_registration(paths, &config)?;
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let ready = manifests
-        .iter()
-        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
-        .collect::<Vec<_>>();
-    Ok(match ready.as_slice() {
-        [manifest] => Some(manifest.runtime_key.clone()),
-        _ => None,
-    })
+    // Zero or several ready runtimes leave the selection open: the caller that
+    // needs a runtime says so in its own words.
+    Ok(
+        match select_single_ready_runtime(paths, &config, SetupRecovery::Persist)? {
+            SingleReadyRuntime::One(manifest) => Some(manifest.runtime_key),
+            SingleReadyRuntime::Zero { .. } | SingleReadyRuntime::Many { .. } => None,
+        },
+    )
 }
 
 pub(crate) fn resolve_runtime_selector_to_exact_key(
@@ -246,13 +239,6 @@ pub(crate) fn resolve_runtime_selector_to_exact_key(
     }
 }
 
-pub(crate) fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
-    match value {
-        Some(value) => vec![flag.to_owned(), value.to_owned()],
-        None => Vec::new(),
-    }
-}
-
 pub(crate) fn engine_recipe_json_arg(
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<Vec<String>> {
@@ -275,20 +261,13 @@ pub(crate) fn parse_engine_recipe_json_arg(
         .transpose()
 }
 
-pub(crate) fn app_path_env_vars(paths: &AppPaths) -> [(&'static str, &Path); 3] {
-    [
-        ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()),
-        ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
-        ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
-    ]
-}
-
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn app_path_env_var_values(
     paths: &AppPaths,
     env_root: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
-    let mut vars = app_path_env_vars(paths)
+    let mut vars = paths
+        .env_vars()
         .into_iter()
         .map(|(key, value)| (key, value.to_path_buf()))
         .collect::<Vec<_>>();
@@ -323,12 +302,6 @@ pub(crate) fn managed_service_launcher_path() -> Result<PathBuf> {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)
-}
-
-pub(crate) fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths) {
-    for (key, value) in app_path_env_vars(paths) {
-        command.env(key, value);
-    }
 }
 
 pub(crate) fn wait_for_service_http_ready(
@@ -524,7 +497,7 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && service_model_reports_rocm_backend(model)
+                name_matches && service_model_reports_gpu_backend(model)
             })
         })
 }
@@ -532,7 +505,7 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
 fn model_list_ready_for_model(
     body: &str,
     canonical_model_id: &str,
-    require_rocm_backend: bool,
+    require_gpu_backend: bool,
 ) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return false;
@@ -546,7 +519,7 @@ fn model_list_ready_for_model(
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && (!require_rocm_backend || service_model_gpu_ready(model))
+                name_matches && (!require_gpu_backend || service_model_gpu_ready(model))
             })
         })
 }
@@ -554,22 +527,26 @@ fn model_list_ready_for_model(
 /// Whether a lemonade `/v1/models` entry is served on GPU. A stock `llama-server`
 /// (direct-serve) entry has no `recipe_options` and is accepted (that path only runs
 /// GPU backends); a Lemonade-router entry carries `recipe_options`, so it must report a
-/// ROCm backend — which keeps a registered-but-unloaded model (empty `recipe_options`)
+/// GPU backend (ROCm or Vulkan) — which keeps a registered-but-unloaded model (empty `recipe_options`)
 /// from reading as ready.
 fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
     match model.get("recipe_options") {
         None => true,
-        Some(_) => service_model_reports_rocm_backend(model),
+        Some(_) => service_model_reports_gpu_backend(model),
     }
 }
 
-fn service_model_reports_rocm_backend(model: &serde_json::Value) -> bool {
+fn service_model_reports_gpu_backend(model: &serde_json::Value) -> bool {
     model
         .get("recipe_options")
         .and_then(|options| options.get("llamacpp_backend"))
         .or_else(|| model.get("llamacpp_backend"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|backend| backend.trim().to_ascii_lowercase().starts_with("rocm"))
+        .is_some_and(|backend| {
+            // The GPU backends the engine can select (ROCm, else Vulkan); never `cpu`.
+            let backend = backend.trim().to_ascii_lowercase();
+            backend.starts_with("rocm") || backend.starts_with("vulkan")
+        })
 }
 
 /// Whether two model names refer to the same model, leniently.
@@ -611,6 +588,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::runtime_registry::validate_runtime_manifest_for_activation;
     use crate::status_for_readiness;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{test_app_paths, test_paths};
@@ -751,6 +729,49 @@ mod tests {
             &registered,
             "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
         ));
+    }
+
+    #[test]
+    fn lemonade_router_readiness_accepts_any_gpu_backend_the_engine_selects() {
+        // The engine selects ROCm first and Vulkan otherwise, and records either as
+        // `backend_requested`; a router-served model on a Vulkan host must read as
+        // ready on both probe paths. CPU (or no backend) must never read as ready.
+        for (backend, ready) in [
+            ("rocm", true),
+            ("rocm-stable", true),
+            ("vulkan", true),
+            ("Vulkan", true),
+            ("cpu", false),
+            ("", false),
+        ] {
+            let health = json!({
+                "all_models_loaded": [{
+                    "model_name": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            let models = json!({
+                "data": [{
+                    "id": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            for (path, body) in [("/v1/health", &health), ("/v1/models", &models)] {
+                assert_eq!(
+                    service_http_readiness_response_ready(
+                        "lemonade",
+                        path,
+                        200,
+                        body,
+                        "Qwen3-0.6B-GGUF"
+                    ),
+                    ready,
+                    "{path} with backend `{backend}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -923,16 +944,6 @@ mod tests {
     }
 
     #[test]
-    fn app_path_env_vars_include_config_data_and_cache() {
-        let paths = test_app_paths();
-        let vars = app_path_env_vars(&paths);
-
-        assert_eq!(vars[0], ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()));
-        assert_eq!(vars[1], ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()));
-        assert_eq!(vars[2], ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()));
-    }
-
-    #[test]
     fn app_path_env_var_values_include_engine_env_root_when_needed() {
         let paths = test_app_paths();
         let engine_root = PathBuf::from("D:/rocm-data/runtime/engines");
@@ -1046,6 +1057,139 @@ mod tests {
         assert!(selection.env_id.is_none());
         assert!(selection.source.is_none());
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Zero ready runtimes, the registry empty: the engine path answers with no
+    /// selection rather than an error, and writes nothing. The caller reports
+    /// the missing runtime in its own words (`engines_cmd.rs` and `serve_cmd.rs`).
+    #[test]
+    fn engine_selection_with_no_registered_runtime_stays_unselected_and_writes_nothing()
+    -> Result<()> {
+        let (root, paths) = test_paths("no-registered-runtime-selection");
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
+        )?;
+
+        assert!(selection.runtime_id.is_none());
+        assert!(selection.env_id.is_none());
+        assert!(selection.source.is_none());
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            Vec::<String>::new()
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Zero ready runtimes, one registered but unusable: still no selection.
+    /// Readiness is `validate_runtime_manifest_for_activation`, so a runtime
+    /// whose interpreter is gone does not count, and it is not picked as "the
+    /// only one" either.
+    #[test]
+    fn engine_selection_does_not_count_an_unusable_runtime_as_ready() -> Result<()> {
+        let (root, paths) = test_paths("unusable-runtime-selection");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+        let python = manifest
+            .python_executable
+            .as_deref()
+            .expect("the fixture records an interpreter");
+        std::fs::remove_file(python)?;
+        assert!(validate_runtime_manifest_for_activation(&manifest).is_err());
+
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
+        )?;
+
+        assert!(selection.runtime_id.is_none());
+        assert!(selection.source.is_none());
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The setup-recovery half of the rule: a ready runtime that only
+    /// `recover_setup_runtime_registration` can make visible is found by the
+    /// engine path, and finding it re-files its registry entry, so the message
+    /// and the state are one fact (the selection names a key that
+    /// `rocm runtimes list` now shows).
+    #[test]
+    fn engine_selection_recovers_the_setup_runtime_the_registry_lost() -> Result<()> {
+        let (root, paths) = test_paths("setup-recovery-selection");
+        let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            Vec::<String>::new(),
+            "the registry must start without the runtime for this test to mean anything"
+        );
+
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
+        )?;
+
+        assert_eq!(
+            selection.runtime_id.as_deref(),
+            Some(manifest.runtime_key.as_str())
+        );
+        assert_eq!(selection.source.as_deref(), Some("single_ready_runtime"));
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", manifest.runtime_key)]
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Recovering the setup runtime writes its registry entry, and a registry
+    /// that cannot take it is reported as that on every path that recovers:
+    /// an explicit `--runtime-id` and the one-ready-runtime default (which
+    /// `serve` and `engines install` both reach). Neither may answer as if there
+    /// were no runtime, or carry on without one: the runtime is there, and the
+    /// failure is what stops the command. The error and the registry are
+    /// asserted together.
+    #[test]
+    fn engine_selection_reports_a_registry_that_cannot_take_the_setup_runtime_back() -> Result<()> {
+        for explicit in [true, false] {
+            let (root, paths) = test_paths("setup-recovery-unwritable-registry");
+            let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                &paths,
+                "release-pip-gfx120x-all-7-14-0",
+            )?;
+            let registry = crate::test_support::make_runtime_registry_unwritable(&paths)?;
+            let runtime_id = explicit.then_some(manifest.runtime_key.as_str());
+
+            let error = validate_engine_selection_runtime(
+                &paths,
+                resolve_engine_selection(&RocmCliConfig::load(&paths)?, "vllm", runtime_id, None),
+            )
+            .expect_err("a registry that cannot be written cannot take the entry back");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!(
+                    "failed to restore setup runtime `{}`",
+                    manifest.runtime_key
+                )),
+                "explicit: {explicit}, got: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&registry)?,
+                "not a directory",
+                "explicit: {explicit}: a failed restore leaves the registry as it was"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
         Ok(())
     }
 }
