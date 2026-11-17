@@ -210,6 +210,17 @@ Understand existing patterns first:
 - sibling implementations in `apps/`, `crates/`, and `engines/`
 - existing tests and conventions in `docs/testing.md`
 
+Read the project's goals in the [Manifesto](README.md#manifesto) section of
+`README.md` before planning a change. Where the approach a request or ticket
+asks for would work against one of them (a manual workaround step, a build
+installed for a GPU it was not built for), raise the conflict with the user
+before implementing it. Where nobody can be asked, implement nothing that
+conflicts, do the rest only where it stands on its own, and name the conflict
+in the final report. The request states one need, and the goals are what the
+project has decided to trade other needs against. The goals only govern
+choices this file leaves open; every rule elsewhere in it, such as §6's ban on
+silent CPU fallback, still binds whatever the user answers.
+
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
