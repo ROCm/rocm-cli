@@ -116,7 +116,8 @@ pub struct ScenarioDecl {
     pub requires_wsl: bool,
     /// `@requires-oom-fault-injection`: the scenario drives the test-only
     /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
-    /// to fabricate a GPU-less OOM launch, so it can only run against a binary
+    /// to fabricate a GPU-less launch (one that OOMs, or one that becomes ready
+    /// and then fails its smoke test), so it can only run against a binary
     /// compiled with that feature. `xtask e2e` builds it in when it builds the
     /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
     /// test a prebuilt shipping release binary that has the hook compiled out —
@@ -175,7 +176,7 @@ pub struct ScenarioDecl {
     /// on-demand runs and only runs in the merge queue, which opts in via
     /// `E2E_MERGE_QUEUE`. Keeps the PR feedback loop short while still exercising
     /// the heavy serves before a change lands. Only the Windows Strix and WSL2
-    /// lanes run in the merge queue; the native Linux GPU lanes (MI300X, W7900,
+    /// lanes run in the merge queue; the native Linux GPU lanes (MI300X,
     /// Strix Ubuntu) do not.
     pub merge_queue: bool,
 }

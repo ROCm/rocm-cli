@@ -61,6 +61,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("therock_next_generation.feature", "therock-next"),
     ("uninstall.feature", "uninstall"),
     ("update.feature", "update"),
+    ("vllm_tensorizer.feature", "vllm-tensorizer"),
 ];
 
 fn features_dir() -> PathBuf {

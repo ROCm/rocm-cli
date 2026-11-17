@@ -262,3 +262,69 @@ Feature: Runtime lifecycle state machine
     And the server is still counted as left on the first runtime
     And the switch to the second runtime was kept
     And the server record still names the first runtime
+
+  # ROCm 10 is published in its own layout, beside the canonical one the CLI
+  # installed from before. A runtime installed from it records that layout, and
+  # its key carries a fingerprint of the exact packages it was built from; a
+  # runtime installed before that layout existed has no top-level
+  # `source_layout_generation` or `devel` field: it records its layout and
+  # toolchain only inside `wheel_composition`. Both kinds stay installed side by
+  # side, so the CLI has to keep reading the older record as it was written while
+  # it lists, switches between and removes the newer ones. These scenarios plant
+  # three managed runtimes as an install would leave them — a registry entry, the
+  # same record inside the runtime's own folder, and stub files where the
+  # readiness check looks — without downloading anything. Every command runs
+  # with the startup update check disabled, since it would otherwise ask the
+  # package index about the planted runtimes. The Windows release lane in CI
+  # selects them by id, so they run on both supported platforms.
+  @id:runtime-lifecycle-side-by-side-across-packaging-change
+  Scenario: runtime-lifecycle-19 - Runtimes installed before and after the ROCm 10 layout are used side by side
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    When the user lists the installed runtimes
+    Then all three runtimes are listed as ready, each under its own key
+    When the user activates each of the three runtimes in turn
+    Then each one becomes the runtime in use in turn
+    And none of the three runtimes' install records was rewritten
+
+  @id:runtime-lifecycle-side-by-side-uninstall-keeps-the-others
+  Scenario: runtime-lifecycle-20 - Uninstalling one side-by-side runtime leaves the others usable
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    And the nightly runtime is in use after the ROCm 10 release runtime
+    When the user uninstalls the ROCm 10 release runtime
+    Then that runtime's folder and record are gone
+    And the other two runtimes keep their folders and unchanged records
+    And the nightly runtime is still in use, with no rollback target left
+    When the user uninstalls the runtime in use
+    Then no runtime is in use
+    When the user activates the ROCm 7 runtime
+    Then the ROCm 7 runtime is the runtime in use
+
+  # The ROCm 7 and ROCm 10 release runtimes share a name: the runtime id is
+  # derived from the channel and GPU family alone. Picking either silently could
+  # put the user on the wrong ROCm major version.
+  @id:runtime-lifecycle-side-by-side-shared-name-refused
+  Scenario: runtime-lifecycle-21 - A name shared by side-by-side runtimes is refused with each runtime named
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    When the user activates a runtime by the name the two release runtimes share
+    Then the CLI refuses and names both release runtimes
+    And no runtime is in use
+
+  # The install report names a runtime's channel, package source, source layout
+  # and exact GPU target; afterwards only its manifest still knows them. The
+  # listing reads them back and says when one was never recorded rather than
+  # inferring it — the older runtime's family is itself an exact target, so a
+  # guess would look like a recorded value. An adopted runtime installed
+  # nothing, so it has no package source; its manifest holds only the marker
+  # adoption writes in place of one, in the on-disk form earlier releases wrote,
+  # and the listing must not show that marker as a source. The planted manifests
+  # need no SDK download or GPU, so this runs on the mock lane.
+  @id:runtime-lifecycle-list-names-runtime-provenance
+  Scenario: runtime-lifecycle-22 - Listing runtimes says which stream, source and GPU each runtime was installed from
+    Given a registered nightly runtime installed for one exact GPU
+    And a registered runtime installed before its source layout and GPU target were recorded
+    And a registered runtime adopted from an environment ROCm CLI did not install
+    When the user lists the registered runtimes
+    Then the nightly runtime's listing names its channel, package source, source layout and exact GPU target
+    And its version shows its build date
+    And the older runtime's listing says which of those facts were not recorded instead of guessing
+    And the adopted runtime's listing says it has no recorded package source

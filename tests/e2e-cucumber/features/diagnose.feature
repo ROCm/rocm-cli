@@ -527,11 +527,20 @@ Feature: Diagnosing failures and listing fixes
   # already knows, and a copy can go stale silently. This is the machine-readable
   # form that replaces the copying — what a tool reads instead of parsing the
   # listing meant for people.
+  #
+  # A meaning is only worth publishing if it is true, so the last two steps run
+  # the CLI and hold the published text to what it does. Exit 2 is the one code
+  # with two causes: a fix-id the catalog does not have, and a command line the
+  # argument parser rejects before any fix-id is looked up. They share the code
+  # on purpose (a code of its own would change what existing readers of 2
+  # receive), so the catalog has to say so and say how to tell them apart.
   @id:diagnose-fix-catalog-is-machine-readable
-  Scenario: diagnose-34 - A tool can read the catalog without parsing prose
+  Scenario: diagnose-34 - A tool can read the catalog without parsing prose, and the shared exit code 2 can be told apart
     When a tool asks the CLI for its catalog in machine-readable form
     Then the catalog names every entry and what the CLI does with each
     And it gives the meaning of every exit code the CLI can return
+    And asking for a fix it does not offer exits with the code the catalog describes for that
+    And a malformed command line exits with that same code, as the catalog warns, and is told apart by its message
 
   # `--json` describes the whole catalog, so pairing it with one entry is a
   # question with no answer. Refusing beats ignoring the flag: a caller that
@@ -606,7 +615,7 @@ Feature: Diagnosing failures and listing fixes
   # `ps_env_scope`'s doc comment names -- "PowerShell missing") rather than
   # faking the read failing, so the abort this proves is a real one, not a
   # simulated one, and it never touches the real User PATH at all, so no
-  # capture/restore is needed here. diagnose-63 and diagnose-64 hold fix-2 and
+  # capture/restore is needed here. diagnose-69 and diagnose-70 hold fix-2 and
   # fix-9 to the same rule.
   @id:diagnose-fix-path-aborts-on-unreadable-user-path @requires-os:windows
   Scenario: diagnose-39 - A fix-6-path run that cannot read the real User PATH aborts instead of wiping it
@@ -921,6 +930,79 @@ Feature: Diagnosing failures and listing fixes
     Then each is refused as a usage error that names the file and says why
     And nothing is diagnosed
 
+  # A diagnosis scores the catalog from two sources at once: what the examined
+  # host shows, and the error the user pasted. A finding about the host can
+  # outrank the entry the paste added to, so the ranking alone does not say
+  # which entries the paste contributed to, and a tool reading the result needs
+  # that said per entry. "Contributed" is all it says: any keyword hit counts,
+  # however weak, so it is not a verdict that the entry explains the error. The
+  # misconfiguration is an unneeded GPU override in the environment the CLI
+  # examines, which every lane reads the same way, so this holds on Linux,
+  # Windows and WSL alike. The paste is an ISA error, which no host state scores
+  # on its own and which names nothing the override entry reads, so the two
+  # answers cannot depend on the runner.
+  @id:diagnose-json-says-which-causes-the-paste-contributed-to
+  Scenario: diagnose-62 - A tool can tell which causes the pasted error contributed to
+    Given a machine with a known misconfiguration in its environment
+    And a pasted error that describes a different failure
+    When the user asks for a diagnosis with that paste, in machine-readable form
+    Then the paste is reported as not contributing to the misconfiguration on the machine
+    And the paste is reported as contributing to the cause it describes
+
+  # The same answer, for a person. Only the cause the paste did not contribute
+  # to is marked, and the mark appears only because the paste contributed to
+  # something else in the same report.
+  @id:diagnose-text-marks-causes-the-paste-did-not-contribute-to
+  Scenario: diagnose-63 - The human-readable diagnosis marks a cause the pasted error did not contribute to
+    Given a machine with a known misconfiguration in its environment
+    And a pasted error that describes a different failure
+    When the user asks for a diagnosis with that paste
+    Then the misconfiguration on the machine is marked as found from the host alone
+    And the cause the pasted error describes carries no such mark
+
+  # With nothing pasted, nothing in a paste contributed to anything. A tool is
+  # still told so on every entry rather than the answer being left out, because
+  # a missing answer is what a CLI too old to give one prints. A person is told
+  # nothing: the mark would sit on every cause and say nothing. The host is the
+  # one diagnose-62 uses, so at least one cause is listed on every lane, and
+  # both forms are asserted against it.
+  @id:diagnose-without-a-paste-credits-no-cause-to-one
+  Scenario: diagnose-64 - Without a pasted error no cause is credited to one, and none is marked
+    Given a machine with a known misconfiguration in its environment
+    When the user asks for a diagnosis without pasting an error, in machine-readable form
+    Then every listed cause is reported as not contributed to by a paste
+    When the user asks for a diagnosis without pasting an error
+    Then no listed cause is marked as found from the host alone
+
+  # fix-4's verify line was kept in two copies, and only the one `rocm diagnose`
+  # printed listed `/dev/kfd`, so `rocm fix` told the user to check less than the
+  # diagnosis did. Both now print one line. Like diagnose-43 to -45 this sees
+  # `rocm fix <id> --dry-run`, which prints the plan before the platform gate, so
+  # it runs on every lane. That `rocm diagnose` prints the same line is held by a
+  # unit test, because the diagnosis only fires on a Linux host.
+  @id:diagnose-render-group-verify-line-shows-who-owns-the-gpu-device
+  Scenario: diagnose-65 - The verify line printed for the render-group fix shows who owns the GPU compute device
+    Given a user who has chosen the fix for a missing render group
+    When the user previews that fix without applying it
+    Then the printed verify line checks the user belongs to the group that owns the GPU compute device, and shows that group
+
+  # fix-8 compares the framework's ROCm version with the system's at X.Y, the
+  # granularity PyTorch's wheel indexes are published at, but its titles said
+  # "major". Text only; the comparison itself is unit tested.
+  @id:diagnose-wheel-mismatch-fix-names-the-release-it-compares
+  Scenario: diagnose-66 - The fix for a mismatched framework wheel names the part of the version it compares
+    Given a user who has chosen the fix for a framework wheel built for another ROCm release
+    When the user previews that fix without applying it
+    Then the printed title names the X.Y release, not the major version
+
+  # diagnose-66 sees the `rocm fix` plan; this is the other copy, the cause that
+  # `rocm diagnose` prints. The library-load error in the report raises it on
+  # its own, so it is listed on every lane whatever ROCm the runner has.
+  @id:diagnose-wheel-mismatch-cause-names-the-release-it-compares
+  Scenario: diagnose-67 - Diagnosing a failed load of the ROCm runtime library names the release the framework and the system must share
+    When the user diagnoses this machine with a ROCm runtime library load failure
+    Then the wheel mismatch cause and its plan name the X.Y release, not the major version
+
   # The sibling of diagnose-15 the reported bug was about: the helper command
   # never finishes. The CLI stops it at the fix's one-minute bound, but it can
   # only stop the command it started (`sudo`), so the change may still have
@@ -931,7 +1013,7 @@ Feature: Diagnosing failures and listing fixes
   # test-only way to shorten it, on purpose, so the bound under test is the one
   # users get. Same lane as diagnose-15, for the same reasons.
   @id:diagnose-fix-command-timeout-says-change-may-be-partial @requires-os:linux @requires-bare-metal
-  Scenario: diagnose-62 - A fix whose helper command never finishes says the change may be partial and how to check it
+  Scenario: diagnose-68 - A fix whose helper command never finishes says the change may be partial and how to check it
     Given a user who has approved a fix whose helper command never finishes
     When the user asks the CLI to apply the approved fix
     Then the CLI reports on stderr, with exit code 4, that the helper was stopped after a minute, how to check the change and which fix to re-run
@@ -946,7 +1028,7 @@ Feature: Diagnosing failures and listing fixes
   # and fix-2 would find nothing to clear, so the runner's User environment is
   # never written.
   @id:diagnose-fix-override-aborts-on-unreadable-user-scope @requires-os:windows
-  Scenario: diagnose-63 - Clearing the GPU override stops when the saved value cannot be read, instead of calling it gone
+  Scenario: diagnose-69 - Clearing the GPU override stops when the saved value cannot be read, instead of calling it gone
     Given a Windows host where PowerShell cannot be found
     And a user who has chosen the fix for the GPU override
     When the user asks the CLI to apply the approved fix
@@ -965,7 +1047,7 @@ Feature: Diagnosing failures and listing fixes
   # fix/runners.rs (`pin_device_read_timeout_stops_before_setx`,
   # `a_read_that_exits_non_zero_stops_every_windows_fix_without_writing`).
   @id:diagnose-fix-igpu-aborts-on-unreadable-user-scope @requires-os:windows
-  Scenario: diagnose-64 - A dry run of the discrete-GPU pin that cannot read the saved device setting stops with exit code 4 and previews no change
+  Scenario: diagnose-70 - A dry run of the discrete-GPU pin that cannot read the saved device setting stops with exit code 4 and previews no change
     Given a Windows host where PowerShell cannot be found
     And a user who has chosen the fix that hides the integrated GPU
     When the user previews that fix for the second GPU

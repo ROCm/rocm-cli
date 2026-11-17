@@ -686,6 +686,193 @@ behaviour wanted, so un-ignoring it is the fix's acceptance test.
 A gap in user-observable CLI behaviour that an e2e scenario covers is tracked
 with an xfail row in `tests/e2e-cucumber/expectations.toml` instead.
 
+## Lemonade serving and dashboard regressions
+
+The real GPU scenarios `serve-lemonade-inference` and
+`serve-hf-checkpoint-inference` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
+start Lemonade, request inference, and verify the model identity. The named-model
+case uses `Qwen3-0.6B-GGUF`; the checkpoint case uses
+`unsloth/Qwen3-0.6B-GGUF:Q4_0`. Both require a usable AMD GPU. Unit tests cover
+registered-name catalog resolution, conservative routing of multi-file and
+model-specific catalog entries, routing of a registered checkpoint that is not
+a plain `owner/repo:variant` (for example, variant `*`) to the router,
+quantization matching, and selection of the
+runtime's GPU backend when competing backend directories exist. Engine tests also
+verify persisted router identity through the health inference request; direct
+servers retain the exact requested alias.
+
+`serve-lemonade-complex-registered-inference` covers the pinned catalog's
+`Qwen3.5-0.8B-GGUF` entry, which also needs a projector file. It verifies router
+state, real inference for that model, and stopping the scenario-owned managed
+service on its isolated port. The `@requires-gpu` and
+`@requires-engine:lemonade` tags require a usable AMD GPU on a Lemonade lane.
+Its `@nightly` tag also requires `E2E_INCLUDE_NIGHTLY=1`, or the self-hosted
+workflow's `include_nightly` dispatch input. A runtime channel named `nightly`
+does not enable these scenarios by itself.
+
+`serve-lemonade-simple-registered-direct-route` is the Linux counterpart for a
+simple registered entry (`Qwen3-0.6B-GGUF`: one checkpoint with a variant, no extra
+files). It reads the engine state and asserts that `load_response.method` is
+`lemonade-packaged-llama-server` and that the `llama-server` that served belongs to
+the backend Lemonade selected (a stale directory of the other backend serving in its
+place fails it), so a change of route is caught even when the endpoint still answers. It also runs
+inference and stops the scenario-owned service. It needs a usable AMD GPU on a
+Lemonade Linux lane (`@requires-gpu`, `@requires-os:linux`,
+`@requires-engine:lemonade`). It has no flaky expectations row, so a route
+regression fails the lane. Of the other direct-route serves, `serve-07` keeps its
+flaky Linux row; `serve-08` has none, so it fails the lane too.
+
+The daemon's Lemonade contracts in
+[telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
+hold observation time during singleton-to-multiple-model transitions. The first
+multi-model snapshot must clear both the rate and its observation metadata;
+natural expiry cannot satisfy that assertion. Independent endpoints must overlap
+while each endpoint checks health before fetching stats. Health failures include
+endpoint context, and an unavailable external endpoint removes its rows without
+a grace period. A never-seen endpoint remains quiet when nothing answers,
+which means a refused connection or a timeout (Windows hangs on a closed local
+port instead of refusing). A never-seen endpoint that answers with an error
+status or a broken body warns.
+
+The dashboard scenarios in
+[dash.feature](../tests/e2e-cucumber/features/dash.feature) include:
+
+- `dash-lemonade-external-protocol-discovery`: a Lemonade protocol fixture on an
+  isolated non-default port, with multiple loaded models and no managed records.
+  The real CLI, embedded daemon, and TUI must discover it, show unknown
+  throughput for each model, report installation truthfully, and exclude it from
+  Services lifecycle targets. Pressing stop and restart must leave no approval
+  prompt and start no job, and the models stay displayed. Twice, after those
+  keys and after dashboard quit, one step asserts that no managed record exists
+  and that the fixture saw no request other than a `GET` of its health or stats
+  route. The fixture is an in-process thread, so the dashboard cannot stop it;
+  the request log is what catches a load, unload, or stop sent to the external
+  server.
+- `dash-lemonade-external-protocol-transitions`: loaded-model changes and endpoint
+  unavailability must update the dashboard, rather than retain false serving
+  claims. One remaining model shows its throughput, an empty or unreachable
+  server shows no models, and a reload restores both.
+- `dash-lemonade-managed-inference-journey`: a GPU-gated real Lemonade serve and
+  inference followed by dashboard observation. On Linux Lemonade hosts it is
+  expected to be flaky and its serve is bounded by `serve_timeout_secs` (readiness polling; the CLI process is killed only 300 s after that) in
+  [expectations.toml](../tests/e2e-cucumber/expectations.toml). The model must
+  appear as a full row in Observe, and its instance detail must show it READY
+  on the port it was served on. This is real engine acceptance;
+  the protocol fixtures do not prove GPU inference or engine installation.
+  The flaky row matches every lane that can run this scenario, so the whole
+  journey is advisory: its dashboard, instance detail, and post-quit inference
+  checks cannot block a merge. Only the serve step is intermittent, but
+  expectations apply per scenario. It also does not gate the
+  "Lemonade — managed runtime installed" wording.
+  Unit tests gate that wording instead:
+  `managed_installed_verdict_follows_detect_result` in
+  [dash.rs](../apps/rocm/src/dash.rs), and the engine pane glyph and verdict
+  tests in [pane.rs](../crates/rocm-dash-tui/src/ui/tabs/pane.rs). No other
+  scenario shows the installed state through a real Detect without a serve.
+  `dash-lemonade-external-protocol-discovery` and
+  `dash-lemonade-external-protocol-transitions` show only the not-installed
+  state.
+
+`dash-07` also covers the positive half of the ownership rule. With a live
+managed service, the Services overlay lists it with its port, and the stop key
+stages an approval prompt that names it. The scenario declines the prompt, so
+nothing is stopped.
+
+The isolated dashboard scenarios turn Lemonade discovery off unless a scenario
+sets it, so a Lemonade server running on the default port of a self-hosted
+runner cannot add rows or warnings. The two external protocol scenarios turn it
+on with their own host and port. None of them exercises the unset-key default,
+which a unit test in `apps/rocm` covers.
+
+`runtime-lemonade-backend-alignment-reported` tests the advice the direct
+serving error gives for a missing `llama-server`, `rocm engines install lemonade
+--reinstall`. It installs Lemonade, deletes the selected backend's `llama-server`
+(asserting it was there and is gone), reinstalls, and requires the file to be
+back. It needs a GPU and a real backend download, and it is tagged
+`@requires-os:windows` and `@nightly`, so it runs only on the Windows nightly GPU
+lane. The Linux direct route, where the direct serving error mostly fires, is not
+exercised by it. Only the selected backend's binary is deleted; a general
+damaged-runtime repair is not tested.
+
+`dash-lemonade-external-protocol-transitions` also requires the `last req tok/s`
+legend next to the single remaining model's rate. The Instances table and detail
+labels are covered by `table_labels_a_last_request_rate_and_only_then` in
+[instances.rs](../crates/rocm-dash-tui/src/ui/tabs/instances.rs) and
+`detail_names_a_last_request_rate` in
+[instance_detail.rs](../crates/rocm-dash-tui/src/ui/instance_detail.rs). That such a rate
+is not counted as live throughput is covered by unit tests:
+`node_efficiency_leaves_out_a_last_request_rate` in
+[efficiency.rs](../crates/rocm-dash-core/src/efficiency.rs),
+`home_heroes_leave_out_a_last_request_rate` in
+[home.rs](../crates/rocm-dash-tui/src/ui/tabs/home.rs),
+`observe_heroes_leave_out_a_last_request_rate` in
+[observe.rs](../crates/rocm-dash-tui/src/ui/tabs/observe.rs) and
+`instance_tools_carry_the_last_request_flag` in
+[snapshot.rs](../crates/rocm-dash-tui/src/agent/snapshot.rs).
+The daemon's two IPv6 contract tests in
+[telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs) fail
+when the machine cannot bind an IPv6 loopback address, since they are the only cover
+for the `::` to `::1` mapping; set `ROCM_TEST_NO_IPV6=1` on a machine that has none,
+and they report that they did not run.
+
+A direct llama-server serve on a non-ROCm GPU backend logs that Lemonade is
+serving on it only after the server is ready. `a_direct_serve_that_never_becomes_ready_does_not_log_that_it_is_serving`
+and the `NotReady` case of `direct_server_step_failure_stops_the_child_and_marks_state_failed`
+in [direct_llama.rs](../engines/lemonade/src/direct_llama.rs) assert the log and the failed
+state together; both are Linux-only unit tests.
+
+A known external Lemonade endpoint that starts answering 401 or 403 on a
+scrape-only tick is reported on that tick, not at the next discovery tick
+(`lemonade_scrape_only_tick_warns_when_a_known_external_endpoint_requires_credentials`
+in [telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)).
+
+Resolving a split (sharded) GGUF to its first shard, and preferring a complete set
+over an older partial download, have no Gherkin scenario. They need a real
+multi-shard checkpoint (several GiB) or a staged Lemonade runtime that the harness
+cannot fabricate. The unit tests in
+[direct_llama.rs](../engines/lemonade/src/direct_llama.rs) cover them
+(`parse_gguf_shard`, `first_shard_of_complete_set`, `is_incomplete_shard_set`).
+
+The Linux fallback from a failed Lemonade router load to direct serving has no
+Gherkin scenario: forcing the router to reject a model needs a real `lemond`
+failure that no safe, deterministic e2e hook produces. Unit tests in
+[lib.rs](../engines/lemonade/src/lib.rs) and
+[router_serve.rs](../engines/lemonade/src/router_serve.rs) cover it, asserting the
+result and the state together: `router_load_failure_falls_back_to_the_selected_gpu_llama_server`
+(llama-server arguments, final state, and the logged line naming the backend and
+saying it is not ROCm), `only_a_router_load_failure_may_fall_back_and_only_on_linux`,
+`fallback_never_serves_through_a_missing_or_cpu_backend`, and
+`only_a_load_or_verification_failure_is_eligible_for_direct_fallback`. The
+`serve-lemonade-complex-registered-inference` scenario remains the real-hardware
+check of the router route.
+
+Unit tests in `rocm-dash-tui` cover the dashboard side of these scenarios. A
+Services selection that outlives its row is clamped. A staged approval whose
+target disappears is dropped, and the next key is handled as a normal key. The
+engine pane shows the check or dot glyph for installed and not-installed
+status. The `rocm dash --help` test asserts that Lemonade discovery is scoped to
+Linux and WSL.
+
+Run the ordinary applicability-aware suite with `cargo xtask e2e`. For focused
+protocol regression development on Linux or WSL:
+
+```bash
+cargo xtask e2e -- -n 'External Lemonade protocol'
+```
+
+Cucumber name filtering bypasses the harness's custom applicability/expectation
+filter. Use it only for scenarios applicable to the local host. Do not force
+GPU-gated scenarios through a name filter on a GPU-less machine. Run the real
+serving journeys through the normal GPU lane selection.
+
+A green local unit or protocol-fixture run does not clear the existing flaky
+Linux serving expectations in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml). Removing one requires
+verification of that same real serving scenario on suitable hardware. Report
+GPU checks that could not run, and do not treat an installed version or a startup
+message as proof that inference works.
+
 ## Coverage floors
 
 Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
@@ -1041,8 +1228,9 @@ an earlier ROCm 7 release because an unpinned install now reads the newest layou
 A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later, a
 nightly built since 2026-08-23, or any install with no pin, which now reads that
 layout) is held to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
-is the one step that chooses the `torch` and `torchvision` versions (the CLI
-picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+is the one step that chooses the `torch` and `torchvision` versions within the
+series the vLLM discover table pairs for that line (the CLI picks the ROCm
+version, the torchaudio pin and that series bound), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
 previous install left) and, with none, stops before that step. It then prints
 what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
@@ -1483,9 +1671,9 @@ the tagging and that they stay reachable when the opt-in is set.
 
 Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
 logs whether Docker is reachable ("Report whether Docker is reachable").
-`serve-27`'s known failure on the Strix Halo pool is an xfail row in
-`expectations.toml`, tracked in rocm-cli#1058; a pass there is an XPASS, which
-means the row is stale.
+`serve-27` failed to confirm the AIM stop on the Strix Halo pool (rocm-cli#1058)
+and passed on the 2026-11-15 and 2026-11-16 nightlies, so it runs expect-pass
+there with no row in `expectations.toml`.
 
 ### Lemonade managed-serve failure evidence
 
@@ -1600,6 +1788,63 @@ List registered managed or read-only runtimes and their exact side-by-side keys:
 rocm runtimes list
 ```
 
+Each runtime's row is followed by its `install_root:` and a `provenance:` line
+naming the `channel`, the package `source` (the wheel index, or the downloaded
+archive for a tarball install), the `source_layout_generation` and the exact
+`device_target` its manifest recorded, for example:
+
+```text
+      provenance: channel=nightly source=<wheel-index-url> source_layout_generation=next-v1 device_target=gfx1201
+```
+
+The values are the ones the manifest recorded: the package index, else the
+artifact URL (never the marker an adopted runtime keeps there); the layout
+field, else the wheel composition's; the recorded target, else the
+`device-<target>` extra in the package specs. For the layout and target this
+chooses the same recorded field `rocm update` uses, through the same accessors;
+`rocm update` then uses the value as recorded, while the listing trims it and
+prints a blank one as `unrecorded`. Each step moves on only when a field is
+absent, so a blank field is not skipped in favour of the next one, and a fact
+recorded nowhere also prints `unrecorded`. Nothing is guessed from other
+facts: a family-wide or tarball install shows `device_target=unrecorded` rather
+than a target guessed from its family, and a runtime registered with
+`rocm runtimes adopt` shows `source=unrecorded`. The chains, their precedence,
+the blank and trimming rules are pinned by
+`runtime_list_reads_each_provenance_fact_from_where_it_was_recorded`; blank or
+padded values are not what `rocm install sdk` writes, but can come from a
+hand-edited manifest or one brought in with `rocm runtimes import`. An adopted
+runtime's channel is the one adoption recorded: the channel `--channel` or
+`--runtime-id` named, `release` when neither names one. All three paths
+(neither flag, `--channel nightly`, and `--runtime-id therock-nightly:<family>`
+with no `--channel`) are pinned by
+`adopted_runtime_lists_its_channel_and_its_source_as_unrecorded` in
+[runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs). The marker adoption
+writes in place of an artifact URL is persisted manifest format. Code in the
+crate refers to it only through its constant, so two checks pin the literal
+value: `adoption_marker_keeps_its_persisted_value` in
+[runtime_registry.rs](../apps/rocm/src/runtime_registry.rs), and
+`runtime-lifecycle-22` (below), which plants it in an adopted runtime's
+manifest.
+`rocm examine` prints the same four facts for the active runtime as
+`active_runtime_channel`, `active_runtime_source`,
+`active_runtime_source_layout_generation` and `active_runtime_device_target`,
+from the same fields. The unit tests
+`runtime_list_names_where_each_runtime_came_from` and
+`examine_names_the_active_runtime_provenance_the_listing_shows` in
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pin the values, the
+latter for an active nightly runtime and an active adopted one;
+`@id:runtime-lifecycle-list-names-runtime-provenance` (`runtime-lifecycle-22`)
+checks the listing end to end with a planted nightly runtime, an older one
+that recorded neither its layout nor an exact target, and an adopted one whose
+manifest holds the adoption marker as earlier releases wrote it, which must
+list `source=unrecorded`; and
+`@id:examine-reports-where-the-active-runtime-came-from` (`examine-54`) checks
+the `examine` lines. Both plant read-only manifests and run on the mock lane:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-22 |examine-54 '
+```
+
 Activate one validated runtime:
 
 ```bash
@@ -1655,6 +1900,17 @@ and still takes the first case-insensitive match, and `config set-default-runtim
 and `config set-engine --runtime-id` store a selector without resolving it. For
 `runtimes activate`, `@id:runtime-lifecycle-case-twin-selector-refused` also
 checks that nothing became active and that naming one key exactly then works.
+
+Runtimes installed before and after the ROCm 10 layout stay usable side by
+side: `@id:runtime-lifecycle-side-by-side-across-packaging-change` lists and
+activates a ROCm 7 runtime, a ROCm 10 release runtime and a ROCm 10 nightly
+runtime without rewriting their install records,
+`@id:runtime-lifecycle-side-by-side-uninstall-keeps-the-others` uninstalls one
+and checks the others keep their folders and records, and
+`@id:runtime-lifecycle-side-by-side-shared-name-refused` checks that the runtime
+id the two release runtimes share is refused with both keys named.
+Uninstalling a runtime that is the rollback target clears it as the rollback
+target in both the config and the active-runtime marker.
 
 Developer-only previous-runtime regression check:
 
@@ -1742,6 +1998,43 @@ cargo test -p rocm --bin rocm extra_env
 cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
+
+## vLLM Tensorizer Check
+
+vLLM's wheel pins a tensorizer release that cannot be imported under Python 3.14,
+and `rocm engines install vllm` checks that it imports and upgrades it when it
+does not (see [vllm.md](vllm.md)). The `vllm-tensorizer-NN` E2E scenarios
+([vllm_tensorizer.feature](../tests/e2e-cucumber/features/vllm_tensorizer.feature);
+gated only on `@requires-os:linux`, with no GPU, network or nightly tag, so the
+Linux e2e jobs run them) run that command against a planted managed runtime
+whose Python cannot import the pinned tensorizer. They check the upgrade
+warning, `dependency_check: expected_divergence`, the note's tensorizer release
+and the release the runtime ends up holding in the same scenario; that a second
+install neither upgrades again nor reinstalls vLLM; that an upgrade which does
+not help warns with the `KeyError` shown when this run did not install vLLM and
+refuses, saying the install ran, when it did (`--reinstall`); that a coloured traceback and a
+`PYTHONPATH` only the server's launch environment provides are judged correctly;
+that a missing library, or a non-library exception raised below tensorizer, is
+left alone; that an upgrade which cannot be fetched warns when this run did not
+install vLLM but fails when it did (a first install or `--reinstall`; a repair takes
+the same path); and
+that repairing a genuine violation beside the upgraded tensorizer clears it and
+upgrades tensorizer again. Unit tests in [install.rs](../engines/vllm/src/install.rs) and
+[repair.rs](../engines/vllm/src/repair.rs) cover the classification (with Unix and Windows paths), the probe
+command, the probe and upgrade timeouts and the repair decision
+(`cargo test -p rocm-engine-vllm -- install::tests repair::tests`, which also
+runs the other tests of those two modules; a `tensorizer` name filter would miss
+the probe-command, timeout and hung-child tests). The shared rule that decides what
+counts as vLLM's own unmet tensorizer pin is tested in `rocm-core`
+(`cargo test -p rocm-core tensorizer_override`), and its use in the dependency
+check report in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs)
+(`cargo test -p rocm --bin rocm runtime_install_finalize`).
+To run just these locally: `cargo xtask e2e -- -n 'vllm-tensorizer'`. The `-n` form
+selects by scenario name and bypasses the harness's own gating, so it needs a Linux
+host for these scenarios.
+The scenarios are Linux only; the real Python 3.14 import is only exercised by
+hand ([manual-testing.md](manual-testing.md#6c-the-tensorizer-upgrade-on-python-314)).
 
 ## Lemonade Installs On Disk
 
@@ -2062,15 +2355,35 @@ on a non-default `--host` is still required: automatic selection only probes
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
 credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
-variable, or let one be generated. The key is handed to the engine via a 0600
-key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
-which is unavailable on headless serving hosts), and printed once as client
+variable, or let one be generated. The key is handed to the engine via a key
+file (never argv), persisted as a per-service file (not the OS keychain, which
+is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
-audit log. Verifying that the running server actually *rejects* an
-unauthenticated request requires a live engine; that end-to-end assertion is a
-deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
-(`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
-generation, the 0600 key file, and key-file resolution.
+audit log. Only the serving user can read the key file: it is mode 0600 on Unix
+and has a protected DACL granting only that user on Windows, and every store
+replaces it with a freshly created owner-only file, so permissions loosened in
+place do not survive a re-store. Verifying that the running server actually
+*rejects* an unauthenticated request requires a live engine; that end-to-end
+assertion is a deferred follow-up and is **not yet** exercised by the GPU
+acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
+key policy, generation, the owner-only key file (including one whose
+permissions were loosened before a re-store, and on the Windows build job the
+DACL read back from disk), and key-file resolution. The tests that fail
+without the repair of a loosened key file are `restoring_a_key_over_a_loosened_file_makes_it_0600_again`
+in [`endpoint_keys.rs`](../apps/rocm/src/endpoint_keys.rs), `write_owner_only_file_atomically_tightens_a_loosened_file`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), and on Windows
+`write_owner_only_file_atomically_replaces_a_loose_dacl_with_an_owner_only_one`
+in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), which starts from a destination whose DACL grants Everyone. `serve-59` (`@id:serve-endpoint-key-readable-by-owner-only`
+in [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature))
+guards fresh-create behaviour only: it checks that a real serve's newly
+written key file is mode 0600 on the Linux GPU lanes, which held before this
+repair too, so it is a guard against a regression in that path, not evidence
+for the repair.
+
+```bash
+cargo test -p rocm-core --lib owner_only
+cargo test -p rocm --bin rocm endpoint_keys
+```
 
 The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
@@ -2096,15 +2409,29 @@ service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being
-deleted, so keeping its key would strand a 0600 secret belonging to a service
-that can no longer be restarted. Neither will touch a record the liveness
+deleted, so keeping its key would strand an owner-only secret belonging to a service
+that can no longer be restarted. They also delete any copy of the key a save
+killed part-way left beside it (`<id>.endpoint-key.tmp-<pid>-<millis>-<n>`):
+`remove` with its record, and `prune` with its record or, when the record is
+already gone, as a leftover under the same age rule. That copy is recognised
+only by the exact name the shared atomic writer gives it, so another service's
+key whose id happens to contain `.tmp-` is never taken for one. Neither will touch a record the liveness
 refresh still reads as running, and `prune` re-checks liveness immediately
 before each delete — but the check and the delete are not atomic, so that
 narrows the race against a concurrent `restart` rather than eliminating it.
-`features/service_record_cleanup.feature` covers both commands on the mock lane,
-asserting on the files left on disk rather than on the summary line the command
-prints — the defect they exist to fix is a file being left behind, which a
-summary claiming success cannot reveal.
+`features/service_record_cleanup.feature` covers both commands on the mock lane.
+Its scenarios assert mainly on the files left on disk, because the defect they
+exist to fix is a file being left behind, which a summary claiming success
+cannot reveal; where they read the output it is for what the user must be
+told, such as the log path before a removal. `service-cleanup-01` plants an
+interrupted-save key copy beside a record and checks `remove` deletes it and
+counts it in `files removed:`; `service-cleanup-03` plants one for the record
+`prune` removes and checks it goes with that record, and one for a record
+already deleted by hand and checks `prune` previews and sweeps it. The unit
+test `services_prune_takes_a_pruned_records_staged_endpoint_key` in
+[service_records.rs](../apps/rocm/src/service_records.rs) covers the first of
+those too, and its neighbours there cover the age rule and what the sweep
+leaves alone.
 
 Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
 and `rocm logs --service`) reads the record through one loader,
@@ -2120,7 +2447,7 @@ error names to confirm it works and does not list the id.
 
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
-writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
+writes the owner-only endpoint key before it writes the record, and `--any-age` leaves
 no age rule to hide that window behind. `serve` already holds the shared
 managed-launch lock across both writes, so `prune` acquires the same lock before
 it reads the directory.
@@ -2177,7 +2504,7 @@ so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
 reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
 closed** on that exact combination (public bind + `--engine lemonade` + Windows)
 and directs the user to `--engine vllm` or a loopback host. vLLM (all platforms,
-via `VLLM_API_KEY`), the packaged llama-server fallback (via `--api-key-file`),
+via `VLLM_API_KEY`), direct llama-server serving (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
@@ -2916,6 +3243,34 @@ catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 ([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
+fix-4 has one verify line, not two: the catalog recipe and the `Fix` that
+`rocm diagnose` builds both read `RENDER_GROUP_VERIFY` in
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs), so the two cannot
+drift apart again. `the_render_group_fix_verify_matches_the_catalog_copy` in
+[linux.rs](../crates/rocm-core/src/diagnose/linux.rs) keeps either side from
+going back to its own copy, and `diagnose-65` asserts the line that
+`rocm fix fix-4-render-group --dry-run` prints. The line passes when the user
+is in the group that owns `/dev/kfd` (read with `stat -c %G`), or in `render`
+or `video`, and `/dev/kfd` exists; the diagnosis tells the user to join the
+owning group, which need not be `render`. It checks membership, not the
+device's mode, and not `rocminfo`, whose status `head` hides.
+`the_render_group_verify_accepts_the_group_that_owns_kfd` in the same file runs
+it in `/bin/sh` with stand-in tools on Unix hosts: a member of a third owning
+group passes, and a user in none of the groups fails, also when `stat` fails or
+names no group. `diagnose-66` asserts that fix-8's title names the
+`X.Y` release, which is what `check_8_wheel_rocm_mismatch` compares
+(`the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). Both run on every lane,
+because the plan prints before the platform gate. `diagnose-67` asserts the
+other copy, the fix-8 cause `rocm diagnose` prints: its title and plan name the
+`X.Y` release and neither says "major". The scenario carries no platform tag:
+its symptom scores 75 from keywords alone (`libamdhip64.so` 50, the loader
+failure 25), above the match threshold of 50, and `check_8_wheel_rocm_mismatch`
+is registered for Linux, Windows and WSL and only adds to that score.
+`a_library_load_error_alone_raises_the_wheel_mismatch_on_every_family` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs) holds that for all three
+families.
+
 When a fix's own command does not succeed, `rocm fix` exits 4 and prints one
 line on stderr, built from how the command ended
 (`Step` in [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs)):
@@ -2930,18 +3285,18 @@ Each row for each runner is unit-tested with an injected command runner in
 [fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) and
 [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs), on every host. The
 scenarios in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
-run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-62`
+run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-68`
 (it never finishes) stand a fake `sudo` on a restricted `PATH` that records the
 arguments it was given, and assert the line together with the exit code, that
 the helper was asked to add the user to the groups, and that the success line is
-absent. Both are `@requires-os:linux @requires-bare-metal`. `diagnose-62`
+absent. Both are `@requires-os:linux @requires-bare-metal`. `diagnose-68`
 waits out the real one-minute bound; there is no switch to shorten it. The step
 waits for the CLI on a blocking thread (`run_rocm_with_scenario_env_off_executor`
 in [e2e.rs](../tests/e2e-cucumber/tests/e2e.rs)): the whole suite is polled on
 one thread, so a synchronous wait would stall every concurrent scenario for that
 minute and push the TUI scenarios past their wall-clock caps.
 
-On Windows, `diagnose-39` (fix-6), `diagnose-63` (fix-2) and `diagnose-64`
+On Windows, `diagnose-39` (fix-6), `diagnose-69` (fix-2) and `diagnose-70`
 (fix-9 with `--device-index 1`, run as a `--dry-run`) give the CLI an empty
 `PATH`, so its PowerShell read cannot start. They assert exit 4 and the
 read-failure line, and that the runner went no further: no `Plan: ...` preview
@@ -2953,7 +3308,7 @@ name in the CLI's own directory, System32 and the Windows directory before
 System32 subdirectory) is not. None of the three can write the runner's real
 User environment even if the read guard regressed: fix-6 writes through
 PowerShell, which cannot start; fix-2 would read both scopes as unset and find
-nothing to clear, so it never reaches its `setx`; and `diagnose-64` is a dry
+nothing to clear, so it never reaches its `setx`; and `diagnose-70` is a dry
 run, which never runs `setx`. The fix-9 path that does write is held by the unit
 tests. These three run only on the self-hosted Strix Halo Windows lanes, neither
 of which is a required check: `E2E tests (Strix Halo, Windows, <sdk>)`
@@ -2971,7 +3326,7 @@ by the unit tests. To run the two Linux scenarios on a bare-metal Linux host
 instead):
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-15|diagnose-62) '
+cargo xtask e2e -- -n '(diagnose-15|diagnose-68) '
 ```
 
 Provider audit focused test:
@@ -3124,11 +3479,13 @@ The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 `rocm serve qwen-small` with no `--engine`, which must reach `ready` and answer.
 It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
-is whichever GPU lane defaults to Lemonade (the Strix Halo and W7900 lanes) and
-the vLLM half falls to the Instinct lane. Those lanes do run on pull requests
-([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
-path filter matches) but none of their check names is a required status check,
-so the two unit tests above are the blocking per-PR coverage. The scenario
+is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
+the queue nightly only) and the vLLM half falls to the Instinct lane. Of all
+these lanes only MI300X and the Strix Halo Windows and WSL2 lanes run on pull
+requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
+the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
+on the queue nightly), and none of their check names is a required status
+check, so the two unit tests above are the blocking per-PR coverage. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
 unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
 their known serve failure there has not been observed, and a row claiming a
@@ -3326,6 +3683,15 @@ python scripts/nightly_canary.py --self-test
 What the scheduled canary checks, who is told and how to rerun it are in
 [ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
 
+The vLLM route check (advisory) has a self-test of the same kind:
+
+```bash
+python scripts/vllm_route_check.py --self-test
+```
+
+What it checks and why it is not a required check are in
+[ci-hardware-testing.md](ci-hardware-testing.md#vllm-route-check-advisory).
+
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
 as a whole string — so a change to its quoting, spacing or field order fails
 the test rather than slipping past a substring assertion — and then runs that
@@ -3479,30 +3845,41 @@ needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios and the native-Windows vLLM refusal scenarios
-`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
-comma-separated list of `@id`s:
+scenarios, the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35`, and the side-by-side runtime scenarios
+`runtime-lifecycle-19`/`runtime-lifecycle-20`/`runtime-lifecycle-21` (none of
+them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,runtime-lifecycle-side-by-side-across-packaging-change,runtime-lifecycle-side-by-side-uninstall-keeps-the-others,runtime-lifecycle-side-by-side-shared-name-refused"
 cargo xtask e2e
 ```
 
-These three were made hermetic and Windows-portable without being tagged
-`@lifecycle` — they're ComfyUI install scenarios, not release packaging/
-install/uninstall ones, and tagging them `@lifecycle` would drop them out of
-the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`, neither of
-which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them into this
-lane instead, so this is the one required lane that guarantees Windows
-coverage for them; the self-hosted Windows lane that otherwise runs them is
-optional.
+All nine are hermetic (planted fixture binaries or runtimes, no GPU, no
+network) and Windows-portable without being tagged `@lifecycle` — they are
+ComfyUI install, vLLM refusal and runtime-selection scenarios, not release
+packaging/install/uninstall ones, and tagging them `@lifecycle` would drop
+them out of the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`,
+neither of which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them
+into this lane instead, so this is the one required lane that guarantees
+Windows coverage for them; the self-hosted Windows lane that otherwise runs
+them is optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; assert the installer's get-started block (banner art
-only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+sidecars before activation. On Linux, with no public key supplied and no
+signature asked for, an install of a specific version with
+`ROCM_CLI_REQUIRE_SIGNATURE=0` still rejects an archive signed with a local key,
+which the pinned release key does not accept (lifecycle-36), and a release
+install with the variable unset still rejects an archive with no `.sig`
+(lifecycle-37). The missing-`.sig` case with nothing asked for is covered on
+the `release` channel only. Both scenarios are Linux-only: on Windows, the
+same default path (no key supplied, no signature asked for) has no scenario,
+and lifecycle-17 covers a no-key install only with the requirement set. The
+scenarios also assert the installer's get-started block (banner art only on a
+UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
 piped or `NO_COLOR` output (the colored TTY branch is not driven by any
 scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
@@ -3519,9 +3896,11 @@ the installer's record, and the running Windows `rocm.exe` removed. The two
 Windows scenarios that change the user `PATH` are `@serial`, since it is one
 registry value for the whole machine.
 Each scenario generates its own local keys, package, and install root under a
-per-scenario temp directory, so they are independent and use generated local
-keys only — project-owned production signing keys remain an owner-controlled
-release step.
+per-scenario temp directory, so they are independent and sign with generated
+local keys only. No scenario holds the production private key, which is an
+owner-controlled release secret; lifecycle-03 and lifecycle-36 (Linux) and
+lifecycle-17 (Windows) use the pinned production public key only to show that it
+rejects a locally signed archive.
 
 If the host does not have `libcap-dev` or `libssl-dev`, run
 `bash scripts/setup-wsl-portable-build-deps.sh` first: it downloads the Ubuntu
@@ -3553,6 +3932,23 @@ cargo test -p rocmd restart_runs_supervise_on_the_rocmd_it_is_given
 cargo test -p rocmd restart_without_a_rocmd_to_run_changes_nothing
 cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
 cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
+cargo test -p rocmd supervise_terminates_the_engine_when_recording_its_pid_fails
+cargo test -p rocmd supervise_terminates_the_engine_when_recording_ready_fails
+cargo test -p rocmd supervise_empties_a_log_left_by_an_earlier_run
+cargo test -p rocmd an_engine_child_dropped_before_its_wait_is_terminated_and_reaped
+cargo test -p rocmd an_engine_child_that_was_waited_for_is_not_signalled_on_drop
+cargo test -p rocmd terminate_recovery_supervisor_kills_and_reaps_the_child_and_its_tree
+cargo test -p rocmd a_termination_that_leaves_the_child_alive_neither_blocks_nor_stays_silent
+cargo test -p rocmd a_termination_that_stops_the_child_reaps_it_and_reports_nothing
+cargo test -p rocmd a_termination_with_unconfirmed_descendants_reaps_the_child_and_says_so
+cargo test -p rocmd an_unconfirmed_termination_still_reaps_a_child_that_already_exited
+cargo test -p rocmd a_failed_wait_leaves_the_engine_guard_armed
+cargo test -p rocmd a_dropped_engine_guard_logs_a_termination_it_could_not_confirm
+cargo test -p rocmd a_dropped_engine_guard_reports_to_stderr_by_default
+cargo test -p rocmd a_report_that_cannot_be_written_does_not_panic
+cargo test -p rocmd restart_reports_a_supervisor_it_could_not_confirm_stopped_in_its_error
+cargo test -p rocmd restart_hands_the_supervisor_its_service_log_as_stderr
+cargo test -p rocmd supervise_engine_output_does_not_overwrite_lines_appended_to_its_log
 cargo test -p rocmd engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd
 cargo test -p rocmd engine_request_without_a_rocm_beside_rocmd_names_it
 cargo test -p rocm-core sibling_binary_path_from
@@ -3937,7 +4333,8 @@ whether a scenario may run at all (see the comment at
 a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
-name on that route. Note also that `-n` matches the scenario *name*
+name on that route, nor any other `@requires-oom-fault-injection` scenario
+(`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
@@ -3948,14 +4345,16 @@ passing an id to it silently selects nothing.
 
 ### The OOM fault-injection capability
 
-serve-41 needs a managed launch that really failed on VRAM, which a GPU-less CI
+The `@id:serve-oom-launch-memory-guidance` scenario needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
-log it owns, and never became ready. No process is spawned, and the seam
-compiles out entirely without the feature, so a build that does not enable it
-behaves exactly as the shipped binary does.
+log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
+ready, so a mock engine can then fail its smoke test. No process is spawned, and
+the seam compiles out entirely without the feature, so a build that does not
+enable it behaves exactly as the shipped binary does.
 
 Only `cargo xtask e2e` enables it, by building the binary under test with
 `--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and it is the
@@ -3968,7 +4367,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-41 to a reported **skip**, not a silent pass. It
+compiled out and resolves both of those scenarios to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -3978,10 +4377,98 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-41 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
-the scenario carries `@requires-os:linux`. On the GPU lanes it is
+both scenarios are never selected there at all: that lane runs
+`E2E_ONLY_LIFECYCLE` and the scenarios carry `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
+
+## Serve Smoke Test Failure
+
+After a fresh launch becomes ready, the `rocm serve` interactive summary sends
+one small chat request. When that request cannot complete the summary is headed
+`Deployment summary (smoke test failed)`, shows the status as
+`started, smoke test failed` instead of `ready`, and a hedged note gives the
+reason and names `rocm logs --service <id>`. See
+[the README](../README.md#model-serving) for the user-facing contract. The
+launch itself stays best-effort: exit code and service record do not change, and
+`--no-smoke-test` and an already-running service are unchanged.
+
+What is detected, and what is not:
+
+- Detected (the summary says the smoke test failed): a transport error or timeout,
+  an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
+  stream cut short.
+- Not detected (no failure is reported and the status reads `ready`): an engine
+  error sent as a `data:` payload inside a `200` stream; a `200` answer with no
+  `data:` line at all (HTML, plain JSON, an empty body); a close-delimited stream
+  cut after a token; and a complete stream with no `content` token, which is
+  deliberately not a failure (a reasoning model can spend its whole small budget
+  first, as the readiness probe also allows for). The metric rows read `n/a` when
+  no content token arrived first; tokens that did arrive (the close-delimited cut,
+  or an in-band `data:` error after content) are measured.
+- Known limitation: the reason shown is whatever the provider call reported, and
+  some of its errors are not the engine's, for example the `/v1/models` re-list
+  before the request ("no ready managed service"), an unreadable services-directory
+  entry, a rejected endpoint URL, and the audit event written after the stream is
+  consumed. Each turns into a failed smoke test, which is why the note says the
+  smoke test could not complete and only that the server may not be able to serve
+  requests.
+- Known limitation: the smoke request is routed by model name, not to the launched
+  service. The newest ready service serving the model is used, so normally the one
+  just launched. If the new service fails the 2 s `/v1/models` listing probe (for
+  example the engine was killed just as it became ready) it is filtered out: an
+  older ready service with the same model then answers, and the summary shows
+  `ready` with that service's metrics and no note, a false pass on a dead launch.
+  With no older service the reason shown is rocm's "no ready managed service", not
+  the engine's.
+
+Focused unit coverage:
+
+```bash
+cargo test -p rocm --bin rocm serve_smoke_test
+cargo test -p rocm --bin rocm a_failed_smoke_test_is_not_presented_as_ready_and_says_why
+cargo test -p rocm --bin rocm a_passing_or_skipped_smoke_test_adds_no_failure_note
+cargo test -p rocm --bin rocm an_already_running_summary_ignores_a_smoke_failure
+cargo test -p rocm --bin rocm failure_reason_
+cargo test -p rocm --bin rocm the_commands_the_failure_note_names_exist_and_parse
+```
+
+The `serve_smoke_test` tests in [providers.rs](../apps/rocm/src/providers.rs)
+run the real smoke test against a local mock engine over a socket (an engine that
+dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, a
+complete stream with no content, a close-delimited stream cut after a token). Only
+the mid-stream-death test goes on to render the summary from the real outcome; the
+others assert on the outcome the smoke test returns.
+
+- `@id:serve-smoke-failure-summary` (serve-60) — a launch that becomes ready
+  whose engine fails its first chat request is shown as a failed smoke test, with
+  the engine's own reason and the full `rocm logs --service <id>` command, and
+  the engine received exactly one chat request. It carries `@requires-no-gpu`,
+  `@requires-os:linux` and `@requires-oom-fault-injection`: it uses the same
+  test-only hook as `@id:serve-oom-launch-memory-guidance` (see [Serve OOM Guidance](#serve-oom-guidance)) in its
+  `ready` mode, a ready record pointing at a mock engine whose chat requests all
+  fail with HTTP 500, so it has that scenario's gates: against a prebuilt
+  `ROCM_CLI_BINARY` the hook is compiled out and the harness reports it as a skip,
+  unless it is selected with `-n` or `--tags`, which bypasses that skip and makes
+  it fail for the wrong reason. Some of its steps are not checks of the fix, so say
+  plainly what they prove:
+  - The exit code 0 is asserted in the `When` step (`wait_for_exit`), not in a
+    `Then` step.
+  - "the engine received exactly one chat request" passes with the fix reverted
+    (the smoke request was already sent); it shows the request was not retried.
+  - "the engine's own reason" matches rocm's wording of the status line around the
+    engine's HTTP status, so it pins that phrasing as well.
+  - "the launch's service record is left as ready" passes with the fix reverted;
+    it is the only assertion behind the "ROCm CLI does not stop the server"
+    promise in the README and `rocm serve --help`.
+  - "no background automation daemon was left behind" is hygiene only: it records
+    that no daemon was started but does not discriminate the
+    `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs`, because no watcher is
+    enabled in the isolated config and the helper starts only when one is.
+
+```bash
+cargo xtask e2e -- -n "serve-60"
+```
 
 ## Windows Tool Notes
 
@@ -4232,7 +4719,7 @@ the probe finds.
 
 `examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
 library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
-own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
+own `$ORIGIN` search path, so `driver_status` is `wsl_rocdxg_ready` with neither the
 cache nor the variable involved, which is the layout of a TheRock tarball
 (ROCM-30386). Its control is `examine-33`, which plants the library alone and
 stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
@@ -4248,6 +4735,20 @@ RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-48 '
+```
+
+`examine-49` to `examine-53` cover the managed-runtime `librocdxg` finding on WSL (see [wsl.md](wsl.md)). `examine-49` to `examine-51` and `examine-53` plant the WSL machine of `examine-32` (`examine-52` plants a host that is not WSL) plus a managed wheel runtime in the registry whose library directory holds `libhsa-runtime64.so.1` and `librocdxg.so.1`.
+
+`examine-49` has no `librocdxg.so` beside them, so `rocm examine --json` lists that `librocdxg.so.1` in `summary.unlinked_runtime_librocdxg` while `driver_status` stays `wsl_rocdxg_ready`. `examine-50` is the control: the same runtime with `librocdxg.so` present, and nothing is listed. `examine-51` reads the text form, runs the `ln -sfn` command its `wsl_runtime_librocdxg` line advises, and inspects again, so the advice is shown to exist, to clear the finding and to make `librocdxg.so` read as the runtime's own copy. `examine-53` plants a dangling `librocdxg.so` (a link to a missing file) beside the runtime's copy: the inspection lists it, the user runs the advised command (`ln -sfn`, since a plain `ln -s` fails with "File exists" on a dangling link), and a second inspection lists nothing and `librocdxg.so` reads as the runtime's own bytes. `examine-52` is the same runtime on a machine that is not WSL, where nothing is listed. Each run sets `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, because a registered runtime would otherwise start the update check, which needs the network and prints ahead of the JSON.
+
+The install side (`rocm install sdk` linking the name on WSL) has no scenario, because it needs a real wheel download; the helper unit tests in [runtime_rocdxg.rs](../crates/rocm-core/src/runtime_rocdxg.rs) cover it against a temporary directory: the link is made and resolves to the runtime's copy, nothing happens off WSL, a refused link is reported with its error and the manual command, a dangling `librocdxg.so` is replaced atomically (no temporary link left; also after an injected rename failure, where removal is the real one), and a name that vanished between the check and the re-check is linked, and a `librocdxg.so` that resolves when it is checked, a file or a working link, is left alone (the name is re-checked before the rename: still dangling or gone, the temporary is renamed into place; resolving by then, it is refused. A name that becomes a working link between the re-check and the rename is replaced; the re-check narrows that window and cannot close it, and its length is not measured). The versioned copy decides whether a directory is listed or linked at all: a file or a resolving link is, and an absent, dangling or looping one is not, through examine's scan as well as the installer. That the report links only the probe's library directories is asserted by `the_install_report_links_only_the_probes_library_directories_when_wsl` in [therock.rs](../apps/rocm/src/therock.rs), not by those helper tests, which take a bare directory list.
+
+The entry point the install calls reads the WSL gate itself, and `the_install_entry_point_reads_the_wsl_gate_from_the_host` drives it on a simulated WSL host and a simulated native one through `ROCM_CLI_TEST_HOST_ROOT`; it runs only with the hooks feature, so run it with `cargo test -p rocm-core --lib --features e2e-test-hooks -- runtime_rocdxg`.
+
+Deleting the call in `install_wheel_runtime` is caught by the dead-code lint under `cargo clippy --workspace --all-targets -- -D warnings` (the required lint job), not by a test: with the call removed, clippy reports `function report_runtime_librocdxg_link is never used` (and the two helpers only it uses), while `cargo test -p rocm --bin rocm therock::` stays green with one warning. A wrong gate or directory list passed through the one-line wrapper is covered by the tests of the shared helpers (`the_install_report_links_only_the_probes_library_directories_when_wsl`, driven with the gate true and false on every Unix host, and the hooks-lane test of the real gate), but a different list passed to the core entry from inside the wrapper is not caught by any test. A possible follow-up, not done here: the gated `runtime-01` scenario (`@requires-gpu @nightly`) could assert the `librocdxg.so` link after its real install when it runs on WSL. The scenarios run on the Linux lanes and need no GPU.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-(49|50|51|52|53) '
 ```
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
@@ -4526,7 +5027,17 @@ hold the behaviour end to end, GPU or not:
   pipe), so nothing in it can run by construction; the scenario asserts the
   diagnosis, not the absence of something no shell could do. The paste is
   ASCII: Windows PowerShell 5.1 pipes text as ASCII, which is why the docs
-  send PowerShell users through a file instead.
+  send PowerShell users through a file instead. The cmd.exe and Windows
+  PowerShell runs need a Windows host, so in CI they run only on the
+  self-hosted Strix Halo Windows lanes: `e2e-gpu-strix-windows` in
+  [e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) (on pull
+  requests that touch the serve paths, on pushes to `main` and `release/**`,
+  and in the merge queue) and the scheduled
+  `e2e-gpu-nightly-strix-windows` in
+  [nightly.yml](../.github/workflows/nightly.yml). Neither is a required
+  check. The required `E2E tests` job in [ci.yml](../.github/workflows/ci.yml)
+  runs only the bash half, on Linux, and ci.yml's Windows lane does not run
+  this scenario.
 - `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
   scenario here; the Windows key is checked by hand in
   [manual-testing.md](manual-testing.md) section 13) runs
@@ -4547,6 +5058,41 @@ top of that feature file: they compare two routes on the same host.
 
 ```bash
 cargo xtask e2e -- -n 'diagnose-(59|60|61) '
+```
+
+### Which causes the pasted error contributed to
+
+Every entry in `rocm diagnose --json`'s `matched` carries `symptom_matched`:
+`true` when the symptom text (from `--symptom` or `--symptom-file`)
+contributed to its score or evidence, `false` when it came from the examined
+host's state alone, and `false` on every entry when no symptom was given. Any
+keyword hit counts, however weak, so the field records a contribution, not that
+the entry explains the error.
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs) decides it by running the
+catalog a second time with no symptom and comparing each entry with its
+counterpart (`contributed`: absent, a different score, or different evidence),
+so no checker sets it by hand. The text report prints a `source: the examined
+host's state alone` line under each shown entry the text did not contribute to,
+once the text contributed to any entry in the report, including one cut off by
+`--top`. The rules are pinned by unit tests in diagnose.rs,
+[report.rs](../crates/rocm-core/src/diagnose/report.rs) and, for the same line
+under `rocm remote doctor`, [doctor.rs](../apps/rocm/src/remote/doctor.rs):
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/credited|contribution_is_any|symptom|carries_the_note|says_so_in_the_text|past_top|before_the_field/)'
+cargo nextest run -p rocm -E 'test(the_symptom_note_is_true_of_a_remote_host)'
+```
+
+`diagnose-62` (JSON), `diagnose-63` (text) and `diagnose-64` (no symptom, both
+forms) in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+cover it on every lane. They set an unneeded `HSA_OVERRIDE_GFX_VERSION` on the
+CLI. The first two also paste an ISA error, so the override entry must read
+`false` and the ISA entry `true` whatever the runner's own state; the third
+pastes nothing, so every entry must read `false` and no line is printed. To run
+only those three without bypassing the harness's gates:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
 ```
 
 ## Model Fit Preflight
@@ -4936,6 +5482,41 @@ it is the one to pass on. The text output names the files it could not read, and
 report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
+
+## Fix Catalog Exit Codes
+
+`rocm fix --json` publishes each exit code twice over: `exit_codes` maps a name
+to its number and `exit_code_descriptions` maps the same name to what it means.
+Both are built from one table, `exit::MEANINGS` in
+[options.rs](../crates/rocm-core/src/fix/options.rs), so a code cannot be named
+without being described. The descriptions are an added field, so
+`contract_version` did not move.
+
+Exit 2 has two causes, and the `unknown_id` description says so: a fix-id the
+catalog does not have, and a command line the argument parser rejects before
+any fix-id is looked up. They are told apart by the message (a stderr line
+starting `Unknown fix-id:` against one starting `error:`), never by the code.
+The claim is about a line, not the start of stderr, because `run()` can print a
+one-time `rocm:` notice before either refusal. Each half of that claim is
+checked where it lives:
+
+- `the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`,
+  `every_published_exit_code_is_described_once` and
+  `every_exit_constant_is_published_and_nothing_else_is` in
+  [manifest.rs](../crates/rocm-core/src/fix/manifest.rs) hold the text and the
+  table, and the table to the `exit::` constants.
+- `a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id` in
+  [main.rs](../apps/rocm/src/main.rs) parses malformed `rocm fix` command lines
+  with the real `clap` definition and checks they exit with the published
+  `unknown_id` code and have a line starting `error:`.
+- `diagnose-34` (`@id:diagnose-fix-catalog-is-machine-readable`) runs the binary:
+  it reads the catalog, then runs `rocm fix` with an unknown fix-id and with an
+  unknown option, and checks each exits with the code the catalog publishes and
+  prints the message the description names. It has no tags, so every lane runs it.
+
+The other five descriptions are claims about the runners. The comment above each
+entry in `exit::MEANINGS` names the unit tests that prove it, and the branches
+no test drives (a command that exits non-zero, a missing tool or install).
 
 ## Doctor Skill Eval Replays
 

@@ -139,14 +139,18 @@ passes — the GPU is AMD or no vendor was named.
 1. **Diagnose.** If the user named no GPU vendor, run `rocm examine --json`
    first. Status `no-amd-gpu` means the CLI found no AMD GPU. On WSL2 the status
    is `wsl` whatever the GPU, so read `has_amd_gpu` there: false means the same.
-   Either way, say so, ask which GPU the machine has, and propose no fix until
-   that is settled. That result alone does not prove the GPU is not AMD: a
+   Either way, say so and ask which GPU the machine has, as an open question:
+   "is it AMD?" invites a yes. End the reply on the question, with no
+   `rocm diagnose` run and no fix offered in it, because a diagnosis or plan
+   shown beside the question is a fix proposed before the question is settled.
+   That result alone does not prove the GPU is not AMD: a
    container without GPU passthrough, or the very failure being diagnosed, can
    hide it. If the user confirms AMD or cannot say, continue with `rocm diagnose`
-   below, which only reads; if the answer is NVIDIA, Intel or Apple, the scope
-   gate declines. Any other result: go on. If `rocm examine` itself fails (it
-   exits 0 whenever it ran, so a non-zero exit is an error from the CLI), relay
-   the error text and stop, as the contract check does.
+   below, which only reads, in the reply after the one that asked; if the
+   answer is NVIDIA, Intel or Apple, the scope gate declines. Any other result:
+   go on in the same reply. If `rocm examine` itself fails (it exits 0 whenever it ran, so a
+   non-zero exit is an error from the CLI), relay the error text and stop, as
+   the contract check does.
 
    Pass the user's error text as the symptom:
 

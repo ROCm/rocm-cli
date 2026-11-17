@@ -1307,8 +1307,10 @@ mod tests {
             "opted out, all four are the user's: {opted_out:?}"
         );
 
-        // Not opted out, only torch is ever an intended divergence: the siblings
-        // are real violations, because rocm-cli realigns torch and nothing else.
+        // Not opted out, torch is the only intended divergence of the torch stack:
+        // its siblings are real violations, because rocm-cli realigns torch and
+        // nothing else of that stack. (vLLM's own unmet tensorizer pin is judged
+        // separately, by what is installed; this fixture has no such line.)
         let aligned = classify_dependency_details(
             details,
             &diverged_packages(retained_diverged_package(&kept), false),

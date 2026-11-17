@@ -50,6 +50,15 @@ Feature: Runtime configuration
   # It reads the block's verdict rather than one string, because a torch that has
   # already run a GPU kernel with this SDK is kept instead of rewritten and reports
   # a `retained_*` verdict — settled, with nothing installed.
+  # On a ROCm 10.x runtime the vLLM install pins torch itself and the engine's own
+  # metadata declares none, so the verdict is `not_applicable (vllm does not pin
+  # torch)`; the step accepts it only after asking the runtime's interpreter that
+  # the installed vLLM really requires no torch.
+  # Nothing compared a pin there, and the device check only proves torch can run a
+  # kernel, so the same step also imports torch, torchvision, vLLM and its compiled
+  # extensions in the runtime: a reinstall that leaves a torch and torchvision pair
+  # unable to register their operators, or a torch the vLLM build does not match,
+  # fails here instead of passing and breaking every serve.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
   Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
@@ -346,11 +355,19 @@ Feature: Runtime configuration
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
+  #
+  # The advice `rocm serve` prints for a missing llama-server is `rocm engines
+  # install lemonade --reinstall`. The Givens install Lemonade and delete the
+  # selected backend's llama-server, so the last Then can only pass if the
+  # reinstall put it back.
   @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-os:windows @requires-engine:lemonade @nightly
   Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
     Given a managed runtime is active
+    And the lemonade engine is installed
+    And the selected Lemonade backend's llama-server binary has been deleted
     When the user reinstalls the lemonade engine
     Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
+    And the selected Lemonade backend's llama-server binary is installed
 
   # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
   # `backend_versions.json` -- the alignment runs on every Lemonade install, so

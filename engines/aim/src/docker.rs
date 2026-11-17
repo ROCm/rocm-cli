@@ -4,7 +4,7 @@
 
 //! Thin wrapper around the `docker` CLI binary. No `bollard`/Docker API
 //! dependency: shelling out mirrors the pattern `engines/lemonade/src/process.rs`
-//! already uses for its own CLI (`run_lemonade_pull`/`run_lemonade_backend_install`).
+//! already uses for its own CLI (`run_lemonade_pull_with_parent`/`run_lemonade_backend_install`).
 
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;

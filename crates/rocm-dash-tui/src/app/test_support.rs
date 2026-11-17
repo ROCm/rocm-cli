@@ -37,6 +37,7 @@ pub(crate) fn with_registry_probe(
         ManagedRegistrySnapshot {
             has_live_service,
             managed_ids: managed_ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
         },
     )));
 }
@@ -71,5 +72,6 @@ pub(super) fn args_with_anthropic_key(key: Option<&str>) -> ResolvedArgs {
         services_past_attempts: 0,
         managed_registry_probe: None,
         launcher_hosted: false,
+        lemonade_managed_installed: None,
     }
 }

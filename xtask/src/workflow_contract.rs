@@ -2833,7 +2833,7 @@ jobs:
     #[test]
     fn every_native_linux_preflight_delegates_to_the_shared_script() {
         // What the deduplication (#294) actually bought, and the only thing
-        // keeping the next #446 from landing eight times: the eight native Linux
+        // keeping the next #446 from landing seven times: the seven native Linux
         // preflights are now one script plus a floor. The drift test below can no
         // longer catch a block left behind, because a block left behind would
         // carry its own body and simply not be compared against anything.
@@ -2872,8 +2872,8 @@ jobs:
             }
         }
         assert_eq!(
-            delegating, 8,
-            "expected the eight native Linux preflight lanes to delegate to \
+            delegating, 4,
+            "expected the four native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
     }
@@ -2885,7 +2885,7 @@ jobs:
         // where re-inlining drift grows back: a lane that keeps the delegation
         // and adds a line of its own above it — one more `pkill -f`, a lane-local
         // retry, a second floor — satisfies `step.contains(SHARED_PREFLIGHT)`
-        // and the floor check and leaves that test green, while the eight bodies
+        // and the floor check and leaves that test green, while the seven bodies
         // are no longer one body. That is how the original six inline copies
         // diverged from their PowerShell mirrors: nothing compared them to each
         // other, only to a substring.
@@ -2894,8 +2894,8 @@ jobs:
         // not_drift` and `both_wsl_lanes_settle_the_clock_before_running_the_
         // suite` pin their pairs, and then pin the shape they agree on: a single
         // `bash <script>` line and nothing else. Equality alone would be
-        // satisfied by eight identically re-inlined copies; the shape assertion
-        // alone would not notice seven of eight.
+        // satisfied by seven identically re-inlined copies; the shape assertion
+        // alone would not notice six of seven.
         //
         // The per-lane floor's VALUE is deliberately not part of this
         // comparison — 8 and 16 are the one intended difference — but
@@ -2917,7 +2917,7 @@ jobs:
                 let name = format!("{workflow} GPU preflight #{i}");
                 let body = preflight_shell_script(step)
                     .unwrap_or_else(|| panic!("{name} carries no `run: |` body"));
-                // Pinned per lane as well as compared across them: eight lanes
+                // Pinned per lane as well as compared across them: seven lanes
                 // that ALL grew `continue-on-error: true` would still agree
                 // with each other.
                 assert_eq!(
@@ -2933,7 +2933,7 @@ jobs:
                     ["GPU_PREFLIGHT_MIN_FREE_GIB"],
                     "{name} sets step environment beyond its floor; a lane-local \
                      ceiling or marker is a second gate configured where the shared \
-                     script cannot see it, and the next fix to it lands eight times again"
+                     script cannot see it, and the next fix to it lands seven times again"
                 );
                 shapes.push((name.clone(), preflight_step_shape(step)));
                 bodies.push((name, body));
@@ -2941,8 +2941,8 @@ jobs:
         }
         assert_eq!(
             bodies.len(),
-            8,
-            "expected eight native Linux preflight bodies to compare, found {} — \
+            4,
+            "expected four native Linux preflight bodies to compare, found {} — \
              if a lane was added or removed, update this count",
             bodies.len()
         );
@@ -2966,7 +2966,7 @@ jobs:
             "the native Linux GPU preflight bodies agree with each other but are no \
              longer a lone delegation to {SHARED_PREFLIGHT}; whatever they now also \
              do is a second gate living in the workflows, where the next fix to it \
-             has to land eight times again"
+             has to land seven times again"
         );
         let (first_name, first) = shapes
             .first()
@@ -2978,7 +2978,7 @@ jobs:
                     "the native Linux GPU preflights agree on their bodies but no longer \
                      on the step AROUND the body — one lane runs {SHARED_PREFLIGHT} under \
                      conditions, error handling or environment the other seven do not, so \
-                     the eight are one gate in name only; {diff}"
+                     the seven are one gate in name only; {diff}"
                 );
             }
         }
@@ -4301,8 +4301,8 @@ fi
             }
         }
         assert_eq!(
-            delegating, 8,
-            "expected the 8 native Linux preflight lanes to delegate to \
+            delegating, 4,
+            "expected the 4 native Linux preflight lanes to delegate to \
              {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
         assert_eq!(
@@ -4312,7 +4312,7 @@ fi
              left inline across both workflows — if a lane was added or removed, update \
              this count"
         );
-        // The shared script once, standing in for all eight delegating lanes: they
+        // The shared script once, standing in for all seven delegating lanes: they
         // run the same bytes, and its loop is the one that has to poll.
         lanes.push((
             format!("shared {SHARED_PREFLIGHT}"),
@@ -4397,6 +4397,129 @@ fi
                 );
             }
         }
+    }
+
+    /// The nightly report carries the shared queue's GPUs into the matrix, and
+    /// so into the wiki and the release-readiness verdict, from the queue's own
+    /// results: the newest finished run on `main`, found by its artifact's name
+    /// (no workflow may name or wait on the queue's, see
+    /// `assert_queue_workflow_holds_no_credential`). Neither step may fail the
+    /// job: a missing or late run is said so at the top of the page.
+    #[test]
+    fn nightly_report_imports_the_latest_queue_run_without_depending_on_it() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "e2e-report-nightly");
+        let steps = job_steps(job).expect("the report job has steps");
+        let position = |prefix: &str| {
+            steps
+                .iter()
+                .position(|(name, _)| name.starts_with(prefix))
+                .unwrap_or_else(|| panic!("e2e-report-nightly has a `{prefix}` step"))
+        };
+        let (fetch, add, build) = (
+            position("Fetch the latest queue results"),
+            position("Add the queue lanes to the report"),
+            position("Build consolidated report"),
+        );
+        assert!(
+            fetch < add && add < build,
+            "the queue lanes must be fetched, then put among the reports, before the report is built"
+        );
+        for at in [fetch, add] {
+            assert_eq!(
+                step_key(&steps[at].1, "continue-on-error"),
+                "true",
+                "`{}` must not be able to fail the nightly report: a missing or late queue run \
+                 is shown as missing, not as a red report",
+                steps[at].0
+            );
+        }
+
+        let fetch = normalized_whitespace(&steps[fetch].1);
+        for needed in [
+            // By artifact name, from a run on this repository's main: the
+            // workflow that makes it may not be named here.
+            "actions/artifacts?name=queue-run-results",
+            ".workflow_run.head_branch == \"main\"",
+            ".workflow_run.head_repository_id == $repo",
+            ".expired == false",
+            // Today's run: not yesterday's, whatever its conclusion was.
+            "date -u -d '24 hours ago'",
+            ".created_at >= $since",
+            "gh run download \"$candidate\"",
+            "--name queue-run-results",
+            // A run that started a day ago is not tonight's, whenever it ended.
+            "[ \"$started_at\" -ge \"$(date -u -d '24 hours ago' +%s)\" ]",
+            // Only a finished run: a run still going has a partial log.
+            "[ \"${run_info%%$'\\t'*}\" = \"completed\" ]",
+            // The log says which branch the run tested and which lanes block;
+            // the run may have several jobs, so every one is scanned.
+            "actions/runs/${candidate}/jobs?per_page=100",
+            "/logs\" > queue-results/job.log.part",
+        ] {
+            assert!(
+                fetch.contains(needed),
+                "the queue fetch step must contain `{needed}`:\n{fetch}"
+            );
+        }
+        assert!(
+            !fetch.contains("conclusion"),
+            "a red queue run is still a run: its artifact is uploaded whatever it concluded"
+        );
+        // No credential beyond the job's own read-only token.
+        let fetch_step = &steps[position("Fetch the latest queue results")].1;
+        let env = step_env(fetch_step);
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("${{ github.token }}"),
+            "{env:?}"
+        );
+        assert_eq!(env.len(), 1, "{env:?}");
+        assert!(!fetch_step.contains("secrets."), "{fetch_step}");
+        let permissions = job_mapping(job, "permissions");
+        assert_eq!(
+            permissions.get("actions").map(String::as_str),
+            Some("read"),
+            "listing and downloading the queue's artifact needs actions: read"
+        );
+        assert_eq!(
+            permissions.get("contents").map(String::as_str),
+            Some("read")
+        );
+        assert_eq!(permissions.len(), 2, "{permissions:?}");
+
+        // Both outcomes go through the importer, which writes the status section.
+        let add = normalized_whitespace(&steps[position("Add the queue lanes to the report")].1);
+        for needed in [
+            "cargo xtask e2e-queue-import",
+            "--queue-dir queue-results/results",
+            "--absent",
+            "--artifacts-dir e2e-artifacts",
+            "--section-out queue-results/queue-lanes.md",
+            // An import that fails leaves no half of one behind, and says so.
+            "rm -rf e2e-artifacts/e2e-queue-*",
+            "--absent \"the queue lanes could not be imported\"",
+        ] {
+            assert!(
+                add.contains(needed),
+                "the queue import step must contain `{needed}`:\n{add}"
+            );
+        }
+        // The section leads the page; the matrix keeps its own first table.
+        let build = normalized_whitespace(&steps[build].1);
+        assert!(
+            build.contains(
+                "cat queue-results/queue-lanes.md consolidated/support-matrix.md > \
+                 \"$RUNNER_TEMP/with-queue.md\""
+            ),
+            "the queue section must be put ahead of the matrix:\n{build}"
+        );
+        // A queue run is never something the report job waits for.
+        let needs = job_scalar(job, "needs");
+        assert!(
+            !needs.contains("queue"),
+            "e2e-report-nightly must not depend on the queue's workflows: {needs}"
+        );
     }
 
     #[test]
@@ -4630,6 +4753,7 @@ fi
             failing_gates: vec!["E2E (report unreadable)".to_string()],
             e2e_fail_total: None,
             build_skipped: false,
+            queue_absent: None,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
@@ -4649,6 +4773,7 @@ fi
             failing_gates: vec![],
             e2e_fail_total: Some(0),
             build_skipped: false,
+            queue_absent: None,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
@@ -4852,11 +4977,8 @@ fi
         }
         for lane in [
             "e2e-gpu-nightly",
-            "e2e-gpu-nightly-rad3",
-            "e2e-gpu-nightly-mi350p",
             "e2e-gpu-nightly-strix",
             "e2e-gpu-nightly-strix-windows",
-            "e2e-gpu-nightly-w7900",
             "e2e-wsl-nightly",
         ] {
             assert!(
@@ -5734,15 +5856,21 @@ fi
         );
     }
 
-    /// The hermetic comfyui-01/02/03 scenarios (no GPU, no network, no
-    /// `e2e-test-hooks` dependency, Windows-portable since #637) must stay
-    /// explicitly selected into this otherwise-`@lifecycle`-only Windows lane
-    /// (#689) — it is required CI, unlike the self-hosted lane that otherwise
-    /// runs them. This checks the whole step (not just the `run: |` body, since
-    /// the selection lives in `env:`), so dropping the env var — or narrowing
-    /// its id list — fails here rather than silently reopening the coverage gap.
+    /// The hermetic non-`@lifecycle` scenarios this otherwise-`@lifecycle`-only
+    /// Windows lane selects through `E2E_ALSO_RUN_IDS` (#689): comfyui-01/02/03
+    /// (Windows-portable since #637), the native-Windows vLLM refusal
+    /// serve-33/34/35, and the side-by-side runtime scenarios
+    /// runtime-lifecycle-19/20/21. None needs a GPU, the network or
+    /// `e2e-test-hooks`, and this is required CI, unlike the self-hosted lane
+    /// that otherwise runs them. This checks the whole step (not just the
+    /// `run: |` body, since the selection lives in `env:`) and pins the id list
+    /// exactly, so dropping the env var, narrowing the list or growing it
+    /// without updating this test fails here. It also holds the PowerShell
+    /// copy of the list in docs/testing.md equal to the ci.yml one; the
+    /// "19/20/21"-style shorthand in docs/testing.md's prose and in
+    /// tests/e2e-cucumber/README.md is not checked.
     #[test]
-    fn ci_windows_lifecycle_lane_also_selects_the_hermetic_comfyui_and_vllm_refusal_scenarios() {
+    fn ci_windows_lifecycle_lane_also_selects_exactly_the_hermetic_non_lifecycle_scenarios() {
         let ci = read_workflow("ci.yml");
         let windows = job_block(&ci, "windows-release");
         let lines: Vec<&str> = windows.lines().collect();
@@ -5761,24 +5889,62 @@ fi
             also_run_ids.len(),
             1,
             "the Windows lifecycle lane must set env.E2E_ALSO_RUN_IDS exactly \
-             once to additionally select the hermetic comfyui and vLLM-refusal scenarios, so \
-             they get required-CI Windows coverage (#689):\n{step}"
+             once to additionally select the hermetic comfyui, vLLM-refusal and \
+             side-by-side runtime scenarios, so they get required-CI Windows \
+             coverage (#689):\n{step}"
         );
-        for id in [
-            "comfyui-uv-install-failure-names-log",
-            "comfyui-uv-install-progress-streamed",
-            "comfyui-ambiguous-runtime-actionable",
-            // The native-Windows vLLM refusal (serve-33/34/35) is
-            // `@requires-os:windows` and hermetic, so this is its required lane.
-            "serve-vllm-refused-on-native-windows",
-            "serve-vllm-install-refused-on-native-windows",
-            "serve-vllm-install-with-runtime-refused-on-native-windows",
-        ] {
-            assert!(
-                also_run_ids[0].contains(id),
-                "the Windows lifecycle lane must select {id} via env.E2E_ALSO_RUN_IDS:\n{step}"
-            );
-        }
+        let selected: Vec<&str> = also_run_ids[0]
+            .trim_matches('"')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            selected,
+            [
+                "comfyui-uv-install-failure-names-log",
+                "comfyui-uv-install-progress-streamed",
+                "comfyui-ambiguous-runtime-actionable",
+                // The native-Windows vLLM refusal (serve-33/34/35) is
+                // `@requires-os:windows` and hermetic, so this is its required lane.
+                "serve-vllm-refused-on-native-windows",
+                "serve-vllm-install-refused-on-native-windows",
+                "serve-vllm-install-with-runtime-refused-on-native-windows",
+                // runtime-lifecycle-19/20/21: planted side-by-side runtimes,
+                // hermetic, whose Windows paths only this lane exercises.
+                "runtime-lifecycle-side-by-side-across-packaging-change",
+                "runtime-lifecycle-side-by-side-uninstall-keeps-the-others",
+                "runtime-lifecycle-side-by-side-shared-name-refused",
+            ],
+            "the Windows lifecycle lane's env.E2E_ALSO_RUN_IDS must select exactly the \
+             hermetic comfyui-01/02/03, serve-33/34/35 and runtime-lifecycle-19/20/21 \
+             scenarios; update this list, docs/testing.md and \
+             tests/e2e-cucumber/README.md together with ci.yml:\n{step}"
+        );
+
+        // docs/testing.md shows the same selection as a PowerShell line to run
+        // the lane locally; it must not drift from what CI selects.
+        let testing = std::fs::read_to_string(repo_root().join("docs/testing.md"))
+            .expect("docs/testing.md must be readable")
+            .replace("\r\n", "\n");
+        let documented: Vec<&str> = testing
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("$env:E2E_ALSO_RUN_IDS = "))
+            .collect();
+        assert_eq!(
+            documented.len(),
+            1,
+            "docs/testing.md must show the Windows lane's E2E_ALSO_RUN_IDS once"
+        );
+        let documented: Vec<&str> = documented[0]
+            .trim_matches('"')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            documented, selected,
+            "docs/testing.md's $env:E2E_ALSO_RUN_IDS line must list exactly the ids \
+             ci.yml's Windows lifecycle lane selects, in the same order"
+        );
     }
 
     /// Every job in `ci.yml` as `(id, block)`, in file order. Unlike [`job_block`]
@@ -7576,7 +7742,7 @@ jobs:
             condition: lane_if(extra, "", platform),
             matrix_lane: true,
         };
-        // Strix Ubuntu and W7900 are off `pull_request` and `merge_group`.
+        // Strix Ubuntu is off `pull_request` and `merge_group`.
         let off_pr_lane = |job, platform: &str| PinnedIf {
             job,
             condition: lane_if(
@@ -7596,7 +7762,6 @@ jobs:
             off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
-            off_pr_lane("e2e-gpu-w7900", "w7900"),
             // Skips because the `serve` output of a skipped `changes` is empty.
             PinnedIf {
                 job: "e2e-report",
@@ -7717,38 +7882,33 @@ jobs:
             );
         }
         // A pull request runs one Linux node (MI300X) and one Windows pool (the
-        // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND
-        // merge_group (W7900 is one runner on borrowed quota; 35% of Strix
-        // Ubuntu's merge-queue jobs hit the 45 min cap; neither check is required
-        // and the queue does not wait for it) but still run on push and dispatch.
+        // Strix Halo pool). Strix Ubuntu is off pull_request AND merge_group (35%
+        // of its merge-queue jobs hit the 45 min cap; the check is not required
+        // and the queue does not wait for it) but still runs on push and dispatch.
         // Pin the WHOLE gate, not a substring: the event exclusions must sit in the
         // non-dispatch branch (so a dispatch can still select the lane) and nothing
         // else about the event may be named, so a gate that dropped push some other
         // way fails too.
-        for (job, platform) in [
-            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
-            ("e2e-gpu-w7900", "w7900"),
-        ] {
-            let expected = format!(
-                "always() && needs.changes.result == 'success' && ( \
-                 (github.event_name != 'workflow_dispatch' \
-                 && github.event_name != 'pull_request' \
-                 && github.event_name != 'merge_group' \
-                 && needs.changes.outputs.serve == 'true') \
-                 || (github.event_name == 'workflow_dispatch' \
-                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
-            );
-            assert_eq!(
-                normalized_whitespace(&gate(job)),
-                normalized_whitespace(&expected),
-                "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
-                 the non-dispatch branch only)"
-            );
-            assert!(
-                !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
-                "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
-            );
-        }
+        let (job, platform) = ("e2e-gpu-strix-ubuntu", "strix-ubuntu");
+        let expected = format!(
+            "always() && needs.changes.result == 'success' && ( \
+             (github.event_name != 'workflow_dispatch' \
+             && github.event_name != 'pull_request' \
+             && github.event_name != 'merge_group' \
+             && needs.changes.outputs.serve == 'true') \
+             || (github.event_name == 'workflow_dispatch' \
+             && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+        );
+        assert_eq!(
+            normalized_whitespace(&gate(job)),
+            normalized_whitespace(&expected),
+            "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
+             the non-dispatch branch only)"
+        );
+        assert!(
+            !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
+            "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
     }
 
     /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
@@ -9659,8 +9819,8 @@ permissions:
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
         for needed in [
             "both the `release` and the `nightly` channel",
-            "The remaining gap is native Windows and WSL.",
-            "the native Windows and WSL lanes stay on their dedicated runners",
+            "The remaining gap is Strix Halo.",
+            "the Strix Halo nightlies (Ubuntu, Windows and WSL) stay on the shared Strix pool",
             "`E2E_CHANNELS`",
             "`/out/<channel>/results`",
         ] {
