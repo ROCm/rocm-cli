@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +19,8 @@ use e2e_cucumber::device_memory::{
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
-    serve_attempt_report, service_log_tail,
+    EngineDeathReport, ServeAttempt, archive_service_log, engine_death_report,
+    engine_from_serve_args, reported_engine, serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
@@ -1408,9 +1409,24 @@ async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
     world.plant_failing_lemonade_runtime();
 }
 
+/// `--wait` is load-bearing. The backend install fails inside the managed
+/// engine process, after `rocm serve` has spawned it. Without `--wait`, serve
+/// only notices an engine that dies within its 200 ms post-spawn check; one
+/// that dies later is reported as `starting` with exit 0 once the readiness
+/// probe gives up, so on a loaded host this scenario would race that window.
+/// With `--wait` a later death fails the serve too, once the 45 s readiness
+/// probe ends, so the slow path costs that long.
+///
+/// Both ways the failure reaches the user are followed: an engine that died
+/// inside the window fails the serve with its log tail, and one that died
+/// later fails it with a pointer to `rocm logs --service <id>`, which this step
+/// then runs, as the user would. The retry and recovery lines are the engine's
+/// own output either way, so the assertions read the serve output together
+/// with that log. A failed serve carrying neither message fails here, naming
+/// both, rather than as a missing retry line later.
 #[when("the user serves a model with Lemonade")]
 async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+    let (mut stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
         world,
         &[
             "serve",
@@ -1418,8 +1434,30 @@ async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
             "--engine",
             "lemonade",
             "--managed",
+            "--wait",
         ],
     );
+    if rc != 0 && !stderr.contains("no usable AMD GPU detected") {
+        match engine_death_report(&stderr) {
+            EngineDeathReport::LogTailQuoted => {}
+            EngineDeathReport::LogsPointer(service_id) => {
+                let (logs, logs_stderr, logs_rc) =
+                    crate::run_rocm(world, &["logs", "--service", &service_id]);
+                assert_eq!(
+                    logs_rc, 0,
+                    "`rocm logs --service {service_id}`, which the failed serve pointed at, \
+                     failed:\n{logs}\n{logs_stderr}"
+                );
+                let _ = write!(stdout, "\n--- rocm logs --service {service_id} ---\n{logs}");
+            }
+            EngineDeathReport::Unrecognised => panic!(
+                "serve failed without either engine-death message: neither the \
+                 post-spawn check's \"managed engine exited immediately\" log tail nor \
+                 the readiness wait's \"see `rocm logs --service <id>`\" pointer. If the \
+                 CLI reworded one, update `engine_death_report`:\n{stdout}\n{stderr}"
+            ),
+        }
+    }
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);

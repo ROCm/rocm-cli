@@ -360,12 +360,46 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
     report
 }
 
+/// How a managed `rocm serve --wait` reported an engine that died before it
+/// became ready, read from its stderr.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EngineDeathReport {
+    /// It died inside the post-spawn check, and the serve's error already quotes
+    /// the tail of its log ("managed engine exited immediately ...").
+    LogTailQuoted,
+    /// It died later, and the serve's error points at
+    /// `rocm logs --service <id>` for its output (the readiness wait's message).
+    LogsPointer(String),
+    /// Neither: the CLI's wording changed, or the failure was something else.
+    Unrecognised,
+}
+
+/// Classifies a failed `rocm serve --wait`'s stderr by its engine-death message.
+///
+/// The wording matched here is the CLI's:
+/// `managed_engine_startup_failure_detail` (the 200 ms post-spawn check) and
+/// `died_during_wait` (the readiness wait), both in `apps/rocm/src/service_launch/`.
+pub fn engine_death_report(stderr: &str) -> EngineDeathReport {
+    if stderr.contains("managed engine exited immediately") {
+        return EngineDeathReport::LogTailQuoted;
+    }
+    stderr
+        .split_once("see `rocm logs --service ")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(id, _)| id.trim_matches(|c| c == '\'' || c == '"'))
+        .filter(|id| !id.is_empty())
+        .map_or(EngineDeathReport::Unrecognised, |id| {
+            EngineDeathReport::LogsPointer(id.to_owned())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
-        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_engine,
-        serve_attempt_report, serve_cli_budget, service_log_tail, slugify, tail_lines,
+        EngineDeathReport, MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt,
+        archive_service_log, engine_death_report, engine_from_serve_args, parse_log_path,
+        read_clamped, read_clamped_file, reported_engine, serve_attempt_report, serve_cli_budget,
+        service_log_tail, slugify, tail_lines,
     };
 
     #[test]
@@ -714,5 +748,29 @@ managed service launched
         }
         // A silent stream is a finding, so it is labelled rather than dropped.
         assert!(report.contains("stderr: (empty)"), "{report}");
+    }
+
+    #[test]
+    fn engine_death_reports_are_told_apart_by_the_clis_two_messages() {
+        // `died_during_wait`'s message, as the CLI prints it.
+        let waited = "Error: the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service lemonade-qwen3-0-6b-gguf-1794920662779` for its output";
+        assert_eq!(
+            engine_death_report(waited),
+            EngineDeathReport::LogsPointer("lemonade-qwen3-0-6b-gguf-1794920662779".to_owned())
+        );
+        // `managed_engine_startup_failure_detail`'s message.
+        let immediate = "Error: managed engine exited immediately with status exit status: 1; inspect /x/svc.log\n\nrecent startup log output:\nretrying once";
+        assert_eq!(
+            engine_death_report(immediate),
+            EngineDeathReport::LogTailQuoted
+        );
+        assert_eq!(
+            engine_death_report("Error: no usable AMD GPU detected"),
+            EngineDeathReport::Unrecognised
+        );
+        assert_eq!(
+            engine_death_report("see `rocm logs --service ` for its output"),
+            EngineDeathReport::Unrecognised
+        );
     }
 }
