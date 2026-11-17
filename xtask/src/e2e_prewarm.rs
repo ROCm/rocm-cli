@@ -53,6 +53,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::e2e_prewarm_vision::{repair_torchvision_mismatch, verify_runtime_imports};
 use crate::paths::{binary_name, release_binary_dir, workspace_root};
 
 /// What the pre-warm should do with the shared tree, given the current
@@ -662,6 +663,11 @@ pub fn run(
     // Repairing first means `decide` reads a registry with nothing dead in it.
     repair_poisoned_runtimes(&rocm, prewarm_dir)?;
 
+    // Likewise a runtime whose torch and torchvision no longer match: remove it so
+    // `decide` below reads a registry without it. Before the dangling-pointer
+    // repair, which cleans up after this removal as it does after the one above.
+    repair_torchvision_mismatch(&rocm, prewarm_dir)?;
+
     // And point the tree at something that exists before anything resolves the
     // active runtime. Must run after the repair above, which can itself remove
     // the runtime the pointer names.
@@ -795,11 +801,11 @@ pub fn run(
     // runtime with no engine, which is the one thing those lanes exist to
     // exercise. Re-checking a warm tree is cheap: without `--reinstall`,
     // `engines install` on a ready engine installs nothing.
-    ensure_default_engine(&rocm, prewarm_dir)?;
+    let engine = ensure_default_engine(&rocm, prewarm_dir)?;
 
     // Also unconditional and before the reuse return, for the same reason: a
     // persisted runtime can be current by version and still unusable.
-    verify_runtime_imports(&rocm, prewarm_dir, runtime_changed(&decision))?;
+    verify_runtime_imports(&rocm, prewarm_dir, runtime_changed(&decision), &engine)?;
 
     if !runtime_changed(&decision) {
         return Ok(());
@@ -858,7 +864,20 @@ const fn runtime_changed(decision: &Decision) -> bool {
 /// path: reusing a stale-but-working runtime keeps a lane meaningful, whereas
 /// serving with no engine fails every GPU scenario later and for reasons that
 /// name none of this.
-fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+///
+/// Returns the engine it ensured, so the checks after it can ask what that engine
+/// needs of the runtime.
+fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+    let engine = default_engine(rocm, prewarm_dir)?;
+    println!("pre-warm: ensuring the {engine} engine is installed");
+    rocm_command(rocm, prewarm_dir)
+        .args(["engines", "install", &engine, "--yes"])
+        .status_ok("rocm engines install")?;
+    Ok(engine)
+}
+
+/// The engine `rocm engines list` marks as the default for this host.
+pub(crate) fn default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
     let output = rocm_command(rocm, prewarm_dir)
         .args(["engines", "list"])
         .output()
@@ -867,177 +886,9 @@ fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
         bail!("`rocm engines list` exited with {}", output.status);
     }
     let inventory = String::from_utf8_lossy(&output.stdout);
-    let engine = default_engine_from_inventory(&inventory)
-        .context("`rocm engines list` did not identify a default engine")?;
-    println!("pre-warm: ensuring the {engine} engine is installed");
-    rocm_command(rocm, prewarm_dir)
-        .args(["engines", "install", engine, "--yes"])
-        .status_ok("rocm engines install")
-}
-
-/// What importing torchvision's operators did in the active runtime's Python.
-#[derive(Debug, PartialEq, Eq)]
-enum VisionImport {
-    /// The runtime ships no torchvision, so there is nothing to check.
-    Absent,
-    /// `import torchvision.ops` succeeded.
-    Working,
-    /// It failed; the tail of stderr says how.
-    Broken(String),
-}
-
-/// What [`TORCHVISION_PROBE`] prints, and [`classify_vision_import`] reads, when
-/// the runtime has no torchvision. A test ties the two together.
-const ABSENT_MARKER: &str = "absent";
-
-/// Run by the active runtime's Python. Prints [`ABSENT_MARKER`] and exits 0 when
-/// the runtime has no torchvision, so such a runtime (a wheel runtime built
-/// without it) is not mistaken for a broken one. `torchvision.ops` is the import
-/// that fails when torchvision's compiled operators were built for a different
-/// torch than the one installed next to it.
-const TORCHVISION_PROBE: &str = "import importlib.util\n\
-if importlib.util.find_spec('torchvision') is None:\n    print('absent')\n\
-else:\n    import torchvision.ops\n";
-
-/// Read what the probe did from its exit status and output.
-fn classify_vision_import(success: bool, stdout: &str, stderr: &str) -> VisionImport {
-    if !success {
-        let mut tail: Vec<&str> = stderr
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .rev()
-            .take(3)
-            .collect();
-        tail.reverse();
-        let tail = if tail.is_empty() {
-            "the interpreter printed nothing to stderr".to_owned()
-        } else {
-            tail.join(" | ")
-        };
-        return VisionImport::Broken(tail);
-    }
-    if stdout.trim() == ABSENT_MARKER {
-        VisionImport::Absent
-    } else {
-        VisionImport::Working
-    }
-}
-
-/// Run [`TORCHVISION_PROBE`] with `python`.
-fn probe_vision_import(python: &Path) -> std::io::Result<VisionImport> {
-    let output = Command::new(python)
-        .args(["-c", TORCHVISION_PROBE])
-        .output()?;
-    let verdict = classify_vision_import(
-        output.status.success(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
-    Ok(match verdict {
-        // A crash during an ABI mismatch leaves no stderr, so say how it ended.
-        VisionImport::Broken(tail) => VisionImport::Broken(format!("{tail}; {}", output.status)),
-        other => other,
-    })
-}
-
-/// The active runtime's key and Python, from the tree's `active.json` and that
-/// runtime's registry manifest.
-///
-/// `Ok(None)` only when there is nothing to check: the tree records no active
-/// runtime, or the manifest records no interpreter (absent or null; the CLI
-/// writes it as optional, so a renamed field cannot be told from that). A marker
-/// or manifest that exists but cannot be read or parsed, or a marker without
-/// `runtime_key` (which the CLI always writes), is an error.
-fn active_runtime_python(prewarm_dir: &Path) -> Result<Option<(String, PathBuf)>> {
-    let runtimes = prewarm_dir.join("data").join("runtimes");
-    let marker = runtimes.join("active.json");
-    let active = match std::fs::read_to_string(&marker) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", marker.display()));
-        }
-    };
-    let active: serde_json::Value = serde_json::from_str(&active)
-        .with_context(|| format!("{} is not valid JSON", marker.display()))?;
-    let key = active
-        .get("runtime_key")
-        .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("{} records no `runtime_key`", marker.display()))?;
-    let manifest_path = runtimes.join("registry").join(format!("{key}.json"));
-    let manifest = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest)
-        .with_context(|| format!("{} is not valid JSON", manifest_path.display()))?;
-    Ok(manifest
-        .get("python_executable")
-        .and_then(serde_json::Value::as_str)
-        .map(|python| (key.to_owned(), PathBuf::from(python))))
-}
-
-/// Fail the pre-warm when the active runtime cannot import torchvision's operators.
-///
-/// A persisted runtime can pass every freshness check and still be broken: when
-/// its torch and torchvision come from different installs (a tree built before
-/// the ROCm 10 SDK pinned them to vLLM's pairing, or an engine install that later
-/// swapped torch), torchvision's compiled operators no longer match torch and
-/// `import torchvision` dies with `operator torchvision::nms does not exist`.
-/// Nothing before the suite imports it, so every vLLM serve scenario found out
-/// for itself, each waiting out its readiness timeout: a lane that takes 33
-/// minutes when healthy took 79 to 90 minutes, red. This finds it once, before
-/// the suite starts.
-///
-/// Fatal, like [`ensure_default_engine`]: serving against a runtime already
-/// known to be broken fails later and names none of this.
-fn verify_runtime_imports(rocm: &Path, prewarm_dir: &Path, installed_this_run: bool) -> Result<()> {
-    let Some((key, python)) = active_runtime_python(prewarm_dir)? else {
-        println!(
-            "pre-warm: no active runtime interpreter recorded; skipping the torchvision check"
-        );
-        return Ok(());
-    };
-    let verdict = probe_vision_import(&python)
-        .with_context(|| format!("failed to run the Python of runtime {key}"))?;
-    match verdict {
-        VisionImport::Absent => {
-            println!("pre-warm: runtime {key} has no torchvision; nothing to check");
-        }
-        VisionImport::Working => println!("pre-warm: runtime {key} imports torchvision.ops"),
-        // This probe runs the interpreter without the library paths the CLI's own
-        // probes add, so a TheRock torch can fail to load HIP here on a healthy
-        // runtime. That reads as an unconfigured probe, not a broken runtime.
-        VisionImport::Broken(tail) if tail.contains("cannot open shared object file") => {
-            println!(
-                "::warning::pre-warm: runtime {key} could not load a shared library for the \
-                 torchvision check ({tail}); skipping it"
-            );
-        }
-        VisionImport::Broken(tail) => {
-            let mismatch = if tail.contains("torchvision::") {
-                " Its torch and torchvision do not match."
-            } else {
-                ""
-            };
-            let advice = if installed_this_run {
-                "This run installed the runtime, so the installer produced the broken pair and \
-                 a reinstall would reproduce it; fix the install."
-                    .to_owned()
-            } else {
-                format!(
-                    "To reinstall it, set ROCM_CLI_CONFIG_DIR={dir}/config, \
-                     ROCM_CLI_DATA_DIR={dir}/data and ROCM_CLI_CACHE_DIR={dir}/cache, run \
-                     `{rocm} runtimes uninstall {key} --yes`, and run the pre-warm again.",
-                    dir = prewarm_dir.display(),
-                    rocm = rocm.display()
-                )
-            };
-            bail!(
-                "runtime {key} cannot `import torchvision.ops` ({tail}).{mismatch} Serves that \
-                 import torch would fail. {advice}"
-            );
-        }
-    }
-    Ok(())
+    default_engine_from_inventory(&inventory)
+        .map(str::to_owned)
+        .context("`rocm engines list` did not identify a default engine")
 }
 
 /// The engine `rocm engines list` marks as the default for this host, if any.
@@ -1239,7 +1090,7 @@ fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
 /// The three `ROCM_CLI_*` directories are what make this a SHARED tree rather
 /// than the caller's own; `HF_HOME` / `UV_CACHE_DIR` are inherited from the job
 /// environment, which the lanes already export.
-fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
+pub(crate) fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
     let mut cmd = Command::new(rocm);
     cmd.env("ROCM_CLI_CONFIG_DIR", prewarm_dir.join("config"))
         .env("ROCM_CLI_DATA_DIR", prewarm_dir.join("data"))
@@ -1249,7 +1100,7 @@ fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
 
 /// Run a command for its exit status, turning a non-zero exit into an error that
 /// names the command.
-trait StatusOk {
+pub(crate) trait StatusOk {
     fn status_ok(&mut self, what: &str) -> Result<()>;
 }
 
@@ -2190,327 +2041,6 @@ message=connect timed out after 30 s";
         assert_eq!(decide(EMPTY, "release", None), Decision::Install);
     }
 
-    #[test]
-    fn vision_probe_is_read_from_exit_status_and_output() {
-        assert_eq!(
-            classify_vision_import(true, "", ""),
-            VisionImport::Working,
-            "a clean import prints nothing"
-        );
-        assert_eq!(
-            classify_vision_import(true, "absent\n", ""),
-            VisionImport::Absent
-        );
-        // The failure that cost the MI300X lane its green runs: only the tail of
-        // the traceback is kept, and the cause is its last line.
-        let stderr = "Traceback (most recent call last):\n  File \"x.py\", line 1\n    a\n    b\n\
-                      RuntimeError: operator torchvision::nms does not exist\n";
-        match classify_vision_import(false, "", stderr) {
-            VisionImport::Broken(tail) => {
-                assert!(tail.ends_with("RuntimeError: operator torchvision::nms does not exist"));
-                assert_eq!(tail.matches(" | ").count(), 2, "three lines kept: {tail}");
-            }
-            other => panic!("expected Broken, got {other:?}"),
-        }
-        // A failure that prints "absent" first is still a failure.
-        assert!(matches!(
-            classify_vision_import(false, "absent\n", "boom"),
-            VisionImport::Broken(_)
-        ));
-    }
-
-    /// A tree whose active runtime records `python`, laid out as the CLI does.
-    fn tree_with_python(python: &Path) -> tempfile::TempDir {
-        let tree = tempfile::tempdir().expect("tempdir");
-        let runtimes = tree.path().join("data").join("runtimes");
-        std::fs::create_dir_all(runtimes.join("registry")).expect("registry dir");
-        std::fs::write(
-            runtimes.join("active.json"),
-            r#"{"runtime_key": "release-wheel-test"}"#,
-        )
-        .expect("active.json");
-        let manifest = serde_json::json!({ "python_executable": python });
-        std::fs::write(
-            runtimes.join("registry").join("release-wheel-test.json"),
-            manifest.to_string(),
-        )
-        .expect("manifest");
-        tree
-    }
-
-    #[test]
-    fn active_runtime_python_follows_the_active_marker_to_its_manifest() {
-        let tree = tree_with_python(Path::new("/runtime/bin/python"));
-        assert_eq!(
-            active_runtime_python(tree.path()).expect("reads"),
-            Some((
-                "release-wheel-test".to_owned(),
-                PathBuf::from("/runtime/bin/python")
-            ))
-        );
-        // No marker, nothing to check.
-        let empty = tempfile::tempdir().expect("tempdir");
-        assert_eq!(active_runtime_python(empty.path()).expect("reads"), None);
-    }
-
-    #[test]
-    fn unreadable_runtime_state_is_an_error_not_a_skip() {
-        let tree = tree_with_python(Path::new("/runtime/bin/python"));
-        let runtimes = tree.path().join("data").join("runtimes");
-        // A marker that exists but is not JSON.
-        std::fs::write(runtimes.join("active.json"), "not json").expect("corrupt marker");
-        assert!(active_runtime_python(tree.path()).is_err());
-        assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false).is_err());
-        // A marker naming a runtime whose manifest is gone.
-        std::fs::write(
-            runtimes.join("active.json"),
-            r#"{"runtime_key": "no-such-runtime"}"#,
-        )
-        .expect("marker");
-        assert!(active_runtime_python(tree.path()).is_err());
-        // A marker that cannot be read at all (here, a directory) is not "absent".
-        std::fs::remove_file(runtimes.join("active.json")).expect("remove marker");
-        std::fs::create_dir(runtimes.join("active.json")).expect("directory marker");
-        assert!(active_runtime_python(tree.path()).is_err());
-        std::fs::remove_dir(runtimes.join("active.json")).expect("remove directory");
-        // A marker without a runtime key is a shape change, not a skip.
-        std::fs::write(runtimes.join("active.json"), "{}").expect("marker");
-        assert!(active_runtime_python(tree.path()).is_err());
-        // A manifest that exists but is not JSON.
-        std::fs::write(
-            runtimes.join("active.json"),
-            r#"{"runtime_key": "release-wheel-test"}"#,
-        )
-        .expect("marker");
-        std::fs::write(
-            runtimes.join("registry").join("release-wheel-test.json"),
-            "not json",
-        )
-        .expect("corrupt manifest");
-        assert!(active_runtime_python(tree.path()).is_err());
-        // A manifest that records no interpreter leaves nothing to check.
-        std::fs::write(
-            runtimes.join("registry").join("release-wheel-test.json"),
-            r#"{"python_executable": null}"#,
-        )
-        .expect("manifest");
-        std::fs::write(
-            runtimes.join("active.json"),
-            r#"{"runtime_key": "release-wheel-test"}"#,
-        )
-        .expect("marker");
-        assert_eq!(active_runtime_python(tree.path()).expect("reads"), None);
-    }
-
-    #[test]
-    fn the_probe_prints_the_marker_the_classifier_reads() {
-        assert!(TORCHVISION_PROBE.contains(&format!("print('{ABSENT_MARKER}')")));
-        assert_eq!(
-            classify_vision_import(true, &format!("{ABSENT_MARKER}\n"), ""),
-            VisionImport::Absent
-        );
-        assert!(
-            matches!(
-                classify_vision_import(false, "", "\n\n"),
-                VisionImport::Broken(ref tail) if tail.contains("nothing to stderr")
-            ),
-            "an empty stderr still says something"
-        );
-    }
-
-    /// A stand-in interpreter: a script that ignores `-c` and behaves as told.
-    #[cfg(unix)]
-    fn fake_python(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("python");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        path
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_probe_is_passed_to_the_interpreter_with_dash_c() {
-        // Succeeds only when its first argument is `-c`, as the probe passes it.
-        let scripts = tempfile::tempdir().expect("tempdir");
-        let python = fake_python(
-            scripts.path(),
-            "[ \"$1\" = -c ] || { echo \"unexpected arguments: $*\" >&2; exit 7; }",
-        );
-        assert_eq!(
-            probe_vision_import(&python).expect("runs"),
-            VisionImport::Working
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_advice_depends_on_whether_this_run_installed_the_runtime() {
-        let scripts = tempfile::tempdir().expect("tempdir");
-        let python = fake_python(scripts.path(), "echo 'ImportError: boom' >&2; exit 1");
-        let tree = tree_with_python(&python);
-        let reused = format!(
-            "{:#}",
-            verify_runtime_imports(Path::new("rocm"), tree.path(), false).expect_err("fails")
-        );
-        assert!(
-            reused.contains("runtimes uninstall release-wheel-test --yes"),
-            "{reused}"
-        );
-        assert!(
-            !reused.contains("do not match"),
-            "no torchvision:: in the tail: {reused}"
-        );
-        let fresh = format!(
-            "{:#}",
-            verify_runtime_imports(Path::new("rocm"), tree.path(), true).expect_err("fails")
-        );
-        assert!(fresh.contains("This run installed the runtime"), "{fresh}");
-        assert!(!fresh.contains("runtimes uninstall"), "{fresh}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_missing_shared_library_is_a_skipped_probe_not_a_broken_runtime() {
-        let scripts = tempfile::tempdir().expect("tempdir");
-        let python = fake_python(
-            scripts.path(),
-            "echo 'libroctx64.so.4: cannot open shared object file' >&2; exit 1",
-        );
-        let tree = tree_with_python(&python);
-        assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_runtime_that_cannot_import_torchvision_ops_fails_the_pre_warm() {
-        let scripts = tempfile::tempdir().expect("tempdir");
-        let python = fake_python(
-            scripts.path(),
-            "echo 'RuntimeError: operator torchvision::nms does not exist' >&2; exit 1",
-        );
-        let tree = tree_with_python(&python);
-        let error =
-            verify_runtime_imports(Path::new("rocm"), tree.path(), false).expect_err("must fail");
-        let message = format!("{error:#}");
-        assert!(
-            message.starts_with("runtime release-wheel-test cannot"),
-            "{message}"
-        );
-        assert!(
-            message.contains(" Its torch and torchvision do not match."),
-            "{message}"
-        );
-        let dir = tree.path().display();
-        assert!(
-            message.contains(&format!(
-                "set ROCM_CLI_CONFIG_DIR={dir}/config, ROCM_CLI_DATA_DIR={dir}/data and \
-                 ROCM_CLI_CACHE_DIR={dir}/cache, run `rocm runtimes uninstall \
-                 release-wheel-test --yes`"
-            )),
-            "{message}"
-        );
-        assert!(message.contains("exit status: 1"), "{message}");
-        assert!(
-            message.contains("torchvision::nms does not exist"),
-            "{message}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn working_and_torchvision_free_runtimes_pass_the_pre_warm() {
-        let scripts = tempfile::tempdir().expect("tempdir");
-        let working = tree_with_python(&fake_python(scripts.path(), "exit 0"));
-        assert!(verify_runtime_imports(Path::new("rocm"), working.path(), false).is_ok());
-
-        let scripts = tempfile::tempdir().expect("tempdir");
-        let absent = tree_with_python(&fake_python(scripts.path(), "echo absent"));
-        assert!(verify_runtime_imports(Path::new("rocm"), absent.path(), false).is_ok());
-
-        // No active runtime recorded: skipped, not failed.
-        let empty = tempfile::tempdir().expect("tempdir");
-        assert!(verify_runtime_imports(Path::new("rocm"), empty.path(), false).is_ok());
-    }
-
-    #[test]
-    fn a_recorded_interpreter_that_cannot_start_fails_the_pre_warm() {
-        // The manifest names a Python that is not there: the runtime is not
-        // usable, which is the same verdict as one that cannot import.
-        let tree = tree_with_python(Path::new("/nonexistent/runtime/bin/python"));
-        let error =
-            verify_runtime_imports(Path::new("rocm"), tree.path(), false).expect_err("must fail");
-        assert!(
-            format!("{error:#}").contains("failed to run the Python of runtime release-wheel-test")
-        );
-    }
-
-    /// Runs the real probe with the host's `python3` against a throwaway
-    /// `torchvision` package, so the probe text itself is exercised and not only
-    /// the classifier. Skipped where no `python3` is on the PATH.
-    #[cfg(unix)]
-    #[test]
-    fn the_probe_imports_torchvision_ops_in_a_real_interpreter() {
-        let python = Path::new("python3");
-        let usable = Command::new(python)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success());
-        // Not skipped quietly: a test that returns early reports `ok`, and this is
-        // the only one that runs the probe text itself.
-        assert!(usable, "this test needs a working python3 on PATH");
-        let write_package = |ops: &str| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let package = dir.path().join("torchvision");
-            std::fs::create_dir_all(&package).expect("package dir");
-            std::fs::write(package.join("__init__.py"), "").expect("__init__");
-            std::fs::write(package.join("ops.py"), ops).expect("ops");
-            dir
-        };
-        let classify = |output: std::process::Output| {
-            classify_vision_import(
-                output.status.success(),
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            )
-        };
-        let run = |path: &Path| {
-            // The package goes on sys.path by hand so the probe text runs as is.
-            let script = format!(
-                "import sys; sys.path.insert(0, {:?})\n{TORCHVISION_PROBE}",
-                path.to_string_lossy()
-            );
-            classify(
-                Command::new(python)
-                    .args(["-c", &script])
-                    .output()
-                    .expect("python3 runs"),
-            )
-        };
-
-        let working = write_package("");
-        assert_eq!(run(working.path()), VisionImport::Working);
-
-        let broken =
-            write_package("raise RuntimeError('operator torchvision::nms does not exist')");
-        match run(broken.path()) {
-            VisionImport::Broken(tail) => {
-                assert!(tail.contains("torchvision::nms does not exist"), "{tail}");
-            }
-            other => panic!("expected Broken, got {other:?}"),
-        }
-
-        // `-I -S`: no site-packages and no current directory, so no torchvision
-        // can be found and the probe takes its `find_spec` branch.
-        let absent = classify(
-            Command::new(python)
-                .args(["-I", "-S", "-c", TORCHVISION_PROBE])
-                .output()
-                .expect("python3 runs"),
-        );
-        assert_eq!(absent, VisionImport::Absent);
-    }
-
     /// `run` is never called by a test, so what keeps the check where the
     /// comment on it says (after the engine check, before the reuse return, which
     /// a warm tree takes every time) is this reading of `run`'s own code: comment
@@ -2531,11 +2061,16 @@ message=connect timed out after 30 s";
                 .position(|line| *line == needle)
                 .unwrap_or_else(|| panic!("`{needle}` is not a top-level statement of run"))
         };
-        let engine = position("    ensure_default_engine(&rocm, prewarm_dir)?;");
+        let engine = position("    let engine = ensure_default_engine(&rocm, prewarm_dir)?;");
         let check = position(
-            "    verify_runtime_imports(&rocm, prewarm_dir, runtime_changed(&decision))?;",
+            "    verify_runtime_imports(&rocm, prewarm_dir, runtime_changed(&decision), &engine)?;",
         );
         let reuse_return = position("    if !runtime_changed(&decision) {");
         assert!(engine < check && check < reuse_return);
+        // The repair runs before `decide` reads the registry and before the
+        // dangling-pointer repair that cleans up after it.
+        let repair = position("    repair_torchvision_mismatch(&rocm, prewarm_dir)?;");
+        let dangling = position("    repair_dangling_active_runtime(&rocm, prewarm_dir)?;");
+        assert!(repair < dangling && dangling < engine);
     }
 }
