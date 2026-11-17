@@ -1149,7 +1149,13 @@ mod tests {
     #[test]
     fn unconfirmed_reason_is_given_exactly_for_an_unconfirmed_stop() {
         // The match has no wildcard, so a new variant fails to compile here until
-        // its reason is pinned; add it to the list below in the same edit.
+        // its reason is pinned; add it to the list below in the same edit. The
+        // strings pin the wording only. That a warning built from it is printed
+        // exactly when the stop is unconfirmed, beside the state it describes, is
+        // proven in the engines by lemonade's
+        // `state::tests::terminate_pid_reports_an_unconfirmed_stop_on_stderr_and_not_a_confirmed_one`
+        // and vLLM's
+        // `process::tests::fail_unready_server_reports_on_stderr_and_kills_a_server_it_could_not_confirm_stopped`.
         let expected = |outcome: TerminationOutcome| match outcome {
             TerminationOutcome::TimedOut => {
                 Some("it, or a process under it, was still running when the stop ended")

@@ -66,7 +66,11 @@ const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(10);
-/// Lemonade state identifies the actual llama-server process directly.
+/// The scope a stop by recorded state uses. The recorded `server_pid` is the
+/// `llama-server` itself on the direct-serve path, but `lemond` on the router
+/// path, which runs the model in a `llama-server` child of its own. A
+/// `Single` stop of `lemond` that escalates to `SIGKILL` can therefore leave
+/// that child running; widening the scope is a follow-up.
 const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Single;
 
 #[derive(Parser)]
