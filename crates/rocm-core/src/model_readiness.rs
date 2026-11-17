@@ -665,13 +665,21 @@ fn assess(
     // Gated on `requires_gpu` for the same reason the "no GPU is visible" check
     // above is: a `cpu_only` recipe never allocates from the accelerator pool,
     // so what that pool is shared with says nothing about whether it will run.
-    // Without the gate a `cpu_only` recipe on an APU is softened to `Degraded`
-    // and handed the plan below -- a remediation for a device the model does
-    // not touch, on evidence no earlier branch put in the report (a recipe with
-    // no GPU minimum takes the `(None, _)` arm and reaches here `Ready` with no
-    // GPU figure at all).
+    //
+    // Gated on `required.is_some()` as well, because `requires_gpu` alone is not
+    // enough: it only asks `device_policy != "cpu_only"`, so a `gpu_required`
+    // recipe that declares no `min_gpu_mem_gb` still passes it. That recipe
+    // takes the `(None, _)` arm above and arrives here `Ready` with no GPU
+    // comparison having been made at all, so softening it to `Degraded` would
+    // rest on a measurement nothing performed. This is not hypothetical: seven
+    // recipes in the shipped catalog have exactly that shape today, and on an
+    // APU with a readable pool every one of them was being stamped `Degraded`
+    // and handed a remediation for a comparison that never happened. The two
+    // terms answer different questions -- "does it use the GPU" and "did we
+    // weigh it against the pool" -- and only the second licenses this verdict.
     if host.accelerator_memory.is_shared_pool()
         && requires_gpu(recipe)
+        && required.is_some()
         && matches!(
             readiness.verdict,
             ModelVerdict::Ready | ModelVerdict::Degraded
@@ -1940,6 +1948,54 @@ mod tests {
              the assertion above proves only that the check is gone: {:?}",
             gpu.evidence
         );
+    }
+
+    /// A `gpu_required` recipe that declares no GPU minimum is never weighed
+    /// against the pool, so the shared-pool softening has nothing to rest on.
+    ///
+    /// Driven off the **shipped catalog**, not a synthetic recipe, because the
+    /// point is that this shape is live: seven recipes carry
+    /// `device_policy: "gpu_required"` with no `min_gpu_mem_gb` today. A
+    /// synthetic stand-in would still pass if the catalog stopped containing
+    /// any, and the bug only matters while it does.
+    #[test]
+    fn a_gpu_recipe_with_no_declared_minimum_is_not_degraded_by_a_pool_it_was_never_weighed_against()
+     {
+        let registry = builtin_model_recipe_registry();
+        let unmeasured: Vec<&ModelRecipeRecord> = registry
+            .recipes
+            .iter()
+            .filter(|recipe| recipe.device_policy != "cpu_only" && recipe.min_gpu_mem_gb.is_none())
+            .collect();
+        assert!(
+            !unmeasured.is_empty(),
+            "premise gone: no shipped recipe needs the GPU without declaring a minimum, so this \
+             test no longer exercises the shape it was written for"
+        );
+
+        let catalog = ModelCatalogSource::Available(&registry);
+        let apu = HostFacts {
+            accelerator_memory: AcceleratorMemory::Unified {
+                gtt_total_gib: 60.0,
+                vram_carveout_gib: Some(4.0),
+            },
+            // Large enough that the system-RAM check cannot be what softens it.
+            system_ram_gib: Some(4096.0),
+        };
+
+        for recipe in unmeasured {
+            let readiness =
+                assess_model_readiness(&recipe.canonical_model_id, &catalog, &apu, &engine_choice);
+            assert!(
+                !readiness
+                    .evidence
+                    .iter()
+                    .any(|line| line.contains("no dedicated VRAM")),
+                "{}: the report claimed the pool was too small for a model it never sized: {:?}",
+                recipe.canonical_model_id,
+                readiness.evidence
+            );
+        }
     }
 
     /// The sibling gap -- no telemetry at all -- keeps its own remediation.
