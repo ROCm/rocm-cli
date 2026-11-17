@@ -783,6 +783,17 @@ Feature: GPU detection and system inspection
     When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
     Then the inspection lists no runtime librocdxg that its own runtime does not load
 
+  # `examine` reports the active runtime's channel, package source, source layout
+  # and exact GPU target in the same words and from the same manifest fields as
+  # the `provenance:` line `rocm runtimes list` prints for it
+  # (`runtime-lifecycle-22`). The planted manifest needs no GPU or download, so
+  # this runs on the mock lane.
+  @id:examine-reports-where-the-active-runtime-came-from
+  Scenario: examine-54 - Examining the system says where the active runtime came from
+    Given the active runtime is a nightly runtime installed for one exact GPU
+    When the user inspects the system
+    Then the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from
+
   # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
   # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
   # mock lane included, not only the Vulkan-only hosts the ticket started from.
@@ -798,7 +809,7 @@ Feature: GPU detection and system inspection
   # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
   # fails here.
   @id:examine-reports-this-hosts-rocm-support-level
-  Scenario: examine-54 - System inspection says whether this machine's GPU is supported by ROCm
+  Scenario: examine-55 - System inspection says whether this machine's GPU is supported by ROCm
     When the user inspects the system
     Then the inspection states this host's ROCm support level
     And the support level agrees with the GPU the inspection detected
@@ -815,7 +826,7 @@ Feature: GPU detection and system inspection
   # machine nobody has looked at, and the three scenarios are what keep those
   # answers distinguishable.
   @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
-  Scenario: examine-55 - A GPU the official stack rejects is told which way it can still run models
+  Scenario: examine-56 - A GPU the official stack rejects is told which way it can still run models
     Given a machine whose GPU has no official support but has a working Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -830,7 +841,7 @@ Feature: GPU detection and system inspection
   # why a failing probe must not be promoted to one), and this scenario covers
   # that narrower claim rather than the driverless host.
   @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
-  Scenario: examine-56 - A machine with no way to run models is not told it has one
+  Scenario: examine-57 - A machine with no way to run models is not told it has one
     Given a machine whose GPU has no official support and no Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -842,7 +853,7 @@ Feature: GPU detection and system inspection
   # reporting a GPU path - the one outcome the no-fallback rule exists to
   # prevent, reached through a backend rather than a policy change.
   @id:examine-does-not-count-a-software-renderer-as-a-gpu-path @requires-os:linux
-  Scenario: examine-57 - A software renderer does not count as a way to run on the GPU
+  Scenario: examine-58 - A software renderer does not count as a way to run on the GPU
     Given a machine whose GPU has no official support and only a software renderer
     When the user inspects that machine
     Then the inspection does not claim models can run through Vulkan
@@ -861,7 +872,7 @@ Feature: GPU detection and system inspection
   # examine-51's. Telling "no drivers" apart from "the tool is broken" needs the
   # loader's own message, which the shared capture discards.
   @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
-  Scenario: examine-58 - A machine that cannot be checked for Vulkan is not told either way
+  Scenario: examine-59 - A machine that cannot be checked for Vulkan is not told either way
     Given a machine whose GPU has no official support and no way to check Vulkan
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack

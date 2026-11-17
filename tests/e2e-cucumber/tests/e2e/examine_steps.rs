@@ -546,6 +546,54 @@ fn planted_setup_runtime_root(world: &E2eWorld) -> std::path::PathBuf {
         .join("setup-runtime")
 }
 
+#[given("the active runtime is a nightly runtime installed for one exact GPU")]
+async fn active_runtime_is_nightly_exact_target(world: &mut E2eWorld) {
+    use super::runtime_lifecycle_steps::{
+        NIGHTLY_EXACT_TARGET_KEY, plant_nightly_exact_target_runtime,
+    };
+    plant_nightly_exact_target_runtime(world);
+    // Black-box: plain JSON matching the CLI's on-disk config schema; every
+    // other field defaults. `examine` reads the active runtime from here.
+    let config_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("config");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config = serde_json::json!({ "active_runtime_key": NIGHTLY_EXACT_TARGET_KEY });
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[then(
+    "the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from"
+)]
+async fn runtime_state_names_active_provenance(world: &mut E2eWorld) {
+    use super::runtime_lifecycle_steps::{
+        NIGHTLY_DEVICE_TARGET, NIGHTLY_SOURCE, NIGHTLY_SOURCE_LAYOUT,
+    };
+    let out = world.cli_output.clone().unwrap_or_default();
+    for (field, expected) in [
+        ("active_runtime_channel", "nightly"),
+        ("active_runtime_source", NIGHTLY_SOURCE),
+        (
+            "active_runtime_source_layout_generation",
+            NIGHTLY_SOURCE_LAYOUT,
+        ),
+        ("active_runtime_device_target", NIGHTLY_DEVICE_TARGET),
+    ] {
+        assert_eq!(
+            field_value(&out, field),
+            Some(expected),
+            "examine must report {field} for the active runtime:\n{out}"
+        );
+    }
+}
+
 #[given("setup names a runtime folder the registry has forgotten")]
 async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
@@ -1713,7 +1761,7 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
 /// `World::command_env` -- so a planted host root never reaches the child and
 /// the CLI silently describes the *runner* instead. A scenario wired to that
 /// step still passes while reporting the lane's own GPU (`gfx942` on the MI300X
-/// runners) under a claim about a planted Renoir APU, so examine-55/56/57 must
+/// runners) under a claim about a planted Renoir APU, so examine-56/57/58 must
 /// use this one.
 #[when("the user inspects that machine")]
 async fn user_inspects_planted_machine_text(world: &mut E2eWorld) {
@@ -3673,7 +3721,7 @@ GPU0:
 /// must leave the host `Inconclusive`, while one that runs and lists nothing is
 /// the genuine "looked and found none" that earns a confirmed `Absent`. The
 /// earlier `exit 1` stub pinned exactly the conflation this probe exists to
-/// avoid, so examine-56 passed for the wrong reason.
+/// avoid, so examine-57 passed for the wrong reason.
 fn plant_unsupported_gpu(
     world: &mut E2eWorld,
     icd_manifest: Option<&str>,
@@ -3746,7 +3794,7 @@ async fn unsupported_gpu_without_vulkan(world: &mut E2eWorld) {
     plant_unsupported_gpu(world, None, None);
 }
 
-/// The *common* no-driver shape, and the one examine-56 does not cover: a host
+/// The *common* no-driver shape, and the one examine-57 does not cover: a host
 /// with no ICD and no `vulkaninfo` to ask. The probe must then report that it
 /// could not confirm, rather than either promising Vulkan or declaring it absent.
 ///
