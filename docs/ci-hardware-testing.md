@@ -46,9 +46,12 @@ been removed from `nightly.yml`: they never got a runner. The queue (below) is
 the scheduled run of R9700 (`r9700s`), MI350P (`mi350p`) and W7900
 (`w7900-dual`). The decommissioning of the runners themselves is separate.
 
-A pull request now runs on exactly one Linux GPU node and one Windows GPU
-pool: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
-the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
+A pull request now runs on one Linux GPU silicon and one Windows GPU pool,
+with two MI300X checks: `e2e-gpu-queue` (the primary: it dispatches
+`queue-pr-run.yml` on the shared GPU queue and publishes the queue run's
+release report as the `e2e-gpu-report` cell) and `e2e-gpu` (the secondary, on
+the self-hosted MI300X runner, reporting as `e2e-gpu-selfhosted-report`; the
+only lane where vLLM is the effective engine), and the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
 Ubuntu lane (`e2e-gpu-strix-ubuntu`) no longer starts on `pull_request` or in
 the merge queue; it keeps its `push`/dispatch triggers and also runs nightly
 (`e2e-gpu-nightly-strix` on the same shared Strix pool labels). There is no
@@ -208,8 +211,9 @@ mixed-silicon pool. `every_self_hosted_lane_pins_a_hardware_label` in
 the lane simply passes on the wrong GPU and reports under the label it was
 named for.
 
-No workflow other than [`queue-run.yml`](../.github/workflows/queue-run.yml)
-and [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) may name the
+No workflow other than [`queue-run.yml`](../.github/workflows/queue-run.yml),
+[`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) and
+[`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) may name the
 `queue-report` label.
 The shared-queue publishing runner carries that label alone, without GitHub's
 default `self-hosted`, OS and architecture labels, so a job reaches it only by
@@ -319,7 +323,7 @@ not applicable, instead of failing them on a premise the host cannot meet.
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
 `e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
-pull request runs only the MI300X and Windows Strix Halo pool lanes among them);
+pull request runs only the MI300X (queue and self-hosted) and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
 platforms (it adds MI300X's `e2e-gpu-nightly` and the Strix Halo Ubuntu,
 Windows and WSL2 nightly lanes) with the `@nightly` scenarios included. The

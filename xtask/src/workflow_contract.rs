@@ -10016,9 +10016,17 @@ permissions:
             1,
             "the gate declares its permissions once"
         );
-        // The whole block, so a second permission written beside it fails here.
-        assert!(
-            gate.contains("    permissions:\n      actions: write\n    "),
+        // The whole mapping, so a second permission written beside it fails here:
+        // every line indented under `permissions:` must be exactly this one.
+        let permissions: Vec<&str> = gate
+            .lines()
+            .skip_while(|line| *line != "    permissions:")
+            .skip(1)
+            .take_while(|line| line.starts_with("      "))
+            .collect();
+        assert_eq!(
+            permissions,
+            ["      actions: write"],
             "the gate's only permission is `actions: write`"
         );
         // A job whose `if` stays true through a cancellation is not cancelled,
@@ -10067,9 +10075,14 @@ permissions:
             gate.contains("HEAD_REF: ${{ github.event.pull_request.head.ref }}"),
             "the branch name must come through env"
         );
+        // Only the first step's script: stop at the next step, whose `with:` block
+        // may legitimately hold an expression.
         let script: Vec<&str> = gate
             .lines()
             .skip_while(|line| !line.trim_start().starts_with("run: |"))
+            .enumerate()
+            .take_while(|(i, line)| *i == 0 || !line.starts_with("      - name:"))
+            .map(|(_, line)| line)
             .collect();
         assert!(
             !script.iter().any(|line| line.contains("${{")),
