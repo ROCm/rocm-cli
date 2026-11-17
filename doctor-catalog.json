@@ -120,7 +120,7 @@
     },
     {
       "id": "fix-8-wheel-rocm",
-      "title": "Reinstall the framework against the system ROCm/HIP major",
+      "title": "Reinstall the framework against the system ROCm/HIP X.Y release",
       "platforms": [
         {
           "os": "linux",

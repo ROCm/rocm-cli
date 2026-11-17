@@ -18,9 +18,13 @@
 //! also holds `paths_equivalent` and `normalize_path_for_compare`, which adopt
 //! and uninstall both need, and the on-disk active-runtime marker
 //! (`ActiveRuntimeMarker`, `active_runtime_marker_path`,
-//! `active_runtime_marker_matches`) that activation writes and uninstall reads
-//! and clears. The serde shape of [`InstalledRuntimeManifest`] and its probe
-//! structs is the on-disk contract of the registry files and of each install's
+//! `active_runtime_marker_matches`, `write_active_runtime_marker`,
+//! `forget_active_runtime_rollback_target`) that activation and rollback write,
+//! and that uninstall reads, removes when it names the removed runtime as the
+//! one in use, and otherwise rewrites to drop that runtime as its rollback
+//! target; `runtimes_cmd.rs`'s module doc lists every writer and remover. The
+//! serde shape of [`InstalledRuntimeManifest`] and its probe structs is the
+//! on-disk contract of the registry files and of each install's
 //! `.rocm-cli-runtime.json`; the marker is user state too, and its serde shape
 //! is as fixed.
 
@@ -108,6 +112,18 @@ const fn devel_default_for_legacy_manifest() -> bool {
     true
 }
 
+/// The `selected_artifact_url` an adopted runtime records (`rocm runtimes
+/// adopt`). Adoption installs nothing, so there is no artifact to name; this
+/// marks that instead, and is never a package source.
+pub(crate) const ADOPTED_RUNTIME_ARTIFACT_URL: &str = "adopted-read-only";
+
+/// The value a provenance chain chose, trimmed, or `None` when there is none or
+/// it is blank. Applied once, after the chain has picked its field: a blank
+/// value is shown as `unrecorded`, it does not make the chain try the next one.
+fn recorded(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 impl InstalledRuntimeManifest {
     /// Whether this runtime has the compiler toolchain.
     ///
@@ -128,6 +144,49 @@ impl InstalledRuntimeManifest {
     /// the folder, so those cannot disagree about which runtimes are whose.
     pub(crate) const fn owns_install_root(&self) -> bool {
         !self.read_only && self.imported_from.is_none()
+    }
+
+    /// The source layout generation this runtime recorded: the manifest's own
+    /// field, else the one its wheel composition was written with. `None` when
+    /// neither is recorded.
+    ///
+    /// Shared by update planning (which treats `None` as the canonical stream)
+    /// and by [`Self::provenance`], so both choose the same recorded field.
+    /// They differ in what they do with its value: update planning uses it
+    /// as recorded, while the listing trims it and prints a blank one (or
+    /// `None`) as `unrecorded`.
+    pub(crate) fn recorded_source_layout_generation(&self) -> Option<&str> {
+        self.source_layout_generation.as_deref().or_else(|| {
+            self.wheel_composition
+                .as_ref()
+                .map(|composition| composition.source_layout_generation.as_str())
+        })
+    }
+
+    /// Where this runtime came from, as far as its manifest recorded it.
+    ///
+    /// The layout and target come from the same recorded field update planning
+    /// uses, through [`Self::recorded_source_layout_generation`] and
+    /// [`wheel_composition_device_target`]; the source is the package index,
+    /// else the artifact URL unless it is the adoption marker. Each chain moves
+    /// to its next field only when a field is absent. The chosen value then
+    /// goes through [`recorded`], which trims it and turns a blank one into
+    /// `None` (shown as `unrecorded`) rather than skipping it.
+    pub(crate) fn provenance(&self) -> RuntimeProvenance<'_> {
+        RuntimeProvenance {
+            channel: recorded(Some(self.channel.as_str())),
+            // A wheel install records the package index it resolved from; a
+            // tarball install records only the archive it downloaded. An
+            // adopted runtime records neither, only the adoption marker.
+            source: recorded(self.index_url.as_deref().or_else(|| {
+                Some(self.selected_artifact_url.as_str())
+                    .filter(|url| *url != ADOPTED_RUNTIME_ARTIFACT_URL)
+            })),
+            source_layout_generation: recorded(self.recorded_source_layout_generation()),
+            device_target: recorded(wheel_composition_device_target(
+                self.wheel_composition.as_ref(),
+            )),
+        }
     }
 
     pub(crate) fn normalize_host_paths(mut self) -> Self {
@@ -166,6 +225,50 @@ impl InstalledRuntimeManifest {
             probe.normalize_storage_paths();
         }
         self
+    }
+}
+
+/// Printed in place of a provenance fact the runtime's manifest does not record.
+///
+/// Older manifests predate some of these fields, and a tarball install never
+/// had an exact GPU target. [`RuntimeProvenance::fields`] shows this for a fact
+/// [`InstalledRuntimeManifest::provenance`] left `None`: its chain of recorded
+/// fields found nothing, or found a blank value. Neither ever guesses one fact
+/// from another — a target from the family, or a layout from the channel,
+/// would read as something the install recorded.
+pub(crate) const UNRECORDED_PROVENANCE: &str = "unrecorded";
+
+/// Where an installed runtime came from: the channel, the package source it was
+/// resolved from, the source layout generation, and the exact GPU target its
+/// packages were installed for. Every field is what the manifest recorded,
+/// trimmed, and `None` when it recorded nothing or a blank value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeProvenance<'a> {
+    pub channel: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub source_layout_generation: Option<&'a str>,
+    pub device_target: Option<&'a str>,
+}
+
+impl RuntimeProvenance<'_> {
+    /// Each fact as `(name, shown value)`, in display order, with
+    /// [`UNRECORDED_PROVENANCE`] for a fact that was not recorded.
+    ///
+    /// `rocm runtimes list` and `rocm examine` both print from this, so the
+    /// names and values the two show for one runtime cannot drift apart.
+    pub(crate) fn fields(&self) -> [(&'static str, &str); 4] {
+        fn shown(value: Option<&str>) -> &str {
+            value.unwrap_or(UNRECORDED_PROVENANCE)
+        }
+        [
+            ("channel", shown(self.channel)),
+            ("source", shown(self.source)),
+            (
+                "source_layout_generation",
+                shown(self.source_layout_generation),
+            ),
+            ("device_target", shown(self.device_target)),
+        ]
     }
 }
 
@@ -769,6 +872,81 @@ pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("runtimes").join("active.json")
 }
 
+/// Replace the active-runtime marker in one step.
+///
+/// Two `rocm` processes can activate a runtime against the same data
+/// directory at once (two terminals, a script), so the write goes through the
+/// shared atomic writer: each writer stages into its own exclusively created
+/// temp file, and the marker is replaced rather than removed first, so a
+/// reader always finds a complete marker: on Windows the publish renames first,
+/// which replaces in one step. Only when that rename fails, because another
+/// process holds the marker open without delete sharing, does it fall back to
+/// `ReplaceFileW`, and a `ReplaceFileW` that fails part-way can leave the marker
+/// missing, which the writer repairs with a plain rename when that succeeds
+/// (see `rocm_core::atomic_write`); two replacements in flight at once through
+/// the fallback are not tested. It does not order the two activations: whichever
+/// publishes last wins.
+pub(crate) fn write_active_runtime_marker(
+    paths: &AppPaths,
+    marker: ActiveRuntimeMarker,
+) -> Result<()> {
+    let path = active_runtime_marker_path(paths);
+    // The shared helper rather than a local temp-file-and-rename: it is the same
+    // write the failed-activation restore uses, and it is strictly stronger than
+    // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
+    // sharing violation when another process holds the marker open. The helper
+    // renames first there and falls back to `ReplaceFileW` when that fails. The
+    // destination is never removed first, on any platform — that would leave a
+    // window with no marker at all, which runtime resolution and the storage
+    // retention holds both read as "nothing is active" — and a failed publish
+    // takes its temp file with it, so a retried activation cannot strand one in
+    // the folder `rocm runtimes` reads. The one exception is a Windows publish
+    // that took the old marker away and could not put the new one in place:
+    // the temp file is then the only copy, so it is kept and the error names
+    // it; a failed activation removes it again once the restore has put the
+    // previous marker back (`runtimes_cmd::discard_failed_marker_replacement`).
+    // It also creates the `runtimes` folder when it is missing.
+    let bytes =
+        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
+    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write active runtime marker {}", path.display()))
+}
+
+/// Drops `runtime_key` from the active-runtime marker's rollback target, keeping
+/// every other field, and returns whether the marker changed.
+///
+/// The read-modify-write of the marker for a removed runtime: no marker
+/// (nothing, or something other than a file, at its path), one with no rollback
+/// target, and one whose rollback target is another runtime are all left alone:
+/// it returns `false` and writes nothing. The write is
+/// [`write_active_runtime_marker`], the one activation uses.
+pub(crate) fn forget_active_runtime_rollback_target(
+    paths: &AppPaths,
+    runtime_key: &str,
+) -> Result<bool> {
+    let marker_path = active_runtime_marker_path(paths);
+    // As in `active_runtime_marker_matches`: anything but a file there is no
+    // marker, so there is no rollback target to drop.
+    if !marker_path.is_file() {
+        return Ok(false);
+    }
+    let bytes = fs::read(&marker_path)
+        .with_context(|| format!("failed to read {}", marker_path.display()))?;
+    let mut marker: ActiveRuntimeMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", marker_path.display()))?;
+    if !marker
+        .previous_runtime_key
+        .as_deref()
+        .is_some_and(|previous| previous.eq_ignore_ascii_case(runtime_key))
+    {
+        return Ok(false);
+    }
+    marker.previous_runtime_key = None;
+    marker.previous_runtime_id = None;
+    write_active_runtime_marker(paths, marker)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +1004,20 @@ mod tests {
             devel: true,
             installed_at_unix_ms,
         }
+    }
+
+    /// The adoption marker is persisted manifest format: every runtime adopted
+    /// so far holds this exact string in its `selected_artifact_url` on disk,
+    /// and the listing recognises it by comparison. Changing the value without
+    /// a migration would make those runtimes list the marker as their package
+    /// source. In-crate code — the producer, the reader and the other unit
+    /// tests — uses the constant, so it cannot notice the value changing. Two
+    /// checks pin the on-disk literal instead: this test, and scenario
+    /// `runtime-lifecycle-22`, whose `plant_adopted_runtime` step writes the
+    /// literal into a manifest and expects it listed as `source=unrecorded`.
+    #[test]
+    fn adoption_marker_keeps_its_persisted_value() {
+        assert_eq!(ADOPTED_RUNTIME_ARTIFACT_URL, "adopted-read-only");
     }
 
     /// A manifest from before compositions were recorded has only the field,
@@ -1773,5 +1965,91 @@ mod tests {
             format!("install root is missing: {}", install_root.display())
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    fn marker_with_previous(previous_key: &str) -> ActiveRuntimeMarker {
+        ActiveRuntimeMarker {
+            runtime_id: "therock-nightly:gfx1151".to_owned(),
+            runtime_key: "nightly-pip-gfx1151-7-14-0a1".to_owned(),
+            manifest_path: PathBuf::from("registry/nightly-pip-gfx1151-7-14-0a1.json"),
+            install_root: PathBuf::from("wheel/nightly-pip-gfx1151-7-14-0a1"),
+            previous_runtime_id: Some("therock-release:gfx1151".to_owned()),
+            previous_runtime_key: Some(previous_key.to_owned()),
+            activated_at_unix_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// A rollback target that names another runtime is not this uninstall's to
+    /// drop: the marker is left byte for byte as it was.
+    #[test]
+    fn forgetting_a_rollback_target_leaves_a_marker_naming_another_runtime_untouched() -> Result<()>
+    {
+        let (root, paths) = test_paths("forget-rollback-other-runtime");
+        write_active_runtime_marker(&paths, marker_with_previous("release-pip-gfx1151-7-13-0"))?;
+        let before = fs::read(active_runtime_marker_path(&paths))?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "release-pip-gfx1151-7-12-0")?;
+
+        assert!(!changed);
+        assert_eq!(fs::read(active_runtime_marker_path(&paths))?, before);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A marker with no rollback target has nothing to drop: it is left byte
+    /// for byte as it was.
+    #[test]
+    fn forgetting_a_rollback_target_leaves_a_marker_without_one_untouched() -> Result<()> {
+        let (root, paths) = test_paths("forget-rollback-none");
+        let mut marker = marker_with_previous("release-pip-gfx1151-7-13-0");
+        marker.previous_runtime_id = None;
+        marker.previous_runtime_key = None;
+        write_active_runtime_marker(&paths, marker)?;
+        let before = fs::read(active_runtime_marker_path(&paths))?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "release-pip-gfx1151-7-13-0")?;
+
+        assert!(!changed);
+        assert_eq!(fs::read(active_runtime_marker_path(&paths))?, before);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Runtime keys compare without regard to case everywhere else in the
+    /// registry, so a case variant of the rollback target is the same runtime.
+    #[test]
+    fn forgetting_a_rollback_target_matches_its_key_without_regard_to_case() -> Result<()> {
+        let (root, paths) = test_paths("forget-rollback-case");
+        write_active_runtime_marker(&paths, marker_with_previous("release-pip-gfx1151-7-13-0"))?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "RELEASE-PIP-GFX1151-7-13-0")?;
+
+        assert!(changed);
+        let after: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        assert_eq!(after.previous_runtime_key, None);
+        assert_eq!(after.previous_runtime_id, None);
+        let in_use = "nightly-pip-gfx1151-7-14-0a1";
+        assert_eq!(after.runtime_key, in_use);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// With no marker there is no rollback target to drop, and that is not an
+    /// error: uninstalling a runtime that was never activated must succeed. It
+    /// leaves the data folder as it found it: no marker, and not even the
+    /// `runtimes` folder the marker writer would create.
+    #[test]
+    fn forgetting_a_rollback_target_without_a_marker_changes_nothing() -> Result<()> {
+        let (root, paths) = test_paths("forget-rollback-no-marker");
+        fs::create_dir_all(&paths.data_dir)?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "release-pip-gfx1151-7-13-0")?;
+
+        assert!(!changed);
+        assert!(!active_runtime_marker_path(&paths).exists());
+        assert_eq!(fs::read_dir(&paths.data_dir)?.count(), 0);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 }

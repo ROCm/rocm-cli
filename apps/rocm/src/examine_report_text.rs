@@ -326,6 +326,12 @@ pub(crate) fn append_examine_runtime_state(
             "managed"
         };
         let _ = writeln!(output, "  active_runtime_mode: {mode}");
+        // Where the active runtime came from, from the same fields and in the
+        // same words as the `provenance:` line `rocm runtimes list` prints for
+        // it, so the two commands cannot describe one runtime differently.
+        for (name, value) in manifest.provenance().fields() {
+            let _ = writeln!(output, "  active_runtime_{name}: {value}");
+        }
     }
     if let Some((setup_root, pip_cache_dir)) = setup_runtime_paths(config) {
         let _ = writeln!(output, "  setup_runtime_root: {}", setup_root.display());
@@ -614,6 +620,7 @@ mod tests {
             wsl: None,
             managed_runtime_count,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),

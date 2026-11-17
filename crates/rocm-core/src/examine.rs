@@ -124,7 +124,7 @@ pub struct WslFacts {
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
     /// Whether `librocdxg.so` is in the same `lib` directory as a
-    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` runpath. A
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` search path. A
     /// TheRock tarball is laid out this way and is never in the linker cache.
     /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
     /// can ask it from outside the distribution.
