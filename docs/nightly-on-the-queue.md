@@ -56,6 +56,69 @@ third dispatch, or the nightly schedule, replaces a dispatch still waiting
 and that one never runs. The branch must exist in this repository;
 otherwise the job fails at once.
 
+## Pull requests
+
+A pull request from this repository also runs its MI300X check on the queue.
+The gate job `e2e-gpu-queue` in
+[`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml) runs on a
+GitHub-hosted runner, holds no queue credential and needs only `actions: write`:
+it dispatches [`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) on
+`main` with the pull request's branch, waits for that run, and publishes the
+release-channel report of the MI300X lane as `e2e-gpu-report`, the MI300X cell
+of the consolidated report. The run's files are the artifact
+`queue-pr-run-results` from `queue-pr-run.yml`, as `queue-run-results` is
+`queue-run.yml`'s.
+The self-hosted MI300X lane of the same pull request uploads
+`e2e-gpu-selfhosted-report`, shown beside it as "MI300X (self-hosted)": the queue
+run is the primary MI300X check and the self-hosted one the second.
+
+A pull request's run is a preset of the queue side: one GPU model (MI300X), the
+`release` channel alone and no `@nightly` scenarios, a lane that waits at most 45
+minutes to be started and runs at most 75, and a limited number of such runs
+at once (the queue side sets the limit). The
+queue side does not take one while the nightly goes, or when it has no healthy
+MI300X worker: the gate job then fails with the reason the queue gave, which is
+capacity, not a failing test (the consolidated report's missing-report check
+then flags the lane too). The nightly window is the exception, being by design:
+the gate ends green with a note in its summary to re-run once the window has
+passed (the queue side defines the window), and
+the consolidated report reads the lane as skipped, not missing. A superseded push cancels the gate job, which cancels
+the run it started, freeing the runner; the queue side's lanes are left to their
+own budgets. The queue run tests the branch as it is when the run starts, not
+the pull request's merge with its base, which the self-hosted lane checks out.
+A pull request from a fork gets no queue run, since
+its token cannot dispatch, and neither does one from Dependabot, whose token is
+read-only whatever the workflow asks for (its gate is skipped) and the queue only checks out branches of this
+repository. `e2e-selfhosted.yml` is the only workflow that may name
+`queue-pr-run.yml`; the runner is set up to run `queue-pr-run.yml` only as it is
+on `main`, never the pull request's own copy of any workflow.
+
+**Merge order.** The queue side (the runner's allow-list and the pull request
+run kind) goes live before the gate does anything. The gate is switched by the
+repository variable `QUEUE_PR_GATE`: until it is `true` the gate ends green with
+a note in its summary, as a skip, not a pass of the MI300X check, and the
+self-hosted `e2e-gpu` is the only MI300X check that runs. Set it once the queue
+side is deployed. Without it, merging `queue-pr-run.yml` first would turn every
+pull request red.
+
+The gate and the queue side agree on two things, and the queue side is not in
+this repository, so the gate's tests pin the gate's half only (the
+`queue_gate_script_*` tests in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs), whose fixtures use
+the same two constants the script is checked against):
+
+- **A refusal.** A run the queue did not take publishes `refused.txt` in
+  `queue-pr-run-results`, whose first line is the reason. A reason that starts
+  with `nightly:` is the nightly window and skips the gate; any other reason
+  fails it.
+- **The report.** The MI300X lane's release-channel report is
+  `mi300x/release/results/report.json` in that artifact, and its whole
+  `results` directory is the job's report. A run with none fails the gate.
+
+GitHub cancels an older run of a branch that is still pending when a newer run
+of the same branch is dispatched; the gate of the older run then sees a run
+that left no report, and fails with that message.
+
 ## Publishing a finished run
 
 Dispatch `nightly-queue.yml` with a run's `request_id` — the id its
@@ -268,10 +331,14 @@ log.
 
 ## What the workflow requires
 
-- a self-hosted Linux runner registered with the `queue-report` label alone,
+- self-hosted Linux runners registered with the `queue-report` label alone,
   without GitHub's default `self-hosted`, OS and architecture labels, so only a
-  job naming `queue-report` lands on it, providing
-  the queue side's publish command and read access to the queue side's results
+  job naming `queue-report` lands on them, each providing
+  the queue side's publish command and read access to the queue side's results.
+  Each run holds a runner for as long as it lasts, so there are as many runners
+  as runs may go at once (the queue side limits pull request runs to that
+  number); a job beyond them waits in GitHub's queue, outside the queue side's
+  limits, and a gate job that waits for such a job can reach its own timeout
 - a registered runner name and host name that do not identify internal
   infrastructure, since GitHub prints both into every job log
 
@@ -285,7 +352,7 @@ this repository can still name the runner's label, which is one reason the
 runner holds no credential, below. On `main`, the tests also refuse any
 other workflow that names the `queue-report` label or these workflows, so none
 sends a job to the runner or waits on them by mistake. The runner is set up to
-run only these two workflows as they are on `main`, by a check on the runner
+run only the allow-listed queue workflows as they are on `main`, by a check on the runner
 that runs before any step. That check lives outside this repository, so
 nothing here can verify it; the runner is still treated as untrusted, as above
 and below. Whether this
@@ -325,7 +392,7 @@ file.
 credential and sends nothing to the queue: the runner, which sits next to the
 queue side, asks it for a run of a branch, and the queue side starts it with
 its own credential. It believes the request because of where it comes from,
-which is why the runner is set up to run only these two workflows from `main`
+which is why the runner is set up to run only the allow-listed queue workflows from `main`
 (a setting outside this repository). A request can start a run of a branch
 already in this repository, and that branch's lane command then runs in the
 lane pods. The lane spec gives those pods no queue or cluster credential and

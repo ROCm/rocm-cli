@@ -53,6 +53,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::e2e_prewarm_vision::{repair_torchvision_mismatch, verify_runtime_imports};
 use crate::paths::{binary_name, release_binary_dir, workspace_root};
 
 /// What the pre-warm should do with the shared tree, given the current
@@ -336,6 +337,19 @@ pub fn assess(runtimes_list_report: &str, runtimes_dir: &Path) -> Vec<PoisonedRu
         });
     }
     poisoned
+}
+
+/// Whether the `rocm update` report says the runtime `runtime_key` is
+/// `ahead_of_index`: newer than anything the index offers, so a reinstall could
+/// only roll it back (see [`decide`]).
+#[must_use]
+pub(crate) fn runtime_ahead_of_index(update_report: &str, runtime_key: &str) -> bool {
+    update_report
+        .lines()
+        .filter_map(RuntimeLine::parse)
+        .any(|line| {
+            line.runtime_key == runtime_key && line.status.as_deref() == Some("ahead_of_index")
+        })
 }
 
 /// One `  {marker} <key> runtime_id=… format=… mode=… status=…` line from
@@ -664,6 +678,11 @@ pub fn run(
     // Repairing first means `decide` reads a registry with nothing dead in it.
     repair_poisoned_runtimes(&rocm, prewarm_dir)?;
 
+    // Likewise a runtime whose torch and torchvision no longer match: remove it so
+    // `decide` below reads a registry without it. Before the dangling-pointer
+    // repair, which cleans up after this removal as it does after the one above.
+    let repair_declined = repair_torchvision_mismatch(&rocm, prewarm_dir, pin.is_some())?;
+
     // And point the tree at something that exists before anything resolves the
     // active runtime. Must run after the repair above, which can itself remove
     // the runtime the pointer names.
@@ -797,7 +816,17 @@ pub fn run(
     // runtime with no engine, which is the one thing those lanes exist to
     // exercise. Re-checking a warm tree is cheap: without `--reinstall`,
     // `engines install` on a ready engine installs nothing.
-    ensure_default_engine(&rocm, prewarm_dir)?;
+    let engine = ensure_default_engine(&rocm, prewarm_dir)?;
+
+    // Also unconditional and before the reuse return, for the same reason: a
+    // persisted runtime can be current by version and still unusable.
+    verify_runtime_imports(
+        &rocm,
+        prewarm_dir,
+        runtime_changed(&decision),
+        &engine,
+        repair_declined,
+    )?;
 
     if !runtime_changed(&decision) {
         return Ok(());
@@ -856,7 +885,20 @@ const fn runtime_changed(decision: &Decision) -> bool {
 /// path: reusing a stale-but-working runtime keeps a lane meaningful, whereas
 /// serving with no engine fails every GPU scenario later and for reasons that
 /// name none of this.
-fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+///
+/// Returns the engine it ensured, so the checks after it can ask what that engine
+/// needs of the runtime.
+fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+    let engine = default_engine(rocm, prewarm_dir)?;
+    println!("pre-warm: ensuring the {engine} engine is installed");
+    rocm_command(rocm, prewarm_dir)
+        .args(["engines", "install", &engine, "--yes"])
+        .status_ok("rocm engines install")?;
+    Ok(engine)
+}
+
+/// The engine `rocm engines list` marks as the default for this host.
+pub(crate) fn default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
     let output = rocm_command(rocm, prewarm_dir)
         .args(["engines", "list"])
         .output()
@@ -865,12 +907,9 @@ fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
         bail!("`rocm engines list` exited with {}", output.status);
     }
     let inventory = String::from_utf8_lossy(&output.stdout);
-    let engine = default_engine_from_inventory(&inventory)
-        .context("`rocm engines list` did not identify a default engine")?;
-    println!("pre-warm: ensuring the {engine} engine is installed");
-    rocm_command(rocm, prewarm_dir)
-        .args(["engines", "install", engine, "--yes"])
-        .status_ok("rocm engines install")
+    default_engine_from_inventory(&inventory)
+        .map(str::to_owned)
+        .context("`rocm engines list` did not identify a default engine")
 }
 
 /// The engine `rocm engines list` marks as the default for this host, if any.
@@ -1052,7 +1091,7 @@ fn list_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
 
 /// Ask the CLI whether the installed runtimes are current. Check-only: plain
 /// `rocm update` without `--apply` never mutates state.
-fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+pub(crate) fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
     let output = rocm_command(rocm, prewarm_dir)
         .arg("update")
         .output()
@@ -1072,7 +1111,7 @@ fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
 /// The three `ROCM_CLI_*` directories are what make this a SHARED tree rather
 /// than the caller's own; `HF_HOME` / `UV_CACHE_DIR` are inherited from the job
 /// environment, which the lanes already export.
-fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
+pub(crate) fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
     let mut cmd = Command::new(rocm);
     cmd.env("ROCM_CLI_CONFIG_DIR", prewarm_dir.join("config"))
         .env("ROCM_CLI_DATA_DIR", prewarm_dir.join("data"))
@@ -1082,7 +1121,7 @@ fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
 
 /// Run a command for its exit status, turning a non-zero exit into an error that
 /// names the command.
-trait StatusOk {
+pub(crate) trait StatusOk {
     fn status_ok(&mut self, what: &str) -> Result<()>;
 }
 
@@ -2042,5 +2081,45 @@ message=connect timed out after 30 s";
         assert!(RuntimeLine::parse("    cli: installed=0.1.0 status=not_configured").is_none());
         // …and end to end, the real empty report still resolves to a cold install.
         assert_eq!(decide(EMPTY, "release", None), Decision::Install);
+    }
+
+    /// `run` is never called by a test, so what keeps the checks where the
+    /// comments on them say is this reading of `run`'s own code: comment lines
+    /// are dropped, and each call must appear in order. The repair comes before
+    /// the freshness decision and the dangling-pointer repair; the check comes
+    /// after the engine check and before the reuse return, which a warm tree
+    /// takes every time. Formatting and unrelated edits do not move these.
+    #[test]
+    fn ahead_of_index_is_read_for_the_named_runtime_only() {
+        let report = "runtime a channel=release status=ahead_of_index\n\
+                      runtime b channel=release status=up_to_date\n";
+        assert!(runtime_ahead_of_index(report, "a"));
+        assert!(!runtime_ahead_of_index(report, "b"));
+        assert!(!runtime_ahead_of_index(report, "c"));
+    }
+
+    #[test]
+    fn the_import_checks_run_where_their_comments_say() {
+        // A Windows checkout may use CRLF line endings.
+        let source = include_str!("e2e_prewarm.rs").replace("\r\n", "\n");
+        let start = source.find("pub fn run(").expect("run exists");
+        let end = source[start..].find("\n}\n").expect("run ends") + start;
+        let code: String = source[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let position = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is not called in run"))
+        };
+        let repair = position("repair_torchvision_mismatch(");
+        let dangling = position("repair_dangling_active_runtime(");
+        let decision = position("let decision =");
+        let engine = position("ensure_default_engine(");
+        let check = position("verify_runtime_imports(");
+        let reuse_return = position("if !runtime_changed(&decision)");
+        assert!(repair < dangling && dangling < decision);
+        assert!(decision < engine && engine < check && check < reuse_return);
     }
 }

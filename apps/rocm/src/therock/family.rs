@@ -223,7 +223,7 @@ fn target_is_vulkan_only(value: &str) -> bool {
 /// reachable only on a host with at least one such card, and the pre-flight
 /// therefore sees ordinal 0. `rocm_core`'s
 /// `a_gfx90c_host_the_kernel_gives_no_compute_node_still_has_a_usable_gpu`
-/// drives both halves off one planted `/sys`, and serve-61 runs the real binary
+/// drives both halves off one planted `/sys`, and serve-62 runs the real binary
 /// against that same host shape on a GPU-less lane.
 fn unsupported_host_gpu_message(raw_arch: &str) -> String {
     format!(
