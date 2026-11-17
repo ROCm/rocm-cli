@@ -4,9 +4,11 @@
 
 //! Version grammar for TheRock runtimes: the strict gate an install is routed
 //! on ([`parse_version`]), the PEP 440 ordering used to pick the newest build
-//! ([`compare_version_strings`], [`version_relation`]), the host-version
-//! reader, and the build-date helpers behind `--build-date` and the version
-//! display.
+//! ([`compare_version_strings`], [`version_relation`]), the `--version`
+//! request grammar (an exact `major.minor.patch`, or a `major.minor` line pin
+//! read by [`stable_release_line_pin`] that matches the stable releases of that
+//! line), the host-version reader, and the build-date helpers behind
+//! `--build-date` and the version display.
 //!
 //! A leaf of the `therock` module: nothing here depends on the rest of it.
 

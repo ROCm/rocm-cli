@@ -195,7 +195,7 @@ fn published_build_of(versions: &[String], release: &str) -> Option<String> {
 /// against that build's torch — the same choice `uv` made unaided when the
 /// pinned build was also the newest one on the index.
 ///
-/// Not [`select_latest_stack_package`]: [`parse_version`] reads only
+/// Not `select_latest_stack_package` (in `wheel.rs`): `parse_version` reads only
 /// `major.minor.patch` and rejects the rest, and torchaudio publishes rebuilds
 /// as extra release segments (`2.11.0.2`, `2.11.0.3`), so that would drop every
 /// rebuild and settle on the original `2.11.0` build.
