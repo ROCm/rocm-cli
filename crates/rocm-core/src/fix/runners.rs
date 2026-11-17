@@ -181,8 +181,9 @@ fn run_unset_override_linux() -> i32 {
 /// Takes the paths rather than deriving them from `$HOME`, for the same reason
 /// [`pin_device_in_rc_file`] takes its rc path: it makes the promise testable
 /// without mutating a process-global. And the promise needs testing — fix-2 is
-/// flagged `auto_applicable`, so `skills/rocm-doctor/` has to say plainly that
-/// this arm still only reports, and something has to hold that true.
+/// `FixClass::Auto` on Windows and `FixClass::PrintOnly` here, yet it still
+/// has a runner that this arm is part of, so `skills/rocm-doctor/` has to say
+/// plainly that this arm only reports, and something has to hold that true.
 fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
     let hits: Vec<&PathBuf> = candidates
         .iter()

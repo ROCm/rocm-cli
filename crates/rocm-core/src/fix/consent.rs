@@ -258,10 +258,9 @@ pub(super) fn confirm(prompt: &str, assume_yes: bool) -> bool {
 mod tests {
     use super::*;
 
-    /// Restored, not new. This PR made the `wsl` arm of the platform lookup
-    /// carry more weight, not less -- it now drives the per-platform class, the
-    /// plan, the recipe printer and the listing -- so the guard tying that arm
-    /// to the real host detector matters more here than it did before.
+    /// The `wsl` answer selects the per-platform class, the plan, the recipe
+    /// printer and the listing, so it must be the real host detector's answer
+    /// and not a second, drifting one.
     #[test]
     fn current_os_reports_wsl_exactly_when_is_wsl_host_does() {
         // `current_os()`'s wsl branch is `crate::is_wsl_host()`, which is
@@ -334,6 +333,18 @@ mod tests {
     /// exit is exit 4, a timeout says "timed out" with the bound it ran under,
     /// and only a command that ran to its own end (or never started) is
     /// reported as having changed nothing.
+    ///
+    /// This pins the wording against a stand-in step. What each line claims is
+    /// proved where a runner prints it, in `fix/runners.rs`:
+    /// `render_group_child_failure_says_nothing_changed_and_returns_4` and
+    /// `unset_override_setx_failure_returns_4` (an exit code: NOT changed);
+    /// `render_group_missing_program_says_it_could_not_start` (never started);
+    /// `render_group_timeout_says_timed_out_and_how_to_check_not_that_nothing_changed`
+    /// and `unset_override_setx_timeout_says_timed_out_and_how_to_check` (a
+    /// timeout: may have changed, how to check, what to re-run); and
+    /// `every_rerun_id_names_a_recipe_with_a_runner` (the re-run command exists).
+    /// No runner test drives `WaitFailed` or `Signaled`; they take the
+    /// timeout's "may or may not have changed" wording from this match.
     #[test]
     fn step_failure_reports_each_outcome_with_its_own_wording() {
         for outcome in [
@@ -401,6 +412,11 @@ mod tests {
         assert!(line.starts_with("setx timed out after 8s "), "{line}");
     }
 
+    /// Pins the wording. That a runner really stops before writing anything
+    /// after a failed read is proved in `fix/runners.rs` by
+    /// `pin_device_read_timeout_stops_before_setx`,
+    /// `unset_override_user_read_timeout_stops_before_anything_is_reported_or_cleared`
+    /// and `a_read_that_exits_non_zero_stops_every_windows_fix_without_writing`.
     #[test]
     fn a_failed_read_says_nothing_was_changed() {
         assert_eq!(

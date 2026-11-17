@@ -275,20 +275,33 @@ passes — the GPU is AMD or no vendor was named.
      present the printed catalog entry as a preview, and do not hand the user
      its commands (such as `setx HIP_VISIBLE_DEVICES <dGPU-index>`) instead.
    - `… NOT changed.` — the command ran and failed, or could not start.
-     Nothing was changed. The exception is a line saying `exited 124`, which
-     is how an older CLI reports a timed-out step: the change may or may not
-     have landed. Say so, have the user check (`id -nG <user>` for
-     `fix-4-render-group`; on Windows, in PowerShell,
-     `[Environment]::GetEnvironmentVariable('<VAR>','User')` with `<VAR>`
-     being `HSA_OVERRIDE_GFX_VERSION`, `PATH` or `HIP_VISIBLE_DEVICES` for
-     fix-2, fix-6 or fix-9), and offer to re-run the same `rocm fix` command
-     if it did not land.
+     Nothing was changed, unless the line says `exited 124` or `exited -1`
+     (see below).
    - `… may or may not have changed. Check … then re-run …` — the command
      timed out or was killed. Relay the check (on Windows, an expression to run
      in PowerShell) and the `rocm fix` command to re-run; claim neither that
      the fix was applied nor that nothing changed until the check has run.
    - `Failed to write <file>: …` — the rc-file append failed; have the user
      look at that file.
+
+   Some CLIs that pass the Phase 0 contract check are older than these lines
+   and report two cases differently:
+
+   - A `NOT changed` line saying `exited 124` (timed out) or `exited -1`
+     (killed by a signal) does not prove nothing changed: the change may or
+     may not have landed. Say so, have the user check (`id -nG <user>` for
+     `fix-4-render-group`; on Windows, in PowerShell,
+     `[Environment]::GetEnvironmentVariable('<VAR>','User')` with `<VAR>`
+     being `HSA_OVERRIDE_GFX_VERSION`, `PATH` or `HIP_VISIBLE_DEVICES` for
+     fix-2, fix-6 or fix-9), and offer to re-run the same `rocm fix` command
+     if it did not land.
+   - On Windows such a CLI takes a failed read for an unset variable, so a
+     clean result is not proof. `fix-2-unset-override` can say
+     `No persistent HSA_OVERRIDE_GFX_VERSION found` and that the user is done,
+     and exit 0, with the override still set; `fix-9-igpu-dgpu --device-index N`
+     can run `setx` over a value the user set on purpose. Have the user run
+     that PowerShell check for fix-2 before calling it done, and for fix-9
+     before applying it.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 

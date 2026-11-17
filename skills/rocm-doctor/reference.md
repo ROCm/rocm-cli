@@ -105,7 +105,7 @@ id is refused, and the refusal exits 1 (see the table). Exit codes:
 | 1 | internal error; also the refusal of `--json` together with a fix id |
 | 2 | usage error (incl. unknown fix-id) |
 | 3 | not applicable on this host (OS mismatch, negative `--device-index`) — nothing changed |
-| 4 | attempted but the command failed or timed out; after a timeout the change may be partial — the message names how to check it and what to re-run. Also, on Windows only, `fix-2-unset-override`, `fix-6-path` or `fix-9-igpu-dgpu --device-index N` when it could not read the current value of the variable it changes, `--dry-run` included — nothing changed and no plan shown; the catalog entry printed first is the fix's generic description, not a preview of the change on this machine |
+| 4 | attempted but the command failed or timed out; after a timeout the change may be partial — the message names how to check it and what to re-run (an older CLI instead prints `exited 124` or `exited -1` with `NOT changed`; see step 3 in [SKILL.md](SKILL.md)). Also, on Windows only, `fix-2-unset-override`, `fix-6-path` or `fix-9-igpu-dgpu --device-index N` when it could not read the current value of the variable it changes, `--dry-run` included — nothing changed and no plan shown; the catalog entry printed first is the fix's generic description, not a preview of the change on this machine |
 | 5 | user declined at the prompt |
 
 Three ids are ever auto-applicable — never four, and `fix-9-igpu-dgpu` is not
