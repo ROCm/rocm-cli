@@ -107,7 +107,7 @@ pub fn run(
         windows_result,
         e2e_report_job_result,
     );
-    facts.queue_absent = queue_absent_reason(&e2e_text);
+    facts.note_queue_absent(queue_absent_reason(&e2e_text));
 
     // Trailing newline so the file ends like a text file.
     write_parented(out, &format!("{}\n", serde_json::to_string_pretty(&facts)?))?;
@@ -173,6 +173,18 @@ fn assemble_facts(
         queue_absent: None,
         commits,
         known_issues,
+    }
+}
+
+impl Facts {
+    /// Record that the queue's lanes are not in the report. A queue that never
+    /// ran is not a pass, so this is a failing gate: the verdict is NO-GO.
+    fn note_queue_absent(&mut self, reason: Option<String>) {
+        let Some(reason) = reason else { return };
+        self.failing_gates
+            .push(format!("queue lanes absent: {reason}"));
+        self.verdict = Verdict::NoGo;
+        self.queue_absent = Some(reason);
     }
 }
 
@@ -545,8 +557,8 @@ pub(crate) fn render_table(facts: &Facts) -> String {
         let _ = writeln!(
             out,
             "⚠️ **The shared queue's GPU lanes are not in tonight's report** ({}). The E2E row \
-             above does not cover them, so a GO here does not cover R9700, MI350P, W7900 or the \
-             queue's blocking lanes.\n",
+             above does not cover R9700, MI350P, W7900 or the queue's blocking lanes, and a queue \
+             that did not run is not a pass: the verdict is NO-GO.\n",
             escape_markdown(reason)
         );
     }
@@ -901,11 +913,26 @@ mod tests {
             "success",
             "success",
         );
-        facts.queue_absent = Some(reason);
+        assert_eq!(facts.verdict, Verdict::Go);
+        facts.note_queue_absent(Some(reason.clone()));
         let table = render_table(&facts);
         assert!(table.contains("queue lanes missing"), "{table}");
         assert!(table.contains("not in tonight's report"), "{table}");
-        // Not a failure: the verdict stays as the other gates decide it.
+        // A queue that never ran is not a pass.
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(
+            facts.failing_gates,
+            [format!("queue lanes absent: {reason}")]
+        );
+        assert!(table.contains("NO-GO"), "{table}");
+        assert!(
+            table.contains("queue lanes absent: no queue run"),
+            "{table}"
+        );
+        // Nothing absent, nothing changed.
+        facts.verdict = Verdict::Go;
+        facts.failing_gates.clear();
+        facts.note_queue_absent(None);
         assert_eq!(facts.verdict, Verdict::Go);
     }
 
