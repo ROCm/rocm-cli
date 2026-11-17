@@ -65,7 +65,9 @@ pub(crate) use crate::runtime_registry::{
     runtime_manifest_path, runtime_registry_dir, runtime_usability_status, select_runtime_manifest,
     validate_runtime_manifest_for_activation,
 };
-use crate::runtime_registry::{unusable_status_text, write_active_runtime_marker};
+use crate::runtime_registry::{
+    RuntimeProvenance, unusable_status_text, write_active_runtime_marker,
+};
 pub(crate) use crate::runtime_uninstall::{
     InstallRootDecision, lemonade_record_report_line, should_remove_runtime_install_root,
     uninstall_runtime,
@@ -673,6 +675,43 @@ struct RuntimeListingEntry {
     rollback_target: bool,
     #[serde(serialize_with = "serialize_path_lossy")]
     install_root: PathBuf,
+    /// Where the runtime came from, as its manifest recorded it
+    /// (`InstalledRuntimeManifest::provenance`). The text form prints it as the
+    /// `provenance:` line under `install_root:`.
+    #[serde(skip)]
+    provenance: RuntimeListingProvenance,
+}
+
+/// An owned copy of a runtime's [`RuntimeProvenance`], so the listing can
+/// outlive the manifests it was computed from. It holds the recorded values
+/// (trimmed, `None` when unrecorded) and prints through
+/// [`RuntimeProvenance::fields`], the same as `rocm examine`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeListingProvenance {
+    channel: Option<String>,
+    source: Option<String>,
+    source_layout_generation: Option<String>,
+    device_target: Option<String>,
+}
+
+impl RuntimeListingProvenance {
+    fn recorded(provenance: &RuntimeProvenance<'_>) -> Self {
+        Self {
+            channel: provenance.channel.map(str::to_owned),
+            source: provenance.source.map(str::to_owned),
+            source_layout_generation: provenance.source_layout_generation.map(str::to_owned),
+            device_target: provenance.device_target.map(str::to_owned),
+        }
+    }
+
+    fn as_provenance(&self) -> RuntimeProvenance<'_> {
+        RuntimeProvenance {
+            channel: self.channel.as_deref(),
+            source: self.source.as_deref(),
+            source_layout_generation: self.source_layout_generation.as_deref(),
+            device_target: self.device_target.as_deref(),
+        }
+    }
 }
 
 /// A path as a JSON string, through `to_string_lossy`. serde's own `Path`
@@ -842,6 +881,7 @@ fn listing_from_manifests(
             // says, so an install missing it should not be silent about that.
             // `rocm examine` reports the same thing for the active runtime.
             let toolchain = RuntimeToolchain::from_includes_devel(manifest.includes_devel());
+            let provenance = RuntimeListingProvenance::recorded(&manifest.provenance());
             RuntimeListingEntry {
                 runtime_key: manifest.runtime_key,
                 runtime_id: manifest.runtime_id,
@@ -854,6 +894,7 @@ fn listing_from_manifests(
                 active: active_index == Some(index),
                 rollback_target: rollback_index == Some(index),
                 install_root: manifest.install_root,
+                provenance,
             }
         })
         .collect();
@@ -1011,6 +1052,11 @@ impl cli_report::JsonOrText for RuntimesListing {
                 "      install_root: {}",
                 runtime.install_root.display()
             );
+            let _ = writeln!(
+                output,
+                "      provenance: {}",
+                provenance_text(&runtime.provenance.as_provenance())
+            );
         }
         output
     }
@@ -1165,6 +1211,18 @@ fn rollback_runtime(
         reactivated: false,
         services,
     })
+}
+
+/// A runtime's provenance as the `name=value` pairs `rocm runtimes list` prints
+/// on its `provenance:` line. `rocm examine` prints the same pairs for the
+/// active runtime as `active_runtime_<name>:` lines.
+fn provenance_text(provenance: &RuntimeProvenance<'_>) -> String {
+    provenance
+        .fields()
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// How the CLI names the toolchain state of a runtime.
@@ -1477,6 +1535,436 @@ pub(crate) mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The row a runtime's `provenance:` line belongs to, found by its key: the
+    /// first `provenance:` line after that runtime's marked row.
+    pub(crate) fn provenance_line<'a>(rendered: &'a str, runtime_key: &str) -> &'a str {
+        let row = format!(" {runtime_key} runtime_id=");
+        rendered
+            .lines()
+            .skip_while(|line| !line.contains(&row))
+            .skip(1)
+            .find(|line| line.trim_start().starts_with("provenance:"))
+            .unwrap_or_else(|| panic!("no provenance line for {runtime_key}:\n{rendered}"))
+    }
+
+    /// A nightly ROCm 10 wheel runtime installed for one exact GPU, with every
+    /// provenance fact recorded the way `rocm install sdk` records it. The
+    /// family is the family-wide `gfx120X-all`, so a target inferred from the
+    /// family instead of read from the install shows up as a wrong value.
+    fn nightly_exact_target_manifest(
+        base: therock::InstalledRuntimeManifest,
+    ) -> therock::InstalledRuntimeManifest {
+        therock::InstalledRuntimeManifest {
+            runtime_key: "nightly-wheel-gfx1201-10-1-0a20260822".to_owned(),
+            runtime_id: "therock-nightly:gfx120X-all".to_owned(),
+            channel: "nightly".to_owned(),
+            family: "gfx120X-all".to_owned(),
+            version: "10.1.0a20260822".to_owned(),
+            selected_artifact_url: "https://example.invalid/whl-multi-arch".to_owned(),
+            index_url: Some("https://example.invalid/whl-multi-arch".to_owned()),
+            source_layout_generation: Some("next-v1".to_owned()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "next-v1".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==10.1.0a20260822".to_owned()],
+                rocm_sdk_target: Some("gfx1201".to_owned()),
+            }),
+            ..base
+        }
+    }
+
+    fn rewrite_manifest(
+        paths: &AppPaths,
+        manifest: &therock::InstalledRuntimeManifest,
+    ) -> Result<()> {
+        fs::write(
+            runtime_manifest_path(paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(manifest)?,
+        )?;
+        Ok(())
+    }
+
+    /// The install report names the channel, source, layout and exact GPU
+    /// target; afterwards the only record of them is the manifest, so the
+    /// listing is where a user finds out which stream and which GPU a runtime
+    /// is for. Each value is asserted exactly, so a field printed from the
+    /// wrong source (the family for the target, the channel for the layout)
+    /// fails here.
+    #[test]
+    fn runtime_list_names_where_each_runtime_came_from() -> Result<()> {
+        let (root, paths) = test_paths("runtime-list-provenance");
+        let base = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+
+        // Written before the index, the layout and the composition were
+        // recorded: only the artifact URL every manifest carries is left.
+        let legacy = therock::InstalledRuntimeManifest {
+            index_url: None,
+            source_layout_generation: None,
+            wheel_composition: None,
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &legacy)?;
+
+        let nightly = nightly_exact_target_manifest(base.clone());
+        write_test_pip_runtime(
+            &paths,
+            &nightly.runtime_key,
+            &nightly.runtime_id,
+            &nightly.version,
+            20,
+        )?;
+        rewrite_manifest(&paths, &nightly)?;
+
+        // A tarball install records the archive it downloaded and its layout;
+        // it was never installed for one exact GPU.
+        let tarball = therock::InstalledRuntimeManifest {
+            runtime_key: "release-tarball-gfx120x-all-7-13-0".to_owned(),
+            format: "tarball".to_owned(),
+            selected_artifact_url:
+                "https://example.invalid/tarball/therock-dist-linux-gfx120X-all-7.13.0.tar.gz"
+                    .to_owned(),
+            index_url: None,
+            source_layout_generation: Some("multi-arch-v2".to_owned()),
+            wheel_composition: None,
+            ..base
+        };
+        rewrite_manifest(&paths, &tarball)?;
+
+        let rendered = render_runtimes_text(&paths, &RocmCliConfig::default())?;
+        let _ = fs::remove_dir_all(root);
+
+        // `cargo xtask e2e` prewarm (`assess` in xtask/src/e2e_prewarm.rs)
+        // reads the line directly after a runtime's row as its
+        // `install_root:`, so the order row, `install_root:`, `provenance:` is
+        // pinned here by index; `provenance_line` searches ahead and would not
+        // notice a reorder.
+        let lines: Vec<&str> = rendered.lines().collect();
+        let row = format!(" {} runtime_id=", nightly.runtime_key);
+        let row_index = lines
+            .iter()
+            .position(|line| line.contains(&row))
+            .unwrap_or_else(|| panic!("no row for {}:\n{rendered}", nightly.runtime_key));
+        assert_eq!(
+            lines.get(row_index + 1).copied(),
+            Some(format!("      install_root: {}", nightly.install_root.display()).as_str()),
+            "the line after the row must be its install_root:\n{rendered}"
+        );
+        assert_eq!(
+            lines.get(row_index + 2).copied(),
+            Some(provenance_line(&rendered, &nightly.runtime_key)),
+            "the line after install_root: must be its provenance:\n{rendered}"
+        );
+
+        assert_eq!(
+            provenance_line(&rendered, &nightly.runtime_key),
+            "      provenance: channel=nightly source=https://example.invalid/whl-multi-arch \
+             source_layout_generation=next-v1 device_target=gfx1201",
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("version=10.1.0a20260822 (build 2026-08-22)"),
+            "the nightly's version must show its build date:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &legacy.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/therock \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &tarball.runtime_key),
+            "      provenance: channel=release \
+             source=https://example.invalid/tarball/therock-dist-linux-gfx120X-all-7.13.0.tar.gz \
+             source_layout_generation=multi-arch-v2 device_target=unrecorded",
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    /// The layout and target are read from the same recorded fields
+    /// `rocm update` reads; it does not read the recorded source. Each chain
+    /// moves to its next field only when a field is absent: package index,
+    /// else artifact URL (never the adoption marker); layout field, else the
+    /// wheel composition's layout; `rocm_sdk_target`, else the
+    /// `device-<target>` package extra. The value chosen is printed trimmed,
+    /// and a fact recorded nowhere, or recorded blank, reads `unrecorded`. One
+    /// runtime per rule:
+    ///
+    /// - index and artifact URL both recorded and differing: the index wins;
+    /// - layout field and composition layout differing, and `rocm_sdk_target`
+    ///   and package extra differing: the field earlier in each chain wins;
+    /// - layout only in the composition (manifests older than the field): it is
+    ///   still the layout;
+    /// - target only as a package extra (manifests older than
+    ///   `rocm_sdk_target`): it is still the target;
+    /// - an adopted runtime (marker, no index): source `unrecorded`;
+    /// - a blank index, layout field and `rocm_sdk_target` in front of a
+    ///   recorded artifact URL, composition layout and package extra: each
+    ///   reads `unrecorded`, since a blank value is not skipped;
+    /// - an empty `device-` extra and no `rocm_sdk_target`: `unrecorded`;
+    /// - values padded with whitespace: printed trimmed;
+    /// - every field blank: each fact `unrecorded`, never an empty `name=`.
+    ///
+    /// Blank or padded values are not what `rocm install sdk` writes; they can
+    /// come from a hand-edited manifest or one brought in with
+    /// `rocm runtimes import`.
+    #[test]
+    fn runtime_list_reads_each_provenance_fact_from_where_it_was_recorded() -> Result<()> {
+        let (root, paths) = test_paths("runtime-list-provenance-precedence");
+        let base = write_test_pip_runtime(
+            &paths,
+            "release-pip-index-and-artifact",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+
+        let index_and_artifact = therock::InstalledRuntimeManifest {
+            index_url: Some("https://example.invalid/simple".to_owned()),
+            selected_artifact_url: "https://example.invalid/whl/rocm-7.13.0.tar.gz".to_owned(),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &index_and_artifact)?;
+
+        let composition_layout = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-composition-layout".to_owned(),
+            source_layout_generation: None,
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "next-v1".to_owned(),
+                package_specs: vec!["rocm[libraries]==7.13.0".to_owned()],
+                rocm_sdk_target: None,
+            }),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &composition_layout)?;
+
+        let spec_target = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-spec-target".to_owned(),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "multi-arch-v2".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: None,
+            }),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &spec_target)?;
+
+        let adopted = therock::InstalledRuntimeManifest {
+            runtime_key: "adopted-release-pip".to_owned(),
+            index_url: None,
+            selected_artifact_url: crate::runtime_registry::ADOPTED_RUNTIME_ARTIFACT_URL.to_owned(),
+            read_only: true,
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &adopted)?;
+
+        let blank_before_fallback = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-blank-before-fallback".to_owned(),
+            index_url: Some(String::new()),
+            selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: Some(String::new()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "next-v1".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some(String::new()),
+            }),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &blank_before_fallback)?;
+
+        let first_in_chain_wins = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-first-in-chain-wins".to_owned(),
+            source_layout_generation: Some("multi-arch-v2".to_owned()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "next-v1".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some("gfx1100".to_owned()),
+            }),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &first_in_chain_wins)?;
+
+        let padded = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-padded".to_owned(),
+            channel: " release ".to_owned(),
+            index_url: Some(" https://example.invalid/simple ".to_owned()),
+            source_layout_generation: Some(" multi-arch-v2 ".to_owned()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "multi-arch-v2".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some(" gfx1201 ".to_owned()),
+            }),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &padded)?;
+
+        let empty_device_extra = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-empty-device-extra".to_owned(),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "multi-arch-v2".to_owned(),
+                package_specs: vec!["rocm[libraries,device-]==7.13.0".to_owned()],
+                rocm_sdk_target: None,
+            }),
+            ..base.clone()
+        };
+        rewrite_manifest(&paths, &empty_device_extra)?;
+
+        let all_blank = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-all-blank".to_owned(),
+            channel: String::new(),
+            index_url: Some(" ".to_owned()),
+            selected_artifact_url: String::new(),
+            source_layout_generation: Some(String::new()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: String::new(),
+                package_specs: vec!["rocm[libraries]==7.13.0".to_owned()],
+                rocm_sdk_target: Some(String::new()),
+            }),
+            ..base
+        };
+        rewrite_manifest(&paths, &all_blank)?;
+
+        let rendered = render_runtimes_text(&paths, &RocmCliConfig::default())?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            provenance_line(&rendered, &index_and_artifact.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/simple \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "the index must win over the artifact URL:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &composition_layout.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/therock \
+             source_layout_generation=next-v1 device_target=unrecorded",
+            "a layout recorded only in the composition is still recorded:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &spec_target.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/therock \
+             source_layout_generation=multi-arch-v2 device_target=gfx1201",
+            "a target recorded only in the package specs is still recorded:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &adopted.runtime_key),
+            "      provenance: channel=release source=unrecorded \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "the adoption marker is not a package source:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &first_in_chain_wins.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/therock \
+             source_layout_generation=multi-arch-v2 device_target=gfx1100",
+            "the first recorded value in each chain must win:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &blank_before_fallback.runtime_key),
+            "      provenance: channel=release source=unrecorded \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "a blank first value reads unrecorded, not the field after it:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &empty_device_extra.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/therock \
+             source_layout_generation=multi-arch-v2 device_target=unrecorded",
+            "an empty device extra names no target:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &padded.runtime_key),
+            "      provenance: channel=release source=https://example.invalid/simple \
+             source_layout_generation=multi-arch-v2 device_target=gfx1201",
+            "shown values must be trimmed:\n{rendered}"
+        );
+        assert_eq!(
+            provenance_line(&rendered, &all_blank.runtime_key),
+            "      provenance: channel=unrecorded source=unrecorded \
+             source_layout_generation=unrecorded device_target=unrecorded",
+            "a fact recorded only as blank must read unrecorded:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// `rocm examine` reports the active runtime's provenance as one line per
+    /// fact. They must be the facts and words the listing shows for that same
+    /// runtime, so this compares the two outputs as well as pinning each.
+    /// Two active runtimes: a nightly install that recorded every fact, and an
+    /// adopted one whose manifest holds only the adoption marker where an
+    /// artifact URL would be, which must not be reported as its source.
+    #[test]
+    fn examine_names_the_active_runtime_provenance_the_listing_shows() -> Result<()> {
+        type Build = fn(therock::InstalledRuntimeManifest) -> therock::InstalledRuntimeManifest;
+        let adopted: Build = |base| therock::InstalledRuntimeManifest {
+            index_url: None,
+            selected_artifact_url: crate::runtime_registry::ADOPTED_RUNTIME_ARTIFACT_URL.to_owned(),
+            read_only: true,
+            imported_from: Some(base.install_root.clone()),
+            ..base
+        };
+        let cases: [(&str, &str, &str, Build, [&str; 4]); 2] = [
+            (
+                "nightly-wheel-gfx1201-10-1-0a20260822",
+                "therock-nightly:gfx120X-all",
+                "10.1.0a20260822",
+                nightly_exact_target_manifest,
+                [
+                    "  active_runtime_channel: nightly",
+                    "  active_runtime_source: https://example.invalid/whl-multi-arch",
+                    "  active_runtime_source_layout_generation: next-v1",
+                    "  active_runtime_device_target: gfx1201",
+                ],
+            ),
+            (
+                "adopted-release-pip-gfx120x-all-7-13-0",
+                "therock-release:gfx120X-all",
+                "7.13.0",
+                adopted,
+                [
+                    "  active_runtime_channel: release",
+                    "  active_runtime_source: unrecorded",
+                    "  active_runtime_source_layout_generation: unrecorded",
+                    "  active_runtime_device_target: unrecorded",
+                ],
+            ),
+        ];
+        for (runtime_key, runtime_id, version, build, expected) in cases {
+            let (root, paths) = test_paths("examine-runtime-provenance");
+            let base = write_test_pip_runtime(&paths, runtime_key, runtime_id, version, 10)?;
+            let manifest = build(base);
+            rewrite_manifest(&paths, &manifest)?;
+            let config = RocmCliConfig {
+                active_runtime_key: Some(manifest.runtime_key.clone()),
+                ..RocmCliConfig::default()
+            };
+
+            let listed = render_runtimes_text(&paths, &config)?;
+            let mut examined = String::new();
+            append_examine_runtime_state(&mut examined, &paths, &config)?;
+            let _ = fs::remove_dir_all(root);
+
+            let listed_pairs = provenance_line(&listed, &manifest.runtime_key)
+                .trim_start()
+                .strip_prefix("provenance: ")
+                .expect("provenance prefix")
+                .split(' ')
+                .map(|pair| pair.split_once('=').expect("name=value pair"))
+                .map(|(name, value)| format!("  active_runtime_{name}: {value}"))
+                .collect::<Vec<_>>();
+            assert_eq!(listed_pairs, expected, "{runtime_key}:\n{listed}");
+            for line in expected {
+                assert!(
+                    examined.lines().any(|examined_line| examined_line == line),
+                    "{runtime_key}: examine must report {line:?} as the listing does:\n{examined}"
+                );
+            }
+        }
         Ok(())
     }
 

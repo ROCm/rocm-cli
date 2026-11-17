@@ -782,3 +782,14 @@ Feature: GPU detection and system inspection
     Then the inspection lists that runtime's librocdxg as one its own runtime does not load
     When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
     Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # `examine` reports the active runtime's channel, package source, source layout
+  # and exact GPU target in the same words and from the same manifest fields as
+  # the `provenance:` line `rocm runtimes list` prints for it
+  # (`runtime-lifecycle-22`). The planted manifest needs no GPU or download, so
+  # this runs on the mock lane.
+  @id:examine-reports-where-the-active-runtime-came-from
+  Scenario: examine-54 - Examining the system says where the active runtime came from
+    Given the active runtime is a nightly runtime installed for one exact GPU
+    When the user inspects the system
+    Then the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from

@@ -430,8 +430,8 @@ pub fn dangling_active_runtime(runtimes_list_report: &str) -> Option<&str> {
     })
 }
 
-/// The already-installed runtime (from `rocm runtimes list`, which carries no
-/// `channel=` field at all) whose key names `pin` within `channel`.
+/// The already-installed runtime (from `rocm runtimes list`) whose key names
+/// `pin` within `channel`.
 ///
 /// Mirrors `decide()`'s pin branch, which scopes its own search to
 /// `channel_runtimes` (or a same-channel unattributed error line) before ever
@@ -439,9 +439,11 @@ pub fn dangling_active_runtime(runtimes_list_report: &str) -> Option<&str> {
 /// pin's token/digit-run appears in a key, with no notion of channel, so an
 /// unscoped search here could match a `release` pin against an installed
 /// `nightly` runtime that happens to share the pin's version/build-date
-/// digits, silently serving the wrong channel's SDK. Since this listing has no
-/// channel field to key off at all, the guard is the same `{channel}-` prefix
-/// `decide()` falls back to for its own degraded, channel-less lines.
+/// digits, silently serving the wrong channel's SDK. The listing prints
+/// `channel=` only on each runtime's separate `provenance:` line, and
+/// `RuntimeEntry::parse` reads only the row line, so the guard is the same
+/// `{channel}-` key prefix `decide()` falls back to for its own degraded,
+/// channel-less lines.
 ///
 /// Read-only (adopted/imported) entries are excluded for the same reason
 /// `activation_candidates` excludes them: a matching entry here becomes
@@ -1170,11 +1172,14 @@ source: index\n"
         )
     }
 
-    /// A real `rocm runtimes list` on a tree holding all three shapes that matter,
-    /// captured verbatim from the built binary rather than written by hand: one
-    /// poisoned managed runtime (an install root under a per-scenario temp dir that
-    /// is gone), one healthy managed runtime inside the tree, and one read-only
-    /// runtime adopted from outside it.
+    /// A `rocm runtimes list` on a tree holding all three shapes that matter,
+    /// captured from the built binary rather than written by hand: one poisoned
+    /// managed runtime (an install root under a per-scenario temp dir that is
+    /// gone), one healthy managed runtime inside the tree, and one read-only
+    /// runtime adopted from outside it. The capture predates the rows'
+    /// `toolchain=` field, which is not added back here; the `provenance:` line
+    /// the listing now prints after each `install_root:` was added by hand, in
+    /// that position, so [`assess`] is read against the current row order.
     ///
     /// Note that ALL THREE report `status=unusable` here. That is the whole reason
     /// [`assess`] keys off the install root instead: the healthy one is unusable
@@ -1192,10 +1197,13 @@ registered ROCm runtimes
 
     adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=unusable (pip runtime manifest is missing rocm_sdk probe data)
       install_root: /opt/external-rocm
+      provenance: channel=release source=unrecorded source_layout_generation=unrecorded device_target=unrecorded
     release-wheel-gfx94x-dcgpu-7-15-0 runtime_id=therock-release-gfx94x-dcgpu version=7.15.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (pip runtime manifest is missing rocm_sdk probe data)
       install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-15-0
+      provenance: channel=release source=https://example.invalid/whl source_layout_generation=unrecorded device_target=unrecorded
     release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (install root is missing: /tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0)
       install_root: /tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+      provenance: channel=release source=https://example.invalid/whl source_layout_generation=unrecorded device_target=unrecorded
 ";
 
     /// A real `rocm runtimes list` on an empty tree, captured from the binary.
@@ -1210,9 +1218,10 @@ registered ROCm runtimes
   next step: rocm install sdk --channel release --format wheel
 ";
 
-    /// A real `rocm runtimes list` on the tree that killed the lane: the config
-    /// still names the 7.14.0 runtime that was removed out of band, while two
-    /// runtimes it could be pointed at sit right there.
+    /// A `rocm runtimes list` on the tree that killed the lane, captured before
+    /// the rows gained `toolchain=` and `provenance:` lines, neither added here:
+    /// the config still names the 7.14.0 runtime that was removed out of band,
+    /// while two runtimes it could be pointed at sit right there.
     ///
     /// Note there is no `*` marker on any entry — the renderer only marks the
     /// active one by matching `active_runtime_key` against a manifest, and that is
@@ -1374,11 +1383,12 @@ registered ROCm runtimes
     #[test]
     fn pinned_runtime_entry_does_not_match_another_channels_installed_runtime() {
         // 7.14.0 is only installed under `nightly`, not the requested
-        // `release`. `rocm runtimes list` carries no `channel=` field at all
-        // (unlike `rocm update`'s report), so the `{channel}-` prefix guard is
-        // the only thing standing between this and silently serving the wrong
-        // channel's SDK for a pin that happens to share another channel's
-        // installed version.
+        // `release`. `rocm runtimes list` prints `channel=` only on each
+        // runtime's `provenance:` line, which `RuntimeEntry::parse` does not
+        // read (it reads the row line alone), so the `{channel}-` key prefix
+        // guard is the only thing standing between this and silently serving
+        // the wrong channel's SDK for a pin that happens to share another
+        // channel's installed version.
         assert!(find_pinned_runtime_entry(MULTI_CHANNEL, "release", "7.14.0").is_none());
         assert_eq!(
             find_pinned_runtime_entry(MULTI_CHANNEL, "nightly", "7.14.0").map(|e| e.runtime_key),
@@ -1453,6 +1463,19 @@ mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/
         assert!(RuntimeEntry::parse("  registry: /w/e2e-prewarm/data/runtimes/registry").is_none());
         assert!(RuntimeEntry::parse("  installed: none").is_none());
         assert!(RuntimeEntry::parse("      install_root: /tmp/x").is_none());
+    }
+
+    #[test]
+    fn a_provenance_line_is_not_read_as_an_entry() {
+        // `rocm runtimes list` prints a `provenance:` line under each runtime,
+        // whose `name=value` fields sit beside the row's own.
+        assert!(
+            RuntimeEntry::parse(
+                "      provenance: channel=release source=unrecorded \
+source_layout_generation=unrecorded device_target=unrecorded"
+            )
+            .is_none()
+        );
     }
 
     #[test]

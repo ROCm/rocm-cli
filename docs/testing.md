@@ -1796,25 +1796,25 @@ else: unset values are `null` rather than `<unset>`, each runtime carries
 text-only. The rules every `--json` command follows, and which commands have
 one, are in [json-output.md](json-output.md). Scenarios
 `@id:runtime-lifecycle-list-json-marks-active-and-rollback`
-(`runtime-lifecycle-22`) and `@id:runtime-lifecycle-list-json-empty-registry`
-(`runtime-lifecycle-23`) parse the whole of stdout as one document, so a stray
-line before or after it fails them; `runtime-lifecycle-22` also checks each
+(`runtime-lifecycle-23`) and `@id:runtime-lifecycle-list-json-empty-registry`
+(`runtime-lifecycle-24`) parse the whole of stdout as one document, so a stray
+line before or after it fails them; `runtime-lifecycle-23` also checks each
 runtime's values as planted, lists the same state as text and checks that the
 `*`/`-` rows name the runtimes the JSON flags, and `runtime-lifecycle-07` covers
 the text markers on their own.
 `@id:runtime-lifecycle-list-json-reports-unusable-runtime`
-(`runtime-lifecycle-24`) deletes a runtime's folder and reads
+(`runtime-lifecycle-25`) deletes a runtime's folder and reads
 `"status": "unusable"` with the reason `install root is missing: <folder>`, and
 `@id:runtime-lifecycle-list-json-reports-missing-active-manifest`
-(`runtime-lifecycle-25`) deletes the active runtime's registry entry and reads
+(`runtime-lifecycle-26`) deletes the active runtime's registry entry and reads
 `active_problem` of kind `missing_manifest_for_key`.
 `@id:runtime-lifecycle-list-json-failure-prints-nothing-on-stdout`
-(`runtime-lifecycle-29`) covers the failure half of those rules: it replaces a
+(`runtime-lifecycle-30`) covers the failure half of those rules: it replaces a
 registry entry with a folder of the same name, so the listing cannot read it
 (an entry that reads but does not parse is skipped, not an error), and checks
 that `--json` exits 1 with nothing on stdout and a plain-text error on stderr
 naming that entry. No scenario checks the
-listing's order: scenario 22's two runtimes share one install time, and the
+listing's order: scenario 23's two runtimes share one install time, and the
 registry is read in filesystem order, which can match key order by chance.
 The order is pinned by unit tests:
 `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
@@ -1829,18 +1829,18 @@ the resolver `rocm examine`, `rocm runtimes activate`/`rollback`,
 `rocm runtimes uninstall` and `rocm update` use, and the surfaces that still
 resolve differently are listed there.
 `@id:runtime-lifecycle-list-default-id-in-other-letter-case`
-(`runtime-lifecycle-26`) sets the first runtime's id in upper case through
+(`runtime-lifecycle-27`) sets the first runtime's id in upper case through
 `rocm config set-default-runtime` and checks that the JSON marks that runtime
 active with `active_problem` `null`, and that the text marks it `*` with no
 `active_status:` line.
 `@id:runtime-lifecycle-list-active-key-in-other-letter-case`
-(`runtime-lifecycle-27`) edits the config's active runtime key to the first
+(`runtime-lifecycle-28`) edits the config's active runtime key to the first
 runtime's key in upper case while the default id still names the second, and
 checks that both forms mark the first runtime active with no problem and that
 `rocm examine --json` reports the first runtime's folder as
 `active_runtime_root`.
 `@id:runtime-lifecycle-list-dead-active-key-falls-back-to-default`
-(`runtime-lifecycle-28`) edits the key to one no runtime has while the default
+(`runtime-lifecycle-29`) edits the key to one no runtime has while the default
 id still names the second runtime, and checks that both forms mark the second
 runtime active, that the JSON reports `missing_manifest_for_key` and the text
 the matching `active_status:` line, and that `rocm examine --json` reports the
@@ -1863,11 +1863,68 @@ folder whose path is not valid UTF-8, and
 `toolchain` words in the text and the JSON together:
 
 ```bash
-cargo xtask e2e -- -n "runtime-lifecycle-(07|22|23|24|25|26|27|28|29) "
+cargo xtask e2e -- -n "runtime-lifecycle-(07|23|24|25|26|27|28|29|30) "
 cargo test -p rocm --bin rocm runtimes_list
 cargo test -p rocm --bin rocm listing_state
 cargo test -p rocm --bin rocm runtime_toolchain_text_and_json_words_agree_for_every_variant
 cargo test -p rocm --bin rocm registry_sort_is_newest_install_first_then_by_key
+```
+
+Each runtime's row is followed by its `install_root:` and a `provenance:` line
+naming the `channel`, the package `source` (the wheel index, or the downloaded
+archive for a tarball install), the `source_layout_generation` and the exact
+`device_target` its manifest recorded, for example:
+
+```text
+      provenance: channel=nightly source=<wheel-index-url> source_layout_generation=next-v1 device_target=gfx1201
+```
+
+The values are the ones the manifest recorded: the package index, else the
+artifact URL (never the marker an adopted runtime keeps there); the layout
+field, else the wheel composition's; the recorded target, else the
+`device-<target>` extra in the package specs. For the layout and target this
+chooses the same recorded field `rocm update` uses, through the same accessors;
+`rocm update` then uses the value as recorded, while the listing trims it and
+prints a blank one as `unrecorded`. Each step moves on only when a field is
+absent, so a blank field is not skipped in favour of the next one, and a fact
+recorded nowhere also prints `unrecorded`. Nothing is guessed from other
+facts: a family-wide or tarball install shows `device_target=unrecorded` rather
+than a target guessed from its family, and a runtime registered with
+`rocm runtimes adopt` shows `source=unrecorded`. The chains, their precedence,
+the blank and trimming rules are pinned by
+`runtime_list_reads_each_provenance_fact_from_where_it_was_recorded`; blank or
+padded values are not what `rocm install sdk` writes, but can come from a
+hand-edited manifest or one brought in with `rocm runtimes import`. An adopted
+runtime's channel is the one adoption recorded: the channel `--channel` or
+`--runtime-id` named, `release` when neither names one. All three paths
+(neither flag, `--channel nightly`, and `--runtime-id therock-nightly:<family>`
+with no `--channel`) are pinned by
+`adopted_runtime_lists_its_channel_and_its_source_as_unrecorded` in
+[runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs). The marker adoption
+writes in place of an artifact URL is persisted manifest format. Code in the
+crate refers to it only through its constant, so two checks pin the literal
+value: `adoption_marker_keeps_its_persisted_value` in
+[runtime_registry.rs](../apps/rocm/src/runtime_registry.rs), and
+`runtime-lifecycle-22` (below), which plants it in an adopted runtime's
+manifest.
+`rocm examine` prints the same four facts for the active runtime as
+`active_runtime_channel`, `active_runtime_source`,
+`active_runtime_source_layout_generation` and `active_runtime_device_target`,
+from the same fields. The unit tests
+`runtime_list_names_where_each_runtime_came_from` and
+`examine_names_the_active_runtime_provenance_the_listing_shows` in
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pin the values, the
+latter for an active nightly runtime and an active adopted one;
+`@id:runtime-lifecycle-list-names-runtime-provenance` (`runtime-lifecycle-22`)
+checks the listing end to end with a planted nightly runtime, an older one
+that recorded neither its layout nor an exact target, and an adopted one whose
+manifest holds the adoption marker as earlier releases wrote it, which must
+list `source=unrecorded`; and
+`@id:examine-reports-where-the-active-runtime-came-from` (`examine-54`) checks
+the `examine` lines. Both plant read-only manifests and run on the mock lane:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-22 |examine-54 '
 ```
 
 Activate one validated runtime:

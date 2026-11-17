@@ -59,7 +59,7 @@ commands that do not have it yet.
 | `rocm update` | supported for the check; one compact JSON line, not pretty, and refused with `--apply` and `--dry-run` | supported; the compact form is a known difference from the others | `update-02`, `update-03` |
 | `rocm storage report` | supported; pretty JSON through `JsonOrText` | supported | `json_or_text_impl_renders_the_report_and_serializes_it` |
 | `rocm services list` | supported; pretty JSON. `rocm remote` reads it back over its control channel | supported | `services_json_round_trips_and_applies_the_same_liveness_filter_as_the_table`; exercised indirectly by `remote-15` (`@requires-docker`), whose `rocm remote` reads it back |
-| `rocm runtimes list` | supported; pretty JSON through `JsonOrText` | supported, additive-only, no version field yet | `runtime-lifecycle-22` to `runtime-lifecycle-29` and `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`; what each covers is in [testing.md](testing.md#runtime-selection-and-activation) |
+| `rocm runtimes list` | supported; pretty JSON through `JsonOrText` | supported, additive-only, no version field yet | `runtime-lifecycle-23` to `runtime-lifecycle-30` and `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`; what each covers is in [testing.md](testing.md#runtime-selection-and-activation) |
 | `rocm runtimes activate`, `rollback`, `uninstall`, `import`, `adopt` | none | follow-up: they change state, so they need the envelope's result and refusal shapes | — |
 | `rocm services logs` | none | intentionally unsupported: streamed text, and `-f` never ends | — |
 | `rocm services stop`, `restart`, `remove`, `prune` | none | follow-up: needs the envelope, including the refusal path | — |
