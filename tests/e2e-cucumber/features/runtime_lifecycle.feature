@@ -400,3 +400,15 @@ Feature: Runtime lifecycle state machine
     And the text listing marks the same runtimes as the JSON
     And the text listing says the active runtime key has no registered runtime
     And examine reports the second runtime as the active one
+
+  # `--json` changes what a successful list prints, not how a failure is
+  # reported: errors are not JSON. A registry entry the CLI cannot read stops
+  # the list, so a script has to learn that from the exit code and an empty
+  # stdout rather than from a document that looks like a shorter list.
+  @id:runtime-lifecycle-list-json-failure-prints-nothing-on-stdout
+  Scenario: runtime-lifecycle-29 - A runtime list that cannot be read fails as JSON with nothing on stdout
+    Given two registered runtimes with the second active after the first
+    And the first runtime's registry entry cannot be read
+    When the user lists the registered runtimes as JSON
+    Then the list fails with nothing printed on stdout
+    And the error on stderr is plain text naming the unreadable registry entry

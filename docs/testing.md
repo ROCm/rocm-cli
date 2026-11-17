@@ -1807,7 +1807,13 @@ the text markers on their own.
 `"status": "unusable"` with the reason `install root is missing: <folder>`, and
 `@id:runtime-lifecycle-list-json-reports-missing-active-manifest`
 (`runtime-lifecycle-25`) deletes the active runtime's registry entry and reads
-`active_problem` of kind `missing_manifest_for_key`. No scenario checks the
+`active_problem` of kind `missing_manifest_for_key`.
+`@id:runtime-lifecycle-list-json-failure-prints-nothing-on-stdout`
+(`runtime-lifecycle-29`) covers the failure half of those rules: it replaces a
+registry entry with a folder of the same name, so the listing cannot read it
+(an entry that reads but does not parse is skipped, not an error), and checks
+that `--json` exits 1 with nothing on stdout and a plain-text error on stderr
+naming that entry. No scenario checks the
 listing's order: scenario 22's two runtimes share one install time, and the
 registry is read in filesystem order, which can match key order by chance.
 The order is pinned by unit tests:
@@ -1857,7 +1863,7 @@ folder whose path is not valid UTF-8, and
 `toolchain` words in the text and the JSON together:
 
 ```bash
-cargo xtask e2e -- -n "runtime-lifecycle-(07|22|23|24|25|26|27|28) "
+cargo xtask e2e -- -n "runtime-lifecycle-(07|22|23|24|25|26|27|28|29) "
 cargo test -p rocm --bin rocm runtimes_list
 cargo test -p rocm --bin rocm listing_state
 cargo test -p rocm --bin rocm runtime_toolchain_text_and_json_words_agree_for_every_variant

@@ -393,6 +393,20 @@ async fn second_runtime_manifest_deleted(world: &mut E2eWorld) {
         .expect("failed to delete the second runtime's manifest");
 }
 
+/// The registry entry is replaced by a folder of the same name: the listing
+/// finds it among the entries and fails reading it, on every platform and
+/// whoever runs the suite, where a file with its permissions removed is still
+/// read by root and cannot be made unreadable the same way on Windows. An entry
+/// that reads but does not parse would not do: the listing skips those.
+#[given("the first runtime's registry entry cannot be read")]
+async fn first_runtime_manifest_unreadable(world: &mut E2eWorld) {
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
+    std::fs::remove_file(&entry)
+        .unwrap_or_else(|error| panic!("failed to delete {}: {error}", entry.display()));
+    std::fs::create_dir(&entry)
+        .unwrap_or_else(|error| panic!("failed to create {}: {error}", entry.display()));
+}
+
 /// A key no runtime is registered under: what the config holds after the
 /// active runtime's registry entry goes without the CLI noticing.
 const UNREGISTERED_KEY: &str = "release-tarball-gfx90a";
@@ -1331,6 +1345,37 @@ async fn json_reports_missing_active_manifest(world: &mut E2eWorld) {
             .iter()
             .any(|listed| listed.eq_ignore_ascii_case(&key)),
         "`{key}` is registered after all:\n{listing:#}"
+    );
+}
+
+/// The failure half of the JSON rules in docs/json-output.md: exit 1 and an
+/// empty stdout, so a script that reads stdout cannot mistake the failure for a
+/// listing.
+#[then("the list fails with nothing printed on stdout")]
+async fn list_fails_with_empty_stdout(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(world.cli_rc, Some(1), "stderr:\n{stderr}");
+    assert_eq!(
+        world.cli_output.as_deref(),
+        Some(""),
+        "stdout must be empty when the list fails; stderr:\n{stderr}"
+    );
+}
+
+/// The error is the plain text a person reads, not a JSON error document, and
+/// it names the entry that could not be read so the user knows what to repair.
+#[then("the error on stderr is plain text naming the unreadable registry entry")]
+async fn stderr_names_unreadable_entry(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stderr.trim()).is_err(),
+        "the error must not be a JSON document:\n{stderr}"
+    );
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
+    assert!(
+        stderr.contains(&format!("failed to read {}", entry.display())),
+        "stderr must name {}:\n{stderr}",
+        entry.display()
     );
 }
 
