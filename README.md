@@ -31,16 +31,17 @@ for Lemonade and vLLM.
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory but not the serving-instance registry; no vLLM |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
-Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory —
-the serving-instance registry view needs the `rocmdashd` unix socket, so it's
-Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
+Live dashboard telemetry works on Windows too: GPU/CPU/memory and the managed
+servers `rocm services list` reports. Per-server throughput and Docker-discovered
+instances need the `rocmdashd` unix socket, so they're Linux/WSL2 only (see
+[Interactive interfaces](#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
@@ -79,7 +80,8 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 ## Installation
 
-The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
+The installer downloads a prebuilt bundle, verifies its SHA-256 checksum and
+its detached signature against the release public key pinned in the installer,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
 `PATH`, or fish's config folder already exists), the installer also adds that
@@ -247,9 +249,10 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
-Live mode works on Windows too, but shows only GPU/CPU/memory — the
-serving-instance registry needs the Unix domain socket telemetry, so that view
-is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
+Live mode works on Windows too, showing GPU/CPU/memory and the managed servers
+`rocm services list` reports. Per-server throughput and Docker-discovered
+instances need the Unix domain socket telemetry, so they are Linux/WSL2 only.
+Use `rocm dash --demo` for a synthetic session that runs
 anywhere without a GPU or daemon.
 
 On Linux and WSL, the embedded daemon also discovers loaded models from a
@@ -1274,7 +1277,8 @@ the memory fraction when a small model shouldn't reserve most of a large card.
 
 `--require-api-key` makes a loopback endpoint require an API key too, which
 matters when something else republishes the port. A public bind generates a key
-automatically unless you supply one. Set `ROCM_SERVE_API_KEY` rather than
+automatically unless you supply one. The key is kept in a file under the data
+directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather than
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
@@ -1586,7 +1590,8 @@ bound by another process, it refuses and the service stays stopped
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
-its engine state file, and its endpoint key file; a running server is refused,
+its engine state file, its endpoint key file and any copy of that key an
+interrupted save left behind; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
 alone, and additionally clears leftover files whose record is already gone. A
 server counts as running while any process it recorded may be running, which on
@@ -1676,9 +1681,10 @@ For `rocm dash`:
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
-- Live mode works on Windows too, but shows only GPU/CPU/memory — there's no
-  `rocmdashd` unix socket to connect to there, so the serving-instance
-  registry view stays empty (Linux and WSL2 get the full live view).
+- Live mode works on Windows too, showing GPU/CPU/memory and the managed
+  servers `rocm services list` reports. There's no `rocmdashd` unix socket
+  there, so per-server throughput and Docker-discovered instances are missing
+  (Linux and WSL2 get the full live view).
 
 ### Bench
 

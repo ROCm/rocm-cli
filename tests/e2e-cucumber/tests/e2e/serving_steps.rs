@@ -2648,12 +2648,42 @@ async fn listed_anthropic_endpoint(world: &mut E2eWorld) -> Option<String> {
     }
 }
 
+/// What a missing `anthropic endpoint:` row has to be explained by: the
+/// listing, and the engine state file the row is read out of.
+///
+/// The row is absent for two very different reasons — the serving process never
+/// published, or something wrote the file whole and replaced the key — and the
+/// listing alone cannot tell them apart. That cost a round trip to the Windows
+/// GPU lane per guess while ROCMAI-550's regression was being chased, so the
+/// file goes in the failure message. `--json` is the records verbatim, so it
+/// carries `engine_state_path`; it also asks no device probe, so reading it
+/// costs nothing a failing step cannot afford.
+fn missing_anthropic_endpoint_evidence(world: &mut E2eWorld) -> String {
+    let listing = world.cli_output.clone().unwrap_or_default();
+    let (records, _, _) = crate::run_rocm(world, &["services", "list", "--json"]);
+    let states = serde_json::from_str::<serde_json::Value>(&records)
+        .ok()
+        .and_then(|records| records.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|record| record.get("engine_state_path")?.as_str().map(str::to_owned))
+        .map(|path| {
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+            format!("{path}:\n{body}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{listing}\nservices list --json:\n{records}\nengine state:\n{states}")
+}
+
 #[then("the service details include an Anthropic-compatible messages endpoint")]
 async fn assert_service_lists_anthropic_endpoint(world: &mut E2eWorld) {
     let listed = listed_anthropic_endpoint(world).await;
-    let output = world.cli_output.clone().unwrap_or_default();
-    let endpoint = listed
-        .unwrap_or_else(|| panic!("no `anthropic endpoint:` row in `services list`:\n{output}"));
+    let Some(endpoint) = listed else {
+        let evidence = missing_anthropic_endpoint_evidence(world);
+        panic!("no `anthropic endpoint:` row in `services list`:\n{evidence}");
+    };
     assert!(
         endpoint.starts_with("http://") && !endpoint.contains("/v1"),
         "the Anthropic endpoint is a base URL clients append `/v1/messages` to, got `{endpoint}`"
@@ -2674,9 +2704,11 @@ async fn assert_service_still_lists_openai_endpoint(world: &mut E2eWorld) {
 /// POST `body` to the served model's Anthropic endpoint and return the JSON
 /// reply, whatever its status.
 async fn post_anthropic_messages(world: &mut E2eWorld, body: serde_json::Value) {
-    let base = listed_anthropic_endpoint(world)
-        .await
-        .expect("no Anthropic endpoint is listed for the served model");
+    let listed = listed_anthropic_endpoint(world).await;
+    let Some(base) = listed else {
+        let evidence = missing_anthropic_endpoint_evidence(world);
+        panic!("no Anthropic endpoint is listed for the served model:\n{evidence}");
+    };
     let budget = Duration::from_secs(crate::inference_timeout_for(world));
     let reply = tokio::spawn(async move {
         reqwest::Client::builder()
@@ -2823,9 +2855,11 @@ async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
 
 #[when("the user sends a streaming request to the Anthropic messages endpoint")]
 async fn user_sends_streaming_anthropic_messages_request(world: &mut E2eWorld) {
-    let base = listed_anthropic_endpoint(world)
-        .await
-        .expect("no Anthropic endpoint is listed for the served model");
+    let listed = listed_anthropic_endpoint(world).await;
+    let Some(base) = listed else {
+        let evidence = missing_anthropic_endpoint_evidence(world);
+        panic!("no Anthropic endpoint is listed for the served model:\n{evidence}");
+    };
     let budget = Duration::from_secs(crate::inference_timeout_for(world));
     // Same budget and model name as the non-streaming request above.
     let body = serde_json::json!({
@@ -2961,11 +2995,11 @@ async fn assert_both_endpoints_healthy(world: &mut E2eWorld) {
     // `services list` probes each endpoint it shows and marks one that does not
     // answer with `(not responding)`; a healthy service carries neither mark.
     let listed = listed_anthropic_endpoint(world).await;
+    if listed.is_none() {
+        let evidence = missing_anthropic_endpoint_evidence(world);
+        panic!("no `anthropic endpoint:` row in `services list`:\n{evidence}");
+    }
     let output = world.cli_output.clone().unwrap_or_default();
-    assert!(
-        listed.is_some(),
-        "no `anthropic endpoint:` row in `services list`:\n{output}"
-    );
     assert!(
         output.contains("status: ready"),
         "the OpenAI-compatible endpoint is not reported ready:\n{output}"
@@ -4145,4 +4179,90 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
         claim_path.display(),
         std::fs::read_to_string(&claim_path).ok()
     );
+}
+
+/// Serve this host's small model on loopback with `--require-api-key`, so the
+/// CLI generates a key and stores it before the engine starts. The serve still
+/// waits a fixed 45 seconds for the engine (`READINESS_WAIT` in
+/// `apps/rocm/src/service_launch/readiness.rs`) and then exits 0, reporting a
+/// server still loading as `starting`, but the check does not depend on
+/// readiness: the key file is what the scenario checks, it exists from before
+/// the spawn, and an engine still loading when the serve returns is not a
+/// failure here. The World's teardown stops the service.
+#[when("the user serves a model that requires an API key")]
+async fn user_serves_model_requiring_api_key(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    ensure_serve_port_free().await;
+    // Bounded like `serve_and_wait`: a `rocm serve --managed` that never returns
+    // must fail this scenario, not stall the lane.
+    let (stdout, stderr, rc) = crate::run_rocm_bounded(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--require-api-key",
+        ],
+        e2e_cucumber::serve_log::serve_cli_budget(serve_timeout_for(world)),
+    );
+    assert_eq!(
+        rc, 0,
+        "`rocm serve {model} --engine {engine} --managed --require-api-key` failed:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The one key file the serve wrote belongs to the service it recorded, holds
+/// a key, and is mode 0600 exactly: no group or other bit, and nothing the
+/// owner would need missing.
+#[then("the server's API key is kept where only that user can read it")]
+async fn endpoint_key_is_owner_only(world: &mut E2eWorld) {
+    let services_dir = world.app_paths().data_dir.join("services");
+    let key_files: Vec<PathBuf> = std::fs::read_dir(&services_dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", services_dir.display()))
+        .map(|entry| entry.expect("services dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "endpoint-key"))
+        .collect();
+    assert_eq!(
+        key_files.len(),
+        1,
+        "expected exactly one endpoint key file in {}, found {key_files:?}",
+        services_dir.display()
+    );
+    let key_file = &key_files[0];
+    let record = key_file.with_extension("json");
+    assert!(
+        record.is_file(),
+        "the key file {} has no service record beside it",
+        key_file.display()
+    );
+    let key = std::fs::read_to_string(key_file).expect("the owner can read the key back");
+    assert!(
+        !key.trim().is_empty(),
+        "the key file {} is empty",
+        key_file.display()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(key_file)
+            .expect("key file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "the key file {} is mode {mode:o}, not 0600",
+            key_file.display()
+        );
+    }
+    #[cfg(not(unix))]
+    panic!("this step checks a Unix file mode; its scenario is tagged @requires-os:linux");
 }

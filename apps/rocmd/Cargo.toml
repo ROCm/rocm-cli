@@ -27,6 +27,9 @@ tokio.workspace = true
 ureq = { version = "2.12", features = ["native-certs"] }
 
 [dev-dependencies]
+# The leftover a killed owner-only key store leaves, for the tests of the
+# cleanups that remove it (`atomic_write::stage_owner_only_file_unpublished`).
+rocm-core = { path = "../../crates/rocm-core", features = ["test-support"] }
 # The fake engine child both engine IPC callers are tested against.
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
 
