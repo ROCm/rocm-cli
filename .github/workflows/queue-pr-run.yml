@@ -1,0 +1,75 @@
+# GPU E2E on the shared queue for one pull request's branch — start a run, wait
+# for it, publish it.
+#
+# Dispatched by a pull request's gate job in e2e-selfhosted.yml, on main, with the
+# branch to test. It is queue-run.yml with the pull request preset: the queue side
+# runs one GPU model on the release channel, with a shorter wait and run time than
+# the nightly, a limited number at once (the queue side sets the limit), and it
+# does not take one while the nightly goes (it refuses, and this job then fails with that reason in refused.txt).
+# Like queue-run.yml it needs no credential and no permission, and the runner
+# runs only the allow-listed workflows as they are on main; that is enforced on
+# the runner, outside this repository.
+# What that protects is in docs/nightly-on-the-queue.md.
+name: E2E on the queue (pull request)
+
+# The run's title names the job that asked for it, which is how that job finds
+# this run among the dispatched ones; the caller is only ever a title here.
+run-name: Pull request run (caller ${{ inputs.caller }}; branch ${{ inputs.branch }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "The branch of this repository to test"
+        type: string
+        required: true
+      caller:
+        description: "The run that asked for this one, for its title"
+        type: string
+        required: true
+
+# Nothing here reads the repository. Uploading files uses the per-job runtime
+# token GitHub issues to every job regardless of these permissions.
+permissions: {}
+
+# One at a time per branch: a run that has started is never cancelled for a
+# newer one, but GitHub still cancels an older run that is only pending when a
+# newer one joins the group, and the gate reports that run as having left no
+# report. The queue side limits how many go at once.
+concurrency:
+  group: queue-pr-run-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run and publish
+    runs-on: [queue-report]
+    # A lane waits at most 45 min to be started, then runs for at most 75 min
+    # counted from its start. Finishing and publishing the run can take 30 min
+    # more, and 20 min are margin for the runner's own delays: 170 min.
+    timeout-minutes: 170
+    steps:
+      # Anyone who can dispatch names the branch, not only the gate job, so it is
+      # checked here, on main, and not only in the gate: a plain branch name that
+      # cannot start with a dash.
+      - name: Check the branch name
+        env:
+          BRANCH: ${{ inputs.branch }}
+        # One line: the workflow contract forbids backslashes in this file.
+        run: if [[ "${BRANCH}" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then exit 0; fi; echo "::error::not a branch name"; exit 1
+
+      - name: Run on the queue and publish
+        env:
+          BRANCH: ${{ inputs.branch }}
+        # One line: the workflow contract forbids backslashes in this file.
+        run: /opt/queue/bin/queue-publish --out "${RUNNER_TEMP}/results" --start "${BRANCH}" --kind pr
+
+      - name: Upload lane results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: queue-pr-run-results
+          path: ${{ runner.temp }}/results
+          # The publisher's files only; a lane's hidden files are not published.
+          include-hidden-files: false
+          if-no-files-found: warn
