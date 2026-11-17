@@ -5140,6 +5140,9 @@ fi
             // The log says which branch the run tested and which lanes block;
             // the run may have several jobs, so every one is scanned.
             "actions/runs/${candidate}/jobs?per_page=100",
+            // curl, not `gh api`: gh refuses a log holding terminal escape
+            // sequences, which is what rejected run 44002836099.
+            "curl -fsSL -H \"Authorization: Bearer ${GH_TOKEN}\"",
             "/logs\" > queue-results/job.log.part",
             // A rejected run says why, on a line of its own: run 44002836099 was
             // rejected and the log could not say which filter did it.
@@ -5153,6 +5156,10 @@ fi
         assert!(
             !fetch.contains("conclusion"),
             "a red queue run is still a run: its artifact is uploaded whatever it concluded"
+        );
+        assert!(
+            !fetch.contains("gh api \"repos/${GITHUB_REPOSITORY}/actions/jobs/"),
+            "`gh api` refuses a job log with terminal escape sequences: read it with curl"
         );
         assert!(
             !fetch.contains("logs\" > queue-results/job.log.part 2>"),

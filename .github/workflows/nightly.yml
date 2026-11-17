@@ -1451,11 +1451,17 @@ jobs:
           # no way to tell which).
           skipped() { echo "::notice::queue run ${candidate} not imported: $1"; }
           # The job log is a redirect to blob storage, and a failure of that
-          # hop is worth another try before the run is given up on.
+          # hop is worth another try before the run is given up on. Read it with
+          # curl, not `gh api`: newer gh refuses a response holding terminal
+          # escape sequences ("pass --allow-escape-sequences"), which every
+          # job log does, so every log read failed and run 44002836099 was
+          # rejected as unreadable. curl follows the redirect and sends the token
+          # only to api.github.com.
           fetch_job_log() {
             local job="$1" attempt
             for attempt in 1 2 3; do
-              gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part && return 0
+              curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part && return 0
               echo "::notice::queue run ${candidate}: reading the log of job ${job} failed (attempt ${attempt} of 3)"
               sleep 5
             done
