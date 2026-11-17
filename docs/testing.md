@@ -2151,7 +2151,11 @@ cargo test -p rocm --bin rocm storage::tests::applying_a_whole_plan_never_remove
 cargo test -p rocm --bin rocm version_proptests
 ```
 
-`storage::properties` runs each property at 2048 cases. All but one check the
+The `storage::properties` filter also runs `generator_reach_report` and the
+example test named below, which are not properties. Each property in it runs
+2048 cases, and the whole-plan property described further down runs 256. Both
+read `PROPTEST_CASES` through `proptest_cases`, so it can raise either count but
+never lower it. All but one check the
 pure policy: that the install in use, the rollback target, the install the
 configured default names, anything the active-runtime marker names, and anything
 ROCm CLI does not own are never selected, even at `--keep 0`; that each group
@@ -2160,10 +2164,12 @@ removes the rest, so raising `--keep` never removes more; that every install is
 either kept or removed, once; and that each kept install is reported with the
 first reason that applies. The remaining one passes each selected key through
 the real runtime resolver and checks that it resolves back to that same install.
-The resolver tries an exact key match first, so generated cases always take that
-branch; the case-twin input the check exists for, two installs whose keys differ
-only in letter case, is pinned as an example test,
-`a_case_twin_pair_resolves_to_the_install_the_policy_cleared`. The tests work
+The resolver tries an exact key match first, so generated cases never reach its
+case-insensitive fallback; what the check guards is that precedence, which a
+resolver trying the case-insensitive match first breaks on the generated keys
+that differ only in letter case. That input is also pinned as an example test,
+`a_case_twin_pair_resolves_to_the_install_the_policy_cleared`, which does not
+depend on the generators reaching it. The tests work
 out the expected groups and holds themselves, from the `--keep` help and the
 matching rules the policy implements, rather than by calling the policy's
 helpers. Keys, channels, formats and families come from small alphabets, some of

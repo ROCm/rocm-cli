@@ -34,6 +34,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseError, TestRunner};
 
 use super::{HoldReason, RetentionInputs, select_runtimes_to_remove};
+use crate::test_support::proptest_cases;
 use crate::therock::{InstalledRuntimeManifest, WheelRuntimeComposition};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -381,7 +382,7 @@ fn recency_groups<'a>(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(2048)))]
 
     /// The documented hard safety invariant, from the `--keep` help: "The one
     /// in use and the rollback target are always kept on top of this count,
@@ -571,12 +572,16 @@ proptest! {
     /// key must resolve to itself.
     ///
     /// The real resolver is called here rather than a copy of its matching
-    /// rule, so this keeps holding whatever that rule becomes. With today's
-    /// resolver, which tries an exact key match first, every freshly generated
-    /// case resolves through that exact match, so what this property guards
-    /// day to day is that precedence. The case it exists for, two installs
-    /// whose keys differ only in letter case, is pinned as an explicit input in
-    /// `a_case_twin_pair_resolves_to_the_install_the_policy_cleared`.
+    /// rule, so this keeps holding whatever that rule becomes. Today's
+    /// resolver tries an exact key match first, so every selected key resolves
+    /// through that match and its case-insensitive fallback is never reached
+    /// here. That precedence is what #497 fixed, and it is what this guards:
+    /// the generators produce installs whose keys differ only in letter case
+    /// (`generator_reach_report` counts them), and a resolver that tried the
+    /// case-insensitive match first sends one of those keys to its twin and
+    /// fails this property. The same input is also pinned as a literal in
+    /// `a_case_twin_pair_resolves_to_the_install_the_policy_cleared`, which
+    /// does not depend on the generators reaching it.
     #[test]
     fn the_deleter_resolves_each_selected_key_to_the_install_the_policy_cleared(
         manifests in manifests(),
@@ -593,6 +598,14 @@ proptest! {
     /// in use is held as Active too; the default only counts when it names
     /// exactly one install. A wrong reason sends a user who is about to free
     /// disk space looking at the wrong install.
+    ///
+    /// The expected reason follows the same order and the same matching rules
+    /// the policy uses, because that order and those rules are what is being
+    /// specified: there is no second, independent source for them. What this
+    /// catches is the policy's own checks drifting from them, such as two
+    /// holds checked in a different order or a pointer compared by exact
+    /// case. Whether the rules themselves are right is pinned by hand-written
+    /// examples, such as `storage::tests::all_force_keeps_compare_case_insensitively`.
     #[test]
     fn every_hold_reason_is_the_first_that_applies(
         manifests in manifests(),
@@ -691,9 +704,9 @@ fn deleter_resolves_each_selected_key_to_itself(
     Ok(())
 }
 
-/// The input that #497's selector fix is about, pinned here rather than left
-/// to the proptest seed file: that file stores an RNG seed, so a change to the
-/// generators makes it replay a different case. Two installs whose keys differ
+/// The input that #497's selector fix is about, pinned here as a literal
+/// rather than kept as a proptest seed: a seed stores an RNG state, so a change
+/// to the generators makes it replay a different case. Two installs whose keys differ
 /// only in case, same runtime id, installed at the same moment, nothing
 /// pointing at either, `--keep 0`: the policy clears both, and the deleter has
 /// to resolve each key to its own install rather than to its twin.
@@ -803,27 +816,27 @@ fn generator_reach_report() {
                     saw[Row::GroupFamilyTwoWays as usize] |= left.family != right.family;
                 }
             }
-            if members.len() > 1 {
-                let first_specs = |manifest: &&InstalledRuntimeManifest| {
-                    manifest
-                        .wheel_composition
-                        .as_ref()
-                        .and_then(|composition| composition.package_specs.first().cloned())
-                        .unwrap_or_default()
-                };
-                saw[Row::GroupDevelDisagrees as usize] |= members
-                    .iter()
-                    .any(|manifest| manifest.devel != installed_the_toolchain(manifest));
-                saw[Row::GroupSpacedDevel as usize] |= members
-                    .iter()
-                    .any(|manifest| first_specs(manifest).contains(SPACED_DEVEL_EXTRAS));
-                saw[Row::GroupNearMissDevel as usize] |= members
-                    .iter()
-                    .any(|manifest| first_specs(manifest).contains(NEAR_MISS_EXTRAS));
-                saw[Row::GroupOtherSpecFirst as usize] |= members
-                    .iter()
-                    .any(|manifest| first_specs(manifest).starts_with("torch["));
-            }
+            // These four describe a single install, so a group of one counts:
+            // read the wrong way, its toolchain can move it into a sibling group.
+            let first_specs = |manifest: &&InstalledRuntimeManifest| {
+                manifest
+                    .wheel_composition
+                    .as_ref()
+                    .and_then(|composition| composition.package_specs.first().cloned())
+                    .unwrap_or_default()
+            };
+            saw[Row::GroupDevelDisagrees as usize] |= members
+                .iter()
+                .any(|manifest| manifest.devel != installed_the_toolchain(manifest));
+            saw[Row::GroupSpacedDevel as usize] |= members
+                .iter()
+                .any(|manifest| first_specs(manifest).contains(SPACED_DEVEL_EXTRAS));
+            saw[Row::GroupNearMissDevel as usize] |= members
+                .iter()
+                .any(|manifest| first_specs(manifest).contains(NEAR_MISS_EXTRAS));
+            saw[Row::GroupOtherSpecFirst as usize] |= members
+                .iter()
+                .any(|manifest| first_specs(manifest).starts_with("torch["));
             saw[Row::GroupOverKeep1 as usize] |= members.len() > 1;
             saw[Row::GroupOverKeep2 as usize] |= members.len() > 2;
             saw[Row::GroupOverKeep3 as usize] |= members.len() > 3;
@@ -939,22 +952,22 @@ const REACH: [(Row, &str, u32); ROWS] = [
     (
         Row::GroupDevelDisagrees,
         "in a group: devel flag disagreeing with the specs",
-        3_070,
+        9_310,
     ),
     (
         Row::GroupSpacedDevel,
         "in a group: a spaced devel extra",
-        970,
+        2_740,
     ),
     (
         Row::GroupNearMissDevel,
         "in a group: a near-miss devel extra",
-        650,
+        2_740,
     ),
     (
         Row::GroupOtherSpecFirst,
         "in a group: another package's spec first",
-        1_570,
+        4_880,
     ),
     (
         Row::GroupsDifferOnlyInToolchain,

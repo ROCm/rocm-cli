@@ -1241,6 +1241,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "storage_properties.rs"]
 mod properties;
 
 #[cfg(test)]
@@ -2473,13 +2474,12 @@ mod tests {
     }
 
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig {
-            // Each case writes and deletes a tree, so this matches the other
-            // filesystem-backed property suites rather than the pure-policy
-            // budget.
-            cases: 256,
-            ..proptest::prelude::ProptestConfig::default()
-        })]
+        // Each case writes and deletes a tree, so this matches the other
+        // filesystem-backed property suites rather than the pure-policy
+        // budget.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(
+            crate::test_support::proptest_cases(256)
+        ))]
 
         /// The same safety invariant as the pure-policy properties, but
         /// driven through real registry files, real install folders and the
