@@ -37,6 +37,13 @@ pub(super) const fn should_skip_daemon(focus: Option<Focus>) -> bool {
 /// while the job is non-terminal we swallow those keys; the user stops a job
 /// explicitly with `Ctrl+C` (never blocked here), and once it is terminal `q` /
 /// `Esc` exit normally. Always `false` for the dashboard (`focus == None`).
+///
+/// Never blocked for a [`ui::job_console::ConsoleExit::Confirmed`] console (the
+/// serve wizard's still-running launch): its console footer advertises
+/// "Esc leave (asks first)", and `ui::serve_wizard::on_key` answers `q` / `Esc`
+/// with a confirmation modal rather than leaving, so the overlay is only nulled
+/// after the user approves. Swallowing the key there made the advertised Esc a
+/// silent no-op.
 pub(super) fn focused_close_key_blocked(
     state: &AppState,
     focus: Option<Focus>,
@@ -48,7 +55,9 @@ pub(super) fn focused_close_key_blocked(
     let running = state
         .active_job_id()
         .is_some_and(|id| ui::job_console::console_esc_closes(state.jobs.job(id)));
-    running && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+    running
+        && state.console_exit() == ui::job_console::ConsoleExit::Immediate
+        && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
 }
 
 /// Open the single overlay a focused host should host, returning any initial
@@ -292,6 +301,55 @@ mod tests {
             !focused_close_key_blocked(&s, Some(Focus::Examine), KeyCode::Char('q')),
             "a terminal job no longer blocks exit (the child already exited)"
         );
+    }
+
+    #[test]
+    fn focused_serve_running_console_esc_reaches_the_confirmation() {
+        // The serve console advertises "Esc leave (asks first)". In a focused
+        // host Esc/q must therefore reach `serve_wizard::on_key` (which raises
+        // the confirmation) instead of being swallowed as a silent no-op.
+        let recipes: Vec<crate::ui::model_picker::ModelRecipeSummary> = Vec::new();
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Serve);
+        {
+            let w = s.serve_wizard.as_mut().unwrap();
+            w.model = "org/model".to_string();
+            w.field = crate::ui::serve_wizard::FIELDS.len() - 1; // Launch
+        }
+        for code in [KeyCode::Enter, KeyCode::Char('y')] {
+            let _ = crate::ui::serve_wizard::on_key(
+                &mut s.serve_wizard,
+                &mut s.jobs,
+                &recipes,
+                press(code),
+            );
+        }
+        assert!(s.has_active_console(), "launch console is showing");
+        assert_eq!(s.console_exit(), ui::job_console::ConsoleExit::Confirmed);
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(
+                !focused_close_key_blocked(&s, Some(Focus::Serve), code),
+                "{code:?} must reach the serve wizard's confirmation"
+            );
+        }
+
+        // Routed to the wizard, Esc raises the confirmation; the overlay stays
+        // open (gate shut) until the user approves.
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Esc),
+        );
+        assert!(s.serve_wizard.as_ref().unwrap().detach_confirm.is_some());
+        assert!(!s.focused_should_exit(Some(Focus::Serve)));
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Char('y')),
+        );
+        assert!(s.focused_should_exit(Some(Focus::Serve)));
     }
 
     #[test]
