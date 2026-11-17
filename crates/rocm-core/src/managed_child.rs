@@ -57,10 +57,12 @@ fn pid_child_is_running(pid: u32, probe: impl FnOnce(u32) -> ProcessProbe) -> bo
 /// its *real* wait status rather than merely probing whether the pid still
 /// exists.
 ///
-/// On Windows there is no equivalent gap: [`process_is_running`] there opens a
-/// fresh handle with `OpenProcess` and reads the actual exit code via
-/// `GetExitCodeProcess`, which needs no parent-side reaping — so the bare pid
-/// is enough, and this variant just defers to it.
+/// On Windows there is no equivalent gap to close: a fresh `OpenProcess` plus
+/// `GetExitCodeProcess` reads the real exit code with no parent-side reaping,
+/// so the bare pid is enough and no handle is retained. The read itself goes
+/// through [`probe_process`], not [`process_is_running`] — see [`Self::is_running`]
+/// for why collapsing `Unqueryable` into "not running" is the wrong answer for
+/// a decision that stamps a record `failed`.
 pub enum ManagedChildLiveness {
     #[cfg(not(windows))]
     Unix(std::process::Child),
@@ -76,8 +78,10 @@ impl ManagedChildLiveness {
         Self::Unix(child)
     }
 
-    /// Build from a bare pid on Windows, where [`process_is_running`] already
-    /// reads the real exit code without needing a retained handle.
+    /// Build from a bare pid on Windows, where the exit code can be read
+    /// without a retained handle. [`Self::is_running`] does that read through
+    /// [`probe_process`], so a process this one cannot open is not mistaken
+    /// for one that has exited.
     #[cfg(windows)]
     pub const fn from_pid(pid: u32) -> Self {
         Self::Windows(pid)

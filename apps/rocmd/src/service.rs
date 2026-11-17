@@ -134,7 +134,18 @@ pub(crate) fn stop_managed_service_via(
         // crash and was stamped `failed` — the exact symptom ROCMAI-541 exists
         // to remove, reintroduced through the one stop path that is not
         // `rocm services stop`.
-        record.settled_stop_unix_ms = record.stop_requested_unix_ms.take();
+        //
+        // Guarded, like the identical move in `service_control.rs` and
+        // `managed_service_status.rs`: a concurrent listing's liveness refresh
+        // may have settled this stop first. `.take()` on an already-emptied
+        // field yields `None`, and assigning that over a `settled_stop_unix_ms`
+        // the refresh had just written correctly erases the only durable
+        // evidence the death was asked for, leaving both fields unset — which
+        // reads as a crash. That is this change's own defect, reachable through
+        // the one stop path its table did not name.
+        if let Some(requested) = record.stop_requested_unix_ms.take() {
+            record.settled_stop_unix_ms = Some(requested);
+        }
         // Recorded PIDs go stale the instant their processes exit, and a stale
         // PID is exactly what the identity check exists to catch — so do not
         // leave one behind for the next stop to find. The same call
