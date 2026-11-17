@@ -3880,7 +3880,7 @@ An installed vLLM whose compiled extensions (`vllm._C`, `vllm._rocm_C`,
 `runtime: installed, not usable` by `rocm engines list` (the listing is read-only, so
 until a launch has written the compat shims it can still read `ready` where torch
 needs them to import), and `rocm serve` refuses it before launching vLLM (the
-guidance is in the service log). `serve-60` (`@id:serve-vllm-broken-extensions-reported-not-usable`,
+guidance is in the service log). `serve-61` (`@id:serve-vllm-broken-extensions-reported-not-usable`,
 `@requires-os:linux`) covers the listing hermetically, against a stand-in
 interpreter, with no GPU, network or real vLLM. The `serve` refusal and the probe
 are unit-tested in [process.rs](../engines/vllm/src/process.rs)
