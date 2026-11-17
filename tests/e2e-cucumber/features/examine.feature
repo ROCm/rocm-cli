@@ -783,6 +783,17 @@ Feature: GPU detection and system inspection
     When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
     Then the inspection lists no runtime librocdxg that its own runtime does not load
 
+  # `examine` reports the active runtime's channel, package source, source layout
+  # and exact GPU target in the same words and from the same manifest fields as
+  # the `provenance:` line `rocm runtimes list` prints for it
+  # (`runtime-lifecycle-22`). The planted manifest needs no GPU or download, so
+  # this runs on the mock lane.
+  @id:examine-reports-where-the-active-runtime-came-from
+  Scenario: examine-54 - Examining the system says where the active runtime came from
+    Given the active runtime is a nightly runtime installed for one exact GPU
+    When the user inspects the system
+    Then the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from
+
   # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
   # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
   # mock lane included, not only the Vulkan-only hosts the ticket started from.
@@ -798,7 +809,7 @@ Feature: GPU detection and system inspection
   # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
   # fails here.
   @id:examine-reports-this-hosts-rocm-support-level
-  Scenario: examine-54 - System inspection says whether this machine's GPU is supported by ROCm
+  Scenario: examine-55 - System inspection says whether this machine's GPU is supported by ROCm
     When the user inspects the system
     Then the inspection states this host's ROCm support level
     And the support level agrees with the GPU the inspection detected
