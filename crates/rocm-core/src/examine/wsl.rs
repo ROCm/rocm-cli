@@ -6,7 +6,7 @@
 //! same facts from a named WSL distribution when `rocm examine` runs on the Windows
 //! host.
 
-use super::{Examination, WSL_MIN_UBUNTU, WSL_PLATFORM_NOTE, WslFacts};
+use super::{Examination, Gpu, WSL_MIN_UBUNTU, WSL_PLATFORM_NOTE, WslFacts};
 use crate::probe_exec::{MEDIUM, run, run_utf16le, which};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -19,7 +19,9 @@ use std::time::Duration;
 /// the Windows host driver version.
 pub(super) fn probe_wsl(e: &mut Examination) {
     let summary = crate::detect_wsl_summary();
-    let (host_reachable, host_driver_version) = host_driver_fields(crate::detect_wsl_host_driver());
+    let (host_driver, host_adapters) = crate::detect_wsl_host_displays();
+    let (host_reachable, host_driver_version) = host_driver_fields(host_driver);
+    record_host_adapters(e, &host_adapters);
     let rocminfo = which("rocminfo");
     e.wsl = Some(WslFacts {
         version: if crate::is_wsl1_kernel(&e.kernel_release) {
@@ -48,6 +50,45 @@ pub(super) fn probe_wsl(e: &mut Examination) {
     });
     sync_shared_fields_from_wsl(e);
     e.notes.push(WSL_PLATFORM_NOTE.to_owned());
+}
+
+/// Record the Windows host's AMD adapters as this examination's GPU list.
+///
+/// WSL has no `lspci` scan and no KFD topology to enumerate from, but the host
+/// inventory the driver probe already reads names every AMD adapter; keeping
+/// only the driver version from it is why `examine` reported one gfx target on
+/// a two-GPU machine.
+///
+/// The target is resolved in three tiers: PCI device id, then the shared
+/// marketing-name table, then the keyword heuristic. The middle tier is not
+/// optional — the id table misses parts the name table knows (`DEV_7448`, the
+/// PRO W7900), which without it get no target at all.
+///
+/// An adapter nothing identified keeps `is_apu` unset rather than `Some(false)`,
+/// unlike `probe_gpus_windows`: `check_9_igpu_dgpu_collision` pairs an APU with a
+/// discrete card, so calling an unidentified part discrete would invent that
+/// pairing. An APU keyword match still counts as integrated with no target.
+fn record_host_adapters(e: &mut Examination, adapters: &[crate::WslHostDisplayAdapter]) {
+    for adapter in adapters {
+        let (gfx_target, is_apu) =
+            match crate::host_gpu::gfx_target_from_pnp_device_id(&adapter.pnp_device_id)
+                .or_else(|| crate::gfx_target::gfx_target_from_amd_marketing_name(&adapter.name))
+            {
+                Some(target) => (target.to_owned(), Some(super::gfx_is_apu_family(target))),
+                None => match super::linux_gpus::classify_amd_marketing_name(&adapter.name) {
+                    (target, false) if target.is_empty() => (target, None),
+                    (target, is_apu) => (target, Some(is_apu)),
+                },
+            };
+        e.gpus.push(Gpu {
+            name: adapter.name.clone(),
+            gfx_target,
+            pci_id: adapter.pnp_device_id.clone(),
+            is_apu,
+            is_amd: true,
+        });
+    }
+    super::linux_gpus::summarise_gpu_categories(e);
 }
 
 /// Flatten a host-driver probe into the two [`WslFacts`] fields that carry it.
@@ -337,6 +378,102 @@ pub(super) fn distro_clears_wsl_floor(distro_id: &str, distro_version: &str) -> 
 mod tests {
     use super::*;
     use crate::probe_exec::decode_utf16le;
+
+    fn host_adapter(name: &str, device_id: &str) -> crate::WslHostDisplayAdapter {
+        crate::WslHostDisplayAdapter {
+            name: name.to_owned(),
+            // The whole string `Win32_VideoController` reports, instance path
+            // included, so the id parser is exercised on what a host actually
+            // sends rather than on a tidied prefix.
+            pnp_device_id: format!(
+                "PCI\\VEN_1002&DEV_{device_id}&SUBSYS_0E0D1002&REV_00\\6&3666587B&0&00000008"
+            ),
+        }
+    }
+
+    /// `DEV_7448`, the PRO W7900, is not in the PCI id table, so this adapter
+    /// is identifiable only by its name. Measured on a real WSL2 host: reading
+    /// the id and then dropping straight to the APU keyword list left this card
+    /// with no target at all, while the scalar probe answered `gfx1100` from
+    /// the same row by consulting the shared marketing-name table.
+    #[test]
+    fn an_adapter_missing_from_the_id_table_is_identified_by_its_name() {
+        let mut e = Examination::default();
+        record_host_adapters(&mut e, &[host_adapter("AMD Radeon PRO W7900", "7448")]);
+
+        assert_eq!(
+            e.gpus[0].gfx_target, "gfx1100",
+            "the name table names this part even though the id table does not"
+        );
+        assert_eq!(
+            e.gpus[0].is_apu,
+            Some(false),
+            "and the target says it is discrete"
+        );
+        assert!(
+            e.has_discrete_amd && !e.has_apu,
+            "a lone discrete card is exactly one kind"
+        );
+    }
+
+    /// A Ryzen desktop whose integrated Radeon is listed by Windows *ahead* of
+    /// the discrete card. Both adapters have to survive the probe — keeping only
+    /// the first is what reported gfx1036 on a host whose card is a gfx1201 —
+    /// and the pair has to read as one APU and one discrete part, which is what
+    /// `check_9_igpu_dgpu_collision` fires on.
+    #[test]
+    fn both_host_adapters_are_recorded_when_the_igpu_is_listed_first() {
+        let mut e = Examination::default();
+        record_host_adapters(
+            &mut e,
+            &[
+                host_adapter("AMD Radeon(TM) Graphics", "164E"),
+                host_adapter("AMD Radeon RX 9070 XT", "7550"),
+            ],
+        );
+
+        let targets: Vec<&str> = e.gpus.iter().map(|g| g.gfx_target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["gfx1036", "gfx1201"],
+            "every AMD adapter the host listed must be recorded, in the host's order"
+        );
+        assert_eq!(
+            e.gpus[0].is_apu,
+            Some(true),
+            "the Raphael iGPU is an APU by its device id"
+        );
+        assert_eq!(
+            e.gpus[1].is_apu,
+            Some(false),
+            "the discrete card must not be folded in with it"
+        );
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "the host summary must show both kinds, or the iGPU/dGPU check has nothing to fire on"
+        );
+    }
+
+    /// An AMD adapter neither table identifies is recorded with no APU verdict.
+    /// `Some(false)` would read as "discrete" and could invent the second half
+    /// of an iGPU/dGPU pair out of a part nothing recognized.
+    #[test]
+    fn an_unidentified_adapter_is_recorded_without_an_apu_verdict() {
+        let mut e = Examination::default();
+        record_host_adapters(&mut e, &[host_adapter("AMD Radeon(TM) Graphics", "73DF")]);
+
+        assert_eq!(e.gpus.len(), 1, "the adapter is still reported");
+        assert!(
+            e.gpus[0].gfx_target.is_empty(),
+            "no table names this device id, so no target may be claimed"
+        );
+        assert_eq!(e.gpus[0].is_apu, None, "and no kind may be claimed either");
+        assert!(
+            !e.has_apu && !e.has_discrete_amd,
+            "an unidentified part counts as neither kind"
+        );
+        assert!(e.has_amd_gpu, "it is still an AMD GPU that is present");
+    }
 
     /// Ported from the Python preflight this replaced, whose `wsl.exe` parser
     /// was covered by a self-test that CI ran on both lanes. That coverage has to

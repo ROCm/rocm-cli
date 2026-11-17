@@ -732,3 +732,19 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
+
+  # WSL2 has no `lspci` and no KFD topology, so the GPU list was left empty
+  # there and the machine-readable report said nothing about the hardware --
+  # on a host whose GPU the same report named in `detected_gfx_target`. The
+  # entries now come from the Windows host's adapter inventory.
+  #
+  # The assertion is "at least one, and every one of them is AMD", not a count:
+  # the query filters to AMD adapters, so a count would only restate the lane's
+  # hardware, while an empty list is exactly the regression this guards.
+  # `@requires-gpu` because a WSL host with no AMD adapter has nothing to list
+  # and the premise does not hold.
+  @id:examine-lists-host-gpus-on-wsl @requires-wsl @requires-gpu
+  Scenario: examine-49 - The machine-readable report lists the host's AMD GPUs on WSL
+    Given the CLI is running in WSL
+    When the user inspects the system both for reading and for scripting
+    Then it lists every AMD GPU the Windows host reports
