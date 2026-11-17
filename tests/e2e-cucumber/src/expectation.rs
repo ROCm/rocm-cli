@@ -482,6 +482,12 @@ pub struct PlatformManifest<'a> {
     pub capability: &'a HostCapability,
     /// Component versions (OS/ROCm/vLLM/lemonade) for the report heading.
     pub versions: crate::capability::PlatformVersions,
+    /// Why the post-run lane check failed the run
+    /// (`lane_verdict::post_run_verdict`), so the consolidated report shows the
+    /// lane as failed even when every scenario it resolved was a skip. Left out
+    /// when the check passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_failure: Option<String>,
     pub expectations: Vec<ResolvedScenario>,
 }
 
@@ -745,6 +751,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -758,6 +766,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -771,6 +781,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: false,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -793,6 +805,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: "wsl_rocdxg_ready".into(),
+                probe_error: None,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -809,6 +823,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -824,6 +840,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -837,6 +855,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
         }
     }
@@ -2116,6 +2136,36 @@ reason = "unrelated open bug"
                     merge_queue: false
                 }
             ),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    /// What the lane-verdict notes say about `@requires-gpu` scenarios (see
+    /// `lane_verdict::preflight_verdict`): `has_amd_gpu` alone decides their
+    /// skip, other gates aside. `resolve` takes no lane declaration, so
+    /// `E2E_EXPECT_GPU` does not enter into it.
+    #[test]
+    fn requires_gpu_runs_where_the_probe_found_a_gpu_and_skips_where_it_did_not() {
+        let m = Expectations::default();
+        let d = decl(&["id:gpu-premise", "requires-gpu"]);
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let with_gpu = cap("strix-ubuntu");
+        assert!(with_gpu.has_amd_gpu);
+        assert_eq!(
+            resolve(&d, &with_gpu, &m, included),
+            Expectation::ExpectPass
+        );
+        let without_gpu = HostCapability {
+            has_amd_gpu: false,
+            ..with_gpu
+        };
+        assert!(matches!(
+            resolve(&d, &without_gpu, &m, included),
             Expectation::Skip { .. }
         ));
     }

@@ -54,6 +54,10 @@ pub(super) struct PlatformManifest {
     /// Component versions (OS/ROCm/vLLM/lemonade); absent in older artifacts.
     #[serde(default)]
     pub(super) versions: PlatformVersions,
+    /// Why the harness's post-run lane check failed the run (for example "0
+    /// scenarios executed"); absent when it passed, and in older artifacts.
+    #[serde(default)]
+    pub(super) lane_failure: Option<String>,
     #[serde(default)]
     pub(super) expectations: Vec<ManifestExpectation>,
 }
