@@ -17,8 +17,8 @@ use super::super::family::{family_resolution_hint, resolve_family};
 use super::super::fetch::download_text_cached;
 use super::super::platform_tarball_token;
 use super::super::source::{
-    FamilyResolution, RuntimeVersionSelector, SourceLayout, TheRockChannel, gate_install_layout,
-    resolve_source, selector_is_release_line,
+    FamilyResolution, RuntimeVersionSelector, SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel,
+    gate_install_layout, resolve_source, selector_is_release_line,
 };
 use super::super::version::{
     compare_version_strings, is_parseable_runtime_version, is_stable_runtime_version,
@@ -238,9 +238,10 @@ fn select_tarball_candidate(
 
 /// The context added when [`select_tarball_candidate`] finds no archive.
 ///
-/// That is the only failure it wraps, and a different `--version` can clear
-/// it, so on the next layout it is always followed by the list of releases to
-/// try. No archive was picked, so no release counts as attempted. The
+/// That is the only failure it wraps, and on the release channel a different
+/// `--version` can clear it, so there the next layout's failure is always
+/// followed by the list of releases to try; a nightly one is not (see
+/// `NextLayoutRecovery::suggests_releases`). No archive was picked, so no release counts as attempted. The
 /// suggested command is a tarball install. It carries no `devel` extras,
 /// because a tarball has none.
 fn tarball_resolution_failure_context(
@@ -251,20 +252,30 @@ fn tarball_resolution_failure_context(
     published: &[String],
 ) -> String {
     let (stream, hint) = match layout {
-        SourceLayout::Next => (
-            "next-layout",
-            next_layout_unsatisfied_hint(
-                version_selector,
-                Some(published),
-                None,
-                NextLayoutRecovery {
-                    format: RecoveryFormat::Tarball,
-                    exact_arch: family_resolution.raw_arch.as_deref(),
-                    include_devel: false,
-                },
-                Some(&family_resolution.family),
-            ),
-        ),
+        SourceLayout::Next => {
+            let recovery = NextLayoutRecovery {
+                channel,
+                format: RecoveryFormat::Tarball,
+                exact_arch: family_resolution.raw_arch.as_deref(),
+                include_devel: false,
+            };
+            let hint = if recovery.suggests_releases() {
+                next_layout_unsatisfied_hint(
+                    version_selector,
+                    Some(published),
+                    None,
+                    recovery,
+                    Some(&family_resolution.family),
+                )
+            } else {
+                format!(
+                    "No {} archive for {} matched this request on the ROCm {THEROCK_NEXT_MIN_MAJOR}+ next layout.",
+                    channel.as_str(),
+                    family_resolution.family
+                )
+            };
+            ("next-layout", hint)
+        }
         SourceLayout::Canonical => (
             "canonical",
             family_resolution_hint(
@@ -637,6 +648,36 @@ mod tests {
             ),
             "{update}"
         );
+
+        // A nightly request on the next layout gets no release list and no
+        // command: that catalog publishes prerelease archives, which the
+        // stable-release hint cannot name, and a `--channel release` command
+        // would move the user off the channel they asked for.
+        let nightly = tarball_resolution_failure_context(
+            TheRockChannel::Nightly,
+            SourceLayout::Next,
+            &family,
+            None,
+            &["10.3.0a20261111".to_owned()],
+        );
+        assert!(
+            nightly.starts_with("next-layout TheRock nightly tarball"),
+            "{nightly}"
+        );
+        assert!(
+            nightly.contains(
+                "No nightly archive for gfx120X-all matched this request on the ROCm 10+ next layout."
+            ),
+            "{nightly}"
+        );
+        for absent in [
+            "--version",
+            "--channel",
+            "rocm install sdk",
+            "stable release",
+        ] {
+            assert!(!nightly.contains(absent), "{nightly} contains {absent}");
+        }
 
         let canonical = tarball_resolution_failure_context(
             TheRockChannel::Release,

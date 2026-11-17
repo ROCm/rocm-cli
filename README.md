@@ -754,7 +754,9 @@ ROCm 10 releases that source publishes, if any, and suggests one of them to
 re-run with, in the same `--format` as the failed request. When `rocm update`
 fails the same way, it suggests a whole `rocm install sdk` command that keeps
 the runtime's format and `--devel` toolchain. A failure no other version can
-fix, such as an unknown GPU arch or a network error, suggests no version.
+fix, such as an unknown GPU arch or a network error, suggests no version, and
+neither does a failed `--channel nightly` request, whose builds are not stable
+releases.
 
 #### Driver installation
 

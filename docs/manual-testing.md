@@ -295,7 +295,8 @@ Version pins, checked with `--dry-run`:
   suggests a whole `rocm install sdk` command with the runtime's `--format`
   and, for a `--devel` runtime, `--devel`. Running that command with
   `--dry-run` must succeed. A failure no other version can clear, such as an
-  unknown device target, must suggest no version.
+  unknown device target, must suggest no version, and so must a failed
+  `--channel nightly` install or update.
 
 ### 2a. A GPU target with no ROCm build
 

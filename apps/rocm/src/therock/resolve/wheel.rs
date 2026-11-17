@@ -804,6 +804,7 @@ fn resolve_pip_runtime_plan(
     // Loaded here rather than inside `resolve_pip_runtime_from_index` so a
     // failure further down can name the releases this index does publish.
     let recovery = NextLayoutRecovery {
+        channel,
         format: RecoveryFormat::Wheel,
         exact_arch: family_resolution.raw_arch.as_deref(),
         include_devel,
@@ -2932,6 +2933,7 @@ sdk install
     }
 
     const WHEEL_AT_GFX1201: NextLayoutRecovery<'static> = NextLayoutRecovery {
+        channel: TheRockChannel::Release,
         format: RecoveryFormat::Wheel,
         exact_arch: Some("gfx1201"),
         include_devel: false,
@@ -3027,6 +3029,41 @@ sdk install
             "{unreadable}"
         );
         assert!(!unreadable.contains("--version"), "{unreadable}");
+    }
+
+    /// A nightly request reads the next layout too, but that layout publishes
+    /// only prerelease builds for it, which the stable-release hint cannot name.
+    /// Even a failure another release could clear gets no release list and no
+    /// `--channel release` command, which would move the user off the channel
+    /// they asked for.
+    #[test]
+    fn a_nightly_next_layout_failure_suggests_no_release() {
+        let nightly = NextLayoutRecovery {
+            channel: TheRockChannel::Nightly,
+            ..WHEEL_AT_GFX1201
+        };
+        let published = vec!["10.3.0a20261110".to_owned(), "10.3.0a20261111".to_owned()];
+        let unsatisfied = VersionUnsatisfied::new(
+            Some("10.3.0a20261111"),
+            "no torchaudio built for ROCm 10.3.0a20261111 is published".to_owned(),
+        );
+        for (selector, listing) in [(None, Some(published.as_slice())), (None, None)] {
+            let context = wheel_resolution_failure_context(
+                TheRockChannel::Nightly,
+                SourceLayout::Next,
+                THEROCK_NEXT_PIP_INDEX_BASE,
+                selector,
+                listing,
+                Some(&unsatisfied),
+                nightly,
+            );
+            assert_eq!(
+                context,
+                format!(
+                    "failed to resolve TheRock nightly wheel runtime from next-layout source {THEROCK_NEXT_PIP_INDEX_BASE}"
+                )
+            );
+        }
     }
 
     /// The three failures a different release can clear are raised as the

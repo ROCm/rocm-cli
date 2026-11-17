@@ -85,6 +85,9 @@ pub(in crate::therock) enum RecoveryFormat {
 /// What a suggested command has to carry over from the request that failed.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::therock) struct NextLayoutRecovery<'a> {
+    /// The channel the failed request read. Only the release channel gets a
+    /// list of releases to try: see [`NextLayoutRecovery::suggests_releases`].
+    pub(in crate::therock) channel: TheRockChannel,
     pub(in crate::therock) format: RecoveryFormat,
     /// The exact arch the request resolved with, so the command repeats it.
     pub(in crate::therock) exact_arch: Option<&'a str>,
@@ -92,6 +95,18 @@ pub(in crate::therock) struct NextLayoutRecovery<'a> {
     /// carries it into the command; a pinned install re-runs its own command,
     /// flags included.
     pub(in crate::therock) include_devel: bool,
+}
+
+impl NextLayoutRecovery<'_> {
+    /// Whether a failure on the next layout is followed by
+    /// [`next_layout_unsatisfied_hint`]. On the release channel a different
+    /// stable release can clear it. The nightly channel publishes only
+    /// prerelease builds there, which that hint does not name and which a
+    /// `--version` re-run on the release channel would leave, so a nightly
+    /// failure gets its own message and no suggestion.
+    pub(in crate::therock) fn suggests_releases(&self) -> bool {
+        self.channel == TheRockChannel::Release
+    }
 }
 
 /// How many published releases a next-layout failure lists by name.
@@ -107,8 +122,9 @@ const NEXT_LAYOUT_HINT_MAX_LISTED: usize = 5;
 /// (`None` when the listing could not be read), narrowed to one GPU family when
 /// `family_scope` names it. `attempted` is the release the failure recorded,
 /// and the hint leaves it out. It also leaves out any release
-/// [`layout_serving`] would not route (the re-run is a release-channel pin) back to this layout, so a re-run
-/// searches the same layout. When nothing else qualifies, the hint says so and
+/// [`layout_serving`] would not route back to this layout on the request's
+/// channel, so a re-run searches the same layout. Callers reach it only for
+/// the release channel ([`NextLayoutRecovery::suggests_releases`]). When nothing else qualifies, the hint says so and
 /// names no command.
 ///
 /// The command depends on the caller:
@@ -149,7 +165,7 @@ pub(in crate::therock) fn next_layout_unsatisfied_hint(
         .filter(|version| attempted != Some(version.as_str()))
         .filter(|version| {
             layout_serving(
-                TheRockChannel::Release,
+                recovery.channel,
                 Some(&RuntimeVersionSelector::Version((*version).clone())),
             ) == SourceLayout::Next
         })
@@ -210,8 +226,9 @@ fn recovery_command(pinned: bool, version: &str, recovery: NextLayoutRecovery<'_
     } else {
         ""
     };
+    let channel = recovery.channel.as_str();
     format!(
-        "Install one of them, for example `rocm install sdk --channel release --format {format} --version {version} --family {family}{devel}`{placeholder_note}."
+        "Install one of them, for example `rocm install sdk --channel {channel} --format {format} --version {version} --family {family}{devel}`{placeholder_note}."
     )
 }
 
@@ -244,7 +261,9 @@ pub(super) fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String
 ///
 /// A ROCm >= 10 pin already refused `--channel nightly` before resolution
 /// (`select_source_layout`), so the canonical hint's nightly suggestion must
-/// not be what a next-layout failure prints. On the next layout:
+/// not be what a next-layout failure prints. On the next layout, a nightly
+/// failure gets the source line alone (see
+/// [`NextLayoutRecovery::suggests_releases`]). On the release channel:
 /// - `published` is `None` when the `rocm` listing itself could not be read,
 ///   and the context says no other version can be suggested.
 /// - `unsatisfied` is the [`VersionUnsatisfied`] in the failure's chain. Only
@@ -266,6 +285,7 @@ pub(super) fn wheel_resolution_failure_context(
     let (source_label, hint) = match layout {
         SourceLayout::Next => {
             let hint = match (published, unsatisfied) {
+                _ if !recovery.suggests_releases() => None,
                 (None, _) => Some(next_layout_unsatisfied_hint(
                     version_selector,
                     None,
@@ -308,6 +328,7 @@ mod tests {
     }
 
     const WHEEL_AT_GFX1200: NextLayoutRecovery<'static> = NextLayoutRecovery {
+        channel: TheRockChannel::Release,
         format: RecoveryFormat::Wheel,
         exact_arch: Some("gfx1200"),
         include_devel: false,
@@ -478,6 +499,7 @@ mod tests {
             Some(&published),
             Some("10.1.0"),
             NextLayoutRecovery {
+                channel: TheRockChannel::Release,
                 format: RecoveryFormat::Wheel,
                 exact_arch: Some("gfx1200"),
                 include_devel: true,
@@ -527,6 +549,7 @@ mod tests {
             Some(&published),
             None,
             NextLayoutRecovery {
+                channel: TheRockChannel::Release,
                 format: RecoveryFormat::Tarball,
                 exact_arch: None,
                 include_devel: false,
