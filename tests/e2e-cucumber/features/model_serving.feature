@@ -1006,6 +1006,21 @@ Feature: Model serving
     When the client repeats those calls with the key
     Then every one of those calls succeeds
 
+  # A vLLM wheel built against a different torch installs and reports a version,
+  # so the inventory called it `runtime: ready` and `serve` then died deep in
+  # engine start-up. The inventory now says it is installed but not usable and
+  # names the extension (read-only, so a host whose torch needs a compat shim
+  # nobody has written yet can still read `ready`). Hermetic: a stand-in interpreter answers the probe, so
+  # no GPU, network or real vLLM is needed. The matching refusal in `serve` is
+  # covered at unit level (`serve_refuses_a_vllm_whose_extensions_do_not_import`)
+  # because reaching it end to end needs a GPU lane.
+  @id:serve-vllm-broken-extensions-reported-not-usable @requires-os:linux
+  Scenario: serve-62 - A vLLM install whose compiled extensions do not import is not reported as ready
+    Given a vLLM install whose compiled extensions do not import
+    When the user lists the engines of that install
+    Then vLLM is reported as installed but not usable
+    And the report names the extension that failed to import
+
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the
@@ -1022,7 +1037,7 @@ Feature: Model serving
   # specifically — the only possible outcome of a scripted/CI `--verbose`
   # session, per that function's own doc comment.
   @id:serve-scripted-death-after-startup @requires-no-gpu
-  Scenario: serve-62 - A managed engine that dies after startup fails loudly
+  Scenario: serve-63 - A managed engine that dies after startup fails loudly
     Given the scripted engine is armed to die shortly after startup
     When the user serves a model expecting the engine to crash after startup
     Then serving fails with a non-zero exit and names the crash
@@ -1036,9 +1051,9 @@ Feature: Model serving
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
   # Before ROCMAI-541 this made a clean, intentional, externally-triggered
-  # stop fail exactly like serve-62's crash.
+  # stop fail exactly like serve-63's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
-  Scenario: serve-63 - An externally stopped attached serve exits cleanly, not as a crash
+  Scenario: serve-64 - An externally stopped attached serve exits cleanly, not as a crash
     Given the scripted engine is armed to run until stopped
     When the user attaches to the scripted serve in the background
     And another shell stops that service while it is attached

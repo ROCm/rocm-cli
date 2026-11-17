@@ -272,6 +272,9 @@ struct Resolution {
     engine: String,
     feature: String,
     scenario: String,
+    /// Tagged `@requires-gpu` or `@requires-multi-gpu`, for the post-run check
+    /// that a GPU-declaring lane executed at least one of them.
+    requires_gpu: bool,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -1523,6 +1526,7 @@ async fn run_suite() {
     use e2e_cucumber::expectation::{
         Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
     };
+    use e2e_cucumber::lane_verdict;
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1582,6 +1586,19 @@ async fn run_suite() {
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
     );
+
+    // Refuse to run when the result could not mean anything: a probe that could
+    // not read the binary, or a lane that declares a GPU the probe did not find,
+    // would resolve every GPU scenario to skip and pass. See `lane_verdict`.
+    let preflight = lane_verdict::preflight(
+        std::env::var_os(lane_verdict::EXPECT_GPU_ENV).as_deref(),
+        cap.probe_error.as_deref(),
+        cap.has_amd_gpu,
+        &e2e_cucumber::capability::probe_facts_summary(cap),
+    )
+    .unwrap_or_else(|fatal| lane_failure(&fatal));
+    print_lane_notes(&preflight.notes);
+    let gpu_declaration = preflight.declaration;
 
     // Shared record of each scenario's resolved expectation, keyed by @id.
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
@@ -1705,6 +1722,7 @@ async fn run_suite() {
                             engine,
                             feature: feature.name.clone(),
                             scenario: scenario.name.clone(),
+                            requires_gpu: lane_verdict::needs_gpu(&decl),
                         },
                     );
                     // Two scenarios sharing an `@id` would silently overwrite each
@@ -1760,31 +1778,41 @@ async fn run_suite() {
     // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come
     // from the shared runtimes tree CI provides (E2E_SHARED_RUNTIMES_DIR) — absent
     // on mock (no runtime) and on local runs (per-scenario dirs already dropped),
-    // where those render as "n/a". Best-effort.
+    // where those render as "n/a". Best-effort. Collected before the lane check
+    // so that, once decided, nothing stands between it and platform.json.
     let shared = shared_runtimes_dir();
     let versions = e2e_cucumber::capability::collect_versions(shared.as_deref());
 
+    // A run with nothing to fail passes; check it executed something, and on
+    // a GPU-declaring lane something that needed the GPU. `resolutions` is empty
+    // when a cucumber `--name`/`--tags` filter replaced `filter_run`, and then
+    // which scenarios need a GPU is unknown. The verdict goes into platform.json,
+    // so the consolidated report shows a failed lane check as red.
+    let resolved: Vec<lane_verdict::ResolvedRun<'_>> = resolutions
+        .iter()
+        .map(|(id, r)| lane_verdict::ResolvedRun {
+            id,
+            feature: &r.feature,
+            scenario: &r.scenario,
+            engine: &r.engine,
+            expectation: &r.expectation,
+            needs_gpu: r.requires_gpu,
+        })
+        .collect();
+    let executed: Vec<&str> = actual.iter().map(|(id, _)| id.as_str()).collect();
+    let (post_run, manifest) =
+        lane_verdict::finish_run(cap, versions, &resolved, &executed, gpu_declaration);
+    print_lane_notes(&post_run.notes);
+
     // Write the platform.json sidecar (probed capability + every resolution,
-    // including skips) for the central report's expected-vs-actual grid.
-    let manifest = e2e_cucumber::expectation::PlatformManifest {
-        platform_slug: &cap.platform_slug,
-        capability: cap,
-        versions,
-        expectations: resolutions
-            .iter()
-            .map(|(id, r)| {
-                e2e_cucumber::expectation::ResolvedScenario::new(
-                    id,
-                    &r.feature,
-                    &r.scenario,
-                    &r.engine,
-                    &r.expectation,
-                )
-            })
-            .collect(),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let _ = std::fs::write(dir.join("platform.json"), json);
+    // including skips, + any lane failure) for the central report's grid.
+    let written = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| error.to_string())
+        .and_then(|json| {
+            std::fs::write(dir.join("platform.json"), json).map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        eprintln!("warning: could not write platform.json: {error}");
     }
 
     // Classify actual results against the matrix. A deterministic XPASS is
@@ -1829,7 +1857,7 @@ async fn run_suite() {
             "XPASS (flaky, tolerated): '{x}' passed this run; the intermittent bug remains tracked."
         );
     }
-    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() {
+    if lane_verdict::run_failed(stale_xpass.len(), unexpected_fail.len(), &post_run) {
         for x in &stale_xpass {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
@@ -1841,6 +1869,24 @@ async fn run_suite() {
                 "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
             );
         }
+        if let Some(fatal) = &post_run.fatal {
+            lane_failure(fatal);
+        }
         std::process::exit(1);
+    }
+}
+
+/// Print a lane-check failure (see `lane_verdict::failure_lines`) and exit
+/// non-zero.
+fn lane_failure(message: &str) -> ! {
+    for line in e2e_cucumber::lane_verdict::failure_lines(message) {
+        eprintln!("{line}");
+    }
+    std::process::exit(1);
+}
+
+fn print_lane_notes(notes: &[String]) {
+    for note in notes {
+        eprintln!("{}", e2e_cucumber::lane_verdict::note_line(note));
     }
 }
