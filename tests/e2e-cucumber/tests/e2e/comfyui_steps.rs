@@ -1067,7 +1067,7 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
 /// `tests/e2e/tui_driver.rs` (through `spawn_binary_with_env`, which overlays
 /// `command_env` onto the child and leaves it in place). It does not reach
 /// plain `run_rocm` or `run_rocm_ok`, which ignore `command_env`.
-fn disable_startup_update_check(world: &mut E2eWorld) {
+pub(crate) fn disable_startup_update_check(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));

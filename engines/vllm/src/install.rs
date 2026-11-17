@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{
-    AppPaths, command_failure_detail, ensure_uv_binary, split_local_version, uv_command_env,
-    uv_pip_freeze_args, uv_pip_install_base,
+    AppPaths, TENSORIZER_PYTHON314_FIX, command_failure_detail, ensure_uv_binary,
+    split_local_version, tensorizer_override_requirement, uv_command_env, uv_pip_freeze_args,
+    uv_pip_install_base,
 };
 use rocm_engine_protocol::{InstallRequest, InstallResponse};
 use std::path::{Path, PathBuf};
@@ -16,8 +17,9 @@ use crate::discover_builds::{
 };
 use crate::repair::{RepairAssessment, assess_runtime_repair};
 use crate::runtime::{
-    assessed_python_for_repair, describe_skipped_managed_runtimes, resolve_managed_runtime_python,
-    resolve_vllm_runtime, runtime_is_managed, vllm_runtime_warnings,
+    VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
+    resolve_managed_runtime_python, resolve_vllm_runtime, runtime_is_managed,
+    vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 use crate::wheel_builds::{
@@ -50,6 +52,9 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
     };
     let mut discover_pins: Vec<String> = Vec::new();
     let mut discover_notes: Vec<String> = Vec::new();
+    // True whenever this run installed vLLM: a first install, `--reinstall` or a
+    // repair pass. Only a runtime that was resolved as already installed skips it.
+    let installed_vllm_now = already_installed.is_none();
     let runtime = if let Some(runtime) = already_installed {
         runtime
     } else {
@@ -89,6 +94,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             )
         })?
     };
+    discover_notes.extend(ensure_runtime_tensorizer(&runtime, installed_vllm_now)?);
     let env_path = runtime
         .command
         .parent()
@@ -129,6 +135,287 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             .collect(),
     })
 }
+/// What the tensorizer import probe found.
+#[derive(Debug, PartialEq, Eq)]
+enum TensorizerProbe {
+    /// `tensorizer` imports, is not installed (vLLM guards that case itself), or
+    /// the import failed for a reason that is not tensorizer's (a torch or
+    /// shared-library failure, which the runtime device check reports).
+    Usable,
+    /// `tensorizer` is installed and raises on import; carries the exception line.
+    Broken(String),
+}
+
+/// How long the import probe and the upgrade may run before they are abandoned.
+const TENSORIZER_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// The path of the last `File "..."` frame in a Python traceback.
+fn last_traceback_frame(stderr: &str) -> Option<&str> {
+    stderr.lines().rev().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("File \"")?;
+        rest.split_once('"').map(|(path, _)| path)
+    })
+}
+
+/// Whether `path` lies inside a `tensorizer` package directory, with either
+/// path separator.
+fn path_is_in_tensorizer_package(path: &str) -> bool {
+    path.contains("/tensorizer/") || path.contains("\\tensorizer\\")
+}
+
+/// Judges the stderr of a failed `import tensorizer.serialization`.
+///
+/// The import pulls in torch, so a torch or shared-library failure has tensorizer
+/// frames in its traceback too. A failure is tensorizer's own when the last frame
+/// before the exception is inside the tensorizer package and the exception is not
+/// a library-load or missing-module error (`ImportError`, `OSError`): that is the
+/// shape of the Python 3.14 `KeyError` and of any other tensorizer code that does
+/// not run on this interpreter. Everything else is left to the device check.
+fn classify_tensorizer_failure(stderr: &str) -> TensorizerProbe {
+    // Python 3.13+ colourises tracebacks under `FORCE_COLOR` even when piped, which
+    // wraps the quoted path in `File "..."` in escapes and defeats the frame
+    // parser. The probe asks for no colour; this is the second line of defence.
+    let stderr = stderr
+        .lines()
+        .map(rocm_core::strip_terminal_control_sequences)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = stderr.as_str();
+    let Some(exception) = stderr.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return TensorizerProbe::Usable;
+    };
+    let exception = exception.trim();
+    let kind = exception.split([':', ' ']).next().unwrap_or_default();
+    let is_load_failure = kind.ends_with("ImportError")
+        || kind.ends_with("OSError")
+        || kind == "ModuleNotFoundError"
+        || exception.contains("shared object file")
+        || exception.contains("DLL load failed");
+    let in_tensorizer = last_traceback_frame(stderr).is_some_and(path_is_in_tensorizer_package);
+    if in_tensorizer && !is_load_failure {
+        TensorizerProbe::Broken(exception.to_owned())
+    } else {
+        TensorizerProbe::Usable
+    }
+}
+
+/// The command that imports what vLLM imports from `tensorizer` in `python`.
+///
+/// Colour is switched off (a forced-colour environment makes the interpreter wrap
+/// the traceback's quoted paths in escape codes), and with `runtime` the command
+/// carries the environment the server is launched with (SDK library path,
+/// `PYTHONPATH` for a ROCm 10.x discover build, and the rest), so a runtime that
+/// needs it to import torch is judged as it will run.
+fn tensorizer_probe_command(
+    python: &Path,
+    runtime: Option<&VllmRuntime>,
+) -> Result<ProcessCommand> {
+    let mut command = ProcessCommand::new(python);
+    // Not `-I`: that implies `-E` and would drop the `PYTHONPATH` (and the rest of
+    // the `PYTHON*` environment) the launch sets for a ROCm 10.x discover build,
+    // so a module the server finds would read as missing. `-s` keeps the user's
+    // site directory out, and `PYTHONSAFEPATH` keeps the working directory off
+    // `sys.path` (Python 3.11+; older interpreters ignore it).
+    command
+        .args(["-s", "-c", "import tensorizer.serialization"])
+        .env("PYTHONSAFEPATH", "1");
+    if let Some(runtime) = runtime {
+        // A launch environment that cannot be built is a failure of the check, not
+        // a runtime that imports: probing without it could read as `Usable` a
+        // failure the server would not have.
+        crate::process::apply_therock_env(&mut command, runtime)
+            .context("could not build the environment the server is launched with")?;
+    }
+    command
+        .env_remove("FORCE_COLOR")
+        .env("NO_COLOR", "1")
+        .env("PYTHON_COLORS", "0");
+    Ok(command)
+}
+
+/// Imports what vLLM imports from `tensorizer` in `python`.
+///
+/// vLLM's model loader imports `tensorizer.serialization` at startup and only
+/// guards `ImportError`, so any other exception raised inside tensorizer ends
+/// the engine core. With `runtime`, the probe runs under the environment the
+/// server is launched with (SDK library path and the rest), so a runtime that
+/// needs it to import torch is judged as it will run.
+fn probe_tensorizer_import(
+    python: &Path,
+    runtime: Option<&VllmRuntime>,
+) -> Result<TensorizerProbe> {
+    probe_tensorizer_import_within(python, runtime, TENSORIZER_STEP_TIMEOUT)
+}
+
+/// [`probe_tensorizer_import`] with the deadline as a parameter, so a test can
+/// exercise the timeout without waiting minutes.
+fn probe_tensorizer_import_within(
+    python: &Path,
+    runtime: Option<&VllmRuntime>,
+    limit: std::time::Duration,
+) -> Result<TensorizerProbe> {
+    let command = tensorizer_probe_command(python, runtime)?;
+    let output = rocm_core::process::run_with_timeout(command, limit, "tensorizer import probe")
+        .with_context(|| format!("failed to import tensorizer with {}", python.display()))?;
+    if output.status.success() {
+        return Ok(TensorizerProbe::Usable);
+    }
+    Ok(classify_tensorizer_failure(&String::from_utf8_lossy(
+        &output.stderr,
+    )))
+}
+
+/// Installs the fixed tensorizer over vLLM's pin, leaving everything else as it is.
+fn upgrade_tensorizer(uv: &Path, paths: &AppPaths, python: &Path) -> Result<()> {
+    upgrade_tensorizer_within(uv, paths, python, TENSORIZER_STEP_TIMEOUT)
+}
+
+/// [`upgrade_tensorizer`] with the deadline as a parameter, so a test can
+/// exercise the timeout without waiting minutes.
+fn upgrade_tensorizer_within(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    limit: std::time::Duration,
+) -> Result<()> {
+    let mut args = uv_pip_install_base(python);
+    args.push("--no-deps".to_owned());
+    args.push(tensorizer_override_requirement());
+    let mut command = ProcessCommand::new(uv);
+    command.args(&args).envs(uv_command_env(paths));
+    let output =
+        rocm_core::process::run_with_timeout(command, limit, "uv pip install for tensorizer")
+            .context("failed to run uv pip install for tensorizer")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "`uv {}` failed: {}",
+        args.join(" "),
+        command_failure_detail(&output)
+    )
+}
+
+/// The decision behind [`ensure_runtime_tensorizer`], with the probe and the
+/// upgrade injected.
+///
+/// Only a managed runtime is rocm-cli's to change, so an external one is not
+/// probed at all. The probe runs first so an interpreter the pinned release works
+/// on keeps exactly what vLLM asked for.
+///
+/// Three things can go wrong after a broken tensorizer is found: the upgrade
+/// fails, the probe cannot run, or the upgrade leaves tensorizer unimportable.
+/// Each is an error when `fatal` (this run installed vLLM, whether a first
+/// install, `--reinstall` or a repair, so the runtime would be left unable to
+/// serve or unchecked) and otherwise a note carrying the same facts, so a no-op
+/// install on a runtime this run did not touch (an offline host, say) stays one.
+/// Returns the note describing what was done, if anything.
+fn tensorizer_step(
+    managed: bool,
+    fatal: bool,
+    mut probe: impl FnMut() -> Result<TensorizerProbe>,
+    upgrade: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
+    if !managed {
+        return Ok(None);
+    }
+    // A probe that cannot run (spawn failure, timeout) is a failure of the check,
+    // not a finding. It fails when this run installed vLLM, which must not report
+    // a runtime it could not look at. On a runtime it did not touch it is a note,
+    // so a host where the check cannot run keeps the no-op install it had before.
+    let unchecked = |error: anyhow::Error| -> Result<Option<String>> {
+        if fatal {
+            Err(error)
+        } else {
+            Ok(Some(format!(
+                "could not check whether vLLM's tensorizer imports: {error:#}"
+            )))
+        }
+    };
+    let reason = match probe() {
+        Ok(TensorizerProbe::Broken(reason)) => reason,
+        Ok(TensorizerProbe::Usable) => return Ok(None),
+        Err(error) => return unchecked(error),
+    };
+    let requirement = tensorizer_override_requirement();
+    if let Err(error) = upgrade() {
+        let message = format!(
+            "vLLM's pinned tensorizer cannot be imported ({reason}) and upgrading it to \
+             {requirement} failed: {error:#}"
+        );
+        return if fatal {
+            Err(anyhow::anyhow!("vLLM was installed, but {message}"))
+        } else {
+            Ok(Some(format!("{message}; vLLM would fail at startup")))
+        };
+    }
+    let after = match probe() {
+        Ok(after) => after,
+        Err(error) => return unchecked(error),
+    };
+    match after {
+        TensorizerProbe::Usable => Ok(Some(format!(
+            "vLLM pins a tensorizer that cannot be imported under this Python ({reason}); \
+             upgraded it to {TENSORIZER_PYTHON314_FIX}, so `uv pip check` reports vLLM's pin as \
+             unmet on purpose"
+        ))),
+        TensorizerProbe::Broken(after) => {
+            // An upgrade can fail to help (the exception is not the one 2.12.1
+            // fixes). When this run installed vLLM that leaves a runtime that
+            // cannot serve, so it fails; on a runtime this run did not touch the
+            // install used to be a no-op and stays one, with the same facts as a note.
+            let message = format!(
+                "tensorizer still cannot be imported after upgrading it to {requirement}: \
+                 {after}. vLLM would fail at startup, so this runtime cannot serve with vLLM."
+            );
+            if fatal {
+                bail!("vLLM was installed, but {message}")
+            }
+            Ok(Some(message))
+        }
+    }
+}
+
+/// Makes sure vLLM's `tensorizer` dependency imports in `runtime`, upgrading it
+/// when it does not.
+///
+/// vLLM's wheel pins `tensorizer==2.10.1`, which raises
+/// `KeyError: 'crypto_stream_salsa20_NONCEBYTES'` at import under Python 3.14
+/// (its constants metaclass reads annotations from the class namespace, where
+/// 3.14 no longer puts them; fixed in tensorizer 2.12.1). The ROCm 10.1.0 vLLM
+/// build exists for Python 3.14 only, so the pin cannot be avoided by choosing
+/// another Python, and an install that reports success would end in an engine
+/// core crash at the first `rocm serve`. Runs after an install pass (`installed_now`)
+/// and on an existing runtime, so one installed before this check existed is
+/// repaired by the next `rocm engines install vllm`.
+fn ensure_runtime_tensorizer(runtime: &VllmRuntime, installed_now: bool) -> Result<Option<String>> {
+    ensure_runtime_tensorizer_with(runtime, installed_now, |python| {
+        let paths = AppPaths::discover()?;
+        let uv =
+            ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+        upgrade_tensorizer(&uv, &paths, python)
+    })
+}
+
+/// [`ensure_runtime_tensorizer`] with the upgrade injected, so a test can drive
+/// the real probe (and its launch environment) against a stand-in interpreter.
+fn ensure_runtime_tensorizer_with(
+    runtime: &VllmRuntime,
+    installed_now: bool,
+    upgrade: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Option<String>> {
+    // The managed check lives in `tensorizer_step`, once, so the rule has one home.
+    let Some(python) = runtime.python_executable.as_deref() else {
+        return Ok(None);
+    };
+    tensorizer_step(
+        runtime_is_managed(runtime),
+        installed_now,
+        || probe_tensorizer_import(python, Some(runtime)),
+        || upgrade(python),
+    )
+}
+
 /// What a vLLM install route resolved: the pins worth surfacing as an install
 /// warning, and a note for each place the route fell back to a weaker choice
 /// than the one it prefers. Both are empty for the static-pin route.
@@ -818,6 +1105,523 @@ fn install_vllm_rocm10_discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const KEY_ERROR_UNIX: &str = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/venv/lib/python3.14/site-packages/tensorizer/serialization.py\", line 40, in <module>\n    from . import _crypt\n  File \"/venv/lib/python3.14/site-packages/tensorizer/_crypt/_encryption.py\", line 367, in __new__\n    type, NamedTuple(name, **{k: annotations[k] for k in entries})\nKeyError: 'crypto_stream_salsa20_NONCEBYTES'\n";
+
+    #[test]
+    fn the_python_314_key_error_is_a_broken_tensorizer() {
+        assert_eq!(
+            classify_tensorizer_failure(KEY_ERROR_UNIX),
+            TensorizerProbe::Broken("KeyError: 'crypto_stream_salsa20_NONCEBYTES'".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_windows_style_tensorizer_path_is_recognised() {
+        let stderr = "Traceback (most recent call last):\n  File \"C:\\venv\\Lib\\site-packages\\tensorizer\\_crypt\\_encryption.py\", line 367, in __new__\nKeyError: 'x'\n";
+        assert!(matches!(
+            classify_tensorizer_failure(stderr),
+            TensorizerProbe::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn a_torch_failure_with_tensorizer_frames_is_not_a_broken_tensorizer() {
+        // `import tensorizer.serialization` imports torch, so a missing HIP library
+        // has tensorizer frames above the torch ones.
+        let stderr = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/venv/lib/python3.14/site-packages/tensorizer/serialization.py\", line 12, in <module>\n    import torch\n  File \"/venv/lib/python3.14/site-packages/torch/__init__.py\", line 300, in <module>\n    _load_global_deps()\nOSError: libamdhip64.so.7: cannot open shared object file: No such file or directory\n";
+        assert_eq!(classify_tensorizer_failure(stderr), TensorizerProbe::Usable);
+    }
+
+    #[test]
+    fn a_non_load_exception_raised_below_tensorizer_is_not_a_broken_tensorizer() {
+        // Tensorizer frames above, but the exception comes from torch and is not a
+        // library-load error, so only the last-frame rule can acquit tensorizer.
+        let stderr = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/venv/lib/python3.14/site-packages/tensorizer/serialization.py\", line 12, in <module>\n    import torch\n  File \"/venv/lib/python3.14/site-packages/torch/_utils.py\", line 80, in helper\n    return table[key]\nKeyError: 'gfx1151'\n";
+        assert_eq!(classify_tensorizer_failure(stderr), TensorizerProbe::Usable);
+    }
+
+    /// Each case raises its exception with tensorizer as the LAST frame, so only
+    /// the library-load rule can acquit it, and each carries exactly one of the
+    /// rule's markers: the exception type or the message.
+    #[test]
+    fn each_library_load_marker_alone_acquits_a_tensorizer_frame() {
+        let cases = [
+            (
+                "OSError type alone",
+                "OSError: [Errno 2] No such file or directory: 'libsodium.so'",
+            ),
+            (
+                "ImportError type alone",
+                "ImportError: cannot import name 'x' from 'y'",
+            ),
+            (
+                "ModuleNotFoundError type alone",
+                "ModuleNotFoundError: No module named 'redis'",
+            ),
+            (
+                "'shared object file' alone, wrapped in another type",
+                "RuntimeError: libamdhip64.so.7: cannot open shared object file",
+            ),
+            (
+                "'DLL load failed' alone, wrapped in another type",
+                "RuntimeError: DLL load failed while importing _tensorizer: The specified module could not be found.",
+            ),
+        ];
+        for (what, exception) in cases {
+            let stderr = format!(
+                "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\n{exception}\n"
+            );
+            assert_eq!(
+                classify_tensorizer_failure(&stderr),
+                TensorizerProbe::Usable,
+                "{what}"
+            );
+        }
+        // The same frame with a non-load exception is tensorizer's own failure.
+        let broken = "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\nKeyError: 'x'\n";
+        assert!(matches!(
+            classify_tensorizer_failure(broken),
+            TensorizerProbe::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn an_absent_tensorizer_or_empty_stderr_is_not_a_finding() {
+        let absent = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'tensorizer'\n";
+        assert_eq!(classify_tensorizer_failure(absent), TensorizerProbe::Usable);
+        assert_eq!(classify_tensorizer_failure(""), TensorizerProbe::Usable);
+    }
+
+    fn broken() -> TensorizerProbe {
+        TensorizerProbe::Broken("KeyError".to_owned())
+    }
+
+    #[test]
+    fn an_unmanaged_runtime_is_never_probed_or_changed() -> Result<()> {
+        let note = tensorizer_step(
+            false,
+            true,
+            || panic!("an environment rocm-cli does not own must not be probed"),
+            || panic!("an environment rocm-cli does not own must not be changed"),
+        )?;
+        assert_eq!(note, None);
+        let runtime = VllmRuntime {
+            source: "environment python".to_owned(),
+            python_executable: Some(PathBuf::from("/nonexistent/python")),
+            ..VllmRuntime::for_test()
+        };
+        assert!(!runtime_is_managed(&runtime));
+        assert_eq!(ensure_runtime_tensorizer(&runtime, true)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_usable_tensorizer_is_left_alone() -> Result<()> {
+        let note = tensorizer_step(
+            true,
+            true,
+            || Ok(TensorizerProbe::Usable),
+            || panic!("a usable tensorizer must not be upgraded"),
+        )?;
+        assert_eq!(note, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_broken_tensorizer_is_upgraded_once_and_probed_again() -> Result<()> {
+        let mut probes = vec![TensorizerProbe::Usable, broken()];
+        let mut upgrades = 0;
+        let note = tensorizer_step(
+            true,
+            true,
+            || Ok(probes.pop().expect("probed more often than expected")),
+            || {
+                upgrades += 1;
+                Ok(())
+            },
+        )?
+        .expect("an override is reported");
+        assert_eq!(upgrades, 1);
+        assert!(probes.is_empty(), "the upgrade must be probed again");
+        assert!(
+            note.contains("2.12.1") && note.contains("on purpose"),
+            "{note}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_upgrade_that_does_not_help_fails_an_install_this_run_made_and_only_warns_otherwise()
+    -> Result<()> {
+        let note = tensorizer_step(true, false, || Ok(broken()), || Ok(()))?
+            .expect("a runtime this run did not install into gets a note");
+        assert!(note.contains("still cannot be imported"), "{note}");
+        assert!(
+            !note.contains("was installed"),
+            "no install ran on that runtime: {note}"
+        );
+        let error = tensorizer_step(true, true, || Ok(broken()), || Ok(()))
+            .expect_err("an install whose tensorizer still cannot import must not succeed");
+        assert!(
+            format!("{error:#}").contains("vLLM was installed, but tensorizer still cannot"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_upgrade_fails_an_install_but_only_warns_on_an_existing_runtime() -> Result<()> {
+        let fail = || -> Result<()> { bail!("network unreachable") };
+        let error = tensorizer_step(true, true, || Ok(broken()), fail)
+            .expect_err("an install must not leave an unusable runtime");
+        // The message already carries the cause once; chaining the error as a
+        // source as well would print it twice under `{:#}`.
+        assert_eq!(
+            format!("{error:#}").matches("network unreachable").count(),
+            1,
+            "{error:#}"
+        );
+        let note = tensorizer_step(true, false, || Ok(broken()), fail)?
+            .expect("the failure is reported as a note");
+        assert!(
+            note.contains("network unreachable") && note.contains("would fail at startup"),
+            "{note}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_reads_the_interpreters_traceback() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let python = root.path().join("python");
+        write_fake_executable(
+            &python,
+            format!("#!/bin/sh\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nexit 1\n"),
+        )?;
+        assert!(matches!(
+            probe_tensorizer_import(&python, None)?,
+            TensorizerProbe::Broken(_)
+        ));
+        Ok(())
+    }
+
+    /// A ROCm 10.x discover runtime whose stand-in interpreter, like a real one,
+    /// does not see `PYTHONPATH` under `-I` (which implies `-E`), and without it
+    /// stops on a missing module before it ever reaches tensorizer.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_keeps_the_pythonpath_the_server_launches_with() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let venv = tempfile::tempdir()?;
+        std::fs::create_dir_all(venv.path().join("bin"))?;
+        std::fs::create_dir_all(venv.path().join("lib/python3.14/site-packages"))?;
+        let python = venv.path().join("bin/python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" -I \"*) unset PYTHONPATH ;; esac\nif [ -z \"$PYTHONPATH\" ]; then\n  echo \"ModuleNotFoundError: No module named 'amdsmi'\" >&2\n  exit 1\nfi\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nexit 1\n"
+            ),
+        )?;
+        let runtime = VllmRuntime {
+            python_executable: Some(python),
+            rocm_sdk_version: Some("10.1.0".to_owned()),
+            ..VllmRuntime::for_test()
+        };
+        assert!(
+            matches!(
+                probe_tensorizer_import(
+                    runtime.python_executable.as_deref().unwrap(),
+                    Some(&runtime)
+                )?,
+                TensorizerProbe::Broken(_)
+            ),
+            "a missing module the server's PYTHONPATH provides must not hide a broken tensorizer"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_upgrade_is_a_no_deps_install_of_the_fixed_release() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv.log");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!("#!/bin/sh\necho \"$@\" >> \"{}\"\n", log.display()),
+        )?;
+        upgrade_tensorizer(&uv, &paths, Path::new("/venv/bin/python"))?;
+        let calls = std::fs::read_to_string(&log)?;
+        assert!(
+            calls.contains("--no-deps") && calls.contains("tensorizer==2.12.1"),
+            "{calls}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_coloured_traceback_is_still_a_broken_tensorizer() {
+        // What Python 3.13+ writes under FORCE_COLOR: escapes wrap the quoted path.
+        let coloured = "\u{1b}[1;35mTraceback (most recent call last):\u{1b}[0m\n  File \u{1b}[35m\"/venv/lib/python3.14/site-packages/tensorizer/_crypt/_encryption.py\u{1b}[0m\", line \u{1b}[35m367\u{1b}[0m, in \u{1b}[35m__new__\u{1b}[0m\n\u{1b}[1;35mKeyError\u{1b}[0m: \u{1b}[35m'crypto_stream_salsa20_NONCEBYTES'\u{1b}[0m\n";
+        assert_eq!(
+            classify_tensorizer_failure(coloured),
+            TensorizerProbe::Broken("KeyError: 'crypto_stream_salsa20_NONCEBYTES'".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_probe_asks_for_no_colour_and_runs_in_the_launch_environment() {
+        let runtime = VllmRuntime::for_test();
+        let command = tensorizer_probe_command(Path::new("python"), Some(&runtime))
+            .expect("a bare runtime has a launch environment");
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+        assert_eq!(
+            env("FORCE_COLOR"),
+            Some(None),
+            "FORCE_COLOR must be removed"
+        );
+        assert_eq!(env("NO_COLOR"), Some(Some("1".into())));
+        let args: Vec<_> = command.get_args().collect();
+        assert!(
+            !args.contains(&std::ffi::OsStr::new("-I"))
+                && !args.contains(&std::ffi::OsStr::new("-E")),
+            "-I and -E drop the PYTHON* environment the server launches with: {args:?}"
+        );
+        assert!(
+            args.contains(&std::ffi::OsStr::new("-s")),
+            "the user's site directory must stay out of the probe: {args:?}"
+        );
+        assert_eq!(
+            env("PYTHONSAFEPATH"),
+            Some(Some("1".into())),
+            "the working directory must stay off sys.path"
+        );
+        assert_eq!(env("PYTHON_COLORS"), Some(Some("0".into())));
+        assert_eq!(
+            env("VLLM_TARGET_DEVICE"),
+            Some(Some("rocm".into())),
+            "the probe must carry the environment the server launches with"
+        );
+        let bare =
+            tensorizer_probe_command(Path::new("python"), None).expect("no runtime to build");
+        assert!(
+            bare.get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("VLLM_TARGET_DEVICE"))
+        );
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_fails_an_install_but_only_warns_on_an_existing_runtime() -> Result<()>
+    {
+        let cannot = || -> Result<TensorizerProbe> { bail!("timed out after 300s") };
+        let error = tensorizer_step(true, true, cannot, || Ok(()))
+            .expect_err("an install must not report a runtime it could not check");
+        assert!(format!("{error:#}").contains("timed out"));
+        let note = tensorizer_step(true, false, cannot, || Ok(()))?
+            .expect("an existing runtime gets a note");
+        assert!(
+            note.contains("could not check") && note.contains("timed out"),
+            "{note}"
+        );
+
+        // The second probe, after a successful upgrade, is held to the same rule.
+        let mut calls = 0;
+        let second_fails = || {
+            calls += 1;
+            if calls == 1 {
+                Ok(broken())
+            } else {
+                bail!("spawn failed")
+            }
+        };
+        let note = tensorizer_step(true, false, second_fails, || Ok(()))?
+            .expect("an existing runtime gets a note");
+        assert!(note.contains("could not check"), "{note}");
+        Ok(())
+    }
+
+    /// A managed runtime whose interpreter is a stand-in that raises the Python
+    /// 3.14 `KeyError` only when launched with the server's environment, and a
+    /// torch-style `OSError` otherwise.
+    #[cfg(unix)]
+    fn runtime_needing_launch_env(root: &Path) -> Result<VllmRuntime> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let python = root.join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"$VLLM_TARGET_DEVICE\" = rocm ]; then\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nelse\necho 'OSError: libamdhip64.so.7: cannot open shared object file' >&2\nfi\nexit 1\n"
+            ),
+        )?;
+        Ok(VllmRuntime {
+            python_executable: Some(python),
+            ..VllmRuntime::for_test()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_sees_the_launch_environment_and_the_upgrade_follows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime_needing_launch_env(root.path())?;
+        let mut upgraded = false;
+        // Still broken after the "upgrade": the stand-in never changes, so the
+        // refusal proves the probe ran with the launch environment both times.
+        let error = ensure_runtime_tensorizer_with(&runtime, true, |_| {
+            upgraded = true;
+            Ok(())
+        })
+        .expect_err("the stand-in stays broken");
+        assert!(
+            upgraded,
+            "the Python 3.14 failure was only visible with the launch environment"
+        );
+        assert!(format!("{error:#}").contains("still cannot be imported"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_upgrade_fails_an_install_this_run_made_and_only_warns_on_an_existing_runtime()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime_needing_launch_env(root.path())?;
+        let fail = |_: &Path| -> Result<()> { bail!("network unreachable") };
+        let error = ensure_runtime_tensorizer_with(&runtime, true, fail)
+            .expect_err("an install this run made must fail");
+        assert!(format!("{error:#}").contains("network unreachable"));
+        let note = ensure_runtime_tensorizer_with(&runtime, false, fail)?
+            .expect("an existing runtime only gets a note");
+        assert!(note.contains("network unreachable"), "{note}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_probe_is_abandoned_promptly_and_its_child_killed() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let pid_file = root.path().join("pid");
+        let python = root.path().join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )?;
+        let started = std::time::Instant::now();
+        let error =
+            probe_tensorizer_import_within(&python, None, std::time::Duration::from_millis(300))
+                .expect_err("a hung probe must be abandoned");
+        assert!(format!("{error:#}").contains("exceeded"), "{error:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the probe waited out the child: {:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file)?;
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "the hung child was left running"
+        );
+        Ok(())
+    }
+
+    /// 5 MB on stderr before the real traceback: more than a pipe holds, so an
+    /// undrained pipe would stall the child until the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_prints_more_than_a_pipe_holds_is_still_classified() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let python = root.path().join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\nhead -c 5000000 /dev/zero | tr '\\0' 'x' >&2\necho >&2\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nexit 1\n"
+            ),
+        )?;
+        let probe =
+            probe_tensorizer_import_within(&python, None, std::time::Duration::from_secs(20))?;
+        assert!(matches!(probe, TensorizerProbe::Broken(_)), "{probe:?}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_upgrade_that_prints_more_than_a_pipe_holds_still_finishes() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let uv = root.path().join("uv");
+        write_fake_executable(&uv, "#!/bin/sh\nhead -c 5000000 /dev/zero >&2\nexit 0\n")?;
+        upgrade_tensorizer_within(
+            &uv,
+            &paths,
+            Path::new("/venv/bin/python"),
+            std::time::Duration::from_secs(20),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_upgrade_is_abandoned_promptly_and_its_child_killed() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let pid_file = root.path().join("pid");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )?;
+        let started = std::time::Instant::now();
+        let error = upgrade_tensorizer_within(
+            &uv,
+            &paths,
+            Path::new("/venv/bin/python"),
+            std::time::Duration::from_millis(300),
+        )
+        .expect_err("a hung upgrade must be abandoned");
+        assert!(format!("{error:#}").contains("exceeded"), "{error:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the upgrade waited out the child: {:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file)?;
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "the hung child was left running"
+        );
+        Ok(())
+    }
+
     #[test]
     fn dry_run_resolved_pin_parses_a_rotated_dev_tag() {
         let stdout = "Resolved 1 package in 601ms\nWould download 1 package\nWould install 1 package\n + vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826\n";

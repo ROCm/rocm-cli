@@ -140,11 +140,10 @@ pub(super) fn quit_confirm_body_with(
     let mut body = Vec::new();
     if total == 0 {
         // `total == 0` here only because `nothing_is_currently_being_served_with`
-        // returned `false` above: either the startup-race fallback (issue
-        // #145) is active — the daemon's first snapshot hasn't landed yet —
-        // or the connection never will succeed at all (Windows: the
-        // dashboard-embedded daemon client's connect path is unix-only, so
-        // `instances` stays empty for the whole session). `instances` can't
+        // returned `false` above: the startup-race fallback (issue #145) is
+        // active — the daemon's first snapshot hasn't landed yet, or (Windows,
+        // which has no daemon and refills `instances` from the registry each
+        // tick) a service was registered since the last tick. `instances` can't
         // name anything in either case, but the live registry read
         // (`managed_ids`) needs no daemon snapshot — it is this host's own
         // `rocm serve` registry, read straight off disk — so it can still
@@ -248,11 +247,10 @@ mod tests {
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
-        // On a host whose daemon client never sends an instance snapshot
-        // (Windows — it connects and streams live GPU/CPU/memory every tick,
-        // but has no `rocmdashd` socket to source an instance list from, so
-        // `has_received_snapshot` never flips for the whole session),
-        // `instances` never fills, so without this the quit prompt
+        // Before `instances` has been filled (the daemon's first snapshot
+        // has not landed, or on Windows the registry gained a service since
+        // the last registry poll), `has_received_snapshot` is false and
+        // `instances` is empty, so without this the quit prompt
         // could only ever print the generic "a model was serving" sentence —
         // no model name (expected: `instances` is the only source for that),
         // but also no stop command and no id, even though the live registry

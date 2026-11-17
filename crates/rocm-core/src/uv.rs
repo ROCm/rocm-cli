@@ -254,7 +254,7 @@ const UV_CHECK_VIOLATION_PREFIX: &str = "The package `";
 /// `Requires-Python`, a package with multiple installed distributions — and none of them
 /// is a `Requires-Dist` a reinstall of the requirer can resolve. Only a requirement
 /// `uv` quotes is one.
-const UV_CHECK_REQUIREMENT_INFIX: &str = " requires `";
+pub(crate) const UV_CHECK_REQUIREMENT_INFIX: &str = " requires `";
 
 /// Report the unsatisfied `Requires-Dist` entries in the environment at `venv_python`.
 ///
