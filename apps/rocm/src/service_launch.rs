@@ -42,8 +42,8 @@
 //!   failed launch, and the reuse refusals.
 //! - `spawn`: the detached engine child, its process and stdio plumbing, and
 //!   `ManagedLaunchReport`.
-//! - `readiness`: waiting on a service, its liveness, and the OOM fault-injection
-//!   seam.
+//! - `readiness`: waiting on a service, its liveness, and the fault-injection
+//!   seam (an OOM launch, or a ready launch).
 //! - `start`: the background launch path and its plain output.
 //! - `helper_autostart`: starting the background automation helper.
 //! - `attach`: the attached run and its log streaming.
