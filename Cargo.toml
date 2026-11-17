@@ -50,7 +50,7 @@ libc = "0.2"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 rand = "0.10"
 rpassword = "7.5"
-rsa = "0.9"
+rsa = "0.10"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
