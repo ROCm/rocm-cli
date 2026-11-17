@@ -45,6 +45,11 @@ pub(crate) enum AgentsCommand {
         /// Like --local, for the named server (an id from `rocm services list`).
         #[arg(long, value_name = "ID")]
         service: Option<String>,
+        /// The model's context window in tokens, for agents that cannot learn
+        /// it from an unknown model name. With --local and no value, it is
+        /// read from the serving engine's log when the engine reports it.
+        #[arg(long, value_name = "N")]
+        context_tokens: Option<u64>,
         /// Arguments passed to the agent.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -81,6 +86,9 @@ pub(crate) struct AgentKind {
     pub passthrough_env: &'static [&'static str],
     /// Extra env set inside the sandbox.
     pub extra_env: &'static [(&'static str, &'static str)],
+    /// Env var through which the agent is told the model's context window,
+    /// for a model it does not recognise.
+    pub context_env: Option<&'static str>,
     /// Extra env set inside the sandbox only when the backend is a model
     /// served by `rocm serve`: features its Anthropic endpoint refuses.
     pub local_env: &'static [(&'static str, &'static str)],
@@ -103,6 +111,7 @@ const KINDS: &[AgentKind] = &[
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         ],
         extra_env: &[("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")],
+        context_env: Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
         // rocm's Anthropic-compatible endpoint answers 400 to a request that
         // asks for extended thinking, which Claude Code does by default.
         local_env: &[
@@ -129,6 +138,8 @@ const KINDS: &[AgentKind] = &[
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         ],
         extra_env: &[],
+        // The probe shell gets the same variable, so a test can see it.
+        context_env: Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
         local_env: &[],
     },
 ];
@@ -142,6 +153,7 @@ pub(crate) fn run(command: AgentsCommand) -> Result<()> {
             workspace,
             local,
             service,
+            context_tokens,
             args,
         } => {
             let local = if local || service.is_some() {
@@ -149,7 +161,14 @@ pub(crate) fn run(command: AgentsCommand) -> Result<()> {
             } else {
                 None
             };
-            run_agent(&root, &agent, workspace, local, &args)
+            let context = match (context_tokens, &local) {
+                (Some(tokens), _) => Some((tokens, "--context-tokens".to_owned())),
+                (None, Some(target)) => target
+                    .context_tokens
+                    .map(|tokens| (tokens, format!("the engine log of `{}`", target.service_id))),
+                (None, None) => None,
+            };
+            run_agent(&root, &agent, workspace, local, context, &args)
         }
         AgentsCommand::List { json } => list(&root, json),
     }
@@ -243,6 +262,7 @@ fn run_agent(
     agent: &str,
     workspace: Option<PathBuf>,
     local: Option<local::LocalTarget>,
+    context: Option<(u64, String)>,
     args: &[String],
 ) -> Result<()> {
     let kind = KINDS.iter().find(|k| k.name == agent).with_context(|| {
@@ -328,6 +348,18 @@ fn run_agent(
         (kind.key_env.into(), placeholder),
     ];
     sandbox_env.extend(backend.model_env);
+    match (&context, kind.context_env) {
+        (Some((tokens, source)), Some(var)) => {
+            eprintln!("rocm: context window {tokens} tokens, from {source}");
+            sandbox_env.push((var.to_owned(), tokens.to_string()));
+        }
+        (None, Some(_)) if local.is_some() => {
+            eprintln!(
+                "rocm: the served model's context window is unknown; pass --context-tokens N"
+            );
+        }
+        _ => {}
+    }
     sandbox_env.extend(
         kind.extra_env
             .iter()

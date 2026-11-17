@@ -25,6 +25,8 @@ pub(crate) struct LocalTarget {
     /// The service's endpoint key, when it requires one. The proxy sends it as
     /// `x-api-key`; the agent never sees it.
     pub endpoint_key: Option<String>,
+    /// The per-request context window the engine reported, when it did.
+    pub context_tokens: Option<u64>,
 }
 
 pub(crate) fn resolve(paths: &AppPaths, wanted: Option<&str>) -> Result<LocalTarget> {
@@ -35,6 +37,20 @@ pub(crate) fn resolve(paths: &AppPaths, wanted: Option<&str>) -> Result<LocalTar
         anthropic_url,
         model: record.served_model_name().to_owned(),
         endpoint_key: crate::endpoint_keys::endpoint_api_key(paths, &record.service_id),
+        context_tokens: std::fs::read_to_string(paths.service_log_path(&record.service_id))
+            .ok()
+            .and_then(|log| served_context_tokens(&log)),
+    })
+}
+
+/// The per-request context window from a llama.cpp server log (Lemonade's
+/// backend): the last `n_ctx_slot = N`, since a reload logs it again.
+/// PROTOTYPE: a log line is not a contract; the engine state should carry it.
+pub(crate) fn served_context_tokens(log: &str) -> Option<u64> {
+    log.lines().rev().find_map(|line| {
+        let rest = line.split_once("n_ctx_slot = ")?.1;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok().filter(|&n| n > 0)
     })
 }
 
@@ -118,6 +134,16 @@ mod tests {
         status.clone_into(&mut record.status);
         record.anthropic_endpoint_url = anthropic.map(str::to_owned);
         record
+    }
+
+    #[test]
+    fn the_context_window_is_the_last_one_the_engine_logged() {
+        let log = "x load_model: initializing, n_slots = 4, n_ctx_slot = 4096, kv_unified = 'true'\n\
+                   other line\n\
+                   y load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'\n";
+        assert_eq!(served_context_tokens(log), Some(262_144));
+        assert_eq!(served_context_tokens("no such line\n"), None);
+        assert_eq!(served_context_tokens("n_ctx_slot = 0\n"), None);
     }
 
     #[test]
