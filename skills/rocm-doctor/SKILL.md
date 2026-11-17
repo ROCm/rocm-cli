@@ -285,7 +285,8 @@ passes — the GPU is AMD or no vendor was named.
      look at that file.
 
    Some CLIs that pass the Phase 0 contract check are older than these lines
-   and report two cases differently:
+   and report two cases differently. The second looks the same as a current
+   CLI's output, so it applies to every Windows fix-2 and fix-9 run:
 
    - A `NOT changed` line saying `exited 124` (timed out) or `exited -1`
      (killed by a signal) does not prove nothing changed: the change may or
@@ -300,10 +301,15 @@ passes — the GPU is AMD or no vendor was named.
      `No persistent HSA_OVERRIDE_GFX_VERSION found` and that the user is done,
      and exit 0, with the override still set in either scope;
      `fix-9-igpu-dgpu --device-index N` can run `setx` over a value the user
-     set on purpose. Its output looks the same as a current CLI's, so on
-     Windows always have the user run that PowerShell check: for fix-2 before
-     calling it done, with `'User'` and again with `'Machine'` (both must come
-     back empty), and for fix-9 before applying it.
+     set on purpose. So have the user run that PowerShell check. For fix-2,
+     run it before calling the fix done, with `'User'` and again with
+     `'Machine'`; blank output means unset. A User value means re-running
+     `rocm fix fix-2-unset-override`; a Machine value has to be cleared from
+     an elevated PowerShell with
+     `[Environment]::SetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION', $null, 'Machine')`.
+     For fix-9, run it before applying the fix; if a value is already set, do
+     not apply it, and tell the user to change that value by hand if they
+     want a different GPU, as the CLI itself says when its read works.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 

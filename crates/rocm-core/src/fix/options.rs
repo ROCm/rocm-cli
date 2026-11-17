@@ -156,9 +156,11 @@ pub mod exit {
         // `windows_path_read_failure_aborts_before_plan_or_write`,
         // `unset_override_user_read_timeout_stops_before_anything_is_reported_or_cleared`,
         // `unset_override_machine_read_failure_stops_before_clearing_the_user_scope`,
-        // `pin_device_read_timeout_stops_before_setx` and
-        // `pin_device_dry_run_with_a_failed_read_stops_without_a_plan` (a failed
-        // read, under `--dry-run` too). Those runners take an injected command
+        // `pin_device_read_timeout_stops_before_setx`,
+        // `unset_override_dry_run_with_a_failed_read_stops_without_a_plan`,
+        // `unset_override_dry_run_with_a_failed_machine_read_stops_without_a_plan`
+        // and `pin_device_dry_run_with_a_failed_read_stops_without_a_plan` (a
+        // failed read, under `--dry-run` too). Those runners take an injected command
         // runner, so no test starts the real program.
         Meaning {
             name: "failed",

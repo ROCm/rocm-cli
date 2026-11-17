@@ -1805,6 +1805,24 @@ mod tests {
         );
     }
 
+    /// fix-2 reads the Machine scope before `--dry-run` is consulted too, so a
+    /// Machine read that fails stops a dry run with no plan, even with the
+    /// User value read and set.
+    #[test]
+    fn unset_override_dry_run_with_a_failed_machine_read_stops_without_a_plan() {
+        let host = FakeHost::new((exited(0), "10.3.0"), exited(0))
+            .with_machine_read((CommandOutcome::NotFound, ""));
+        let (code, out, err) = unset_override_with(&host, &dry_run());
+        assert_eq!(code, exit::FAILED);
+        assert!(host.writes().is_empty());
+        assert_eq!(out, SHELL_UNSET, "no plan is printed");
+        assert_eq!(
+            err,
+            "Could not read the current Machine HSA_OVERRIDE_GFX_VERSION: PowerShell could not \
+             be started: it was not found; nothing was changed.\n"
+        );
+    }
+
     /// Every "re-run `rocm fix <id>`" line names a recipe that exists and has
     /// a runner, so the recovery it advises can actually be carried out.
     #[test]
