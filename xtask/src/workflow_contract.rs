@@ -10687,7 +10687,8 @@ permissions:
             false
         }
 
-        /// `node`'s tokens, outer attributes included, taken from the parsed
+        /// `node`'s tokens — for an item, its outer attributes included; for a
+        /// `syn::File`, its inner attributes and items — taken from the parsed
         /// node itself rather than by re-lexing the source slice its span
         /// covers, which breaks on CRLF line endings and a byte order mark.
         fn tokens_of(node: &impl ToTokens) -> TokenStream {
@@ -10778,11 +10779,24 @@ permissions:
                     files.iter().any(|(file, _)| {
                         let source = std::fs::read_to_string(file)
                             .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
-                        names_feature_in_a_cfg(&source.parse().expect("source tokenizes"))
+                        source_names_feature_in_a_cfg(&source)
                     })
                 })
                 .map(|(name, _)| name.clone())
                 .collect()
+        }
+
+        /// Whether the Rust file `source` holds a `cfg(..)`, `cfg!(..)` or
+        /// `cfg_attr(..)` naming the feature, in either polarity. It goes
+        /// through `syn::parse_file`, as the item scanner does, so the two
+        /// scanners accept the same input. Lexing the raw text would also drop
+        /// a byte order mark; what differs is a shebang line, which
+        /// `parse_file` drops and raw lexing fails on when it is not valid Rust
+        /// tokens. `parse_file` is also stricter (it needs valid items), which
+        /// costs nothing here: `reached_source_files` has already parsed every
+        /// listed file with it.
+        fn source_names_feature_in_a_cfg(source: &str) -> bool {
+            names_feature_in_a_cfg(&tokens_of(&syn::parse_file(source).expect("source parses")))
         }
 
         /// Whether `tokens` hold a `cfg(..)`, `cfg!(..)` or `cfg_attr(..)`
@@ -11092,7 +11106,7 @@ permissions:
 
         #[test]
         fn the_seam_scan_sees_either_polarity_and_nothing_else() {
-            let seam = |source: &str| names_feature_in_a_cfg(&source.parse().expect("tokenizes"));
+            let seam = source_names_feature_in_a_cfg;
             assert!(seam(
                 "#[cfg(not(feature = \"e2e-test-hooks\"))]\nfn f() {}\n"
             ));
@@ -11102,12 +11116,51 @@ permissions:
             assert!(seam(
                 "#[cfg_attr(feature = \"e2e-test-hooks\", allow(dead_code))]\nfn f() {}\n"
             ));
+            assert!(seam("#![cfg(feature = \"e2e-test-hooks\")]\nfn f() {}\n"));
+            assert!(seam(
+                "#![cfg_attr(not(feature = \"e2e-test-hooks\"), allow(dead_code))]\nfn f() {}\n"
+            ));
             assert!(!seam(
                 "fn f() -> &'static str { \"feature = e2e-test-hooks\" }\n"
             ));
             assert!(!seam(
                 "#[doc = \"cfg(feature = \\\"e2e-test-hooks\\\")\"]\nfn f() {}\n"
             ));
+        }
+
+        /// The seam scan reads a file with CRLF line endings, a byte order mark,
+        /// or a shebang line, and answers as it does for the plain text. Each
+        /// variant is written to a file and handed to [`crates_with_hooks_seams`],
+        /// so the test drives the same read-and-parse path the contract runs on
+        /// the workspace. The shebang rows hold an unterminated `"`, which is
+        /// not valid Rust tokens: they are the rows lexing the raw file would
+        /// fail on. The CRLF and byte-order-mark rows pin parity with the item
+        /// scanner, which reads the same variants.
+        #[test]
+        fn the_seam_scan_reads_crlf_bom_and_shebang_sources() {
+            let seam =
+                "//! Docs.\n/// Doc.\n#[cfg(not(feature = \"e2e-test-hooks\"))]\nfn f() {}\n";
+            let plain = seam.replace("e2e-test-hooks", "other-hooks");
+            let dir = tempfile::tempdir().expect("a scratch dir");
+            for (source, expected) in [(seam.to_owned(), true), (plain, false)] {
+                for variant in [
+                    source.clone(),
+                    source.replace('\n', "\r\n"),
+                    format!("\u{feff}{source}"),
+                    format!("\u{feff}{}", source.replace('\n', "\r\n")),
+                    format!("#!/bin/sh -c \"x\n{source}"),
+                ] {
+                    let file = dir.path().join("lib.rs");
+                    std::fs::write(&file, &variant).expect("write the fixture");
+                    let packages: Vec<ReachedPackage> =
+                        vec![("demo".to_owned(), vec![(file, false)])];
+                    assert_eq!(
+                        crates_with_hooks_seams(&packages).contains("demo"),
+                        expected,
+                        "{variant:?}"
+                    );
+                }
+            }
         }
 
         /// A step named after `command`, with `run` as its `run:` line.

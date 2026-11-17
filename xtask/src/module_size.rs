@@ -251,7 +251,9 @@ impl From<&MetaPackage> for Package {
 #[cfg(test)]
 pub(crate) type ReachedPackage = (String, Vec<(PathBuf, bool)>);
 
-/// Every source file each workspace package's targets reach, by package name,
+/// Every `.rs` file each workspace package's targets reach (test-gated files,
+/// and the files of a package under a `tests/` directory such as
+/// `tests/e2e-cucumber`, included — unlike the size count), by package name,
 /// with whether the file is reached through a test-gated `mod` declaration
 /// (`#[cfg(test)] mod x;`, or any file below one), or through a file whose own
 /// `#![cfg(test)]` gates it: the walk passes that gate on to the file's
@@ -262,6 +264,7 @@ pub(crate) type ReachedPackage = (String, Vec<(PathBuf, bool)>);
 /// follow the module tree this check walks — including `#[path]` modules and
 /// files one package loads from another's directory — rather than guess a
 /// file's package and gating from where it sits.
+///
 /// The walk starts only from library, binary, proc-macro and build-script
 /// targets, so integration tests under a package's `tests/` directory are not
 /// listed.
