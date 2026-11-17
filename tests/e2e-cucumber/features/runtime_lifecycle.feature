@@ -432,3 +432,26 @@ Feature: Runtime lifecycle state machine
     When the user lists the registered runtimes as JSON
     Then the list fails with nothing printed on stdout
     And the error on stderr is plain text naming the unreadable registry entry
+
+  # A script reads where each runtime came from out of the JSON listing instead
+  # of parsing the text's `provenance:` line. A fact the manifest never recorded
+  # has no value there, where the text prints `unrecorded`, so a script cannot
+  # take the placeholder for a recorded value. The same runtimes as
+  # `runtime-lifecycle-22` are planted, and the text listing of the same state
+  # is compared fact by fact, so the two forms are shown to agree. The startup
+  # update check is off: with wheel runtimes registered it looks for a Python
+  # and the network, and can print ahead of the document, which is not what
+  # this scenario is about. The planted manifests need no SDK download or GPU,
+  # so this runs on the mock lane.
+  @id:runtime-lifecycle-list-json-names-runtime-provenance
+  Scenario: runtime-lifecycle-31 - A script reads from the JSON runtime list which stream, source and GPU each runtime was installed from
+    Given a registered nightly runtime installed for one exact GPU
+    And a registered runtime installed before its source layout and GPU target were recorded
+    And a registered runtime adopted from an environment ROCm CLI did not install
+    And ROCm CLI does not check for runtime updates when it starts
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON names the nightly runtime's channel, package source, source layout and exact GPU target
+    And the JSON gives no value for each fact the older runtime did not record instead of guessing
+    And the JSON gives no package source for the adopted runtime
+    And the text listing names the same provenance as the JSON for every runtime

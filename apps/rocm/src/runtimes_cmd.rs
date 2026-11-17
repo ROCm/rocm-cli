@@ -601,7 +601,8 @@ const ROLLBACK_RUNTIME_MARKER: &str = "-";
 /// and the JSON `active`/`rollback_target` flags come from the same
 /// computation. The text adds only presentation: the marker legend, the
 /// next-step hint for an empty registry, the build date it derives from
-/// `version`, and the `unusable (…)` wording around `unusable_reason`. The JSON
+/// `version`, the `unusable (…)` wording around `unusable_reason`, and the word
+/// `unrecorded` for a provenance fact the JSON writes as `null`. The JSON
 /// form is additive-only: fields may be added, but none is renamed, removed or
 /// given a new meaning (see `docs/json-output.md`).
 #[derive(Debug, Serialize)]
@@ -677,15 +678,17 @@ struct RuntimeListingEntry {
     install_root: PathBuf,
     /// Where the runtime came from, as its manifest recorded it
     /// (`InstalledRuntimeManifest::provenance`). The text form prints it as the
-    /// `provenance:` line under `install_root:`.
-    #[serde(skip)]
+    /// `provenance:` line under `install_root:`; the JSON form as an object
+    /// with the same names, `null` where the text prints `unrecorded`.
     provenance: RuntimeListingProvenance,
 }
 
 /// An owned copy of a runtime's [`RuntimeProvenance`], so the listing can
 /// outlive the manifests it was computed from. It holds the recorded values
-/// (trimmed, `None` when unrecorded) and prints through
-/// [`RuntimeProvenance::fields`], the same as `rocm examine`.
+/// (trimmed, `None` when unrecorded). The text prints them through
+/// [`RuntimeProvenance::fields`], the same as `rocm examine`, and the JSON
+/// writes them through [`RuntimeProvenance::recorded_fields`], so the two forms
+/// take their names and order from one list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeListingProvenance {
     channel: Option<String>,
@@ -711,6 +714,21 @@ impl RuntimeListingProvenance {
             source_layout_generation: self.source_layout_generation.as_deref(),
             device_target: self.device_target.as_deref(),
         }
+    }
+}
+
+/// One JSON object holding each fact under the name the text prints it with,
+/// as a string, or `null` when it was not recorded. Not the text's
+/// `unrecorded` word: a script must not read that placeholder as a value.
+impl Serialize for RuntimeListingProvenance {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let fields = self.as_provenance().recorded_fields();
+        let mut object = serializer.serialize_map(Some(fields.len()))?;
+        for (name, value) in fields {
+            object.serialize_entry(name, &value)?;
+        }
+        object.end()
     }
 }
 
@@ -3055,6 +3073,19 @@ pub(crate) mod tests {
                         "active",
                         "rollback_target",
                         "install_root",
+                        "provenance",
+                    ]
+                    .map(String::from)
+                )
+            );
+            assert_eq!(
+                key_set(&runtime["provenance"]),
+                std::collections::BTreeSet::from(
+                    [
+                        "channel",
+                        "source",
+                        "source_layout_generation",
+                        "device_target",
                     ]
                     .map(String::from)
                 )
@@ -3073,6 +3104,203 @@ pub(crate) mod tests {
     /// when the config says so (`rocm runtimes activate` and `rollback` never
     /// write that, but the config file is read as it is). Both JSON flags are true;
     /// the text has one marker column, and active wins it.
+    /// Plants the runtimes whose provenance the JSON tests read: one per way a
+    /// fact can be recorded or not. Returns their keys, in this order: a
+    /// nightly that recorded every fact, a runtime from before the layout and
+    /// target were recorded, an adopted one (the adoption marker is not a
+    /// source), a tarball install (no exact target), one whose values are
+    /// padded with whitespace, and one whose every value is blank.
+    fn plant_provenance_runtimes(paths: &AppPaths) -> Result<[String; 6]> {
+        let base = write_test_pip_runtime(
+            paths,
+            "release-pip-legacy",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let legacy = therock::InstalledRuntimeManifest {
+            index_url: None,
+            source_layout_generation: None,
+            wheel_composition: None,
+            ..base.clone()
+        };
+        let nightly = nightly_exact_target_manifest(base);
+        write_test_pip_runtime(
+            paths,
+            &nightly.runtime_key,
+            &nightly.runtime_id,
+            &nightly.version,
+            20,
+        )?;
+        let adopted = therock::InstalledRuntimeManifest {
+            runtime_key: "adopted-release-pip".to_owned(),
+            index_url: None,
+            selected_artifact_url: crate::runtime_registry::ADOPTED_RUNTIME_ARTIFACT_URL.to_owned(),
+            read_only: true,
+            ..legacy.clone()
+        };
+        let tarball = therock::InstalledRuntimeManifest {
+            runtime_key: "release-tarball-gfx120x-all-7-13-0".to_owned(),
+            format: "tarball".to_owned(),
+            selected_artifact_url: "https://example.invalid/tarball/rocm-7.13.0.tar.gz".to_owned(),
+            source_layout_generation: Some("multi-arch-v2".to_owned()),
+            ..legacy.clone()
+        };
+        let padded = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-padded".to_owned(),
+            channel: " release ".to_owned(),
+            index_url: Some(" https://example.invalid/simple ".to_owned()),
+            source_layout_generation: Some(" multi-arch-v2 ".to_owned()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "multi-arch-v2".to_owned(),
+                package_specs: vec!["rocm[libraries]==7.13.0".to_owned()],
+                rocm_sdk_target: Some(" gfx1201 ".to_owned()),
+            }),
+            ..legacy.clone()
+        };
+        let all_blank = therock::InstalledRuntimeManifest {
+            runtime_key: "release-pip-all-blank".to_owned(),
+            channel: String::new(),
+            index_url: Some(" ".to_owned()),
+            selected_artifact_url: String::new(),
+            source_layout_generation: Some(String::new()),
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: String::new(),
+                package_specs: vec!["rocm[libraries]==7.13.0".to_owned()],
+                rocm_sdk_target: Some(String::new()),
+            }),
+            ..legacy.clone()
+        };
+        let planted = [nightly, legacy, adopted, tarball, padded, all_blank];
+        for manifest in &planted {
+            rewrite_manifest(paths, manifest)?;
+        }
+        Ok(planted.map(|manifest| manifest.runtime_key))
+    }
+
+    /// The JSON names each runtime's provenance facts as strings, trimmed, and
+    /// writes `null` for one recorded nowhere or recorded blank — never the
+    /// text's `unrecorded` placeholder, which a script would read as a value.
+    /// Each object is compared whole, so a fact under the wrong name, a missing
+    /// one or a placeholder in place of `null` fails here.
+    #[test]
+    fn runtimes_list_json_names_recorded_provenance_and_null_for_unrecorded() -> Result<()> {
+        let (root, paths) = test_paths("runtime-list-json-provenance");
+        let [nightly, legacy, adopted, tarball, padded, all_blank] =
+            plant_provenance_runtimes(&paths)?;
+        let listing = runtimes_list_json(&paths, &RocmCliConfig::default())?;
+        let _ = fs::remove_dir_all(root);
+
+        let provenance = |key: &str| listed_runtime(&listing, key)["provenance"].clone();
+        for (key, expected) in [
+            (
+                nightly,
+                serde_json::json!({
+                    "channel": "nightly",
+                    "source": "https://example.invalid/whl-multi-arch",
+                    "source_layout_generation": "next-v1",
+                    "device_target": "gfx1201",
+                }),
+            ),
+            (
+                legacy,
+                serde_json::json!({
+                    "channel": "release",
+                    "source": "https://example.invalid/therock",
+                    "source_layout_generation": null,
+                    "device_target": null,
+                }),
+            ),
+            (
+                adopted,
+                serde_json::json!({
+                    "channel": "release",
+                    "source": null,
+                    "source_layout_generation": null,
+                    "device_target": null,
+                }),
+            ),
+            (
+                tarball,
+                serde_json::json!({
+                    "channel": "release",
+                    "source": "https://example.invalid/tarball/rocm-7.13.0.tar.gz",
+                    "source_layout_generation": "multi-arch-v2",
+                    "device_target": null,
+                }),
+            ),
+            (
+                padded,
+                serde_json::json!({
+                    "channel": "release",
+                    "source": "https://example.invalid/simple",
+                    "source_layout_generation": "multi-arch-v2",
+                    "device_target": "gfx1201",
+                }),
+            ),
+            (
+                all_blank,
+                serde_json::json!({
+                    "channel": null,
+                    "source": null,
+                    "source_layout_generation": null,
+                    "device_target": null,
+                }),
+            ),
+        ] {
+            assert_eq!(provenance(&key), expected, "{key}:\n{listing:#}");
+        }
+        Ok(())
+    }
+
+    /// The text's `provenance:` line and the JSON's `provenance` object name
+    /// the same facts with the same values for every runtime, the text printing
+    /// `unrecorded` exactly where the JSON has `null`. Both forms are rendered
+    /// from one listing of the same registry and compared fact by fact, over
+    /// every way a fact can be recorded or not.
+    #[test]
+    fn runtimes_list_text_and_json_name_the_same_provenance() -> Result<()> {
+        use cli_report::JsonOrText as _;
+        let (root, paths) = test_paths("runtime-list-provenance-agree");
+        let keys = plant_provenance_runtimes(&paths)?;
+        let listing = runtimes_listing(&paths, &RocmCliConfig::default())?;
+        let _ = fs::remove_dir_all(root);
+        let text = listing.render_text();
+        let json = serde_json::to_value(&listing)?;
+
+        for key in keys {
+            let text_pairs: Vec<(String, String)> = provenance_line(&text, &key)
+                .trim_start()
+                .strip_prefix("provenance: ")
+                .expect("provenance prefix")
+                .split(' ')
+                .map(|pair| pair.split_once('=').expect("name=value pair"))
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect();
+            let object = listed_runtime(&json, &key)["provenance"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{key} has no provenance object:\n{json:#}"))
+                .clone();
+            assert_eq!(
+                text_pairs.len(),
+                object.len(),
+                "{key}: the text and the JSON name different facts:\n{text}\n{json:#}"
+            );
+            for (name, shown) in text_pairs {
+                let in_json = object
+                    .get(&name)
+                    .unwrap_or_else(|| panic!("{key}: the JSON has no {name}:\n{json:#}"));
+                let expected = match in_json {
+                    serde_json::Value::Null => crate::runtime_registry::UNRECORDED_PROVENANCE,
+                    serde_json::Value::String(value) => value.as_str(),
+                    other => panic!("{key}: {name} is neither a string nor null: {other}"),
+                };
+                assert_eq!(shown, expected, "{key}: {name}:\n{text}\n{json:#}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn runtimes_list_marks_a_runtime_both_active_and_rollback_target_as_active() -> Result<()> {
         let (root, paths) = test_paths("runtime-list-active-and-rollback");

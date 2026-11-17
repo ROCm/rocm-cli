@@ -59,7 +59,7 @@ commands that do not have it yet.
 | `rocm update` | supported for the check; one compact JSON line, not pretty, and refused with `--apply` and `--dry-run` | supported; the compact form is a known difference from the others | `update-02`, `update-03` |
 | `rocm storage report` | supported; pretty JSON through `JsonOrText` | supported | `json_or_text_impl_renders_the_report_and_serializes_it` |
 | `rocm services list` | supported; pretty JSON. `rocm remote` reads it back over its control channel | supported | `services_json_round_trips_and_applies_the_same_liveness_filter_as_the_table`; exercised indirectly by `remote-15` (`@requires-docker`), whose `rocm remote` reads it back |
-| `rocm runtimes list` | supported; pretty JSON through `JsonOrText` | supported, additive-only, no version field yet | `runtime-lifecycle-23` to `runtime-lifecycle-30` and `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`; what each covers is in [testing.md](testing.md#runtime-selection-and-activation) |
+| `rocm runtimes list` | supported; pretty JSON through `JsonOrText` | supported, additive-only, no version field yet | `runtime-lifecycle-23` to `runtime-lifecycle-31` and `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`; what each covers is in [testing.md](testing.md#runtime-selection-and-activation) |
 | `rocm runtimes activate`, `rollback`, `uninstall`, `import`, `adopt` | none | follow-up: they change state, so they need the envelope's result and refusal shapes | — |
 | `rocm services logs` | none | intentionally unsupported: streamed text, and `-f` never ends | — |
 | `rocm services stop`, `restart`, `remove`, `prune` | none | follow-up: needs the envelope, including the refusal path | — |
@@ -92,9 +92,18 @@ that activation applies, `unusable` when it fails it; `ready` does not promise
 that an activation succeeds), `unusable_reason` (`null` when ready, otherwise
 why the runtime fails that check: text for a person, not a code to match on),
 `toolchain` (`included` or `excluded`, the words `rocm examine` uses), `active`,
-`rollback_target` and `install_root`. `active` and `rollback_target` are the facts the text marks with
+`rollback_target`, `install_root` and `provenance`. `active` and `rollback_target` are the facts the text marks with
 `*` and `-`; a runtime that is both is shown as `*` in the text. The text's
 next-step hint for an empty registry is not part of the JSON.
+
+`provenance` is an object with the four facts the text prints on the runtime's
+`provenance:` line, under the same names: `channel`, `source` (the package
+index, else the downloaded archive), `source_layout_generation` and
+`device_target`. Each is the value the manifest recorded, trimmed, or `null`
+where the text prints `unrecorded`: a fact recorded nowhere or recorded blank,
+the source of an adopted runtime, the exact target of a tarball or family-wide
+install. A script reads `null` as "not recorded"; nothing is guessed from other
+facts.
 
 `registry`, `marker` and `install_root` are strings. A path that is not valid
 UTF-8 is written with each invalid sequence replaced by U+FFFD, as the text

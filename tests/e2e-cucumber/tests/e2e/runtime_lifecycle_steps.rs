@@ -670,6 +670,23 @@ async fn registered_adopted_runtime(world: &mut E2eWorld) {
     plant_adopted_runtime(world);
 }
 
+/// A registered wheel runtime makes `rocm` start with the startup update check,
+/// which looks for a usable Python and the network, and prints a progress line
+/// on stdout ahead of a `--json` document when the Python on `PATH` does not fit
+/// (the examine steps turn it off for the same reason). The scenarios that set
+/// this are about the listing, not updates. Like every scenario env it is
+/// consumed by one run, so a step that runs `rocm` again sets it again.
+fn disable_startup_update_check(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
+}
+
+#[given("ROCm CLI does not check for runtime updates when it starts")]
+async fn no_startup_update_check(world: &mut E2eWorld) {
+    disable_startup_update_check(world);
+}
+
 #[given("a runtime manifest to import")]
 async fn manifest_to_import(world: &mut E2eWorld) {
     let path = write_import_manifest(world);
@@ -829,9 +846,12 @@ async fn set_default_runtime_in_other_case(world: &mut E2eWorld) {
     crate::run_rocm_ok(world, &["config", "set-default-runtime", &runtime_id]);
 }
 
+/// Runs with the scenario's command environment (none unless a Given step set
+/// one), which this run consumes.
 #[when("the user lists the registered runtimes as JSON")]
 async fn list_runtimes_json(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list", "--json"]);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["runtimes", "list", "--json"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -2101,4 +2121,111 @@ async fn adopted_listing_says_source_unrecorded(world: &mut E2eWorld) {
         "adoption installed nothing, so the listing must not present the \
          adoption marker as a package source:\n{out}"
     );
+}
+
+/// The `provenance` object the JSON listing gives `runtime_key`, compared whole
+/// against `expected` by the steps below, so a fact under another name, a
+/// missing one, or the text's `unrecorded` in place of `null` fails.
+fn assert_json_provenance(world: &E2eWorld, runtime_key: &str, expected: &serde_json::Value) {
+    let listing = listing_json(world);
+    assert_eq!(
+        &listed_runtime(&listing, runtime_key)["provenance"],
+        expected,
+        "{runtime_key}:\n{listing:#}"
+    );
+}
+
+#[then(
+    "the JSON names the nightly runtime's channel, package source, source layout and exact GPU target"
+)]
+async fn json_names_nightly_provenance(world: &mut E2eWorld) {
+    assert_json_provenance(
+        world,
+        NIGHTLY_EXACT_TARGET_KEY,
+        &serde_json::json!({
+            "channel": "nightly",
+            "source": NIGHTLY_SOURCE,
+            "source_layout_generation": NIGHTLY_SOURCE_LAYOUT,
+            "device_target": NIGHTLY_DEVICE_TARGET,
+        }),
+    );
+}
+
+/// The older runtime's family is the exact `gfx942`, so a target guessed from
+/// it would be a plausible string here rather than `null`.
+#[then(
+    "the JSON gives no value for each fact the older runtime did not record instead of guessing"
+)]
+async fn json_gives_null_for_unrecorded_facts(world: &mut E2eWorld) {
+    assert_json_provenance(
+        world,
+        FIRST_KEY,
+        &serde_json::json!({
+            "channel": "release",
+            "source": format!("https://example.invalid/{FIRST_KEY}.tar.gz"),
+            "source_layout_generation": null,
+            "device_target": null,
+        }),
+    );
+}
+
+#[then("the JSON gives no package source for the adopted runtime")]
+async fn json_gives_adopted_runtime_no_source(world: &mut E2eWorld) {
+    assert_json_provenance(
+        world,
+        ADOPTED_KEY,
+        &serde_json::json!({
+            "channel": "release",
+            "source": null,
+            "source_layout_generation": null,
+            "device_target": null,
+        }),
+    );
+}
+
+/// Lists the same state as text and compares every runtime's `provenance:` line
+/// with the JSON object just read: the same names, the same values, and
+/// `unrecorded` exactly where the JSON has `null`.
+#[then("the text listing names the same provenance as the JSON for every runtime")]
+async fn text_provenance_matches_json(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    // The listing run consumed the scenario's setting; this run sets it again.
+    disable_startup_update_check(world);
+    let (text, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["runtimes", "list"]);
+    assert_eq!(rc, 0, "the text listing failed:\n{text}\n{stderr}");
+    let runtimes = listing["runtimes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`runtimes` is not an array:\n{listing:#}"));
+    assert!(
+        !runtimes.is_empty(),
+        "the JSON lists no runtime, so there is nothing to compare:\n{listing:#}"
+    );
+    for runtime in runtimes {
+        let key = runtime["runtime_key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a runtime has no runtime_key:\n{listing:#}"));
+        let object = runtime["provenance"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{key} has no provenance object:\n{listing:#}"));
+        let shown: Vec<(&str, &str)> = listed_provenance(&text, key)
+            .split(' ')
+            .map(|pair| {
+                pair.split_once('=')
+                    .unwrap_or_else(|| panic!("{key}: {pair:?} is not name=value:\n{text}"))
+            })
+            .collect();
+        assert_eq!(
+            shown.len(),
+            object.len(),
+            "{key}: the text and the JSON name different facts:\n{text}\n{listing:#}"
+        );
+        for (name, value) in shown {
+            let expected = match object.get(name) {
+                Some(serde_json::Value::Null) => "unrecorded",
+                Some(serde_json::Value::String(recorded)) => recorded.as_str(),
+                other => panic!("{key}: the JSON's {name} is {other:?}:\n{listing:#}"),
+            };
+            assert_eq!(value, expected, "{key}: {name}:\n{text}\n{listing:#}");
+        }
+    }
 }

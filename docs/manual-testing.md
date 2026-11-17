@@ -141,6 +141,9 @@ Expected result:
   one; the runtime marked `-`, if any, has `"rollback_target": true`.
 - The runtime marked active is the one `rocm examine` reports: its
   `install_root` is the `active_runtime_root` that `rocm examine` prints.
+- Each runtime's `provenance` object names the same `channel`, `source`,
+  `source_layout_generation` and `device_target` as its `provenance:` line in
+  the text, with `null` where the text shows `unrecorded`.
 
 Optional: an unreadable settings file. Copy `config.json` from the config
 directory aside, cut the original off part-way through, and run `rocm version`

@@ -1863,7 +1863,7 @@ folder whose path is not valid UTF-8, and
 `toolchain` words in the text and the JSON together:
 
 ```bash
-cargo xtask e2e -- -n "runtime-lifecycle-(07|23|24|25|26|27|28|29|30) "
+cargo xtask e2e -- -n "runtime-lifecycle-(07|23|24|25|26|27|28|29|30|31) "
 cargo test -p rocm --bin rocm runtimes_list
 cargo test -p rocm --bin rocm listing_state
 cargo test -p rocm --bin rocm runtime_toolchain_text_and_json_words_agree_for_every_variant
@@ -1925,6 +1925,32 @@ the `examine` lines. Both plant read-only manifests and run on the mock lane:
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-22 |examine-54 '
+```
+
+`rocm runtimes list --json` gives each runtime the same four facts as a
+`provenance` object under the same names, with `null` where the text prints
+`unrecorded` ([json-output.md](json-output.md)). Both
+forms render from one listing, and the JSON takes its names and order from
+`RuntimeProvenance::recorded_fields`, the list `RuntimeProvenance::fields`
+shows. `runtimes_list_json_names_recorded_provenance_and_null_for_unrecorded`
+in [runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pins the whole object
+for a nightly, an older, an adopted, a tarball, a padded and an all-blank
+runtime; `runtimes_list_text_and_json_name_the_same_provenance` checks over the
+same runtimes that the text line and the JSON object name the same facts with
+the same values; and
+`runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
+pins the object's key set.
+`@id:runtime-lifecycle-list-json-names-runtime-provenance`
+(`runtime-lifecycle-31`) plants the runtimes of `runtime-lifecycle-22`, reads
+each one's provenance from the JSON, and compares it with the text listing of
+the same state. It sets `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, as the
+examine scenarios that plant a runtime do: with wheel runtimes registered, the
+startup update check looks for a Python and the network and can print a
+progress line on stdout ahead of the document. It runs on the mock lane:
+
+```bash
+cargo xtask e2e -- -n 'runtime-lifecycle-31 '
+cargo test -p rocm --bin rocm runtimes_list
 ```
 
 Activate one validated runtime:
