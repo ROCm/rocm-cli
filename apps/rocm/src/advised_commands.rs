@@ -1136,6 +1136,12 @@ pub(crate) fn verdict(argv: &[String]) -> Verdict {
 /// and an entry whose text no longer occurs fails
 /// `exclusions_still_match_something`.
 const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
+    // Loop bodies whose subcommand and value are variables.
+    (
+        "docs/manual-testing.md",
+        "rocm config $w[0] $value | Out-Null",
+        "PowerShell loop body; the setters and values it runs are spelled out in the array above it",
+    ),
     // Prose that happens to begin with the program name.
     (
         "crates/rocm-core/src/diagnose/engine.rs",

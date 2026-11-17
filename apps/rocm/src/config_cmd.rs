@@ -35,10 +35,19 @@ use crate::{ConfigCommand, provider_keys, provider_name, providers};
 
 pub(crate) fn config(command: ConfigCommand) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let mut config = RocmCliConfig::load(&paths)?;
+    // Every change loads, changes and saves `config.json` under one lock, so two
+    // `rocm config` commands run at once cannot undo each other's change. It
+    // returns the settings it saved, for the confirmation to print.
+    let update = |change: &dyn Fn(&mut RocmCliConfig) -> Result<()>| {
+        RocmCliConfig::update(&paths, |config| {
+            change(config)?;
+            Ok(config.clone())
+        })
+    };
 
     match command {
         ConfigCommand::Show => {
+            let config = RocmCliConfig::load(&paths)?;
             print!("{}", render_config_text(&paths, &config));
         }
         ConfigCommand::SetEngine {
@@ -47,57 +56,62 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
             env_id,
             clear,
         } => {
-            let entry = config.engine_config_mut(&engine);
-            if clear {
-                entry.preferred_runtime_id = None;
-                entry.preferred_env_id = None;
-            } else if let Some(runtime_id) = runtime_id {
-                entry.preferred_runtime_id = Some(runtime_id);
-                entry.preferred_env_id = None;
-            } else if let Some(env_id) = env_id {
-                entry.preferred_env_id = Some(env_id);
-                entry.preferred_runtime_id = None;
-            } else {
+            // Refused before the lock is taken, so a refusal writes nothing,
+            // not even the lock file.
+            if !clear && runtime_id.is_none() && env_id.is_none() {
                 bail!("set-engine requires --runtime-id, --env-id, or --clear");
             }
-            config.save(&paths)?;
+            update(&|config| {
+                let entry = config.engine_config_mut(&engine);
+                if clear {
+                    entry.preferred_runtime_id = None;
+                    entry.preferred_env_id = None;
+                } else if let Some(runtime_id) = &runtime_id {
+                    entry.preferred_runtime_id = Some(runtime_id.clone());
+                    entry.preferred_env_id = None;
+                } else if let Some(env_id) = &env_id {
+                    entry.preferred_env_id = Some(env_id.clone());
+                    entry.preferred_runtime_id = None;
+                }
+                Ok(())
+            })?;
             println!("updated engine config for {engine}");
         }
         ConfigCommand::SetDefaultEngine { engine } => {
-            config.default_engine = Some(engine.clone());
-            config.save(&paths)?;
+            update(&|config| {
+                config.default_engine = Some(engine.clone());
+                Ok(())
+            })?;
             println!("default engine set to {engine}");
         }
         ConfigCommand::ClearDefaultEngine => {
-            config.default_engine = None;
-            config.save(&paths)?;
+            update(&|config| {
+                config.default_engine = None;
+                Ok(())
+            })?;
             println!("default engine cleared");
         }
         ConfigCommand::SetDefaultRuntime { runtime_id } => {
-            config.default_runtime_id = Some(runtime_id.clone());
-            config.active_runtime_key = None;
-            config.previous_runtime_key = None;
-            config.save(&paths)?;
-            let _ = fs::remove_file(active_runtime_marker_path(&paths));
+            set_default_runtime(&paths, Some(&runtime_id))?;
             println!("default runtime set to {runtime_id}");
         }
         ConfigCommand::ClearDefaultRuntime => {
-            config.default_runtime_id = None;
-            config.active_runtime_key = None;
-            config.previous_runtime_key = None;
-            config.save(&paths)?;
-            let _ = fs::remove_file(active_runtime_marker_path(&paths));
+            set_default_runtime(&paths, None)?;
             println!("default runtime cleared");
         }
         ConfigCommand::SetTelemetry { mode } => {
-            config.telemetry.mode = mode.as_str().to_owned();
-            config.save(&paths)?;
+            let config = update(&|config| {
+                config.telemetry.mode = mode.as_str().to_owned();
+                Ok(())
+            })?;
             println!("telemetry mode set to {}", mode.as_str());
             println!("  policy: {}", telemetry_policy_summary(&config.telemetry));
         }
         ConfigCommand::SetPermissions { mode } => {
-            config.permissions.mode = mode.as_str().to_owned();
-            config.save(&paths)?;
+            update(&|config| {
+                config.permissions.mode = mode.as_str().to_owned();
+                Ok(())
+            })?;
             record_cli_audit_event(
                 &paths,
                 "permissions",
@@ -110,8 +124,10 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
         }
         ConfigCommand::SetPlannerProvider { provider } => {
             let provider = provider_name(provider);
-            config.planner_provider = Some(provider.to_owned());
-            config.save(&paths)?;
+            let config = update(&|config| {
+                config.planner_provider = Some(provider.to_owned());
+                Ok(())
+            })?;
             println!("planner provider set to {provider}");
             if provider != "local" && !config.provider_enabled(provider) {
                 println!(
@@ -120,8 +136,10 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
             }
         }
         ConfigCommand::ClearPlannerProvider => {
-            config.planner_provider = None;
-            config.save(&paths)?;
+            update(&|config| {
+                config.planner_provider = None;
+                Ok(())
+            })?;
             println!("planner provider cleared");
         }
         ConfigCommand::EnableProvider { provider } => {
@@ -129,8 +147,10 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
             if provider == "local" {
                 bail!("local provider is always enabled and does not send prompts to a cloud API");
             }
-            config.provider_config_mut(provider).enabled = true;
-            config.save(&paths)?;
+            update(&|config| {
+                config.provider_config_mut(provider).enabled = true;
+                Ok(())
+            })?;
             println!("provider {provider} enabled for prompt sending");
             match providers::provider_key_status_text(provider) {
                 Ok(status) if status.starts_with("no key saved") => {
@@ -146,11 +166,14 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
             if provider == "local" {
                 bail!("local provider is always enabled and does not send prompts to a cloud API");
             }
-            config.provider_config_mut(provider).enabled = false;
-            config.save(&paths)?;
+            update(&|config| {
+                config.provider_config_mut(provider).enabled = false;
+                Ok(())
+            })?;
             println!("provider {provider} disabled for prompt sending");
         }
         ConfigCommand::SetProviderKey { provider } => {
+            let config = RocmCliConfig::load(&paths)?;
             let provider = provider_name(provider);
             if provider == "local" {
                 bail!("local provider does not use a cloud API key");
@@ -175,6 +198,7 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
             }
         }
         ConfigCommand::ClearProviderKey { provider } => {
+            let config = RocmCliConfig::load(&paths)?;
             let provider = provider_name(provider);
             if provider == "local" {
                 bail!("local provider does not use a cloud API key");
@@ -196,6 +220,22 @@ pub(crate) fn config(command: ConfigCommand) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `config set-default-runtime` (`Some`) and `config clear-default-runtime`
+/// (`None`): record the runtime id, forget the active and rollback runtime keys
+/// and drop the active-runtime marker, all under the config lock, so a runtime
+/// activation running at the same time cannot leave its marker beside these
+/// settings.
+fn set_default_runtime(paths: &AppPaths, runtime_id: Option<&str>) -> Result<()> {
+    let lock = RocmCliConfig::lock(paths)?;
+    let mut config = lock.load()?;
+    config.default_runtime_id = runtime_id.map(str::to_owned);
+    config.active_runtime_key = None;
+    config.previous_runtime_key = None;
+    lock.save(&config)?;
+    let _ = fs::remove_file(active_runtime_marker_path(paths));
     Ok(())
 }
 
@@ -364,5 +404,45 @@ mod tests {
         assert!(off.contains("telemetry_policy: disabled"));
         assert!(off.contains("no local polling"));
         assert!(off.contains("    openai: enabled"));
+    }
+
+    /// `config set-default-runtime` and `clear-default-runtime` change the
+    /// runtime fields of the settings on disk and nothing else, and remove the
+    /// active-runtime marker, whose runtime the settings no longer name.
+    #[test]
+    fn setting_the_default_runtime_keeps_other_settings_and_drops_the_marker() -> Result<()> {
+        let (root, paths) = test_paths("config-set-default-runtime");
+        RocmCliConfig {
+            active_runtime_key: Some("runtime-a".to_owned()),
+            previous_runtime_key: Some("runtime-b".to_owned()),
+            ..RocmCliConfig::default()
+        }
+        .save(&paths)?;
+        RocmCliConfig::update(&paths, |config| {
+            config.telemetry.mode = TELEMETRY_MODE_OFF.to_owned();
+            Ok(())
+        })?;
+        let marker = active_runtime_marker_path(&paths);
+        fs::create_dir_all(marker.parent().expect("the marker sits in a folder"))?;
+        fs::write(&marker, b"{\"runtime_key\":\"runtime-a\"}")?;
+
+        set_default_runtime(&paths, Some("therock-release:gfx1151"))?;
+        let set = RocmCliConfig::load(&paths)?;
+        let marker_after_set = marker.exists();
+        set_default_runtime(&paths, None)?;
+        let cleared = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            set.default_runtime_id.as_deref(),
+            Some("therock-release:gfx1151")
+        );
+        assert_eq!(set.active_runtime_key, None);
+        assert_eq!(set.previous_runtime_key, None);
+        assert_eq!(set.telemetry.mode, TELEMETRY_MODE_OFF);
+        assert!(!marker_after_set, "the marker still names runtime-a");
+        assert_eq!(cleared.default_runtime_id, None);
+        assert_eq!(cleared.telemetry.mode, TELEMETRY_MODE_OFF);
+        Ok(())
     }
 }

@@ -13,10 +13,13 @@
 //! `env_root_for_engine_install`, `env_root_for_runtime` and
 //! `env_root_for_self_managed_engine` resolve the engine environment root,
 //! `runtime_manifest_for_selector` resolves a selector to one installed
-//! runtime, and `runtime_key_for_python` attributes an interpreter to the
-//! runtime whose install root contains it.
+//! runtime, `runtime_key_for_python` attributes an interpreter to the
+//! runtime whose install root contains it, and `record_engine_install` records
+//! a finished install in `config.json` under the config lock.
 //!
-//! Relocated from `engines_cmd.rs` with no behavior change. It imports
+//! The resolvers were relocated from `engines_cmd.rs` with no behavior change;
+//! `record_engine_install` was added here because both modules record an
+//! install. It imports
 //! `recover_setup_runtime_registration` from `runtime_adopt.rs`,
 //! `select_runtime_manifest` and `validate_runtime_manifest_for_activation`
 //! from `runtime_registry.rs`, and the runtime-manifest model from
@@ -164,6 +167,35 @@ fn runtime_key_owning_python<'a>(
         .map(|manifest| manifest.runtime_key.as_str())
 }
 
+/// Record in `config.json` that `engine` was installed for `runtime_id`, into
+/// `env_id` when the install made one, and make that env the engine's
+/// preference when it has none yet. Returns the settings as saved.
+///
+/// The engine install can run for minutes, so this loads the settings again
+/// under the config lock (`RocmCliConfig::update`) instead of saving the copy
+/// read before it: that copy would undo whatever another command saved during
+/// the install, such as the runtime an SDK install activated.
+pub(crate) fn record_engine_install(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_id: &str,
+    env_id: Option<&str>,
+) -> Result<RocmCliConfig> {
+    RocmCliConfig::update(paths, |config| {
+        let engine_config = config.engine_config_mut(engine);
+        engine_config.last_installed_runtime_id = Some(runtime_id.to_owned());
+        if let Some(env_id) = env_id {
+            engine_config.last_installed_env_id = Some(env_id.to_owned());
+            if engine_config.preferred_runtime_id.is_none()
+                && engine_config.preferred_env_id.is_none()
+            {
+                engine_config.preferred_env_id = Some(env_id.to_owned());
+            }
+        }
+        Ok(config.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +337,51 @@ mod tests {
             ),
             Some("inner")
         );
+    }
+
+    /// Recording an install takes no settings, only the paths: it loads them
+    /// itself, so a setting already on disk is kept and the install is
+    /// recorded beside it. The install's env becomes the engine's
+    /// preference only while it has none, and the settings come back as saved.
+    #[test]
+    fn recording_an_engine_install_starts_from_the_settings_on_disk() -> Result<()> {
+        let (root, paths) = test_paths("engine-install-record-from-disk");
+        RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            telemetry: rocm_core::TelemetryConfig {
+                mode: rocm_core::TELEMETRY_MODE_OFF.to_owned(),
+            },
+            ..RocmCliConfig::default()
+        }
+        .save(&paths)?;
+
+        let first = record_engine_install(&paths, "vllm", "runtime-1", Some("env-1"))?;
+        let second = record_engine_install(&paths, "vllm", "runtime-2", Some("env-2"))?;
+        let saved = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(saved.telemetry.mode, rocm_core::TELEMETRY_MODE_OFF);
+        assert_eq!(saved.default_engine.as_deref(), Some("vllm"));
+        let vllm = saved
+            .engine_config("vllm")
+            .expect("the install was recorded");
+        assert_eq!(vllm.last_installed_runtime_id.as_deref(), Some("runtime-2"));
+        assert_eq!(vllm.last_installed_env_id.as_deref(), Some("env-2"));
+        assert_eq!(
+            vllm.preferred_env_id.as_deref(),
+            Some("env-1"),
+            "the first install's env stays the preference"
+        );
+        assert_eq!(
+            first
+                .engine_config("vllm")
+                .and_then(|e| e.preferred_env_id.as_deref()),
+            Some("env-1")
+        );
+        assert_eq!(
+            serde_json::to_value(&second)?,
+            serde_json::to_value(&saved)?
+        );
+        Ok(())
     }
 }

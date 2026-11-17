@@ -726,6 +726,75 @@ count is zero, so a generator that stops producing that input fails the run
 instead of passing without testing anything. A property that fails prints its
 shrunk counterexample.
 
+### Concurrent settings changes
+
+Every command that changes `config.json` loads, changes and saves it under one
+lock (`RocmCliConfig::update` and `RocmCliConfig::lock` in
+[`config.rs`](../crates/rocm-core/src/config.rs)), so two commands run at once
+cannot undo each other's change. The tests of the lock itself sit beside it:
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/config::tests::(concurrent_updates|an_update|a_nested_config_lock|a_config_lock_guard|a_killed_holder|a_legacy_migration_keeps|production_code_saves)/)'
+```
+
+- `concurrent_updates_from_threads_keep_every_change` and
+  `concurrent_updates_from_processes_keep_every_change` run writers side by side
+  (threads, then copies of the test binary) and check that every change each
+  made is in the file at the end. Run without the lock they lost dozens of
+  updates; they cannot prove the absence of a race, only catch one.
+- `an_update_waits_for_the_one_in_progress_and_keeps_its_change` is the
+  deterministic version: it holds one update between its load and its save and
+  checks that a second one does not get through until it is released.
+- `an_update_that_cannot_get_the_lock_says_so_and_changes_nothing` checks the
+  timeout error together with the file it claims was left alone,
+  `an_update_whose_change_fails_saves_nothing` that a change that fails is not
+  saved, and `an_update_of_an_unreadable_config_leaves_the_file_alone` that the
+  lock does not change the rule that an unreadable `config.json` is never saved
+  over.
+- `a_killed_holder_releases_the_config_lock` kills a process holding the lock
+  and checks the lock is free afterwards, the reason the lock file never needs
+  deleting. `a_config_lock_guard_is_not_send` keeps the guard on the thread
+  that took it.
+- `a_legacy_migration_keeps_a_config_written_while_it_waited` checks the legacy
+  migration's second look, under the lock, for a `config.json` written since.
+- `production_code_saves_the_config_only_under_its_lock` scans the sources for
+  a `.save(paths)`, a `RocmCliConfig::save(` or a direct write to
+  `config_path()` outside the lock, the way a new writer would bypass it.
+  `RocmCliConfig::save` itself is compiled only for tests and the
+  `test-support` feature, so a production build cannot call it at all.
+
+A locked change can still save settings it read before taking the lock, which
+no scan sees. The changes whose caller passes in a copy of the settings have
+a test that saves a setting to disk, hands the change a stale copy and checks
+that both the setting and the change survive: runtime activation and rollback
+(`activation_and_rollback_keep_a_setting_saved_after_the_callers_copy` in
+[`runtimes_cmd.rs`](../apps/rocm/src/runtimes_cmd.rs)) and runtime uninstall
+(`uninstall_keeps_a_setting_saved_after_its_settings_were_read` in
+[`runtime_uninstall.rs`](../apps/rocm/src/runtime_uninstall.rs)). Recording an
+engine install and `config set-default-runtime` take no settings, only the
+paths, so their tests check that a setting already on disk is kept and that
+the change is made: `recording_an_engine_install_starts_from_the_settings_on_disk`
+in [`engine_install_env.rs`](../apps/rocm/src/engine_install_env.rs) and
+`setting_the_default_runtime_keeps_other_settings_and_drops_the_marker` in
+[`config_cmd.rs`](../apps/rocm/src/config_cmd.rs). Beside them,
+`activation_and_rollback_check_live_servers_before_taking_the_config_lock` keeps
+the slow per-server HTTP check out of the lock,
+`a_rollback_whose_target_changed_meanwhile_is_refused` that a rollback does not
+switch to a target other than the one it checked, and
+`uninstall_decides_the_default_from_the_settings_it_changes` that an uninstall
+does not apply a decision made before another command activated a runtime.
+
+Scenario `config-12` (`@id:config-concurrent-changes-all-kept`) drives the real
+binary: seven loops at once, each alternating two `rocm config` commands (a
+setter, a `clear-*`, `set-engine` with each of its flags) and checking before
+every change that its previous one is still in the file. Run against binaries
+without the lock it failed 3 of 3 runs in WSL and 2 of 6 on native Windows: it
+catches the race often, not on every run. The 30-second timeout has no
+scenario: it is not configurable, so a scenario would have to hold the lock for
+30 seconds of lane time, and
+`an_update_that_cannot_get_the_lock_says_so_and_changes_nothing` drives the
+same code with a short timeout.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
