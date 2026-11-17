@@ -3079,6 +3079,38 @@ approval. User-facing TUI/chat flows should still route mutating tool calls
 through their normal approval cards rather than relying on this hidden helper
 flag.
 
+Assistant tool-call arguments:
+
+The approval card for a mutating assistant tool call and the command its
+approval runs are built from the same argument object. No tool takes a
+parameter named `arguments`, so a call whose arguments carry a nested
+`arguments` field is refused by `validate_chat_tool_call` in
+[tool_policy.rs](../apps/rocm/src/tool_policy.rs) before any card is shown, on
+the dash, chat and `rocm mcp-call` paths alike. `chat-17`
+(`chat-ambiguous-tool-call-refused-before-approval` in
+[chat.feature](../tests/e2e-cucumber/features/chat.feature), Linux mock lane,
+no GPU) drives it through the interactive chat: a mock model answers with a
+two-payload `launch_server` call, the model is told the call was refused for
+its nested field, and no approval prompt appears.
+
+The hidden `rocm mcp-call` command still accepts a pasted MCP `tools/call`
+params envelope (`name`, `arguments` and an optional `_meta`) and unwraps it at
+its own boundary, but only a pure envelope, and it refuses one that names a
+different tool. `chat-18` runs a read-only tool from such an envelope and
+checks the tool's own result; `chat-19` passes tool fields mixed with a nested
+`arguments` object and checks the call is refused and prints no tool result.
+Arguments that are not a JSON object are refused rather than run as `{}`.
+
+```bash
+cargo xtask e2e -- -n "chat-1[789]"
+cargo test -p rocm --bin rocm nested_arguments
+cargo test -p rocm --bin rocm seam_approval_card_matches
+cargo test -p rocm --bin rocm mcp_call_
+cargo test -p rocm --bin rocm no_rocm_tool_declares_an_arguments_parameter
+cargo test -p rocm-dash-tui no_rocm_tool_declares_an_arguments_parameter
+cargo test -p e2e-cucumber --lib a_scripted_tool_call_answers_only_the_triggering_user_turn
+```
+
 Artifact cache and prefetch policy tests:
 
 ```bash
