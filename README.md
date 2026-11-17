@@ -1314,6 +1314,15 @@ the full inference endpoint, the API-qualified model name, and a quick smoke
 test (time to first token and approximate tokens per second). `rocm services`
 reports the same `device` for each running service.
 
+On an interactive terminal, if the smoke test cannot complete, the summary is
+headed `(smoke test failed)`, shows the status as `started, smoke test failed`
+instead of `ready`, and a note gives the reason and points at
+`rocm logs --service <id>`. ROCm CLI does not stop the server, and the command
+still exits 0. Which failures are detected, and which still read as `ready`, is
+listed under
+[Serve Smoke Test Failure](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md#serve-smoke-test-failure)
+in the testing guide.
+
 The device line is omitted when the engine cannot say yet. A server is reported
 ready as soon as it answers, which can be before it has finished loading the
 model, and until then the engine does not know which device it ended up on;

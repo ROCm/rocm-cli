@@ -17,7 +17,7 @@ Feature: Model serving
   # This discriminates nothing yet: the scenario is an expected failure on every
   # host while its xfail row stands, and the vLLM run stops before printing a
   # plan, so the step panics there whatever the lemonade half did. It becomes
-  # regression coverage when that row is narrowed. serve-55 and the unit tests in
+  # regression coverage when that row is narrowed. serve-60 and the unit tests in
   # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
   Scenario: serve-02 - Every engine expands a short name rather than serving it
@@ -975,6 +975,23 @@ Feature: Model serving
     When the user serves a model that requires an API key
     Then the server's API key is kept where only that user can read it
 
+  # A launch that became ready but whose first chat request fails must not be
+  # shown as a healthy deployment (#523). Same test-only hook as
+  # @id:serve-oom-launch-memory-guidance, in its
+  # `ready` mode, pointed at a mock engine that fails every chat request. The
+  # unit and provider tests prove the rendering and the failure classes; this
+  # proves `serve()` carries the smoke test's failure into the summary.
+  @id:serve-smoke-failure-summary @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-60 - A launch whose first chat request fails is not presented as ready
+    Given a managed vLLM launch that becomes ready but whose engine fails its first chat request
+    When the user opens the interactive serve summary against that engine
+    Then the deployment summary says the smoke test failed and does not call the service ready
+    And the deployment summary gives the engine's own reason
+    And the engine received exactly one chat request
+    And the deployment summary names the logs command for that service
+    And the launch's service record is left as ready
+    And no background automation daemon was left behind
+
   # ROCMAI-550, and the evidence that the Vulkan remediation is not a dead end.
   # `rocm install sdk` on a gfx90c APU refuses and tells the user to run `rocm
   # serve <model> --engine lemonade`; AGENTS.md section 3 only allows that if
@@ -994,7 +1011,7 @@ Feature: Model serving
   # ROCM_CLI_TEST_HOST_ROOT (an `e2e-test-hooks` build), so the GPU-less mock
   # lane is where this runs.
   @id:serve-accepts-an-apu-the-kernel-gives-no-compute-node @requires-os:linux
-  Scenario: serve-60 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
+  Scenario: serve-61 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
     Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
     When the user is told to serve on Lemonade because this GPU has no ROCm build
     Then serving got past the no-GPU pre-flight and reported this host's usable GPU
