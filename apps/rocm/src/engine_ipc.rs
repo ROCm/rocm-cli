@@ -329,8 +329,8 @@ pub(crate) fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
 /// How long one call can take, since `rocm services list` makes one per ready
 /// service: [`engine_request`] itself imposes no deadline, so the bound comes
 /// from the engine. The three built-in engines answer in-process and every
-/// endpoint probe they make is timeout-bounded (`engines/vllm`'s
-/// `HEALTHCHECK_TIMEOUT_MS`, `engines/lemonade`'s
+/// endpoint probe they make is timeout-bounded (`engines/vllm`'s and
+/// `engines/aim`'s own `HEALTHCHECK_TIMEOUT_MS`, `engines/lemonade`'s
 /// `rocm_core::INFERENCE_PROBE_TIMEOUT`), so a stalled server costs seconds,
 /// not forever. An *external* plugin is a spawned child that
 /// `engine_request` waits on unbounded, exactly as every other engine call
@@ -365,11 +365,24 @@ pub(crate) fn fetch_service_device(
 
 /// The engine's reported device, or `None` when it said nothing usable.
 ///
-/// `"unknown"` is the engines' own device value when no state is on disk for
-/// this service id yet (see `engines/vllm/src/state.rs` and
-/// `engines/lemonade/src/lib.rs`), and it is not more informative than showing
-/// nothing — a `device: unknown` row claims the CLI asked and learned
-/// something, which is the opposite of what happened.
+/// `"unknown"` is the engines' own "I cannot say yet", and it is not more
+/// informative than showing nothing — a `device: unknown` row claims the CLI
+/// asked and learned something, which is the opposite of what happened.
+///
+/// *When* an engine stops saying it is not uniform, and that difference is why
+/// [`SERVE_DEVICE_PROBE_BUDGET`] exists at all:
+///
+/// * `engines/vllm` and `engines/aim` answer as soon as a state file exists
+///   for the service id (`Some(state) => reported_device(state)`,
+///   `None => "unknown"`), so the row is available from the launch write
+///   onwards, readiness or not;
+/// * `engines/lemonade` keeps answering `"unknown"` while a state file plainly
+///   exists — its `healthcheck_service_at` reports a device only once the
+///   service is `ready`, which there means its own inference probe has come
+///   back.
+///
+/// So this filter is what keeps the slowest of the three from printing a row
+/// that says nothing; it is not a uniform no-state-on-disk guard.
 ///
 /// A named function rather than an inline `then_some` because the only caller
 /// is an RPC to a live engine: in default CI that call never succeeds, so the
@@ -481,10 +494,10 @@ where
 /// `device:` row, so a bridge client calling the tool makes no probe and waits
 /// for nothing — unlike the sibling `engines` MCP tool, which ROCMAI-550 did
 /// make host-aware. The shared name is the trap, so this says which surface it
-/// means (review on #678); giving the tool the row is a change in its own
+/// means; giving the tool the row is a change in its own
 /// right, not something this constant may be read as already covering.
 ///
-/// # The decision, recorded (review on #678)
+/// # The decision, recorded
 ///
 /// This is accepted rather than merely observed. `rocm services list` and
 /// `rocm chat`'s `services` command can both block ~18s on a host whose

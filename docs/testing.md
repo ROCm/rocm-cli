@@ -4458,11 +4458,10 @@ same report prints, so every lane checks the level its own hardware implies:
 cargo xtask e2e -- -n '(examine-55)'
 ```
 
-Vulkan-only here is inferred from the gfx table, not probed: this change has
-three levels and this section describes three. Probing the host for a Vulkan
-driver, and the further levels that evidence makes knowable, is separate work.
-Written this way deliberately — a forward reference to an unmerged change reads
-as false the moment this merges on its own.
+Vulkan-only here is inferred from the gfx table, not probed: there are three
+support levels and this section describes three. Probing the host for a Vulkan
+driver, and the further levels that evidence would make knowable, is separate
+work.
 
 ## Windows Tool Notes
 

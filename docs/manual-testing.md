@@ -439,9 +439,16 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
 
-With that foreground server stopped, check that a catalogued recipe reaches
-Lemonade with a build it can load, from a short name alone — no `--engine`, no
-quantization variant typed by hand:
+That server is in the background — `rocm serve` returns to the shell once it is
+ready — so stop it before continuing, or it keeps the GPU and port 11435:
+
+```powershell
+rocm services stop <service-id> --yes
+```
+
+With it stopped, check that a catalogued recipe reaches Lemonade with a build
+it can load, from a short name alone — no `--engine`, no quantization variant
+typed by hand:
 
 ```powershell
 rocm serve qwen-small --managed
