@@ -78,6 +78,10 @@ pub(crate) struct TheRockRuntimeManifest {
     pub sdk_torch: Option<String>,
     #[serde(default)]
     pub installed_at_unix_ms: Option<u128>,
+    /// The wheel index the SDK install resolved its packages from (nightly or
+    /// release); absent in manifests written before it was recorded.
+    #[serde(default)]
+    pub index_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -355,6 +359,29 @@ fn sort_manifests_newest_install_first(manifests: &mut [(PathBuf, TheRockRuntime
             .then_with(|| left.runtime_key.cmp(&right.runtime_key))
             .then_with(|| left_path.cmp(right_path))
     });
+}
+/// The wheel index the SDK in the runtime whose interpreter is `python` was installed
+/// from, as its manifest in `paths`' runtime registry records it. `Ok(None)` means no
+/// manifest for that interpreter recorded one; `Err` means the registry could not be read.
+///
+/// A discover row that reuses the SDK's own torch stack has to fetch those exact builds
+/// again from the index they came from: a nightly SDK's torch is not on the release
+/// index and a release SDK's is not on the nightly one.
+pub(crate) fn recorded_sdk_index_url(paths: &AppPaths, python: &Path) -> Result<Option<String>> {
+    let registry = paths.data_dir.join("runtimes").join("registry");
+    let manifests = load_runtime_manifests_in(&registry, None)?;
+    Ok(sdk_index_url_for_python(&manifests, python))
+}
+/// The `index_url` of the manifest whose interpreter is `python`, if it recorded a
+/// non-empty one.
+fn sdk_index_url_for_python(manifests: &[TheRockRuntimeManifest], python: &Path) -> Option<String> {
+    manifests
+        .iter()
+        .find(|manifest| manifest.python_executable.as_deref() == Some(python))
+        .and_then(|manifest| manifest.index_url.as_deref())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
 }
 /// The torch build the SDK installed into this runtime, as its manifest records it.
 ///
@@ -845,6 +872,38 @@ fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_sdk_index_comes_from_the_manifest_of_that_interpreter() {
+        let manifest = |python: &str, index: Option<&str>| TheRockRuntimeManifest {
+            python_executable: Some(PathBuf::from(python)),
+            index_url: index.map(str::to_owned),
+            ..Default::default()
+        };
+        let manifests = vec![
+            manifest(
+                "/rt/nightly/bin/python",
+                Some("https://nightly.example/whl"),
+            ),
+            manifest(
+                "/rt/release/bin/python",
+                Some(" https://stable.example/whl "),
+            ),
+            manifest("/rt/old/bin/python", None),
+            manifest("/rt/blank/bin/python", Some("  ")),
+        ];
+        let lookup = |python: &str| sdk_index_url_for_python(&manifests, Path::new(python));
+        assert_eq!(
+            lookup("/rt/nightly/bin/python").as_deref(),
+            Some("https://nightly.example/whl")
+        );
+        assert_eq!(
+            lookup("/rt/release/bin/python").as_deref(),
+            Some("https://stable.example/whl")
+        );
+        assert_eq!(lookup("/rt/old/bin/python"), None);
+        assert_eq!(lookup("/rt/blank/bin/python"), None);
+        assert_eq!(lookup("/rt/unknown/bin/python"), None);
+    }
     #[test]
     fn managed_env_reflects_managed_runtime_manifest_source() {
         let mut runtime = VllmRuntime {

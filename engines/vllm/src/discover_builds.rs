@@ -183,8 +183,10 @@ pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // Same staging host as 10.1: it publishes the `.rocm102` vLLM builds
         // (`0.32.1.dev0+g<sha>.d<date>.rocm102`) next to the 10.1 ones.
         vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
-        // The torch stack is the SDK's own, from the nightly index it was
-        // installed from (see `TorchStack::FromInstalledSdk`). Not the staging
+        // The torch stack is the SDK's own, fetched again from the index its
+        // runtime manifest records (see `TorchStack::FromInstalledSdk`); the
+        // nightly index below is only the fallback for a manifest that
+        // recorded none. Not the staging
         // host's `+rocm10.2.0rcN` torch: that build requires
         // `amd-torch-device-gfx*==2.14.0+rocm10.2.0rcN` and
         // `rocm==10.2.0rc2`, which staging answers 403 for, so a GPU payload

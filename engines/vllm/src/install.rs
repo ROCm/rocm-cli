@@ -19,8 +19,8 @@ use crate::discover_builds::{
 use crate::repair::{RepairAssessment, assess_runtime_repair};
 use crate::runtime::{
     VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
-    resolve_managed_runtime_python, resolve_vllm_runtime, runtime_is_managed,
-    vllm_runtime_warnings,
+    recorded_sdk_index_url, resolve_managed_runtime_python, resolve_vllm_runtime,
+    runtime_is_managed, vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 use crate::wheel_builds::{
@@ -771,6 +771,19 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
         (!version.is_empty()).then(|| format!("{pkg}=={version}"))
     })
 }
+/// The index the torch stack is fetched from for `build`.
+///
+/// A [`TorchStack::FromInstalledSdk`] row reuses the SDK's own builds, so it asks for
+/// them from the index the SDK came from (`recorded`, from the runtime manifest) rather
+/// than the row's fixed one: the row serves nightly and release SDKs alike, and each
+/// one's torch lives only on its own index. A manifest that recorded none, and every
+/// row that discovers its stack, keeps the row's `torch_index_url`.
+fn torch_index_url_for(build: &VllmRocmDiscoverBuild, recorded: Option<&str>) -> String {
+    match (build.torch_stack, recorded) {
+        (TorchStack::FromInstalledSdk, Some(url)) => url.to_owned(),
+        _ => build.torch_index_url.to_owned(),
+    }
+}
 /// Builds the `uv pip install` argv for pinned torch alone, scoped to only
 /// `torch_index_url`.
 ///
@@ -800,7 +813,7 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
 fn vllm_rocm10_discover_torch_install_args(
     python: &Path,
     reinstall: bool,
-    build: &VllmRocmDiscoverBuild,
+    torch_index_url: &str,
     torch_pin: &str,
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -813,7 +826,7 @@ fn vllm_rocm10_discover_torch_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--index-url".to_owned());
-    args.push(build.torch_index_url.to_owned());
+    args.push(torch_index_url.to_owned());
     args
 }
 /// Builds the `uv pip install` argv that realigns torch, torchvision and
@@ -835,7 +848,7 @@ fn vllm_rocm10_discover_torch_install_args(
 /// exists to prevent.
 fn vllm_rocm10_discover_realign_install_args(
     python: &Path,
-    build: &VllmRocmDiscoverBuild,
+    torch_index_url: &str,
     pins: &[String],
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -850,7 +863,7 @@ fn vllm_rocm10_discover_realign_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--index-url".to_owned());
-    args.push(build.torch_index_url.to_owned());
+    args.push(torch_index_url.to_owned());
     args
 }
 /// Builds the `uv pip install` argv for pinned vllm/flash-attn/amd-aiter,
@@ -1122,7 +1135,17 @@ fn install_vllm_rocm10_discover(
     // Two separate `uv pip install` calls, each scoped to exactly one index:
     // see `vllm_rocm10_discover_torch_install_args` for why combining both
     // indexes into one call is unsafe.
-    let torch_args = vllm_rocm10_discover_torch_install_args(python, reinstall, build, &pins[0]);
+    let recorded_index = recorded_sdk_index_url(paths, python).unwrap_or_else(|err| {
+        notes.push(format!(
+            "could not read the runtime registry ({err:#}); the torch stack is fetched from {}, \
+             which may not be the index the SDK was installed from",
+            build.torch_index_url
+        ));
+        None
+    });
+    let torch_index_url = torch_index_url_for(build, recorded_index.as_deref());
+    let torch_args =
+        vllm_rocm10_discover_torch_install_args(python, reinstall, &torch_index_url, &pins[0]);
     run_uv_pip_install(uv, paths, python, torch_args)?;
 
     let mut remaining_args =
@@ -1149,7 +1172,8 @@ fn install_vllm_rocm10_discover(
     // force the whole stack back to the coherent trio discovered above. This
     // must run unconditionally, before the device-plugin discovery below: a
     // `uv pip freeze` failure there must not skip restoring the trio too.
-    let trio_realign_args = vllm_rocm10_discover_realign_install_args(python, build, &pins[..3]);
+    let trio_realign_args =
+        vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &pins[..3]);
     run_uv_pip_install(uv, paths, python, trio_realign_args)?;
 
     // The full-dependency resolve can also pull in an AMD device-kernel
@@ -1178,7 +1202,7 @@ fn install_vllm_rocm10_discover(
     }
     if !device_pins.is_empty() {
         let device_realign_args =
-            vllm_rocm10_discover_realign_install_args(python, build, &device_pins);
+            vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &device_pins);
         run_uv_pip_install(uv, paths, python, device_realign_args)?;
     }
 
@@ -1734,7 +1758,12 @@ mod tests {
         let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
         let torch_pin = "torch==2.12.0+rocm10.0.0";
 
-        let args = vllm_rocm10_discover_torch_install_args(&python, false, build, torch_pin);
+        let args = vllm_rocm10_discover_torch_install_args(
+            &python,
+            false,
+            build.torch_index_url,
+            torch_pin,
+        );
         assert!(!args.contains(&"--reinstall".to_owned()));
         assert!(!args.contains(&"--reinstall-package".to_owned()));
         assert!(args.contains(&torch_pin.to_owned()));
@@ -1754,10 +1783,48 @@ mod tests {
              and hit a fatal 403 from a nonexistent sub-path"
         );
 
-        let args = vllm_rocm10_discover_torch_install_args(&python, true, build, torch_pin);
+        let args = vllm_rocm10_discover_torch_install_args(
+            &python,
+            true,
+            build.torch_index_url,
+            torch_pin,
+        );
         assert!(args.contains(&"--reinstall-package".to_owned()));
         assert!(args.contains(&"torch".to_owned()));
         assert!(!args.contains(&"--reinstall".to_owned()));
+    }
+    #[test]
+    fn an_installed_sdk_row_fetches_its_torch_stack_from_the_index_the_sdk_came_from() {
+        let python = PathBuf::from("/opt/venv/bin/python");
+        let release = "https://stable.repo.amd.com/rocm/whl-next";
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 has a discover row");
+        assert_eq!(ten_two.torch_stack, TorchStack::FromInstalledSdk);
+
+        // A release SDK's torch is not on the row's nightly index, so the row's own
+        // index must not be the one handed to uv.
+        let index = torch_index_url_for(ten_two, Some(release));
+        assert_eq!(index, release);
+        assert_ne!(index, ten_two.torch_index_url);
+        let pins = vec!["torch==2.14.0+rocm10.2.0".to_owned()];
+        let install = vllm_rocm10_discover_torch_install_args(&python, false, &index, &pins[0]);
+        let realign = vllm_rocm10_discover_realign_install_args(&python, &index, &pins);
+        for args in [&install, &realign] {
+            assert!(args.contains(&release.to_owned()), "{args:?}");
+            assert!(
+                !args.contains(&ten_two.torch_index_url.to_owned()),
+                "{args:?}"
+            );
+        }
+
+        // A manifest that recorded no index keeps the row's.
+        assert_eq!(torch_index_url_for(ten_two, None), ten_two.torch_index_url);
+        // A row that discovers its stack never takes the recorded index.
+        let ten_one = vllm_rocm_discover_build("10.1.0").expect("10.1 has a discover row");
+        assert_eq!(ten_one.torch_stack, TorchStack::Discover);
+        assert_eq!(
+            torch_index_url_for(ten_one, Some(release)),
+            ten_one.torch_index_url
+        );
     }
     #[test]
     fn vllm_rocm10_discover_remaining_install_args_use_only_the_vllm_index() {
@@ -2004,6 +2071,154 @@ exit 0
             .map(str::to_owned)
             .collect();
         Ok((outcome, calls))
+    }
+
+    /// Runs `install_vllm_rocm10_discover` on the 10.2 row against a fake `uv`
+    /// whose `pip freeze` reports a release SDK's torch stack, with `prepare`
+    /// free to set up the runtime registry first. Returns the outcome and every
+    /// `uv` argv.
+    #[cfg(unix)]
+    fn run_ten_two_discover_with_fake_uv(
+        prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
+    ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+        prepare(&paths, &python)?;
+        let log = root.path().join("uv.log");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*--config-file*)
+    echo "Resolved 3 packages" >&2
+    ;;
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    case "$last" in
+      *'*'*) echo " + ${{pkg}}==9.9.9" >&2 ;;
+      *) echo " + ${{last}}" >&2 ;;
+    esac
+    ;;
+  *"pip freeze"*)
+    echo "torch==2.14.0+rocm10.2.0"
+    echo "torchvision==0.29.2+rocm10.2.0"
+    echo "torchaudio==2.11.1+rocm10.2.0"
+    echo "amd-torch-device-gfx1151==2.14.0+rocm10.2.0"
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+        let outcome = install_vllm_rocm10_discover(&uv, &paths, &python, true, build);
+        // A test may have made the registry unreadable; let the temp dir clean up.
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        if registry.is_dir() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let calls = std::fs::read_to_string(&log)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Ok((outcome, calls))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_sdk_on_the_ten_two_row_gets_its_torch_stack_from_its_own_index() -> Result<()> {
+        let release = "https://stable.example/rocm/whl-next";
+        let (outcome, calls) = run_ten_two_discover_with_fake_uv(|paths, python| {
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            std::fs::create_dir_all(&registry)?;
+            std::fs::write(
+                registry.join("release.json"),
+                format!(
+                    r#"{{"python_executable":"{}","index_url":"{release}"}}"#,
+                    python.display()
+                ),
+            )?;
+            Ok(())
+        })?;
+        outcome?;
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+        // The torch install, the trio realign and the device realign are the real
+        // installs that name a torch-stack package; each must ask the SDK's index.
+        let torch_stack_installs: Vec<&String> = calls
+            .iter()
+            .filter(|call| !call.contains("--dry-run") && call.contains("--no-deps"))
+            .filter(|call| call.contains("torch"))
+            .collect();
+        assert_eq!(
+            torch_stack_installs.len(),
+            3,
+            "expected torch install, trio realign and device realign: {calls:?}"
+        );
+        for call in torch_stack_installs {
+            assert!(call.contains(&format!("--index-url {release}")), "{call}");
+            assert!(!call.contains(build.torch_index_url), "{call}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ten_two_row_keeps_its_own_index_without_a_recorded_one_and_says_when_it_could_not_look()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+
+        // A manifest that records no index: the row's index, no note.
+        let (outcome, calls) = run_ten_two_discover_with_fake_uv(|paths, python| {
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            std::fs::create_dir_all(&registry)?;
+            std::fs::write(
+                registry.join("old.json"),
+                format!(r#"{{"python_executable":"{}"}}"#, python.display()),
+            )?;
+            Ok(())
+        })?;
+        assert!(outcome?.notes.is_empty());
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains(&format!("--index-url {}", build.torch_index_url)))
+        );
+
+        // A registry that cannot be read: the row's index, and the install says so.
+        let (outcome, calls) = run_ten_two_discover_with_fake_uv(|paths, _| {
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            std::fs::create_dir_all(&registry)?;
+            std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o000))?;
+            Ok(())
+        })?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not read the runtime registry")),
+            "{notes:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains(&format!("--index-url {}", build.torch_index_url)))
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

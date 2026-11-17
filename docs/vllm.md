@@ -123,12 +123,15 @@ The `10.2.0` row does not discover its torch stack: it keeps the torch,
 torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,
 torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`), checks them
 against the row's series and the SDK's ROCm line, and realigns to those exact
-builds from the nightly index. A series match would not work there: that index
-serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
+builds from the index the SDK was installed from (the one its runtime manifest
+records, so a nightly SDK uses the nightly index and a release SDK the release
+one; the row's nightly index when a manifest recorded none). A series match
+would not work there: the nightly index serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
 `+rocm10.3` build. The staging host's `+rocm10.2.0rcN` torch is not used: it
 requires `rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that
 staging does not serve. The row has been installed and imported (`import
-vllm._C`) against a 10.2 SDK, but not yet served on a GPU, and the 10.2 vLLM
+vllm._C`) against a 10.2 SDK. A GPU serve has been run on WSL2 only with the
+runtime linked to its own `librocdxg.so`, never against a release SDK, and the 10.2 vLLM
 wheel is published for `linux_x86_64` only. The nightly channel resolves to
 ROCm 10.3, which has no vLLM build and no row.
 
