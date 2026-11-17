@@ -666,10 +666,10 @@ fn assess(
     // above is: a `cpu_only` recipe never allocates from the accelerator pool,
     // so what that pool is shared with says nothing about whether it will run.
     // Without the gate a `cpu_only` recipe on an APU is softened to `Degraded`
-    // and handed "close what else is using memory before serving" -- a
-    // remediation for a device the model does not touch, on evidence no earlier
-    // branch put in the report (a recipe with no GPU minimum takes the
-    // `(None, _)` arm and reaches here `Ready` with no GPU figure at all).
+    // and handed the plan below -- a remediation for a device the model does
+    // not touch, on evidence no earlier branch put in the report (a recipe with
+    // no GPU minimum takes the `(None, _)` arm and reaches here `Ready` with no
+    // GPU figure at all).
     if host.accelerator_memory.is_shared_pool()
         && requires_gpu(recipe)
         && matches!(
@@ -686,11 +686,31 @@ fn assess(
                 .to_owned(),
         );
         if was_ready {
+            // Deliberately no `verify`. This `Degraded` is not occupancy a user
+            // can clear: it is forced by the branch above whenever the pool is
+            // shared and the recipe needs the GPU, because only the aperture
+            // was measured and nothing here reads free memory. A
+            // `rocm diagnose --model …` verify line would therefore reprint
+            // this same verdict however much the user freed, which reads as a
+            // check that was not satisfied rather than one that cannot be --
+            // and the renderer omits an empty `verify` entirely, so nothing is
+            // promised that cannot be delivered. The note says the limit out
+            // loud instead of leaving the reader to discover it by re-running.
+            //
+            // What IS left is a real next step: the load itself. `rocm serve`
+            // is the only thing on this host that resolves the question, and
+            // the summary says so rather than implying this check will.
             readiness.fix = Some(Fix {
-                summary: "close what else is using memory before serving; the engine, not this \
-                          check, has the last word on whether it loads"
+                summary: "nothing here is broken: serve it and let the engine answer, having \
+                          closed what else is using memory"
                     .to_owned(),
-                verify: format!("rocm diagnose --model {model_ref}"),
+                commands: vec![format!("rocm serve {model_ref}")],
+                notes: vec![
+                    "this check compared the model against the pool's ceiling and cannot read \
+                     how much of the pool is free, so asking it again reports the same thing \
+                     however much you close; the load is what settles it"
+                        .to_owned(),
+                ],
                 ..Fix::default()
             });
         }
@@ -1739,12 +1759,103 @@ mod tests {
         );
     }
 
+    /// The shared-pool plan offers no check that can never pass.
+    ///
+    /// This `Degraded` is forced by the host, not by anything the user is
+    /// doing: the branch fires whenever the pool is shared and the recipe needs
+    /// the GPU, because only the aperture is measured and free memory never is.
+    /// A `verify` of `rocm diagnose --model …` -- which is what this plan
+    /// carried -- therefore reprints the identical verdict however much the
+    /// user closes, so the reader is sent round a loop with no exit and is left
+    /// to conclude they failed to free enough.
+    ///
+    /// The first assertion is the premise, run rather than asserted from the
+    /// source: the same question asked twice of the same host gives the same
+    /// answer, so no `verify` naming this check could ever clear. The rest pins
+    /// what is offered instead -- a command that genuinely resolves it, and a
+    /// note that states the limit rather than hiding it behind a re-run.
+    #[test]
+    fn the_shared_pool_plan_names_no_check_that_can_never_clear() {
+        let registry = builtin_model_recipe_registry();
+        let catalog = ModelCatalogSource::Available(&registry);
+        let apu = HostFacts {
+            accelerator_memory: AcceleratorMemory::Unified {
+                gtt_total_gib: 60.0,
+                vram_carveout_gib: Some(0.5),
+            },
+            // Above every recipe's recommendation, so the system-RAM softening
+            // is not what produces the verdict or the plan below.
+            system_ram_gib: Some(4096.0),
+        };
+        let ask = || assess_model_readiness(SMALL_MODEL_REF, &catalog, &apu, &engine_choice);
+
+        let first = ask();
+        assert_eq!(
+            first.verdict,
+            ModelVerdict::Degraded,
+            "{:?}",
+            first.evidence
+        );
+        // The premise. Nothing in this host's facts carries occupancy, so the
+        // second answer cannot differ -- which is precisely why a `verify` that
+        // re-asks it is a dead end.
+        assert_eq!(
+            ask().verdict,
+            first.verdict,
+            "premise failed: re-asking changed the verdict, so a verify line naming this check \
+             would not be a dead end after all and this test is guarding nothing"
+        );
+
+        let fix = first.fix.as_ref().expect("a plan for a softened verdict");
+        assert!(
+            fix.verify.is_empty(),
+            "the plan offers a check to run after it; the only verdict this host can give is the \
+             one above, so whatever it names will reproduce it forever: {:?}",
+            fix.verify
+        );
+        assert!(
+            !fix.verify.contains("diagnose") && !fix.summary.contains("rocm diagnose"),
+            "the dead-end check came back by another route: {fix:?}"
+        );
+        assert!(
+            fix.commands
+                .iter()
+                .any(|command| command.starts_with("rocm serve")),
+            "with no check to offer, the plan has to name the one thing that does settle it: \
+             {:?}",
+            fix.commands
+        );
+        assert!(
+            fix.notes
+                .iter()
+                .any(|note| note.contains("cannot read how much of the pool is free")),
+            "the reader is owed the reason this cannot be checked again, or they will read the \
+             missing verify line as an oversight: {:?}",
+            fix.notes
+        );
+
+        // Non-vacuity: a dedicated card of the same size is `Ready` and gets no
+        // plan at all, so the assertions above are about the shared pool rather
+        // than about every plan this function builds.
+        let dedicated = assess_model_readiness(
+            SMALL_MODEL_REF,
+            &catalog,
+            &HostFacts {
+                accelerator_memory: AcceleratorMemory::Dedicated(60.0),
+                system_ram_gib: Some(4096.0),
+            },
+            &engine_choice,
+        );
+        assert_eq!(dedicated.verdict, ModelVerdict::Ready);
+        assert!(dedicated.fix.is_none(), "{:?}", dedicated.fix);
+    }
+
     /// A `cpu_only` recipe is not softened for a pool it never allocates from.
     ///
     /// The shared-pool check is the last thing `assess` does, and it used to
     /// fire on the host alone: any `Ready`/`Degraded` verdict on an APU was
     /// downgraded, told "this host's integrated GPU has no dedicated VRAM" and
-    /// handed "close what else is using memory before serving". For a
+    /// handed a plan about freeing memory and serving. For a
     /// `cpu_only` recipe that is a remediation for a device the model does not
     /// touch -- and one attached to evidence no earlier branch put in the
     /// report, since a recipe with no GPU minimum takes the `(None, _)` arm and
