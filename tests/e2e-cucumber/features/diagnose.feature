@@ -1123,7 +1123,7 @@ Feature: Diagnosing failures and listing fixes
   # withholds every row first, and the answer is "GPU memory unmeasured" before
   # the aperture is ever consulted -- so the scenario plants a stub `amd-smi`
   # reporting the one compute device, alongside the two cards in sysfs. The
-  # premise it rests on is diagnose-68: the same APU with the same readable
+  # premise it rests on is diagnose-71: the same APU with the same readable
   # 60 GiB aperture, alone, does get a figure.
   @id:diagnose-model-two-amd-cards-leave-the-pool-unattributable @requires-os:linux
   Scenario: diagnose-74 - An integrated GPU beside a second AMD card is credited with neither pool
