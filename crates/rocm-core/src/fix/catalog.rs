@@ -732,7 +732,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-wsl-5-distro-too-old",
         title: "Move to a distro release the WSL path supports",
-        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked against, so the engine cannot start there at all. This is a hard floor, not a recommendation.",
+        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor the pinned Lemonade embeddable is linked against (newer Lemonade releases need more), so the engine cannot start there at all. This is a hard floor, not a recommendation.",
         commands: &[
             "# From Windows, install a supported distro alongside the current one:",
             "#   wsl --install -d Ubuntu-24.04",
