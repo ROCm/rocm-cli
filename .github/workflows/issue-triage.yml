@@ -1,0 +1,65 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# First-pass triage of a newly opened issue: labels (type, area, platform,
+# priority, needs-info) and a round-robin maintainer assignee. The model call
+# goes to GitHub Models with the job's own GITHUB_TOKEN, so no secret is
+# involved. The issue text is untrusted: the model's reply is checked against
+# fixed enums and this job's token can only write issues. See
+# scripts/triage_issue.py and docs/issue-triage.md.
+
+name: Issue triage
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to triage (re-runs are idempotent)
+        required: true
+        type: number
+      dry_run:
+        description: Print the plan without changing the issue
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: Triage issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      models: read
+    steps:
+      # The default branch only: an `issues` event never runs a branch's copy of
+      # this workflow, and no issue-controlled value is used as a ref.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/triage_issue.py
+            .github/triage-maintainers.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Only the issue number reaches the script from the event; it fetches
+          # the title and body itself, so no issue text is ever interpolated
+          # into a shell command line.
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --issue "$ISSUE_NUMBER")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 scripts/triage_issue.py "${args[@]}"
