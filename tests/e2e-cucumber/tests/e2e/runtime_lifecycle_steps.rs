@@ -128,6 +128,114 @@ fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String
     .expect("failed to serialize runtime manifest")
 }
 
+/// A nightly ROCm 10 wheel runtime installed for one exact GPU. Its family is the
+/// family-wide `gfx120X-all` while its exact target is `gfx1201`, so a listing
+/// that guessed the target from the family would show a different value.
+pub(crate) const NIGHTLY_EXACT_TARGET_KEY: &str = "nightly-wheel-gfx1201-10-1-0a20260822";
+/// The package index the nightly runtime records. `.invalid` never resolves;
+/// nothing here is fetched, the value is only read back.
+pub(crate) const NIGHTLY_SOURCE: &str = "https://example.invalid/whl-multi-arch";
+/// The artifact URL the nightly runtime records beside its index. Deliberately
+/// different from [`NIGHTLY_SOURCE`], so a listing that showed the artifact URL
+/// instead of the package index would be caught. (`rocm install sdk` writes the
+/// index into both; an imported manifest can carry two different values.)
+const NIGHTLY_ARTIFACT_URL: &str = "https://example.invalid/artifacts/rocm-10.1.0a20260822";
+/// The source layout generation a ROCm 10 nightly is published under.
+pub(crate) const NIGHTLY_SOURCE_LAYOUT: &str = "next-v1";
+/// The exact GPU target the nightly runtime's packages were installed for.
+pub(crate) const NIGHTLY_DEVICE_TARGET: &str = "gfx1201";
+
+/// Write a read-only nightly `wheel` runtime manifest recording every provenance
+/// fact the way `rocm install sdk` records it: channel, package index, source
+/// layout generation, and the exact GPU target in its wheel composition. Its
+/// version embeds a build date. Read-only and with no Python, it lists as
+/// unusable — which does not matter to what these scenarios read from it.
+pub(crate) fn plant_nightly_exact_target_runtime(world: &E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let install_root = root.path().join("runtime-nightly-gfx1201");
+    std::fs::create_dir_all(&install_root).expect("failed to create install root");
+    let registry = registry_dir(world);
+    std::fs::create_dir_all(&registry).expect("failed to create registry dir");
+    let manifest = serde_json::json!({
+        "runtime_key": NIGHTLY_EXACT_TARGET_KEY,
+        "runtime_id": "therock-nightly:gfx120X-all",
+        "channel": "nightly",
+        "format": "wheel",
+        "family": "gfx120X-all",
+        "family_source": "detected",
+        "version": "10.1.0a20260822",
+        "install_root": install_root,
+        "selected_artifact_url": NIGHTLY_ARTIFACT_URL,
+        "source_layout_generation": NIGHTLY_SOURCE_LAYOUT,
+        "index_url": NIGHTLY_SOURCE,
+        "wheel_composition": {
+            "source_layout_generation": NIGHTLY_SOURCE_LAYOUT,
+            "package_specs": [format!("rocm[libraries,device-{NIGHTLY_DEVICE_TARGET}]==10.1.0a20260822")],
+            "rocm_sdk_target": NIGHTLY_DEVICE_TARGET,
+        },
+        "read_only": true,
+        "devel": false,
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    });
+    std::fs::write(
+        registry.join(format!("{NIGHTLY_EXACT_TARGET_KEY}.json")),
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write runtime manifest");
+}
+
+/// Key of the planted adopted runtime, in the shape `rocm runtimes adopt`
+/// derives when no key is given: `adopted-{channel}-pip-{family}-{version}`.
+const ADOPTED_KEY: &str = "adopted-release-pip-gfx1100-7-13-0";
+/// Version matching [`ADOPTED_KEY`].
+const ADOPTED_VERSION: &str = "7.13.0";
+
+/// Write a runtime manifest carrying the fields the listing reads, as adoption
+/// writes them for an environment ROCm CLI did not install: read-only,
+/// `imported_from` its own folder, no package index or source layout, and the
+/// adoption marker where an artifact URL would be. It is not everything
+/// `rocm runtimes adopt` writes (there is no SDK probe or Python), and it is
+/// planted rather than adopted because adopting needs a real ROCm SDK
+/// environment to probe.
+fn plant_adopted_runtime(world: &E2eWorld) {
+    let install_root = plant_runtime(world, ADOPTED_KEY, "gfx1100");
+    let manifest_path = registry_dir(world).join(format!("{ADOPTED_KEY}.json"));
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("failed to read planted manifest"),
+    )
+    .expect("planted manifest is not JSON");
+    let fields = manifest
+        .as_object_mut()
+        .expect("planted manifest is not an object");
+    fields.insert("version".into(), ADOPTED_VERSION.into());
+    fields.insert("format".into(), "wheel".into());
+    fields.insert("family_source".into(), "runtime_id".into());
+    fields.insert("imported_from".into(), serde_json::json!(install_root));
+    // The literal adoption has always written here, NOT the CLI's constant:
+    // runtimes adopted by earlier releases hold exactly this on disk, so the
+    // listing must keep recognising it. If the CLI changes the marker without
+    // a migration, this scenario goes red, as does the unit test
+    // `adoption_marker_keeps_its_persisted_value` in runtime_registry.rs,
+    // which pins the same literal against the constant.
+    fields.insert("selected_artifact_url".into(), "adopted-read-only".into());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write runtime manifest");
+}
+
+/// The `provenance:` line the listing prints under `runtime_key`'s row: the
+/// first one after the row that names the key.
+fn listed_provenance<'a>(out: &'a str, runtime_key: &str) -> &'a str {
+    let row = format!(" {runtime_key} runtime_id=");
+    out.lines()
+        .skip_while(|line| !line.contains(&row))
+        .skip(1)
+        .find_map(|line| line.trim().strip_prefix("provenance: "))
+        .unwrap_or_else(|| panic!("no provenance line listed for {runtime_key}:\n{out}"))
+}
+
 /// Plant a managed-service record the CLI reads as a LIVE local server that was
 /// launched against `recorded_runtime_key`, so activation has something real to
 /// report on. Uses the shared record schema (`write_service_record_with`) rather
@@ -445,6 +553,26 @@ async fn one_readonly_runtime(world: &mut E2eWorld) {
     let install_root = plant_runtime(world, FIRST_KEY, "gfx942");
     // Stash the install_root path so the uninstall scenario can assert it survives.
     world.model_name = Some(install_root.to_string_lossy().into_owned());
+}
+
+#[given("a registered nightly runtime installed for one exact GPU")]
+async fn registered_nightly_exact_target_runtime(world: &mut E2eWorld) {
+    plant_nightly_exact_target_runtime(world);
+}
+
+/// The planted tarball manifest records its archive URL and nothing about a
+/// source layout or an exact GPU target, as manifests written before those
+/// fields did. Its family is the exact `gfx942`, so a target guessed from the
+/// family would be indistinguishable from a recorded one — which is the guess
+/// the listing must not make.
+#[given("a registered runtime installed before its source layout and GPU target were recorded")]
+async fn registered_runtime_without_recorded_provenance(world: &mut E2eWorld) {
+    plant_runtime(world, FIRST_KEY, "gfx942");
+}
+
+#[given("a registered runtime adopted from an environment ROCm CLI did not install")]
+async fn registered_adopted_runtime(world: &mut E2eWorld) {
+    plant_adopted_runtime(world);
 }
 
 #[given("a runtime manifest to import")]
@@ -1410,5 +1538,61 @@ async fn server_record_still_names_first_runtime(world: &mut E2eWorld) {
         Some("starting"),
         "the restart was refused before the stop, so the record must still be \
          the live one it was:\n{record}"
+    );
+}
+
+#[then(
+    "the nightly runtime's listing names its channel, package source, source layout and exact GPU target"
+)]
+async fn nightly_listing_names_provenance(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert_eq!(
+        listed_provenance(&out, NIGHTLY_EXACT_TARGET_KEY),
+        format!(
+            "channel=nightly source={NIGHTLY_SOURCE} \
+             source_layout_generation={NIGHTLY_SOURCE_LAYOUT} \
+             device_target={NIGHTLY_DEVICE_TARGET}"
+        ),
+        "the listing must name where the nightly runtime came from:\n{out}"
+    );
+}
+
+#[then("its version shows its build date")]
+async fn nightly_version_shows_build_date(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let row = out
+        .lines()
+        .find(|line| line.contains(&format!(" {NIGHTLY_EXACT_TARGET_KEY} runtime_id=")))
+        .unwrap_or_else(|| panic!("no row listed for the nightly runtime:\n{out}"));
+    assert!(
+        row.contains(" version=10.1.0a20260822 (build 2026-08-22) "),
+        "the nightly runtime's version must show its build date:\n{row}"
+    );
+}
+
+#[then(
+    "the older runtime's listing says which of those facts were not recorded instead of guessing"
+)]
+async fn older_listing_says_unrecorded(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert_eq!(
+        listed_provenance(&out, FIRST_KEY),
+        format!(
+            "channel=release source=https://example.invalid/{FIRST_KEY}.tar.gz \
+             source_layout_generation=unrecorded device_target=unrecorded"
+        ),
+        "an unrecorded fact must say so, not be inferred from the family:\n{out}"
+    );
+}
+
+#[then("the adopted runtime's listing says it has no recorded package source")]
+async fn adopted_listing_says_source_unrecorded(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert_eq!(
+        listed_provenance(&out, ADOPTED_KEY),
+        "channel=release source=unrecorded \
+         source_layout_generation=unrecorded device_target=unrecorded",
+        "adoption installed nothing, so the listing must not present the \
+         adoption marker as a package source:\n{out}"
     );
 }
