@@ -15,8 +15,9 @@ ROCm CLI ships as a single prebuilt binary. Platform support:
 
 For WSL2 setup and diagnosis, see [ROCm CLI on WSL2](wsl.md).
 
-Live dashboard GPU/CPU/memory telemetry works on Windows too; the
-serving-instance registry view is Linux/WSL2 only, since there's no
+Live dashboard GPU/CPU/memory telemetry and the managed servers
+`rocm services list` reports work on Windows too; per-server throughput and
+Docker-discovered instances are Linux/WSL2 only, since there's no
 `rocmdashd` unix socket on Windows (see
 [Interactive interfaces](../getting-started.md#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see

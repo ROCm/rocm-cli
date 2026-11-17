@@ -24,7 +24,9 @@ mod sidecars;
 #[cfg(test)]
 mod test_support;
 
-pub use descriptor::artifact_name_for_platform_slug;
+pub use descriptor::{
+    ADVISORY_QUEUE_MARKER, artifact_name_for_platform_slug, queue_artifact_name, queue_lane_gpu,
+};
 use descriptor::{Descriptor, full_platform_label, parse_descriptor, with_paren_suffix};
 use sidecars::{
     CommandRecord, ManifestExpectation, PlatformManifest, PlatformVersions, parse_commands,

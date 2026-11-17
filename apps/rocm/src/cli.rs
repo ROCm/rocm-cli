@@ -106,7 +106,8 @@ pub(crate) enum Command {
         #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
         /// Read the error text from a file instead, or from standard input
-        /// when PATH is `-`, so no shell quoting is needed.
+        /// when PATH is `-`, so no shell quoting is needed. A file named `-`
+        /// is passed as `./-`.
         ///
         /// The text that arrives is matched as `--symptom` would match it,
         /// with one trailing line break removed (shells and editors add one).
@@ -559,6 +560,9 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
         /// Skip the post-startup inference smoke test (time-to-first-token, tokens/sec).
+        ///
+        /// When the smoke test runs and cannot complete, the summary says so
+        /// and does not report the service as ready; ROCm CLI does not stop the server.
         #[arg(long)]
         no_smoke_test: bool,
         /// Allow binding to a non-local address.
@@ -1235,9 +1239,9 @@ pub(crate) enum ServicesCommand {
     ///
     /// Only works on a record that is not running: stop the server first (on
     /// Windows a process `rocm` cannot query counts as running). The record's
-    /// details file, log, engine state file, and endpoint key file are all
-    /// deleted, so its log can no longer be read and it can no longer be
-    /// restarted.
+    /// details file, log, engine state file, and endpoint key file (with any
+    /// copy of the key an interrupted save left beside it) are all deleted, so
+    /// its log can no longer be read and it can no longer be restarted.
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -1248,9 +1252,9 @@ pub(crate) enum ServicesCommand {
         ///
         /// Only when a stop was requested, no recorded process is confirmed
         /// running, and at least one could not be queried (on Windows, a live
-        /// process the account may not open). Deletes the record, log, engine
-        /// state and endpoint key, and says which process; if it is still
-        /// running it keeps running. Refused for a process confirmed running.
+        /// process the account may not open). Deletes the same files as a
+        /// plain `remove`, and says which process; if it is still running it
+        /// keeps running. Refused for a process confirmed running.
         #[arg(long)]
         force: bool,
     },

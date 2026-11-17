@@ -179,6 +179,15 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Serializes `value` to `path` as pretty JSON, creating the parent directory
+/// if needed. The low-level primitive [`write_running_state`],
+/// [`merge_state_field`] and [`write_terminal_state`] all go through — it is
+/// not the only way this module's state files are written:
+/// inference-verification latches go through
+/// `rocm_core::merge_json_state_file` instead (see [`inference_verified`]),
+/// which patches the file under the state directory's lock rather than
+/// routing through here. This function takes no such lock and writes in
+/// place, so the lock does not order it against those latches.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

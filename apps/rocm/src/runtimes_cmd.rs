@@ -22,11 +22,18 @@
 //! `RuntimeActivationResult` stays
 //! `pub(crate)`: it is read by `append_update_activate_summary` in
 //! `update_cmd.rs`'s `apply_runtime_update` flow. The uninstall plan and apply
-//! code lives in `runtime_uninstall.rs`, and the active-runtime marker model in
-//! `runtime_registry.rs`; `uninstall_runtime`,
-//! `should_remove_runtime_install_root`, `InstallRootDecision`,
-//! `ActiveRuntimeMarker` and `active_runtime_marker_path` are re-exported from
-//! here for `storage.rs` and `main.rs`.
+//! code lives in `runtime_uninstall.rs`, and the active-runtime marker model and
+//! `write_active_runtime_marker` in `runtime_registry.rs`; activation and
+//! rollback here write the marker through it, as uninstall does when it drops a
+//! rollback target. A failed activation's restore and three removals touch the
+//! marker without it. The restore puts the earlier bytes back with
+//! `rocm_core::atomic_write::write_file_atomically`, or removes the marker when
+//! there was none before. Uninstalling the runtime in use removes it, and
+//! `rocm config set-default-runtime` and `rocm config clear-default-runtime`
+//! remove it and ignore a failed removal.
+//! `uninstall_runtime`, `should_remove_runtime_install_root`,
+//! `InstallRootDecision`, `ActiveRuntimeMarker` and `active_runtime_marker_path`
+//! are re-exported from here for `storage.rs` and `main.rs`.
 //! `recover_setup_runtime_registration`, `newest_installed_runtime_manifest`
 //! and `setup_runtime_paths` (from `runtime_adopt.rs`) and
 //! `normalize_path_for_compare` (from `runtime_registry.rs`) are re-exported
@@ -52,13 +59,13 @@ use crate::runtime_adopt::{
 pub(crate) use crate::runtime_adopt::{
     newest_installed_runtime_manifest, recover_setup_runtime_registration, setup_runtime_paths,
 };
-use crate::runtime_registry::unusable_status_text;
 pub(crate) use crate::runtime_registry::{
     ActiveRuntimeMarker, active_runtime_marker_path, current_runtime_manifest,
     default_runtime_id_matches, normalize_path_for_compare, runtime_keys_text,
     runtime_manifest_path, runtime_registry_dir, runtime_usability_status, select_runtime_manifest,
     validate_runtime_manifest_for_activation,
 };
+use crate::runtime_registry::{unusable_status_text, write_active_runtime_marker};
 pub(crate) use crate::runtime_uninstall::{
     InstallRootDecision, lemonade_record_report_line, should_remove_runtime_install_root,
     uninstall_runtime,
@@ -1172,43 +1179,6 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
     } else {
         "excluded"
     }
-}
-
-/// Replace the active-runtime marker in one step.
-///
-/// Two `rocm` processes can activate a runtime against the same data
-/// directory at once (two terminals, a script), so the write goes through the
-/// shared atomic writer: each writer stages into its own exclusively created
-/// temp file, and the marker is replaced rather than removed first, so a
-/// reader always finds a complete marker: on Windows the publish renames first,
-/// which replaces in one step. Only when that rename fails, because another
-/// process holds the marker open without delete sharing, does it fall back to
-/// `ReplaceFileW`, and a `ReplaceFileW` that fails part-way can leave the marker
-/// missing, which the writer repairs with a plain rename when that succeeds
-/// (see `rocm_core::atomic_write`); two replacements in flight at once through
-/// the fallback are not tested. It does not order the two activations: the last
-/// one to publish wins, as before.
-fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
-    let path = active_runtime_marker_path(paths);
-    // The shared helper rather than a local temp-file-and-rename: it is the same
-    // write the failed-activation restore uses, and it is strictly stronger than
-    // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
-    // sharing violation when another process holds the marker open. The helper
-    // renames first there and falls back to `ReplaceFileW` when that fails. The
-    // destination is never removed first, on any platform — that would leave a
-    // window with no marker at all, which runtime resolution and the storage
-    // retention holds both read as "nothing is active" — and a failed publish
-    // takes its temp file with it, so a retried activation cannot strand one in
-    // the folder `rocm runtimes` reads. The one exception is a Windows publish
-    // that took the old marker away and could not put the new one in place:
-    // the temp file is then the only copy, so it is kept and the error names
-    // it; a failed activation removes it again once the restore has put the
-    // previous marker back (`discard_failed_marker_replacement`). It also
-    // creates the `runtimes` folder when it is missing.
-    let bytes =
-        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
-    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
-        .with_context(|| format!("failed to write active runtime marker {}", path.display()))
 }
 
 #[cfg(test)]

@@ -263,13 +263,59 @@ Feature: Runtime lifecycle state machine
     And the switch to the second runtime was kept
     And the server record still names the first runtime
 
+  # ROCm 10 is published in its own layout, beside the canonical one the CLI
+  # installed from before. A runtime installed from it records that layout, and
+  # its key carries a fingerprint of the exact packages it was built from; a
+  # runtime installed before that layout existed has no top-level
+  # `source_layout_generation` or `devel` field: it records its layout and
+  # toolchain only inside `wheel_composition`. Both kinds stay installed side by
+  # side, so the CLI has to keep reading the older record as it was written while
+  # it lists, switches between and removes the newer ones. These scenarios plant
+  # three managed runtimes as an install would leave them — a registry entry, the
+  # same record inside the runtime's own folder, and stub files where the
+  # readiness check looks — without downloading anything. Every command runs
+  # with the startup update check disabled, since it would otherwise ask the
+  # package index about the planted runtimes. The Windows release lane in CI
+  # selects them by id, so they run on both supported platforms.
+  @id:runtime-lifecycle-side-by-side-across-packaging-change
+  Scenario: runtime-lifecycle-19 - Runtimes installed before and after the ROCm 10 layout are used side by side
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    When the user lists the installed runtimes
+    Then all three runtimes are listed as ready, each under its own key
+    When the user activates each of the three runtimes in turn
+    Then each one becomes the runtime in use in turn
+    And none of the three runtimes' install records was rewritten
+
+  @id:runtime-lifecycle-side-by-side-uninstall-keeps-the-others
+  Scenario: runtime-lifecycle-20 - Uninstalling one side-by-side runtime leaves the others usable
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    And the nightly runtime is in use after the ROCm 10 release runtime
+    When the user uninstalls the ROCm 10 release runtime
+    Then that runtime's folder and record are gone
+    And the other two runtimes keep their folders and unchanged records
+    And the nightly runtime is still in use, with no rollback target left
+    When the user uninstalls the runtime in use
+    Then no runtime is in use
+    When the user activates the ROCm 7 runtime
+    Then the ROCm 7 runtime is the runtime in use
+
+  # The ROCm 7 and ROCm 10 release runtimes share a name: the runtime id is
+  # derived from the channel and GPU family alone. Picking either silently could
+  # put the user on the wrong ROCm major version.
+  @id:runtime-lifecycle-side-by-side-shared-name-refused
+  Scenario: runtime-lifecycle-21 - A name shared by side-by-side runtimes is refused with each runtime named
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    When the user activates a runtime by the name the two release runtimes share
+    Then the CLI refuses and names both release runtimes
+    And no runtime is in use
+
   # A script reads the runtime list without scraping the table. stdout must hold
   # one JSON document and nothing else; diagnostics belong on stderr. The active
   # and rollback flags are the facts the text marks with `*` and `-`, so the
   # scenario also lists the same state as text and checks that both forms mark
   # the same runtimes.
   @id:runtime-lifecycle-list-json-marks-active-and-rollback
-  Scenario: runtime-lifecycle-19 - A script reads the runtime list as JSON
+  Scenario: runtime-lifecycle-22 - A script reads the runtime list as JSON
     Given two registered runtimes with the second active after the first
     When the user lists the registered runtimes as JSON
     Then the output is a single JSON document and nothing else
@@ -281,7 +327,7 @@ Feature: Runtime lifecycle state machine
   # and a next-step hint; the JSON form has to stay a parseable document with
   # nulls instead, not fall back to that text.
   @id:runtime-lifecycle-list-json-empty-registry
-  Scenario: runtime-lifecycle-20 - Listing runtimes as JSON with none registered
+  Scenario: runtime-lifecycle-23 - Listing runtimes as JSON with none registered
     Given no ROCm runtime is registered
     When the user lists the registered runtimes as JSON
     Then the output is a single JSON document and nothing else
@@ -291,7 +337,7 @@ Feature: Runtime lifecycle state machine
   # activation would refuse it. A script has to see that from the document
   # alone, without trying the activation.
   @id:runtime-lifecycle-list-json-reports-unusable-runtime
-  Scenario: runtime-lifecycle-21 - The JSON runtime list reports a runtime whose folder is gone as unusable
+  Scenario: runtime-lifecycle-24 - The JSON runtime list reports a runtime whose folder is gone as unusable
     Given two registered runtimes with the second active after the first
     And the first runtime's folder has been deleted
     When the user lists the registered runtimes as JSON
@@ -302,7 +348,7 @@ Feature: Runtime lifecycle state machine
   # The active runtime's registry entry was removed by hand while the config
   # still names it. The document has to say so, not just mark nothing active.
   @id:runtime-lifecycle-list-json-reports-missing-active-manifest
-  Scenario: runtime-lifecycle-22 - The JSON runtime list says when the active runtime's registry entry is gone
+  Scenario: runtime-lifecycle-25 - The JSON runtime list says when the active runtime's registry entry is gone
     Given two registered runtimes with the second active after the first
     And the second runtime's registry entry has been deleted
     When the user lists the registered runtimes as JSON
@@ -315,7 +361,7 @@ Feature: Runtime lifecycle state machine
   # alone. An id that differs from a runtime's only in letter case still names
   # that runtime, and the list must not also report its registry entry missing.
   @id:runtime-lifecycle-list-default-id-in-other-letter-case
-  Scenario: runtime-lifecycle-23 - A default runtime set in other letter case is listed as active with no problem
+  Scenario: runtime-lifecycle-26 - A default runtime set in other letter case is listed as active with no problem
     Given two registered runtimes and none active
     When the user sets the default runtime to the first runtime's id in other letter case
     And the user lists the registered runtimes as JSON
@@ -330,7 +376,7 @@ Feature: Runtime lifecycle state machine
   # report that same runtime. The default runtime still names the second
   # runtime, so a list that fell back to it would mark the wrong one.
   @id:runtime-lifecycle-list-active-key-in-other-letter-case
-  Scenario: runtime-lifecycle-24 - An active runtime named in other letter case is listed as the one examine reports
+  Scenario: runtime-lifecycle-27 - An active runtime named in other letter case is listed as the one examine reports
     Given two registered runtimes with the second active after the first
     And the configuration names the first runtime as active in other letter case
     When the user lists the registered runtimes as JSON
@@ -344,7 +390,7 @@ Feature: Runtime lifecycle state machine
   # marks that runtime active, as `rocm examine` reports it, and still says the
   # configured active runtime is missing, in both forms.
   @id:runtime-lifecycle-list-dead-active-key-falls-back-to-default
-  Scenario: runtime-lifecycle-25 - A missing active runtime is reported while the default runtime the commands use is listed active
+  Scenario: runtime-lifecycle-28 - A missing active runtime is reported while the default runtime the commands use is listed active
     Given two registered runtimes with the second active after the first
     And the configuration names an unregistered runtime as active
     When the user lists the registered runtimes as JSON

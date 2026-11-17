@@ -1,0 +1,88 @@
+name: vLLM route check
+
+# Advisory, and deliberately NOT a required check. Resolves the SDK an unpinned
+# `rocm install sdk` picks on the release and the nightly channel, and warns
+# when the vLLM engine has no install route for it (see
+# scripts/vllm_route_check.py). It reads the live indexes, so it can warn on a
+# PR that changed nothing: an index moved on to an SDK vLLM has no wheels for.
+# Required, that would block unrelated merges, so a missing route only reports.
+#
+# Runs on a PR only when it touches what decides the answer: the resolver that
+# picks the default SDK (therock.rs and therock/), the engine's two build
+# tables, or this check. CPU only: a dry run, no install.
+#
+# A finding is reported as a warning plus a job summary and the job stays green
+# (the step swallows exit code 1), so a known gap does not leave a permanent red
+# X on every PR touching these paths. The build, the self-test and a check that
+# cannot run (exit 2) still fail it.
+
+on:
+  pull_request:
+    paths:
+      - apps/rocm/src/therock.rs
+      - apps/rocm/src/therock/**
+      - engines/vllm/src/wheel_builds.rs
+      - engines/vllm/src/discover_builds.rs
+      - scripts/vllm_route_check.py
+      - .github/workflows/vllm-route-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  AWS_LC_SYS_USE_SYSTEM: "0"
+
+jobs:
+  vllm-route:
+    name: vLLM route for the default SDKs (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache-key: ubuntu-24.04
+
+      - name: Build rocm
+        run: cargo build --release -p rocm
+
+      - name: Self-test
+        run: python3 scripts/vllm_route_check.py --self-test
+
+      - name: Check the vLLM route of the default SDKs
+        id: route
+        # Exit 1 = a default SDK has no route: reported below, job stays green.
+        # Any other non-zero exit (2 = the check itself could not run, for
+        # example the build tables no longer parse, or `rocm install sdk
+        # --dry-run` timed out, failed or printed no plan) fails the job.
+        run: |
+          rc=0
+          python3 scripts/vllm_route_check.py --rocm target/release/rocm \
+            > "$RUNNER_TEMP/route.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/route.txt"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+
+      - name: Report a missing route
+        if: steps.route.outputs.rc == '1'
+        run: |
+          echo "::warning title=vLLM route::A default SDK has no vLLM install route. See the job summary."
+          {
+            echo "### vLLM route check: no route for a default SDK"
+            echo
+            echo "Advisory: add the discovery row once the wheels are published."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/route.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
