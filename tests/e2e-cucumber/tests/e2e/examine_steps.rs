@@ -3855,6 +3855,68 @@ async fn unsupported_gpu_with_software_renderer(world: &mut E2eWorld) {
     );
 }
 
+/// The `render`-group shape: a real GPU driver manifest the loader would find,
+/// and a `vulkaninfo` that enumerates only the CPU rasteriser because this user
+/// cannot open the device node.
+///
+/// Deliberately the *same* enumeration as the step above, with only the
+/// manifest changed. The two scenarios are a discrimination rather than two
+/// assertions: the device evidence alone cannot tell the hosts apart, so an
+/// implementation that reads it before the ICD evidence reports both as a
+/// confirmed absence and fails exactly one of the pair.
+#[given(
+    "a machine whose GPU has no official support and a Vulkan driver masked by a software renderer"
+)]
+async fn unsupported_gpu_with_masked_vulkan_driver(world: &mut E2eWorld) {
+    plant_unsupported_gpu(
+        world,
+        Some("radeon_icd.x86_64.json"),
+        Some(LAVAPIPE_VULKANINFO_SUMMARY),
+    );
+}
+
+#[then("the inspection does not say a Vulkan driver is missing")]
+async fn assert_vulkan_driver_not_denied(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        !output.contains("no Vulkan GPU driver was found"),
+        "a driver this very report lists in `icds` must not be declared missing:\n{output}"
+    );
+    assert!(
+        !output.contains("install one"),
+        "nor may the host be sent to install what it already has:\n{output}"
+    );
+    assert!(
+        output.contains("vulkan: driver_present_devices_unverified"),
+        "the machine-readable status must say the driver is there and unconfirmed:\n{output}"
+    );
+}
+
+#[then("the inspection names the installed Vulkan driver it could not confirm")]
+async fn assert_masked_vulkan_driver_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let line = rocm_support_line(output).expect("no rocm_support line");
+    assert!(
+        line.contains("a Vulkan driver is installed"),
+        "the support sentence must say what was actually established: {line}\n{output}"
+    );
+    // The evidence line is where a reader can check that claim: it has to name
+    // the driver the manifest implies and the reason nothing was confirmed, or
+    // "a driver is installed" is just another unbacked promise.
+    assert!(
+        output.contains("Mesa RADV is installed"),
+        "the evidence line must name the driver the planted manifest implies:\n{output}"
+    );
+    assert!(
+        output.contains("software (CPU) Vulkan device"),
+        "and why it could not be confirmed:\n{output}"
+    );
+    assert!(
+        !output.contains("the Vulkan backend can be used"),
+        "but an unconfirmed driver is not a confirmed device:\n{output}"
+    );
+}
+
 #[then("the inspection reports the GPU as unsupported by the official stack")]
 async fn assert_gpu_unsupported_by_rocm(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");

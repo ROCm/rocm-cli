@@ -821,9 +821,9 @@ Feature: GPU detection and system inspection
   # of which the harness can plant. So these run on the ungated mock lane, which
   # is the lane that has neither.
   #
-  # Each pins one of the three answers a probe can reach where inference from the
-  # gfx table reaches only one: "no ROCm build" does not mean "Vulkan then" on a
-  # machine nobody has looked at, and the three scenarios are what keep those
+  # Each pins one of the answers a probe can reach where inference from the gfx
+  # table reaches only one: "no ROCm build" does not mean "Vulkan then" on a
+  # machine nobody has looked at, and these scenarios are what keep those
   # answers distinguishable.
   @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
   Scenario: examine-56 - A GPU the official stack rejects is told which way it can still run models
@@ -859,17 +859,17 @@ Feature: GPU detection and system inspection
     Then the inspection does not claim models can run through Vulkan
     And the inspection says the only renderer it found runs on the CPU
 
-  # The shape examine-51 does not reach. examine-51 plants a `vulkaninfo` that
+  # The shape examine-57 does not reach. examine-57 plants a `vulkaninfo` that
   # runs and reports no devices, which is the only shape that earns a confirmed
   # absence; this host has no `vulkaninfo` to ask at all, and must be told the
   # check could not be made rather than either promised Vulkan or declared to
   # have nothing.
   #
   # Known gap, measured rather than assumed: a real `vulkaninfo` on a Linux host
-  # with no reachable driver does NOT produce examine-51's shape. It prints
+  # with no reachable driver does NOT produce examine-57's shape. It prints
   # "Found no drivers!" and exits 1, which this probe classifies as
   # inconclusive — so such a host lands at *this* scenario's level rather than
-  # examine-51's. Telling "no drivers" apart from "the tool is broken" needs the
+  # examine-57's. Telling "no drivers" apart from "the tool is broken" needs the
   # loader's own message, which the shared capture discards.
   @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
   Scenario: examine-59 - A machine that cannot be checked for Vulkan is not told either way
@@ -878,3 +878,23 @@ Feature: GPU detection and system inspection
     Then the inspection reports the GPU as unsupported by the official stack
     And the inspection does not claim models can run through Vulkan
     And the inspection says it could not confirm whether a Vulkan driver is there
+
+  # examine-58 with one thing changed: the manifest beside the software renderer
+  # names a real GPU driver. That is the common `render`-group permission shape
+  # -- the driver is installed, and the user's own account cannot open the
+  # device, so the loader falls back to llvmpipe -- and it is the one case where
+  # the device evidence must NOT be allowed to deny the driver. "No Vulkan GPU
+  # driver was found - install one" would contradict the `icds` field of the
+  # same report and name an install the host has already done.
+  #
+  # The pair is the test: examine-58 and this scenario plant the same
+  # enumeration and differ only in the manifest, so an implementation that reads
+  # the devices before the manifests passes one and fails the other instead of
+  # collapsing both into a confirmed absence.
+  @id:examine-does-not-deny-an-installed-vulkan-driver-a-software-renderer-masks @requires-os:linux
+  Scenario: examine-60 - An installed GPU driver masked by a software renderer is not reported as missing
+    Given a machine whose GPU has no official support and a Vulkan driver masked by a software renderer
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection names the installed Vulkan driver it could not confirm

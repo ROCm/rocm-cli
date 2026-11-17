@@ -4451,7 +4451,7 @@ levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only,
 Vulkan-unconfirmed, no-GPU-backend, or unknown. Unknown covers both "nothing
 detected" and "a target this build's catalog does not recognize" — conflating
 the latter with "confirmed to have no ROCm build" would turn a detection gap
-into a claim about the hardware. `examine-49` holds the line against the
+into a claim about the hardware. `examine-55` holds the line against the
 `detected_gfx_target` and `compatible_therock_family` the same report prints,
 so every lane checks the level its own hardware implies:
 
@@ -4469,16 +4469,26 @@ evidentiary state rather than a different wording of one:
 | `examine-57` | A `vulkaninfo` that runs and reports nothing. | no GPU backend |
 | `examine-58` | Only a software rasteriser (lavapipe). | no GPU backend |
 | `examine-59` | No ICD, no device, and no `vulkaninfo` to ask. | Vulkan-unconfirmed |
+| `examine-60` | A GPU ICD whose `vulkaninfo` enumerates only a software rasteriser. | Vulkan-only, through `DriverPresentDevicesUnverified` |
 
 ```bash
-cargo xtask e2e -- -n '(examine-56|examine-57|examine-58|examine-59)'
+cargo xtask e2e -- -n '(examine-56|examine-57|examine-58|examine-59|examine-60)'
 ```
 
-`examine-51` and `examine-53` are the pair worth keeping straight: both end
+`examine-57` and `examine-59` are the pair worth keeping straight: both end
 with nothing found, and they differ only in whether a tool was there to look.
 That difference is the whole reason `VulkanUnconfirmed` exists, so a change
 that collapses them will pass one of these and fail the other rather than
 silently reporting a confirmed absence to a host nobody probed.
+
+`examine-58` and `examine-60` are the second such pair, and they differ only in
+which ICD manifest is planted beside the same software-only enumeration. A
+lavapipe manifest leaves nothing to contradict the devices, so that host is a
+confirmed absence; `radeon_icd.x86_64.json` is a GPU driver the report itself
+lists, so telling that host "no Vulkan GPU driver was found - install one"
+would contradict the same report's `icds` field with advice it cannot act on.
+`examine-60` is also the only scenario that reaches
+`VulkanStatus::DriverPresentDevicesUnverified` at all.
 
 ## Windows Tool Notes
 
