@@ -539,8 +539,10 @@ jobs:
   # in the merge queue the selection is forced to `--workspace`, so post-merge
   # `main` and every queued PR run the full suite — a required check is never
   # starved and the queue cannot stall. The full Windows suite
-  # (the windows-debug job) also runs the whole workspace on every change, so it
-  # backstops any crate a graph-based selection could miss (e.g. an integration
+  # (the windows-debug job) also runs the whole workspace on every Rust change
+  # (its `heavy` filter matches every `.rs` file), and so does the Linux
+  # `coverage` job for every crate but e2e-cucumber, so they
+  # backstop any crate a graph-based selection could miss (e.g. an integration
   # test that drives another crate only at runtime).
   #
   # This job is deliberately left off sccache, unlike the other compile-heavy

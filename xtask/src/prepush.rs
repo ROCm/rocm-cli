@@ -332,7 +332,8 @@ fn banner(check: Check, push: &Push, selection: &Selection, fallback: Option<&st
         ),
         // The claim about CI is backed by `.github/workflows/ci.yml`: the
         // `windows-debug` job runs `cargo test --workspace --all-targets` on every
-        // change, and the `test` job selects `--workspace` for every event but
+        // Rust change (its `heavy` filter matches every `.rs` file), and the
+        // `test` job selects `--workspace` for every event but
         // `pull_request` (the merge queue and pushes to main). The test
         // `the_banner_claim_about_ci_matches_the_workflow` fails if either stops
         // being true, so change the text and that test together.

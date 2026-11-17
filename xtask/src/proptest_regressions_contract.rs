@@ -44,8 +44,10 @@
 //! never writes a seed file, and one with a different `FileFailurePersistence`
 //! would put its seeds outside `proptest-regressions/`, where this does not
 //! look. `cfg(test)` only, like the other source-scan contracts in this
-//! crate: `cargo test -p xtask` runs it, and the merge queue (which runs the
-//! whole workspace) is where a change confined to another crate meets it.
+//! crate: `cargo test -p xtask` runs it, and a change confined to another crate
+//! meets it in the jobs that run the whole workspace's tests: `windows-debug`
+//! and, for every crate but `e2e-cucumber`, the Linux `coverage` job on every
+//! Rust change, and the merge queue.
 
 #[cfg(test)]
 mod tests {
