@@ -40,19 +40,66 @@ impl ExamineSummary {
         )
     }
 
-    /// What a [`GpuSupportLevel::VulkanUnconfirmed`] host is told to do next.
+    /// Whether this summary's own evidence already contradicts "install a
+    /// Vulkan driver".
     ///
     /// `DriverSummary::status` only ever reads `AMD_DISPLAY_DRIVER_DETECTED`
     /// on Windows — `windows_driver_summary` is the sole producer of that word
     /// — so matching on it *is* the Windows cross-check, with no second read
     /// of `os` to keep in step with it. On that platform the display driver
-    /// carries the Vulkan ICD, so its presence contradicts "install a Vulkan
-    /// driver" and only `vulkaninfo` is left to settle the question.
+    /// carries the Vulkan ICD, so its presence contradicts that advice: the
+    /// report would print `driver_status: amd_display_driver_detected` a few
+    /// lines above a sentence telling the reader to go and install what it
+    /// names.
+    ///
+    /// The cross-check is Windows-only for that reason, and not by accident:
+    /// Linux's `driver_status` reports the `amdgpu` kernel module, which says
+    /// nothing about whether a userspace ICD such as Mesa RADV is installed,
+    /// so suppressing the install advice there would withhold the one step
+    /// that can help.
+    ///
+    /// One predicate rather than a test spelled out in each arm that gives
+    /// install advice. Two arms now need it — `VulkanUnconfirmed` and
+    /// `NoGpuBackend` — and the second one shipped without it precisely
+    /// because the first one's check lived inside that first one's `match`
+    /// arm. Each arm's own test pins its half:
+    /// `examine_render_does_not_tell_a_windows_host_to_install_the_driver_it_has`
+    /// and
+    /// `examine_render_does_not_tell_a_no_backend_windows_host_to_install_the_driver_it_has`.
+    fn install_advice_is_contradicted_by_the_driver(&self) -> bool {
+        self.driver.status == super::AMD_DISPLAY_DRIVER_DETECTED
+    }
+
+    /// What a [`GpuSupportLevel::VulkanUnconfirmed`] host is told to do next.
     fn vulkan_unconfirmed_next_step(&self) -> &'static str {
-        if self.driver.status == super::AMD_DISPLAY_DRIVER_DETECTED {
+        if self.install_advice_is_contradicted_by_the_driver() {
             crate::gfx_target::VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER
         } else {
             crate::gfx_target::VULKAN_UNCONFIRMED_NEXT_STEP
+        }
+    }
+
+    /// What a [`GpuSupportLevel::NoGpuBackend`] host is told to do next.
+    ///
+    /// The unconditional branch is the whole story on a host with nothing
+    /// installed: both halves of the level are established facts, there is
+    /// nothing left to go and find out, and installing a driver is the one
+    /// thing that can clear it.
+    ///
+    /// The other branch is a Windows host that already has the driver that
+    /// sentence names. Its probe answered — `VulkanStatus::Absent` is never
+    /// reached without `vulkaninfo`'s answer behind it — so "run `vulkaninfo`"
+    /// is not left either, the way it is under `VulkanUnconfirmed`. What is
+    /// left is the display driver itself: it is installed and is exposing no
+    /// Vulkan GPU device here, which a repair or update of that driver can
+    /// change and a fresh install cannot.
+    fn no_gpu_backend_next_step(&self) -> &'static str {
+        if self.install_advice_is_contradicted_by_the_driver() {
+            "the AMD display driver is installed (see `driver_status`) but is exposing no Vulkan \
+             GPU device here, so repairing or updating it is the step that could open one"
+        } else {
+            "install one (Mesa RADV on Linux, the AMD display driver on Windows) to run models on \
+             this GPU"
         }
     }
 
@@ -152,15 +199,24 @@ impl ExamineSummary {
             // Both halves are established facts: the catalog confirmed there is
             // no ROCm build, and the probe looked for a Vulkan driver and found
             // none. Unlike `VulkanUnconfirmed` above, there is nothing left to
-            // go and find out on this host, so "install a driver" is the whole
-            // story. Only `Absent` reaches this level — `gpu_support_level`
-            // routes the probed-but-inconclusive host to `VulkanUnconfirmed`
-            // precisely so that this sentence is never said to one.
+            // go and find out on this host. Only `Absent` reaches this level —
+            // `gpu_support_level` routes the probed-but-inconclusive host to
+            // `VulkanUnconfirmed` precisely so that this sentence is never said
+            // to one.
+            //
+            // The next step is cross-checked against `driver.status` for the
+            // same reason `VulkanUnconfirmed`'s is, and through the same
+            // predicate: a Windows host whose report already says
+            // `driver_status: amd_display_driver_detected` must not be told, a
+            // few lines below, to install the driver it is showing. The
+            // confirmed absence itself is unaffected — the probe did look and
+            // did find no Vulkan GPU device — only what the host can do about
+            // it differs.
             GpuSupportLevel::NoGpuBackend => format!(
                 "  rocm_support: GPU detected ({}) but not supported by ROCm, and no Vulkan GPU \
-                 driver was found - install one (Mesa RADV on Linux, the AMD display driver on \
-                 Windows) to run models on this GPU\n",
-                detected.unwrap_or_default()
+                 driver was found - {}\n",
+                detected.unwrap_or_default(),
+                self.no_gpu_backend_next_step(),
             ),
             // The covering family is the fact; it is already printed on its own
             // line above, so this one says what it means rather than repeating
@@ -603,11 +659,25 @@ mod tests {
     /// nothing for it to fall back to.
     #[test]
     fn examine_render_does_not_promise_vulkan_on_a_host_that_has_none() {
-        let summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
+        let mut summary = gfx90c_summary_with_vulkan(Some(VulkanSupport {
             status: VulkanStatus::Absent,
             detail: Some("no Vulkan driver found".to_owned()),
             ..VulkanSupport::default()
         }));
+        // The shared fixture is a Windows host carrying
+        // `AMD_DISPLAY_DRIVER_DETECTED`, which is the one state where "install
+        // one" is the wrong advice (see
+        // `examine_render_does_not_tell_a_no_backend_windows_host_to_install_the_driver_it_has`).
+        // This test is about the host that genuinely has nothing, so it plants
+        // that host rather than asserting the install sentence on a summary
+        // whose own `driver_status` line contradicts it.
+        summary.os = "linux".to_owned();
+        summary.driver = DriverSummary {
+            policy: "amdgpu_dkms".to_owned(),
+            status: "amdgpu_module_loaded".to_owned(),
+            detail: None,
+            windows: None,
+        };
 
         let rendered = summary.render_text();
 
@@ -795,6 +865,91 @@ mod tests {
         );
         assert!(
             !linux.contains("the AMD display driver is installed"),
+            "and must not be told about a Windows driver it cannot have: {linux}"
+        );
+    }
+
+    /// The same misdirection one level down, and the one the
+    /// `VulkanUnconfirmed` cross-check above did not stop: a Windows host whose
+    /// report prints `driver_status: amd_display_driver_detected` must not be
+    /// told, a few lines higher in the same output, to install the AMD display
+    /// driver.
+    ///
+    /// `NoGpuBackend` keeps the confirmed absence — the probe did look and did
+    /// find no Vulkan GPU device, and that is not in question here — but the
+    /// *advice* has to be one the host can act on, and "install the driver you
+    /// are already showing" is not. `vulkaninfo` is not offered as the next
+    /// step either, unlike under `VulkanUnconfirmed`: reaching `Absent` takes
+    /// `vulkaninfo`'s own answer, so that question is already settled.
+    ///
+    /// Both directions are asserted, against the two hosts that differ only in
+    /// `driver_status`, so an arm that dropped the cross-check again fails here
+    /// rather than passing on the Linux half alone.
+    #[test]
+    fn examine_render_does_not_tell_a_no_backend_windows_host_to_install_the_driver_it_has() {
+        let absent = || {
+            Some(VulkanSupport {
+                status: VulkanStatus::Absent,
+                detail: Some("no Vulkan driver found".to_owned()),
+                ..VulkanSupport::default()
+            })
+        };
+        // The shared fixture is already a Windows host carrying
+        // `AMD_DISPLAY_DRIVER_DETECTED` — the exact summary this arm shipped
+        // being rendered against, and the reason the omission was invisible.
+        let windows = gfx90c_summary_with_vulkan(absent());
+        assert_eq!(
+            windows.driver.status,
+            super::super::AMD_DISPLAY_DRIVER_DETECTED,
+            "this test is only a discrimination while the fixture it reuses is the \
+             display-driver host"
+        );
+        let windows = windows.render_text();
+        let support = windows
+            .lines()
+            .find(|line| line.contains("rocm_support:"))
+            .expect("every host gets a support line");
+
+        assert!(
+            windows.contains("driver_status: amd_display_driver_detected"),
+            "the contradiction this guards against is between two lines of one report: {windows}"
+        );
+        assert!(
+            !support.contains("install one"),
+            "this host already has the driver that sentence names: {support}"
+        );
+        assert!(
+            support.contains("repairing or updating it"),
+            "and it is owed the step that can actually open a GPU path: {support}"
+        );
+        assert!(
+            support.contains("no Vulkan GPU driver was found"),
+            "the confirmed absence itself is unchanged; only the advice is: {support}"
+        );
+        assert!(
+            !support.contains("run `vulkaninfo`"),
+            "`Absent` already has `vulkaninfo`'s answer behind it, so there is nothing \
+             left to ask it: {support}"
+        );
+
+        // The Linux shape of the same status: `driver_status` there reports the
+        // `amdgpu` kernel module, which says nothing about a userspace ICD, so
+        // the install advice is true and must survive.
+        let mut linux = gfx90c_summary_with_vulkan(absent());
+        linux.os = "linux".to_owned();
+        linux.driver = DriverSummary {
+            policy: "amdgpu_dkms".to_owned(),
+            status: "amdgpu_module_loaded".to_owned(),
+            detail: None,
+            windows: None,
+        };
+        let linux = linux.render_text();
+        assert!(
+            linux.contains("install one (Mesa RADV on Linux, the AMD display driver on Windows)"),
+            "a host with no display-driver evidence still gets the install step: {linux}"
+        );
+        assert!(
+            !linux.contains("repairing or updating it"),
             "and must not be told about a Windows driver it cannot have: {linux}"
         );
     }
