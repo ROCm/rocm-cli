@@ -5,7 +5,7 @@
 //! The checks on the engine runtime that run on Linux and WSL2: the vLLM
 //! out-of-memory and import failures, a second copy of the code object manager,
 //! a `/dev/shm` too small for a serving workload, and a vLLM compiled extension
-//! that failed to load, with the three canonical symptom strings the vLLM engine
+//! that failed to load, with the canonical symptom strings the vLLM engine
 //! falls back to. The classifiers the engine calls
 //! (`vllm_oom_symptom_is_diagnosable` and its siblings) run the whole catalog,
 //! so they live in the module root rather than here.
