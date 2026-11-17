@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod advised_commands;
+mod agents;
 /// Shared archive generator and filesystem oracle for the extraction property
 /// tests in `comfyui` and `therock`.
 #[cfg(all(test, unix))]
@@ -853,6 +854,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }),
         Some(Command::Comfyui { command }) => comfyui::run(command),
         Some(Command::Services { command }) => services(command),
+        Some(Command::Agents { command }) => agents::run(command),
         Some(Command::Remote { command }) => remote::run(command),
         Some(Command::Automations { command }) => automations(command),
         Some(Command::Config { command }) => config(command),
@@ -1174,6 +1176,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "comfyui",
         "comfy",
         "services",
+        "agents",
         "remote",
         "automations",
         "config",

@@ -639,6 +639,11 @@ rocm serve qwen --verbose --device gpu_required")]
         #[command(subcommand)]
         command: Option<ServicesCommand>,
     },
+    /// [prototype] Run coding agents in AXIS sandboxes.
+    Agents {
+        #[command(subcommand)]
+        command: crate::agents::AgentsCommand,
+    },
     /// [preview] Work with GPU machines on your tailnet.
     Remote {
         #[command(subcommand)]
