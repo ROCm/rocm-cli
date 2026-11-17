@@ -26,7 +26,7 @@
 //! well as for a process the CLI launches.
 //!
 //! The name is judged three ways ([`NameState`]): absent, present and resolving
-//! (a regular file or a link that resolves: left alone, never replaced), and
+//! (a regular file or a link that resolves: left alone), and
 //! dangling (a link whose target is missing). A dangling `librocdxg.so` is as bad
 //! as an absent one: the loader's `open` fails with `ENOENT` on a broken link,
 //! tries the next directory and loads the host's copy (`LD_DEBUG=libs` on the
@@ -257,10 +257,12 @@ pub fn link_runtime_copy(copy: &Path) -> io::Result<Linked> {
                 })
             }
             NameState::Dangling => {
-                replace_with_link(dir, &link)?;
+                // Whether a dangling link was really replaced is what the final
+                // check found: a name that vanished since is linked, not replaced.
+                let replaced_dangling = replace_with_link(dir, &link)?;
                 Ok(Linked {
                     path: link,
-                    replaced_dangling: true,
+                    replaced_dangling,
                 })
             }
             NameState::Resolves => Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists")),
@@ -292,7 +294,7 @@ pub fn link_runtime_copy(copy: &Path) -> io::Result<Linked> {
 /// could only collide after the pid is reused, and then `symlink` fails with
 /// `File exists`, which is reported, not acted on.
 #[cfg(unix)]
-fn replace_with_link(dir: &Path, link: &Path) -> io::Result<()> {
+fn replace_with_link(dir: &Path, link: &Path) -> io::Result<bool> {
     replace_with_link_using(
         dir,
         link,
@@ -309,7 +311,7 @@ fn replace_with_link_using(
     state: impl Fn(&Path) -> NameState,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
     remove: impl Fn(&Path) -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let temporary = dir.join(format!(
@@ -318,8 +320,14 @@ fn replace_with_link_using(
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::os::unix::fs::symlink(SHIPPED_NAME, &temporary)?;
+    // Whether the name dangled at the final check: only then was a link replaced.
+    let mut replaced_dangling = false;
     let outcome = match state(link) {
-        NameState::Dangling | NameState::Absent => rename(&temporary, link),
+        NameState::Dangling => {
+            replaced_dangling = true;
+            rename(&temporary, link)
+        }
+        NameState::Absent => rename(&temporary, link),
         NameState::Resolves => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "File exists (it resolves now)",
@@ -337,7 +345,7 @@ fn replace_with_link_using(
             ),
         });
     }
-    Ok(())
+    Ok(replaced_dangling)
 }
 
 #[cfg(test)]
@@ -775,9 +783,44 @@ mod tests {
                 |path| std::fs::remove_file(path),
             );
 
-            assert!(outcome.is_ok(), "{outcome:?}");
+            // Nothing was replaced: the name was gone, so `false`.
+            assert!(!outcome.expect("linked"));
             assert_eq!(std::fs::read(&link).expect("resolves"), b"own");
             assert_eq!(temporaries_in(dir.path()), 0);
+        }
+
+        #[test]
+        fn the_three_cases_each_print_their_own_line() {
+            let dirs = vec![PathBuf::from("/rt/lib")];
+            let exists = || files(&["/rt/lib/librocdxg.so.1", "/rt/lib/libhsa-runtime64.so.1"]);
+            let line = |replaced_dangling| {
+                link_copies_with(&dirs, exists(), |copy| {
+                    Ok(Linked {
+                        path: copy.with_file_name("librocdxg.so"),
+                        replaced_dangling,
+                    })
+                })
+                .remove(0)
+            };
+
+            // Absent from the start, and vanished at the re-check, both `false`.
+            assert!(line(false).starts_with("librocdxg: linked /rt/lib/librocdxg.so to"));
+            assert!(!line(false).contains("replaced"));
+            assert!(
+                line(true).starts_with("librocdxg: replaced a dangling /rt/lib/librocdxg.so with")
+            );
+        }
+
+        #[test]
+        fn a_dangling_name_replaced_reports_true_and_an_absent_one_linked_reports_false() {
+            let dir = runtime_dir_with_a_dangling_link();
+            let copy = dir.path().join("librocdxg.so.1");
+            let replaced = link_runtime_copy(&copy).expect("replaced");
+            assert!(replaced.replaced_dangling);
+
+            let absent = runtime_dir_shipping_only_the_versioned_copy();
+            let linked = link_runtime_copy(&absent.path().join("librocdxg.so.1")).expect("linked");
+            assert!(!linked.replaced_dangling);
         }
 
         /// Two threads replacing dangling links in one directory at once (two
@@ -788,7 +831,7 @@ mod tests {
             const ROUNDS: usize = 200;
             let dir = tempfile::tempdir().expect("temp dir");
             let barrier = std::sync::Barrier::new(2);
-            let results: Vec<Vec<io::Result<()>>> = std::thread::scope(|scope| {
+            let results: Vec<Vec<io::Result<bool>>> = std::thread::scope(|scope| {
                 let run = |name: &'static str| {
                     let (dir, barrier) = (dir.path(), &barrier);
                     scope.spawn(move || {
@@ -1050,7 +1093,7 @@ mod tests {
             );
             assert!(
                 link_runtime_copy(&copy).is_err(),
-                "an existing librocdxg.so is never replaced"
+                "a librocdxg.so that resolves is left alone"
             );
         }
     }

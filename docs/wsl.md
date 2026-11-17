@@ -336,7 +336,10 @@ below.
   names, and an adopted runtime is never linked); for a runtime installed earlier the line names the
   `ln -sfn librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same
   (`-fn` so that it also replaces a dangling `librocdxg.so`; the install replaces
-  one atomically, and never touches a `librocdxg.so` that resolves). The
+  one atomically, and leaves alone a `librocdxg.so` that resolves when it is
+  checked; the install refuses at its final check if the name resolves by then,
+  and a name that becomes a working link between that check and the rename is
+  replaced). The
   versioned name is the fixed `librocdxg.so.1`: a wheel whose soname changes is
   not detected or linked, and a dangling `librocdxg.so` beside a runtime with no
   `librocdxg.so.1` is not detected. A `librocdxg.so.1` that is itself dangling or
