@@ -1978,9 +1978,11 @@ becomes ready:
 - `rocm serve <model> --no-smoke-test` prints the plain `Deployment summary` with
   no smoke-test note, and re-running against an already-running service prints
   the `(already running)` summary with no smoke-test note.
-- Some failures are deliberately not detected and still read as `ready` (an error
-  sent as a `data:` payload inside a `200` stream, a `200` answer with no `data:`
-  line, a close-delimited stream cut after a token); the full list is in
+- An error the engine sends as a `data:` payload inside a `200` stream is
+  detected: the summary reads `started, smoke test failed` with the engine's
+  message. Some failures are deliberately not detected and still read as `ready`
+  (a `200` answer with no `data:` line, a close-delimited stream cut after a
+  token); the full list is in
   [testing.md](testing.md#serve-smoke-test-failure).
 - A reasoning model that spends its small token budget before emitting any
   content is not a failure: the summary stays `ready` with the two metric rows

@@ -87,12 +87,14 @@ pub(crate) enum SmokeOutcome {
     /// `openai_chat_completion_probe` also allows for readiness. The status check
     /// is deliberately stricter than that probe's (any non-200 fails here, where
     /// the probe accepts anything below 500). Not detected here, and so
-    /// `Measured`: an error reported inside a 200 stream as a `data:` payload, a
-    /// 200 answer with no `data:` line at all (HTML, plain JSON, an empty body),
-    /// and a close-delimited stream cut after a token.
+    /// `Measured`: a 200 answer with no `data:` line at all (HTML, plain JSON, an
+    /// empty body), and a close-delimited stream cut after a token. An error
+    /// reported inside a 200 stream as a `data:` payload is detected and is
+    /// [`SmokeOutcome::Failed`] (`parse_openai_sse_line` in `providers/wire.rs`).
     Measured(SmokeMetrics),
     /// The smoke test could not complete: a transport error, an HTTP error
-    /// status, a parse error, a chunked or `Content-Length` stream cut short, or
+    /// status, a parse error, an error reported in-band as a `data:` payload in a
+    /// 200 stream, a chunked or `Content-Length` stream cut short, or
     /// a failure in the provider plumbing around the request (finding the ready
     /// service, writing the audit event after the stream). Carries a one-line
     /// reason. It does not by itself prove the engine failed.
@@ -378,10 +380,11 @@ pub(crate) fn oom_memory_note(
 /// does any other error from the provider call, including two that are not the
 /// engine's fault: no ready service found when it re-lists `/v1/models`, and the
 /// audit-log write after the stream. A request that completes without a content
-/// token is `Measured` with empty metrics, not a failure. Also `Measured`, and so
-/// not detected: an error `data:` payload inside a 200 stream, a 200 answer with
-/// no `data:` line at all, and a close-delimited stream cut after a token (it has
-/// no framing to cut short).
+/// token is `Measured` with empty metrics, not a failure. An error reported
+/// in-band, as a `data:` payload inside a 200 stream, is detected and is
+/// `Failed` with the server's message, even after content tokens arrived. Also
+/// `Measured`, and so not detected: a 200 answer with no `data:` line at all, and
+/// a close-delimited stream cut after a token (it has no framing to cut short).
 pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeOutcome {
     let request = ChatRequest {
         model: Some(api_model.to_owned()),
