@@ -610,6 +610,15 @@ fn torch_stack_pins(
     }
 }
 
+/// Whether an installed `release` (a `uv pip freeze` version, with any `+local` part)
+/// satisfies `wanted`: a series takes any release inside it, an exact pin takes that
+/// release and no longer one, with the same meaning as PEP 440 `==release`.
+fn stack_release_matches(release: &str, wanted: DiscoverVersion) -> bool {
+    match wanted {
+        DiscoverVersion::Series(series) => release.starts_with(&format!("{series}.")),
+        DiscoverVersion::Exact(exact) => split_local_version(release).0 == exact,
+    }
+}
 /// [`torch_stack_pins`] for a [`TorchStack::FromInstalledSdk`] row, from the
 /// `uv pip freeze` output of the SDK runtime.
 ///
@@ -618,18 +627,16 @@ fn torch_stack_pins(
 /// one the vLLM wheel was built against is refused instead of silently kept.
 fn installed_torch_stack_pins(freeze: &str, build: &VllmRocmDiscoverBuild) -> Result<Vec<String>> {
     let wanted = [
-        ("torch", build.torch_version_prefix),
-        ("torchvision", build.torchvision_version_prefix),
+        ("torch", DiscoverVersion::Series(build.torch_version_prefix)),
         (
-            "torchaudio",
-            match build.torchaudio_version {
-                DiscoverVersion::Series(series) | DiscoverVersion::Exact(series) => series,
-            },
+            "torchvision",
+            DiscoverVersion::Series(build.torchvision_version_prefix),
         ),
+        ("torchaudio", build.torchaudio_version),
     ];
     wanted
         .into_iter()
-        .map(|(pkg, series)| {
+        .map(|(pkg, wanted_release)| {
             let prefix = format!("{pkg}==");
             let pin = freeze
                 .lines()
@@ -643,10 +650,14 @@ fn installed_torch_stack_pins(freeze: &str, build: &VllmRocmDiscoverBuild) -> Re
                     )
                 })?;
             let release = &pin[prefix.len()..];
-            if !release.starts_with(&format!("{series}.")) {
+            if !stack_release_matches(release, wanted_release) {
                 bail!(
-                    "the ROCm SDK runtime has `{pin}`, but vLLM for ROCm {} needs `{pkg}` {series}.x",
-                    build.rocm_sdk_version
+                    "the ROCm SDK runtime has `{pin}`, but vLLM for ROCm {} needs `{pkg}` {}",
+                    build.rocm_sdk_version,
+                    match wanted_release {
+                        DiscoverVersion::Series(series) => format!("{series}.x"),
+                        DiscoverVersion::Exact(release) => release.to_owned(),
+                    }
                 );
             }
             ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
@@ -960,13 +971,7 @@ fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Resul
     let Some(local) = split_local_version(version).1 else {
         return Ok(());
     };
-    let matches = if let Some(local_rocm) = local.strip_prefix("rocm") {
-        rocm_sdk_series_matches(local_rocm, rocm_sdk_version)
-    } else if let Some(compact) = compact_rocm_local_segment(local) {
-        // `.rocm102` names 10.2 with no dot between major and minor.
-        rocm_series(rocm_sdk_version)
-            .is_some_and(|(major, minor)| compact == format!("{major}{minor}"))
-    } else {
+    let Some(matches) = local_rocm_matches(local, rocm_sdk_version) else {
         return Ok(());
     };
     if matches {
@@ -975,6 +980,29 @@ fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Resul
     bail!(
         "discovered `{pin}` for ROCm SDK {rocm_sdk_version}, but its `+{local}` build targets a \
          different ROCm release; the index for this ROCm line is serving another SDK's wheels"
+    )
+}
+/// Whether the ROCm line a local version names is `rocm_sdk_version`'s, or `None` when
+/// it names none. A dotted `rocm10.2.0` is read from its first `rocm` segment to the end
+/// of the local version, wherever it sits; a compact `rocm102` is the digits of that
+/// segment alone, so `rocm102` as the whole local version and `d20261110.rocm102` after
+/// other segments are both read.
+fn local_rocm_matches(local: &str, rocm_sdk_version: &str) -> Option<bool> {
+    let segments: Vec<&str> = local.split('.').collect();
+    let at = segments
+        .iter()
+        .position(|segment| segment.starts_with("rocm"))?;
+    let dotted = segments[at..].join(".");
+    if let Some(recorded) = dotted.strip_prefix("rocm")
+        && rocm_series(recorded).is_some()
+    {
+        return Some(rocm_sdk_series_matches(recorded, rocm_sdk_version));
+    }
+    let compact = compact_rocm_local_segment(local)?;
+    // `.rocm102` names 10.2 with no dot between major and minor.
+    Some(
+        rocm_series(rocm_sdk_version)
+            .is_some_and(|(major, minor)| compact == format!("{major}{minor}")),
     )
 }
 /// The digits of a `rocm<digits>` segment in a dotted local version, e.g.
@@ -2430,6 +2458,14 @@ fi
         let err = ensure_rocm_local_version_matches(ten_two, "10.1.0")
             .expect_err("a 10.2 wheel must not install onto a 10.1 SDK");
         assert!(format!("{err:#}").contains("rocm102"), "{err:#}");
+        // A tagged release carries the compact spelling as the whole local version.
+        let bare = "vllm==0.32.1+rocm102";
+        assert!(ensure_rocm_local_version_matches(bare, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(bare, "10.1.0").is_err());
+        // And the dotted spelling is read as a series wherever its segment sits.
+        let late = "vllm==0.32.1+g5df63a720.rocm10.2.0";
+        assert!(ensure_rocm_local_version_matches(late, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(late, "10.3.0").is_err());
         // And a 10.1 wheel must not slip onto a 10.2 SDK through the dotted spelling.
         assert!(
             ensure_rocm_local_version_matches("vllm==0.29.1.dev0+rocm10.1.0.gabc", "10.2.0")
@@ -2468,6 +2504,34 @@ fi
         // A runtime with no torch says what to do.
         let err = installed_torch_stack_pins("flash-attn==2.8.3\n", ten_two).expect_err("no torch");
         assert!(format!("{err:#}").contains("rocm install sdk"), "{err:#}");
+    }
+    /// An `Exact` torchaudio pin on a row that reuses the SDK's stack means that
+    /// release and no other (PEP 440 `==release`): the `+local` part is not
+    /// compared, and a longer release is not a match.
+    #[test]
+    fn installed_torch_stack_pins_treats_an_exact_pin_as_that_release() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let exact = |release: &'static str| VllmRocmDiscoverBuild {
+            torchaudio_version: DiscoverVersion::Exact(release),
+            ..*ten_two
+        };
+        let freeze = |torchaudio: &str| {
+            format!(
+                "torch==2.14.0+rocm10.2.0a20261022\ntorchvision==0.29.2+rocm10.2.0a20261022\n\
+                 torchaudio=={torchaudio}+rocm10.2.0a20261022\n"
+            )
+        };
+        let accepted = installed_torch_stack_pins(&freeze("2.11.0.2"), &exact("2.11.0.2"))
+            .expect("the exact release with its local version");
+        assert_eq!(accepted[2], "torchaudio==2.11.0.2+rocm10.2.0a20261022");
+        for installed in ["2.11.0.2.9", "2.11.0.3", "2.11.1"] {
+            assert!(
+                installed_torch_stack_pins(&freeze(installed), &exact("2.11.0.2")).is_err(),
+                "{installed} is not the release 2.11.0.2"
+            );
+        }
+        // A shorter pin does not accept the longer rebuild it is a prefix of.
+        assert!(installed_torch_stack_pins(&freeze("2.11.0.2"), &exact("2.11.0")).is_err());
     }
     /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
     /// arg-builder helpers in isolation: the remaining-deps install must use

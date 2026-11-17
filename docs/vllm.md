@@ -110,14 +110,15 @@ vLLM install then refuses that runtime; re-running the install with
 `--python-version 3.14` moves it back.
 
 This route is selected by `major.minor`, so `10.0.0`, `10.1.0` and `10.2.0`
-discover through *different* rows: they pin different vLLM minors and read vLLM from
-different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
-host from 10.0's production index. Both rows take their torch stack from the
-same `whl-next` index, which is also where `rocm install sdk` resolves either
-SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
-resolves its own torch, torchvision, and torchaudio pins fresh from the row's
-own static version prefixes, instead of reusing what the SDK install resolved.
-The SDK install might have resolved a different torch version than the row pins.
+discover through *different* rows, each pinning its own vLLM minor. `10.0.0` reads
+vLLM from the production index; `10.1.0` and `10.2.0` read it from a separate
+staging host, where AMD stages their vLLM builds. The `10.0.0` and `10.1.0` rows
+take their torch stack from the stable `whl-next` index, which is also where
+`rocm install sdk` resolves those SDKs' own `+rocmX.Y` torch from. For those two
+rows vLLM's discovery is independent of the SDK install: it resolves its own
+torch, torchvision, and torchaudio pins fresh from the row's own static version
+prefixes, instead of reusing what the SDK install resolved. The SDK install might
+have resolved a different torch version than the row pins.
 
 The `10.2.0` row does not discover its torch stack: it keeps the torch,
 torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,

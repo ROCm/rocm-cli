@@ -69,6 +69,7 @@ pub(crate) enum TorchStack {
 /// under a fixed filename (AMD rotates the dev-tag suffix constantly), so the
 /// exact wheel must be discovered from the index at install time instead of
 /// pinned in `wheel_builds::VLLM_ROCM_BUILD_TABLE`.
+#[derive(Clone, Copy)]
 pub(crate) struct VllmRocmDiscoverBuild {
     pub(crate) rocm_sdk_version: &'static str,
     /// PEP 425 interpreter tag this row's wheels are published for. AMD builds
@@ -334,6 +335,12 @@ mod tests {
         assert_eq!(
             ten_two.vllm_index_url,
             "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/"
+        );
+        // Still read by the torch install and the realign for the 10.2 row, as the
+        // fallback when the runtime manifest records no index of its own.
+        assert_eq!(
+            ten_two.torch_index_url,
+            "https://nightly.repo.amd.com/rocm/whl-next/"
         );
         assert_eq!(ten_two.vllm_version_prefix, "0.32");
         // 2.14, not 2.13: vLLM 0.32's `_C` needs a torch 2.14 symbol.
