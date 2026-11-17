@@ -265,13 +265,15 @@ stops being needed, or whose file moves. A new field reuses the helper; a new
 exception is a reviewed entry in that list.
 
 Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
-for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
-every pull request that changes Rust, and the merge queue and post-merge runs
-test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
-selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
-a file it reads, so a pull request that touches nothing but
-`crates/rocm-dash-tui` does not run this test on Linux. The module-import
-contract above has the same property.
+for any Rust change; on every pull request that changes Rust, the
+`windows-debug` job runs `cargo test --workspace` and the Linux `coverage` job
+runs `cargo xtask coverage` (`cargo llvm-cov --workspace --exclude
+e2e-cucumber`); and the merge queue and post-merge runs test the whole
+workspace. The Linux `test` job (`cargo xtask affected`) selects `xtask` only
+for a change in `xtask` or in a crate it depends on, or for a file it reads, so
+a pull request that touches nothing but `crates/rocm-dash-tui` does not run this
+test in that job, only in the `windows-debug` and `coverage` jobs. The
+module-import contract above has the same property.
 
 ### Tests that run a fake executable
 
@@ -635,8 +637,8 @@ when the diff of a changed Rust file adds or removes a line containing
 `proptest!`, so a property test moved inside `apps/rocm` alone still runs this
 check on the pull request, whether or not its seed moved with it. The other
 source-scan contracts do not have this rule; they still meet a change confined to
-a crate that `xtask` does not depend on in the merge queue, which runs the whole
-workspace. To prove a moved seed is read,
+a crate that `xtask` does not depend on in the jobs that run the whole
+workspace's tests (see [CI test selection](#ci-test-selection)). To prove a moved seed is read,
 append a deliberately unparsable line to it, run the test with `--nocapture`
 (`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
 `unparsable line, ignoring` warning naming that path, and remove the line.
@@ -1070,7 +1072,7 @@ filter, as before, including a lockfile-only push.
 The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
 job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
 `cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
-every change, in the Linux `coverage` job (`cargo xtask coverage`, every crate but `e2e-cucumber`)
+every Rust change, in the Linux `coverage` job (`cargo xtask coverage`, every crate but `e2e-cucumber`)
 on every Rust change, and in the merge queue and on `main`, where the Linux `test` job is forced to
 `--workspace`.
 

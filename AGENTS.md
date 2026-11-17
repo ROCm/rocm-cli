@@ -403,7 +403,7 @@ cargo clippy --workspace --all-targets --features rocm/e2e-test-hooks -- -D warn
 cargo xtask smoke
 ```
 
-The pre-push hooks build with `e2e-test-hooks` off; the feature-on test steps run in CI, or by hand with the commands in [CI test selection](docs/testing.md#ci-test-selection).
+The feature-on test steps are not part of this minimum gate: CI's `test` job runs them, and the pre-push hooks build with `e2e-test-hooks` off, so when a change touches code or tests behind `e2e-test-hooks`, also run the commands in [CI test selection](docs/testing.md#ci-test-selection) by hand.
 
 Deleting or weakening a test is a change in its own right: every crate has a committed
 coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops

@@ -768,7 +768,7 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 
 Boundaries:
 
-- The eight `*_contract.rs` files define no command: each is one `#[cfg(test)]` module run by `cargo test -p xtask`, and [`rust_source.rs`](../xtask/src/rust_source.rs) is declared test-only in [`main.rs`](../xtask/src/main.rs). The pull-request test selection narrows to the crates a change touches, so a change confined to another crate may not select them there; pushes to `main` and the merge queue run the whole workspace.
+- The eight `*_contract.rs` files define no command: each is one `#[cfg(test)]` module run by `cargo test -p xtask`, and [`rust_source.rs`](../xtask/src/rust_source.rs) is declared test-only in [`main.rs`](../xtask/src/main.rs). The pull-request test selection narrows to the crates a change touches, so a change confined to another crate may not select them there; the `windows-debug` and Linux `coverage` jobs still run the whole workspace's tests on every Rust change, as do pushes to `main` and the merge queue.
 - [`affected.rs`](../xtask/src/affected.rs) is the one crate selection used by both CI's affected-crates job and [`prepush.rs`](../xtask/src/prepush.rs), which only widens it with `CROSS_CRATE_READS`; a change to how files are attributed to crates changes both.
 - [`paths.rs`](../xtask/src/paths.rs) defines the workspace root, the active target directory and binary file names, honouring `CARGO_TARGET_DIR` and a cross-compilation target; a new task uses it rather than recomputing them.
 

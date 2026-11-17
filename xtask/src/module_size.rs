@@ -257,11 +257,11 @@ pub(crate) type ReachedPackage = (String, Vec<(PathBuf, bool)>);
 /// `#![cfg(test)]` gates it: the walk passes that gate on to the file's
 /// children. A file reached both through a gate and without one is listed as
 /// gated. The flag does not reflect a file's own `#![cfg(test)]` on that file
-/// itself: a caller that needs it reads the file's inner attributes. For the
-/// `e2e-test-hooks` contract in
-/// `workflow_contract.rs`, which must follow the module tree this check walks —
-/// including `#[path]` modules and files one package loads from another's
-/// directory — rather than guess a file's package and gating from where it sits.
+/// itself: a caller that needs it reads the file's inner attributes. It exists
+/// for the `e2e-test-hooks` contract in `workflow_contract.rs`, which must
+/// follow the module tree this check walks — including `#[path]` modules and
+/// files one package loads from another's directory — rather than guess a
+/// file's package and gating from where it sits.
 /// The walk starts only from library, binary, proc-macro and build-script
 /// targets, so integration tests under a package's `tests/` directory are not
 /// listed.
